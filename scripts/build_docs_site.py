@@ -260,6 +260,28 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "databricks-metric-views-compatibility.md",
+        "semantic-layers/databricks-metric-views",
+        PageMeta(
+            "Databricks Metric View compatibility",
+            "How dex reads and validates Databricks Metric View YAML with no "
+            "workspace connection: the ported 1.1 rules, the catalog mapping and "
+            "what it declines to claim.",
+            "Databricks Metric Views",
+        ),
+    ),
+    ReferencePage(
+        "snowflake-semantic-views-compatibility.md",
+        "semantic-layers/snowflake-semantic-views",
+        PageMeta(
+            "Snowflake Semantic View compatibility",
+            "How dex reads Snowflake Semantic View YAML with no Snowflake "
+            "connection: rules qualified against verify_only, the catalog "
+            "mapping and what it declines to claim.",
+            "Snowflake Semantic Views",
+        ),
+    ),
+    ReferencePage(
         "ossie-walkthrough.md",
         "guides/ossie-semantic-layer",
         PageMeta(
@@ -392,6 +414,13 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
 # One row per generated page. A CLI group with no row fails the build, so adding
 # a group to COMMAND_SURFACE forces it a title, a description and a nav entry.
 GENERATED_PAGES: dict[str, PageMeta] = {
+    "cli/init": PageMeta(
+        "dex init",
+        "Set up a Dex project, try a local demo, adopt existing dbt, or explore "
+        "without dbt. Managed docs, connection checks and readiness for agents "
+        "and terminals.",
+        "init",
+    ),
     "cli/overview": PageMeta(
         "dex CLI overview",
         "Every dex CLI command at a glance: global options, connection flags "
@@ -453,6 +482,13 @@ GENERATED_PAGES: dict[str, PageMeta] = {
         "Reference for dex procedure: print the agent procedure every dex skill "
         "carries, the block to paste into CLAUDE.md or AGENTS.md, and a stale check.",
         "procedure",
+    ),
+    "cli/feedback": PageMeta(
+        "dex feedback",
+        "Reference for dex feedback: report a bug or suggest an improvement, with "
+        "the environment to paste and issue links prefilled from it. Nothing is "
+        "sent.",
+        "feedback",
     ),
     "changelog": PageMeta(
         "Changelog",

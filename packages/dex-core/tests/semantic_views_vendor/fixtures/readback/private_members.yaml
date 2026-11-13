@@ -1,0 +1,42 @@
+name: PRIVATE_MEMBERS
+tables:
+  - name: LINEITEM
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: LINEITEM
+    primary_key:
+      columns:
+        - L_ORDERKEY
+        - L_LINENUMBER
+    dimensions:
+      - name: RETURN_FLAG
+        expr: l_returnflag
+        data_type: VARCHAR(1)
+        access_modifier: public_access
+    facts:
+      - name: DISCOUNT
+        expr: l_discount
+        data_type: "NUMBER(12,2)"
+        access_modifier: private_access
+      - name: DISCOUNTED_PRICE
+        expr: lineitem.extended_price * (1 - lineitem.discount)
+        data_type: "NUMBER(25,4)"
+        access_modifier: public_access
+      - name: EXTENDED_PRICE
+        expr: l_extendedprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: GROSS
+        expr: SUM(lineitem.extended_price)
+        access_modifier: private_access
+      - name: NET
+        expr: SUM(lineitem.discounted_price)
+        access_modifier: public_access
+metrics:
+  - name: DISCOUNT_SHARE
+    synonyms: []
+    description: ""
+    expr: 1 - lineitem.net / lineitem.gross
+    access_modifier: public_access

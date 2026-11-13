@@ -427,7 +427,8 @@ A blank line between two entries stays wherever the edit happens beside it. A te
 is counted and never rewritten, so a configured `accepted_values` survives an edit to
 the plain names beside it. A file dex cannot span safely, one indented with tabs, one
 holding several YAML documents, or one using anchors and aliases, is declined by name
-rather than spliced at an offset nobody chose. Every result is re-parsed and compared
+rather than spliced at an offset nobody chose. Anchors and aliases are read from the
+YAML parse, so `*emphasis*` in a comment or a description is not one. Every result is re-parsed and compared
 against what the edit intended before it can reach the plan store.
 
 **A table that drifted on two axes arrives as one edit.** Schema drift and a lost
@@ -444,7 +445,16 @@ lookup `transform place` and model declarations use. The
 `models/staging/stg_<table>.<suffix>` convention answers only for a model the project
 does not have yet. A drift finding for a table already named `stg_orders` resolves
 `stg_orders.yml`, not `stg_stg_orders.yml`; reconcile can therefore see an existing
-`unique` test instead of advising the user to add it again. Reconcile and declarations
+`unique` test instead of advising the user to add it again. A lost key on a relation the
+project builds as a model (a mart, or any model outside `models/staging/`) resolves that
+model, since dbt names a model's relation after its file, and the `unique` test edit lands
+in the YAML that declares it. A relation the project also declares as a source table (its
+`identifier`, else its `name`) keeps the staging convention, because a bare name cannot say
+which of the two the finding is about. When the key already has a `unique` test, the
+proposal names it as the test that fails on the duplicates where the finding is on the model's
+own relation and the test is a plain `unique` (unless the duplicates are NULL keys, which dbt's
+`unique` ignores), and otherwise says the test is already declared, since a source's drift or
+a `where` filter can leave it passing. Reconcile and declarations
 agree on where a model lives, and a re-scaffold that would land beside a model the
 project keeps elsewhere is refused as misplaced rather than written as a second copy.
 

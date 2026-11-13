@@ -1,0 +1,5 @@
+{
+  "kind": "diagnose",
+  "models": ["stg_events", "subscription_activity"],
+  "prompt": "Something looks off about subscription 1034 in `subscription_activity`; the account manager thinks some of its activity is missing. Look into it and fix the model if something is wrong."
+}

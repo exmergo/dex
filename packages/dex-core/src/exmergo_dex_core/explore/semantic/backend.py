@@ -49,7 +49,8 @@ class SemanticLayer(Protocol):
     """The behavior required from a semantic layer and its runtime.
 
     A layer is the semantic system of record, whether it is a local dbt
-    artifact, dbt Cloud, native Ossie documents, or SLayer model files.
+    artifact, dbt Cloud, native Ossie documents, SLayer model files, Cube
+    model files, or Databricks Metric View files.
     ``backend`` was the old name for this seam; it hid that every
     implementation owns discovery as well as execution.
     """
@@ -173,6 +174,8 @@ _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
     "dbt": {EXECUTION_DEX: "local", EXECUTION_VENDOR: "dbt_cloud"},
     "ossie": {EXECUTION_DEX: "local"},
     "slayer": {EXECUTION_DEX: "local"},
+    "databricks": {EXECUTION_DEX: "local"},
+    "snowflake": {EXECUTION_DEX: "local"},
 }
 
 # The vendors whose deployment (where the layer runs) and execution (who runs
@@ -217,6 +220,18 @@ def _local_cube(engine: Any) -> SemanticLayer:
     return LocalCubeLayer.from_engine(engine)
 
 
+def _local_metric_views(engine: Any) -> SemanticLayer:
+    from .metric_views import LocalMetricViewLayer
+
+    return LocalMetricViewLayer.from_engine(engine)
+
+
+def _local_semantic_views(engine: Any) -> SemanticLayer:
+    from .semantic_views import LocalSemanticViewLayer
+
+    return LocalSemanticViewLayer.from_engine(engine)
+
+
 # Which backend answers for a resolved (vendor, deployment) pair. A table rather
 # than a chain of conditions, so a vendor is a row here and nowhere else, and so
 # a deployment that resolved is a deployment that gets used: the previous shape
@@ -232,6 +247,8 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("ossie", "local"): _local_ossie,
     ("slayer", "local"): _local_slayer,
     ("cube", "local"): _local_cube,
+    ("databricks", "local"): _local_metric_views,
+    ("snowflake", "local"): _local_semantic_views,
 }
 
 # Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
@@ -261,6 +278,18 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
         "a semantic source supplies a hosted dbt Cloud token and has no "
         "meaning for Cube model files, which are files in this repository. "
         "Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+    ("databricks", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Databricks Metric View files, which are files in this "
+        "repository. Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+    ("snowflake", "local"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Snowflake Semantic View files, which are files in this "
+        "repository. Drop the source, or select a hosted dbt semantic layer with "
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),
 }

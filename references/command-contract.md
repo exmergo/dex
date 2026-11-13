@@ -25,8 +25,13 @@ logic.
   SLayer renders its own `query` and `values`. `[cube]` follows the same
   `semantic.vendor` read for the same commands where the vendor is `cube`, is
   always taken by `semantic cube`, and a
-  Cube `query` or `values` never takes `[semantic]` either. A repo that runs
-  neither resolves neither scikit-learn nor MetricFlow.
+  Cube `query` or `values` never takes `[semantic]` either. `[metric-views]`
+  follows the same read where the vendor is `databricks`, is always taken by
+  `semantic databricks`, and never takes `[semantic]`. `[semantic-views]`
+  follows the same read where the vendor is `snowflake` (also a connector name,
+  whose extra still comes from `connector:` alone), is always taken by
+  `semantic snowflake`, and never takes `[semantic]`.
+  A repo that runs neither resolves neither scikit-learn nor MetricFlow.
 - That environment is uv's own, and `--no-project` is what keeps it so. Without it
   uv discovers whatever Python project the caller is standing in, builds it, leaves
   a `.venv/` and a `uv.lock` in their repo, and puts their dependencies on the
@@ -69,7 +74,7 @@ did not write.
 
 ## The command surface
 
-Capabilities, not final spelling. Implemented incrementally: `demo`, `procedure`, `connect test`,
+Capabilities, not final spelling. Implemented incrementally: `demo`, `procedure`, `feedback`, `connect test`,
 the `config` group, the `explore` group, the authoring surface (`transform`,
 `semantic`), and the `maintain` group are live.
 
@@ -91,13 +96,21 @@ dex procedure [--block] [--check <file>...]
                                      data.digest, data.engine_version, data.markers.
                                      --block adds data.block, the text between the
                                      dex:procedure markers, to paste into CLAUDE.md or
-                                     AGENTS.md (dex never writes either). --check reads
+                                     AGENTS.md (procedure itself writes neither). --check reads
                                      each file and reports its copy current, stale,
                                      missing, malformed, absent or unreadable under
                                      data.copies, never echoing content; any copy that
                                      is not current is status error (reason request).
                                      Routed before any engine: no config, no connector
                                      extra, no connection; allowed in values-free mode
+dex feedback [--command <sub>]    -> what a bug report needs: data.environment (versions,
+                                     OS, connector and semantic vendor names, result
+                                     mode; never a target, credential, path or value),
+                                     data.links (bug and feature issue forms prefilled
+                                     from it) and data.guidance. Nothing is sent. Routed
+                                     before any engine; allowed in values-free mode. A
+                                     reason: internal error envelope carries data.report,
+                                     the same prefilled bug link, never the error text
 dex connect test                  -> {capabilities, dialect, read_only: true}
 dex config get [key]              -> the effective value of every setting, or of those
                                      under key, as flat rows under data.settings: value,
@@ -230,7 +243,20 @@ dex explore semantic query <m,m>  -> one governed metric query, capped and row-m
   [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
                                      server-side where dex's cost guard is structurally unavailable and every
                                      result says so
-dex transform init "<name>"       -> bootstrap a dbt project skeleton; requires an explicit
+dex init [<name>]                -> complete project setup: new dbt-backed Dex project,
+                                     complete DuckDB demo, existing dbt adoption, or
+                                     exploration without dbt. .dex/ stays at repo root;
+                                     a name creates dbt beneath it, '.' is in-place.
+                                     TTY questions/completion go to stderr; stdout is
+                                     one JSON envelope. Noninteractive missing inputs
+                                     are structured, never prompts. Existing config
+                                     changes return a diff requiring --confirm.
+                                     README/agent managed sections preserve authored
+                                     content. Verifies connection; never scans tables,
+                                     runs builds, or chooses budgets during setup.
+                                     data.readiness separates configuration, connection,
+                                     build_prerequisites, and build (unchecked).
+dex transform init "<name>"       -> legacy bootstrap of a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their
                                      own <layer>_<target name> schemas; warns when a target
@@ -253,10 +279,16 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      data.change_scope (#1115), static and free: per existing
                                      model the plan rewrites, population changed / kept /
                                      unchecked and each output removed, added, retyped,
-                                     re-aggregated or re-NULLed, every judged change declared
+                                     re-aggregated or re-NULLed (an aggregate is followed
+                                     through the CTEs its column reads, so one moved into a
+                                     CTE whose rows are produced alike is not
+                                     re-aggregated, #1253), every judged change declared
                                      (an assumption names its column) or undeclared (a warning),
                                      carried to a --for-plan build's
-                                     completion.obligations.change_scope;
+                                     completion.obligations.change_scope; a changed driving relation
+                                     or a declared population.parent removed or replaced is kind
+                                     redriven (reason redriven, against applied or earlier_plan),
+                                     declared only by an assumption at request or contract tier (#1228);
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref
@@ -353,6 +385,25 @@ dex transform place <column>      -> where a derived column shared by several mo
                                      `per_target` and the reason is stated rather than the worse thing
                                      being done quietly. --explain returns the reasoning and stores no
                                      plan. Repo-only and free
+dex transform repair <node>...    -> the project override that repairs each package model whose
+                                     latest build attempt failed, drafted as one stored, unapplied
+                                     plan (#1229; every failed model in one call, since each disables
+                                     its node in the same dbt_project.yml): the package's SQL restated as
+                                     <model path>/overrides/<node>.sql (package macros qualified,
+                                     each var() given what the package node saw, a relation var
+                                     inlined so a project var cannot cycle, materialized/schema/alias
+                                     restated) and +enabled: false for the node in dbt_project.yml,
+                                     written in place. Inside the calls the error names, and only
+                                     there, each column of the offending type is converted where the
+                                     input's cached profile settles it (all NULL: a cast through text;
+                                     epoch seconds/ms: the epoch reader, meaning_changing: true; ISO
+                                     text: a parse), else left as written, unresolved with a
+                                     reason_code. Compiled, then bound on dev reading no row (DuckDB
+                                     limit 0, BigQuery dry run), each further type error converted
+                                     the same way. data.repair leads the payload (status, plan_id,
+                                     compiled, next, nodes[]). A --for-plan build of it carries
+                                     data.completion.obligations.repair, one `repair: satisfied` entry
+                                     per override whose every check held
 dex transform declare [<model>]   -> declarations for models that already exist, opt-in. One stored
   [--edits-file <f>] [--limit N]     plan proposing, per selected model, only the measured facts its
   [--intent "<text>"]                YAML does not state: the grain, a key or foreign_key role, a
@@ -384,7 +435,7 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
              [--for-plan <id>]       --verify sweeps the nodes this build ran for correctness and
              [--for-plan-file <f>]   reports the findings in the same envelope, under
              [--no-install-deps]     data.verification; findings never change the status
-             [--select <s>]          --full-refresh passes dbt's flag, for after an incremental
+             [--select <s ...>]      --full-refresh passes dbt's flag, for after an incremental
              [--full-refresh]        model's logic changed: priced as the full rebuild, the
                                      rebuilt nodes named under data.full_refresh, recorded in
                                      data.evidence.invocation.full_refresh. Every dbt invocation
@@ -540,7 +591,10 @@ dex semantic define|update|plan   -> dbt semantic model edits as diffs (fronted 
 dex semantic ossie define|update|plan
                                   -> native Ossie whole-document edits as diffs; limited to the exact
                                      files in semantic.ossie.files, validated as one prospective
-                                     layer, and applied atomically with transform apply
+                                     layer, and applied atomically with transform apply;
+                                     --from-metric-view <file>... [--name] [--into] [--dataset-metrics]
+                                     proposes the document from a Metric View file through the Ossie
+                                     bridge (#1260), every notice under data.bridge
 dex semantic slayer define|update|plan
                                   -> SLayer model files as whole-file diffs; limited to the exact
                                      files in semantic.slayer.models, validated as one prospective
@@ -553,6 +607,24 @@ dex semantic cube define|update|plan
                                      set with dex's port of Cube's model rules, each cube and view
                                      classified defined, updated or unchanged, and applied atomically
                                      with transform apply
+dex semantic databricks define|update|plan
+                                  -> Databricks Metric View YAML files as whole-file diffs; limited
+                                     to the files in semantic.databricks.files (.sql refused by name),
+                                     validated as one prospective set with dex's port of the Metric
+                                     View YAML 1.1 rules (unknown keys and fields beside dimensions
+                                     refused on write), each view classified defined, updated or
+                                     unchanged, applied atomically with transform apply, never deployed;
+                                     --from-ossie <file>... [--fact] [--into] proposes views from
+                                     Ossie documents through the Ossie bridge (#1260)
+dex semantic snowflake define|update|plan
+                                  -> Snowflake Semantic View YAML files as whole-file diffs; limited
+                                     to the files in semantic.snowflake.files (.sql refused by name),
+                                     validated as one prospective set with dex's port of Snowflake's
+                                     specification and validation rules (unknown keys, access_modifier
+                                     on a dimension and a qualified read naming no member refused on
+                                     write), each logical table and derived metric classified defined,
+                                     updated or unchanged, applied atomically with transform apply,
+                                     never deployed
 dex maintain snapshot [--project-only]
                                   -> capture/refresh the known-good baseline in .dex/snapshot.json;
                                      --project-only re-fingerprints only project layers and carries the
@@ -595,8 +667,10 @@ dex maintain reconcile [<class>]  -> propose the edits that reconcile detected d
                                      semantic_plan_id;
                                      cardinality advisories distinguish expansion from contraction
                                      using available counts, and flag approximate counts as uncertain
-dex maintain verify [<selector>]  -> is the project correct right now, no .dex/snapshot.json baseline
-                                     required (unlike every subcommand above). Build status:
+dex maintain verify [<models>]    -> is the project correct right now, no .dex/snapshot.json baseline
+                                     required (unlike every subcommand above). The scope is model
+                                     names: repeatable, comma-separated, or in one quoted argument
+                                     separated by spaces ("a b"), none = every model. Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
                                      through transitively skipped parents), nodes that warned rather
                                      than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
@@ -612,7 +686,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      incremental model is skipped (under transform build --full-refresh
                                      --verify, one it rebuilt is compared, except a microbatch model, which
                                      rebuilds only from its begin). A model generated in SQL with no parent
-                                     relation is named in notes. A real parent relation missing from the
+                                     relation is named in notes, and so is one driven off the project's
+                                     time spine (a time_spine: config or the metricflow_time_spine name)
+                                     or off a model generated in SQL, which supplies anchors rather than a
+                                     population and is not compared (#988). A real parent relation missing from the
                                      warehouse is still a warning. Free on metadata alone, and every
                                      count made exact where counting bills nothing; a relation the
                                      warehouse keeps no count for (any view) is priced as one batched
@@ -634,6 +711,10 @@ dex maintain verify [<selector>]  -> is the project correct right now, no .dex/s
                                      entity counts, one data.temporal_contracts record per contract;
                                      unchecked with snapshot_not_ancestor or lineage_unavailable where
                                      the manifest does not show the model descending from it),
+                                     population_delta (a built model declaring no parent, against the
+                                     parent dex drafts for it: orphan_keys, missing_parents, empty_rows,
+                                     one data.population_delta record per model, needs_decision listed
+                                     under completion.obligations.needs_decision; build only, #1228),
                                      each class
                                      priced into the same single offer on a metered connector. Join
                                      contract: every equality join's coverage, rows and distinct keys
@@ -686,7 +767,12 @@ supplied, each also a warning). For measures, warnings name only the missing
 `aggregation`, `additivity`, or `unit` fields and group columns with the same
 missing fields; the `missing` list keeps its per-column paths unchanged.
 `drafted.precedent` says what the project's other models do with each column
-that the model filters, branches on or aggregates, and a
+that the model filters, branches on or aggregates; `drafted.population_parent`
+is the parent dex drafts for a model that declares none (a unique key equal to
+the grain, a `relationships` edge, the description's "one row per" noun, the
+driving relation, strongest first), labelled `drafted` with its evidence and
+never written, with `transform build --verify` measuring the model against it
+(#1228); and a
 literal compared to a column whose complete cached domain does not hold it is a
 warning. On a model that already exists, `contradictions` lists each declared rule
 (population filter, grain, declared column, an upstream column's additivity) that
@@ -717,7 +803,24 @@ beside the configured files (`primary_key` on the grain dimensions, other roles 
 dimensions, declared aggregations as measures named after the column,
 `many_to_one` joins from foreign keys), validated by `semantic cube`'s own checks
 and read back through its catalog, and included or proposed on the same terms
-against `semantic.cube.files`. Under `ossie` it is a dataset (a field per declared
+against `semantic.cube.files`. Under `databricks` it is a Metric View file of its
+own, `<dir>/<mart>.yaml` (the mart as `source`, other roles as fields with a
+`date`/`date_time` format on temporal columns, declared aggregations as measures
+`<column>_<agg>` with a currency or percentage format from the unit, `many_to_one`
+joins from foreign keys with `rely.at_most_one_match` only where the parent
+declares that key as its grain), validated by `semantic databricks`'s own checks,
+read back through its catalog, and included or proposed on the same terms against
+`semantic.databricks.files`; a Metric View has no metadata key, so the population
+is only the last sentence of its `comment`. Under `snowflake` it is a logical
+table (the mart as a three-part `base_table`, `primary_key` from the grain, a
+`time` role as a time dimension and other roles as dimensions, each measure a fact
+with declared aggregations as metrics `<column>_<agg>`, `non_additive_dimensions`
+for a `semi_additive` one, and a relationship from each foreign key to a parent
+table keyed on that column) spliced into the configured file holding the tables
+its foreign keys reference and stored as a second plan (`plan_id`), or a view of
+its own, `<dir>/<mart>.yaml`, included or proposed against
+`semantic.snowflake.files`; a Semantic View has no metadata key, so the
+population is only the last sentence of the table's `description`. Under `ossie` it is a dataset (a field per declared
 column, `primary_key` on every grain field, declared aggregations as dataset-scoped
 metrics `<column>_<agg>`, a relationship from each foreign key to the parent's
 field) appended to the configured document holding the datasets its foreign keys
@@ -727,9 +830,10 @@ every layer a population is carried as metadata (`config.meta.dex`, `meta.dex`, 
 Ossie's `ai_context`, and one sentence in the description)
 and never as a filter, since the mart's SQL already enforces it; per model,
 `carried` and `not_carried` account for every declared field.
-`semantic slayer define|update|plan`, `semantic cube define|update|plan` and
-`semantic ossie define|update|plan` take `declarations` too, annotating a model,
-cube or dataset the payload or the layer defines. A command that takes no declarations refuses a payload
+`semantic slayer define|update|plan`, `semantic cube define|update|plan`,
+`semantic ossie define|update|plan`, `semantic databricks define|update|plan` and
+`semantic snowflake define|update|plan` take `declarations` too, annotating a
+model, cube, dataset, view or logical table the payload or the layer defines. A command that takes no declarations refuses a payload
 carrying them rather than dropping them. A version of a native dbt versioned
 model is declared as `"model": "dim_teams.v2"` and renders into that item of the
 model's `versions:` list, every other byte kept (#895); the bare name is the
@@ -1236,7 +1340,7 @@ default, or a filter or operator after it is refused. A key naming a location
   is, and what its edits actually contain. Both are repo-only and free. See
   `references/host-integration.md` for the whole seam, including the
   conformance vectors shipped for a consumer to assert its own reader against.
-- `transform build` accepts `--target`, `--select`, `--full-refresh` and `--verify`. The target must be `dev`
+- `transform build` accepts `--target`, `--select` (one or more selector expressions or space-separated model names, matching dbt's syntax), `--full-refresh` and `--verify`. The target must be `dev`
   (or the `dbt_target` named in `.dex/config.yml`); production-looking targets
   are refused outright, before the cost gate, and `--confirm` cannot override
   the refusal. On a billed connector the cost gate is priced upfront: dex runs a
@@ -1532,9 +1636,16 @@ default, or a filter or operator after it is refused. A key naming a location
   checked twice. A declared `population.parent` is held to the parent's keys
   (`parent_population_missing`, `parent_population_unexpected`, #857), and a
   declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
-  per contract under `data.verification.temporal_contracts`). Every class that
+  per contract under `data.verification.temporal_contracts`). A built model that
+  declares no parent is measured against the parent dex drafts for it (#1228):
+  orphan keys, missing parents and rows whose child columns are all NULL or zero
+  (a sign of no child, not proof), one record per drafted model under
+  `data.verification.population_delta`, a `population_delta` finding and
+  `completion.obligations.needs_decision` where the counts ask which rows belong.
+  Only the plan's models with `--for-plan`, at most 25 without. Every class that
   did not run is named in `suppressed` (`grain`, `unit`, `additivity`,
-  `population`, `parent_population`, `temporal`).
+  `population`, `parent_population`, `temporal`); `population_delta` never is,
+  since each model it considered has its own record.
 
   **Join coverage.** Every equality join the built models write is measured as
   `maintain verify` measures it (#857), with one record per join under
@@ -1618,7 +1729,12 @@ default, or a filter or operator after it is refused. A key naming a location
   re-parses the result and compares it against what was sent. A file whose
   layout it cannot span safely (a flow-style sequence, anchors or aliases,
   multiple documents, tab indentation) is refused with `--edits-file` named as
-  the way to edit it. Classification is scoped to the definitions named, so a
+  the way to edit it. Anchors and aliases are read from the YAML parse, so
+  `*emphasis*` in a comment or a description does not count as one, and a file
+  that does not parse is refused saying so. A project file that does not parse
+  hides the definitions it declares, so a refusal that would call a name absent
+  names each file that could not be read and why instead of reporting it "not
+  in the project". Classification is scoped to the definitions named, so a
   spliced file's other definitions are reported in no class at all. Names
   implicitly created by `create_metric: true` measures count as existing metrics
   everywhere. Beyond MetricFlow's schemas, the engine
@@ -1687,6 +1803,29 @@ default, or a filter or operator after it is refused. A key naming a location
   carries is reported `defined`, `updated` or `unchanged`. Apply writes the
   authored bytes, all files or none, and a file changed after planning is a
   conflict.
+- `semantic databricks define|update|plan` is the same route for Databricks
+  Metric View YAML files (#1258). Each edit is one whole view body keyed as
+  `semantic.databricks.files` names it; a path off that list, a `.sql` file,
+  another suffix and a stem another file names are refused by name, and a delete
+  is refused. The prospective set is validated by dex's port of the Metric View
+  YAML 1.1 rules, every error refusing it, and in a file the plan writes an
+  unknown key (at any level, `rely` included) and `fields` beside `dimensions`
+  refuse it too. Each view is reported `defined`, `updated` or `unchanged`,
+  compared as YAML 1.2. Apply writes the authored bytes, all files or none, a
+  file changed after planning is a conflict, and nothing is deployed.
+- `semantic snowflake define|update|plan` is the same route for Snowflake
+  Semantic View YAML files (#1292). Each edit is one whole file keyed as
+  `semantic.snowflake.files` names it, its view named by its own `name`; a path
+  off that list, a `.sql` file and another suffix are refused by name, and a
+  delete is refused. The prospective set is validated by dex's port of
+  Snowflake's specification and validation rules, every error refusing it, and
+  in a file the plan writes an unknown key, `access_modifier` on a dimension and
+  `unresolved_member` (a read qualified with its own table naming no member)
+  refuse it too. Each logical table (`view.table`) and derived metric
+  (`view.metric`) is reported `defined`, `updated` or `unchanged`, compared as
+  YAML 1.2, and a change to a view's other parts only reports the view. Apply
+  writes the authored bytes, all files or none, keeping each file's mode, a file
+  changed after planning is a conflict, and nothing is deployed.
 
 
 Skill-to-subcommand mapping: `explore` fronts `connect`/`explore`; `transform`
@@ -1837,6 +1976,68 @@ schema axis holds each member's columns and type to dex's own metadata, whose
 removals `maintain reconcile` plans through the `semantic cube update` route. `semantic cube define|update|plan` authors the files, and a
 declared dbt mart derives a cube of its own (see `transform plan` above). Selecting the vendor without the `[cube]` extra (the dialect
 engine) refuses and names it. See `references/semantic-layer.md`.
+
+**`vendor: databricks` reads Databricks Metric View files from the repository**,
+the exact paths named in `semantic.databricks.files`, statically and with no
+Databricks package and no workspace connection; dex never deploys a view. Each
+file is one Metric View YAML body (the document `CREATE VIEW ... WITH METRICS
+LANGUAGE YAML` holds), named after its stem; a `.sql` file is refused by name.
+Each body is validated by dex's own port of the Metric View YAML 1.1 rules, with
+YAML 1.2 booleans so a bare `on:` key stays text, a version other than `1.1`
+refused by name, and every refusal naming the file and the element. `list`
+answers. Each view is a semantic model on the relation its `source` names (or a
+plain single-table projection query), each field a dimension keyed `view.field`,
+each single-aggregate measure a measure and a `simple` metric, `MEASURE(a) /
+MEASURE(b)` a `ratio` and any other composition `derived`, with the view's
+`filter` on every metric. A metric is groupable by its own view's fields, so
+`--for-dimension` answers. Entities and time grains are declared `unavailable`;
+each join's key pairs and arity, and each `rely.at_most_one_match` key on the
+joined table, reach `explore` through the declaration channel at confidence 1.0.
+`query` and `values` refuse by name until #964, `values` after the PII gate.
+`semantic databricks define|update|plan` authors the files through a stored plan,
+never deploying them, and a declared dbt mart derives a view of its own (see
+`transform plan` above).
+`maintain snapshot` records `vendor: databricks`, `format_version: 1.1` and each
+file's declared `version` (`definition_versions`, so a re-saved view is
+`semantic_format_changed` for that file alone), and the layer-neutral axes read it: definition drift
+on the semantic axis, each `rely` key and join arity on the grain axis. The
+schema axis holds the views to the warehouse metadata with the four `declared_*`
+codes, and `maintain reconcile` stores their removals as a `semantic databricks
+update` plan (#1259). Selecting the vendor without the
+`[metric-views]` extra (the dialect engine) refuses and names it. See
+[Databricks Metric View compatibility](databricks-metric-views-compatibility.md).
+
+**`vendor: snowflake` reads Snowflake Semantic View files from the repository**,
+the exact paths named in `semantic.snowflake.files`, statically and with no
+Snowflake package and no Snowflake connection; dex never deploys a view. Each file
+is one Semantic View YAML document (what `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`
+takes and `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` returns), named by its own `name`
+(a stem that disagrees warns); a `.sql` file and a legacy Cortex Analyst semantic
+model are refused by name. Each document is validated by dex's own port of
+Snowflake's specification and validation rules, qualified against `verify_only`
+on a live account, with every refusal naming the file and the element. `list`
+answers. Every name carries its view: each logical table is a semantic model
+`view.table` on its `base_table` (or a plain single-table `definition` query),
+each dimension, time dimension and fact a dimension row `view.table.member` (a
+fact marked `kind: fact`, `groupable: false`), each single-aggregate table metric
+a measure and a `simple` metric, one metric over another a `ratio`, and any other
+composition (view-level metrics included) `derived`. A metric is groupable by its
+table's dimensions and those its relationships reach many-to-one, so
+`--for-dimension` answers. A single-column primary key is a primary entity and a
+relationship referencing it a foreign declaration; every primary and unique key
+and every key-equality relationship, with its arity, reach `explore` through the
+declaration channel at confidence 1.0. `sample_values` are counted and never
+surfaced. `query` and `values` refuse by name until #1290, `values` after the PII
+gate. `maintain snapshot` records `vendor: snowflake` and dex's own rule-set
+revision as `format_version` (the format has no `version` key), over a canonical
+form, so a view read back from Snowflake fingerprints as its file; the
+layer-neutral axes read it: definition drift on the semantic axis, each key and
+relationship arity on the grain axis. `semantic snowflake define|update|plan`
+authors the files through a stored plan, never deploying them, and a declared dbt
+mart derives a logical table (see `transform plan` above); the schema axis and
+reconcile are #1293. Selecting the vendor without the `[semantic-views]` extra (the
+dialect engine) refuses and names it. See
+[Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md).
 
 `list` costs no warehouse query on either backend, and neither does the reverse
 lookup, which inverts the dimension list each metric already carries rather than

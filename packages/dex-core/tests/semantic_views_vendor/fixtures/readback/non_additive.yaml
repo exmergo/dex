@@ -1,0 +1,35 @@
+name: NON_ADDITIVE
+tables:
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: ORDER_STATUS
+        expr: o_orderstatus
+        data_type: VARCHAR(1)
+        access_modifier: public_access
+    facts:
+      - name: TOTAL_PRICE
+        expr: o_totalprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: LATEST_DAY_VALUE
+        description: The order value on the last order date in the range.
+        expr: SUM(orders.total_price)
+        access_modifier: public_access
+        non_additive_dimensions:
+          - table: ORDERS
+            dimension: ORDER_DATE
+            sort_direction: descending
+            null_order: last
+    time_dimensions:
+      - name: ORDER_DATE
+        expr: o_orderdate
+        data_type: DATE
+        access_modifier: public_access

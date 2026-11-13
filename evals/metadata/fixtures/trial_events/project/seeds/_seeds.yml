@@ -1,0 +1,13 @@
+version: 2
+seeds:
+  - name: event_tier_codes
+    description: The canonical event tier for each tier code the billing feed sends, lowercased and trimmed.
+    columns:
+      - name: tier_code
+        data_tests: [unique, not_null]
+      - name: event_tier
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [trial, paid]

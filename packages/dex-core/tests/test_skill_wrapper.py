@@ -101,6 +101,7 @@ def test_the_wrapper_knows_every_engine_connector(wrapper):
         (["semantic", "ossie", "define", "--edits-file", "edits.json"], ["ossie"]),
         (["semantic", "ossie", "update", "--edits-file", "edits.json"], ["ossie"]),
         (["semantic", "ossie", "plan", "--edits-file", "edits.json"], ["ossie"]),
+        (["semantic", "ossie", "plan", "--from-metric-view", "v.yaml"], ["ossie"]),
         (["maintain", "semantic"], ["ossie"]),
         (["maintain", "check"], ["ossie"]),
         (["maintain", "snapshot"], ["ossie"]),
@@ -289,6 +290,89 @@ def test_the_slayer_extra_follows_the_configured_vendor(
     ],
 )
 def test_the_cube_extra_follows_the_configured_vendor(wrapper, argv, vendor, expected):
+    assert wrapper._feature_extras(argv, vendor) == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "vendor", "expected"),
+    [
+        (
+            ["explore", "semantic", "list"],
+            "databricks",
+            ["ossie", "metric-views", "semantic-api"],
+        ),
+        # A Metric View query is SQL over the view: MetricFlow is never installed.
+        (
+            ["explore", "semantic", "query", "orders.revenue"],
+            "databricks",
+            ["ossie", "metric-views", "semantic-api"],
+        ),
+        (["maintain", "grain"], "databricks", ["metric-views"]),
+        (
+            ["explore", "profile", "a.b.c", "--use-project"],
+            "databricks",
+            ["metric-views"],
+        ),
+        (["transform", "apply"], "databricks", ["metric-views"]),
+        # Authoring validates with the reader's port of the rules (#1258), so it
+        # takes the extra whatever the configured vendor says.
+        (["semantic", "databricks", "define"], "databricks", ["metric-views"]),
+        (["semantic", "databricks", "plan"], None, ["metric-views"]),
+        # The Ossie bridge (#1260) reads its source with a pure-Python port, so
+        # its flags add nothing to the target's own extra.
+        (
+            ["semantic", "databricks", "plan", "--from-ossie", "m.yaml", "--fact", "o"],
+            "databricks",
+            ["metric-views"],
+        ),
+        # Not for a command that reads no layer, and never from the connector name.
+        (["explore", "inventory"], "databricks", []),
+        (["explore", "map"], "databricks", []),
+        (["maintain", "grain"], "dbt", []),
+    ],
+)
+def test_the_metric_views_extra_follows_the_configured_vendor(
+    wrapper, argv, vendor, expected
+):
+    assert wrapper._feature_extras(argv, vendor) == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "vendor", "expected"),
+    [
+        (
+            ["explore", "semantic", "list"],
+            "snowflake",
+            ["ossie", "semantic-views", "semantic-api"],
+        ),
+        # A Semantic View query is a `SEMANTIC_VIEW()` clause Snowflake runs:
+        # MetricFlow is never installed.
+        (
+            ["explore", "semantic", "query", "sales.orders.revenue"],
+            "snowflake",
+            ["ossie", "semantic-views", "semantic-api"],
+        ),
+        (["maintain", "grain"], "snowflake", ["semantic-views"]),
+        (
+            ["explore", "relationships", "--use-project"],
+            "snowflake",
+            ["semantic-views"],
+        ),
+        (["transform", "apply"], "snowflake", ["semantic-views"]),
+        # Authoring validates with the reader's port of the rules (#1292), so it
+        # takes the extra whatever the configured vendor says.
+        (["semantic", "snowflake", "define"], "snowflake", ["semantic-views"]),
+        (["semantic", "snowflake", "plan"], None, ["semantic-views"]),
+        # Not for a command that reads no layer, and never from the connector
+        # name: `connector: snowflake` with `vendor: dbt` takes nothing here.
+        (["explore", "inventory"], "snowflake", []),
+        (["explore", "map"], "snowflake", []),
+        (["maintain", "grain"], "dbt", []),
+    ],
+)
+def test_the_semantic_views_extra_follows_the_configured_vendor(
+    wrapper, argv, vendor, expected
+):
     assert wrapper._feature_extras(argv, vendor) == expected
 
 

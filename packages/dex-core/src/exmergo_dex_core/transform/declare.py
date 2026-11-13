@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .. import model_scope
 from .. import model_versions as mv
 from . import declarations as declarations_mod
 from .declarations import Declaration, DeclarationError
@@ -87,11 +88,11 @@ def select_models(
 ) -> Selection:
     """The models ``objects`` names, the way ``maintain verify`` reads them.
 
-    Model names, repeatable and comma-separated, case-insensitive; none at all
-    selects every model. Read from the repository alone, so no compile is
-    needed. Unlike ``verify``, a name that matches nothing is reported rather
-    than dropped: a declaration that silently did not happen reads like one that
-    did.
+    Model names, repeatable and comma-separated, or in one quoted argument
+    separated by spaces, case-insensitive; none at all selects every model. Read
+    from the repository alone, so no compile is needed. Unlike ``verify``, a name
+    that matches nothing is reported rather than dropped: a declaration that
+    silently did not happen reads like one that did.
     """
 
     files = {path: source.content for path, source in view.files.items()}
@@ -99,9 +100,7 @@ def select_models(
     vmap = mv.cached_version_map(files, view.model_paths)
     by_name = {Path(path).stem.lower(): Path(path).stem for path in sql}
 
-    wanted = [
-        name.strip() for raw in objects or [] for name in raw.split(",") if name.strip()
-    ]
+    wanted = model_scope.model_names(objects)
     selection = Selection()
     names: list[str] = []
     if not wanted:

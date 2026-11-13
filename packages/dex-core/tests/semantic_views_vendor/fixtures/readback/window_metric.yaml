@@ -1,0 +1,28 @@
+name: WINDOW_METRIC
+tables:
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    facts:
+      - name: TOTAL_PRICE
+        expr: o_totalprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: REVENUE
+        expr: SUM(orders.total_price)
+        access_modifier: public_access
+      - name: REVENUE_7D_AVG
+        description: Seven-day trailing average of daily revenue.
+        expr: AVG(orders.revenue) OVER (PARTITION BY EXCLUDING orders.order_date ORDER BY orders.order_date RANGE BETWEEN INTERVAL '6 days' PRECEDING AND CURRENT ROW)
+        access_modifier: public_access
+    time_dimensions:
+      - name: ORDER_DATE
+        expr: o_orderdate
+        data_type: DATE
+        access_modifier: public_access

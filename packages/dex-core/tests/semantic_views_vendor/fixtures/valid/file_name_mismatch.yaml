@@ -1,0 +1,13 @@
+# warns: file_name
+# The view is named by its `name`, not its file: a stem that disagrees warns.
+name: orders_by_status
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - name: order_status
+        expr: o_orderstatus
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

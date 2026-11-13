@@ -30,9 +30,10 @@ the cap of 200 occurrences and 50 files; without it the answer can stop short
 with no file named. Read `data.completeness` and `data.limits`: `incomplete`
 means some files could not be read, so the list may be short. Resolve each entry
 under `data.indeterminate` by reading its line, since it may or may not name
-what you asked about. Dex re-checks the models from compiled SQL in step 3; it
-does not re-check tests or semantic definitions, so the search is what finds
-those.
+what you asked about. Dex re-checks the models from compiled SQL in step 3, and
+the tests and semantic definitions over a producer's governed column from the
+same index, so a test or a dimension the search turns up belongs in the payload
+too.
 
 ## 2. Write the gated edits, with a `toggle` contract
 
@@ -73,12 +74,23 @@ dex transform plan "hide fee columns behind enable_fees" --edits-file payload.js
 Only `transform plan` takes `toggle`. Every other command refuses it rather than
 dropping it unread, and a payload cannot carry `toggle` and `retirement` together.
 
+A disabled model that reads the flag is edited through the same plan. dbt
+compiles no SQL for a disabled model, so Dex compiles it once more in the
+throwaway copy with an in-file `config(enabled=true)` to hold its SQL to the
+same read-only checks, and warns that it is not built. Do not edit it outside
+the plan.
+
 ## 3. Read `data.toggle`
 
 Dex compiles **every model of the project** in a throwaway copy three times: the
 proposal at `on_value`, the proposal at `off_value`, and the tree before the plan
 at `on_value`. The checks read compiled SQL and never probe a table's rows, so an
-empty table is judged like a full one. Compiling can still query the warehouse
+empty table is judged like a full one. Compiled SQL is the judge: a select list
+or a `group by` count gated with `{% if var(...) %}` is plain SQL once compiled,
+so a model whose source text the reference scan cannot parse is still judged at
+both values, and that scan's "could not parse the SQL for columns" is not a
+limit here. A `*` over another model, a seed or a profiled source is resolved
+from that relation in the same compile. Compiling can still query the warehouse
 where a macro does (`run_query` and other introspective macros), which a
 metered connector bills.
 `models[]` lists each producer and each model with a problem, with its columns on
@@ -93,14 +105,31 @@ outputs a governed column with the flag on.
 | `governed_column_lost_when_on` | With the flag on, the model no longer outputs a governed column it outputs today | The on branch must keep today's behavior |
 | `ungoverned_column_lost` | A column the toggle does not govern is gone on either value | Keep it, or add it to `columns` |
 | `ungoverned_columns_differ` | The two values output different non-governed columns | Same as above |
-| `branch_compile_failed` | The project does not compile at one value (for example, a dangling ref) | Fix that branch |
+| `branch_compile_failed` | The model does not compile at one value (for example, a dangling ref). Recorded on that model alone; the rest of the project is still judged | Fix that branch |
+| `governed_column_tested_when_off` | A test on a producer's governed column (a column test, a model-level test naming it, a `relationships` test pointing at it) still runs with the flag off, so the off build fails it. The check names its `path`, `line`, `column` and `test` | Disable it at the off value, with an `enabled` config true at `on_value` alone: `"{{ var('enable_fees') }}"` for an on value of `true`, `"{{ not var('disable_fees') }}"` for `false`, `"{{ var('fee_mode') == 'on' }}"` for a string. The warning names the one for this contract. That keeps the test on the on value; remove it only when the request asks for its removal |
+| `governed_column_in_semantic_layer` | A dimension, measure or entity is defined over a producer's governed column, so it stops resolving with the flag off. The check names its `path`, `line`, `kind`, `definition`, `semantic_model` and, for a measure, the `metrics` drawing on it. A metric that filters on a dimension or entity is not listed, so read the metrics' filters too | Change it and its metrics in the same payload, together with any metric (on any semantic model) whose filter names one of its dimensions or entities. Or disable the semantic model at the off value together with every metric on any of its measures, directly or through other metrics, and every metric filtering on its dimensions or entities: dbt refuses to parse an enabled metric over a disabled semantic model, so the off value fails with `branch_compile_failed`. Disabling also hides the model's measures the flag does not govern, so prefer changing the governed definitions alone when it carries others |
 
 `verdict: satisfied` needs every record satisfied **and** `completeness: complete`.
-`unchecked` is not clean. A record carries `reason_code` `unreadable_select` (a
-`*` over a source with no cached profile: run `dex explore profile` on it) or
-`compile_unavailable` (no dbt or no working dev profile). `limits` names what the
-reading could not cover, such as a `var()` whose name is not a literal, which may
-read this flag. `package_scope` names package models that read the flag; they are
+`unchecked` is not clean. A record carries a `reason_code`:
+
+| `reason_code` | Meaning | Next step |
+|---|---|---|
+| `unreadable_select` | A `*` over a source with no cached profile, or compiled SQL Dex cannot read | `dex explore profile` the source the reason names |
+| `compile_failed` | The model does not compile at either value. dbt stops at the first failing model, so Dex sets it aside and compiles the rest again | Fix the model |
+| `not_compiled` | A disabled model that reads the flag, itself or through a macro. dbt compiles no SQL for it, so it is named under `not_compiled` and the verdict is incomplete for it alone | Enable it to have it judged, or delete it if it is retired |
+| `compile_unavailable` | No dbt or no working dev profile, so nothing compiled | Fix the environment |
+
+Where the flag is read is reported beside the records:
+
+- `reads` lists every literal read, by file and line.
+- `macro_reads` lists each read inside a project macro, with the `models` whose compiled SQL calls that macro, directly or through another macro. Their output is judged with the rest.
+- `dynamic_reads` lists each `var()` whose name is not a literal, with the model it sits in (or, in a macro, the models calling it). The compile gives the flag its value wherever it is read, so a dynamic read is already inside the compiled SQL that is judged. It is listed so you can confirm it, and does not limit the verdict.
+
+`limits` names what the reading could not cover: the disabled models above, the
+tree before the plan failing to compile, a reference-index limit other than a
+column parse, a computed semantic `expr` over a producer that the index cannot
+resolve to a column, or a test naming a governed column that dbt compiled into
+no test node. `package_scope` names package models that read the flag; they are
 reported and never judged.
 
 Correct the payload and plan again until the verdict is `satisfied`.
@@ -150,7 +179,13 @@ through a reviewed plan that carries the same `toggle`, then build again with
 ## What this does not establish
 
 - The values in the on branch: `transform compare` does that, at `on_value`.
-- Package models, or a dynamic `var()` read: named under `package_scope` and
-  `limits`, never judged.
-- A metric or semantic definition over a governed column: run
-  `dex transform references <column>` and change it in the same payload.
+- Package models: named under `package_scope`, never judged.
+- A disabled model: named under `not_compiled` until it is enabled.
+- A semantic definition whose `expr` is computed (`fee_amount * 2`): it is
+  listed under `limits` with its file and line, not judged. Read it, and change
+  it in the same payload if it reads a governed column. The limit stays even when
+  it reads none, so the verdict stays `unchecked`: keep that incomplete verdict
+  and say why, or move the expression into a model column and point `expr` at
+  that column, which the compiled SQL then judges.
+- Tests and semantic definitions in installed packages, and singular tests
+  under `tests/`.

@@ -40,6 +40,7 @@
             "group": "CLI",
             "pages": [
               "cli/overview",
+              "cli/init",
               "cli/connect",
               "cli/explore",
               "cli/transform",
@@ -47,7 +48,8 @@
               "cli/maintain",
               "cli/config",
               "cli/demo",
-              "cli/procedure"
+              "cli/procedure",
+              "cli/feedback"
             ]
           },
           {
@@ -84,7 +86,9 @@
             "pages": [
               "semantic-layers/overview",
               "semantic-layers/ossie",
-              "semantic-layers/cube"
+              "semantic-layers/cube",
+              "semantic-layers/databricks-metric-views",
+              "semantic-layers/snowflake-semantic-views"
             ]
           },
           {

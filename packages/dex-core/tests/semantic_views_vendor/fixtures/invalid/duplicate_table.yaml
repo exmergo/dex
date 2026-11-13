@@ -1,0 +1,13 @@
+# expect: duplicate_name
+# Two logical tables with one name.
+name: duplicate_table
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}

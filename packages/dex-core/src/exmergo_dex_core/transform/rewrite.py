@@ -32,6 +32,7 @@ something to take on trust.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,10 +40,17 @@ import sqlglot
 import yaml
 from sqlglot import expressions as exp
 
+from .. import model_versions as mv
 from ..dbt_project import jinja_regions, metric_inputs, physical_column
 from ..errors import DexError
 from ..references import blank_jinja
-from ..yaml_spans import before_trailing_blanks, block_end, indent_of
+from ..yaml_items import dump_items
+from ..yaml_spans import (
+    before_trailing_blanks,
+    block_end,
+    indent_of,
+    sequence_item_span,
+)
 
 
 class RewriteError(DexError):
@@ -696,9 +704,17 @@ class YamlName:
     kind: str
     span: tuple[int, int]
     owner: str | None = None
+    #: Inside a versioned model's entry, the versions this name applies to, as
+    #: :attr:`~..references.Reference.versions` has them (#1126).
+    versions: list[str] | None = None
+    #: The version whose ``versions:`` item this is written under, or ``None``
+    #: at the model's top level.
+    version: str | None = None
 
 
-def yaml_names(content: str) -> list[YamlName]:
+def yaml_names(
+    content: str, versioned: Mapping[str, mv.VersionedModel] | None = None
+) -> list[YamlName]:
     """Every structural position in one YAML file that names something.
 
     A structural walk, not a text scan, which is the point: a column's
@@ -706,6 +722,10 @@ def yaml_names(content: str) -> list[YamlName]:
     rewritten, while a name buried in a test's arguments must be. Mirrors what
     :class:`~..references.ReferenceIndex` reads, so the two cannot drift into
     disagreeing about what a file declares.
+
+    ``versioned`` is the project's versioned models, which places a semantic
+    model's columns in the version its ``ref()`` resolves to. A model's own
+    versions are read from its entry and need nothing passed.
     """
 
     try:
@@ -726,7 +746,7 @@ def yaml_names(content: str) -> list[YamlName]:
                 _walk_source_entry(entry, found)
         elif key == "semantic_models":
             for entry in _sequence(node):
-                _walk_semantic_model(entry, found)
+                _walk_semantic_model(entry, found, versioned or {})
         elif key == "metrics":
             for entry in _sequence(node):
                 _walk_metric(entry, found)
@@ -743,6 +763,18 @@ def yaml_names(content: str) -> list[YamlName]:
 def _walk_node_entry(entry: Any, found: list[YamlName]) -> None:
     fields = dict(_mapping(entry))
     owner = _scalar_value(fields.get("name"))
+    parsed = _construct(entry)
+    if owner and isinstance(parsed, dict) and mv.version_items(parsed):
+        found.append(
+            YamlName(
+                name=owner,
+                form="yaml_model_entry",
+                kind="model",
+                span=_span(fields["name"]),
+            )
+        )
+        _walk_versioned_entry(parsed, fields, found, owner)
+        return
     if "name" in fields:
         found.append(
             YamlName(
@@ -793,25 +825,111 @@ def _walk_source_entry(entry: Any, found: list[YamlName]) -> None:
 
 
 def _walk_columns(
-    fields: dict[str, Any], found: list[YamlName], owner: str | None
+    fields: dict[str, Any],
+    found: list[YamlName],
+    owner: str | None,
+    versions: Any = None,
+    version: str | None = None,
 ) -> None:
     for column in _sequence(fields.get("columns")):
         column_fields = dict(_mapping(column))
         name_node = column_fields.get("name")
         if name_node is None:
             continue
+        name = _scalar_value(name_node) or ""
+        reached = versions(name) if versions is not None else None
         found.append(
             YamlName(
-                name=_scalar_value(name_node) or "",
+                name=name,
                 form="yaml_column",
                 kind="column",
                 span=_span(name_node),
                 owner=owner,
+                versions=reached,
+                version=version,
             )
         )
         for key in ("tests", "data_tests"):
             for test in _sequence(column_fields.get(key)):
-                _walk_test(test, found, owner)
+                _walk_test(test, found, owner, reached, version)
+
+
+def _walk_versioned_entry(
+    parsed: dict[str, Any], fields: dict[str, Any], found: list[YamlName], owner: str
+) -> None:
+    """A versioned model's columns, each placed in the versions it applies to.
+
+    Mirrors ``ReferenceIndex._scan_versioned_entry``: a top-level column entry
+    applies to every version that inherits it, a version's own entries and tests
+    to that version, and a name in an ``include`` or ``exclude`` list to the
+    versions the top-level entry of that name reaches (#1126).
+    """
+
+    _walk_columns(fields, found, owner, lambda c: mv.column_versions(parsed, c))
+    shared = mv.versions_inheriting_tests(parsed)
+    for key in ("tests", "data_tests"):
+        for test in _sequence(fields.get(key)):
+            _walk_test(test, found, owner, shared)
+    for item in _sequence(fields.get("versions")):
+        label = _version_label(owner, item)
+        if label is None:
+            continue
+        item_fields = dict(_mapping(item))
+        element = _include_element(item_fields.get("columns"))
+        for key, form in (
+            ("include", "yaml_version_include"),
+            ("exclude", "yaml_version_exclude"),
+        ):
+            listed = dict(_mapping(element)).get(key) if element is not None else None
+            found.extend(
+                YamlName(
+                    name=node.value,
+                    form=form,
+                    kind="column",
+                    span=_span(node),
+                    owner=owner,
+                    versions=mv.column_versions(parsed, node.value),
+                    version=label,
+                )
+                for node in _sequence(listed)
+                if isinstance(node, yaml.ScalarNode)
+            )
+        _walk_columns(item_fields, found, owner, lambda _c, lb=label: [lb], label)
+        for key in ("tests", "data_tests"):
+            for test in _sequence(item_fields.get(key)):
+                _walk_test(test, found, owner, [label], label)
+
+
+def _construct(node: Any) -> Any:
+    """The Python value of one composed node, as ``yaml.safe_load`` reads it."""
+
+    if node is None:
+        return None
+    loader = yaml.SafeLoader("")
+    try:
+        return loader.construct_document(node)
+    except yaml.YAMLError:
+        return None
+    finally:
+        loader.dispose()
+
+
+def _version_label(base: str, item: Any) -> str | None:
+    """``base.v<v>`` for one ``versions:`` item node, or ``None``."""
+
+    parsed = _construct(item)
+    if not isinstance(parsed, dict) or "v" not in parsed:
+        return None
+    return f"{base}.v{mv.version_text(parsed['v'])}"
+
+
+def _include_element(columns: Any) -> Any:
+    """The ``include``/``exclude`` element of a version's ``columns:``."""
+
+    return next(
+        (node for node in _sequence(columns) if "include" in dict(_mapping(node))),
+        None,
+    )
 
 
 #: Test argument keys whose value names a column. The same set
@@ -820,7 +938,13 @@ def _walk_columns(
 _COLUMN_ARG_KEYS = ("field", "column_name", "combination_of_columns", "compare_columns")
 
 
-def _walk_test(test: Any, found: list[YamlName], owner: str | None) -> None:
+def _walk_test(
+    test: Any,
+    found: list[YamlName],
+    owner: str | None,
+    versions: list[str] | None = None,
+    version: str | None = None,
+) -> None:
     if isinstance(test, yaml.ScalarNode):
         found.append(
             YamlName(
@@ -855,18 +979,30 @@ def _walk_test(test: Any, found: list[YamlName], owner: str | None) -> None:
                         kind="column",
                         span=_span(node),
                         owner=owner,
+                        versions=versions,
+                        version=version,
                     )
                     for node in carried
                     if isinstance(node, yaml.ScalarNode)
                 )
 
 
-def _walk_semantic_model(entry: Any, found: list[YamlName]) -> None:
+def _walk_semantic_model(
+    entry: Any, found: list[YamlName], versioned: Mapping[str, mv.VersionedModel]
+) -> None:
     fields = dict(_mapping(entry))
     model_node = fields.get("model")
     owner = None
+    versions = None
     if model_node is not None:
         owner = _relation_target(_scalar_value(model_node))
+        if owner is not None and "." not in owner:
+            label = mv.ref_target(
+                owner,
+                mv.written_ref_version(_scalar_value(model_node) or ""),
+                versioned,
+            )
+            versions = [label] if label else None
         if owner is not None:
             found.append(
                 YamlName(
@@ -904,6 +1040,7 @@ def _walk_semantic_model(entry: Any, found: list[YamlName]) -> None:
                         kind="column",
                         span=_span(expr_node),
                         owner=owner,
+                        versions=versions,
                     )
                 )
 
@@ -1034,15 +1171,23 @@ class YamlBlock:
     kind: str
     span: tuple[int, int]
     owner: str | None = None
+    #: As on :class:`YamlName`: the versions a column entry of a versioned
+    #: model applies to, and the version it is written under.
+    versions: list[str] | None = None
+    version: str | None = None
 
 
-def yaml_blocks(content: str) -> list[YamlBlock]:
+def yaml_blocks(content: str, *, versions: bool = False) -> list[YamlBlock]:
     """Every removable declaration in one YAML file, with its full span.
 
     The set a removal needs, and no more: a model, seed or snapshot entry, a
     column entry, a source table entry, a semantic definition, a metric, and a
     declared var. Anything else is either not removable on its own or is reached
     by removing one of these.
+
+    ``versions`` also returns the column entries a versioned model's versions
+    write under ``versions:`` (#1126), which only a caller that reads
+    :attr:`YamlBlock.version` can tell from the model's top-level columns.
     """
 
     try:
@@ -1067,7 +1212,23 @@ def yaml_blocks(content: str) -> list[YamlBlock]:
                             _entry_span(content, entry),
                         )
                     )
-                found.extend(_column_blocks(content, fields, name))
+                parsed = _construct(entry)
+                if not (name and isinstance(parsed, dict) and mv.version_items(parsed)):
+                    found.extend(_column_blocks(content, fields, name))
+                    continue
+                for block in _column_blocks(content, fields, name):
+                    block.versions = mv.column_versions(parsed, block.name)
+                    found.append(block)
+                if not versions:
+                    continue
+                for item in _sequence(fields.get("versions")):
+                    label = _version_label(name, item)
+                    if label is None:
+                        continue
+                    for block in _column_blocks(content, dict(_mapping(item)), name):
+                        block.versions = [label]
+                        block.version = label
+                        found.append(block)
         elif key == "sources":
             for entry in _sequence(node):
                 fields = dict(_mapping(entry))
@@ -1125,6 +1286,254 @@ def _column_blocks(
                 )
             )
     return blocks
+
+
+def stop_inheriting_column(
+    content: str, base: str, label: str, column: str, new: str | None
+) -> list[tuple[int, int, str]]:
+    """Splices that stop version ``label`` inheriting the top-level ``column``.
+
+    For a change to one version of a column every version shares through
+    ``include`` (#1126): the top-level entry stays for the others, and this
+    version drops it from its ``include`` list, or adds it to its ``exclude``
+    list, or gains an ``include: all`` element excluding it. With ``new`` the
+    version also declares its own entry, a copy of the top-level one under the
+    new name, so the rename carries its description, tests and meta.
+
+    Only block-style YAML is edited. A flow-style entry shares its lines with
+    what is not being changed, so it is refused rather than rewritten.
+    """
+
+    where = f"'{label}' in the YAML entry of '{base}'"
+    try:
+        root = yaml.compose(content)
+    except yaml.YAMLError as exc:
+        raise RewriteError(f"{where}: the YAML did not parse") from exc
+    entry = _model_entry(root, base)
+    if entry is None:
+        raise RewriteError(f"{where}: dex could not find the entry")
+    fields = dict(_mapping(entry))
+    item = next(
+        (
+            node
+            for node in _sequence(fields.get("versions"))
+            if _version_label(base, node) == label
+        ),
+        None,
+    )
+    top = next(
+        (
+            node
+            for node in _sequence(fields.get("columns"))
+            if _scalar_value(dict(_mapping(node)).get("name")) == column
+        ),
+        None,
+    )
+    if item is None or top is None:
+        raise RewriteError(f"{where}: dex could not find the version or the column")
+    for node in (entry, fields.get("versions"), item, fields.get("columns")):
+        if getattr(node, "flow_style", False):
+            raise RewriteError(
+                f"{where} is written in flow style, and dex only splices "
+                "block-style YAML. Make this edit by hand"
+            )
+    own = None
+    if new is not None:
+        copied = _construct(top)
+        own = {"name": new, **{k: v for k, v in copied.items() if k != "name"}}
+
+    edits: list[tuple[int, int, str]] = []
+    item_fields = dict(_mapping(item))
+    columns = item_fields.get("columns")
+    if columns is None:
+        line_start = content.rfind("\n", 0, item.start_mark.index) + 1
+        end = before_trailing_blanks(
+            content, block_end(content, line_start, indent_of(content, line_start))
+        )
+        block = {"columns": [{"include": "all", "exclude": [column]}]}
+        if own is not None:
+            block["columns"].append(own)
+        edits.append((end, end, dump_items(block, item.start_mark.column)))
+        return _merged(content, edits)
+    if (
+        not isinstance(columns, yaml.SequenceNode)
+        or columns.flow_style
+        or not columns.value
+    ):
+        raise RewriteError(
+            f"{where}: its `columns:` is not a block-style list, and dex only "
+            "splices block-style YAML. Make this edit by hand"
+        )
+    dash = _dash_indent(content, columns.value[0], where)
+    element = _include_element(columns)
+    if element is None:
+        first = content.rfind("\n", 0, columns.value[0].start_mark.index) + 1
+        edits.append(
+            (first, first, dump_items([{"include": "all", "exclude": [column]}], dash))
+        )
+    else:
+        edits.extend(_exclude_from(content, element, column, where))
+    if own is not None:
+        last = columns.value[-1]
+        line_start = content.rfind("\n", 0, last.start_mark.index) + 1
+        end = before_trailing_blanks(content, block_end(content, line_start, dash))
+        edits.append((end, end, dump_items([own], dash)))
+    return _merged(content, edits)
+
+
+#: The reference form of a name in a version's ``include`` or ``exclude`` list.
+_LIST_FORMS = {"include": "yaml_version_include", "exclude": "yaml_version_exclude"}
+
+
+def version_list_removals(
+    content: str, base: str, column: str
+) -> list[tuple[str, tuple[int, int, str]]]:
+    """``(form, splice)`` taking ``column`` out of every version's ``include``
+    and ``exclude`` lists, for a removal of the top-level entry they name."""
+
+    try:
+        root = yaml.compose(content)
+    except yaml.YAMLError:
+        return []
+    entry = _model_entry(root, base)
+    if entry is None:
+        return []
+    out = []
+    for item in _sequence(dict(_mapping(entry)).get("versions")):
+        element = _include_element(dict(_mapping(item)).get("columns"))
+        if element is None:
+            continue
+        for key, value in element.value:
+            if _scalar_value(key) not in _LIST_FORMS or not isinstance(
+                value, yaml.SequenceNode
+            ):
+                continue
+            target = next((n for n in value.value if _scalar_value(n) == column), None)
+            if target is not None:
+                out.append(
+                    (
+                        _LIST_FORMS[key.value],
+                        _list_item_removal(content, key, value, target, base),
+                    )
+                )
+    return out
+
+
+def _model_entry(root: Any, base: str) -> Any:
+    """The ``models:`` entry named ``base`` in a composed document, or ``None``."""
+
+    for key, node in _mapping(root):
+        if key != "models":
+            continue
+        for entry in _sequence(node):
+            if _scalar_value(dict(_mapping(entry)).get("name")) == base:
+                return entry
+    return None
+
+
+def _dash_indent(content: str, item: Any, where: str) -> int:
+    """The column of the dash that opens a block-sequence item."""
+
+    span = sequence_item_span(content, item.start_mark.index)
+    if span is None:
+        raise RewriteError(
+            f"{where}: a list item shares its line with another, and dex only "
+            "splices one item per line. Make this edit by hand"
+        )
+    return indent_of(content, span[0])
+
+
+def _exclude_from(
+    content: str, element: Any, column: str, where: str
+) -> list[tuple[int, int, str]]:
+    """Splices that make one ``include``/``exclude`` element drop ``column``."""
+
+    if element.flow_style:
+        raise RewriteError(
+            f"{where}: its `include` element is written in flow style, and dex "
+            "only splices block-style YAML. Make this edit by hand"
+        )
+    pairs = {_scalar_value(key): (key, value) for key, value in element.value}
+    include_key, include = pairs["include"]
+    if isinstance(include, yaml.SequenceNode):
+        target = next((n for n in include.value if _scalar_value(n) == column), None)
+        if target is None:
+            return []
+        return [_list_item_removal(content, include_key, include, target, where)]
+    if "exclude" not in pairs:
+        line_start = content.rfind("\n", 0, element.start_mark.index) + 1
+        end = before_trailing_blanks(
+            content, block_end(content, line_start, indent_of(content, line_start))
+        )
+        return [
+            (end, end, dump_items({"exclude": [column]}, element.start_mark.column))
+        ]
+    _key, exclude = pairs["exclude"]
+    if not isinstance(exclude, yaml.SequenceNode):
+        raise RewriteError(
+            f"{where}: its `exclude` is not a list. Make this edit by hand"
+        )
+    if exclude.flow_style:
+        close = exclude.end_mark.index - 1
+        if content[close] != "]":
+            raise RewriteError(f"{where}: dex could not read its `exclude` list")
+        return [(close, close, (", " if exclude.value else "") + column)]
+    last = exclude.value[-1]
+    line_start = content.rfind("\n", 0, last.start_mark.index) + 1
+    indent = indent_of(content, line_start)
+    end = before_trailing_blanks(content, block_end(content, line_start, indent))
+    return [(end, end, dump_items([column], indent))]
+
+
+def _list_item_removal(
+    content: str, key: Any, sequence: Any, item: Any, where: str
+) -> tuple[int, int, str]:
+    """The splice taking one scalar out of a list, leaving ``[]`` for the last."""
+
+    kept = [node for node in sequence.value if node is not item]
+    if sequence.flow_style:
+        text = ", ".join(
+            content[node.start_mark.index : node.end_mark.index] for node in kept
+        )
+        return (sequence.start_mark.index, sequence.end_mark.index, f"[{text}]")
+    span = sequence_item_span(content, item.start_mark.index)
+    if span is None:
+        raise RewriteError(
+            f"{where}: a list item shares its line with another, and dex only "
+            "splices one item per line. Make this edit by hand"
+        )
+    end = before_trailing_blanks(content, span[1])
+    if kept:
+        return (span[0], end, "")
+    newline = "\n" if content[end - 1 : end] == "\n" else ""
+    return (key.end_mark.index, end, ": []" + newline)
+
+
+def _merged(
+    content: str, edits: list[tuple[int, int, str]]
+) -> list[tuple[int, int, str]]:
+    """Insertions at one offset folded into one, in the order they were made.
+
+    ``splice`` applies equal offsets right to left, which would put the second
+    insertion ahead of the first. An inserted line is given the line break it
+    needs where it lands at the end of a file that has none.
+    """
+
+    out: list[tuple[int, int, str]] = []
+    inserted: dict[int, int] = {}
+    for start, end, text in edits:
+        if start != end:
+            out.append((start, end, text))
+            continue
+        if start in inserted:
+            position = inserted[start]
+            out[position] = (start, end, out[position][2] + text)
+            continue
+        if text.endswith("\n") and start and content[start - 1] != "\n":
+            text = "\n" + text
+        inserted[start] = len(out)
+        out.append((start, end, text))
+    return out
 
 
 def column_anchor(content: str, model: str) -> tuple[int, str] | None:

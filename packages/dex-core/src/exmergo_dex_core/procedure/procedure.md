@@ -1,5 +1,11 @@
 ## Procedure
 
+For project setup, run `dex init` (or `init` through an installed skill wrapper).
+It creates or adopts a project, installs managed README and agent instructions,
+and verifies the connection. It does not explore data or build models. Read its
+structured missing inputs and readiness before continuing; installing skills
+does not necessarily install a `dex` executable.
+
 Dex works in one loop: explore, transform, maintain. `dex <command>` below is
 the `dex` CLI; where it is not installed, run the same command through the
 skill's `scripts/run.py` wrapper. Each command prints one JSON envelope: read
@@ -105,10 +111,24 @@ the project edits, migrations and dev builds described below.
    `equivalent` verdict) and an `incremental_replay` entry that is not
    `satisfied` (no passing unit test ran the `is_incremental()` branch) are
    unfinished work, not a passing build.
+   A model that declares no parent is measured against the one Dex drafts for
+   it (`data.declarations.<model>.drafted.population_parent` on the plan): each
+   `population_delta` record counts its orphan keys, missing parents and rows
+   whose child columns are all NULL or zero (a sign of a parent with no child,
+   not proof). `needs_decision` (listed under
+   `data.completion.obligations.needs_decision`) asks which rows the model is
+   for: declare `population.parent`, or record the population as an assumption
+   naming the key `column` at `request`, `contract` or `precedent` tier.
    Output keys the parent lacks are never the population: drive the model from
    the parent instead. Check the rows the request is about with an aggregate
    over the built model, `dex explore query --target dev "<SELECT ...>"`, which
-   reads the dev namespace for that one command.
+   reads the dev namespace for that one command. Observed counts describe the
+   data; they do not establish the intended population or NULL policy. NULL or
+   zero aggregates on a model driven from its parent point at the join key (its
+   type, its spelling, the relation it reads): investigate the join, and do not
+   re-drive the model from the child table. A change of driving relation or
+   parent is `redriven` in `data.change_scope`, settled only at `request` or
+   `contract` tier.
 6. **Maintain.** `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
@@ -127,8 +147,8 @@ implementation detail. Weigh evidence in this order, and never present a
    settle.
 3. `precedent`: how sibling models decide the same thing
    (`dex transform references <model.column> --usage`).
-4. `data`: what profiling showed about the data. Observed counts describe the
-   data; they do not establish the intended population or NULL policy.
+4. `data`: what profiling showed about the data (see step 5: counts never
+   establish the intended population).
 5. `default`: the conventional analytics-engineering choice.
 
 Name `request` or `contract` only when that source actually settles the choice;
@@ -138,6 +158,30 @@ reasonable population, record it as `default`, say why in one line of `detail`,
 and continue without asking for approval. "Include every account" and "only
 accounts with events" are each `request`, and a population the project already
 declares is `contract`.
+
+**Diagnose the value the request names.** A report that data is missing or a
+number is wrong is answered from the output the person reads. Finding the entity
+is one branch, not the verdict: when the row is there, the defect can be an
+attribute, a category membership or a derived measure. Bound what to check with
+the symptom, the model's definitions and its declared contract, rather than every
+column. For each field, follow the expression the model returns under that column
+name through the final select, its aliases and aggregations, to the filters,
+category mappings and joins it reads (the model SQL, and
+`dex transform references <model.column> --usage`). A correct intermediate
+formula proves nothing until the delivered column is shown to use it. Check the
+rows in question with an aggregate (`dex explore query`), and set the categories a
+predicate keeps beside the column's actual values (`dex explore profile`): a
+spelling outside the predicate is evidence to investigate. Only a mapping,
+contract or precedent that covers that value settles that it belongs; a
+resemblance of names is a `default` at most, and never outranks a mapping that
+leaves the value out or a contract that keeps unlisted values as sent, so such a
+value stays where it is and is reported as open. Report the
+field checked, its derivation, and the evidence of the defect or of what explains
+the symptom. Where the evidence does not settle it, say the question is
+unresolved and name what was not verified, rather than "nothing is wrong" or a
+question asked before investigating. A green build, or a model that selects the
+expected answer as a constant, is not that evidence. A defect found is repaired
+through transform.
 
 **Settle the scope before the repair.** Before changing a model that already
 exists, name what the request asks for: the outputs (each column and its visible
@@ -250,11 +294,19 @@ the checkable form where the model carries the column, and read
   `--cold-deps` proves a project repair survives a reinstall, not that the data
   changed.
 - Never edit installed packages (`dbt_packages/`) and never repair only in the
-  warehouse: a reinstall or a reload undoes both. When a prerequisite blocks a
-  deliverable, read `data.prerequisites` for its owner, its `plan_relation` and
-  the repairs dbt supports, make a supported one through a plan (an explicit
-  cast, never dropped rows), and prove it with `--cold-deps` on the build. With no
-  repair in scope the deliverable is incomplete: report the prerequisite and the
+  warehouse: a reinstall or a reload undoes both. A prerequisite that blocks the
+  request's own deliverables is part of the request, not scope creep: a
+  durable project-side repair is how the request completes. Each
+  `completion.blockers[]` entry's `next` names it. For a package model, run
+  `dex transform repair <node>...` (after `explore profile` on the input it
+  names; every failed package model in one call): it drafts the overrides as a
+  plan of their own, with the conversion read from
+  the error and the data, or left `unresolved` where they do not settle it.
+  Review it, relay each `meaning_changing` conversion as a decision, settle any
+  `unresolved` conversion (profile its input, draft again) before applying, then
+  apply it and build it with `--cold-deps`; never fold it into the deliverable's plan. Stop
+  only when the draft is refused or stays `unresolved` with nothing that settles
+  it: then the deliverable is incomplete, so report the prerequisite and the
   remedy tried. An override of a model its package documents takes the
   package's YAML entry, and dbt allows it no second one, so it carries no
   declaration: declare the models that read it. `dex transform deps` and the

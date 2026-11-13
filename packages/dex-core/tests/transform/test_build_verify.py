@@ -496,6 +496,49 @@ def test_a_time_spine_alone_is_a_note(tmp_path: Path):
     assert result.suppressed["row_population"] == generated
 
 
+def test_a_model_driven_off_the_time_spine_is_a_note_on_a_build(tmp_path: Path):
+    """#988: a build's sweep skips the spine-driven comparison with a note, no
+    row count and no row-population finding."""
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."metricflow_time_spine"',
+                "compiled_code": 'select date_day from "warehouse"."raw"."dates"',
+            },
+            "model.shop.fct_weekly": {
+                "name": "fct_weekly",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_weekly"',
+                "compiled_code": (
+                    "select s.date_day, o.id from "
+                    '"warehouse"."dbt_dev"."metricflow_time_spine" s '
+                    'cross join "warehouse"."raw"."orders" o'
+                ),
+            },
+        },
+        results=[{"unique_id": "model.shop.fct_weekly", "status": "success"}],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_weekly")],
+        counts={"warehouse.dbt_dev.fct_weekly": 10},
+    )
+    result = _sweep(tmp_path, _summary([_node("model.shop.fct_weekly")]), adapter)
+    note = (
+        "row population was not compared for fct_weekly (its driving parent "
+        "'metricflow_time_spine' is the project's time spine, which supplies "
+        "anchors rather than a population the model is expected to preserve)"
+    )
+    assert note in result.notes
+    assert note not in result.warnings
+    assert result.suppressed.get("row_population") == note
+    assert not [q for q in adapter.queries if "count(" in q.lower()], adapter.queries
+    assert not [f for f in result.findings if f.code in {"row_fanout", "row_loss"}]
+
+
 def test_a_model_whose_final_cte_is_a_union_is_suppressed_with_reason(tmp_path: Path):
     sql = (
         "with named as (select 1 as id), "
@@ -779,6 +822,53 @@ def test_a_cold_dev_target_degrades_to_a_note_rather_than_failing(tmp_path: Path
     assert len(notes) == 1
     assert "could not price this build's verification upfront" in notes[0]
     assert "priced again after the build" in notes[0]
+
+
+def test_bigquery_cold_target_pricing_warning_is_single_line_without_url(
+    tmp_path: Path,
+):
+    """bigquery cold target pricing warning is one line naming the relation.
+
+    when bigquery upfront preflight hits notfound for an unbuilt relation,
+    the warning is reported in one line naming the relation without leaking
+    the request url or job id (issue #1209).
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.adapters.base import warehouse_refusal
+    from exmergo_dex_core.adapters.bigquery import _api_error_message
+    from exmergo_dex_core.errors import StatementStage
+    from exmergo_dex_core.transform.verify import price_verification
+
+    _priceable_manifest(tmp_path, materialized="view")
+    raw_404 = (
+        "404 POST https://bigquery.googleapis.com/bigquery/v2/projects/test-proj/"
+        "jobs?prettyPrint=false: Not found: Table test-proj:dbt_dev.fct_orders "
+        "was not found in location US\n\nLocation: None\nJob ID: fake-job-1234"
+    )
+
+    class _BigQueryEstimator:
+        """fake estimator translating bigquery notfound via warehouse_refusal."""
+
+        dialect = "bigquery"
+
+        def query_estimate(self, sql: str) -> float:
+            """dry-run estimator that raises translated notfound."""
+            exc = api_exceptions.NotFound(raw_404)
+            raise warehouse_refusal(_api_error_message(exc), stage=StatementStage.PLAN)
+
+    price, notes = price_verification(
+        _BigQueryEstimator(), tmp_path, scope={"model.p.fct_orders"}
+    )
+    assert price == 0.0
+    assert len(notes) == 1
+    (warning,) = notes
+    assert "https://" not in warning
+    assert "Job ID" not in warning
+    assert "\n" not in warning
+    assert "test-proj:dbt_dev.fct_orders" in warning
+    assert "could not price this build's verification upfront" in warning
 
 
 def test_a_connector_with_no_dry_run_prices_nothing_and_says_nothing(tmp_path: Path):

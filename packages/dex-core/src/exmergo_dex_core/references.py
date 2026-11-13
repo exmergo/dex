@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import yaml
 from pydantic import BaseModel, Field
 
+from . import model_versions as mv
 from .dbt_project import (
     DbtProjectView,
     JinjaCall,
@@ -124,6 +125,13 @@ class Reference(BaseModel):
     #: is invisible to this index, so a caller concluding that a name does not
     #: exist has to know it was qualified. Recorded only when it is a literal.
     qualifier: str | None = None
+    #: The versions of a versioned model this occurrence belongs to, as labels
+    #: (`dim_teams.v2`), where dex can tell (#1126). A version's file belongs to
+    #: its own version, a `ref('dim_teams')` to the version it resolves to, and a
+    #: column entry under the model's top-level `columns:` to every version that
+    #: inherits it through `include`. ``None`` where no versioned model is
+    #: involved.
+    versions: list[str] | None = None
 
 
 class ReferenceIndex:
@@ -171,6 +179,21 @@ class ReferenceIndex:
         #: It bounds column references only: a ``var()``, ``ref()`` or macro
         #: call is found by the Jinja scan, which read these files (#1172).
         self.column_unread: list[str] = []
+        #: This project's versioned models by base name, and what joins a
+        #: version to the rest of the graph (#1126). No file is named after a
+        #: versioned model's base name, so `ref('dim_teams')` reaches a node
+        #: only through the version it resolves to: `dim_teams_v2.sql` for the
+        #: latest one, or the version a `v=` pins.
+        self.versions: dict[str, mv.VersionedModel] = {}
+        #: Version label -> the node (file stem) that builds it.
+        self._version_stems: dict[str, str] = {}
+        #: Version file -> its label.
+        self._version_files: dict[str, str] = {}
+        #: Node -> the version labels its `ref()` calls resolve to.
+        self._version_refs: dict[str, set[str]] = defaultdict(set)
+        #: Versioned base name -> each `path:line` whose `ref()` pins a version
+        #: with an expression dex cannot read (`v=var('x')`).
+        self._unread_pins: dict[str, list[str]] = defaultdict(list)
 
         self._scan(view, package=None)
         if scan_packages:
@@ -192,11 +215,13 @@ class ReferenceIndex:
         kinds = [kind for kind in KINDS if self._by_name.get((kind, name))]
         if kinds or not self._is_qualified(name):
             return kinds
+        if self._version_label_hits(name) is not None:
+            return ["model"]
         # A dotted name is a source (`raw.orders`) as often as it is a qualified
         # column (`stg_orders.order_id`). The name as written wins; the column
         # reading is the fallback, so `raw.orders` is never answered as a column
         # called `orders` that happens to exist somewhere else.
-        column = name.split(".", 1)[1]
+        column = self.split_column(name)[1]
         return ["column"] if self._by_name.get(("column", column)) else []
 
     def references_to(self, name: str, kind: str) -> tuple[list[Reference], list[str]]:
@@ -211,9 +236,13 @@ class ReferenceIndex:
         """
 
         if kind != "column":
-            return list(self._by_name.get((kind, name), [])), self._python_query_limits(
-                kind
-            )
+            hits = list(self._by_name.get((kind, name), []))
+            limits = self._python_query_limits(kind)
+            label = self._version_label_hits(name) if kind == "model" else None
+            if label is not None:
+                hits, extra = label
+                limits = [*limits, *extra]
+            return hits, limits
 
         query_limits = (
             [
@@ -227,26 +256,204 @@ class ReferenceIndex:
         if not self._is_qualified(name):
             return list(self._by_name.get(("column", name), [])), query_limits
 
-        model, _, column = name.partition(".")
+        model, column = self.split_column(name)
         hits = list(self._by_name.get(("column", column), []))
-        if not self._by_name.get(("model", model)) and model not in self._model_refs:
+        selection = self.version_selection(model)
+        if selection is not None:
+            versioned, labels = selection
+            if not labels:
+                return hits, [
+                    *query_limits,
+                    f"'{versioned.base}' has no version '{model.partition('.')[2]}' "
+                    f"(its versions are {', '.join(versioned.labels)}), so "
+                    f"'{name}' was matched by column name alone",
+                ]
+            roots = self.version_nodes(labels)
+        elif not self._by_name.get(("model", model)) and model not in self._model_refs:
             return hits, [
                 *query_limits,
                 f"'{model}' is not a model in this project, so '{name}' was "
                 "matched by column name alone",
             ]
+        else:
+            roots = {model}
+        attributed, reached = self._attribute(hits, roots)
+        return attributed, [*query_limits, *self.version_pin_limits(reached)]
 
-        lineage = self.descendants_of(model)
-        return [
-            hit.model_copy(
-                update={
-                    "note": "lineage_resolved"
-                    if (hit.owner or node_name(hit.path)) in lineage
-                    else "same_name_elsewhere"
-                }
+    def _version_label_hits(
+        self, name: str
+    ) -> tuple[list[Reference], list[str]] | None:
+        """Where a version label (``dim_teams.v2``) is used as a model: the file
+        that builds it and the ``ref()`` calls that resolve to it. ``None`` where
+        ``name`` labels no version this project declares."""
+
+        base, v = mv.split_label(name)
+        model = mv.lookup(self.versions, base) if v is not None else None
+        found = model.version(v) if model is not None and v is not None else None
+        if model is None or found is None:
+            return None
+        hits = [
+            reference
+            for reference in self._by_name.get(("model", model.base), [])
+            if reference.versions == [found.label]
+        ]
+        for node in self.version_nodes([found.label]):
+            hits.extend(
+                reference
+                for reference in self._by_name.get(("model", node), [])
+                if reference.form == "definition"
             )
-            for hit in hits
-        ], query_limits
+        return hits, self.version_pin_limits({found.label})
+
+    def version_pin_limits(self, labels: set[str]) -> list[str]:
+        """A limit for each ``ref()`` that pins a version of a model these
+        versions belong to with an expression dex cannot read: it may read any
+        of them, so no answer about one version is complete."""
+
+        bases = sorted({mv.split_label(label)[0] for label in labels})
+        return [
+            f"{where}: a `ref()` to '{base}' pins its version with an expression "
+            "dex cannot read, so dex cannot tell which version it reads"
+            for base in bases
+            for where in self._unread_pins.get(base, [])
+        ]
+
+    def _attribute(
+        self, hits: list[Reference], roots: set[str]
+    ) -> tuple[list[Reference], set[str]]:
+        """Each column hit marked in or out of the lineage of ``roots``, and with
+        the versions it reaches the column through; and the versions in that
+        lineage.
+
+        A hit in a YAML entry of a versioned model is placed by the versions the
+        entry applies to, since the file it sits in builds none of them. Any
+        other hit is placed by the node it belongs to, and attributed to each
+        version in the lineage whose own lineage reaches that node.
+        """
+
+        lineage = self.column_lineage(roots)
+        reached = {
+            label: self.column_lineage({stem})
+            for label, stem in self._version_stems.items()
+            if stem in lineage
+        }
+        out = []
+        for hit in hits:
+            if hit.versions is not None and hit.form != "select_column":
+                attributed = [label for label in hit.versions if label in reached]
+                inside = bool(attributed)
+            else:
+                owner = hit.owner or node_name(hit.path)
+                inside = owner in lineage
+                attributed = sorted(
+                    label for label, nodes in reached.items() if owner in nodes
+                )
+            update: dict[str, Any] = {
+                "note": "lineage_resolved" if inside else "same_name_elsewhere"
+            }
+            if attributed:
+                update["versions"] = attributed
+            out.append(hit.model_copy(update=update))
+        return out, set(reached)
+
+    def split_column(self, name: str) -> tuple[str, str]:
+        """``model.column`` as ``(model, column)``, reading ``dim_teams.v2.x`` as
+        version ``dim_teams.v2``'s column ``x`` where ``dim_teams`` is versioned.
+        """
+
+        first, _, rest = name.partition(".")
+        model = mv.lookup(self.versions, first)
+        if model is not None:
+            # Longest first, so `dim_teams.v1.5.x` is version 1.5's column.
+            for label in sorted(model.labels, key=len, reverse=True):
+                written = f"{first}.{label.partition('.')[2]}."
+                if name.startswith(written):
+                    return written[:-1], name[len(written) :]
+        label, dot, column = rest.partition(".")
+        if (
+            dot
+            and model is not None
+            and mv.split_label(f"{first}.{label}")[1] is not None
+        ):
+            return f"{first}.{label}", column
+        return first, rest
+
+    def version_selection(
+        self, node: str
+    ) -> tuple[mv.VersionedModel, list[str]] | None:
+        """The versioned model ``node`` names and the versions it selects.
+
+        A base name (``dim_teams``) selects every version and a label
+        (``dim_teams.v2``) that one, as ``--select`` does; an unknown version
+        selects none. ``None`` where ``node`` names no versioned model, including
+        a version's own file stem, which is an ordinary node of the graph.
+        """
+
+        base, v = mv.split_label(node)
+        model = mv.lookup(self.versions, base)
+        if model is None:
+            return None
+        if v is None:
+            return model, model.labels
+        found = model.version(v)
+        return model, [found.label] if found else []
+
+    def version_nodes(self, labels: list[str]) -> set[str]:
+        """The nodes (file stems) that build these versions."""
+
+        return {
+            self._version_stems[label]
+            for label in labels
+            if label in self._version_stems
+        }
+
+    def column_lineage(self, nodes: set[str]) -> set[str]:
+        """``nodes`` and everything that reads them, transitively, across versions.
+
+        :meth:`descendants_of`, with each version joined to the models whose
+        ``ref()`` resolves to it (#1126): ``ref('dim_teams')`` reads the latest
+        version and ``ref('dim_teams', v=1)`` the first, while the base name
+        itself is no node. Without versioned models the two are the same walk.
+        """
+
+        consumers: dict[str, set[str]] = defaultdict(set)
+        for consumer, labels in self._version_refs.items():
+            for label in labels:
+                consumers[label].add(consumer)
+        labels_of: dict[str, set[str]] = defaultdict(set)
+        for label, stem in self._version_stems.items():
+            labels_of[stem].add(label)
+
+        reached = set(nodes)
+        pending = deque(reached)
+        while pending:
+            current = pending.popleft()
+            found: set[str] = set()
+            if current not in self.versions:
+                found.update(
+                    candidate
+                    for candidate, refs in self._model_refs.items()
+                    if current in refs
+                )
+            for label in labels_of.get(current, ()):
+                found.update(consumers.get(label, ()))
+            for candidate in found - reached:
+                reached.add(candidate)
+                pending.append(candidate)
+        return reached
+
+    def versions_named(self, name: str, kind: str) -> list[str] | None:
+        """The versions a ``model`` or qualified ``column`` query selects, or
+        ``None`` where it names no versioned model."""
+
+        if kind == "column":
+            if not self._is_qualified(name):
+                return None
+            name = self.split_column(name)[0]
+        elif kind != "model":
+            return None
+        selection = self.version_selection(name)
+        return selection[1] if selection is not None else None
 
     def references_from(
         self, paths: set[str] | frozenset[str]
@@ -415,6 +622,19 @@ class ReferenceIndex:
             for reference in self._declared.get((kind, name), ())
         )
 
+    def defined_nodes(self) -> list[str]:
+        """Every model, seed and snapshot name the project or an installed
+        package defines, sorted. A package node the project shadows is one
+        name, as it is one node dbt builds."""
+
+        names = set(self._node_kinds)
+        for kind, name in list(self._by_name) + list(self._declared):
+            if kind in ("model", "seed", "snapshot") and self.declarations_of(
+                name, (kind,)
+            ):
+                names.add(name)
+        return sorted(names)
+
     def package_node_kind(self, node: str) -> tuple[str, str] | None:
         """``(kind, package)`` for a node only an installed package defines.
 
@@ -503,6 +723,15 @@ class ReferenceIndex:
         }
         if package is None:
             self._node_kinds = dict(file_node_kinds)
+            self.versions = mv.version_map(
+                {raw: source.content for raw, source in view.files.items()},
+                view.model_paths,
+            )
+            for model in self.versions.values():
+                for item in model.versions:
+                    if item.file is not None and item.stem is not None:
+                        self._version_stems[item.label] = item.stem
+                        self._version_files[item.file] = item.label
         documents = yaml_documents(view)
         node_kinds = {
             **self._declared_node_kinds(documents),
@@ -623,9 +852,9 @@ class ReferenceIndex:
                 "source() calls were not read"
             )
             return
-        for callee, line, args in calls:
+        for callee, line, args, version in calls:
             self._record_python_relation(
-                callee, line, args, path, node_kinds, package=package
+                callee, line, args, path, node_kinds, package=package, version=version
             )
 
     def _record_python_relation(
@@ -637,6 +866,7 @@ class ReferenceIndex:
         node_kinds: dict[str, str],
         *,
         package: str | None,
+        version: str | None = None,
     ) -> None:
         """One ``dbt.ref`` or ``dbt.source`` call, recorded like a jinja call.
 
@@ -657,6 +887,9 @@ class ReferenceIndex:
                     resolution=RESOLVED if target else INDETERMINATE,
                     package=package,
                     qualifier=args[0] if target and len(args) > 1 else None,
+                    versions=self._ref_versions(
+                        path, line, target, version, package=package
+                    ),
                 )
             )
             if target:
@@ -704,7 +937,7 @@ class ReferenceIndex:
         *,
         package: str | None,
     ) -> None:
-        regions, _masked = jinja_regions(content)
+        regions, masked = jinja_regions(content)
         defined: set[int] = set()
         for region in regions:
             keyword = region.body.strip().lstrip("-").strip().split("(")[0].split()
@@ -731,7 +964,7 @@ class ReferenceIndex:
         for call in (c for region in regions for c in region.calls):
             if id(call) in defined:
                 continue
-            self._record_call(call, path, node_kinds, package=package)
+            self._record_call(call, path, node_kinds, package=package, text=masked)
 
         self._scan_columns(content, path, package=package)
 
@@ -742,6 +975,7 @@ class ReferenceIndex:
         node_kinds: dict[str, str],
         *,
         package: str | None,
+        text: str = "",
     ) -> None:
         if call.callee == "config":
             return
@@ -761,6 +995,13 @@ class ReferenceIndex:
                     resolution=RESOLVED if target else INDETERMINATE,
                     package=package,
                     qualifier=call.args[0] if target and len(call.args) > 1 else None,
+                    versions=self._ref_versions(
+                        path,
+                        call.line,
+                        target,
+                        _written_version(text, call),
+                        package=package,
+                    ),
                 )
             )
             if target:
@@ -814,6 +1055,36 @@ class ReferenceIndex:
             self._macro_args.extend(
                 (path, call.line, arg, node_name(path)) for arg in call.args if arg
             )
+
+    def _ref_versions(
+        self,
+        path: str,
+        line: int,
+        target: str | None,
+        version: str | None,
+        *,
+        package: str | None,
+    ) -> list[str] | None:
+        """The version a ``ref()`` to a versioned model resolves to, recorded as
+        an edge from the node ``path`` builds to that version (#1126).
+
+        A version pinned by an expression is no edge to any version, and it is
+        not the latest either: it is recorded so every question about that
+        model's versions names it as a limit.
+        """
+
+        if package is not None or not target:
+            return None
+        if version == mv.UNREAD_VERSION:
+            model = mv.lookup(self.versions, target)
+            if model is not None:
+                self._unread_pins[model.base].append(f"{path}:{line}")
+            return None
+        label = mv.ref_target(target, version, self.versions)
+        if label is None:
+            return None
+        self._version_refs[node_name(path)].add(label)
+        return [label]
 
     def _resolve_macro_args(self) -> None:
         """Literal macro arguments that name a column the project declares.
@@ -899,6 +1170,7 @@ class ReferenceIndex:
             tokens = sqlglot.tokenize(blanked)
         except Exception:
             return
+        version = self._version_files.get(path) if package is None else None
         for token in tokens:
             if token.text in columns:
                 self._record(
@@ -910,6 +1182,7 @@ class ReferenceIndex:
                         name=token.text,
                         package=package,
                         owner=node_name(path),
+                        versions=[version] if version else None,
                     )
                 )
 
@@ -1073,6 +1346,11 @@ class ReferenceIndex:
                     package=package,
                 )
             )
+            if mv.version_items(entry):
+                self._scan_versioned_entry(
+                    entry, name, path, lines, node_kinds, package=package
+                )
+                return
         self._scan_columns_block(
             entry,
             path,
@@ -1081,6 +1359,94 @@ class ReferenceIndex:
             package=package,
             owner=name if isinstance(name, str) else None,
         )
+
+    def _scan_versioned_entry(
+        self,
+        entry: dict[str, Any],
+        name: str,
+        path: str,
+        lines: _ScalarLines,
+        node_kinds: dict[str, str],
+        *,
+        package: str | None,
+    ) -> None:
+        """The columns of a versioned model's entry, each placed in its versions.
+
+        dbt builds each version's columns from the top-level ``columns:`` its
+        ``include``/``exclude`` admits plus its own entries under ``versions:``
+        (#1126). A top-level entry belongs to every version that inherits it, a
+        version's own entry and tests to that version, and a name in an
+        ``include`` or ``exclude`` list to the versions the top-level entry of
+        that name reaches, since that is what it selects. Every occurrence keeps
+        ``owner`` as the base name, which is what the YAML entry is called.
+        """
+
+        def record(column: str, form: str, versions: list[str]) -> None:
+            self._record(
+                Reference(
+                    path=path,
+                    line=lines.take(column),
+                    form=form,
+                    kind="column",
+                    name=column,
+                    package=package,
+                    owner=name,
+                    versions=versions,
+                )
+            )
+
+        def columns(block: list[dict[str, Any]], versions: Any) -> None:
+            for column in block:
+                column_name = column.get("name")
+                if not isinstance(column_name, str):
+                    continue
+                reached = versions(column_name)
+                record(column_name, "yaml_column", reached)
+                for test in _tests_of(column):
+                    self._scan_test(
+                        test,
+                        path,
+                        lines,
+                        node_kinds,
+                        package=package,
+                        owner=name,
+                        versions=reached,
+                    )
+
+        columns(_dicts(entry.get("columns")), lambda c: mv.column_versions(entry, c))
+        shared = mv.versions_inheriting_tests(entry)
+        for test in _tests_of(entry):
+            self._scan_test(
+                test,
+                path,
+                lines,
+                node_kinds,
+                package=package,
+                owner=name,
+                versions=shared,
+            )
+        for label, item in mv.version_items(entry):
+            include, exclude, _position = mv.include_exclude(item)
+            for form, listed in (
+                ("yaml_version_include", include if isinstance(include, list) else []),
+                ("yaml_version_exclude", exclude),
+            ):
+                for column_name in listed:
+                    if isinstance(column_name, str):
+                        record(
+                            column_name, form, mv.column_versions(entry, column_name)
+                        )
+            columns(mv.own_columns(item), lambda _c, label=label: [label])
+            for test in _tests_of(item):
+                self._scan_test(
+                    test,
+                    path,
+                    lines,
+                    node_kinds,
+                    package=package,
+                    owner=name,
+                    versions=[label],
+                )
 
     def _scan_source_entry(
         self,
@@ -1157,6 +1523,7 @@ class ReferenceIndex:
         *,
         package: str | None,
         owner: str | None = None,
+        versions: list[str] | None = None,
     ) -> None:
         """One declared test: the generic test it invokes and the names it passes.
 
@@ -1223,6 +1590,7 @@ class ReferenceIndex:
                             name=column,
                             package=package,
                             owner=owner,
+                            versions=versions,
                         )
                     )
 
@@ -1236,6 +1604,18 @@ class ReferenceIndex:
         package: str | None,
     ) -> None:
         target = _relation_from(entry.get("model"))
+        versions = None
+        if target is not None and "." not in target and package is None:
+            version = mv.written_ref_version(str(entry.get("model")))
+            label = mv.ref_target(target, version, self.versions)
+            versions = [label] if label else None
+            model = mv.lookup(self.versions, target)
+            if version == mv.UNREAD_VERSION and model is not None:
+                # A semantic model is no node, so its `ref()` is no edge; an
+                # unread pin is still one, and every version question names it.
+                self._unread_pins[model.base].append(
+                    f"{path}:{lines.peek(str(entry.get('model')))}"
+                )
         if target is not None:
             self._record(
                 Reference(
@@ -1245,6 +1625,7 @@ class ReferenceIndex:
                     kind="source" if "." in target else node_kinds.get(target, "model"),
                     name=target,
                     package=package,
+                    versions=versions,
                 )
             )
         for role, form in (
@@ -1285,6 +1666,7 @@ class ReferenceIndex:
                         package=package,
                         owner=target,
                         note=None if column else f"computed expr on '{name}'",
+                        versions=versions,
                     )
                 )
 
@@ -1533,22 +1915,23 @@ def _dicts(value: Any) -> list[dict[str, Any]]:
 
 def _python_relation_calls(
     content: str,
-) -> list[tuple[str, int, tuple[str | None, ...]]] | None:
+) -> list[tuple[str, int, tuple[str | None, ...], str | None]] | None:
     """``dbt.ref`` and ``dbt.source`` calls in one Python model.
 
     Each positional argument is the string literal dex read, or ``None`` when
     the argument is anything else. On ``dbt.ref``, ``v`` and ``version`` are
-    dbt's version selector and are ignored, so the model name stays the
-    positional argument. Any other keyword, including ``**kwargs``, leaves the
-    call unresolved. ``None`` for the whole list means the file did not parse,
-    which is a different fact from a file that parses and names nothing.
+    dbt's version selector: the model name stays the positional argument, and a
+    literal version is returned beside the arguments. Any other keyword,
+    including ``**kwargs``, leaves the call unresolved. ``None`` for the whole
+    list means the file did not parse, which is a different fact from a file
+    that parses and names nothing.
     """
 
     try:
         tree = ast.parse(content)
     except SyntaxError:
         return None
-    found: list[tuple[int, int, str, tuple[str | None, ...]]] = []
+    found: list[tuple[int, int, str, tuple[str | None, ...], str | None]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -1563,6 +1946,7 @@ def _python_relation_calls(
         versioned_ref = func.attr == "ref" and all(
             keyword.arg in {"v", "version"} for keyword in node.keywords
         )
+        version = None
         if node.keywords and not versioned_ref:
             args: tuple[str | None, ...] = (None,)
         else:
@@ -1572,9 +1956,39 @@ def _python_relation_calls(
                 else None
                 for arg in node.args
             )
-        found.append((node.lineno, node.col_offset, func.attr, args))
-    found.sort()
-    return [(callee, line, args) for line, _col, callee, args in found]
+            # Both `v` and `version` on one call is left unread: dbt lets
+            # `version` win, and dex does not reproduce that.
+            version = next(
+                (
+                    mv.version_text(keyword.value.value)
+                    if isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, (str, int, float))
+                    and not isinstance(keyword.value.value, bool)
+                    and len(node.keywords) == 1
+                    else mv.UNREAD_VERSION
+                    for keyword in node.keywords
+                ),
+                None,
+            )
+        found.append((node.lineno, node.col_offset, func.attr, args, version))
+    found.sort(key=lambda call: (call[0], call[1]))
+    return [
+        (callee, line, args, version) for line, _col, callee, args, version in found
+    ]
+
+
+def _written_version(text: str, call: JinjaCall) -> str | None:
+    """The version a jinja ``ref()`` call pins with ``v=`` or ``version=``.
+
+    Keyword arguments are not among a call's ``args``, so the call is read as
+    written, from its name to its closing parenthesis.
+    """
+
+    if call.callee != "ref" or call.callee_span is None or not text:
+        return None
+    start = call.callee_span[0]
+    close = text.find(")", start)
+    return mv.written_ref_version(text[start : close + 1 if close != -1 else None])
 
 
 def _relation_from(value: Any) -> str | None:
@@ -1721,12 +2135,14 @@ def find_references(
             limits.extend(query_limits)
             indeterminate.extend(index.indeterminate_for(one_kind))
             kept, elided_files, elided_hits, budget = _cap(hits, budget, full)
+            versions = index.versions_named(name, one_kind)
             targets.append(
                 {
                     "name": name,
                     "kind": one_kind,
                     "found": bool(hits),
                     "scope": _scope_of(name, one_kind),
+                    **({"versions": versions} if versions is not None else {}),
                     "occurrence_count": len(hits),
                     "files": kept,
                 }
@@ -1812,6 +2228,11 @@ def _cap(
                         "form": occurrence.form,
                         "resolution": occurrence.resolution,
                         "note": occurrence.note,
+                        **(
+                            {"versions": occurrence.versions}
+                            if occurrence.versions
+                            else {}
+                        ),
                     }
                     for occurrence in take
                 ],

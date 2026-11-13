@@ -218,6 +218,53 @@ statically with no Cube server. `list` reads the same shape as anywhere else:
   pre-aggregation means Cube would answer from a rollup table; query members it
   does not cover.
 
+## When the layer is Databricks Metric Views
+
+`vendor: databricks` means the layer is Metric View YAML files in the repository,
+read statically with no workspace connection. `list` reads the same shape as
+anywhere else:
+
+- **A view is named after its file.** `views/orders.yaml` is the view `orders`,
+  whatever it is deployed as in Unity Catalog. Tokens are `view.field` and
+  `view.measure`.
+- **A joined field has no `column`.** `customer.name` sits on the joined table,
+  named in `vendor_params.join`; that table is the one to profile. The view's own
+  `relation` is its `source`.
+- **There are no entities and no time grains.** Joins and `rely` keys reach
+  `explore map`, `relationships` and `profile` through `--use-project`. A field is
+  `time` only where its `format` says date. A time bucket is the field's own SQL.
+- **Read `vendor_params` before trusting a metric.** A window or `partition`
+  measure is listed as `derived` with its spec there, and is not modelled. The
+  view's `filter` is on every metric's `filter`.
+- **`query` and `values` refuse until #964.** Use `explore profile` and
+  `explore query` on the relations the catalog names.
+- **A `rely` key is a claim Databricks never checks.** A wrong one returns wrong
+  numbers silently, so `explore profile --use-project` and `maintain grain`
+  measure it; a duplicate there is a finding to report.
+
+## When the layer is Snowflake Semantic Views
+
+`vendor: snowflake` means the layer is Semantic View YAML files in the
+repository, read statically with no Snowflake connection. `list` reads the same
+shape as anywhere else:
+
+- **Every name carries its view.** A logical table is `view.table`, a member
+  `view.table.member`, a view-level metric `view.metric`. The part after the
+  view is what Snowflake's `SEMANTIC_VIEW(...)` clause takes.
+- **A fact is a dimension row that never groups.** `vendor_params.kind: fact`,
+  `groupable: false`: Snowflake queries facts on their own, never beside a
+  metric, so no metric lists one as groupable.
+- **Entities are real.** A primary key is an entity, and relationships are joins
+  with their arity; they reach `explore map`, `relationships` and `profile`
+  through `--use-project`. There are no time grains.
+- **Read `vendor_params` and `notes` before trusting a metric.** Window metrics,
+  `NON ADDITIVE BY`, `using_relationships` and ASOF or range relationships are
+  carried, not modelled. A private metric or fact is marked `access: private`.
+- **`sample_values` never reach you.** Only their count does: Snowflake does not
+  mask them.
+- **`query` and `values` refuse until #1290.** Use `explore profile` and
+  `explore query` on the relations the catalog names.
+
 ## When the layer is SLayer models
 
 `vendor: slayer` means the layer is SLayer model files in the repository. `list`,
@@ -248,6 +295,17 @@ read differently:
   Bucket time with `--grain month`, which applies to the model's
   `default_time_dimension` (its `time_axis` in `list`). Order only by a metric or
   a column you grouped by, with `-` for descending (`--order-by=-orders.revenue`).
+- **A list column groups by its elements, `model.column.value`.** A column
+  declared `type: ARRAY` is listed with `groupable: false` and its
+  `element_type`; its elements are the token to group by and to read with
+  `values` (`--group-by posts.tags.value`, `values posts.tags.value`). Each row
+  counts the parents holding that element, so a post with two tags counts under
+  both: the rows overlap and do not sum to the total, and the result says so.
+  Grouping by the whole list is refused, naming the `.value` token. Filter on
+  membership with `contains(tags, 'dbt')`, `contains_any(tags, ['dbt', 'sql'])`,
+  `contains_all(tags, [...])` or `tags.value = 'dbt'`. A list of PII is screened
+  as its column, so `email.value` is refused wherever `email` would be. Redshift
+  has no native lists, so a list column is refused there.
 - **`--where` is SLayer's filter syntax, not Jinja.** Write
   `--where "status = 'paid'"`, with columns read relative to the query's model;
   a dotted name (`customers.region = 'EU'`) walks a declared join. The gate

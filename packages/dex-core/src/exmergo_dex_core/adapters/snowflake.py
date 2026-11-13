@@ -1113,7 +1113,11 @@ class SnowflakeAdapter:
             # a db.schema allowlist keeps comfortably distant.
             by_table: dict[str, list[ColumnMeta]] = {}
             for row in self._show(f"SHOW COLUMNS {in_clause}"):
-                if _reserved(row):
+                # A semantic view's dimensions, facts and metrics are listed
+                # here too, with `kind` DIMENSION, FACT or METRIC; a semantic
+                # view is no relation to profile (a plain SELECT on one fails),
+                # and SHOW VIEWS leaves it out, so its members are kept out too.
+                if _reserved(row) or str(row.get("kind") or "COLUMN") != "COLUMN":
                     continue
                 identifier = self._identifier_of(row)
                 columns = by_table.setdefault(identifier, [])
@@ -1425,9 +1429,15 @@ class SnowflakeAdapter:
         return [] if rows else [f'dev_database "{database}"']
 
     def list_namespace_objects(self, database: str, schema: str) -> list[str]:
-        """Table and view names already in one schema. Free: SHOW only, no
-        warehouse. A schema (or database) that does not exist holds nothing to
-        collide with, so the ProgrammingError it raises reads as empty."""
+        """Table, view and semantic view names already in one schema. Free: SHOW
+        only, no warehouse. A schema (or database) that does not exist holds
+        nothing to collide with, so the ProgrammingError it raises reads as
+        empty.
+
+        Semantic views are listed here although the inventory leaves them out:
+        ``SHOW VIEWS`` does not return them, and a schema holding one is not
+        empty. An account that cannot list semantic views is read as holding
+        none, rather than the whole listing failing."""
 
         scope = f"{_quote_ident(database.upper())}.{_quote_ident(schema.upper())}"
         names: set[str] = set()
@@ -1437,6 +1447,11 @@ class SnowflakeAdapter:
             except self._sf_errors.ProgrammingError:
                 return []
             names.update(str(row["name"]) for row in rows)
+        try:
+            rows = self._show(f"SHOW SEMANTIC VIEWS IN SCHEMA {scope}")
+        except self._sf_errors.ProgrammingError:
+            rows = []
+        names.update(str(row["name"]) for row in rows)
         return sorted(names)
 
     def _scope_clause(self, scope: str) -> str:

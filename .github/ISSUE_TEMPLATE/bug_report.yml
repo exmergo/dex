@@ -1,14 +1,15 @@
 name: Bug report
-description: Report a defect in dex or the dex-core engine.
+description: Report a defect in dex or the dex-core engine. Reports drafted by an agent on a person's behalf are welcome.
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: >-
-        Thanks for filing a bug. Please do not paste credentials, connection
-        strings, or raw warehouse rows. dex sanitizes its own output; keep your
-        report sanitized too. For security issues, use the private channel in
-        SECURITY.md instead of this form.
+        Thanks for filing a bug. `dex feedback` prints the environment below and
+        a link that prefills this form. Please do not paste credentials,
+        connection strings, or raw warehouse rows. dex sanitizes its own output;
+        keep your report sanitized too. For security issues, use the private
+        channel in SECURITY.md instead of this form.
   - type: textarea
     id: what-happened
     attributes:
@@ -20,12 +21,19 @@ body:
     id: repro
     attributes:
       label: Steps to reproduce
+      description: The smallest steps that reproduce it. `dex demo` builds a public warehouse that often reproduces a defect without your data.
       placeholder: |
         1. ...
         2. ...
         3. ...
     validations:
       required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The dex command that misbehaved, without its arguments if they name your data.
+      placeholder: dex explore profile
   - type: dropdown
     id: connector
     attributes:
@@ -39,24 +47,59 @@ body:
         - PostgreSQL
         - Amazon Redshift
         - ClickHouse
+        - Trino
         - Not connector-specific
+    validations:
+      required: true
+  - type: dropdown
+    id: semantic-layer
+    attributes:
+      label: Semantic layer
+      description: Which semantic layer was involved, if any?
+      options:
+        - None or not involved
+        - dbt Semantic Layer (local)
+        - dbt Semantic Layer (hosted)
+        - Apache Ossie
+        - SLayer
+        - Cube
+        - Databricks Metric Views
+  - type: dropdown
+    id: how-run
+    attributes:
+      label: How you run dex
+      options:
+        - Claude Code skill or plugin
+        - Another agent (Codex, Cursor, Gemini, ...) via skills or AGENTS.md
+        - The dex CLI directly
+        - The Python library (DexEngine)
+    validations:
+      required: true
+  - type: dropdown
+    id: filed-by
+    attributes:
+      label: Filed by
+      options:
+        - A person
+        - An agent, on a person's behalf
     validations:
       required: true
   - type: input
     id: version
     attributes:
       label: dex-core version
-      description: The pinned `exmergo-dex-core` version, or the git commit if running from source.
+      description: The `exmergo-dex-core` version (`dex feedback` prints it), or the git commit if running from source.
     validations:
       required: true
   - type: textarea
     id: env
     attributes:
       label: Environment
-      description: OS, Python version, and how you invoked dex (Claude Code skill, AGENTS.md, or direct CLI).
+      description: Paste `data.environment` from `dex feedback`, or your OS and Python version.
+      render: text
   - type: textarea
     id: output
     attributes:
       label: Relevant output
-      description: The sanitized JSON envelope or error text. Redact anything sensitive.
+      description: The sanitized JSON envelope or error text. Read it before pasting, and redact anything you would not publish.
       render: shell

@@ -1,0 +1,9 @@
+# expect: metric_aggregate
+# A table metric adding an unaggregated row-level value to an aggregate.
+name: metric_unaggregated_read
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - {name: odd, expr: SUM(o_totalprice) + o_totalprice}

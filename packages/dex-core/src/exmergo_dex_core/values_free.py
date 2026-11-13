@@ -118,6 +118,8 @@ ALLOWED_COMMANDS = frozenset(
         "explore semantic list",
         # Package text and marker checks on instruction files; no table is read.
         "procedure",
+        # Versions, the platform and the connector's name; no table is read.
+        "feedback",
     }
 )
 

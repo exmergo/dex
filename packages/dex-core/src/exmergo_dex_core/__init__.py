@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 # subprocess per command, so keeping package import to almost nothing is free
 # latency on every invocation.
 _EXPORTS = {
+    "SetupResult": "onboarding",
     "BaselineUnreadableError": "maintain.commands",
     "BudgetExhaustedError": "results",
     "BuildEvidenceError": "transform.evidence",
@@ -95,8 +96,13 @@ _EXPORTS = {
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
+    "MetricViewDependencyError": "metric_views.dependency",
+    "SemanticViewDependencyError": "semantic_views.dependency",
     "MissingPackagesError": "transform.build",
     "PlanDeclaresMissingPackagesError": "transform.build",
+    "BridgeError": "transform.semantic_bridge",
+    "ConversionError": "metric_views.ossie_bridge",
+    "RepairRefusedError": "transform.package_repair",
     "ModelVersionError": "transform.model_versions",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
@@ -198,6 +204,9 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
+    from .metric_views.dependency import MetricViewDependencyError
+    from .metric_views.ossie_bridge import ConversionError
+    from .onboarding import SetupResult
     from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
@@ -205,6 +214,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         Result,
         to_envelope,
     )
+    from .semantic_views.dependency import SemanticViewDependencyError
     from .slayer.dependency import SlayerDependencyError
     from .storage import (
         CacheLock,
@@ -228,6 +238,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .transform.evidence import BuildEvidenceError
     from .transform.expected_change import ExpectationError
     from .transform.model_versions import ModelVersionError
+    from .transform.package_repair import RepairRefusedError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -235,6 +246,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         ScaffoldPrerequisiteError,
         SourcesFileError,
     )
+    from .transform.semantic_bridge import BridgeError
     from .values_free import ResultMode, ValuesFreeCode, ValuesFreeError
 
 try:
@@ -249,6 +261,7 @@ except PackageNotFoundError:
 __all__ = [
     "DEMO_FILENAME",
     "BaselineUnreadableError",
+    "BridgeError",
     "BudgetExhaustedError",
     "BuildEvidenceError",
     "CacheLock",
@@ -264,6 +277,7 @@ __all__ = [
     "ConfirmationRequiredError",
     "ConnectionSource",
     "ConnectorError",
+    "ConversionError",
     "Cost",
     "CostGuardError",
     "CredentialDiscoveryError",
@@ -290,6 +304,7 @@ __all__ = [
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
+    "MetricViewDependencyError",
     "MissingPackagesError",
     "ModelVersionError",
     "NoBaselineError",
@@ -306,6 +321,7 @@ __all__ = [
     "ProjectError",
     "QueryRefusedError",
     "Relationship",
+    "RepairRefusedError",
     "RepoRootRequiredError",
     "RequestError",
     "Result",
@@ -317,7 +333,9 @@ __all__ = [
     "SemanticLayerError",
     "SemanticQueryRefusedError",
     "SemanticSource",
+    "SemanticViewDependencyError",
     "SessionCeilingDecisionRequiredError",
+    "SetupResult",
     "SlayerDependencyError",
     "Snapshot",
     "SourcesFileError",

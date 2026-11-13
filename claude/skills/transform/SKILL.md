@@ -14,6 +14,12 @@ until `transform apply`, and any build runs against a dev target only.
 <!-- dex:procedure:begin -->
 ## Procedure
 
+For project setup, run `dex init` (or `init` through an installed skill wrapper).
+It creates or adopts a project, installs managed README and agent instructions,
+and verifies the connection. It does not explore data or build models. Read its
+structured missing inputs and readiness before continuing; installing skills
+does not necessarily install a `dex` executable.
+
 Dex works in one loop: explore, transform, maintain. `dex <command>` below is
 the `dex` CLI; where it is not installed, run the same command through the
 skill's `scripts/run.py` wrapper. Each command prints one JSON envelope: read
@@ -85,7 +91,16 @@ the project edits, migrations and dev builds described below.
    refactor's plan: its comparison would have nothing built to read
    (`mixed_with_repair`). Equivalence is about
    the results the request keeps, not an intermediate's layout. A change meant
-   to alter results needs no comparison.
+   to alter results (a backfill, an exclusion, late arrivals) is compared too,
+   against what it is meant to change:
+   `dex transform compare <plan-id> --key <grain> --expect '<json>'`, stating
+   which rows may be `added` and `removed` (`"none"`, `"any"`, or
+   `{"where": "<predicate over output columns>"}`, which may test a column
+   with `IN (SELECT <column> FROM ref('<model>') WHERE ...)`), the
+   `changed_columns` a kept key may change, and that the key holds.
+   `as_expected` is the verdict to relay; `unexpected` is a defect, as
+   `different` is: its `findings` and `unexpected_keys` name the rows the
+   change reached beyond its statement.
 4. **Apply.** `dex transform apply <plan-id>` writes the plan as a reviewable
    diff. A `needs_confirmation` here means a file changed since planning:
    plan again against it. A commit carrying files Dex wrote ends with the
@@ -104,9 +119,30 @@ the project edits, migrations and dev builds described below.
    `join_coverage`, `parent_population` and `temporal_contracts` is `satisfied`,
    `contradicted` (a finding to fix), `not_applicable` (nothing to judge, such as
    an empty input, which is not full coverage) or `unchecked` (its `reason_code`
-   says why, and it is not clean).
+   says why, and it is not clean). The same holds for
+   `data.completion.obligations`: a `comparison` entry that is not `satisfied`
+   (a rewrite applied uncompared, or compared without an `as_expected` or
+   `equivalent` verdict) and an `incremental_replay` entry that is not
+   `satisfied` (no passing unit test ran the `is_incremental()` branch) are
+   unfinished work, not a passing build.
+   A model that declares no parent is measured against the one Dex drafts for
+   it (`data.declarations.<model>.drafted.population_parent` on the plan): each
+   `population_delta` record counts its orphan keys, missing parents and rows
+   whose child columns are all NULL or zero (a sign of a parent with no child,
+   not proof). `needs_decision` (listed under
+   `data.completion.obligations.needs_decision`) asks which rows the model is
+   for: declare `population.parent`, or record the population as an assumption
+   naming the key `column` at `request`, `contract` or `precedent` tier.
    Output keys the parent lacks are never the population: drive the model from
-   the parent instead.
+   the parent instead. Check the rows the request is about with an aggregate
+   over the built model, `dex explore query --target dev "<SELECT ...>"`, which
+   reads the dev namespace for that one command. Observed counts describe the
+   data; they do not establish the intended population or NULL policy. NULL or
+   zero aggregates on a model driven from its parent point at the join key (its
+   type, its spelling, the relation it reads): investigate the join, and do not
+   re-drive the model from the child table. A change of driving relation or
+   parent is `redriven` in `data.change_scope`, settled only at `request` or
+   `contract` tier.
 6. **Maintain.** `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
@@ -125,8 +161,8 @@ implementation detail. Weigh evidence in this order, and never present a
    settle.
 3. `precedent`: how sibling models decide the same thing
    (`dex transform references <model.column> --usage`).
-4. `data`: what profiling showed about the data. Observed counts describe the
-   data; they do not establish the intended population or NULL policy.
+4. `data`: what profiling showed about the data (see step 5: counts never
+   establish the intended population).
 5. `default`: the conventional analytics-engineering choice.
 
 Name `request` or `contract` only when that source actually settles the choice;
@@ -136,6 +172,30 @@ reasonable population, record it as `default`, say why in one line of `detail`,
 and continue without asking for approval. "Include every account" and "only
 accounts with events" are each `request`, and a population the project already
 declares is `contract`.
+
+**Diagnose the value the request names.** A report that data is missing or a
+number is wrong is answered from the output the person reads. Finding the entity
+is one branch, not the verdict: when the row is there, the defect can be an
+attribute, a category membership or a derived measure. Bound what to check with
+the symptom, the model's definitions and its declared contract, rather than every
+column. For each field, follow the expression the model returns under that column
+name through the final select, its aliases and aggregations, to the filters,
+category mappings and joins it reads (the model SQL, and
+`dex transform references <model.column> --usage`). A correct intermediate
+formula proves nothing until the delivered column is shown to use it. Check the
+rows in question with an aggregate (`dex explore query`), and set the categories a
+predicate keeps beside the column's actual values (`dex explore profile`): a
+spelling outside the predicate is evidence to investigate. Only a mapping,
+contract or precedent that covers that value settles that it belongs; a
+resemblance of names is a `default` at most, and never outranks a mapping that
+leaves the value out or a contract that keeps unlisted values as sent, so such a
+value stays where it is and is reported as open. Report the
+field checked, its derivation, and the evidence of the defect or of what explains
+the symptom. Where the evidence does not settle it, say the question is
+unresolved and name what was not verified, rather than "nothing is wrong" or a
+question asked before investigating. A green build, or a model that selects the
+expected answer as a constant, is not that evidence. A defect found is repaired
+through transform.
 
 **Settle the scope before the repair.** Before changing a model that already
 exists, name what the request asks for: the outputs (each column and its visible
@@ -214,7 +274,8 @@ the checkable form where the model carries the column, and read
   safe. Prove the incremental branch with a unit test that overrides
   `is_incremental` (`dex transform test --scaffold <model>` writes one), build
   again without `--full-refresh`, and state the late-arrival horizon the repair
-  supports. Never insert probe rows into a loader's source.
+  supports. `obligations.incremental_replay` reads `full_refresh_only` or
+  `no_incremental_test` until that test passes in the build. Never insert probe rows into a loader's source.
   Recipe: `skills/transform/references/incremental-repairs.md`.
 - Change only what the request asks; keep the output columns, their types and
   the population the request and the existing model define, and own every other
@@ -247,15 +308,26 @@ the checkable form where the model carries the column, and read
   `--cold-deps` proves a project repair survives a reinstall, not that the data
   changed.
 - Never edit installed packages (`dbt_packages/`) and never repair only in the
-  warehouse: a reinstall or a reload undoes both. When a prerequisite blocks a
-  deliverable, read `data.prerequisites` for its owner, its `plan_relation` and
-  the repairs dbt supports, make a supported one through a plan (an explicit
-  cast, never dropped rows), and prove it with `--cold-deps` on the build. With no
-  repair in scope the deliverable is incomplete: report the prerequisite and the
-  remedy tried. `dex transform deps` and the build's own install fetch the
-  packages the project already declares (pinned where `package-lock.yml`
-  matches `packages.yml`): that is not installing or upgrading a tool, so a
-  request not to update tools does not rule it out. Recipe: `skills/transform/references/prerequisite-repairs.md`.
+  warehouse: a reinstall or a reload undoes both. A prerequisite that blocks the
+  request's own deliverables is part of the request, not scope creep: a
+  durable project-side repair is how the request completes. Each
+  `completion.blockers[]` entry's `next` names it. For a package model, run
+  `dex transform repair <node>...` (after `explore profile` on the input it
+  names; every failed package model in one call): it drafts the overrides as a
+  plan of their own, with the conversion read from
+  the error and the data, or left `unresolved` where they do not settle it.
+  Review it, relay each `meaning_changing` conversion as a decision, settle any
+  `unresolved` conversion (profile its input, draft again) before applying, then
+  apply it and build it with `--cold-deps`; never fold it into the deliverable's plan. Stop
+  only when the draft is refused or stays `unresolved` with nothing that settles
+  it: then the deliverable is incomplete, so report the prerequisite and the
+  remedy tried. An override of a model its package documents takes the
+  package's YAML entry, and dbt allows it no second one, so it carries no
+  declaration: declare the models that read it. `dex transform deps` and the
+  build's own install fetch the packages the project already declares (pinned
+  where `package-lock.yml` matches `packages.yml`): that is not installing or
+  upgrading a tool, so a request not to update tools does not rule it out.
+  Recipe: `skills/transform/references/prerequisite-repairs.md`.
 
 **Spending authority.** It comes from the person running this session, or from
 limits committed before it started: `budget.ceiling` (per command) and
@@ -314,9 +386,15 @@ fetches the engine's dependencies from PyPI or your configured index.
 
 ## Transforming, step by step
 
-1. **No dbt project yet?** Offer `transform init "<name>" --connector <c>` (scaffolds into `<name>/` by default, or the current directory with `--in-place`) before
-   anything else. Ask the user for the name and **confirm the connector with
-   them**: init never defaults one. Do not hand-write the skeleton. Read
+1. **Project setup requested, or no dbt project yet?** Use the installed wrapper
+   for complete setup, including README, agent instructions and connection
+   verification. For a new project, use `init "<name>" --connector <c>`;
+   for an existing project, use `init --mode adopt --project-dir <directory>`.
+   The adoption target is its directory, which may differ from the dbt project
+   name. Existing authored files are preserved. The legacy `transform init`
+   scaffolder remains available. New projects scaffold into `<name>/` by default,
+   or the current directory with `--in-place`. Confirm the connector and the
+   new project's name with the user; do not hand-write the skeleton. Read
    `${CLAUDE_SKILL_DIR}/references/init-and-dev-target.md` for per-connector
    setup, `--in-place`, `--layered-schemas`, and the namespace warning.
 2. **Find every use first** when a change has to land in more than one place:
@@ -338,8 +416,12 @@ fetches the engine's dependencies from PyPI or your configured index.
    For the semantic layer, use the command for the vendor `semantic.vendor`
    names (`dex config get semantic` reads it): `semantic define|update|plan`
    (dbt), `semantic ossie define|update|plan` (native Ossie),
-   `semantic slayer define|update|plan` (SLayer model files), or
-   `semantic cube define|update|plan` (Cube YAML model files). Read
+   `semantic slayer define|update|plan` (SLayer model files),
+   `semantic cube define|update|plan` (Cube YAML model files), or
+   `semantic databricks define|update|plan` (Databricks Metric View YAML files,
+   never deployed). To propose a Metric View from an Ossie document, use
+   `semantic databricks --from-ossie <file>`; for the reverse,
+   `semantic ossie --from-metric-view <file>`. Read
    `${CLAUDE_SKILL_DIR}/references/semantic-layer.md` first.
 4. **Declare.** Read `data.declarations.<model>` on the plan envelope: `drafted`
    is what Dex measured, `declared` is what the YAML says, `missing` is the intent
@@ -347,7 +429,7 @@ fetches the engine's dependencies from PyPI or your configured index.
    `declarations` entry, and re-plan until `missing` holds only what you decided
    to leave open. For a declared mart, also read `data.semantic_proposal`: the
    semantic definition the declaration implies in the repository's own layer
-   (`vendor`: a MetricFlow model, or a SLayer or Cube model file stored as a
+   (`vendor`: a MetricFlow model, or a SLayer, Cube or Metric View file stored as a
    second plan whose id is `plan_id`), already planned (`mode: included`) or offered with
    the commands that adopt it (`mode: proposed`), with every gap it could not
    fill named and every declared field it could not carry in `not_carried`. When the user
@@ -457,6 +539,12 @@ a field, flag, or macro you need is not described here.
   free). When `data.strategy` is `per_target`, relay the reason rather than
   applying duplicated copies on the user's behalf; often the fix it names is what
   they want.
+- `transform repair <node>`: when a build's blocker `next` names it. Profile the
+  input it reads first, then read `data.repair`: `status`, each conversion's
+  `kind` and `meaning_changing` (relay that as a decision), anything `unresolved`.
+  While `data.repair.status` is `unresolved`, settle the conversion first
+  (profile the input it names) and draft again rather than applying. Then apply
+  it and build it `--cold-deps` as its own plan, never inside the deliverable's.
 - Use a shipped macro (`transform macro <name>`) rather than hand-rolling or
   inlining a copy of it, and do not hand-write `generate_schema_name`. When a
   plan warns that a called macro is missing, scaffold it. Do not "fix" the
@@ -503,6 +591,11 @@ a field, flag, or macro you need is not described here.
   A running Cube server does not reload an applied edit: tell the user to
   restart it before `explore semantic query` is run against the new model, which
   Dex otherwise refuses as a stale renderer.
+- For Databricks Metric Views, edit only the files listed in
+  `semantic.databricks.files`, each one view's whole YAML body (never the
+  `CREATE VIEW` SQL), and never write it through a YAML 1.1 library, which turns
+  a join's `on:` into `true:`. Dex never deploys the view: creating it in the
+  workspace is the user's step. The wrapper installs `[metric-views]`.
 - SLayer declares no entities, no aggregation on a saved measure (the formula
   carries it, as in `amount:sum`), and no per-measure time dimension (only the
   model's `default_time_dimension`). Never write those into a SLayer model.

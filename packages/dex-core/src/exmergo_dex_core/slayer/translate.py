@@ -21,6 +21,12 @@ model, so a refusal here costs nothing and happens before SLayer plans anything.
   refuses it. Grouping by that same column as well folds it into the time
   dimension, which is what the caller meant and the only form SLayer accepts:
   the raw column and its bucket share one result name.
+- ``--group-by model.column.value`` groups by the elements of a list column
+  (``type: ARRAY``), one row per element. The query is sent with
+  ``to_many_handling='associate'``, so each element row counts the parents that
+  hold it; SLayer's default would repeat the metric's whole total on every
+  element row. The whole list column is listed but groups nothing, and grouping
+  by it or reading its values is refused here, naming the ``.value`` token.
 - ``--where`` becomes ``filters``, verbatim, in SLayer's own dialect. A clause
   carrying ``{var}`` syntax is refused, because SLayer fills a placeholder from
   the model's declared defaults when a query passes none, and the column it
@@ -69,7 +75,20 @@ from ..explore.semantic.backend import SemanticBackendError
 from ..explore.semantic.model import SemanticQuery, ValuesRequest
 from ..semantic_catalog import MetricInfo, SemanticCatalogView, SemanticModelInfo
 
-__all__ = ["GRAINS", "source_model", "to_slayer_query", "to_slayer_values_query"]
+__all__ = [
+    "ASSOCIATE",
+    "GRAINS",
+    "element_note",
+    "element_tokens",
+    "list_tokens",
+    "source_model",
+    "to_slayer_query",
+    "to_slayer_values_query",
+]
+
+#: How a query grouped by a list column's elements treats the fan-out: each
+#: element row counts the parents holding it (SLayer's `associate`).
+ASSOCIATE = "associate"
 
 # A catalog name: identifiers joined by dots. Anything else in a metric position
 # is an expression, which is a formula rather than a name.
@@ -93,6 +112,7 @@ def to_slayer_query(q: SemanticQuery, view: SemanticCatalogView) -> SlayerQuery:
     columns: dict[str, str] = {}  # grouped token -> column, in request order
     for token in dict.fromkeys(q.group_by):
         if token not in groupable:
+            _refuse_whole_list(token, view, "group by")
             raise SemanticBackendError(
                 f"cannot group {_names(metrics)} by {token}: the layer does not "
                 f"report it as groupable for "
@@ -117,6 +137,11 @@ def to_slayer_query(q: SemanticQuery, view: SemanticCatalogView) -> SlayerQuery:
     ]
     if dimensions:
         fields["dimensions"] = dimensions
+    if any(_is_element(token, view) for token in columns):
+        # One row per element, and a parent holding several counts under each.
+        # SLayer's default (`broadcast`) instead repeats the metric's whole total
+        # on every element row, a number that reads per element and is not.
+        fields["to_many_handling"] = ASSOCIATE
     if time_column:
         fields["time_dimensions"] = [
             TimeDimension(dimension=ColumnRef(name=time_column), granularity=grain)
@@ -160,6 +185,7 @@ def to_slayer_values_query(
             "model.column"
         )
 
+    _refuse_whole_list(request.name, view, "read the values of")
     if request.metrics:
         metrics = _metrics(request.metrics, view)
         source = _source_model(metrics, view)
@@ -266,6 +292,74 @@ def _source_model(
             "source model to query it from"
         )
     return model
+
+
+def element_tokens(tokens: Iterable[str], view: SemanticCatalogView) -> list[str]:
+    """The tokens among ``tokens`` that group by a list column's elements."""
+
+    return [token for token in dict.fromkeys(tokens) if _is_element(token, view)]
+
+
+def list_tokens(tokens: Iterable[str], view: SemanticCatalogView) -> list[str]:
+    """The tokens among ``tokens`` that read a list column, whole or by element."""
+
+    found = []
+    for token in dict.fromkeys(tokens):
+        params = _dimension_params(token, view) or {}
+        if params.get("element_of") or params.get("groupable") is False:
+            found.append(token)
+    return found
+
+
+def element_note(tokens: list[str]) -> str:
+    """What a grouping by list elements means for the numbers."""
+
+    return (
+        f"grouped by the elements of a list column ({', '.join(tokens)}): each row "
+        "counts the parents holding that element, so a parent with several "
+        "elements counts under each, rows overlap, and they do not sum to the "
+        "metric's total. A parent with no elements, or a NULL list, is in no row"
+    )
+
+
+def _is_element(token: str, view: SemanticCatalogView) -> bool:
+    params = _dimension_params(token, view)
+    return bool(params and params.get("element_of"))
+
+
+def _dimension_params(token: str, view: SemanticCatalogView) -> dict | None:
+    for dimension in view.dimensions:
+        if dimension.name == token:
+            return dimension.vendor_params or None
+    return None
+
+
+def _refuse_whole_list(token: str, view: SemanticCatalogView, verb: str) -> None:
+    """Refuse grouping by, or reading the values of, a whole list column.
+
+    SLayer groups a list by its elements and refuses the list itself
+    (``ListTypeError``) only once it renders; here the refusal comes first and
+    names the element token to use instead.
+    """
+
+    params = _dimension_params(token, view)
+    if not params or params.get("groupable") is not False:
+        return
+    element = params.get("group_by")
+    if element:
+        model = token.rsplit(".", 1)[0]
+        raise SemanticBackendError(
+            f"cannot {verb} {token}: it is a list column "
+            f"(ARRAY of {params.get('element_type')}), and SLayer groups a list by "
+            f"its elements. Use {model}.{element}; filter on the whole list with "
+            f"contains({token.rsplit('.', 1)[1]}, ...), contains_any or "
+            "contains_all in --where"
+        )
+    raise SemanticBackendError(
+        f"cannot {verb} {token}: it is a list column whose element type is "
+        "UNKNOWN, so SLayer has no element to group by. Declare its "
+        "`element_type` on the model"
+    )
 
 
 def _groupable(metrics: list[MetricInfo]) -> set[str]:

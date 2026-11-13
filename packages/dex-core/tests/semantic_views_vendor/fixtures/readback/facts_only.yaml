@@ -1,0 +1,15 @@
+name: FACTS_ONLY
+tables:
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    facts:
+      - name: PRICE
+        expr: o_totalprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access

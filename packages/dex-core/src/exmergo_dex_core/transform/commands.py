@@ -71,6 +71,7 @@ from .results import (
     PlanResult,
     PreflightResult,
     PropagationResult,
+    RepairResult,
     TestScaffoldResult,
 )
 
@@ -807,6 +808,7 @@ def _draft(
                 "packaged": _package_lookup(view, files.get("dbt_project.yml")),
             },
             index=lambda: _post_change_index(view, edits),
+            key_facts=lambda: _post_change_key_facts(view, edits),
             prior={path: source.content for path, source in view.files.items()},
             package_documented={
                 name: {"package": o.package, "package_entry": o.package_entry}
@@ -838,6 +840,15 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         note = "there is no exploration cache yet; run `explore map` first"
     if cache is not None:
         cache = mask_overridden(cache, pii_override_paths(engine.config.pii_overrides))
+    manifest = getattr(view, "manifest", None)
+    manifest_stale = True
+    if manifest is not None:
+        try:
+            from ..dbt_project import manifest_freshness
+
+            manifest_stale = manifest_freshness(view).get("stale") is not False
+        except Exception:
+            manifest_stale = True
     return {
         "cache": cache,
         "dialect": get_dialect(engine.connector or engine.config.connector),
@@ -850,6 +861,8 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         "cache_note": note,
         "dev_namespace": _dev_namespace(engine),
         "packaged": _package_lookup(view),
+        "manifest": manifest,
+        "manifest_stale": manifest_stale,
     }
 
 
@@ -873,6 +886,7 @@ def _package_lookup(
         else (current.content if current is not None else None)
     )
     seen: dict[str, str | None] = {}
+    targets: dict[str, Any] = {}
 
     def lookup(name: str) -> str | None:
         """The package that builds ``name``, or ``None``; remembered per name."""
@@ -880,9 +894,16 @@ def _package_lookup(
             found = find_package_target(
                 view.root, name, project_yml=text, manifest=view.manifest
             )
-            seen[name] = found.package if found is not None and found.enabled else None
+            targets[name] = found if found is not None and found.enabled else None
+            seen[name] = targets[name].package if targets[name] is not None else None
         return seen[name]
 
+    def get_target(name: str) -> Any:
+        """the target node of an installed package called ``name``."""
+        lookup(name)
+        return targets.get(name)
+
+    lookup.target = get_target  # type: ignore[attr-defined]
     return lookup
 
 
@@ -912,6 +933,17 @@ def _post_change_index(view: Any, edits: list[PlanEdit]) -> Any:
     from .propagate import _project_after_edits
 
     return ReferenceIndex(_project_after_edits(view, edits))
+
+
+def _post_change_key_facts(view: Any, edits: list[PlanEdit]) -> Any:
+    """The keys and joins the project states once ``edits`` land: its YAML as
+    the plan leaves it, and the compiled manifest for an installed package's
+    tests (#1228)."""
+
+    from .population_inference import facts_for
+    from .propagate import _project_after_edits
+
+    return facts_for(_project_after_edits(view, edits), view.manifest)
 
 
 def _plan_decisions(
@@ -1007,6 +1039,13 @@ def _offer_refactor_comparison(
                         "status": b.status,
                         "owner": "package" if b.package else "project",
                         **({"package": b.package} if b.package else {}),
+                        # The command that drafts the repair, so the offer
+                        # names one rather than a key a plan never emits (#1229).
+                        **(
+                            {"repair": f"dex transform repair {b.model}"}
+                            if b.package and b.status != "skipped"
+                            else {}
+                        ),
                     }
                     for b in blocked
                 ]
@@ -1317,6 +1356,8 @@ def _report_change_scope(
             and edit.new_content is not None
             and edit.path in view.files
         ]
+        earlier, against, parents = _redrive_baselines(engine, view, edits, result)
+        rewrites.extend(earlier)
         if not rewrites:
             return
         report = change_scope.analyze(
@@ -1324,6 +1365,8 @@ def _report_change_scope(
             result.decisions or [],
             get_dialect(engine.connector or engine.config.connector),
             view.vars,
+            parents=parents,
+            against=against,
         )
     except Exception as exc:
         result.warnings.append(
@@ -1343,6 +1386,114 @@ def _report_change_scope(
         stored = store.load_plan(result.plan_id)
         stored.change_scope = per_model
         store.save_plan(stored)
+
+
+def _redrive_baselines(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], result: PlanResult
+) -> tuple[list[tuple[str, str, str]], dict[str, str], dict[str, Any]]:
+    """What re-driving is judged against (#1228): for a model only an earlier
+    unapplied plan wrote, that plan's SQL as the prior version; and for every
+    model this plan writes, its declared ``population.parent`` before (on disk,
+    or in that earlier plan) and after. Never raises."""
+
+    from . import declarations as declarations_mod
+    from .contradictions import _declared_parent
+    from .drafting import read_declared
+
+    earlier: list[tuple[str, str, str]] = []
+    against: dict[str, str] = {}
+    parents: dict[str, Any] = {}
+    written = [
+        edit
+        for edit in edits
+        if edit.kind is EditKind.MODEL_SQL
+        and edit.op is EditOp.UPSERT
+        and edit.new_content is not None
+        and edit.path.endswith(".sql")
+    ]
+    before_files = {path: source.content for path, source in view.files.items()}
+    after_files = declarations_mod.post_change_files(view, edits)
+    # A declaration-only edit can remove or replace a parent with the SQL left
+    # as it is; that model is judged on its unchanged SQL and its parents.
+    sql_written = {edit.path for edit in written}
+    for name in _yaml_models(edits):
+        path = declarations_mod.model_sql_path(before_files, view.model_paths, name)
+        if path is None or path in sql_written:
+            continue
+        moved = (
+            _declared_parent(read_declared(before_files, name)),
+            _declared_parent(read_declared(after_files, name)),
+        )
+        if moved[0] is not None and (moved[1] or "").lower() != moved[0].lower():
+            earlier.append((path, before_files[path], before_files[path]))
+            parents[path] = moved
+    if not written:
+        return earlier, against, parents
+    previous = _earlier_plans(engine, result.plan_id)
+    for edit in written:
+        model = Path(edit.path).stem
+        baseline_files = before_files
+        if edit.path not in view.files:
+            plan = next(
+                (
+                    p
+                    for p in previous
+                    if any(
+                        e.path == edit.path
+                        and e.op is EditOp.UPSERT
+                        and e.new_content is not None
+                        for e in p.edits
+                    )
+                ),
+                None,
+            )
+            if plan is None:
+                continue
+            prior_sql = next(
+                e.new_content
+                for e in plan.edits
+                if e.path == edit.path and e.new_content is not None
+            )
+            earlier.append((edit.path, prior_sql, edit.new_content or ""))
+            against[edit.path] = "earlier_plan"
+            baseline_files = declarations_mod.post_change_files(view, list(plan.edits))
+        parents[edit.path] = (
+            _declared_parent(read_declared(baseline_files, model)),
+            _declared_parent(read_declared(after_files, model)),
+        )
+    return earlier, against, parents
+
+
+def _yaml_models(edits: list[PlanEdit]) -> set[str]:
+    """The model names the plan's YAML edits carry an entry for."""
+
+    import yaml
+
+    names: set[str] = set()
+    for edit in edits:
+        if edit.kind is not EditKind.SCHEMA_YML or edit.new_content is None:
+            continue
+        with contextlib.suppress(yaml.YAMLError):
+            parsed = yaml.safe_load(edit.new_content)
+            if not isinstance(parsed, dict):
+                continue
+            for entry in parsed.get("models") or []:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    names.add(entry["name"])
+    return names
+
+
+def _earlier_plans(engine: DexEngine, plan_id: str | None) -> list[Any]:
+    """The stored unapplied plans other than ``plan_id``, newest first."""
+
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("reading earlier plans")
+        return [
+            plan
+            for plan in store.list_plans()
+            if plan.plan_id != plan_id and plan.applied_at is None
+        ]
+    return []
 
 
 def _contradiction_warnings(result: PlanResult) -> None:
@@ -1814,10 +1965,15 @@ def declare(
     files = {path: source.content for path, source in view.files.items()}
     inputs = _drafting_inputs(engine, view)
 
+    from .population_inference import facts_for
+
+    def facts_fn():
+        return facts_for(view, getattr(view, "manifest", None))
+
     def draft_one(model: str) -> tuple[dict[str, Any] | None, list[str]]:
         try:
             drafts, warnings = drafting.draft(
-                [model], files, view.model_paths, **inputs
+                [model], files, view.model_paths, **inputs, key_facts=facts_fn
             )
         except Exception as exc:
             return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
@@ -1899,6 +2055,316 @@ def cmd_declare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
         return env.error_for(exc)
+
+
+def _failed_package_node(
+    project: Path, name: str
+) -> tuple[str, dict[str, Any], dict[str, Any], Any]:
+    """The failed package node named ``name``: its unique id, manifest node,
+    the manifest, and its latest attempt. Refuses whatever is not one."""
+
+    from .artifact_runtime import latest_node_runs
+    from .evidence import FAILED_STATUSES
+    from .package_repair import RepairRefusedError
+
+    runs = latest_node_runs(project)
+    if runs.manifest is None:
+        raise RepairRefusedError(
+            f"no build has run here, so there is no failure of {name} to repair: "
+            "run `dex transform build --target dev` first"
+        )
+    manifest = json.loads(runs.manifest.read_text(encoding="utf-8"))
+    root = (manifest.get("metadata") or {}).get("project_name")
+    wanted = name.split(".")[-1].lower()
+    candidates = [
+        (uid, node)
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if isinstance(node, dict)
+        and str(node.get("name") or "").lower() == wanted
+        and (len(name.split(".")) == 1 or uid.split(".")[1] == name.split(".")[0])
+    ]
+    if not candidates:
+        disabled = [
+            uid
+            for uid, entries in (manifest.get("disabled") or {}).items()
+            if uid.split(".")[-1].lower() == wanted
+        ]
+        if disabled:
+            raise RepairRefusedError(
+                f"{name} is disabled in the project already, so an override is in "
+                "place: the project owns the model now, so fix it with "
+                "`dex transform plan`"
+            )
+        raise RepairRefusedError(
+            f"no node named {name} is in the latest build's manifest"
+        )
+    failed = [
+        (uid, node)
+        for uid, node in candidates
+        if (run := runs.nodes.get(uid)) is not None and run.status in FAILED_STATUSES
+    ]
+    if not failed:
+        statuses = sorted(
+            {runs.nodes[uid].status for uid, _ in candidates if uid in runs.nodes}
+        )
+        raise RepairRefusedError(
+            f"the latest build attempt of {name} did not fail"
+            + (f" ({', '.join(statuses)})" if statuses else " (never attempted)")
+            + ": `transform repair` drafts a fix for a failed package model; "
+            "build it first to see whether it fails"
+        )
+    unique_id, node = failed[0]
+    if node.get("package_name") == root:
+        path = node.get("original_file_path") or name
+        raise RepairRefusedError(
+            f"the project owns {name} ({path}), so it is repaired with an ordinary "
+            "`dex transform plan` on that file, not an override"
+        )
+    return unique_id, node, manifest, runs.nodes[unique_id]
+
+
+def repair(engine: DexEngine, names: str | Sequence[str] | None) -> RepairResult:
+    """Draft the project overrides that repair failing package models (#1229).
+
+    Every node named goes into one plan: each override disables its package node
+    in the same ``dbt_project.yml``, so separate plans would conflict on apply.
+    Reads the latest build attempt and its manifest, the project and the
+    exploration cache. dbt's compile of the drafts answers column listings from
+    metadata, and the bind check reads no row. The drafts are an ordinary plan:
+    every gate ``transform plan`` runs, runs on them.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import package_repair as repair_mod
+    from .prerequisites import _override_option
+    from .validate import EditValidationError
+
+    wanted = list(
+        dict.fromkeys(
+            name.strip()
+            for name in ([names] if isinstance(names, str) else list(names or []))
+            for name in name.split(",")
+            if name.strip()
+        )
+    )
+    if not wanted:
+        raise repair_mod.RepairRefusedError(
+            "transform repair needs the failing node: `transform repair <model>`"
+        )
+    project = Path(engine.project_dir())
+    view = load_project(project)
+    project_file = project / "dbt_project.yml"
+    project_text = (
+        project_file.read_text(encoding="utf-8") if project_file.is_file() else ""
+    )
+    raw_project = yaml.safe_load(project_text or "") or {}
+    root_vars = raw_project.get("vars") if isinstance(raw_project, dict) else None
+    try:
+        cache = readable_cache(engine.store)
+    except Exception:
+        cache = None
+    connector = str(engine.connector or engine.config.connector or "")
+    installed = repair_mod.installed_names(project)
+
+    drafts: list[repair_mod.Draft] = []
+    manifests: dict[str, dict[str, Any]] = {}
+    for name in wanted:
+        unique_id, node, manifest, run = _failed_package_node(project, name)
+        if any(d.unique_id == unique_id for d in drafts):
+            continue
+        nodes = {
+            **(manifest.get("nodes") or {}),
+            **(manifest.get("unit_tests") or {}),
+        }
+        option = _override_option(unique_id, node, nodes, _install_dir(project))
+        if not option.get("supported"):
+            raise repair_mod.RepairRefusedError(
+                f"{node.get('package_name')}.{node.get('name')} cannot be "
+                f"overridden: {option.get('reason')}"
+            )
+        target = repair_mod.override_path(view.model_paths, str(node["name"]))
+        clash = next(
+            (
+                path
+                for path in view.files
+                if path.endswith(".sql")
+                and Path(path).stem.lower() == str(node["name"]).lower()
+                and path != target
+            ),
+            None,
+        )
+        if clash is not None:
+            raise repair_mod.RepairRefusedError(
+                f"the project already has a file named {Path(clash).name} "
+                f"({clash}); an override would be a second model of that name"
+            )
+        package = str(node.get("package_name"))
+        drafted = repair_mod.draft(
+            node=node,
+            unique_id=unique_id,
+            manifest=manifest,
+            message=run.message,
+            # Each draft writes into the project file the previous one left.
+            project_yml=drafts[-1].project_yml if drafts else project_text,
+            root_project=view.project_name,
+            root_vars=root_vars if isinstance(root_vars, dict) else {},
+            package_vars=repair_mod.package_vars(project, package),
+            installed=installed,
+            model_paths=view.model_paths,
+            cache=cache,
+            connector=connector,
+        )
+        drafts.append(drafted)
+        manifests[unique_id] = manifest
+
+    def drafted_edits() -> list[PlanEdit]:
+        """The plan's edits as the drafts stand: the overrides, then the project."""
+
+        return [
+            *(
+                PlanEdit(
+                    path=d.override_path,
+                    kind=EditKind.MODEL_SQL,
+                    new_content=d.override_sql,
+                )
+                for d in drafts
+            ),
+            PlanEdit(
+                path="dbt_project.yml",
+                kind=EditKind.PROJECT_YML,
+                new_content=drafts[-1].project_yml,
+            ),
+        ]
+
+    compile_notes: list[str] = []
+    compiled_ok: bool | None = None
+    adapter = None
+    # Compile the drafts, then bind each on dev reading no row; each typing
+    # error a bind reveals is one more failure to convert, as successive builds
+    # would reveal them one rebuild at a time.
+    for _pass in range(repair_mod.MAX_PASSES):
+        edits = drafted_edits()
+        try:
+            from .compile import compile_models
+
+            compiled, broker = compile_models(
+                engine, edits, force={d.override_path for d in drafts}
+            )
+            broker.settle()
+            compile_notes.extend(broker.warnings)
+            compiled_ok = True
+        except EditValidationError as exc:
+            if "require dbt" in str(exc):
+                compiled_ok = False
+                compile_notes.append(
+                    "dbt is not installed, so the drafts were neither compiled nor "
+                    "bound before they were stored; `transform build` compiles them"
+                )
+                for d in drafts:
+                    d.bind_check = {
+                        "status": "not_checked",
+                        "reason": "dbt is not installed",
+                    }
+                break
+            raise repair_mod.RepairRefusedError(
+                "the drafted override of "
+                + ", ".join(f"{d.package}.{d.name}" for d in drafts)
+                + f" does not compile, so no plan was stored: {exc}"
+            ) from exc
+        progressed = False
+        for d in drafts:
+            if d.bind_check.get("status") == "bound":
+                continue
+            try:
+                if adapter is None:
+                    adapter = engine._adapter("transform repair", reads_dev_target=True)
+                outcome, detail, text = repair_mod.bind_check(
+                    adapter, connector, compiled[d.override_path].sql
+                )
+            except Exception as exc:
+                outcome, text = "not_checked", None
+                detail = f"no connection to bind the draft on ({type(exc).__name__})"
+            d.bind_check = {"status": outcome}
+            if detail:
+                d.bind_check["detail" if outcome == "failed" else "reason"] = detail
+            if outcome == "failed" and repair_mod.add_failure(
+                d,
+                text or detail,
+                source="bind_check",
+                manifest=manifests[d.unique_id],
+                cache=cache,
+                connector=connector,
+            ):
+                progressed = True
+        if not progressed:
+            break
+    edits = drafted_edits()
+    records = [repair_mod.finish(d) for d in drafts]
+    conversions = ", ".join(
+        f"{record['node']}.{c['column']} {c['kind']}"
+        for record in records
+        for c in record["conversions"]
+        if c.get("status") == "resolved"
+    )
+    intent = (
+        "repair "
+        + ", ".join(f"{d.package}.{d.name}" for d in drafts)
+        + " with a project override"
+        + (f" ({conversions})" if conversions else "")
+    )
+    planned = plan(engine, intent, edits=edits)
+    statuses = {record["status"] for record in records}
+    overall = (
+        "unresolved"
+        if "unresolved" in statuses
+        else "unbound"
+        if "unbound" in statuses
+        else "resolved"
+    )
+    build_step = (
+        f"`dex transform apply {planned.plan_id}` and `dex transform build "
+        f"--target dev --verify --for-plan {planned.plan_id} --cold-deps`"
+    )
+    summary: dict[str, Any] = {
+        "status": overall,
+        "plan_id": planned.plan_id,
+        "compiled": compiled_ok,
+        "nodes": records,
+        "next": {
+            "resolved": f"review the diff, then {build_step}",
+            "unbound": "every failure was converted, but nothing checked the "
+            "draft's types on dev (see each node's `bind_check.reason`): review "
+            f"the diff with that in mind, then {build_step}, which is the check",
+            "unresolved": "edit each unresolved conversion in the draft (or "
+            "profile the input it names and repair again) before applying it",
+        }[overall],
+    }
+    result = RepairResult(**planned.model_dump(), repair=summary)
+    # The compile and the parse run dbt twice over one tree, so its own
+    # warnings arrive twice; each is said once.
+    result.warnings = list(
+        dict.fromkeys(
+            [*(w for d in drafts for w in d.warnings), *compile_notes, *result.warnings]
+        )
+    )
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("recording a repair")
+        stored = store.load_plan(planned.plan_id)
+        stored.repair = summary
+        store.save_plan(stored)
+    return result
+
+
+def cmd_repair(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """CLI shim for `transform repair`: draft the overrides and wrap the result."""
+
+    try:
+        result = repair(engine, getattr(args, "nodes", None))
+    except DbtParseError as exc:
+        return env.error_for(exc, warnings=exc.warnings)
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result, hints={"next": result.repair.get("next", "")})
 
 
 def _split_targets(raw: list[str] | None) -> list[str]:
@@ -4745,7 +5211,7 @@ def build(
     engine: DexEngine,
     *,
     target: str | None = None,
-    select: str | None = None,
+    select: str | Sequence[str] | None = None,
     verify: bool = False,
     for_plan: str | None = None,
     for_plan_document: Any = None,
@@ -4779,6 +5245,8 @@ def build(
         "pass the plan id the build is for, or omit the flag to build with no "
         "plan coverage",
     )
+    if select is not None and not isinstance(select, str):
+        select = " ".join(select)
     kwargs: dict[str, Any] = {
         "target": target,
         "select": select,
@@ -5094,6 +5562,8 @@ def _build_project(
     if dependencies is DependencyPolicy.REFUSE:
         assert_packages_installed(project)
 
+    from .verify import plan_models
+
     estimate, per_node, price_notes, upper_bounds, adapter = _price_build(
         engine,
         checkout,
@@ -5102,6 +5572,11 @@ def _build_project(
         verify=verify,
         artifact_directory=artifacts_dir,
         full_refresh=full_refresh,
+        focus=(
+            plan_models(_plan_edits(engine, for_plan, for_plan_document))
+            if verify
+            else None
+        ),
     )
     if estimate is not None:
         command_args.billed_handshake(
@@ -5380,12 +5855,15 @@ def _for_plan_document(args: argparse.Namespace) -> Any:
 
 
 def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    select = getattr(args, "select", None)
+    if select is not None and not isinstance(select, str):
+        select = " ".join(select)
     try:
         return to_envelope(
             build(
                 engine,
                 target=getattr(args, "target", None),
-                select=getattr(args, "select", None),
+                select=select,
                 verify=getattr(args, "verify", False),
                 for_plan=getattr(args, "for_plan", None),
                 for_plan_document=_for_plan_document(args),
@@ -5974,6 +6452,7 @@ def _price_build(
     verify: bool = False,
     artifact_directory: Path | None = None,
     full_refresh: bool = False,
+    focus: set[str] | None = None,
 ):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
@@ -6086,7 +6565,7 @@ def _price_build(
                     adapter, Path(project), scope=scope, recomputed=recomputed
                 )
                 facts, facts_notes = price_declared_facts(
-                    adapter, Path(project), scope=scope
+                    adapter, Path(project), scope=scope, engine=engine, focus=focus
                 )
                 joins, join_notes = price_join_contract(
                     adapter, Path(project), scope=scope
@@ -6534,6 +7013,7 @@ def _attach_completion(
             identifier_conversions=inputs.get("identifier_conversions"),
             change_scope=inputs.get("change_scope"),
             incremental_replay=_incremental_replay_inputs(result, inputs),
+            repair=inputs.get("repair"),
         )
     except Exception as exc:
         result.notes.append(
@@ -6620,6 +7100,7 @@ def _completion_inputs(
                 getattr(stored, "identifier_conversions", None) or {}
             )
             inputs["change_scope"] = getattr(stored, "change_scope", None) or {}
+            inputs["repair"] = getattr(stored, "repair", None)
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):
@@ -6775,6 +7256,8 @@ def _semantic_plan(
     no_parse: bool = False,
     declarations: list[Any] | None = None,
 ) -> PlanResult:
+    """Validate, parse-gate, and construct a semantic plan across authoring modes."""
+
     from ..dbt_project import load as load_project
 
     project = engine.project_dir()
@@ -6867,8 +7350,9 @@ def _semantic_plan(
     elif spine_warning:
         parse_warning = "dbt parse skipped until the project has a time spine"
     else:
-        from .build import shadow_parse
+        from .build import assert_plan_packages_installed, shadow_parse
 
+        assert_plan_packages_installed(project, edits)
         parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
         if not parse_result["available"]:
             parse_warning = parse_result["reason"]

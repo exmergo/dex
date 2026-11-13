@@ -1,0 +1,5 @@
+{
+  "kind": "diagnose",
+  "models": ["product_pricing"],
+  "prompt": "Before we publish `avg_adjusted_price` from `product_pricing`, confirm that it really is the average price after discounts. Fix the model if it is not."
+}

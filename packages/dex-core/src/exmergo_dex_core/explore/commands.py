@@ -1172,6 +1172,7 @@ def relationships(
             "window); pass --refresh to re-profile them"
         )
     profiled: list[Dataset] = []
+    profile_errors: list[tuple[str, WarehouseQueryError]] = []
     # Nothing stale means nothing to price or confirm: skip the handshake and
     # the scan entirely, and reuse the cached profiles wholesale.
     if stale:
@@ -1191,12 +1192,18 @@ def relationships(
             )
 
         profile_reporter = _reporter(len(stale), "profiled", "objects")
+
+        def _record_profile_error(ident: str, err: WarehouseQueryError) -> None:
+            """record profiling failure for an object so it can be noted."""
+            profile_errors.append((ident, err))
+
         try:
             profiled = profile_mod.profile(
                 adapter,
                 stale,
                 progress=profile_reporter,
                 on_complete=checkpoint,
+                on_error=_record_profile_error,
                 pii_overrides=pii_override_paths(config.pii_overrides),
                 include_blobs=blob_paths,
             )
@@ -1415,6 +1422,9 @@ def relationships(
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
     notes.extend(defs.notes)
+    for ident, err in profile_errors:
+        reason = "warehouse_refused" if values_free else (err.detail or str(err))
+        notes.append(f"{ident} not profiled: {reason}")
     if confirmed:
         notes.append(
             f"{confirmed} inferred join(s) match declared joins; kept as declared"
@@ -2748,6 +2758,7 @@ def map(
             "window); pass --refresh to re-profile them"
         )
     profiled: list[Dataset] = []
+    profile_errors: list[tuple[str, WarehouseQueryError]] = []
     # Nothing stale means nothing to price or confirm: skip the handshake and
     # the scan entirely, and reuse the cached profiles wholesale.
     if stale:
@@ -2766,12 +2777,18 @@ def map(
             )
 
         profile_reporter = _reporter(len(stale), "profiled", "objects")
+
+        def _record_profile_error(ident: str, err: WarehouseQueryError) -> None:
+            """record profiling failure for an object so it can be noted."""
+            profile_errors.append((ident, err))
+
         try:
             profiled = profile_mod.profile(
                 adapter,
                 stale,
                 progress=profile_reporter,
                 on_complete=checkpoint,
+                on_error=_record_profile_error,
                 pii_overrides=pii_override_paths(config.pii_overrides),
                 include_blobs=blob_paths,
             )
@@ -2986,6 +3003,16 @@ def map(
         reusable,
         observed_namespaces=observed_namespaces,
     )
+    failed_reasons = {
+        ident: "warehouse_refused" if values_free else (err.detail or str(err))
+        for ident, err in profile_errors
+    }
+    for ds in datasets:
+        ds.data_quality = [
+            n for n in ds.data_quality if not n.startswith("not profiled: ")
+        ]
+        if ds.identifier in failed_reasons:
+            ds.data_quality.append(f"not profiled: {failed_reasons[ds.identifier]}")
 
     # A verified join at a catastrophic orphan rate is a finding, not just a
     # demoted confidence (issue #207): mirrored onto the child dataset's
@@ -3054,6 +3081,9 @@ def map(
         _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
+    for ident, err in profile_errors:
+        reason = "warehouse_refused" if values_free else (err.detail or str(err))
+        notes.append(f"{ident} not profiled: {reason}")
     if semantic_exposed:
         notes.append(
             f"{semantic_exposed} object(s) are exposed through the project's "
@@ -4164,6 +4194,8 @@ _DECLARING_LAYER = {
     "ossie": "the Ossie layer",
     "slayer": "the SLayer layer",
     "cube": "the Cube layer",
+    "databricks": "the Databricks Metric View layer",
+    "snowflake": "the Snowflake Semantic View layer",
 }
 
 
@@ -4172,10 +4204,10 @@ def _drop_metricflow_under_native_vendor(
 ) -> dbt_project.ProjectDefinitions:
     """Drop MetricFlow grain and metric lineage when a native vendor owns the layer.
 
-    Under ``semantic.vendor: ossie|slayer|cube`` the vendor layer is the
-    repository's one semantic layer (#922). ``explore`` still reads the dbt
-    project for transformation declarations (``config.meta.dex``, unique and
-    relationships tests), but MetricFlow-derived ``primary_entities`` and
+    Under ``semantic.vendor: ossie|slayer|cube|databricks|snowflake`` the vendor
+    layer is the repository's one semantic layer (#922). ``explore`` still reads
+    the dbt project for transformation declarations (``config.meta.dex``, unique
+    and relationships tests), but MetricFlow-derived ``primary_entities`` and
     ``metric_models`` must not fold into exploration beside that vendor. Under
     ``vendor: dbt`` (or an unset vendor) the definitions are unchanged.
     """

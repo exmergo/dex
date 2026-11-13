@@ -1,5 +1,5 @@
 ---
-title: Your first warehouse map
+title: Set up your Dex project
 sidebarTitle: Quickstart
 description: Install Dex, create a local demo warehouse, and investigate a broken key and join. Learn to read the results before connecting your own warehouse.
 ---
@@ -21,7 +21,12 @@ dex --help
 Already using the Dex skills? Ask your agent to run the commands below through
 its installed wrapper. The wrapper and the CLI use the same engine.
 
-## 2. Create the demo
+## 2. Initialize the project
+
+For guided setup, run `dex init`. It recommends creating a Dex project backed
+by dbt and your chosen connector. The second option creates a complete local
+demo. Existing dbt projects are adopted without replacing their authored files;
+exploration-only and standalone semantic setups do not require dbt.
 
 Use a new directory outside an existing Dex project so the demo can create its
 own configuration.
@@ -29,11 +34,19 @@ own configuration.
 ```bash
 mkdir dex-first-run
 cd dex-first-run
-dex demo
+dex init analytics --mode demo
 ```
 
-The command creates `dex_demo.duckdb` and `.dex/config.yml`. The warehouse has
-seven tables and 29,512 rows. It refuses to replace an existing warehouse file.
+The command creates `dex_demo.duckdb`, `.dex/config.yml`, a dbt skeleton under
+`analytics/`, a README, and managed agent instructions. The warehouse has seven
+tables and 29,512 rows. `.dex/` and onboarding docs stay at the repository root.
+Rerunning setup preserves authored content and updates only Dex-managed sections.
+
+Setup verifies the connection but does not explore data or run a dbt build.
+Read `data.readiness`: configuration, connection, build prerequisites, and an
+actual build are reported separately. Missing credentials leave setup incomplete
+with recovery instructions. No warehouse objects are created during cloud setup.
+The commands below are explicit follow-up work after initialization.
 
 ## 3. Map the warehouse
 

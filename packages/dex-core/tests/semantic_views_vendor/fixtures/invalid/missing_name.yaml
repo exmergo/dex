@@ -1,0 +1,9 @@
+# expect: name
+# A view with no `name`.
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

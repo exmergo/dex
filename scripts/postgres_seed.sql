@@ -33,6 +33,7 @@ CREATE SCHEMA slayer;
 
 CREATE TYPE app.product_category AS ENUM ('electronics', 'grocery', 'apparel', 'home');
 CREATE TYPE app.order_status AS ENUM ('pending', 'paid', 'shipped', 'cancelled');
+CREATE TYPE app.uncomparable AS (payload json);
 
 CREATE TABLE app.customers (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -189,6 +190,7 @@ GRANT CONNECT ON DATABASE dex_dogfood TO dex_ro, dbt_dev;
 -- dex_ro: read the app and slayer schemas, nothing else. No access to dbt_dev.
 GRANT USAGE ON SCHEMA app TO dex_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA app TO dex_ro;
+GRANT USAGE ON TYPE app.uncomparable TO dex_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO dex_ro;
 GRANT USAGE ON SCHEMA slayer TO dex_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA slayer TO dex_ro;
@@ -196,8 +198,10 @@ GRANT SELECT ON ALL TABLES IN SCHEMA slayer TO dex_ro;
 -- dbt_dev: read sources, write only the dev schema; server-side time cap.
 GRANT USAGE ON SCHEMA app TO dbt_dev;
 GRANT SELECT ON ALL TABLES IN SCHEMA app TO dbt_dev;
+GRANT USAGE ON TYPE app.uncomparable TO dbt_dev;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO dbt_dev;
 GRANT USAGE, CREATE ON SCHEMA dbt_dev TO dbt_dev;
 ALTER ROLE dbt_dev SET statement_timeout = '600s';
 
 ANALYZE;
+CREATE EXTENSION IF NOT EXISTS citext;

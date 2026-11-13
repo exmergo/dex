@@ -1,0 +1,26 @@
+# Two tables whose expressions read each other (orders reads customers, and a
+# customers metric reads orders). Snowflake accepts it: a cycle between tables
+# is no cycle between members.
+name: table_cycle
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: segment, expr: customers.market_segment}
+    facts:
+      - {name: total_price, expr: o_totalprice}
+    metrics:
+      - {name: order_count, expr: COUNT(o_orderkey)}
+  - name: customers
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: CUSTOMER}
+    primary_key: {columns: [c_custkey]}
+    dimensions:
+      - {name: market_segment, expr: c_mktsegment}
+    metrics:
+      - {name: avg_order_value, expr: AVG(SUM(orders.total_price))}
+relationships:
+  - name: orders_customers
+    left_table: orders
+    right_table: customers
+    relationship_columns: [{left_column: o_custkey, right_column: c_custkey}]
