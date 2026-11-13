@@ -270,6 +270,21 @@ def _sub_connection_options() -> argparse.ArgumentParser:
     return common
 
 
+def _positive_limit(value: str) -> int:
+    """argparse ``type`` for a --limit that widens a ranked list.
+
+    A zero or negative cap would silently slice the ranking to nothing (or, worse,
+    Python-negative-index it), so reject it at parse time with a usage error.
+    """
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--limit must be a positive integer, got {n}")
+    return n
+
+
 #: One line per group, shown both in --help's subcommand list and as the
 #: onboarding orientation (#296): `dex --help` is where a stranger's first
 #: contact lands, and a bare argparse flag/subcommand dump answered none of
@@ -797,7 +812,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     # --rank, since the unranked list carries no order to cut from.
                     sp.add_argument(
                         "--limit",
-                        type=int,
+                        type=_positive_limit,
                         default=None,
                         metavar="N",
                         help="widen the ranked list to N objects (with --rank)",
