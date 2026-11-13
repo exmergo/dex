@@ -772,7 +772,10 @@ def test_a_project_grain_and_a_rely_key_on_the_same_columns_are_both_named():
 
 def test_a_having_name_both_alias_and_column_is_unchecked_not_dropped(tmp_path, capsys):
     """Databricks reads a table column before an alias in HAVING, so a name
-    that is both was a read only while the table had it: named, not judged."""
+    that is both was a read only while the table had it: named, not judged.
+    The source is an aggregate query, so it claims no relation at all: the
+    whole source goes uncompared, which is the stronger form of not judged.
+    """
 
     _sql(
         tmp_path,
@@ -795,6 +798,8 @@ def test_a_having_name_both_alias_and_column_is_unchecked_not_dropped(tmp_path, 
     assert not findings
     rc, envelope = _run(capsys, root, "maintain", "schema")
     assert rc == 0, envelope["errors"]
-    assert "whether it read the table was not checked" in json.dumps(
-        envelope["warnings"]
+    assert (
+        "view 'orders': its source carries no physical relation dex can read, "
+        "so what reads it was not compared to the warehouse"
+        in json.dumps(envelope["warnings"])
     )
