@@ -14,6 +14,134 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.17.9] - 2026-11-13
+
+### Added
+
+- **`semantic derivation` normalizes double underscores in derived semantic model names.**
+  Marts following Fivetran naming conventions (such as `intercom__threads`) derive
+  valid MetricFlow semantic model names (`intercom_threads`) while preserving the
+  underlying `ref('intercom__threads')` reference. ([#1214](https://github.com/exmergo/dex/pull/1214))
+- **Ambiguous `ref()` inputs resolve through compiled dbt manifest.** When an input matches multiple cached relations (such as legacy and dev builds), `transform plan` and `transform declare` resolve it against the compiled manifest's relation for target when fresh and matching. ([#1242](https://github.com/exmergo/dex/pull/1242))
+- **`semantic.vendor: snowflake` reads Snowflake Semantic View files as the
+  semantic layer.** Name the Semantic View YAML files in
+  `semantic.snowflake.files` (the form `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML` takes
+  and `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` returns) and `explore semantic list`
+  (with `--metric`, `--for-dimension` and `--search`, which also matches
+  synonyms) answers from them. The files are read statically with no Snowflake
+  connection, and validated by dex's own port of Snowflake's specification and
+  validation rules, qualified against `verify_only` on a live account. Every
+  refusal names the file and the element, and a `.sql` file and a legacy Cortex
+  Analyst model are refused by name.
+
+  Every name carries its view:
+  - logical tables are semantic models `view.table`;
+  - dimensions, time dimensions and facts are `view.table.member`, with facts
+    marked never groupable;
+  - a metric that is one aggregate is a measure and a simple metric, and one
+    metric over another is a ratio.
+
+  Primary keys are entities, and every primary and unique key and every
+  relationship (with its arity) reach `explore relationships|map|profile
+  --use-project` at confidence 1.0. `maintain snapshot` fingerprints the layer so
+  that a view read back from Snowflake matches its file, and `maintain grain`
+  measures the keys and arities. Sample values are never surfaced. Governed `query`
+  and `values` are not available yet and refuse by name. Install with
+  `exmergo-dex-core[semantic-views]`.
+
+  A deployed semantic view is never inventoried or probed: `SHOW VIEWS` does not
+  list one, and the inventory skips its members in `SHOW COLUMNS`. The dev-namespace
+  check still counts it as content.
+
+  ([#1313](https://github.com/exmergo/dex/pull/1313))
+- **`semantic snowflake define|update|plan` authors Snowflake Semantic View files,
+  and a declared mart derives a logical table.** Whole files listed in
+  `semantic.snowflake.files` are validated together with dex's port of Snowflake's
+  rules and stored as a reviewable plan that `transform apply` writes byte for
+  byte, keeping each file's mode. A path off the list, a `.sql` file, another
+  suffix and a delete are refused by name, the first with the `dex config set`
+  that adopts it. Every error anywhere in the set refuses the plan. In a file the
+  plan writes, an unknown key, `access_modifier` on a dimension, and a read
+  qualified with its own table that names no member also refuse it. Reading
+  reports that last one as the new `unresolved_member` warning.
+
+  Each logical table and derived metric is reported `defined`, `updated` or
+  `unchanged`, compared as YAML 1.2, so reformatting is not a change. Nothing is
+  deployed: dex runs no `CREATE SEMANTIC VIEW`, no YAML procedure and no grant, and
+  opens no Snowflake connection.
+
+  On `transform plan`, a declared mart becomes a logical table:
+  - the grain as its primary key;
+  - dimensions and time dimensions from its roles;
+  - a fact per measure, and a metric per declared aggregation, held non-additive
+    over time where the measure is semi-additive;
+  - a relationship to each parent table keyed on its foreign key.
+
+  The table is spliced into the file that holds its parents, or proposed as a view
+  of its own. A `declarations` payload on `semantic snowflake plan` annotates an
+  existing table, rewriting only the lines it changes, comments inside the table
+  included. The population is the last sentence of the table's description, which
+  the catalog withholds. Units, NULL rules and assumptions are reported as not
+  carried.
+
+  ([#1314](https://github.com/exmergo/dex/pull/1314))
+- **`maintain` holds Snowflake Semantic Views to the warehouse, and reconciles them
+  through `semantic snowflake update`.** Under `semantic.vendor: snowflake`,
+  `maintain schema` reports four codes, with no Snowflake object created. Each
+  names the view and the element; a column finding also names the column, and a
+  dependency finding lists the elements it takes under `data.reasons`:
+
+  - `declared_column_missing`: a dimension, time dimension, fact, metric,
+    relationship column, key or `base_table.definition` reads a column its table
+    lost.
+  - `declared_relation_missing`: a logical table's `base_table` is gone since the
+    baseline.
+  - `declared_type_conflict`: `SUM`/`AVG` over text, a time dimension over a
+    column that is not temporal, or a declared `data_type` in another family.
+  - `declared_dependency_dropped`: whatever Dex's reader then refuses, to a
+    fixpoint.
+
+  The severities follow what Snowflake does with each conflict, probed on an
+  account. It fails every query that sums text. It answers a text time dimension
+  with the column's values, so that finding is advised, never cut. It ignores a
+  declared `data_type`.
+
+  `maintain reconcile` cuts the removals out of the files as a plan the reader
+  validates, with the comments written directly above each removed entry, keeping
+  every other byte. A gone `base_table`, a key or `definition` naming a dropped
+  column, and a removal that empties the view stay advisory.
+
+  The fingerprint records which key is the primary key and which a uniqueness
+  claim (`key_claims`), and each table's primary key as its declaration, so a
+  changed primary key is `declaration_changed`. A contradicted key or
+  relationship arity is worded as the view's claim and carries `declared_by` and
+  `claim`, since Snowflake trusts a declared key without checking it.
+  `key_lost_uniqueness` names the claim too, and `join_cardinality_exceeded`
+  carries `declared_by` and `claim` for every native vendor.
+
+  ([#1315](https://github.com/exmergo/dex/pull/1315))
+
+### Fixed
+
+- **Metric View query sources with an aggregate or `HAVING` claim no relation.** A `source` query that aggregates its table (for example `SELECT SUM(b) AS a FROM t`), or filters with `HAVING` and no `GROUP BY`, no longer claims that table as its relation, since the view holds fewer rows than the table. A window function keeps the claim, as it keeps the row count. ([#1302](https://github.com/exmergo/dex/pull/1302))
+- **`maintain reconcile` no longer refuses a repository whose only layer is a
+  native semantic layer without a schema route of its own.** Its findings are
+  advisory there, as they already were for vendors with one. A contradicted primary
+  key's advice now names a `semantic <vendor> update` route only where dex authors
+  that vendor, and says to change the key in its file otherwise. ([#1313](https://github.com/exmergo/dex/pull/1313))
+- **`maintain reconcile` advice follows the semantic layer's claim, and no longer
+  promises a test edit with no project to put it in.**
+
+  - A lapsed key a semantic layer declares used to get the dbt advice ("change
+    the declared grain"). It now names the layer's route to change the key.
+  - A Snowflake relationship's arity is no longer advised as a cardinality to
+    declare. It is inferred from the referenced table's key.
+  - In a repository whose only layer is a semantic one, a lost key no longer
+    warns that a `unique` test has nowhere to go.
+
+  ([#1315](https://github.com/exmergo/dex/pull/1315))
+
+
 ## [1.17.8] - 2026-11-12
 
 ### Added
