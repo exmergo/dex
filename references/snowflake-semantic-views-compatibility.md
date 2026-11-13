@@ -145,7 +145,7 @@ The account decided, and each row below records what it said:
 
 **What only the warehouse can decide.** Whether a name a table reads is one of
 its base table's columns is a fact about the warehouse, so the static reader
-accepts it. `maintain`'s schema checks (#1293) hold the columns to the warehouse.
+accepts it. `maintain`'s schema axis holds the columns to the warehouse (see below).
 
 ## How a Semantic View maps onto the catalog
 
@@ -225,12 +225,59 @@ A semantic view on the account is not a relation Dex profiles: a plain
 
 | Axis | On Semantic Views |
 |---|---|
-| `snapshot` | fingerprints the view's own keys (description, `variables`, `max_staleness`, tags) as a definition named after the view, each logical table (`view.table`, with its members' columns and its primary and unique keys), each table and view-level metric, and each key-equality relationship with its ordered pairs and arity; records `vendor: snowflake` and `format_version` |
-| `schema` | unchanged: no vendor schema axis yet (#1293) |
+| `snapshot` | fingerprints the view's own keys (description, `variables`, `max_staleness`, tags) as a definition named after the view, each logical table (`view.table`, with its members' columns and its primary and unique keys, each key's claim under `key_claims`), each table and view-level metric, and each key-equality relationship with its ordered pairs and arity; records `vendor: snowflake` and `format_version`, and each table's primary key as its declaration |
+| `schema` | the four `declared_*` codes, on Dex's own metadata (see below) |
 | `volume` | unchanged: it reads the warehouse, not the layer |
-| `grain` | measures each primary and unique key (`declared_grain_not_unique`) and each relationship's arity (`join_cardinality_exceeded`); an ASOF or range relationship states no arity and is named unchecked |
-| `semantic` | definition drift, as everywhere |
-| `reconcile` | advisory, naming `semantic snowflake update` as the route; no edit is stored until the schema axis (#1293) |
+| `grain` | measures each primary and unique key (`declared_grain_not_unique`, or `key_lost_uniqueness` for a key measured unique at the baseline) and each relationship's arity (`join_cardinality_exceeded`), each worded as the view's claim with `declared_by: snowflake` and `claim`; an ASOF or range relationship states no arity and is named unchecked |
+| `semantic` | definition drift, as everywhere; a changed primary key is `declaration_changed` on `grain`, and a new rule set `semantic_format_changed` |
+| `reconcile` | the schema removals as a `semantic snowflake update` plan, cut in place; key and arity findings advisory (see below) |
+
+**The schema axis** holds each view to the columns and types Dex captured
+through its own connection. Snowflake compares a semantic view against its
+tables only when one is created, and Dex creates none, so the rules run on Dex's
+metadata.
+
+| Code | When |
+|---|---|
+| `declared_column_missing` | a dimension, time dimension, fact or metric, a relationship's columns on either side, a `primary_key` or `unique_keys` entry, or a `base_table.definition` query reads a column its table no longer has |
+| `declared_relation_missing` | a logical table's `base_table` was in the baseline and is gone; one neither the connection nor the baseline lists is a note |
+| `declared_type_conflict` | `SUM`/`AVG` over text, a time dimension over a column that is not temporal, a declared `data_type` in another family than the column's |
+| `declared_dependency_dropped` | what the reader refuses once those go, to a fixpoint |
+
+Each finding names the view and the element. `declared_column_missing` and
+`declared_type_conflict` name it in `data.element`
+(`tables['orders'].dimensions['region']`, `relationships['orders_customers']`,
+`tables['customers'].unique_keys[0]`) and carry the column. A
+`declared_relation_missing` names the logical table and has no column. One
+`declared_dependency_dropped` per relation lists each element it takes, with the
+reason, under `data.reasons`. Probed on an account, Snowflake accepts all three type conflicts when the
+view is created. What happens after that sets each one's severity and remedy:
+
+| Conflict | Snowflake | Dex |
+|---|---|---|
+| `SUM`/`AVG` over text | fails every query reading it (`Numeric value ... is not recognized`) | `high`; the metric is removed |
+| a time dimension over text | answers with the column's values as the time dimension | `medium`; advised, never cut |
+| a declared `data_type` in another family | ignores it and records the column's own type | `low`; the `data_type` is cut, the member kept |
+
+**Reconcile cuts in place.** `maintain reconcile` cuts each removed member,
+derived metric and relationship out of its list, along with the comments
+written directly above it, and stores the result as a `semantic snowflake
+update` plan. The reader validates the plan, strict rules included, before it
+is stored, and every other byte is kept. An emptied list is written `[]`, which
+Snowflake accepts.
+
+Advisory, never written:
+
+- a logical table whose `base_table` is gone;
+- a key naming a dropped column;
+- a `definition` query reading one;
+- a time dimension over text;
+- a removal the reader would refuse, or one that leaves the view no member.
+
+A primary key, unique key or relationship arity the data contradicts is advice
+naming `semantic snowflake update`. Snowflake trusts a declared key without
+checking it: with one key duplicated, a count grouped through the relationship
+includes that customer's orders twice.
 
 **A read-back fingerprints as its file.** `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`
 changes nothing that is part of the definition, so the hash covers a canonical

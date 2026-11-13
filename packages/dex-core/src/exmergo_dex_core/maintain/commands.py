@@ -2029,10 +2029,9 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # A semantic vendor with no project beside it is that repository's
             # one layer: its findings on the other axes (a contradicted key on
             # grain, say) are advisory there too, never a refusal (#1259). That
-            # holds for a vendor whose source has no schema channel yet as well
-            # (Snowflake Semantic Views until #1293): the layer is still the
-            # repository's one layer, and its findings still have nowhere to
-            # land but a person's edit.
+            # holds for a native vendor whose source has no schema channel as
+            # well: the layer is still the repository's one layer, and its
+            # findings still have nowhere to land but a person's edit.
             if semantic_source is None and not _native_semantic_vendor(engine):
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(

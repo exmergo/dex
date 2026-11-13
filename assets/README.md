@@ -17,8 +17,9 @@ They are drawn in the trydex.ai style and made from source in
 
 # README section images
 
-`readme/explore-*.png`, `readme/transform-*.png`, and `readme/maintain-*.png`
-illustrate the README's Explore, Transform, and Maintain sections, each in a
+`readme/explore-*.png`, `readme/transform-*.png`, `readme/maintain-*.png`, and
+`readme/semantics-*.png` illustrate the README's Explore, Transform, Maintain, and
+Dex Semantics sections, each in a
 light and a dark (blueprint) version for GitHub's two themes, at 2x the size
 the README shows them. Their sources are `dex/readme/*.html` in
 exmergo/internal-marketing.

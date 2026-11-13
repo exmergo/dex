@@ -1,8 +1,8 @@
 # expect: reference
 # An expression reading a member the table does not declare.
 # static: unchecked. Whether `total_price` is a column of ORDERS needs the
-# warehouse, so dex's static reader accepts it; maintain's schema checks (#1293)
-# hold columns to the warehouse. Reading warns `unresolved_member`, and authoring
+# warehouse, so dex's static reader accepts it; maintain's schema axis holds
+# columns to the warehouse (#1293). Reading warns `unresolved_member`, and authoring
 # refuses it in a file dex writes (#1292).
 # warns: unresolved_member
 name: unknown_member

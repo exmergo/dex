@@ -227,6 +227,16 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "dex-semantics.md",
+        "semantic-layers/dex-semantics",
+        PageMeta(
+            "Dex Semantics",
+            "What Dex Semantics is: declarations that keep a model's meaning as "
+            "code, checks of the built data against them, and the semantic "
+            "layers they derive.",
+        ),
+    ),
+    ReferencePage(
         "semantic-layer.md",
         "semantic-layers/overview",
         PageMeta(

@@ -36,6 +36,7 @@ __all__ = [
     "Read",
     "aggregate",
     "aggregates",
+    "definition_reads",
     "definition_table",
     "over_columns",
     "plain",
@@ -68,6 +69,8 @@ class Read:
     qualifier: str | None
     name: str
     depth: int
+    #: Whether the name was written quoted, which keeps its spelling.
+    quoted: bool = False
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,11 @@ def _read(node: exp.Column) -> Read | None:
         if isinstance(parent, exp.AggFunc):
             depth += 1
         parent = parent.parent
-    return Read(qualifier=node.table or None, name=node.name, depth=depth)
+    identifier = node.this
+    quoted = bool(getattr(identifier, "quoted", False))
+    return Read(
+        qualifier=node.table or None, name=node.name, depth=depth, quoted=quoted
+    )
 
 
 def reads(sql: str) -> list[Read] | None:
@@ -287,3 +294,50 @@ def definition_table(sql: str) -> tuple[str | None, str | None]:
             "stands behind it"
         )
     return ".".join(part.name for part in single.parts), None
+
+
+def definition_reads(sql: str) -> tuple[str, list[str]] | None:
+    """The one table a ``base_table.definition`` query reads, and every column
+    of it the query names, or ``None`` where that cannot be said (#1293).
+
+    Any shape of query over one table qualifies, a filter or a grouping
+    included, since every column it names is a column of that table. ``None``
+    for a query that does not parse, reads more than one table (a join, a
+    subquery, a ``WITH`` clause), or names a column through a qualifier other
+    than that table's. A name in ``ORDER BY``, ``GROUP BY`` or ``HAVING`` that
+    is also an output alias is left out, since Snowflake may read it as the
+    alias.
+    """
+
+    tree = _unwrap(_parse(sql))
+    while isinstance(tree, exp.Subquery):
+        tree = tree.this
+    if not isinstance(tree, exp.Select):
+        return None
+    tables = list(tree.find_all(exp.Table))
+    if len(tables) != 1 or any(True for _ in tree.find_all(exp.Subquery, exp.CTE)):
+        return None
+    (table,) = tables
+    names = {part.name.lower() for part in table.parts[-1:]}
+    if table.alias:
+        names.add(table.alias.lower())
+    aliases = {
+        projection.alias.lower()
+        for projection in tree.expressions
+        if isinstance(projection, exp.Alias)
+    }
+    found: list[str] = []
+    for node in tree.find_all(exp.Column):
+        if isinstance(node.this, exp.Star):
+            continue
+        if node.args.get("db") or node.args.get("catalog"):
+            return None
+        if node.table and node.table.lower() not in names:
+            return None
+        if not node.table and node.name.lower() in aliases:
+            clause = node.find_ancestor(exp.Order, exp.Group, exp.Having)
+            if clause is not None:
+                continue
+        if node.name.lower() not in {f.lower() for f in found}:
+            found.append(node.name)
+    return ".".join(part.name for part in table.parts), found
