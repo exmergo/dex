@@ -83,6 +83,8 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # Declarations for models that already exist (#501): opt-in, one capped
         # plan per call, repo-and-cache only.
         "declare",
+        # A failing package model's project override, drafted as a plan (#1229).
+        "repair",
         "test",
         # Whether a stored plan keeps a model's results (#856).
         "compare",
@@ -406,6 +408,14 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "intent the --edits-file declarations supply. Capped at 25 models; "
         "every skipped model is named. Repo-only and free.",
     ),
+    ("transform", "repair"): (
+        "draft an override that repairs a failing package model",
+        "Read the latest build's failure of a package model, restate its SQL as "
+        "a project override (package macros qualified, vars resolved, the "
+        "package node disabled), convert the columns the error names where the "
+        "cached profile settles what they hold, compile it, and store it as a "
+        "plan. Nothing is applied.",
+    ),
     ("transform", "test"): (
         "scaffold a unit test, or mutation-test existing tests",
         "--scaffold plans a unit_tests skeleton for a model. --mutate plants "
@@ -474,6 +484,13 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "semantic.cube.files configures, with dex's port of Cube's model rules, "
         "then store a plan. Needs the [cube] extra. No Cube server, no "
         "warehouse. Repo-only.",
+    ),
+    ("semantic", "databricks"): (
+        "plan whole-file edits to the Metric View YAML files",
+        "Validate whole Metric View YAML files at the paths "
+        "semantic.databricks.files configures, with dex's port of the Metric View "
+        "YAML 1.1 rules, then store a plan. Needs the [metric-views] extra. Never "
+        "deploys a view and opens no workspace connection. Repo-only.",
     ),
     ("maintain", "snapshot"): (
         "capture the known-good baseline in .dex/snapshot.json",
@@ -576,6 +593,8 @@ ranks what matters, profiles it, and infers how the tables join.
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """The argparse tree for every group and subcommand."""
+
     parser = argparse.ArgumentParser(
         prog="dex",
         description=(
@@ -753,6 +772,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="DATASETS",
                         help=(
                             "run each statement once per dataset, substituted for {ds}"
+                        ),
+                    )
+                    # A model `transform build` just wrote lives in the dev
+                    # namespace, outside the source scope (#1133); this reads it
+                    # for one command, as `explore profile --target dev` does.
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "also read this dbt dev target's namespace; "
+                            "prod-looking targets are refused"
                         ),
                     )
                 if group == "explore" and name == "cluster":
@@ -1143,9 +1173,13 @@ def _build_parser() -> argparse.ArgumentParser:
                     )
                     sp.add_argument(
                         "--select",
+                        nargs="+",
                         default=None,
                         metavar="SELECTOR",
-                        help="dbt node selection, passed through to dbt",
+                        help=(
+                            "dbt node selection (one or more selectors, or quoted), "
+                            "passed through to dbt"
+                        ),
                     )
                     # Opt-in on every connector, free ones included. Verifying
                     # on DuckDB costs nothing, so defaulting it on there was
@@ -1299,9 +1333,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="return the reasoning without storing a plan",
                     )
+                if group == "transform" and name == "repair":
+                    sp.add_argument(
+                        "nodes",
+                        nargs="*",
+                        metavar="model",
+                        help="a failing package model (`model` or `pkg.model`)",
+                    )
                 if group == "transform" and name == "declare":
-                    # The selector `maintain verify` takes: model names, repeated
-                    # or comma-separated; none selects every model.
+                    # The selector `maintain verify` takes: model names, repeated,
+                    # comma-separated, or in one quoted argument separated by
+                    # spaces; none selects every model.
                     sp.add_argument(
                         "objects",
                         nargs="*",
@@ -1364,6 +1406,19 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=None,
                         metavar="COLUMN",
                         help="baseline column whose type may change in its family",
+                    )
+                    expect = sp.add_mutually_exclusive_group()
+                    expect.add_argument(
+                        "--expect",
+                        default=None,
+                        metavar="JSON",
+                        help="JSON: the rows the plan may add, remove and change",
+                    )
+                    expect.add_argument(
+                        "--expect-file",
+                        default=None,
+                        metavar="PATH",
+                        help='read --expect\'s JSON from a file ("-" reads stdin)',
                     )
                     sp.add_argument(
                         "--target",
@@ -1510,7 +1565,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         nargs="*",
                         metavar="object",
                         help=(
-                            "dbt selector to verify (default: the whole project)"
+                            "model names: repeated, comma-separated or "
+                            "space-separated (default: all)"
                             if name == "verify"
                             else "object to check (default: the whole project)"
                         ),
@@ -1609,6 +1665,8 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # First, and without `ensure_dialect_available`: demo authors no SQL a guard
     # has to clear, and it must stay reachable on the lightest install that can
     # run it, which is the one a first-time user has.
+    """Dispatch one parsed command to its handler and return its envelope."""
+
     if args.group == "demo":
         from .demo.commands import cmd_demo
 
@@ -1685,6 +1743,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         ("transform", "remove"): "cmd_remove",
         ("transform", "place"): "cmd_place",
         ("transform", "declare"): "cmd_declare",
+        ("transform", "repair"): "cmd_repair",
         ("transform", "test"): "cmd_test",
         ("transform", "compare"): "cmd_compare",
         ("transform", "export"): "cmd_export",

@@ -22,7 +22,7 @@ through [supported connectors](#connectors).
 [![PyPI](https://img.shields.io/pypi/v/exmergo-dex-core?logo=pypi&logoColor=white&color=165dfc)](https://pypi.org/project/exmergo-dex-core/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-165dfc)](LICENSE)
 [![data-eng-bench](https://img.shields.io/badge/data--eng--bench-57%25-33cf56)](benchmarks/data-eng-bench/README.md)
-[![ADE-bench](https://img.shields.io/badge/ADE--bench-76%25-33cf56)](benchmarks/ade_bench/README.md)
+[![ADE-bench](https://img.shields.io/badge/ADE--bench-80%25-33cf56)](benchmarks/ade_bench/README.md)
 [![CI](https://github.com/exmergo/dex/actions/workflows/ci.yml/badge.svg)](https://github.com/exmergo/dex/actions/workflows/ci.yml)
 
 [![Docs](https://img.shields.io/badge/docs-docs.exmergo.com%2Fdex-165dfc?logo=readthedocs&logoColor=white)](https://docs.exmergo.com/dex)
@@ -162,16 +162,10 @@ type contradicts their content, and two designed PII false positives. See the
 
 ## How it works
 
-```mermaid
-flowchart LR
-  Agent[Coding agent] --> Skills[Dex skills]
-  Skills --> Engine[exmergo-dex-core engine]
-  Engine -->|SELECT-only SQL, cost-capped| Database[(Your database, data warehouse, or SQL endpoint)]
-  Engine -->|dbt builds, dev target only| Database
-  Engine -->|one sanitized JSON envelope| Agent
-  Engine -->|plans as diffs| Repo[Your repository: dbt project + semantic layer]
-  Engine <--> Cache[.dex/ cache and snapshot]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/how-it-works-dark.png" />
+  <img width="760" height="630" alt="How it works: your coding agent runs a Dex skill, which calls the exmergo-dex-core engine; the engine queries your data (SELECT-only, cost-capped, dbt builds on dev only), writes plans as reviewable diffs to your repository, keeps its cache in .dex/, and returns one sanitized JSON envelope to the agent" src="assets/readme/how-it-works-light.png" />
+</picture>
 
 The skills connect your agent to the `exmergo-dex-core` engine, which holds the
 logic and guardrails behind a [small command contract](https://docs.exmergo.com/dex/reference/command-contract).
@@ -186,7 +180,10 @@ personal data, read and query the semantic layer, and map relationships as a
 Mermaid ER diagram. Exploration is read-only and needs no dbt project.
 [Skill](skills/explore/SKILL.md) · [methodology](https://docs.exmergo.com/dex/concepts/methodology) · [commands](https://docs.exmergo.com/dex/cli/explore)
 
-<img width="522" height="343" alt="Explore" src="https://github.com/user-attachments/assets/7f16b370-66ed-4596-ae01-041cf3db3525" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/explore-dark.png" />
+  <img width="522" height="343" alt="Explore" src="assets/readme/explore-light.png" />
+</picture>
 
 ### Transform
 
@@ -196,7 +193,10 @@ native semantic layer without a dbt project. Review each stored plan before
 applying it, then build and verify on a dev target.
 [Skill](skills/transform/SKILL.md) · [what Dex writes](https://docs.exmergo.com/dex/concepts/dbt-project) · [commands](https://docs.exmergo.com/dex/cli/transform)
 
-<img width="504" height="271" alt="Transform" src="https://github.com/user-attachments/assets/fda40e48-b481-424c-adc7-d79c0ede346b" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/transform-dark.png" />
+  <img width="504" height="271" alt="Transform" src="assets/readme/transform-light.png" />
+</picture>
 
 ### Maintain
 
@@ -206,7 +206,10 @@ the proposed edits. `maintain verify` also checks a project as it stands, with n
 baseline needed.
 [Skill](skills/maintain/SKILL.md) · [commands](https://docs.exmergo.com/dex/cli/maintain)
 
-<img width="484" height="344" alt="Maintain" src="https://github.com/user-attachments/assets/ff714eaf-f0b2-46d6-8a4b-c69791740f18" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/maintain-dark.png" />
+  <img width="484" height="344" alt="Maintain" src="assets/readme/maintain-light.png" />
+</picture>
 
 > [!TIP]
 > **Give every agent in your repository the same procedure.**
@@ -301,9 +304,12 @@ raw per-task results, including the ones that flatter us least.
 | Benchmark | Setup | Result | Details |
 |---|---|---|---|
 | **data-eng-bench** (Snowflake, 103 tasks) | Dex + Claude Sonnet 5 | **57.3%** resolved, 89.7% of assertions pass | [README](benchmarks/data-eng-bench/README.md) |
-| **ADE-bench** (dbt Labs, 75 tasks) | Dex + Claude Sonnet 5 | **76%** resolved, at 2.5x lower cost than Fable 5 | [README](benchmarks/ade_bench/README.md) |
+| **ADE-bench** (dbt Labs, 75 tasks) | Dex 1.17.4 + Claude Sonnet 5.5 | **80%** resolved vs 73.3% without Dex; **25% fewer failures** | [README](benchmarks/ade_bench/README.md) |
 
-<img width="719" height="283" alt="ADE-bench accuracy and cost by model" src="https://github.com/user-attachments/assets/9f8bca64-6508-4590-9fa7-bb1ac077263d" />
+On ADE-bench, the same Claude Sonnet 5.5 model solves **60 of 75 tasks with Dex**,
+compared with **55 without it**: **+6.7 percentage points**, with net gains across
+six of seven projects. Both configurations make one scored attempt per task.
+[Compare the runs and raw results](benchmarks/ade_bench/README.md).
 
 We believe that benchmarks are important, but not as important as user/agent experience.  
 Trust in a diff, cost surfaced before spend, and sensitive data kept out of context. We optimize for that experience

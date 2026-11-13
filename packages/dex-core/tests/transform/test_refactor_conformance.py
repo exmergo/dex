@@ -51,8 +51,8 @@ def test_shared_case_on_duckdb(case, adapter):
     ],
 )
 def test_no_connector_gets_a_hash_or_a_sample(dialect):
-    left = _project("select 1 as a", ["a"], ["a"], dialect)
-    right = _project("select 1 as a", ["a"], ["a"], dialect)
+    left = _project("select 1 as a", ["a"], ["a"], [None], dialect)
+    right = _project("select 1 as a", ["a"], ["a"], [None], dialect)
     for sql in (
         _multiset_sql(left, right, ["a"], dialect),
         _keyed_sql(left, right, ["a"], ["a"], dialect),

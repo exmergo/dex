@@ -1,0 +1,35 @@
+{
+  "diagnosis": {
+    "verdict": "no_defect",
+    "fields": [
+      "1099"
+    ],
+    "evidence": [
+      [
+        "raw.subscriptions",
+        "subscriptions",
+        "source",
+        "feed"
+      ]
+    ],
+    "explains": [
+      "not in the source",
+      "not in raw",
+      "does not exist",
+      "doesn't exist",
+      "no row",
+      "no record",
+      "not present",
+      "absent",
+      "never arrived",
+      "not in the feed",
+      "no such subscription",
+      "isn't in the source",
+      "isn't in raw",
+      "is not in the source",
+      "is not in raw",
+      "no 1099",
+      "not in the source data"
+    ]
+  }
+}

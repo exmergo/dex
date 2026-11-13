@@ -1,0 +1,7 @@
+{
+  "kind": "build",
+  "models": [
+    "listing_review_summary"
+  ],
+  "prompt": "Build a mart model `listing_review_summary` in models/marts with one row per listing that has at least one review: `listing_id`, `listing_name`, `review_count` and `avg_rating` (the mean rating of its reviews). Build it on dev when you are done."
+}

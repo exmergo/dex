@@ -75,6 +75,9 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # CacheRequiredError and NoBaselineError stayed unreachable long enough for
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
+    # Caught before a caller sees it: a retirement tree that does not compile
+    # becomes `compile_unavailable` records (#1170).
+    "CompileUnavailableError",
     # Caught before a caller sees it: an identifier probe or a join coverage
     # probe that needs a safe cast on Postgres becomes an `unchecked` record
     # with `reason_code: no_safe_cast_on_connector` (#861).
@@ -89,6 +92,12 @@ INTERNAL_REFUSALS = {
     "CubeRefusalError",
     "CubeTransportError",
     "StaleRendererError",
+    # Never leaves the Metric View validator: it stops reading one element, and
+    # the finding it carries is what a caller sees (#1257).
+    "_RefusedError",
+    # Never leaves Metric View annotation: it becomes the declaration's `failed`
+    # reason, which the native route refuses the plan with (#1258).
+    "_UnwritableError",
     # Connector-specific connection failures. A host catches the ConnectorError
     # family instead of importing eight names, one per warehouse it does not use.
     "BigQueryConnectionError",

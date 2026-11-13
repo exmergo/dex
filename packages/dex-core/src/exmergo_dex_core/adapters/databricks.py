@@ -29,7 +29,7 @@ dex never spends on a warehouse the config does not name.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import DatabricksTarget
@@ -45,6 +45,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_parts,
     is_blob_type,
     is_integer_type,
@@ -238,7 +239,7 @@ class DatabricksAdapter:
         self._clock = clock
         self._conn: Any = None
         self._visible_catalogs: set[str] | None = None
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
@@ -347,7 +348,7 @@ class DatabricksAdapter:
         # facts it learned lived on the objects dropped above.
         self._detail_attempted: set[str] = set()
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``catalog.schema``, the namespace this command's build
         writes into, or stop reading it with ``None``.
 
@@ -358,7 +359,7 @@ class DatabricksAdapter:
         changed.
         """
 
-        scope = scope.strip().lower() if scope else None
+        scope = dev_target_entries(scope, str.lower)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()
@@ -387,7 +388,17 @@ class DatabricksAdapter:
 
     def _register(self, table: Any) -> None:
         identifier = str(table.full_name)
-        table_type = str(getattr(table, "table_type", "") or "")
+        raw_type = getattr(table, "table_type", "") or ""
+        # The SDK hands an enum (`TableType.METRIC_VIEW`); a fake or an older
+        # SDK, the text. Its value is the text either way.
+        table_type = str(getattr(raw_type, "value", raw_type))
+        if table_type.upper() == "METRIC_VIEW":
+            # A deployed Metric View is a semantic definition, not a relation:
+            # Databricks refuses a plain SELECT of its measure columns
+            # (METRIC_VIEW_MISSING_MEASURE_FUNCTION), so a profile or a grain
+            # probe over it would fail the whole command (#1259). Its YAML is
+            # read from the repository under `semantic.vendor: databricks`.
+            return
         columns = self._column_metas_from(getattr(table, "columns", None))
         if columns is not None:
             self._columns[identifier] = columns

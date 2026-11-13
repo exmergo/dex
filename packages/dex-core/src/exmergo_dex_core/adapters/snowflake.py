@@ -38,7 +38,7 @@ import contextlib
 import json
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -55,6 +55,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -903,7 +904,7 @@ class SnowflakeAdapter:
 
         self._sf_errors = sf_errors
         self._visible_databases: set[str] | None = None
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._warehouse_info: dict | None = None
         self._notes: dict[str, list[str]] = {}
@@ -1044,11 +1045,14 @@ class SnowflakeAdapter:
         # verdicts compare against rows that were counted rather than reported.
         self._exact_rows: dict[str, int] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
+        # Each column's SHOW COLUMNS type document, kept beside the rendered
+        # token so a dbt macro can be handed the type DESCRIBE prints (#1154).
+        self._type_documents: dict[str, list[tuple[str, str]]] = {}
         self._inventory_loaded = False
         self._resolved_scopes: list[str] | None = None
         self._schemas_by_database: dict[str, set[str]] = {}
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``DATABASE.SCHEMA``, the namespace this command's build
         writes into, or stop reading it with ``None``.
 
@@ -1058,7 +1062,7 @@ class SnowflakeAdapter:
         what was listed, since the scope that produced it has changed.
         """
 
-        scope = scope.strip().upper() if scope else None
+        scope = dev_target_entries(scope, str.upper)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()
@@ -1113,6 +1117,9 @@ class SnowflakeAdapter:
                     continue
                 identifier = self._identifier_of(row)
                 columns = by_table.setdefault(identifier, [])
+                self._type_documents.setdefault(identifier, []).append(
+                    (str(row["column_name"]), str(row["data_type"]))
+                )
                 columns.append(
                     ColumnMeta(
                         name=str(row["column_name"]),
@@ -1164,6 +1171,9 @@ class SnowflakeAdapter:
         if columns is None:
             columns = []
             rows = self._show(f"SHOW COLUMNS IN TABLE {self._quote(identifier)}")
+            self._type_documents[identifier] = [
+                (str(row["column_name"]), str(row["data_type"])) for row in rows
+            ]
             for ordinal, row in enumerate(rows):
                 columns.append(
                     ColumnMeta(
@@ -1186,6 +1196,56 @@ class SnowflakeAdapter:
             return str(parsed.get("type", data_type_json))
         except (json.JSONDecodeError, AttributeError):
             return data_type_json
+
+    def dbt_column_types(self, identifier: str) -> list[list[str]]:
+        """One relation's columns typed as ``DESCRIBE TABLE`` prints them (#1154).
+
+        dbt-snowflake lists a relation's columns with ``describe table`` and
+        builds each with ``SnowflakeColumn.from_description``, so a macro reads
+        ``NUMBER(10,2)`` and ``VARCHAR(16777216)`` where ``table_metadata``
+        surfaces the bare ``FIXED`` and ``TEXT`` tokens. Rendered from the same
+        free ``SHOW COLUMNS`` documents, so planning hands dbt the type a build
+        would see, precision, scale and length included.
+        """
+
+        self.table_metadata(identifier)
+        key = identifier if identifier in self._objects else identifier.upper()
+        return [
+            [name, self._describe_type(document)]
+            for name, document in self._type_documents.get(
+                self._objects[key]["identifier"], []
+            )
+        ]
+
+    @staticmethod
+    def _describe_type(data_type_json: str) -> str:
+        """A SHOW COLUMNS type document as DESCRIBE TABLE spells the type."""
+
+        try:
+            parsed = json.loads(data_type_json)
+            kind = str(parsed["type"])
+        except (json.JSONDecodeError, AttributeError, KeyError, TypeError):
+            return data_type_json
+
+        def sized(name: str, *keys: str) -> str:
+            """``name(k1,k2)`` where the document carries every key, else ``name``."""
+
+            values = [parsed.get(key) for key in keys]
+            if any(value is None for value in values):
+                return name
+            return f"{name}({','.join(str(value) for value in values)})"
+
+        if kind == "FIXED":
+            return sized("NUMBER", "precision", "scale")
+        if kind == "TEXT":
+            return sized("VARCHAR", "length")
+        if kind == "BINARY":
+            return sized("BINARY", "length")
+        if kind == "REAL":
+            return "FLOAT"
+        if kind in {"TIMESTAMP_NTZ", "TIMESTAMP_LTZ", "TIMESTAMP_TZ", "TIME"}:
+            return sized(kind, "scale")
+        return kind
 
     @staticmethod
     def _column_nullable(data_type_json: str) -> bool:

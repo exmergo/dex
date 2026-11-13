@@ -1,0 +1,12 @@
+version: 2
+sources:
+  - name: tiny_inbox
+    schema: raw
+    description: The inbox vendor's tables, as its connector loads them.
+    tables:
+      - name: conversations
+        description: One row per conversation the vendor still has.
+      - name: conversation_parts
+        description: >-
+          One row per message, note or assignment in a conversation. The
+          connector never deletes, so parts of a deleted conversation remain.

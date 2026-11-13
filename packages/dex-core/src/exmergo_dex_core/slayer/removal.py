@@ -65,6 +65,61 @@ def proposals_and_edits(
 
     by_file: dict[str, list[DriftFinding]] = {}
     for finding in findings:
+        if finding.code == "declared_type_conflict" and (
+            finding.data.get("remedy_kind") == "reingest"
+        ):
+            # A column that became a list. SLayer's remedy is `slayer ingest`,
+            # which rewrites the model file dex owns, so the edit is stated as
+            # the declaration it leads to, made through dex's own route.
+            element = finding.data.get("element_type") or "UNKNOWN"
+            proposals.append(
+                _proposal(
+                    finding,
+                    "advisory",
+                    f"SLayer model '{finding.data.get('semantic_model')}' "
+                    f"({finding.data.get('model_file')}), column "
+                    f"'{finding.data.get('declared_column')}' is now a list "
+                    f"({finding.data.get('warehouse_type')}). SLayer's remedy is "
+                    "to re-ingest the datasource; dex does not run `slayer "
+                    "ingest`, which would rewrite a file dex owns. Declare it "
+                    f"`type: ARRAY` with `element_type: {element}` through "
+                    "`semantic slayer update` (group it by its elements, "
+                    f"`{finding.data.get('declared_column')}.value`), "
+                    + (
+                        "and remove or rewrite the measures a list cannot "
+                        "aggregate: "
+                        + ", ".join(
+                            f"{b['measure']} ({b['aggregation']})"
+                            for b in finding.data.get("breaks_measures") or []
+                        )
+                        + "; "
+                        if finding.data.get("breaks_measures")
+                        else ""
+                    )
+                    + "or restore the warehouse type if the change was not "
+                    "intended",
+                    paths=[str(finding.data.get("model_file"))],
+                )
+            )
+            continue
+        if finding.code == "declared_type_conflict":
+            # SLayer removes nothing for a retype; its remedy is the declared
+            # type, which only the author can confirm is the one they mean.
+            proposals.append(
+                _proposal(
+                    finding,
+                    "advisory",
+                    f"SLayer model '{finding.data.get('semantic_model')}' "
+                    f"({finding.data.get('model_file')}), column "
+                    f"'{finding.data.get('declared_column')}': "
+                    f"{finding.data.get('remedy') or 'change the declared type'}. "
+                    "Make that edit with `semantic slayer update`, which refuses "
+                    "a measure the new type cannot aggregate; or restore the "
+                    "warehouse type if the change was not intended",
+                    paths=[str(finding.data.get("model_file"))],
+                )
+            )
+            continue
         by_file.setdefault(str(finding.data.get("model_file")), []).append(finding)
 
     for path, group in sorted(by_file.items()):
@@ -118,14 +173,7 @@ def proposals_and_edits(
                 "mechanical",
                 f"remove {described} from SLayer model '{model}', the minimal "
                 "removal SLayer's own validate-models rules compute for this "
-                "schema; review the diff before applying it"
-                + (
-                    ". If the warehouse type is the intended one, discard this "
-                    "plan and change the column's declared type with `semantic "
-                    "slayer update` instead"
-                    if finding.code == "declared_type_conflict"
-                    else ""
-                ),
+                "schema; review the diff before applying it",
                 paths=[path],
             )
             for finding in group

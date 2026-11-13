@@ -280,6 +280,8 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
 
 
 def plan_hint(result: PlanResult) -> dict[str, str]:
+    """The plan envelope's `next`: what to compare, repair or apply, in order."""
+
     companion = (getattr(result, "semantic_proposal", None) or {}).get("plan_id")
     if companion:
         # Named both explicitly: a bare `transform apply` takes the latest
@@ -309,12 +311,28 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
                 for b in m.get("blocked_inputs") or []
             }
         )
+        failed_packages = sorted(
+            {
+                b["model"]
+                for m in offer["per_model"]
+                for b in m.get("blocked_inputs") or []
+                if b.get("repair")
+            }
+        )
         if blocked and not offer.get("mixed_with_repair"):
-            # The comparison cannot run until its baseline builds (#1114).
+            # The comparison cannot run until its baseline builds (#1114); a
+            # failed package model's repair is drafted by one command naming
+            # every such model, since the overrides share dbt_project.yml (#1229).
+            how = (
+                f" (`dex transform repair {' '.join(failed_packages)}` drafts it)"
+                if failed_packages
+                else ""
+            )
             step = (
                 f"the baseline does not build ({', '.join(blocked)}): repair it in "
-                "its own plan, apply and build that plan (`--cold-deps` where a "
-                "package owns the node), and leave this plan unapplied; then " + step
+                f"its own plan{how}, apply and build that plan (`--cold-deps` "
+                "where a package owns the node), and leave this plan unapplied; "
+                "then " + step
             )
         elif offer.get("mixed_with_repair"):
             step = (

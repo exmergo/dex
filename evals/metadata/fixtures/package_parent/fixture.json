@@ -1,0 +1,5 @@
+{
+  "name": "package_parent",
+  "seed": 1155,
+  "description": "A conversation-level mart over an installed package's staging models (tiny_inbox, served from a local git repository and built into its own schema). The package's parts table still holds parts of conversations the vendor deleted, and some conversations have no parts, so a mart driven from the parts holds the wrong conversations. The right parent is the package's conversations model, which a declaration can name as population.parent (#1155)."
+}

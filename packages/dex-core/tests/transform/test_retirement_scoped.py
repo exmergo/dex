@@ -94,7 +94,10 @@ def test_the_full_retirement_refuses_and_names_the_scoped_route(jinja_repo, caps
     refused = _remove(jinja_repo, capsys, RETIRE_SQL, RETIRE)
     assert refused["status"] == "error"
     message = " ".join(map(str, refused["errors"]))
-    assert "macros/unioned.sql" in message
+    # The macro whose columns do not parse no longer refuses (#1172); the
+    # dynamic read beside it still does, and names the scoped route.
+    assert "macros/unioned.sql" not in message
+    assert "name no literal variable" in message
     assert '"scope": "authored"' in message
 
 

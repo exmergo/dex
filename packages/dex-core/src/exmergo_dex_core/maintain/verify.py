@@ -39,17 +39,21 @@ bounded metadata) alone.
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
+from ..envelope import failure_text
 from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
+from ..value_mask import mask_values
 from .drift import DriftFinding, _grain_severity
 
 #: dbt's own run_results.json status strings that mean the node did not build.
@@ -236,7 +240,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             continue
         name = name_of(uid)
         if status in _WARNING_STATUSES:
-            message = result.get("message") or status
+            message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -249,7 +253,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             )
             continue
         if status in _FAILURE_STATUSES:
-            message = result.get("message") or status
+            message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -280,6 +284,14 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             )
         )
     return findings, []
+
+
+def _dbt_message(result: dict, status: str) -> str:
+    """dbt's message on one node, with any value a warehouse conversion error
+    quotes masked: a model that fails on a cast fails in the warehouse's words,
+    and those quote the row's value (#1070)."""
+
+    return mask_values(str(result.get("message") or status))
 
 
 def missing_relation_findings(
@@ -382,9 +394,38 @@ def missing_relation_findings(
 # --- column contract: a built relation against its declared schema.yml ---------
 
 
+class ColumnContractPlan(tuple[dict[str, dict[str, str | None]], int, list[str]]):
+    """The plan for checking column contracts against the compiled manifest.
+
+    A 3-tuple of ``(declared_by_model, undeclared, notes)`` for backwards
+    compatibility with callers that unpack it, plus ``package_entries`` naming
+    the package YAML that documents any project override among them (#1205).
+    """
+
+    declared_by_model: dict[str, dict[str, str | None]]
+    undeclared: int
+    notes: list[str]
+    package_entries: dict[str, str]
+
+    def __new__(
+        cls,
+        declared_by_model: dict[str, dict[str, str | None]],
+        undeclared: int,
+        notes: list[str],
+        package_entries: dict[str, str] | None = None,
+    ) -> ColumnContractPlan:
+        """Create a new column contract plan."""
+        obj = super().__new__(cls, (declared_by_model, undeclared, notes))
+        obj.declared_by_model = declared_by_model
+        obj.undeclared = undeclared
+        obj.notes = notes
+        obj.package_entries = package_entries or {}
+        return obj
+
+
 def column_contract_plan(
     project_dir: Path, *, scope: set[str] | None = None
-) -> tuple[dict[str, dict[str, str | None]], int, list[str]]:
+) -> ColumnContractPlan:
     """Every selected model's declared column contract, from the compiled
     manifest, plus how many considered models declare none at all (#230).
 
@@ -401,27 +442,38 @@ def column_contract_plan(
     has: a model name is conventionally lowercase already, so this never narrows
     past what an exact-case match would.
 
-    Returns ``(declared_by_model, undeclared_count, notes)``. A model with no
-    ``columns:`` entry contributes to the count and nothing to the mapping:
-    it has no contract to compare, which is a fact about the project rather
-    than a finding about any one model, so it is named once at the summary
-    level (#230's acceptance) rather than repeated per model. ``notes`` names
-    the one condition that stops this from running at all, the same way
-    :func:`row_population_plan` does for its own manifest read.
+    Returns a :class:`ColumnContractPlan` unpacking as ``(declared_by_model,
+    undeclared_count, notes)``. A model with no ``columns:`` entry contributes to
+    the count and nothing to the mapping: it has no contract to compare, which is a
+    fact about the project rather than a finding about any one model, so it is named
+    once at the summary level (#230's acceptance) rather than repeated per model.
+    ``notes`` names the one condition that stops this from running at all, the same
+    way :func:`row_population_plan` does for its own manifest read.
     """
 
     nodes = _manifest_nodes(project_dir)
     if nodes is None:
-        return (
+        return ColumnContractPlan(
             {},
             0,
             [
                 "no compiled manifest found; run `dbt compile` or `dbt build` "
                 "for column-contract findings"
             ],
+            {},
         )
 
+    from ..transform.build import packages_dir
+
+    try:
+        install_dir = (
+            packages_dir(project_dir).relative_to(Path(project_dir)).as_posix()
+        )
+    except Exception:
+        install_dir = "dbt_packages"
+
     declared_by_model: dict[str, dict[str, str | None]] = {}
+    package_entries: dict[str, str] = {}
     undeclared = 0
     for uid, node in nodes.items():
         if not isinstance(node, dict) or node.get("resource_type") != "model":
@@ -444,7 +496,25 @@ def column_contract_plan(
             for column_name, column in columns.items()
             if isinstance(column_name, str)
         }
-    return declared_by_model, undeclared, []
+        patch = node.get("patch_path")
+        if isinstance(patch, str) and "://" in patch:
+            pkg, path = patch.split("://", 1)
+            if pkg and path and pkg != node.get("package_name"):
+                package_entries[name] = f"{install_dir.rstrip('/')}/{pkg}/{path}"
+
+    with contextlib.suppress(Exception):
+        from ..transform.package_overrides import documented_overrides
+
+        project_file = Path(project_dir) / "dbt_project.yml"
+        if project_file.is_file():
+            project_yml = project_file.read_text(encoding="utf-8")
+            overrides = documented_overrides(
+                project_dir, declared_by_model.keys(), project_yml
+            )
+            for model_name, override in overrides.items():
+                package_entries[model_name] = override.package_entry
+
+    return ColumnContractPlan(declared_by_model, undeclared, [], package_entries)
 
 
 @dataclass
@@ -485,11 +555,18 @@ def column_contract_findings(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     undeclared: int,
+    *,
+    package_entries: Mapping[str, str] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """:func:`column_contract_check`, as findings and notes alone."""
 
     check = column_contract_check(
-        adapter, declared_by_model, model_relations, live_identifiers, undeclared
+        adapter,
+        declared_by_model,
+        model_relations,
+        live_identifiers,
+        undeclared,
+        package_entries=package_entries,
     )
     return check.findings, check.notes
 
@@ -500,6 +577,8 @@ def column_contract_check(
     model_relations: dict[str, str],
     live_identifiers: list[str],
     undeclared: int,
+    *,
+    package_entries: Mapping[str, str] | None = None,
 ) -> ColumnContractCheck:
     """A built relation's actual columns against what its schema.yml declares,
     in both directions, plus a type check where a type is declared (#230).
@@ -526,10 +605,13 @@ def column_contract_check(
     A relation whose metadata cannot be read is named and the rest still
     compared. A cost-guard refusal is re-raised: it is the caller's own limit
     rather than a gap in this check.
+
+    An override of a package model documented by the package names the package's
+    YAML entry in its findings (``package_entries``) and explains that the project
+    cannot declare the override (#1205).
     """
 
     from ..dbt_project import column_contract_divergence
-    from ..envelope import redact
     from ..guards.cost_guard import CostGuardError
 
     check = ColumnContractCheck()
@@ -554,10 +636,8 @@ def column_contract_check(
             raise
         except Exception as exc:
             unreadable.append(
-                redact(
-                    f"the column contract was not checked for {model}: its "
-                    f"metadata could not be read ({type(exc).__name__}: {exc})"
-                )
+                f"the column contract was not checked for {model}: its "
+                f"metadata could not be read ({failure_text(exc)})"
             )
             check.unchecked[model] = "metadata_unreadable"
             continue
@@ -573,6 +653,9 @@ def column_contract_check(
             declared_lower, actual_lower, connector=connector
         )
 
+        package_entry = (package_entries or {}).get(model)
+        source = f"`{package_entry}`" if package_entry else "schema.yml"
+
         if missing:
             findings.append(
                 DriftFinding(
@@ -582,23 +665,34 @@ def column_contract_check(
                     severity="high",
                     detail=(
                         f"'{model}' declares column(s) {', '.join(missing)} in "
-                        "schema.yml that the built relation does not have"
+                        f"{source} that the built relation does not have"
                     ),
                     data={"model": model, "columns": missing},
                 )
             )
         if extra:
+            if package_entry:
+                detail = (
+                    f"'{model}' builds column(s) {', '.join(extra)} that "
+                    f"`{package_entry}` does not declare; the project cannot "
+                    "declare the override"
+                )
+            else:
+                detail = (
+                    f"'{model}' builds column(s) {', '.join(extra)} that "
+                    "schema.yml does not declare"
+                )
+            extra_data: dict[str, Any] = {"model": model, "columns": extra}
+            if package_entry:
+                extra_data["package_entry"] = package_entry
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="column_undeclared",
                     identifier=model,
                     severity="low",
-                    detail=(
-                        f"'{model}' builds column(s) {', '.join(extra)} that "
-                        "schema.yml does not declare"
-                    ),
-                    data={"model": model, "columns": extra},
+                    detail=detail,
+                    data=extra_data,
                 )
             )
         if mismatched:
@@ -614,7 +708,7 @@ def column_contract_check(
                             f"{name} as {declared_type}"
                             for name, declared_type, _ in mismatched
                         )
-                        + " in schema.yml, but the built relation has "
+                        + f" in {source}, but the built relation has "
                         + ", ".join(
                             f"{name} as {actual_type}"
                             for name, _, actual_type in mismatched
@@ -692,8 +786,9 @@ def grain_plan(
     Priority is per model, not per candidate: a model whose declaration
     states a grain is checked on that grain alone (#496); otherwise every
     column independently declared ``unique`` is checked (a model can have more
-    than one, each its own claim); a declared composite is checked only when
-    the model has no single-column unique test; the primary entity is checked
+    than one, each its own claim); every declared composite is checked only
+    when the model has no single-column unique test (#1223: a second composite
+    on the same model was once dropped); the primary entity is checked
     only when the model has none of those. A model can therefore only ever
     produce candidates from one source, never a mix, so one duplicate is never
     reported twice under two sources.
@@ -704,34 +799,156 @@ def grain_plan(
     """
 
     by_model: dict[str, list[GrainCandidate]] = {}
-    for model, columns in definitions.declared_grains.items():
-        if scope is not None and model.lower() not in scope:
-            continue
-        by_model[model] = [GrainCandidate(columns=list(columns), source="declaration")]
-    declared = set(by_model)
-    for key in definitions.declared_keys:
-        if not key.unique or key.model in declared:
-            continue
-        if scope is not None and key.model.lower() not in scope:
-            continue
-        by_model.setdefault(key.model, []).append(
-            GrainCandidate(columns=[key.column], source="unique_test")
-        )
-    for combo in definitions.declared_composite_keys:
-        if combo.model in by_model:
-            continue
-        if scope is not None and combo.model.lower() not in scope:
-            continue
-        by_model.setdefault(combo.model, []).append(
-            GrainCandidate(columns=list(combo.columns), source="unique_test_composite")
-        )
-    for model, column in definitions.primary_entities.items():
-        if model in by_model:
-            continue
-        if scope is not None and model.lower() not in scope:
-            continue
-        by_model[model] = [GrainCandidate(columns=[column], source="primary_entity")]
+    for model, candidates in declared_grain_candidates(
+        definitions, scope=scope
+    ).items():
+        for source in _GRAIN_SOURCE_ORDER:
+            chosen = [c for c in candidates if c.source == source]
+            if chosen:
+                by_model[model] = chosen
+                break
     return by_model
+
+
+#: The order :func:`grain_plan` ranks the declared sources in, first wins.
+_GRAIN_SOURCE_ORDER = (
+    "declaration",
+    "unique_test",
+    "unique_test_composite",
+    "primary_entity",
+)
+
+
+def declared_grain_candidates(
+    definitions, *, scope: set[str] | None = None
+) -> dict[str, list[GrainCandidate]]:
+    """Every grain each selected model declares, from every source, before
+    :func:`grain_plan`'s priority rule picks the ones it checks (#1223).
+
+    The difference between the two is what ``grain_coverage`` reports as
+    ``not_planned``: a key the project states that this command leaves to a
+    higher-ranked one. Each candidate appears once per model and source; the
+    order within a model is the ranking, then declaration order.
+    """
+
+    def wanted(model: str) -> bool:
+        return scope is None or model.lower() in scope
+
+    by_model: dict[str, list[GrainCandidate]] = {}
+    for model, columns in definitions.declared_grains.items():
+        if wanted(model):
+            by_model.setdefault(model, []).append(
+                GrainCandidate(columns=list(columns), source="declaration")
+            )
+    for key in definitions.declared_keys:
+        if key.unique and wanted(key.model):
+            by_model.setdefault(key.model, []).append(
+                GrainCandidate(columns=[key.column], source="unique_test")
+            )
+    for combo in definitions.declared_composite_keys:
+        if wanted(combo.model):
+            by_model.setdefault(combo.model, []).append(
+                GrainCandidate(
+                    columns=list(combo.columns), source="unique_test_composite"
+                )
+            )
+    for model, column in definitions.primary_entities.items():
+        if wanted(model):
+            by_model.setdefault(model, []).append(
+                GrainCandidate(columns=[column], source="primary_entity")
+            )
+    for model, candidates in by_model.items():
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        unique: list[GrainCandidate] = []
+        for c in sorted(candidates, key=lambda c: _GRAIN_SOURCE_ORDER.index(c.source)):
+            marker = (c.source, tuple(column.lower() for column in c.columns))
+            if marker not in seen:
+                seen.add(marker)
+                unique.append(c)
+        by_model[model] = unique
+    return by_model
+
+
+def grain_record(
+    model: str,
+    candidate: GrainCandidate,
+    status: str,
+    reason: str | None = None,
+    *,
+    rows: int | None = None,
+    distinct: int | None = None,
+) -> dict:
+    """One ``grain_coverage`` record (#1223): a declared key and its verdict.
+
+    ``status`` is ``proven`` (the exact distinct count reached the row count),
+    ``broken`` (it did not, and a ``grain_broken`` finding says by how much),
+    ``not_applicable`` (the relation has no rows, so uniqueness says nothing),
+    ``unchecked`` (planned, not measured; ``reason`` says why) or
+    ``not_planned`` (left to a higher-ranked key, ``reason`` ``priority``).
+    ``measured`` carries the two counts wherever both were read, and never a
+    value: the warehouse's own words stay in ``notes``.
+    """
+
+    return {
+        "model": model,
+        "columns": list(candidate.columns),
+        "source": candidate.source,
+        "status": status,
+        "reason": reason,
+        "measured": (
+            {"rows": rows, "distinct": distinct}
+            if rows is not None and distinct is not None
+            else None
+        ),
+    }
+
+
+def measured_grain_record(
+    model: str, candidate: GrainCandidate, rows: int, distinct: int
+) -> dict:
+    if rows == 0:
+        return grain_record(
+            model,
+            candidate,
+            "not_applicable",
+            "empty_relation",
+            rows=rows,
+            distinct=distinct,
+        )
+    status = "proven" if distinct >= rows else "broken"
+    return grain_record(model, candidate, status, rows=rows, distinct=distinct)
+
+
+def not_planned_grain_records(
+    declared: dict[str, list[GrainCandidate]],
+    planned: dict[str, list[GrainCandidate]],
+) -> list[dict]:
+    """A ``not_planned`` record for each declared key the priority rule left
+    out, unless a planned key on the same model names the same columns: that
+    key is judged, under the source that ranked first (#1223)."""
+
+    records: list[dict] = []
+    for model, candidates in declared.items():
+        chosen = planned.get(model, [])
+        judged = {frozenset(column.lower() for column in c.columns) for c in chosen}
+        for candidate in candidates:
+            if candidate in chosen:
+                continue
+            if frozenset(column.lower() for column in candidate.columns) in judged:
+                continue
+            records.append(grain_record(model, candidate, "not_planned", "priority"))
+    return records
+
+
+def sort_grain_records(records: list[dict]) -> list[dict]:
+    return sorted(
+        records,
+        key=lambda r: (
+            r["model"],
+            _GRAIN_SOURCE_ORDER.index(r["source"]),
+            [column.lower() for column in r["columns"]],
+        ),
+    )
 
 
 _GRAIN_SOURCE_PHRASE = {
@@ -755,6 +972,13 @@ def _grain_broken_finding(
 ) -> DriftFinding:
     duplicates = row_count - distinct_count
     severity, extra_data, note_suffix = _grain_severity(row_count, min_rows)
+    if source == "heuristic" and severity == "high":
+        severity = "medium"
+        extra_data = {**extra_data, "severity_cap_applied": "heuristic_grain"}
+        note_suffix = (
+            " (severity capped at medium: guessed from column name; "
+            "not a declared grain)"
+        )
     approx = "" if exact else "approximately "
     columns_text = " and ".join(columns) if len(columns) < 3 else ", ".join(columns)
     unique_word = "unique" if len(columns) == 1 else "jointly unique"
@@ -793,10 +1017,12 @@ def _declared_grain_findings(
     candidates: list[GrainCandidate],
     min_rows: int,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
 ) -> tuple[list[DriftFinding], str | None, list[str]]:
     """Check every declared candidate for one model. Returns ``(findings,
     unchecked_reason, unresolved)``, and records in ``proven`` the first
-    candidate the scans showed unique (see :func:`damp_fanout`).
+    candidate the scans showed unique (see :func:`damp_fanout`). ``records``,
+    when given, gains one ``grain_coverage`` record per candidate (#1223).
     ``unchecked_reason`` is None when every candidate was measured, ``"scan"``
     when a candidate could not be measured at all (a metered adapter declining
     an unaffordable scan, per
@@ -888,6 +1114,26 @@ def _declared_grain_findings(
     row_count = adapter.table_metadata(identifier)[0].row_count
     if row_count is None:
         row_count = meta.row_count
+
+    def counted(names: list[str] | None) -> int | None:
+        if names is None:
+            return None
+        if len(names) == 1:
+            return single_counts.get(names[0])
+        return combo_counts.get(tuple(names))
+
+    if records is not None:
+        for c, spelled in resolved:
+            distinct = counted(spelled)
+            if spelled is None:
+                records.append(grain_record(model, c, "unchecked", "missing_columns"))
+            elif distinct is None:
+                records.append(grain_record(model, c, "unchecked", "scan"))
+            elif row_count is None:
+                records.append(grain_record(model, c, "unchecked", "no_count"))
+            else:
+                records.append(measured_grain_record(model, c, row_count, distinct))
+
     if row_count is None:
         if single_counts or combo_counts:
             return [], "no_count", unresolved
@@ -1050,6 +1296,8 @@ def grain_findings(
     *,
     min_rows: int = 100,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ) -> tuple[list[DriftFinding], list[str]]:
     """A built relation's grain against what the project declares (or, absent
     any declaration, a free naming guess), for every selected model (#229).
@@ -1058,15 +1306,26 @@ def grain_findings(
     (#841). Only a declaration counts: the naming guess is never recorded,
     because a guess proven unique says nothing about what the model intends.
 
+    ``records``, when given, gains one ``grain_coverage`` record per declared
+    candidate in ``declared`` (#1223), measured or not, so a key that held is
+    stated rather than left to an absent finding. Each reason a candidate went
+    unmeasured has a code there that the notes below spell out in prose:
+    ``no_relation`` (nothing in the warehouse matched, or the model has no
+    relation), ``ambiguous`` (more than one matched), ``refused``,
+    ``missing_columns``, ``scan`` and ``no_count``. The naming guess has no
+    record, since it is not a declared key.
+
     A declared source (unique test, composite, or primary entity) is checked
     directly with an exact scan: the declaration itself is the justification
     for spending on verification, the same reasoning ``maintain grain``'s own
     ``declared_composite_checks`` already rests on. Only a model with no
     declaration at all falls to the heuristic, which is free-first and
     escalates to exact only when already close (see
-    :func:`_heuristic_candidate`) -- so a ``grain_broken`` finding's ``exact``
-    flag is always True except in exactly that one approximate-verdict case,
-    honestly naming the one place this check ever reports from a guess.
+    :func:`_heuristic_candidate`), unless the model is a time spine,
+    generated in SQL, or driven off one (#1202). A ``grain_broken`` finding's
+    ``exact`` flag is always True except in exactly that one
+    approximate-verdict case, honestly naming the one place this check ever
+    reports from a guess.
 
     An unknown grain and a broken one are reported through different
     channels on purpose (the issue's own framing): a broken grain is a
@@ -1083,15 +1342,24 @@ def grain_findings(
     unresolved: dict[str, list[str]] = {}
     refused: dict[str, str] = {}
 
-    for model in sorted(all_models):
+    def unmeasured(model: str, reason: str) -> None:
+        if records is not None:
+            for candidate in declared.get(model) or []:
+                records.append(grain_record(model, candidate, "unchecked", reason))
+
+    for model in sorted(all_models | set(declared)):
         relation = model_relations.get(model)
         if relation is None:
             # missing_relation_findings already reports this model; nothing
             # about its grain belongs in a second, unrelated finding class.
+            unmeasured(model, "no_relation")
+            continue
+        if model not in all_models:
             continue
         matches = match_identifier(relation, live_identifiers)
         if len(matches) != 1:
             ambiguous.append(model)
+            unmeasured(model, "ambiguous" if matches else "no_relation")
             continue
         identifier = matches[0]
 
@@ -1102,9 +1370,24 @@ def grain_findings(
         try:
             candidates = declared.get(model)
             if candidates:
-                model_findings, unchecked_reason, missing = _declared_grain_findings(
-                    adapter, model, identifier, candidates, min_rows, proven
-                )
+                model_records: list[dict] | None = [] if records is not None else None
+                try:
+                    model_findings, unchecked_reason, missing = (
+                        _declared_grain_findings(
+                            adapter,
+                            model,
+                            identifier,
+                            candidates,
+                            min_rows,
+                            proven,
+                            model_records,
+                        )
+                    )
+                except WarehouseQueryError:
+                    unmeasured(model, "refused")
+                    raise
+                if records is not None and model_records is not None:
+                    records.extend(model_records)
                 findings.extend(model_findings)
                 if unchecked_reason == "scan":
                     unchecked.append(model)
@@ -1114,9 +1397,15 @@ def grain_findings(
                     unresolved[model] = missing
                 continue
 
+            if spine_or_generated and (
+                model in spine_or_generated
+                or model.lower() in {m.lower() for m in spine_or_generated}
+            ):
+                continue
+
             finding, reason = _heuristic_candidate(adapter, model, identifier, min_rows)
         except WarehouseQueryError as exc:
-            refused[model] = exc.detail
+            refused[model] = failure_text(exc, detail_only=True)
             continue
         if finding is not None:
             findings.append(finding)
@@ -1169,6 +1458,11 @@ def grain_findings(
 # --- row population: a model against the relation it is built from -------------
 
 _GENERATED_SQL = "generated in SQL; no parent relation to compare against"
+#: Why a driving parent is not a population (#988), as the note words it.
+_TIME_SPINE = "the project's time spine"
+_GENERATED_PARENT = "generated in SQL"
+#: The time spine's required name before dbt 1.9 added the `time_spine:` config.
+_LEGACY_TIME_SPINE = "metricflow_time_spine"
 
 
 @dataclass(frozen=True)
@@ -1294,18 +1588,98 @@ def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = Non
     )
 
 
-def _join_label(join, resolved, name_of) -> str:
+def _join_label(
+    join,
+    resolved,
+    name_of,
+    cte_scopes: dict | None = None,
+    sql_shape=None,
+) -> str:
     """One join named the way a reader would name it: how it joins, and what to.
 
     The project's own name for the joined relation where there is one, since
     that is what the reader will go and open; the physical relation otherwise.
+    When a joined CTE holds a set operation, it has no underlying physical table,
+    so the join is named after the CTE itself. A join to an anonymous set operation
+    names it as a set operation rather than a generic subquery.
     The ON condition is deliberately not here, because it travels separately as
     the join keys, which is the part that identifies a wrong grain.
     """
 
-    if resolved is None:
-        return f"{join.side} join to a subquery"
-    return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
+    if resolved is not None:
+        return f"{join.side} join to '{name_of(_table_name(resolved))[1]}'"
+
+    if cte_scopes and _cte_name(join.relation, cte_scopes) is not None:
+        return f"{join.side} join to '{join.relation.name}'"
+
+    inner = (
+        join.relation.this.unnest()
+        if hasattr(join.relation, "this") and hasattr(join.relation.this, "unnest")
+        else getattr(join.relation, "this", None)
+    )
+    if (
+        sql_shape is not None
+        and sql_shape.SET_OPERATIONS
+        and isinstance(inner, sql_shape.SET_OPERATIONS)
+    ):
+        return f"{join.side} join to a set operation"
+
+    return f"{join.side} join to a subquery"
+
+
+def _generates_rows(relation) -> bool:
+    """An ``UNNEST`` of generator calls or literal arrays: BigQuery's
+    ``unnest(generate_date_array(...))``, the time spine's usual shape there,
+    generates its rows in SQL just as DuckDB's ``range(...)`` does (#988)."""
+
+    from sqlglot import expressions as exp
+
+    if not isinstance(relation, exp.Unnest) or not relation.expressions:
+        return False
+    generators = tuple(
+        kind
+        for kind in (
+            getattr(exp, name, None)
+            for name in (
+                "GenerateDateArray",
+                "GenerateTimestampArray",
+                "GenerateSeries",
+                "ExplodingGenerateSeries",
+            )
+        )
+        if kind is not None
+    )
+    return all(
+        isinstance(argument, generators)
+        or (
+            isinstance(argument, exp.Array)
+            and all(isinstance(item, exp.Literal) for item in argument.expressions)
+        )
+        for argument in relation.expressions
+    )
+
+
+_DRIVEN_BY_SET_OPERATION = "it is driven by a set operation, so it has no single parent"
+
+
+def _set_operation_reason(node, sql_shape, reason: str) -> str:
+    """Why a set operation has no parent: ``reason``, unless every branch
+    selects from nothing or from VALUES, which generates its rows in SQL
+    (``select 0 union all select 1``, the seed of ``dbt_utils.date_spine``)."""
+
+    from sqlglot import expressions as exp
+
+    def generates(branch) -> bool:
+        if sql_shape.SET_OPERATIONS and isinstance(branch, sql_shape.SET_OPERATIONS):
+            return generates(branch.left) and generates(branch.right)
+        if isinstance(branch, exp.Subquery):
+            return generates(branch.this)
+        if not isinstance(branch, exp.Select) or sql_shape.joins(branch):
+            return False
+        relation = sql_shape.from_relation(branch)
+        return relation is None or isinstance(relation, exp.Values)
+
+    return _GENERATED_SQL if generates(node) else reason
 
 
 def _driving_parent(tree, sql_shape):
@@ -1335,7 +1709,9 @@ def _driving_parent(tree, sql_shape):
             [],
             [],
             False,
-            "it is a set operation, so it has no single parent",
+            _set_operation_reason(
+                tree, sql_shape, "it is a set operation, so it has no single parent"
+            ),
             {},
         )
     if not isinstance(tree, exp.Select):
@@ -1359,7 +1735,7 @@ def _driving_parent(tree, sql_shape):
                 reducers,
                 found_joins,
                 multiplies,
-                "it is driven by a set operation, so it has no single parent",
+                _set_operation_reason(current, sql_shape, _DRIVEN_BY_SET_OPERATION),
                 cte_scopes,
             )
         if not isinstance(current, exp.Select):
@@ -1391,7 +1767,7 @@ def _driving_parent(tree, sql_shape):
                     reducers,
                     found_joins,
                     multiplies,
-                    "it is driven by a set operation, so it has no single parent",
+                    _set_operation_reason(inner, sql_shape, _DRIVEN_BY_SET_OPERATION),
                     cte_scopes,
                 )
             if not isinstance(inner, exp.Select):
@@ -1412,7 +1788,7 @@ def _driving_parent(tree, sql_shape):
             )
             current = inner
             continue
-        if isinstance(relation, exp.Values):
+        if isinstance(relation, exp.Values) or _generates_rows(relation):
             return (
                 None,
                 reducers,
@@ -1450,8 +1826,143 @@ def _driving_parent(tree, sql_shape):
                 )
             visited.add(name)
             current = cte_scopes[name]
+            # A CTE can carry a WITH of its own (dbt_utils.date_spine compiles
+            # to one): its names are in scope from here down, and a nested name
+            # is never a physical table.
+            if isinstance(current, exp.Select):
+                cte_scopes.update(
+                    {
+                        nested: scope
+                        for nested, scope in sql_shape.scopes(current).items()
+                        if nested != sql_shape.MAIN_SCOPE
+                    }
+                )
             continue
         return relation, reducers, found_joins, multiplies, None, cte_scopes
+
+
+def spine_or_generated_models(
+    project_dir: Path | str | None,
+    dialect: str = "duckdb",
+    nodes: dict[str, dict] | None = None,
+) -> set[str]:
+    """Models that are a time spine, generated in SQL, or driven off one (#1202).
+
+    Such models supply anchors or cross products rather than preserving a
+    parent's population or holding a natural single-column primary key. Absent
+    a declared grain, the naming heuristic is skipped on them so a cross
+    product (like a calendar crossed with customers) is not flagged as a
+    broken grain.
+    """
+
+    if nodes is None:
+        if project_dir is None:
+            return set()
+        project_path = (
+            Path(project_dir) if isinstance(project_dir, str) else project_dir
+        )
+        nodes = _manifest_nodes(project_path) or {}
+    if not nodes:
+        return set()
+
+    import sqlglot
+
+    from .. import sql_shape
+
+    relations: dict[str, str] = {}
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        if isinstance(relation, str) and relation and isinstance(node.get("name"), str):
+            relations[strip_relation_quoting(relation)] = manifest_node_label(uid, node)
+
+    known = sorted(relations)
+
+    def name_of(relation: str) -> tuple[str, str]:
+        matched = match_identifier(relation, known)
+        resolved = matched[0] if len(matched) == 1 else relation
+        return resolved, relations.get(resolved, resolved)
+
+    non_population: dict[str, str] = {}
+    model_by_relation: dict[str, dict] = {}
+    result: set[str] = set()
+
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        if not (isinstance(relation, str) and relation):
+            continue
+        label = manifest_node_label(uid, node)
+        stripped = strip_relation_quoting(relation)
+        model_by_relation[stripped] = node
+        if node.get("time_spine") or str(node.get("name", "")).lower() == (
+            _LEGACY_TIME_SPINE
+        ):
+            non_population[stripped] = _TIME_SPINE
+            result.add(label)
+
+    checks: list[tuple[str, str, list[str]]] = []
+    for uid, node in nodes.items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        code = node.get("compiled_code")
+        if not (isinstance(node.get("name"), str) and node["name"]):
+            continue
+        name = manifest_node_label(uid, node)
+        if not (isinstance(relation, str) and relation):
+            continue
+        stripped = strip_relation_quoting(relation)
+        if not (isinstance(code, str) and code.strip()):
+            continue
+        try:
+            tree = sqlglot.parse_one(code, read=dialect)
+        except Exception:
+            tree = None
+        if tree is None:
+            continue
+        table, _, found_joins, _, reason, cte_scopes = _driving_parent(tree, sql_shape)
+        model_by_relation.pop(stripped, None)
+        if table is None:
+            if reason == _GENERATED_SQL:
+                result.add(name)
+                non_population.setdefault(stripped, _GENERATED_PARENT)
+            continue
+        parent_relation, _ = name_of(_table_name(table))
+        join_rels: list[str] = []
+        for join in found_joins:
+            resolved = _through_ctes(join.relation, cte_scopes, sql_shape)
+            if resolved is not None:
+                join_rels.append(name_of(_table_name(resolved))[0])
+        checks.append((name, parent_relation, join_rels))
+
+    for _name, parent_relation, _ in checks:
+        parent_node = model_by_relation.get(parent_relation)
+        if parent_relation in non_population or parent_node is None:
+            continue
+        parent_code = parent_node.get("compiled_code")
+        if not (isinstance(parent_code, str) and parent_code.strip()):
+            continue
+        try:
+            parent_tree = sqlglot.parse_one(parent_code, read=dialect)
+        except Exception:
+            parent_tree = None
+        if parent_tree is not None and (
+            _driving_parent(parent_tree, sql_shape)[4] == _GENERATED_SQL
+        ):
+            non_population[parent_relation] = _GENERATED_PARENT
+        else:
+            model_by_relation.pop(parent_relation, None)
+
+    for name, parent_relation, join_rels in checks:
+        if parent_relation in non_population or any(
+            j in non_population for j in join_rels
+        ):
+            result.add(name)
+
+    return result
 
 
 def row_population_plan(
@@ -1486,6 +1997,12 @@ def row_population_plan(
     a caller with no build behind it leaves it empty. A microbatch model stays
     skipped even so: it rebuilds only from its own ``begin``, so what it holds is
     still not its whole parent, and nothing in its SQL would say so.
+
+    A model whose driving parent supplies anchors rather than a population
+    (#988) is not compared either, and an informational note says why: the
+    project's time spine (a `time_spine:` config, or the `metricflow_time_spine`
+    name dbt required before it), or a model generated in SQL. A model that only
+    joins one is unaffected.
     """
 
     import sqlglot
@@ -1525,6 +2042,25 @@ def row_population_plan(
         matched = match_identifier(relation, known)
         resolved = matched[0] if len(matched) == 1 else relation
         return resolved, relations.get(resolved, resolved)
+
+    # Relations that supply rows without being a population (#988): the
+    # project's time spine, by its dbt `time_spine:` config or the name dbt
+    # before 1.9 required, and, filled in below, any model generated in SQL.
+    # A model driven off one is not compared to its row count, because the
+    # spine's dates are anchors, not rows the model is expected to preserve.
+    non_population: dict[str, str] = {}
+    model_by_relation: dict[str, dict] = {}
+    for node in nodes.values():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        relation = node.get("relation_name")
+        if not (isinstance(relation, str) and relation):
+            continue
+        model_by_relation[strip_relation_quoting(relation)] = node
+        if node.get("time_spine") or str(node.get("name", "")).lower() == (
+            _LEGACY_TIME_SPINE
+        ):
+            non_population[strip_relation_quoting(relation)] = _TIME_SPINE
 
     checks: list[RowPopulationCheck] = []
     notes: list[str] = []
@@ -1588,9 +2124,14 @@ def row_population_plan(
         table, reducers, found_joins, multiplies, reason, cte_scopes = _driving_parent(
             tree, sql_shape
         )
+        # Read here, so the generated-parent pass below need not read it again.
+        model_by_relation.pop(strip_relation_quoting(relation), None)
         if table is None:
             if reason == _GENERATED_SQL:
                 generated.append(name)
+                non_population.setdefault(
+                    strip_relation_quoting(relation), _GENERATED_PARENT
+                )
             else:
                 unfollowable.append(f"{name} ({reason})")
             continue
@@ -1607,6 +2148,8 @@ def row_population_plan(
                         join,
                         _through_ctes(join.relation, cte_scopes, sql_shape),
                         name_of,
+                        cte_scopes=cte_scopes,
+                        sql_shape=sql_shape,
                     )
                     for join in found_joins
                 ),
@@ -1641,6 +2184,43 @@ def row_population_plan(
         )
         notes.append(generated_note)
         informational.append(generated_note)
+    # Settled only now, since a generated parent is known once every model has
+    # been read. A parent outside a scoped run was never read above, so it is
+    # read here, once. A spine reached only through a join is not the driving
+    # parent, so a model that joins one keeps its check.
+    for check in checks:
+        parent_node = model_by_relation.get(check.parent_relation)
+        if check.parent_relation in non_population or parent_node is None:
+            continue
+        parent_code = parent_node.get("compiled_code")
+        if not (isinstance(parent_code, str) and parent_code.strip()):
+            continue
+        try:
+            parent_tree = sqlglot.parse_one(parent_code, read=dialect)
+        except Exception:
+            parent_tree = None
+        if parent_tree is not None and (
+            _driving_parent(parent_tree, sql_shape)[4] == _GENERATED_SQL
+        ):
+            non_population[check.parent_relation] = _GENERATED_PARENT
+        else:
+            model_by_relation.pop(check.parent_relation, None)
+    anchored = sorted(
+        (check for check in checks if check.parent_relation in non_population),
+        key=lambda check: check.model,
+    )
+    if anchored:
+        checks = [
+            check for check in checks if check.parent_relation not in non_population
+        ]
+        anchored_note = "row population was not compared for " + ", ".join(
+            f"{check.model} (its driving parent '{check.parent}' is "
+            f"{non_population[check.parent_relation]}, which supplies anchors "
+            "rather than a population the model is expected to preserve)"
+            for check in anchored
+        )
+        notes.append(anchored_note)
+        informational.append(anchored_note)
     if unfollowable:
         notes.append(
             "no single driving parent could be identified for "
@@ -2011,9 +2591,16 @@ class _FilterWalk:
     quoted, the form the coverage probe is authored in before it is transpiled
     to the connector's dialect. ``scopes`` names each filtering scope as the
     model writes it, for the record. ``code``/``reason`` is the first failure.
+
+    ``keep_rows`` is set by the join contract, which measures the rows a model
+    joins: a scope whose own join can drop rows of the relation a column reads
+    is then refused like any other reducer (#1159). Lineage leaves it unset,
+    since a join that drops rows does not change which physical column an
+    output is.
     """
 
     dialect: str | None = None
+    keep_rows: bool = False
     filters: list[tuple[str, str]] = field(default_factory=list)
     scopes: list[str] = field(default_factory=list)
     code: str | None = None
@@ -2059,6 +2646,38 @@ class _FilterWalk:
         if name not in self.scopes:
             self.scopes.append(name)
         return True
+
+    def narrows(self, select, source, sql_shape) -> bool:
+        """Whether one of ``select``'s own joins can drop rows of ``source``,
+        the relation in it a column is read from; record why if so (#1159).
+
+        Joins associate left to right, so ``source`` keeps every row only when
+        the join that brings it in (if any) keeps its right side, a RIGHT or
+        FULL join, and every join after that keeps its left side, a LEFT or
+        FULL join. An inner join, a bare JOIN, a comma join and a CROSS JOIN
+        can all drop rows (a CROSS JOIN with an empty side, or an UNNEST of an
+        empty array, keeps none), so probing the whole relation underneath
+        would count keys the model never joins. Semi and anti joins never
+        reach here: :func:`~..sql_shape.reducing_clauses` already names them.
+        """
+
+        if not self.keep_rows:
+            return False
+        joins = sql_shape.joins(select)
+        start = next((i for i, j in enumerate(joins) if j.relation is source), None)
+        for i, join in enumerate(joins):
+            if start is not None and i < start:
+                continue
+            side = join.side.split(" ")[0]
+            kept = ("right", "full") if i == start else ("left", "full")
+            if side not in kept:
+                self._refuse(
+                    _scope_label(select),
+                    f"its {join.label}, which can drop rows of "
+                    f"`{source.alias_or_name}`",
+                )
+                return True
+        return False
 
     def _refuse(self, name: str, why: str) -> bool:
         self.fail(
@@ -2192,7 +2811,9 @@ def _resolve_within_scope(
 
     Refuses -- rather than resolving through -- any scope that reduces rows
     (:func:`~..sql_shape.reducing_clauses`: a WHERE, a HAVING, a GROUP BY, a
-    scalar aggregate, a DISTINCT, a LIMIT). ``select * from customers where
+    scalar aggregate, a DISTINCT, a LIMIT, a semi or anti join; for the join
+    contract, also a join that can drop rows of the relation the column is
+    read from, :meth:`_FilterWalk.narrows`, #1159). ``select * from customers where
     active = true``
     projects the same column names the physical ``customers`` table has,
     but not the same rows: probing a join against the whole table when the
@@ -2232,7 +2853,7 @@ def _resolve_within_scope(
             source = _qualified_source(inner, scope_relations)
             return (
                 None
-                if source is None
+                if source is None or (walk and walk.narrows(select, source, sql_shape))
                 else _resolve_join_column(
                     source, inner.name, cte_scopes, sql_shape, seen, walk
                 )
@@ -2244,7 +2865,7 @@ def _resolve_within_scope(
             source = _qualified_source(proj, scope_relations)
             return (
                 None
-                if source is None
+                if source is None or (walk and walk.narrows(select, source, sql_shape))
                 else _resolve_join_column(
                     source, proj.name, cte_scopes, sql_shape, seen, walk
                 )
@@ -2583,7 +3204,8 @@ def _model_joins(
                 # Each side resolves with its own walk, which carries a
                 # supported filter down to the physical relation (#1085) and
                 # records why an unsupported one stays unchecked.
-                left_walk, right_walk = _FilterWalk(dialect), _FilterWalk(dialect)
+                left_walk = _FilterWalk(dialect, keep_rows=True)
+                right_walk = _FilterWalk(dialect, keep_rows=True)
                 left_resolved = _resolve_join_column(
                     left_relation, left.name, cte_scopes, sql_shape, walk=left_walk
                 )
@@ -2758,13 +3380,18 @@ class ModelJoinContext:
     computed column has no entry. ``columns`` is each output column's declared
     ``config.meta.dex`` (lowered keys). ``parents`` maps every project node
     name (lowered) to its relation, so a ``references`` can be lined up with
-    the relation a join reads.
+    the relation a join reads. ``assumptions`` is the model's declared
+    ``assumptions`` entries and ``population_filters`` the columns its
+    ``population.filters`` entries name (lowered), which say an INNER join's
+    unmatched rows are the population the model means to drop (#1162).
     """
 
     relation: str | None = None
     lineage: dict[str, tuple[str, str]] = field(default_factory=dict)
     columns: dict[str, dict] = field(default_factory=dict)
     parents: dict[str, str] = field(default_factory=dict)
+    assumptions: list[dict] = field(default_factory=list)
+    population_filters: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2863,6 +3490,9 @@ def plan_join_contract(
                 column_name = column.get("name") or key
                 if isinstance(dex, dict) and isinstance(column_name, str):
                     declared[column_name.lower()] = dex
+            assumptions, population_filters = _model_population_intent(
+                entry_meta(node).get("dex")
+            )
             plan.context[name] = ModelJoinContext(
                 relation=strip_relation_quoting(relation)
                 if isinstance(relation, str) and relation
@@ -2870,8 +3500,37 @@ def plan_join_contract(
                 lineage=_output_lineage(tree, sql_shape),
                 columns=declared,
                 parents=parents,
+                assumptions=assumptions,
+                population_filters=population_filters,
             )
     return plan
+
+
+def _model_population_intent(dex) -> tuple[list[dict], tuple[str, ...]]:
+    """The model-level ``assumptions`` entries that name a column, and the
+    columns its ``population.filters`` entries name (lowered), from its
+    ``config.meta.dex`` (#1162)."""
+
+    if not isinstance(dex, dict):
+        return [], ()
+    stated = dex.get("assumptions")
+    assumptions = [
+        entry
+        for entry in (stated if isinstance(stated, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("column"), str)
+        and entry["column"].strip()
+    ]
+    population = dex.get("population")
+    entries = population.get("filters") if isinstance(population, dict) else None
+    filters = tuple(
+        entry["column"].strip().lower()
+        for entry in (entries if isinstance(entries, list) else [])
+        if isinstance(entry, dict)
+        and isinstance(entry.get("column"), str)
+        and entry["column"].strip()
+    )
+    return assumptions, filters
 
 
 def join_contract_plan(
@@ -2989,6 +3648,10 @@ class JoinPolicy:
     declared_optional: bool
     #: NULL driving keys count as unmatched rather than ineligible.
     null_keys_unmatched_by: str | None
+    #: On an INNER join the declaration does not require, what in it says the
+    #: unmatched driving rows are meant to be dropped: an ``assumptions`` entry
+    #: or a ``population.filters`` entry naming the driving key column (#1162).
+    unmatched_accounted_for: dict | None = None
 
 
 def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinPolicy:
@@ -3000,6 +3663,11 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
     whose ``references`` names the joined relation (every key must exist in the
     parent). NULL driving keys count against coverage only when the column
     carrying them is declared ``null_rule: never``.
+
+    An INNER join that is not required drops its unmatched driving rows, which
+    is a filter when the model means it: an ``assumptions`` entry whose
+    ``column`` names the driving key column, or a ``population.filters`` entry
+    on it, says so, and is returned as what accounts for those rows (#1162).
     """
 
     if ctx is None:
@@ -3043,13 +3711,40 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
         _null_allowed(ctx.columns.get(c)) for c in derived
     )
     counted = next((c for c in driving if _never_null(ctx.columns.get(c))), None)
+    inner = candidate.side.split(" ")[0] == "inner" if candidate.side else False
     return JoinPolicy(
         derived,
         driving,
         required_by,
         declared_optional,
         f"{counted} is declared null_rule: never" if counted else None,
+        _unmatched_accounted_for(from_columns | set(driving), ctx)
+        if inner and required_by is None
+        else None,
     )
+
+
+def _unmatched_accounted_for(keys: set[str], ctx: ModelJoinContext) -> dict | None:
+    """The declaration entry that names one of ``keys`` (the driving key's
+    physical columns and the output columns carrying it, lowered): the first
+    such ``assumptions`` entry, else the first ``population.filters`` entry,
+    or None (#1162)."""
+
+    for assumption in ctx.assumptions:
+        column = assumption.get("column")
+        if isinstance(column, str) and column.strip().lower() in keys:
+            return {
+                "by": "assumption",
+                **{
+                    k: assumption[k]
+                    for k in ("column", "decision", "chosen", "evidence")
+                    if assumption.get(k) is not None
+                },
+            }
+    for column in ctx.population_filters:
+        if column in keys:
+            return {"by": "population_filter", "column": column}
+    return None
 
 
 def _resolve_join_relationships(
@@ -3483,7 +4178,11 @@ def join_coverage(
       (``threshold_source: default``, stated in ``data``), and on a LEFT join
       unmatched rows are the optional relationship a LEFT join writes: recorded
       as evidence, with ``join_orphans`` withheld and ``join_zero_overlap``
-      ranked medium.
+      ranked medium. On an INNER join whose unmatched rows the declaration
+      accounts for (an ``assumptions`` entry or a ``population.filters`` entry
+      naming the driving key column), the join is the model's filter: the
+      record is ``satisfied``, keeps its counts and names that entry under
+      ``unmatched_accounted_for`` (#1162).
     - ``join_field_all_null`` (high): a column the join supplies, declared
       ``null_rule: never``, is NULL on every row of the built relation.
       ``join_field_newly_null`` (medium): one with no declared rule that is
@@ -3737,6 +4436,7 @@ def _judge_coverage(
         else ""
     )
 
+    accounted = policy.unmatched_accounted_for if unmatched_rows else None
     if matched_rows == 0:
         code = "join_no_match"
         severity = "low" if policy.declared_optional and not required else "high"
@@ -3786,6 +4486,16 @@ def _judge_coverage(
         record["status"] = "satisfied"
         if left and unmatched_rows:
             record["optional_unmatched"] = True
+        if accounted is not None:
+            record["unmatched_accounted_for"] = dict(accounted)
+        return None
+
+    if accounted is not None and code != "join_no_match":
+        # An INNER join used as a filter, and the declaration says so: the
+        # rows it drops are the population the model means (#1162). The counts
+        # stay on the record, with the finding the default would have raised.
+        record["status"] = "satisfied"
+        record["unmatched_accounted_for"] = {**accounted, "withheld_finding": code}
         return None
 
     record["status"] = "contradicted"
@@ -4098,7 +4808,7 @@ def relation_counts(
             absent,
             set(to_count),
             None,
-            [f"the row counts could not be read ({type(exc).__name__}: {exc})"],
+            [f"the row counts could not be read ({failure_text(exc)})"],
         )
     row = dict(zip(result.columns, result.cells[0], strict=True))
     counted = set()

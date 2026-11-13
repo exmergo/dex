@@ -48,6 +48,7 @@ SECRET_FILE="$STATE_DIR/cube.secret"
 
 DB=postgres
 MODEL="$SCRIPTS/cube/model"
+CONF="$SCRIPTS/cube/cube.js"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --down)
@@ -117,6 +118,7 @@ docker run -d --name "$CONTAINER" \
     -e CUBEJS_DB_TYPE="$DB" \
     "${DB_ENV[@]}" \
     -v "$MODEL:/cube/conf/model:ro" \
+    -v "$CONF:/cube/conf/cube.js:ro" \
     -p "127.0.0.1:$PORT:4000" \
     "$IMAGE" >/dev/null
 rm -f "$envfile"

@@ -39,15 +39,23 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from ..dbt_project import jinja_regions
 from .declarations import model_sql_path
-from .drafting import Usage, _Reading, _untoken, dataset_for, read_declared
+from .drafting import (
+    Usage,
+    _dataset_for_model,
+    _Reading,
+    _untoken,
+    dataset_for,
+    proven_keys,
+    read_declared,
+)
 
 if TYPE_CHECKING:
-    from ..cache import DexCache
+    from ..cache import Dataset, DexCache
     from ..references import ReferenceIndex
 
 _FILTER_CLAUSES = ("where", "having", "qualify")
@@ -93,6 +101,8 @@ class Contradiction:
     parent: str | None = None
     #: The plan creates this model, so "the plan changed both" means it wrote both.
     created: bool = False
+    #: An upstream profile that would confirm or settle dependence.
+    profile: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -108,6 +118,7 @@ class Contradiction:
             "prior",
             "authored",
             "reason",
+            "profile",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -168,7 +179,13 @@ def check(
     found: list[Contradiction] = []
     found.extend(_population(model, before, after))
     found.extend(_parent(model, before, after, model_paths, index))
-    grain = _grain(model, before, after)
+    grain = _grain(
+        model,
+        before,
+        after,
+        cache=cache,
+        model_paths=model_paths,
+    )
     found.extend(grain)
     dropped = {c.column for c in grain if c.column}
     found.extend(_columns(model, before, after, skip=dropped))
@@ -229,6 +246,19 @@ def _judge(
             prior=before.said,
             authored=after.said,
             reason=after.reason,
+            **extra,
+        )
+    if after.state == "unconfirmed":
+        return Contradiction(
+            model,
+            check,
+            "contradicted",
+            rule,
+            stale="unconfirmed",
+            prior=before.said,
+            authored=after.said,
+            profile=after.reason,
+            preexisting=before.state in ("unconfirmed", "contradicted"),
             **extra,
         )
     if not rule_changed:
@@ -394,7 +424,8 @@ def _in_lineage(
         # A source is no node of the ref() graph, so what links it to the parent
         # is a model upstream of the parent reading it.
         readers = {
-            PurePosixPath(path).stem.lower() for path in graph.readers_of(driver)
+            PurePosixPath(path).stem.lower()
+            for path in graph.readers_of(driver, packages=True)
         }
         if (readers - {model.lower()}) & upstream:
             return True
@@ -405,6 +436,74 @@ def _in_lineage(
 _TRANSPARENT_CALLS = frozenset(
     {"ref", "source", "config", "var", "is_incremental", "this", "env_var"}
 )
+
+#: Macros that shape columns or values and read no relation of their own: a
+#: relation they are handed arrives through ``ref()``, ``source()`` or a column
+#: listing, which names nothing new. Package staging models (Fivetran's, the
+#: dbt-labs packages') are written with these, so without them every package
+#: parent's lineage would read as hidden (#1155). A region whose outermost call
+#: is one of these is read as a whole, since its arguments (a package's own
+#: ``get_<table>_columns()`` list) only describe columns.
+_CROSS_DATABASE = (
+    "type_string",
+    "type_timestamp",
+    "type_int",
+    "type_bigint",
+    "type_numeric",
+    "type_float",
+    "type_boolean",
+    "current_timestamp",
+    "current_timestamp_backcompat",
+    "dateadd",
+    "datediff",
+    "date_trunc",
+    "last_day",
+    "safe_cast",
+    "cast_bool_to_text",
+    "concat",
+    "hash",
+    "length",
+    "replace",
+    "right",
+    "position",
+    "split_part",
+    "string_literal",
+    "escape_single_quotes",
+    "any_value",
+    "bool_or",
+    "listagg",
+)
+_COLUMN_ONLY_CALLS = frozenset(
+    {
+        "adapter.get_columns_in_relation",
+        "adapter.quote",
+        "dbt_utils.star",
+        "dbt_utils.generate_surrogate_key",
+        "dbt_utils.surrogate_key",
+        "dbt_utils.safe_add",
+        "fivetran_utils.fill_staging_columns",
+        "fivetran_utils.source_relation",
+        "fivetran_utils.timestamp_add",
+        "fivetran_utils.timestamp_diff",
+        "fivetran_utils.json_parse",
+        "fivetran_utils.string_agg",
+        *_CROSS_DATABASE,
+        *(f"dbt.{name}" for name in _CROSS_DATABASE),
+        *(f"dbt_utils.{name}" for name in _CROSS_DATABASE),
+    }
+)
+
+
+def _hidden_call(regions: list[Any]) -> str | None:
+    """The first call in ``regions`` that may read a relation dex cannot see."""
+
+    for region in regions:
+        if region.calls and region.calls[0].callee in _COLUMN_ONLY_CALLS:
+            continue
+        for call in region.calls:
+            if call.callee not in _TRANSPARENT_CALLS | _COLUMN_ONLY_CALLS:
+                return call.callee
+    return None
 
 
 def _unsettled(
@@ -427,19 +526,21 @@ def _unsettled(
         for call in region.calls
         if call.callee == "source" and call.args
     }
-    if graph.node_kind(parent) is None:
+    if graph.node_kind(parent) is None and graph.package_node_kind(parent) is None:
         return (
-            f"the declared parent '{parent}' is not defined in this project, so its "
-            "lineage cannot be read"
+            f"the declared parent '{parent}' is not defined in this project or an "
+            "installed package, so its lineage cannot be read"
         )
     lineage = set(graph.ancestors_of(parent))
     for driver in drivers:
         if driver.lower() in sources:
             continue
-        if graph.node_kind(driver) is None:
+        if graph.node_kind(driver) is None and graph.package_node_kind(driver) is None:
             return (
-                f"'{driver}' is not defined in this project (an installed package, or "
-                "a name nothing defines), so its lineage cannot be read"
+                f"'{driver}' is not a SQL model of this project or an installed "
+                "package (a Python model, a versioned model's base name, packages "
+                "not installed yet, or a name nothing defines), so its lineage "
+                "cannot be read"
             )
         lineage |= graph.ancestors_of(driver)
     stems = _lowered(lineage)
@@ -451,16 +552,35 @@ def _unsettled(
             )
     for name in sorted(lineage):
         path = model_sql_path(side.files, model_paths, name)
-        if path is None:
+        text = side.files[path] if path is not None else _package_sql(graph, name)
+        if text is None:
             continue
-        regions, _ = jinja_regions(side.files[path])
-        for region in regions:
-            for call in region.calls:
-                if call.callee not in _TRANSPARENT_CALLS:
-                    return (
-                        f"'{name}' calls {call.callee}(), which may read a relation "
-                        "dex cannot see"
-                    )
+        regions, _ = jinja_regions(text)
+        hidden = _hidden_call(regions)
+        if hidden is not None:
+            return (
+                f"'{name}' calls {hidden}(), which may read a relation dex cannot see"
+            )
+    return None
+
+
+def _package_sql(graph: ReferenceIndex, name: str) -> str | None:
+    """The SQL of a model only an installed package defines, read from disk."""
+
+    path = graph.package_file_of(name)
+    if path is None or not path.endswith(".sql"):
+        return None
+    from .build import packages_dir
+
+    root = Path(graph.view.root)
+    # The index spells a package file under its install directory's path
+    # relative to the project, or under the directory's bare name when the
+    # configured install path lies outside the project.
+    for candidate in (root / path, packages_dir(root).parent / path):
+        try:
+            return candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
     return None
 
 
@@ -598,19 +718,107 @@ def _polarity(expression: str) -> bool | None:
 # --- grain ------------------------------------------------------------------------
 
 
-def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
+def _is_unique_key_in_dataset(dataset: Dataset, key_columns: list[str]) -> bool:
+    """whether key_columns matches a proven key of the profiled dataset."""
+    key_set = {c.lower() for c in key_columns}
+    return any({c.lower() for c in key} == key_set for key in proven_keys(dataset))
+
+
+def _check_grain_dependence(
+    reading: _Reading,
+    grain: list[str],
+    *,
+    model: str | None = None,
+    cache: DexCache | None = None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
+) -> tuple[str, str | None]:
+    """check whether extra group by columns depend on the declared grain."""
+    if not reading.grain:
+        return ("contradicted", None)
+    reading_grain_set = {c.lower() for c in reading.grain}
+    grain_set = {c.lower() for c in grain}
+    if not grain_set.issubset(reading_grain_set):
+        return ("contradicted", None)
+    extra = [c for c in reading.grain if c.lower() not in grain_set]
+    if not extra:
+        return ("holds", None)
+
+    files_map = files or {}
+    paths = model_paths or []
+
+    grain_origins = [reading.origins.get(g.lower()) for g in grain]
+    extra_origins = [reading.origins.get(e.lower()) for e in extra]
+
+    relations: list[str] = []
+    for orig in (*grain_origins, *extra_origins):
+        if orig is not None and orig.relation not in relations:
+            relations.append(orig.relation)
+    if not relations:
+        fallback = (
+            reading.driving[0]
+            if reading.driving
+            else (reading.relations[0] if reading.relations else None)
+        )
+        if fallback:
+            relations.append(fallback)
+
+    if not cache or not relations:
+        target = relations[0] if relations else model
+        return ("unconfirmed", target)
+
+    for rel in relations:
+        rel_ds = _dataset_for_model(cache, rel, files_map, paths)
+        if rel_ds is None or not rel_ds.columns:
+            return ("unconfirmed", rel)
+
+    if all(orig is not None for orig in (*grain_origins, *extra_origins)):
+        grain_rel = grain_origins[0].relation
+        if all(orig.relation == grain_rel for orig in (*grain_origins, *extra_origins)):
+            rel_ds = _dataset_for_model(cache, grain_rel, files_map, paths)
+            if rel_ds is not None:
+                upstream_grain = [orig.column.lower() for orig in grain_origins]
+                if _is_unique_key_in_dataset(rel_ds, upstream_grain):
+                    return ("holds", None)
+
+    return ("contradicted", None)
+
+
+def _grain(
+    model: str,
+    before: _Side,
+    after: _Side,
+    *,
+    cache: DexCache | None = None,
+    model_paths: list[str] | None = None,
+) -> list[Contradiction]:
+    """the declared grain matched against what the sql reading proves."""
     declared = after.declared.get("grain")
     if not isinstance(declared, list) or not declared:
         return []
     grain = [str(g).lower() for g in declared]
     prior = before.declared.get("grain")
     prior_grain = [str(g).lower() for g in prior] if isinstance(prior, list) else None
-    after_verdict = _grain_verdict(after.reading, grain)
+    after_verdict = _grain_verdict(
+        after.reading,
+        grain,
+        model=model,
+        cache=cache,
+        files=after.files,
+        model_paths=model_paths,
+    )
     found = _judge(
         model,
         "grain",
         f"grain [{', '.join(declared)}]",
-        _grain_verdict(before.reading, prior_grain or grain),
+        _grain_verdict(
+            before.reading,
+            prior_grain or grain,
+            model=model,
+            cache=cache,
+            files=before.files,
+            model_paths=model_paths,
+        ),
         after_verdict,
         rule_changed=prior_grain is None or set(prior_grain) != set(grain),
     )
@@ -624,7 +832,16 @@ def _grain(model: str, before: _Side, after: _Side) -> list[Contradiction]:
     return [found]
 
 
-def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
+def _grain_verdict(
+    reading: _Reading,
+    grain: list[str],
+    *,
+    model: str | None = None,
+    cache: DexCache | None = None,
+    files: Mapping[str, str] | None = None,
+    model_paths: list[str] | None = None,
+) -> _Verdict:
+    """whether the reading matches the declared grain, or what it does instead."""
     produced = reading.produced
     dropped = [g for g in grain if produced is not None and g not in produced]
     # The declared grain is matched against every proven key, not only the one
@@ -650,9 +867,40 @@ def _grain_verdict(reading: _Reading, grain: list[str]) -> _Verdict:
         said = f"[{', '.join(reading.grain)}]"
         if any(set(key) == set(grain) for key in proven):
             return _Verdict("holds", said=said, signature=signature)
+        if set(grain) < {c.lower() for c in reading.grain}:
+            dep_state, target = _check_grain_dependence(
+                reading,
+                grain,
+                model=model,
+                cache=cache,
+                files=files,
+                model_paths=model_paths,
+            )
+            if dep_state == "holds":
+                if reading.proven_grains is not None:
+                    if grain not in reading.proven_grains:
+                        reading.proven_grains.append(grain)
+                else:
+                    reading.proven_grains = [reading.grain, grain]
+                return _Verdict("holds", said=said, signature=signature)
+            if dep_state == "unconfirmed":
+                said_with_evidence = (
+                    f"{said} ({reading.grain_evidence})"
+                    if reading.grain_evidence
+                    else said
+                )
+                return _Verdict(
+                    "unconfirmed",
+                    said=said_with_evidence,
+                    reason=target,
+                    signature=signature,
+                )
+        said_with_evidence = (
+            f"{said} ({reading.grain_evidence})" if reading.grain_evidence else said
+        )
         return _Verdict(
             "contradicted",
-            said=f"{said} ({reading.grain_evidence})",
+            said=said_with_evidence,
             signature=signature,
         )
     reason = reading.grain_withheld or (
@@ -1021,6 +1269,14 @@ def _sentence(model: str, item: dict[str, Any]) -> str:
         fix = (
             "edit the SQL in this same plan to implement the declaration, or "
             "correct the declaration if it is the side that is wrong"
+        )
+    elif stale == "unconfirmed":
+        side = "could not confirm the declared grain holds"
+        profile = item.get("profile")
+        fix = (
+            f"`explore profile {profile}` would settle it"
+            if profile
+            else "an `explore profile` of the upstream relation would settle it"
         )
     elif item.get("created"):
         side = "this plan writes both the SQL and the declaration and they disagree"

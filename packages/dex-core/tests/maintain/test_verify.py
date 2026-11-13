@@ -325,6 +325,22 @@ def test_a_column_with_no_declared_type_maps_to_none(tmp_path: Path):
     assert declared["a"] == {"id": None}
 
 
+def test_package_entry_is_identified_for_override_node(tmp_path: Path):
+    """A manifest node patched by a package YAML records package_entries (#1205)."""
+    node = _node_with_columns("pkg_task", {"id": "INTEGER"})
+    node["package_name"] = "p"
+    node["patch_path"] = "tiny_pkg://models/pkg_task.yml"
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.pkg_task": node},
+        results=[],
+    )
+    plan = column_contract_plan(tmp_path)
+    assert plan.package_entries == {
+        "pkg_task": "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    }
+
+
 def test_a_missing_declared_column_is_reported_high_severity():
     findings, notes = column_contract_findings(
         _ColumnAdapter({"db.main.a": [("id", "INTEGER")]}),
@@ -356,6 +372,36 @@ def test_an_undeclared_column_is_reported_low_severity():
     assert finding.code == "column_undeclared"
     assert finding.severity == "low"
     assert "extra" in finding.detail
+    assert "schema.yml" in finding.detail
+    assert "the project cannot declare the override" not in finding.detail
+    assert finding.data == {"model": "a", "columns": ["extra"]}
+
+
+def test_an_undeclared_column_on_package_override_names_entry_and_refuses():
+    """An override of a package-documented model names the package's YAML entry
+    and states that the project cannot declare the override (#1205)."""
+    pkg_entry = "dbt_packages/tiny_pkg/models/pkg_task.yml"
+    findings, _notes = column_contract_findings(
+        _ColumnAdapter({"db.main.a": [("id", "INTEGER"), ("extra", "VARCHAR")]}),
+        declared_by_model={"a": {"id": "INTEGER"}},
+        model_relations={"a": "db.main.a"},
+        live_identifiers=["db.main.a"],
+        undeclared=0,
+        package_entries={"a": pkg_entry},
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "column_undeclared"
+    assert finding.severity == "low"
+    assert "extra" in finding.detail
+    assert pkg_entry in finding.detail
+    assert "the project cannot declare the override" in finding.detail
+    assert "schema.yml" not in finding.detail
+    assert finding.data == {
+        "model": "a",
+        "columns": ["extra"],
+        "package_entry": pkg_entry,
+    }
 
 
 def test_a_declared_type_that_disagrees_is_a_medium_severity_mismatch():
@@ -1554,6 +1600,64 @@ def test_verify_scopes_to_the_named_object(maintain_repo, _assume_the_project_co
     assert [f["identifier"] for f in payload["data"]["findings"]] == ["a"]
 
 
+def _two_failing_models(maintain_repo) -> None:
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.a": {"name": "a", "resource_type": "model"},
+            "model.maintain_test.b": {"name": "b", "resource_type": "model"},
+            "model.maintain_test.c": {"name": "c", "resource_type": "model"},
+        },
+        results=[
+            {"unique_id": "model.maintain_test.a", "status": "error"},
+            {"unique_id": "model.maintain_test.b", "status": "error"},
+            {"unique_id": "model.maintain_test.c", "status": "error"},
+        ],
+    )
+
+
+def _verified(maintain_repo, *scope: str) -> list[str]:
+    rc, payload = maintain_repo.dex("maintain", "verify", *scope)
+    assert rc == 0 and payload["status"] == "ok", payload
+    return [f["identifier"] for f in payload["data"]["findings"]]
+
+
+def test_verify_scopes_to_a_quoted_list_of_models(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`maintain verify "a b"` names two models, not one named "a b" (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a b") == ["a", "b"]
+
+
+def test_verify_scopes_to_a_quoted_list_mixed_with_another_argument(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A quoted list and a separate argument name the same models (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a b", "c") == ["a", "b", "c"]
+
+
+def test_verify_scopes_to_a_comma_separated_list(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The comma-separated spelling still names both models (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "a,b") == ["a", "b"]
+
+
+def test_verify_scopes_to_a_list_in_any_case(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A model name is matched case-insensitively, however it is spelled (#1243)."""
+    _two_failing_models(maintain_repo)
+
+    assert _verified(maintain_repo, "A B") == ["a", "b"]
+
+
 # --- row population: a model against the relation it is built from (#226) ------
 #
 # Pure, like the build-status half above: a manifest on disk in, findings out,
@@ -1793,7 +1897,7 @@ def test_a_model_that_fans_out_is_reported_with_its_join_key(tmp_path: Path):
 
 _ANCHORED = (
     "with anchors as (select date_day as anchor_date "
-    'from "wh"."main"."metricflow_time_spine"), '
+    'from "wh"."main"."anchor_dates"), '
     'daily as (select * from "wh"."main"."fct_daily") '
     "select anchors.anchor_date, daily.page from anchors inner join daily "
     "on daily.data_date >= anchors.anchor_date - 14 "
@@ -1808,7 +1912,7 @@ def test_a_join_with_no_readable_key_caps_its_fanout_at_medium(tmp_path: Path):
     checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
     findings, _ = _judge(
         checks,
-        {"metricflow_time_spine": 2557, "fct_daily": 900, "fct_comparison": 19096},
+        {"anchor_dates": 2557, "fct_daily": 900, "fct_comparison": 19096},
     )
     assert [f.code for f in findings] == ["row_fanout"]
     finding = findings[0]
@@ -1823,7 +1927,7 @@ def test_a_fanout_inside_the_medium_band_with_no_key_says_no_cap(tmp_path: Path)
     checks, _ = _plan(tmp_path, {"m.1": _model("fct_comparison", _ANCHORED)})
     findings, _ = _judge(
         checks,
-        {"metricflow_time_spine": 100, "fct_daily": 900, "fct_comparison": 150},
+        {"anchor_dates": 100, "fct_daily": 900, "fct_comparison": 150},
     )
     assert findings[0].severity == "medium"
     assert findings[0].data["join_key_read"] is False
@@ -1857,6 +1961,308 @@ def test_each_join_is_shown_beside_its_own_keys(tmp_path: Path):
     # One join's key is readable, so the size of the expansion still ranks it.
     assert findings[0].severity == "high"
     assert "join_key_read" not in findings[0].data
+
+
+# --- #988: a date spine supplies anchors, not a population ----------------------
+
+_SPINE_ANCHORED = _ANCHORED.replace("anchor_dates", "{spine}")
+
+
+def _spine_node(name: str, **extra) -> dict:
+    return _model(name, 'select * from "wh"."main"."raw_dates"', **extra)
+
+
+def _spine_plan(tmp_path: Path, nodes: dict):
+    """Like :func:`_plan`, with the informational notes kept."""
+
+    target = tmp_path / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps({"nodes": nodes, "sources": {}}), encoding="utf-8"
+    )
+    return verify_mod.row_population_plan(tmp_path, "duckdb")
+
+
+def test_a_model_driven_off_the_legacy_time_spine_is_not_compared(tmp_path: Path):
+    """#988: the spine's row count is not a population the model preserves,
+    so the comparison is skipped and a note, not a warning, says why."""
+
+    checks, notes, informational = _spine_plan(
+        tmp_path,
+        {
+            "m.spine": _spine_node("metricflow_time_spine"),
+            "m.1": _model(
+                "fct_comparison", _SPINE_ANCHORED.format(spine="metricflow_time_spine")
+            ),
+        },
+    )
+    assert [check.model for check in checks] == ["metricflow_time_spine"]
+    note = (
+        "row population was not compared for fct_comparison (its driving parent "
+        "'metricflow_time_spine' is the project's time spine, which supplies "
+        "anchors rather than a population the model is expected to preserve)"
+    )
+    assert note in notes and note in informational
+
+
+def test_a_time_spine_config_marks_a_spine_under_any_name(tmp_path: Path):
+    """dbt 1.9's ``time_spine:`` config lands on the manifest node."""
+
+    checks, notes, _ = _spine_plan(
+        tmp_path,
+        {
+            "m.spine": _spine_node(
+                "all_days", time_spine={"standard_granularity_column": "date_day"}
+            ),
+            "m.1": _model("fct_comparison", _SPINE_ANCHORED.format(spine="all_days")),
+        },
+    )
+    assert "fct_comparison" not in [check.model for check in checks]
+    assert any("'all_days' is the project's time spine" in note for note in notes)
+
+
+def test_a_parent_generated_in_sql_is_not_a_population(tmp_path: Path):
+    checks, notes, informational = _spine_plan(
+        tmp_path,
+        {
+            "m.days": _model(
+                "days",
+                "select cast(range as date) as date_day from "
+                "range(date '2020-01-01', date '2021-01-01', interval 1 day)",
+            ),
+            "m.1": _model("fct_comparison", _SPINE_ANCHORED.format(spine="days")),
+        },
+    )
+    assert checks == []
+    note = next(note for note in notes if "fct_comparison" in note)
+    assert "its driving parent 'days' is generated in SQL" in note
+    assert note in informational
+
+
+def test_a_generated_parent_outside_the_scope_is_still_recognized(tmp_path: Path):
+    """A build that verifies one model has not read its parent: the parent is
+    read for this, once, and the note stays inside the scope."""
+
+    target = tmp_path / "target"
+    target.mkdir(parents=True)
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "nodes": {
+                    "m.days": _model(
+                        "days",
+                        "select cast(range as date) as date_day from "
+                        "range(date '2020-01-01', date '2021-01-01', interval 1 day)",
+                    ),
+                    "m.1": _model(
+                        "fct_comparison", _SPINE_ANCHORED.format(spine="days")
+                    ),
+                },
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    checks, notes, _ = verify_mod.row_population_plan(tmp_path, "duckdb", scope={"m.1"})
+    assert checks == []
+    assert len(notes) == 1 and "'days' is generated in SQL" in notes[0]
+
+
+_DATE_SPINE = (
+    "with rawdata as (with p as (select 0 as generated_number union all "
+    "select 1), unioned as (select p0.generated_number * power(2, 0) + "
+    "p1.generated_number * power(2, 1) + 1 as generated_number "
+    "from p as p0 cross join p as p1) "
+    "select * from unioned where generated_number <= 3 order by generated_number), "
+    "all_periods as (select cast('2020-01-01' as date) + "
+    "(row_number() over (order by 1) - 1) as date_day from rawdata), "
+    "filtered as (select * from all_periods "
+    "where date_day <= cast('2030-01-01' as date)) "
+    "select * from filtered"
+)
+
+
+def test_dbt_utils_date_spine_is_generated_in_sql(tmp_path: Path):
+    """``dbt_utils.date_spine`` compiles to a CTE with a WITH of its own over a
+    union of FROM-less selects. The nested name ``unioned`` was read as a
+    physical parent; it is generated in SQL, and so is a model driven off it."""
+
+    checks, notes, _ = _spine_plan(
+        tmp_path,
+        {
+            "m.days": _model("all_days", _DATE_SPINE),
+            "m.1": _model("fct_comparison", _SPINE_ANCHORED.format(spine="all_days")),
+        },
+    )
+    assert checks == []
+    text = " ".join(notes)
+    assert "all_days (generated in SQL; no parent relation" in text
+    assert "its driving parent 'all_days' is generated in SQL" in text
+    assert "unioned" not in text
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "select day as date_day from "
+        "unnest(generate_date_array('2024-01-01', '2024-04-30')) as day",
+        "select x from unnest([1, 2, 3]) as x",
+    ],
+)
+def test_bigquery_unnest_of_a_generator_is_generated_in_sql(sql):
+    """BigQuery's spine is ``unnest(generate_date_array(...))``: it generates
+    its rows in SQL, like DuckDB's ``range(...)``, rather than reading as a
+    relation dex cannot follow."""
+
+    import sqlglot
+
+    from exmergo_dex_core import sql_shape
+
+    tree = sqlglot.parse_one(sql, read="bigquery")
+    assert verify_mod._driving_parent(tree, sql_shape)[4] == verify_mod._GENERATED_SQL
+
+
+def test_an_unnest_of_a_column_is_not_generated_sql():
+    import sqlglot
+
+    from exmergo_dex_core import sql_shape
+
+    tree = sqlglot.parse_one(
+        'select item from "wh"."main"."orders" o, unnest(o.items) as item',
+        read="duckdb",
+    )
+    assert verify_mod._driving_parent(tree, sql_shape)[4] != verify_mod._GENERATED_SQL
+
+
+def test_spine_or_generated_models_identifies_spines_and_driven_models(tmp_path: Path):
+    nodes = {
+        "m.spine": _spine_node("metricflow_time_spine"),
+        "m.configured": _model(
+            "configured_spine",
+            "select date_day from raw_dates",
+            time_spine={"standard_granularity_column": "date_day"},
+        ),
+        "m.generated": _model(
+            "generated_dates",
+            "select cast(range as date) as date_day from "
+            "range(date '2024-01-01', date '2024-04-10', interval 1 day)",
+        ),
+        "m.driven": _model(
+            "fct_calendar_coverage",
+            _SPINE_ANCHORED.format(spine="metricflow_time_spine"),
+        ),
+        "m.driven_gen": _model(
+            "fct_generated_coverage",
+            _SPINE_ANCHORED.format(spine="generated_dates"),
+        ),
+        "m.ordinary": _model(
+            "dim_customers",
+            'select c.customer_id from "wh"."main"."stg_customers" c',
+        ),
+    }
+    models = verify_mod.spine_or_generated_models(tmp_path, "duckdb", nodes=nodes)
+    assert "metricflow_time_spine" in models
+    assert "configured_spine" in models
+    assert "generated_dates" in models
+    assert "fct_calendar_coverage" in models
+    assert "fct_generated_coverage" in models
+    assert "dim_customers" not in models
+
+
+def test_grain_findings_skips_naming_guess_on_spine_driven_model():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.fct_coverage": 100},
+        columns={"db.main.fct_coverage": ["customer_id", "date_day"]},
+        approx={"db.main.fct_coverage": {"customer_id": (40, 0.0)}},
+    )
+    findings, notes = verify_mod.grain_findings(
+        adapter,
+        {},
+        {"fct_coverage": "db.main.fct_coverage"},
+        ["db.main.fct_coverage"],
+        {"fct_coverage"},
+        spine_or_generated={"fct_coverage"},
+    )
+    assert findings == []
+    assert notes == []
+
+
+def test_grain_findings_checks_declared_grain_on_spine_driven_model_at_full_severity():
+    candidate = verify_mod.GrainCandidate(
+        columns=("customer_id",), source="declaration"
+    )
+    adapter = _GrainAdapter(
+        row_counts={"db.main.fct_coverage": 100},
+        columns={"db.main.fct_coverage": ["customer_id", "date_day"]},
+        exact={"db.main.fct_coverage": {"customer_id": 40}},
+    )
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {"fct_coverage": [candidate]},
+        {"fct_coverage": "db.main.fct_coverage"},
+        ["db.main.fct_coverage"],
+        {"fct_coverage"},
+        spine_or_generated={"fct_coverage"},
+    )
+    assert len(findings) == 1
+    assert findings[0].severity == "high"
+    assert findings[0].data["source"] == "declaration"
+
+
+def test_grain_findings_caps_heuristic_guess_at_medium_severity():
+    adapter = _GrainAdapter(
+        row_counts={"db.main.orders": 100},
+        columns={"db.main.orders": ["order_id"]},
+        approx={"db.main.orders": {"order_id": (40, 0.0)}},
+    )
+    findings, _ = verify_mod.grain_findings(
+        adapter,
+        {},
+        {"orders": "db.main.orders"},
+        ["db.main.orders"],
+        {"orders"},
+    )
+    assert len(findings) == 1
+    assert findings[0].severity == "medium"
+    assert findings[0].data["source"] == "heuristic"
+    assert findings[0].data["severity_cap_applied"] == "heuristic_grain"
+    assert "severity capped at medium" in findings[0].detail
+
+
+def test_a_union_reading_a_table_is_still_a_set_operation(tmp_path: Path):
+    checks, notes = _plan(
+        tmp_path,
+        {
+            "m.1": _model(
+                "mixed", 'select 1 as a union all select a from "wh"."main"."t"'
+            )
+        },
+    )
+    assert checks == []
+    assert "mixed (it is a set operation, so it has no single parent)" in notes[0]
+
+
+def test_a_model_that_only_joins_the_spine_keeps_its_check(tmp_path: Path):
+    """The spine is skipped only as the driving parent: a fact joined to it is
+    still compared, and its fan-out is reported as before."""
+
+    checks, notes, _ = _spine_plan(
+        tmp_path,
+        {
+            "m.spine": _spine_node("metricflow_time_spine"),
+            "m.1": _model(
+                "fct",
+                'select o.id from "wh"."main"."stg_orders" o inner join '
+                '"wh"."main"."metricflow_time_spine" s on o.ordered_at = s.date_day '
+                'left join "wh"."main"."stg_items" i on o.id = i.order_id',
+            ),
+        },
+    )
+    fct = next(check for check in checks if check.model == "fct")
+    assert fct.parent == "wh.main.stg_orders" or fct.parent.endswith("stg_orders")
+    assert not any("fct (" in note for note in notes)
+    findings, _ = _judge([fct], {"stg_orders": 100, "stg_items": 300, "fct": 400})
+    assert [f.code for f in findings] == ["row_fanout"]
 
 
 def _fanout(severity: str = "high", code: str = "row_fanout", model: str = "fct"):
@@ -2344,12 +2750,19 @@ def test_verify_reports_row_loss_end_to_end(
     assert "row_population" not in payload["data"]["suppressed"]
 
 
-def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
-    """#841's shape on a real warehouse: Monday anchors off a date spine,
-    range-joined to a daily fact, one row per anchor x day x page."""
+def _anchored_comparison(
+    maintain_repo,
+    *,
+    duplicate: bool = False,
+    anchors: str = "anchor_dates",
+    spine_config: dict | None = None,
+) -> None:
+    """#841's shape on a real warehouse: Monday anchors off a date table,
+    range-joined to a daily fact, one row per anchor x day x page. ``anchors``
+    names the date table; the project's time spine is not compared (#988)."""
 
     maintain_repo.sql(
-        "CREATE TABLE metricflow_time_spine AS SELECT "
+        f"CREATE TABLE {anchors} AS SELECT "  # noqa: S608 - a fixed test name
         "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 100) t(i)"
     )
     maintain_repo.sql(
@@ -2357,8 +2770,8 @@ def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
         "data_date, p AS page FROM range(0, 100) t(i), (VALUES ('a'), ('b')) v(p)"
     )
     sql = (
-        "with anchors as (select date_day as anchor_date from "
-        '"warehouse"."main"."metricflow_time_spine" where dayofweek(date_day) = 1), '
+        "with anchors as (select date_day as anchor_date from "  # noqa: S608
+        f'"warehouse"."main"."{anchors}" where dayofweek(date_day) = 1), '
         'daily as (select * from "warehouse"."main"."fct_daily") '
         "select anchors.anchor_date || '|' || daily.data_date || '|' || daily.page "
         "as comparison_key, anchors.anchor_date, daily.data_date, daily.page "
@@ -2368,9 +2781,26 @@ def _anchored_comparison(maintain_repo, *, duplicate: bool = False) -> None:
     )
     built = f"{sql} union all ({sql} limit 5)" if duplicate else sql
     maintain_repo.sql(f"CREATE TABLE fct_comparison AS {built}")
+    spine = (
+        {
+            f"model.maintain_test.{anchors}": {
+                "name": anchors,
+                "resource_type": "model",
+                "relation_name": f'"warehouse"."main"."{anchors}"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day from "
+                    "range(date '2024-01-01', date '2024-04-10', interval 1 day)"
+                ),
+                **spine_config,
+            }
+        }
+        if spine_config is not None
+        else {}
+    )
     _write_artifacts(
         maintain_repo.project_dir,
         nodes={
+            **spine,
             "model.maintain_test.fct_comparison": {
                 "name": "fct_comparison",
                 "resource_type": "model",
@@ -2422,14 +2852,43 @@ def test_verify_ranks_an_intended_expansion_low_end_to_end(
     # One finding states one cap: the grain's replaces the unread key's.
     assert comparison["detail"].count("severity capped") == 1
     assert "severity capped at low" in comparison["detail"]
-    assert (
-        comparison["data"]["driving_parent"] == "warehouse.main.metricflow_time_spine"
-    )
+    assert comparison["data"]["driving_parent"] == "warehouse.main.anchor_dates"
     assert fanouts["fct_order_lines"]["severity"] == "high"
     assert not [
         f
         for f in payload["data"]["findings"]
         if f["code"] == "grain_broken" and f["identifier"] == "fct_comparison"
+    ]
+
+
+def test_verify_does_not_compare_a_model_to_its_time_spine_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#988 end to end: the same comparison off the project's time spine
+    reports no row-population finding, names the spine in a note, and still
+    reports the ordinary fan-out in the same sweep."""
+
+    _anchored_comparison(
+        maintain_repo,
+        anchors="all_days",
+        spine_config={"time_spine": {"standard_granularity_column": "date_day"}},
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    population = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] in {"row_fanout", "row_loss"}
+    ]
+    assert [f["identifier"] for f in population] == ["fct_order_lines"]
+    note = next(note for note in payload["data"]["notes"] if "fct_comparison (" in note)
+    assert "'all_days' is the project's time spine" in note
+    # Row population speaks in the note only; the range join's own coverage
+    # warning is the join contract's, and is unchanged.
+    assert not [
+        warning
+        for warning in payload["warnings"]
+        if "fct_comparison" in warning and "row population" in warning
     ]
 
 
@@ -2447,6 +2906,109 @@ def test_verify_leaves_a_fanout_undamped_when_its_grain_broke(
     assert by_code["grain_broken"]["data"]["duplicate_count"] == 5
     assert by_code["row_fanout"]["severity"] == "medium"
     assert "grain_proven" not in by_code["row_fanout"]["data"]
+
+
+def test_verify_skips_naming_guess_on_spine_driven_model_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#1202 end to end: a spine-driven cross-product model with no declared
+    grain produces no grain_broken finding from a naming guess."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 10) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_calendar_coverage AS "
+        "SELECT o.customer_id, s.date_day FROM metricflow_time_spine s "
+        "CROSS JOIN orders o"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day from "
+                    "range(date '2024-01-01', date '2024-01-10', interval 1 day)"
+                ),
+            },
+            "model.maintain_test.fct_calendar_coverage": {
+                "name": "fct_calendar_coverage",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_calendar_coverage"',
+                "compiled_code": (
+                    "select o.customer_id, s.date_day from "
+                    '"warehouse"."main"."metricflow_time_spine" s '
+                    'cross join "warehouse"."main"."orders" o'
+                ),
+            },
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    grain_findings = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_calendar_coverage"
+    ]
+    assert grain_findings == []
+
+
+def test_verify_checks_declared_grain_on_spine_driven_model_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """#1202 end to end: a spine-driven model that declares a broken grain
+    is still checked and reported at full severity."""
+
+    maintain_repo.sql(
+        "CREATE TABLE metricflow_time_spine AS SELECT "
+        "DATE '2024-01-01' + i::INTEGER AS date_day FROM range(0, 10) t(i)"
+    )
+    maintain_repo.sql(
+        "CREATE TABLE fct_calendar_coverage AS "
+        "SELECT o.customer_id, s.date_day FROM metricflow_time_spine s "
+        "CROSS JOIN orders o"
+    )
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."metricflow_time_spine"',
+                "compiled_code": (
+                    "select cast(range as date) as date_day from "
+                    "range(date '2024-01-01', date '2024-01-10', interval 1 day)"
+                ),
+            },
+            "model.maintain_test.fct_calendar_coverage": {
+                "name": "fct_calendar_coverage",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_calendar_coverage"',
+                "compiled_code": (
+                    "select o.customer_id, s.date_day from "
+                    '"warehouse"."main"."metricflow_time_spine" s '
+                    'cross join "warehouse"."main"."orders" o'
+                ),
+                "config": {"meta": {"dex": {"grain": ["customer_id"]}}},
+            },
+        },
+        results=[],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    grain_findings = [
+        f
+        for f in payload["data"]["findings"]
+        if f["code"] == "grain_broken" and f["identifier"] == "fct_calendar_coverage"
+    ]
+    assert len(grain_findings) == 1
+    assert grain_findings[0]["severity"] == "high"
+    assert grain_findings[0]["data"]["source"] == "declaration"
 
 
 def test_verify_names_generated_sql_in_notes(
@@ -2544,6 +3106,56 @@ def test_a_join_is_named_by_the_model_it_reads_not_the_cte_alias(tmp_path: Path)
     # The key keeps the aliases the SQL uses, because that is the text the
     # reader will find when they open the file.
     assert fanned.join_keys == ("orders.order_id = lines.order_id",)
+
+
+def test_a_cross_join_to_a_set_operation_cte_names_the_cte(tmp_path: Path):
+    """#1211: a join to a CTE whose body is a set operation has no physical table
+    behind it, but it is a CTE with a name: report the CTE's own name rather than
+    calling it a subquery."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model("stg_orders", 'select * from "wh"."main"."orders"'),
+            "m.2": _model(
+                "fct_windows",
+                'with orders as (select * from "wh"."main"."stg_orders"), '
+                "windows as (select 1 as w union all select 2 as w) "
+                "select orders.id, windows.w from orders cross join windows",
+            ),
+        },
+    )
+    fanned = next(c for c in checks if c.model == "fct_windows")
+    assert fanned.joins == ("cross join to 'windows'",)
+    findings, _ = _judge(checks, {"stg_orders": 100, "fct_windows": 200})
+    assert [f.code for f in findings] == ["row_fanout"]
+    assert "the cross join to 'windows'" in findings[0].detail
+    assert "cross join to a subquery" not in findings[0].detail
+
+
+def test_a_cross_join_to_an_anonymous_set_operation_says_a_set_operation(
+    tmp_path: Path,
+):
+    """When a set operation is written inline as a subquery with no CTE name,
+    it is labelled as a set operation rather than an ordinary subquery."""
+
+    checks, _ = _plan(
+        tmp_path,
+        {
+            "m.1": _model("stg_orders", 'select * from "wh"."main"."orders"'),
+            "m.2": _model(
+                "fct_windows",
+                'with stg as (select * from "wh"."main"."stg_orders") '
+                "select stg.id, w.n from stg "
+                "cross join (select 1 as n union all select 2 as n) as w",
+            ),
+        },
+    )
+    fanned = next(c for c in checks if c.model == "fct_windows")
+    assert fanned.joins == ("cross join to a set operation",)
+    findings, _ = _judge(checks, {"stg_orders": 100, "fct_windows": 200})
+    assert [f.code for f in findings] == ["row_fanout"]
+    assert "the cross join to a set operation" in findings[0].detail
 
 
 def test_a_project_that_was_never_compiled_says_so(
@@ -2716,12 +3328,13 @@ def test_a_join_inside_a_joined_cte_is_also_visited():
         ),
         sql_shape,
     )
-    assert skipped == []
     pairs = {(c.from_relation, c.to_relation) for c in candidates}
-    assert pairs == {
-        ("wh.main.orders", "wh.main.customers"),
-        ("wh.main.customers", "wh.main.regions"),
-    }
+    assert pairs == {("wh.main.customers", "wh.main.regions")}
+    # The outer join reads `customers` through that inner join, which can drop
+    # customers, so it is not probed against the whole table (#1159).
+    (skip,) = skipped
+    assert skip.code == "filtered_cte"
+    assert "CTE `cust_regions`" in skip.reason
 
 
 def test_a_using_join_is_an_equality_candidate():
@@ -2762,13 +3375,15 @@ def test_a_chained_using_join_with_two_relations_in_scope_is_skipped():
 
 def test_a_cte_column_projected_from_a_joined_relation_resolves_correctly():
     # `c.region_id` inside the CTE comes from `customers`, joined there, not
-    # from the CTE's own FROM relation (`orders`, which has no region_id).
+    # from the CTE's own FROM relation (`orders`, which has no region_id). A
+    # RIGHT join keeps every customer, so the column resolves through; an
+    # inner join could drop some and would be `filtered_cte` (#1159).
     candidates, skipped = verify_mod._model_joins(
         _parsed(
             "with x as ("
             "  select o.order_id, c.region_id from "
             '  "wh"."main"."orders" o '
-            '  inner join "wh"."main"."customers" c on o.customer_id = c.id'
+            '  right join "wh"."main"."customers" c on o.customer_id = c.id'
             ") "
             'select * from x inner join "wh"."main"."regions" r '
             "on x.region_id = r.id"
@@ -4130,6 +4745,157 @@ def test_maintain_verify_target_dev_reads_dev_namespace(tmp_path: Path):
     assert data_dev["target"] == "dev"
     assert data_dev["manifest_target"] == "dev"
     assert data_dev["judged_namespace"] == "dbt_dev"
+
+
+def test_maintain_verify_target_dev_reads_a_package_seed_parents_namespace(
+    tmp_path: Path,
+):
+    """#1155: a declared parent that is a package seed built into
+    ``<dev schema>_<name>`` (a package's ``+schema``) is read by
+    ``maintain verify --target dev`` and judged, not reported unbuilt."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+    from exmergo_dex_core.config import DexConfig, PostgresTarget
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.maintain import commands as maintain_cmds
+    from exmergo_dex_core.storage import MemoryStore
+
+    def meta(schema: str, name: str) -> ObjectMeta:
+        """Metadata for one built table."""
+        return ObjectMeta(
+            identifier=f"dexdb.{schema}.{name}",
+            object_type="table",
+            schema=schema,
+            name=name,
+            row_count=4,
+            byte_size=1024,
+            column_count=1,
+        )
+
+    class _DevAdapter:
+        name = "postgres"
+        dialect = "postgres"
+        paradigm = Paradigm.DB_LOAD
+        cost_gate = None
+        target = PostgresTarget(schemas=["shop"], dev_schema="dbt_dev")
+
+        def __init__(self):
+            self.reads: list = []
+            self.probes: list[str] = []
+
+        def read_dev_target(self, scope) -> None:
+            self.reads.append(scope)
+
+        def _namespaces(self) -> set[str]:
+            """The dev namespaces the last command asked to read."""
+            scope = self.reads[-1] if self.reads else None
+            return {scope} if isinstance(scope, str) else set(scope or ())
+
+        def list_objects(self, *, include_views: bool = True):
+            objects = [meta("shop", "customers")]
+            if "dbt_dev" in self._namespaces():
+                objects.append(meta("dbt_dev", "threads"))
+            if "dbt_dev_inbox" in self._namespaces():
+                objects.append(meta("dbt_dev_inbox", "inbox_states"))
+            return objects
+
+        def table_metadata(self, identifier: str):
+            return (
+                meta(*identifier.split(".")[1:]),
+                [ColumnMeta(name="state", data_type="text", nullable=False, ordinal=1)],
+            )
+
+        def exact_distinct_counts(self, identifier: str, columns: list[str]):
+            return dict.fromkeys(columns, 4)
+
+        def distinct_combination_counts(self, identifier, combinations):
+            return {tuple(c): 4 for c in combinations}
+
+        def run_query(self, sql: str, *, max_rows: int, timeout_seconds=None):
+            """Answer the parent probe: four parents, every one present."""
+
+            from exmergo_dex_core.adapters.base import QueryResult
+
+            if "dex_parents_present" not in sql:
+                raise RuntimeError("only the parent probe is answered here")
+            self.probes.append(sql)
+            counts = {
+                "dex_out_rows": 4,
+                "dex_out_keys": 4,
+                "dex_out_null": 0,
+                "dex_out_known": 4,
+                "dex_parent_keys": 4,
+                "dex_eligible_parents": 4,
+                "dex_parents_present": 4,
+            }
+            return QueryResult(
+                columns=list(counts),
+                types=["integer"] * len(counts),
+                cells=[list(counts.values())],
+                truncated=False,
+            )
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    (project_dir / "dbt_project.yml").write_text("name: test_proj\nversion: '1.0'\n")
+    parent = {"model": "inbox_states", "key": {"state": "state"}}
+    _write_artifacts(
+        project_dir,
+        nodes={
+            "model.test_proj.threads": {
+                "name": "threads",
+                "resource_type": "model",
+                "relation_name": '"dexdb"."dbt_dev"."threads"',
+                "config": {"meta": {"dex": {"population": {"parent": parent}}}},
+                "columns": {"state": {"name": "state", "data_type": "text"}},
+            },
+            "seed.tiny_inbox.inbox_states": {
+                "name": "inbox_states",
+                "resource_type": "seed",
+                "package_name": "tiny_inbox",
+                "relation_name": '"dexdb"."dbt_dev_inbox"."inbox_states"',
+            },
+        },
+        results=[],
+        metadata={"target_name": "dev"},
+    )
+    adapter = _DevAdapter()
+    config = DexConfig(
+        connector="postgres",
+        dbt_project_dir=str(project_dir),
+        postgres=PostgresTarget(schemas=["shop"], dev_schema="dbt_dev"),
+    )
+    engine = DexEngine(config=config, store=MemoryStore(), repo_root=str(tmp_path))
+    engine._adapter_instance = adapter
+
+    result = maintain_cmds.verify(engine, target="dev")
+
+    assert adapter.reads[-1] == ["dbt_dev", "dbt_dev_inbox"], adapter.reads
+    assert any("dbt_dev_inbox" in note for note in result.notes)
+    unbuilt = [
+        reason
+        for reason in [
+            result.suppressed.get("parent_population", ""),
+            *(
+                r.get("reason") or ""
+                for r in result.data().get("parent_population") or []
+            ),
+        ]
+        if "was not built" in reason
+    ]
+    assert unbuilt == [], unbuilt
+    [probe] = adapter.probes
+    normalized = probe.replace('"', "").lower()
+    assert "dexdb.dbt_dev.threads" in normalized, probe
+    assert "dexdb.dbt_dev_inbox.inbox_states" in normalized, probe
+    [record] = result.data().get("parent_population") or []
+    assert record["parent_relation"] == "dexdb.dbt_dev_inbox.inbox_states"
+    assert record["status"] == "satisfied", record
+    assert "reason" not in record
+    assert record["measured"]["missing_parents"] == 0
+    assert record["measured"]["unexpected_keys"] == 0
+    assert record["measured"]["coverage"] == 1.0
 
 
 def test_a_model_whose_final_cte_is_a_union_is_unfollowable_not_unbuilt(tmp_path: Path):

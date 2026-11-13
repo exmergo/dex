@@ -53,6 +53,7 @@ import json
 import math
 import re
 import time
+from collections.abc import Sequence
 from typing import Any
 
 from ..config import ClickHouseTarget
@@ -68,6 +69,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -339,7 +341,7 @@ class ClickHouseAdapter:
         from clickhouse_connect.driver import exceptions as ch_exceptions
 
         self._ch_exceptions = ch_exceptions
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._server_version: str | None = None
         self._notes: dict[str, list[str]] = {}
@@ -678,7 +680,7 @@ class ClickHouseAdapter:
         self._resolved_databases: list[str] | None = None
         self._visible_databases: set[str] | None = None
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_database``, the database this command's build writes into,
         or stop reading it with ``None``.
 
@@ -689,7 +691,7 @@ class ClickHouseAdapter:
         changed.
         """
 
-        scope = scope.strip() if scope else None
+        scope = dev_target_entries(scope, str)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()

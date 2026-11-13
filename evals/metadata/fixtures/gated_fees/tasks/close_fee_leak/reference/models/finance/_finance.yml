@@ -1,0 +1,52 @@
+version: 2
+models:
+  - name: ledger_daily
+    description: >-
+      One row per posting day and ledger account. With enable_platform_fees
+      off, the fee total is not output.
+    config:
+      meta:
+        dex:
+          grain: [posted_on, account]
+          population:
+            rule: Every posting the ledger feed delivered; nothing is filtered.
+          assumptions:
+            - decision: Whether the fees account keeps its rows when fees are off
+              chosen: kept, only the fee column goes
+              evidence: request
+              detail: every row stays whichever way the variable is set
+    columns:
+      - name: posted_on
+        config:
+          meta:
+            dex:
+              role: time
+      - name: account
+        config:
+          meta:
+            dex:
+              role: dimension
+      - name: posting_count
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: count
+      - name: total_amount
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: currency:EUR
+      - name: total_fees
+        config:
+          meta:
+            dex:
+              role: measure
+              aggregation: sum
+              additivity: additive
+              unit: currency:EUR

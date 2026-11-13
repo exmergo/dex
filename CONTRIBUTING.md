@@ -48,9 +48,11 @@ Everything is deterministic and free: no cloud account is needed. The live
 cloud integration tests under `tests/integration/` collect as skipped with
 the enabling variables named in the skip reason.
 
-CI runs the same suite split into parallel groups by test file, defined in
-`tests/ci_groups.py`. A new test file needs nothing: it lands in the catch-all
-group until someone moves it. To reproduce one group locally, run
+CI runs the same suite split into parallel groups, defined in
+`tests/ci_groups.py`: by test file, and test by test (`file::test_name`) for
+the few dbt-heavy files too slow for one job, so every job stays under five
+minutes. A new test file needs nothing: it lands in the catch-all group until
+someone moves it. To reproduce one group locally, run
 `uv run pytest --ci-group <name>`. The `tests` check stays red unless the groups,
 between them, ran every collected test exactly once
 (`scripts/check_test_groups.py`).
@@ -600,7 +602,9 @@ fields its format structurally cannot carry instead of returning them empty. The
 shipped native Ossie source binds every applicable contract in
 `packages/dex-core/tests/ossie/test_conformance.py`, which is the worked example
 to read. `packages/dex-core/tests/cube_vendor/test_reader.py` binds them for the
-Cube source, including a Cube rendering of the reference layer.
+Cube source, including a Cube rendering of the reference layer, and
+`packages/dex-core/tests/metric_views_vendor/test_reader.py` for the Databricks
+Metric View source.
 
 ## Linting and formatting (Ruff)
 
@@ -645,9 +649,9 @@ pre-commit hook locally before you push so the gate passes on the first try.
 
 `explore diagram` emits Mermaid text. dex never renders it, so nothing in
 `pyproject.toml` pins the syntax dialect it has to stay compatible with, and the
-`mermaid-syntax` CI job holds that contract instead: it renders a fixture corpus
-from the engine and parses each one with the real `mermaid` package from npm. It is
-advisory, like `sqlglot-canary`, because a Mermaid release breaking our dialect
+Mermaid steps of the `docs-checks` CI job hold that contract instead: they render a
+fixture corpus from the engine and parse each one with the real `mermaid` package
+from npm. They are advisory, like `sqlglot-canary`, because a Mermaid release breaking our dialect
 should be loud without blocking an unrelated merge.
 
 To reproduce it locally you need Node. Install outside the checkout so a Python

@@ -148,7 +148,12 @@ mode, an error reaching the caller carries its class (`reason`) and a stable cod
 | Any other refusal dex wrote | unchanged words (they name objects, columns, numbers and fixes) and a code |
 
 The replacement does not chain the original, so a traceback does not print the
-words it exists to drop. The query ledger records the code in place of the words
+words it exists to drop. A refusal a command catches and reports rather than
+raises is held to the same rule: a join probe `explore relationships --verify`
+or `explore map --verify` could not run names the edge and the exception type,
+never the warehouse's message, in the notes and in the dataset's
+`data_quality`. Outside the mode those words are kept with any value they quote
+masked ([`pii-policy.md`](pii-policy.md#warehouse-error-text)). The query ledger records the code in place of the words
 too. It still records each statement's SQL, which is the agent's own text.
 
 ## The cache

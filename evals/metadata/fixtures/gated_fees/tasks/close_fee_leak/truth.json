@@ -1,0 +1,147 @@
+{
+  "models": {
+    "ledger_daily": {
+      "grain": [
+        "posted_on",
+        "account"
+      ],
+      "population": {
+        "filters": "none"
+      },
+      "columns": {
+        "posted_on": {
+          "role": [
+            "time",
+            "key"
+          ]
+        },
+        "account": {
+          "role": [
+            "dimension",
+            "key"
+          ]
+        },
+        "posting_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "the default keeps every fee column",
+      "expect": 5,
+      "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name || '.' || lower(column_name) in ('fct_orders.platform_fee', 'fct_orders.net_amount', 'rpt_merchant_revenue.platform_fees', 'rpt_merchant_revenue.high_fee', 'ledger_daily.total_fees')"
+    }
+  ],
+  "var_builds": [
+    {
+      "name": "fees_on",
+      "vars": {
+        "enable_platform_fees": true
+      },
+      "checks": [
+        {
+          "name": "the order fact has exactly its fee and other columns",
+          "expect": "gross_amount,merchant_id,net_amount,order_id,ordered_on,platform_fee",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'fct_orders'"
+        },
+        {
+          "name": "the merchant report has exactly its fee and other columns",
+          "expect": "gross_revenue,high_fee,merchant_id,order_count,platform_fees",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_merchant_revenue'"
+        },
+        {
+          "name": "the ledger has exactly its fee and other columns",
+          "expect": "account,posted_on,posting_count,total_amount,total_fees",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'ledger_daily'"
+        },
+        {
+          "name": "ledger fees match the postings",
+          "expect": true,
+          "sql": "select (select sum(total_fees) from main.ledger_daily) = (select sum(fee_amount) from raw.ledger_postings)"
+        },
+        {
+          "name": "every order is reported",
+          "expect": 40,
+          "sql": "select count(*) from main.fct_orders"
+        },
+        {
+          "name": "the ledger keeps one row per day and account",
+          "expect": 10,
+          "sql": "select count(*) from main.ledger_daily"
+        },
+        {
+          "name": "ledger totals are unchanged",
+          "expect": true,
+          "sql": "select (select sum(total_amount) from main.ledger_daily) = (select sum(amount) from raw.ledger_postings)"
+        },
+        {
+          "name": "the retired report stays disabled",
+          "expect": 0,
+          "sql": "select count(*) from information_schema.tables where table_schema = 'main' and table_name = 'rpt_fee_history'"
+        }
+      ]
+    },
+    {
+      "name": "fees_off",
+      "vars": {
+        "enable_platform_fees": false
+      },
+      "checks": [
+        {
+          "name": "no reporting model exposes a fee column",
+          "expect": 0,
+          "sql": "select count(*) from information_schema.columns where table_schema = 'main' and table_name not like 'stg_%' and lower(column_name) in ('platform_fee', 'net_amount', 'platform_fees', 'high_fee', 'total_fees', 'lifetime_fees')"
+        },
+        {
+          "name": "the order fact has exactly its other columns",
+          "expect": "gross_amount,merchant_id,order_id,ordered_on",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'fct_orders'"
+        },
+        {
+          "name": "the merchant report has exactly its other columns",
+          "expect": "gross_revenue,merchant_id,order_count",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'rpt_merchant_revenue'"
+        },
+        {
+          "name": "the merchant report keeps one row per merchant",
+          "expect": true,
+          "sql": "select (select count(*) from main.rpt_merchant_revenue) = (select count(distinct merchant_id) from raw.orders)"
+        },
+        {
+          "name": "the ledger has exactly its other columns",
+          "expect": "account,posted_on,posting_count,total_amount",
+          "sql": "select string_agg(lower(column_name), ',' order by lower(column_name)) from information_schema.columns where table_schema = 'main' and table_name = 'ledger_daily'"
+        },
+        {
+          "name": "every order is reported",
+          "expect": 40,
+          "sql": "select count(*) from main.fct_orders"
+        },
+        {
+          "name": "the ledger keeps one row per day and account",
+          "expect": 10,
+          "sql": "select count(*) from main.ledger_daily"
+        },
+        {
+          "name": "ledger totals are unchanged",
+          "expect": true,
+          "sql": "select (select sum(total_amount) from main.ledger_daily) = (select sum(amount) from raw.ledger_postings)"
+        },
+        {
+          "name": "the retired report stays disabled",
+          "expect": 0,
+          "sql": "select count(*) from information_schema.tables where table_schema = 'main' and table_name = 'rpt_fee_history'"
+        }
+      ]
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true,
+    "toggle_contract_before_apply": true
+  }
+}

@@ -18,7 +18,7 @@ caps and truncates them before the envelope.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -28,6 +28,7 @@ from typing import Protocol, runtime_checkable
 
 from ..envelope import Paradigm
 from ..errors import StatementStage, WarehouseQueryError
+from ..value_mask import mask_values
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class ObjectMeta:
     row_count: int | None
     byte_size: int | None
     column_count: int
+    database: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,11 @@ class ColumnMeta:
     data_type: str
     nullable: bool
     ordinal: int
+    # A connector can mark an extension type as not safely groupable.  It remains
+    # part of the reported schema, but refactor comparison stops before running.
+    groupable: bool = True
+    # A connector may require a stable representation for exact comparison.
+    comparison_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -233,8 +240,33 @@ def scope_within(scope: str, committed: list[str]) -> bool:
     )
 
 
+def dev_target_entries(
+    scope: str | Sequence[str] | None, normalize: Callable[[str], str] = str
+) -> tuple[str, ...] | None:
+    """The dev namespaces one command reads, each spelled by ``normalize``.
+
+    The dev namespace itself, plus any namespace dbt derives from it for this
+    target (``<dev schema>_<custom>``, where a package or a folder sets
+    ``+schema``), which a verified build judges as its own output too (#1155).
+    ``None`` for no entry at all, so a command that reads nothing compares equal
+    however it was cleared.
+    """
+
+    if not scope:
+        return None
+    items = [scope] if isinstance(scope, str) else list(scope)
+    entries = tuple(
+        dict.fromkeys(
+            normalize(item.strip()) for item in items if item and item.strip()
+        )
+    )
+    return entries or None
+
+
 def with_dev_target(
-    scopes: list[str], dev_target: str | None, exists: Callable[[str], bool]
+    scopes: list[str],
+    dev_target: str | Sequence[str] | None,
+    exists: Callable[[str], bool],
 ) -> list[str]:
     """The resolved source scope, plus the dev namespace when this command reads it.
 
@@ -258,9 +290,15 @@ def with_dev_target(
     normalized it.
     """
 
-    if not dev_target or scope_within(dev_target, scopes) or not exists(dev_target):
+    entries = [dev_target] if isinstance(dev_target, str) else list(dev_target or ())
+    added = [
+        entry
+        for entry in entries
+        if entry and not scope_within(entry, scopes) and exists(entry)
+    ]
+    if not added:
         return scopes
-    return sorted({*scopes, dev_target})
+    return sorted({*scopes, *added})
 
 
 SUGGESTION_CAP = 12
@@ -314,8 +352,10 @@ def warehouse_refusal(
     Every adapter funnels through here so the envelope reads the same whichever
     warehouse said no, and so the server's words get the same trim: first line
     only (drivers append the statement, a caret diagram, or their whole error
-    payload after it) and capped. ``code`` is the connector's own error code
-    where it has one, which is what a caller looking the failure up needs.
+    payload after it), the data value a conversion failure quotes masked (see
+    :mod:`~exmergo_dex_core.value_mask`), and capped. ``code`` is the
+    connector's own error code where it has one, which is what a caller looking
+    the failure up needs.
 
     ``stage`` is which door the refusal came through, for an adapter that can
     tell (see :class:`~exmergo_dex_core.errors.StatementStage`). It is kept as a
@@ -325,7 +365,9 @@ def warehouse_refusal(
     """
 
     first = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
-    detail = first or "the server gave no message"
+    # Masked before the cap: a cap that cut through a quoted value would leave
+    # it without the closing quote the mask reads its end from (#1070).
+    detail = mask_values(first) or "the server gave no message"
     if len(detail) > _SERVER_DETAIL_CAP:
         detail = detail[:_SERVER_DETAIL_CAP].rstrip() + "..."
     return WarehouseQueryError(f"{detail} [{code}]" if code else detail, stage=stage)
@@ -1042,6 +1084,18 @@ class Adapter(Protocol):
     - ``describe_query_free``: ``False`` where ``describe_query`` runs on paid
       compute (it can start a stopped warehouse), so a comparison prices first.
       Absent reads as free.
+    - ``table_columns(identifier)``: one object's columns, as
+      ``table_metadata`` returns them, without the exact row count. An adapter
+      whose ``table_metadata`` runs a ``COUNT(*)`` (DuckDB) offers it, so a
+      caller that needs only names and types does not scan the relation.
+      Absent, ``table_metadata`` answers from metadata alone.
+    - ``column_schema(identifier)``: one relation's column tree as the
+      connector's dbt adapter builds its columns from it (a list of
+      ``{name, type, mode, fields}`` dicts), from free metadata. Planning hands
+      it to dbt's column class when a compile-time macro calls
+      ``adapter.get_columns_in_relation`` (#1154), so a nested type renders as
+      dbt renders it. Absent, the macro gets ``table_metadata``'s names and
+      types, which is exact for every connector whose dbt columns are flat.
     - ``in_scope(namespace)``: whether a dotted namespace lies inside the
       scope this command examined (issue #984). Tells carry-forward whether
       an object missing from this run's inventory was looked for and is gone

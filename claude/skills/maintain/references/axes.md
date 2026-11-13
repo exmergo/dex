@@ -67,7 +67,9 @@ Under `semantic.vendor: slayer` the SLayer models are also held to the warehouse
 by SLayer's own `validate-models` rules, run on the metadata Dex captured and
 never through a SLayer datasource: `declared_column_missing`,
 `declared_type_conflict` (SLayer's type buckets: number, string, boolean,
-temporal), `declared_relation_missing` (a table gone since the baseline), and
+temporal, and a list; a column that became a list is `remedy_kind: reingest`
+with the warehouse's `element_type`, and reconcile states it as a `type: ARRAY`
+declaration rather than `slayer ingest`), `declared_relation_missing` (a table gone since the baseline), and
 `declared_dependency_dropped` (a join, measure or filter lost to another drop).
 Each carries the model's whole removal under `data.removal`, which is what
 `maintain reconcile` plans.
@@ -175,6 +177,21 @@ change is accepted. `maintain reconcile` answers these findings with advisories
 only: a declaration is a human's decision, so Dex never rewrites one to match the
 baseline.
 
+A native semantic layer (Ossie, SLayer, Cube) is compared the same way, from
+each definition's own declaration: every key of the `dex` block in its
+`ai_context` (Ossie) or `meta` (SLayer, Cube) and in each member's, a member's
+fields keyed by the column it reads, and its primary key as the `grain`, so a
+changed primary key is a `high` grain change and a `grain` written in the `dex`
+block is not read. The finding names the definition (`commerce.orders`, a SLayer
+model, a cube) and carries `data.layer: semantic` and `data.vendor`. With no
+transformation project, `data.declaration_drift` is the layer's own status, with
+its `vendor`; beside a dbt project the layer's status rides under
+`data.declaration_drift.semantic_layer`, and `checked` is true only when both
+were compared. A baseline pinned before native declarations were fingerprinted,
+a layer whose declarations could not be read, and a change of vendor are
+`checked: false` with a `reason`, never clean; `maintain snapshot
+--project-only` baselines them.
+
 The baseline records which vendor read the layer, and for SLayer the release and
 model format version. A change in any of them is reported first
 (`semantic_vendor_changed`, `semantic_format_changed`), and definitions are not
@@ -209,7 +226,12 @@ Needs no baseline. The classes of finding:
   `transform build --full-refresh --verify`, only one the build did not rebuild,
   or a microbatch model). A model that
   generates its rows in SQL, such as `range(...)` or a `VALUES` clause, has no
-  parent relation. That is named in `notes`. A real parent relation that is
+  parent relation. That is named in `notes`. A model whose driving parent is
+  the project's time spine (a `time_spine:` config, or the
+  `metricflow_time_spine` name) or a model generated in SQL
+  (`dbt_utils.date_spine` included) is not compared either, since the spine
+  supplies anchors rather than a population, and `notes` names it (#988). A
+  model that only joins a spine keeps its check. A real parent relation that is
   absent from the warehouse is still a warning.
 - **Column contract**: `column_missing`, `column_undeclared` and
   `column_type_mismatch`, the built relation's columns against `schema.yml`.
@@ -219,6 +241,20 @@ Needs no baseline. The classes of finding:
   `unique_combination_of_columns` test, a semantic model's primary entity,
   then a naming guess. `data.source` says which one. A declared grain is
   counted in the declared-fact statement below, so it is priced with it.
+  `data.grain_coverage` (#1223) holds one record per declared key, whichever
+  source declared it (`model`, `columns`, `source`, `status`, `reason`,
+  `measured`), so a key that held is stated rather than read out of an absent
+  finding. `status` is `proven` (the exact distinct count reached the row
+  count), `broken` (beside its `grain_broken` finding), `not_applicable`
+  (`empty_relation`), `unchecked` or `not_planned` (`priority`: a key from a
+  lower-ranked source the model's checked keys displaced; one on the same
+  columns as a checked key is judged by it and gets no record of its own).
+  `unchecked` names its `reason`: `no_relation`, `ambiguous`,
+  `metadata_unreadable`, `missing_columns`, `scan` (the connector could not
+  run the count), `scan_offered`, `no_count`, `refused` or `not_measured`. The
+  naming guess has no record, and the field is absent when the grain class is
+  suppressed. Only `proven` is a pass. `measured` carries the row and distinct
+  counts where both were read; the warehouse's own words stay in `notes`.
 - **Join contract** (#228, #857): every equality join's coverage, measured
   with one aggregate probe per driving relation and recorded under
   `data.join_coverage`, one record per join:
@@ -258,7 +294,10 @@ Needs no baseline. The classes of finding:
     warehouse table), `filtered_cte` (a filtering scope of any other shape: a
     `GROUP BY`, `DISTINCT`, `LIMIT`, `HAVING`, `QUALIFY`, a join beside the
     filter, a subquery or clock function in it, or a filter on a computed or
-    window column such as `rn = 1`; the reason names the scope and the shape),
+    window column such as `rn = 1`, or a join that can drop rows of the
+    relation the key is read from: an inner, bare, comma or CROSS join, a
+    RIGHT join with the key on its left, or a LEFT join with the key on its
+    joined side; the reason names the scope and the shape),
     `unparseable_sql`, `relation_not_found`,
     `probe_refused` or `scan_offered`.
 
@@ -270,7 +309,14 @@ Needs no baseline. The classes of finding:
     row (`threshold_source: contract`, high). Otherwise the stated defaults,
     0.2 and 0.9 of eligible rows (`threshold_source: default`). On a LEFT join
     with no requirement, unmatched rows are the optional relationship the join
-    writes: no `join_orphans`, and `join_zero_overlap` at medium.
+    writes: no `join_orphans`, and `join_zero_overlap` at medium. On an INNER
+    join with no requirement whose unmatched rows the declaration accounts for
+    (an `assumptions` entry whose `column` names the driving key column, or a
+    `population.filters` entry on it), the join is the model's filter: the
+    record is `satisfied`, keeps its measured counts, and names the entry
+    under `unmatched_accounted_for` (`by`: `assumption` or
+    `population_filter`, the `column`, and the `withheld_finding` the default
+    would have raised). `join_no_match` still stands (#1162).
   - `join_field_all_null` (high): a column the join supplies, declared
     `null_rule: never`, NULL on every row. `join_field_newly_null` (medium):
     one with no rule, NULL on every row, where the exploration cache profiled
@@ -297,6 +343,24 @@ Needs no baseline. The classes of finding:
     named in `filters_unapplied` and drops the missing finding to medium.
     Unexpected keys are never the population. Each declared parent has a
     record under `data.parent_population` with the same statuses as a join.
+    The parent may be an installed package's model (#1155), measured on the
+    relation the manifest names for it; with `--target dev` (and on a build's
+    `--verify`) a package that sets `+schema` is read in the
+    `<dev schema>_<name>` namespace dbt built it into.
+  - `population_delta` (high with orphan keys, medium with missing parents,
+    low for parents kept with no children), on `transform build --verify`
+    only, for a built model that declares no `population.parent` (#1228): the
+    same counts against the parent dex drafts for it, plus the rows whose child
+    columns are all NULL or zero (a sign of parents kept with no children, not
+    proof: children whose amounts sum to zero read the same). It asks which rows the model is for rather
+    than calling any of them wrong. Its records are under
+    `data.verification.population_delta` (`satisfied`, `needs_decision`,
+    `settled`, `not_applicable`, `unchecked`), and it is never named in
+    `suppressed`. Not every such model gets one: with `--for-plan` only the
+    plan's models are drafted (one the draft cannot reach is `unchecked`),
+    without it at most 25, and a model nothing could be drafted for is named in
+    `notes`, so an absent record does not mean the model was checked.
+    `maintain verify` measures declared parents only.
   - `temporal_transition_count_mismatch`, `temporal_latest_transition_mismatch`
     and `temporal_first_attainment_mismatch` (high), `temporal_population_missing`
     and `temporal_population_unexpected` (high), and

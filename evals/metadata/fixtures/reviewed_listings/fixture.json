@@ -1,0 +1,5 @@
+{
+  "name": "reviewed_listings",
+  "seed": 1228,
+  "description": "Rental listings and their guest reviews. Eight listings were never reviewed, and five reviews name listings that were taken down. A review summary the request scopes to reviewed listings must drop the unreviewed ones and the reviews of removed listings; driven from the listings with the reviews left-joined, it keeps unreviewed listings with NULL ratings, and driven from the reviews it keeps the removed ones (#1228)."
+}

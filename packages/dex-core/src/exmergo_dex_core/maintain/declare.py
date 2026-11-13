@@ -38,11 +38,13 @@ from ..transform.rewrite import (
     splice,
     yaml_blocks,
 )
-from ..yaml_spans import with_leading_comments
+from ..yaml_spans import uses_anchors_or_aliases, with_leading_comments
 
 #: Structures a span splice cannot be trusted through. Tabs make indentation
-#: ambiguous, a second document makes "which one" unanswerable, and an alias
-#: expands somewhere the offsets do not describe.
+#: ambiguous, and a second document makes "which one" unanswerable. An anchor or
+#: alias, which expands somewhere the offsets do not describe, is read from the
+#: parse instead (:func:`uses_anchors_or_aliases`): as text, `*active*` in a
+#: description looks like one.
 _UNSPANNABLE = (
     (
         re.compile(r"^\t| \t", re.MULTILINE),
@@ -51,10 +53,6 @@ _UNSPANNABLE = (
     (
         re.compile(r"^---\s*$.*^---\s*$", re.MULTILINE | re.DOTALL),
         "holds more than one YAML document",
-    ),
-    (
-        re.compile(r"(?<![\w&*])[&*][A-Za-z_][\w-]*"),
-        "uses YAML anchors or aliases, whose expansion dex does not track",
     ),
 )
 
@@ -171,6 +169,12 @@ class DeclarationEdits:
             if pattern.search(content):
                 return Declined(path, f"{path} {complaint}")
         try:
+            if uses_anchors_or_aliases(content):
+                return Declined(
+                    path,
+                    f"{path} uses YAML anchors or aliases, whose expansion dex "
+                    "does not track",
+                )
             parsed = yaml.safe_load(content)
         except yaml.YAMLError:
             return Declined(path, f"{path} did not parse as YAML")

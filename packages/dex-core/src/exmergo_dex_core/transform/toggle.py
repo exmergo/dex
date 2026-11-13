@@ -37,8 +37,18 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ..dbt_project import DbtProjectView, jinja_calls
+from ..references import column_parse_limit
 from ..semantic_declarations import Assumption, _Strict
-from .plans import EditOp, PlanEdit
+from .compiled_tree import (
+    _QUOTES,
+    Branch,
+    Catalog,
+    compile_branch,
+    identifiers,
+    macro_callers,
+    macro_closure,
+)
+from .plans import PlanEdit
 
 if TYPE_CHECKING:
     from ..engine import DexEngine
@@ -269,261 +279,19 @@ def matches(value: Any, wanted: Any) -> bool:
 # --- plan time: compile every model on both values ---------------------------
 
 
-class _Model:
-    """One model's compiled form in one branch."""
-
-    def __init__(self, sql: str, relation: str | None, package: str, path: str) -> None:
-        """One model's compiled SQL, relation and file, with no columns read yet."""
-
-        self.sql = sql
-        self.relation = relation
-        self.package = package
-        self.path = path
-        self.columns: list[str] | None = None
-        self.reason: str | None = None
-
-
-class _Branch:
-    """Every project model compiled at one value, or why the compile failed."""
-
-    def __init__(self) -> None:
-        """An empty branch: no models, nothing disabled, no failure."""
-
-        self.models: dict[str, _Model] = {}
-        self.disabled: set[str] = set()
-        self.failure: str | None = None
-        self.manifest: Mapping[str, Any] = {}
-
-
-_QUOTES = re.compile(r'["`\[\]]')
-
-
-def _relation_key(name: str) -> tuple[str, ...]:
-    """A compiled relation name as lowercase parts, quoting removed."""
-
-    return tuple(
-        part.strip().lower() for part in _QUOTES.sub("", name).split(".") if part
-    )
-
-
-def _compile_branch(
-    engine: DexEngine,
-    stored: Any,
-    project: Path,
-    view: DbtProjectView,
-    connector: str | None,
-    *,
-    vars_: Mapping[str, Any],
-    proposed: bool,
-) -> _Branch:
-    """Compile every model this project owns, in a throwaway copy.
-
-    Nothing is made ephemeral: a star over another model resolves through the
-    compiled columns of that model in this same branch (:class:`_Catalog`), so
-    the whole branch is read as one tree.
-    """
-
-    from .refactor_compare import _shadow
-
-    branch = _Branch()
-    target = engine.config.dbt_target or "dev"
-    name = view.project_name or ""
-    selector = f"package:{name},resource_type:model" if name else "resource_type:model"
-    try:
-        with _shadow(engine, project, target, connector or "") as shadow:
-            shadow.strip_run_hooks()
-            if proposed:
-                for edit in stored.edits:
-                    if edit.op is EditOp.DELETE:
-                        shadow.remove(edit.path)
-                    else:
-                        shadow.write(edit.path, edit.new_content or "")
-            manifest = shadow.compile(selector, vars_=vars_)
-    except Exception as exc:
-        # dbt absent, no dev profile, or this branch does not compile: the
-        # caller tells the cases apart by which branches failed.
-        text = str(exc).strip()
-        branch.failure = text.splitlines()[0][:300] if text else type(exc).__name__
-        return branch
-    _read_manifest(branch, manifest, name)
-    return branch
-
-
-def _read_manifest(branch: _Branch, manifest: Mapping[str, Any], project: str) -> None:
-    """Fill ``branch`` with this project's compiled and disabled models."""
-
-    for uid, node in (manifest.get("nodes") or {}).items():
-        if not uid.startswith("model.") or node.get("package_name") != project:
-            continue
-        label = str(node.get("name"))
-        if node.get("version") is not None:
-            label = f"{label}.v{node['version']}"
-        branch.models[label] = _Model(
-            (node.get("compiled_code") or "").strip().rstrip(";"),
-            node.get("relation_name"),
-            str(node.get("package_name")),
-            str(node.get("original_file_path") or ""),
-        )
-    for uid, entries in (manifest.get("disabled") or {}).items():
-        if uid.startswith(f"model.{project}."):
-            for node in entries if isinstance(entries, list) else [entries]:
-                branch.disabled.add(str(node.get("name")))
-    branch.manifest = manifest
-
-
-class _Catalog:
-    """The columns a star over a compiled relation reads.
-
-    A project model is read from its own compiled SQL in the same branch; a
-    seed from its CSV header; anything else (a source, a snapshot, a package
-    model) from the exploration cache. A cycle or an unknown relation is a
-    reason, never a guess.
-    """
-
-    def __init__(
-        self,
-        branch: _Branch,
-        view: DbtProjectView,
-        dialect: str | None,
-        cache: Callable[[], Any],
-    ) -> None:
-        """Index every relation the branch's manifest names by its parts."""
-
-        self.branch = branch
-        self.view = view
-        self.dialect = dialect
-        self.cache = cache
-        self.by_relation: dict[tuple[str, ...], tuple[str, str]] = {}
-        manifest = branch.manifest
-        for label, model in branch.models.items():
-            if model.relation:
-                self.by_relation[_relation_key(model.relation)] = ("model", label)
-        for uid, node in (manifest.get("nodes") or {}).items():
-            if node.get("relation_name") and uid.startswith("seed."):
-                self.by_relation[_relation_key(node["relation_name"])] = (
-                    "seed",
-                    str(node.get("original_file_path") or ""),
-                )
-        for node in (manifest.get("sources") or {}).values():
-            if node.get("relation_name"):
-                self.by_relation[_relation_key(node["relation_name"])] = (
-                    "cached",
-                    f"{node.get('schema')}."
-                    f"{node.get('identifier') or node.get('name')}",
-                )
-
-    def resolve(self, label: str, stack: frozenset[str] = frozenset()) -> None:
-        """Read ``label``'s output columns, following stars through ``_columns``."""
-
-        from .select_list import resolve_select_list
-
-        model = self.branch.models[label]
-        if model.columns is not None or model.reason is not None:
-            return
-        if not model.sql:
-            model.reason = "dbt wrote no compiled SQL"
-            return
-        read = resolve_select_list(
-            model.sql,
-            dialect=self.dialect,
-            relation_columns=lambda relation: self._columns(relation, stack | {label}),
-        )
-        if read.columns is not None:
-            model.columns = sorted(c.lower() for c in read.columns)
-        else:
-            model.reason = read.reason or "the SELECT list could not be read"
-
-    def _lookup(self, parts: tuple[str, ...]) -> tuple[str, str] | None:
-        """The model, seed or cached relation a compiled name refers to, if unique."""
-
-        key = tuple(p.lower() for p in parts)
-        if key in self.by_relation:
-            return self.by_relation[key]
-        found = [
-            value
-            for stored, value in self.by_relation.items()
-            if stored[-len(key) :] == key or key[-len(stored) :] == stored
-        ]
-        return found[0] if len(found) == 1 else None
-
-    def _columns(self, relation: Any, stack: frozenset[str]) -> Any:
-        """The columns a star over ``relation`` reads, or why they are unknown."""
-
-        from .select_list import RelationColumns
-
-        found = self._lookup(tuple(relation.parts))
-        if found is None:
-            return self._cached(".".join(relation.parts[-2:]), str(relation))
-        kind, where = found
-        if kind == "model":
-            if where in stack:
-                return RelationColumns(reason=f"a cycle through {where}")
-            self.resolve(where, stack)
-            model = self.branch.models[where]
-            if model.columns is None:
-                return RelationColumns(
-                    reason=f"a `*` over {where}, whose columns could not be read "
-                    f"({model.reason})"
-                )
-            return RelationColumns(list(model.columns))
-        if kind == "seed":
-            source = self.view.files.get(where)
-            header = source.content.splitlines()[0] if source and source.content else ""
-            if header:
-                return RelationColumns(
-                    [c.strip().strip('"').lower() for c in header.split(",")]
-                )
-            return RelationColumns(reason=f"a `*` over seed {where} with no header")
-        return self._cached(where, str(relation))
-
-    def _cached(self, name: str, shown: str) -> Any:
-        """A relation's columns from the cache, or a reason naming the profile."""
-
-        from .drafting import dataset_for
-        from .select_list import RelationColumns
-
-        try:
-            cache = self.cache()
-        except Exception:
-            cache = None
-        dataset = dataset_for(cache, name)
-        if dataset is None or not dataset.columns:
-            return RelationColumns(
-                reason=(
-                    f"a `*` over {shown} with no single cached profile; "
-                    f"`dex explore profile {name}` would supply one"
-                )
-            )
-        return RelationColumns(
-            [c.name.lower() for c in dataset.columns], read_from=[dataset.identifier]
-        )
-
-
-def _identifiers(sql: str, dialect: str | None) -> set[str] | None:
-    """Every column a compiled statement names, lowercased; ``None`` if unread."""
-
-    import sqlglot
-    from sqlglot import expressions as exp
-
-    try:
-        parsed = sqlglot.parse_one(sql, read=dialect or "duckdb")
-    except Exception:
-        return None
-    return {column.name.lower() for column in parsed.find_all(exp.Column)}
-
-
 def _record(model: str) -> dict[str, Any]:
     """A fresh record for ``model``, satisfied until a check says otherwise."""
 
     return {"model": model, "status": "satisfied", "checks": []}
 
 
-def _contradict(record: dict[str, Any], check: str, detail: str) -> None:
-    """Mark ``record`` contradicted by ``check``, keeping every check's detail."""
+def _contradict(record: dict[str, Any], check: str, detail: str, **where: Any) -> None:
+    """Mark ``record`` contradicted by ``check``, keeping every check's detail
+    and, where a check names a site (a file and line), that site."""
 
     record["status"] = "contradicted"
     record["finding"] = record.get("finding") or check
-    record["checks"].append({"check": check, "detail": detail})
+    record["checks"].append({"check": check, "detail": detail, **where})
 
 
 def _uncheck(record: dict[str, Any], code: str, reason: str | None = None) -> None:
@@ -557,33 +325,20 @@ def analyze(
     connector = engine.connector or engine.config.connector
     dialect = get_dialect(connector) if connector else None
     branches = {
-        "on": _compile_branch(
+        side: compile_branch(
             engine,
             stored,
             project,
             view,
             connector,
-            vars_={variable: contract.on_value},
-            proposed=True,
-        ),
-        "off": _compile_branch(
-            engine,
-            stored,
-            project,
-            view,
-            connector,
-            vars_={variable: contract.off_value},
-            proposed=True,
-        ),
-        "before": _compile_branch(
-            engine,
-            stored,
-            project,
-            view,
-            connector,
-            vars_={variable: contract.on_value},
-            proposed=False,
-        ),
+            vars_={variable: value},
+            proposed=proposed,
+        )
+        for side, value, proposed in (
+            ("on", contract.on_value, True),
+            ("off", contract.off_value, True),
+            ("before", contract.on_value, False),
+        )
     }
     cached: list[Any] = []
 
@@ -594,26 +349,33 @@ def analyze(
             cached.append(readable_cache(engine.store))
         return cached[0]
 
-    for branch in branches.values():
+    after = _files_after(view, list(stored.edits))
+    for side, branch in branches.items():
         if branch.failure is None:
-            catalog = _Catalog(branch, view, dialect, cache)
+            # A proposed branch reads the plan's own seeds, the tree before it
+            # the project's.
+            catalog = Catalog(
+                branch, after if side != "before" else view, dialect, cache
+            )
             for label in branch.models:
                 catalog.resolve(label)
 
     governed = {c.lower() for c in contract.columns}
     exempt = {m.lower() for m in contract.exempt_models}
-    after = _files_after(view, list(stored.edits))
     reads, dynamic = local_reads(after, variable)
-    limits: list[str] = []
-    if dynamic:
-        limits.append(
-            f"{len(dynamic)} var() read(s) in this project name no literal "
-            "variable, so they may read this flag: " + ", ".join(dynamic[:10])
-        )
     from ..references import ReferenceIndex
 
     index = ReferenceIndex(after, scan_packages=False)
-    limits.extend(index.limits)
+    # The compiled SQL is the judge (#1156): a file whose source the column scan
+    # could not parse once its Jinja was blanked is either a model judged below
+    # from what dbt compiled, or a macro whose effect is inside those models.
+    # Every other reason the index is short still stands.
+    unparsed = set(index.column_unread)
+    limits: list[str] = [
+        limit
+        for limit in index.limits
+        if not any(limit == column_parse_limit(path) for path in unparsed)
+    ]
 
     on, off, before = branches["on"], branches["off"], branches["before"]
     if before.failure and not (on.failure and off.failure):
@@ -637,7 +399,20 @@ def analyze(
 
     records: list[dict[str, Any]] = []
     producers: dict[str, list[str]] = {}
-    labels = sorted(set(on.models) | set(off.models) | set(before.models))
+    compiled = (
+        set(on.models)
+        | set(off.models)
+        | set(before.models)
+        | set(on.failed)
+        | set(off.failed)
+    )
+    labels = sorted(
+        set(on.models)
+        | set(off.models)
+        | set(before.models)
+        | set(on.failed)
+        | set(off.failed)
+    )
     for label in labels:
         record = _record(label)
         records.append(record)
@@ -657,24 +432,183 @@ def analyze(
                 )
             break
 
+    project_name = view.project_name or _manifest_project(branches)
+    callers = _callers(branches, project_name)
+    macro_reads = _attributed(reads, callers, view)
+    dynamic_reads = _attributed(dynamic, callers, view, keep_models=True)
+    not_compiled = _not_compiled(branches, reads, view)
+    for entry in not_compiled:
+        record = _record(entry["model"])
+        _uncheck(
+            record,
+            "not_compiled",
+            f"dbt leaves {entry['path']} disabled at both values, so its output "
+            "was never compiled; enable it, or delete it if it is retired",
+        )
+        record["path"] = entry["path"]
+        records.append(record)
+    if not_compiled:
+        limits.append(
+            f"{len(not_compiled)} disabled model(s) read this flag and were not "
+            "compiled, so the toggle is unchecked for them only: "
+            + ", ".join(e["model"] for e in not_compiled[:10])
+        )
+
+    # What else reads a governed column with the flag off: a test that still
+    # runs, and a semantic definition that stops resolving (#1169).
+    by_label = {record["model"]: record for record in records}
+    sites, reader_limits = governed_readers(
+        index,
+        after,
+        off,
+        {
+            label: cols
+            for label, cols in producers.items()
+            if label.lower() not in exempt
+        },
+        name=project_name,
+        variable=variable,
+        on_value=contract.on_value,
+        off_value=contract.off_value,
+    )
+    limits.extend(reader_limits)
+    for label, found in sites.items():
+        for site in found:
+            check = site.pop("check")
+            detail = site.pop("detail")
+            _contradict(by_label[label], check, detail, **site)
+
     judged = [r for r in records if r["status"] != "satisfied" or r.get("produces")]
     report = _report(
         judged,
         limits,
         reads,
         len(labels),
-        clean=len(labels) - len(judged),
+        clean=len(labels) - len([r for r in judged if r["model"] in compiled]),
     )
     report["producers"] = producers
     report["exempt_models"] = sorted(exempt)
+    report["macro_reads"] = macro_reads
+    report["dynamic_reads"] = dynamic_reads
+    report["not_compiled"] = not_compiled
     report["package_scope"] = package_scope(view, project, variable)
     return report
+
+
+def _manifest_project(branches: Mapping[str, Branch]) -> str:
+    """The project's name as dbt wrote it, where ``dbt_project.yml`` left it out."""
+
+    for branch in branches.values():
+        for model in branch.models.values():
+            if model.package:
+                return model.package
+    return ""
+
+
+def _callers(branches: Mapping[str, Branch], project: str) -> dict[str, list[str]]:
+    """Per macro file, the models calling it on either proposed branch."""
+
+    merged: dict[str, set[str]] = {}
+    for side in ("on", "off"):
+        if branches[side].failure is None:
+            for path, labels in macro_callers(branches[side], project).items():
+                merged.setdefault(path, set()).update(labels)
+    return {path: sorted(labels) for path, labels in sorted(merged.items())}
+
+
+def _attributed(
+    sites: list[str],
+    callers: Mapping[str, list[str]],
+    view: DbtProjectView,
+    *,
+    keep_models: bool = False,
+) -> list[dict[str, Any]]:
+    """Each read in a macro, with the models whose compiled SQL it reaches.
+
+    ``sites`` are ``path:line``. A read in a model file is the model's own,
+    already judged from its compiled SQL; it is listed only with
+    ``keep_models`` (a dynamic read), naming its model. A macro nothing calls
+    changes no model.
+    """
+
+    out: list[dict[str, Any]] = []
+    for site in sites:
+        path, _, line = site.rpartition(":")
+        if not path:
+            continue
+        entry: dict[str, Any] = {
+            "path": path,
+            "line": int(line) if line.isdigit() else None,
+        }
+        if path in callers or _is_macro(path, view):
+            entry["macro"] = True
+            entry["models"] = list(callers.get(path, []))[:MAX_MODELS]
+        elif keep_models and path.endswith(".sql"):
+            entry["models"] = [Path(path).stem]
+        else:
+            continue
+        out.append(entry)
+    return out[:MAX_MODELS]
+
+
+def _is_macro(path: str, view: DbtProjectView) -> bool:
+    """Whether ``path`` sits under one of the project's macro paths."""
+
+    return any(
+        path == base or path.startswith(base.rstrip("/") + "/")
+        for base in (getattr(view, "macro_paths", None) or ["macros"])
+    )
+
+
+def _not_compiled(
+    branches: Mapping[str, Branch], reads: list[str], view: DbtProjectView
+) -> list[dict[str, Any]]:
+    """Disabled models that read the flag, which no branch compiled (#1156).
+
+    Read the flag means the model's own file has a ``var()`` read of it, or its
+    disabled node calls a project macro that does, directly or through another
+    macro. A macro read counts whether or not any enabled model calls it. A
+    model enabled at either value is judged instead, with its disabled side
+    reported on its record.
+    """
+
+    on, off = branches["on"], branches["off"]
+    read_paths = {site.rpartition(":")[0] for site in reads}
+    macro_paths = {path for path in read_paths if _is_macro(path, view)}
+    disabled = {
+        label: path
+        for label, path in {**off.disabled, **on.disabled}.items()
+        if label not in on.models
+        and label not in off.models
+        and label not in on.failed
+        and label not in off.failed
+    }
+    macros_of: dict[str, set[str]] = {}
+    for branch in (on, off):
+        for uid, entries in (branch.manifest.get("disabled") or {}).items():
+            if not uid.startswith("model."):
+                continue
+            for node in entries if isinstance(entries, list) else [entries]:
+                depends = (node.get("depends_on") or {}).get("macros") or ()
+                macros_of.setdefault(str(node.get("name")), set()).update(depends)
+    manifest_macros = on.manifest.get("macros") or off.manifest.get("macros") or {}
+    out = []
+    for label, path in sorted(disabled.items()):
+        called = {
+            str((manifest_macros.get(uid) or {}).get("original_file_path") or "")
+            for uid in macro_closure(
+                manifest_macros, macros_of.get(label.split(".v")[0], set())
+            )
+        }
+        if path in read_paths or called & macro_paths:
+            out.append({"model": label, "path": path})
+    return out[:MAX_MODELS]
 
 
 def _judge_model(
     label: str,
     record: dict[str, Any],
-    branches: Mapping[str, _Branch],
+    branches: Mapping[str, Branch],
     governed: set[str],
     exempt: set[str],
     dialect: str | None,
@@ -700,6 +634,26 @@ def _judge_model(
     if label.lower() in exempt:
         record["exempt"] = True
 
+    # One model that does not compile is that model's finding alone (#1156).
+    failed = {
+        side: branches[side].failed[label]
+        for side in ("on", "off")
+        if label in branches[side].failed
+    }
+    if len(failed) == 2:
+        _uncheck(record, "compile_failed", f"dbt could not compile it: {failed['on']}")
+    else:
+        for side, reason in failed.items():
+            value = contract.on_value if side == "on" else contract.off_value
+            _contradict(
+                record,
+                "branch_compile_failed",
+                f"'{label}' does not compile with the flag {side} ({value!r}): "
+                f"{reason}",
+            )
+    for side in failed:
+        record["branches"][side] = "compile_failed"
+
     for side, model in (("on", on), ("off", off)):
         if model is not None and model.columns is None:
             _uncheck(record, "unreadable_select", f"{side}: {model.reason}")
@@ -720,7 +674,7 @@ def _judge_model(
                 f"with the flag off ({contract.off_value!r}), '{label}' still "
                 f"outputs {', '.join(present)}",
             )
-        names = _identifiers(off.sql, dialect) if off is not None else None
+        names = identifiers(off.sql, dialect) if off is not None else None
         read = sorted((names or set()) & governed - set(present))
         if read:
             _contradict(
@@ -763,6 +717,446 @@ def _judge_model(
                 + (f"; only off: {', '.join(only_off)}" if only_off else "")
                 + ". Add them to `columns` if the feature governs them",
             )
+
+
+# --- what else reads a governed column (#1169) ---------------------------------
+
+#: The test arguments that name a column of the model the test is attached to.
+#: ``field`` is apart: a ``relationships`` test names a column of its ``to``.
+_TEST_COLUMN_KEYS = ("column_name", "combination_of_columns", "compare_columns")
+
+
+def _names(value: Any) -> set[str]:
+    """Lowercased column names from one test argument, quoting removed."""
+
+    values = value if isinstance(value, list) else [value]
+    return {
+        _QUOTES.sub("", item).strip().lower()
+        for item in values
+        if isinstance(item, str)
+    }
+
+
+def _test_columns(node: Mapping[str, Any], uid: str) -> set[str]:
+    """The columns of model ``uid`` a compiled test node reads."""
+
+    from ..references import _relation_from
+
+    kwargs = (node.get("test_metadata") or {}).get("kwargs") or {}
+    names: set[str] = set()
+    if node.get("attached_node") == uid:
+        names |= _names(node.get("column_name"))
+        for key in _TEST_COLUMN_KEYS:
+            names |= _names(kwargs.get(key))
+    parts = uid.split(".")
+    if (
+        len(parts) > 2
+        and uid in ((node.get("depends_on") or {}).get("nodes") or [])
+        and _relation_from(kwargs.get("to")) == parts[2]
+    ):
+        names |= _names(kwargs.get("field"))
+    return names
+
+
+def _argument_columns(node: Mapping[str, Any]) -> set[str]:
+    """The columns a test names in its arguments, beyond the column it sits on.
+
+    The index records these as ``yaml_test_column``; a column test's own
+    ``column_name`` is the column entry it is written under instead.
+    """
+
+    kwargs = (node.get("test_metadata") or {}).get("kwargs") or {}
+    names: set[str] = set()
+    for key in ("combination_of_columns", "compare_columns", "field"):
+        names |= _names(kwargs.get(key))
+    if not node.get("column_name"):
+        names |= _names(kwargs.get("column_name"))
+    return names
+
+
+def _project_tests(
+    manifest: Mapping[str, Any], project: str
+) -> tuple[list[tuple[str, Mapping[str, Any]]], list[tuple[str, Mapping[str, Any]]]]:
+    """This project's test nodes in one compiled branch: enabled, then disabled."""
+
+    enabled = [
+        (uid, node)
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if uid.startswith(f"test.{project}.")
+    ]
+    disabled = []
+    for uid, entries in (manifest.get("disabled") or {}).items():
+        if uid.startswith(f"test.{project}."):
+            for node in entries if isinstance(entries, list) else [entries]:
+                disabled.append((uid, node))
+    return enabled, disabled
+
+
+def _indent(text: str) -> int:
+    """The column a YAML line's content starts at."""
+
+    return len(text) - len(text.lstrip(" -"))
+
+
+def _test_line(content: str, column_line: int, test: str) -> int | None:
+    """The line under a column's YAML entry that invokes ``test``, if any.
+
+    The index places the column's entry, and its tests sit inside it: the first
+    line naming the test before the entry ends is the one dbt reads.
+    """
+
+    lines = content.splitlines()
+    if not 0 < column_line <= len(lines):
+        return None
+    depth = _indent(lines[column_line - 1])
+    pattern = re.compile(rf"(?<!\w){re.escape(test)}(?!\w)")
+    for number in range(column_line - 1, len(lines)):
+        text = lines[number]
+        stripped = text.lstrip()
+        if number >= column_line and stripped and not stripped.startswith("#"):
+            # The next column, or the end of the entry this column sits in.
+            indent = _indent(text)
+            if indent < depth or (indent == depth and stripped.startswith("- ")):
+                return None
+        if pattern.search(text.split("#", 1)[0]):
+            return number + 1
+    return None
+
+
+def governed_readers(
+    index: Any,
+    view: DbtProjectView,
+    off: Branch,
+    producers: Mapping[str, list[str]],
+    *,
+    name: str,
+    variable: str,
+    on_value: Any,
+    off_value: Any,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """The tests and semantic definitions over a producer's governed column.
+
+    ``producers`` are the models that output a governed column with the flag
+    on, exempt ones left out (they keep the column off). The sites come from
+    :meth:`ReferenceIndex.references_to` on ``model.column``, as retirement's
+    ``removed_column_still_read`` does, and each carries its file and line:
+
+    - ``governed_column_tested_when_off``: a test that dbt still runs with the
+      flag off, read from the off branch's manifest, so a test disabled at the
+      off value (``enabled: "{{ var('flag') }}"``) is not reported;
+    - ``governed_column_in_semantic_layer``: a dimension, measure or entity
+      whose column is gone with the flag off, with the metrics drawing on it.
+
+    A reference the index cannot resolve, and a test it names that the manifest
+    holds no node for, are returned as limits rather than dropped.
+    """
+
+    sites: dict[str, list[dict[str, Any]]] = {}
+    limits: list[str] = []
+    if not producers:
+        return sites, limits
+    hits_of: dict[tuple[str, str], list[Any]] = {}
+    for label, columns in sorted(producers.items()):
+        base = label.split(".")[0]
+        for column in sorted(set(columns)):
+            hits, query_limits = index.references_to(f"{base}.{column}", "column")
+            limits.extend(query_limits)
+            hits_of[(label, column)] = [hit for hit in hits if not hit.package]
+
+    if off.failure is None:
+        advice = _enabled_expression(variable, on_value, off_value)
+        _tested_when_off(view, off, hits_of, sites, limits, name, advice, off_value)
+    elif any(
+        hit.form in ("yaml_column", "yaml_test_column")
+        for hits in hits_of.values()
+        for hit in hits
+    ):
+        limits.append(
+            "the tests over governed columns were not judged: the project does "
+            "not compile with the flag off"
+        )
+    _in_semantic_layer(index, view, off, producers, hits_of, sites, limits, name)
+    return sites, limits
+
+
+def _tested_when_off(
+    view: DbtProjectView,
+    off: Branch,
+    hits_of: Mapping[tuple[str, str], list[Any]],
+    sites: dict[str, list[dict[str, Any]]],
+    limits: list[str],
+    project: str,
+    advice: str,
+    off_value: Any,
+) -> None:
+    """Each test still enabled with the flag off over a producer's governed column."""
+
+    enabled, disabled = _project_tests(off.manifest, project)
+    seen: set[str] = set()
+    taken: set[tuple[str, int]] = set()
+    for (label, column), hits in sorted(hits_of.items()):
+        uid = f"model.{project}.{label}"
+        base = label.split(".")[0]
+        reading = [
+            (test_id, node)
+            for test_id, node in enabled
+            if column in _test_columns(node, uid)
+        ]
+        compiled = [
+            node
+            for _test_id, node in (*enabled, *disabled)
+            if column in _test_columns(node, uid)
+        ]
+        for test_id, node in reading:
+            if test_id in seen:
+                continue
+            path = str(node.get("original_file_path") or "")
+            test = str(
+                (node.get("test_metadata") or {}).get("name") or node.get("name")
+            )
+            line = _locate_test(view, hits, path, base, column, node, test, taken)
+            seen.add(test_id)
+            where = f"{path}:{line}" if line else path
+            sites.setdefault(label, []).append(
+                {
+                    "check": "governed_column_tested_when_off",
+                    "detail": (
+                        f"the {test} test at {where} reads '{label}.{column}' and "
+                        f"still runs with the flag off ({off_value!r}), where the "
+                        "column is gone, so the off build fails it. Disable it at "
+                        f'the off value (`enabled: "{advice}"` in its config) or '
+                        "remove it"
+                    ),
+                    "path": path,
+                    "line": line,
+                    "column": column,
+                    "test": test,
+                }
+            )
+        # A test the index places on this column that dbt compiled into no node,
+        # enabled or not, is one this check could not judge. Each site is held
+        # to the nodes of its own file and kind, so one compiled test on the
+        # column does not stand for another written elsewhere.
+        for hit in hits:
+            if hit.owner != base or hit.form not in ("yaml_test_column", "yaml_column"):
+                continue
+            in_file = [
+                node
+                for node in compiled
+                if node.get("original_file_path") == hit.path
+                and (
+                    column in _argument_columns(node)
+                    if hit.form == "yaml_test_column"
+                    else str(node.get("column_name") or "").lower() == column
+                )
+            ]
+            if in_file or (
+                hit.form == "yaml_column"
+                and not _declares_tests(view, hit.path, base, column)
+            ):
+                continue
+            limits.append(
+                f"{hit.path}:{hit.line} names '{label}.{column}' in a test "
+                "that matched no compiled test node, so whether it runs with "
+                "the flag off is unknown"
+            )
+
+
+def _enabled_expression(variable: str, on_value: Any, off_value: Any) -> str:
+    """A test ``enabled`` config that is true at ``on_value`` and false at
+    ``off_value``.
+
+    A bare ``var()`` only works for a boolean flag that is on when true: a
+    ``disable_x`` flag turns the feature on with ``false``, and a string or
+    integer flag renders a value dbt does not read as a boolean. A contract may
+    pair values Jinja holds equal across types (``0`` and ``false``), so the
+    test then also checks the type, never truthiness alone.
+    """
+
+    read = f"var('{variable}')"
+    if isinstance(on_value, bool) and isinstance(off_value, bool):
+        expression = read if on_value else f"not {read}"
+    elif isinstance(on_value, bool):
+        expression = f"{read} is sameas {'true' if on_value else 'false'}"
+    elif isinstance(off_value, bool) and on_value == off_value:
+        expression = f"({read} == {on_value!r} and {read} is not boolean)"
+    else:
+        expression = f"{read} == {on_value!r}"
+    return "{{ " + expression + " }}"
+
+
+def _declares_tests(view: DbtProjectView, path: str, model: str, column: str) -> bool:
+    """Whether the YAML at ``path`` declares a test under ``model.column``."""
+
+    from ..dbt_project import yaml_documents
+    from ..references import _tests_of
+
+    for parsed, where in yaml_documents(view):
+        if where != path:
+            continue
+        for entry in parsed.get("models") or []:
+            if not isinstance(entry, dict) or entry.get("name") != model:
+                continue
+            for item in entry.get("columns") or []:
+                if (
+                    isinstance(item, dict)
+                    and str(item.get("name") or "").lower() == column
+                    and _tests_of(item)
+                ):
+                    return True
+    return False
+
+
+def _locate_test(
+    view: DbtProjectView,
+    hits: list[Any],
+    path: str,
+    base: str,
+    column: str,
+    node: Mapping[str, Any],
+    test: str,
+    taken: set[tuple[str, int]],
+) -> int | None:
+    """The line of one compiled test in its YAML file, from the index's sites."""
+
+    in_file = [hit for hit in hits if hit.path == path]
+    source = view.files.get(path)
+    if str(node.get("column_name") or "").lower() == column and source is not None:
+        for hit in in_file:
+            if hit.form == "yaml_column" and hit.owner == base:
+                line = _test_line(source.content, hit.line, test)
+                if line:
+                    return line
+    # A test naming the column in its arguments: the argument's own line, on
+    # the model the test is declared under (a relationships test sits on the
+    # model that points at this one).
+    attached = str(node.get("attached_node") or "").split(".")
+    owner = attached[2] if len(attached) > 2 else None
+    for hit in in_file:
+        if (
+            hit.form == "yaml_test_column"
+            and hit.owner == owner
+            and (path, hit.line) not in taken
+        ):
+            taken.add((path, hit.line))
+            return int(hit.line)
+    for hit in in_file:
+        if hit.form == "yaml_column" and hit.owner == base:
+            return int(hit.line)
+    return None
+
+
+def _in_semantic_layer(
+    index: Any,
+    view: DbtProjectView,
+    off: Branch,
+    producers: Mapping[str, list[str]],
+    hits_of: Mapping[tuple[str, str], list[Any]],
+    sites: dict[str, list[dict[str, Any]]],
+    limits: list[str],
+    project: str,
+) -> None:
+    """Each semantic definition over a producer's governed column, and the
+    metrics drawing on it; an unresolved semantic expression is a limit."""
+
+    from ..dbt_project import metric_inputs, physical_column, semantic_yaml_entries
+    from ..references import _relation_from
+
+    entries = semantic_yaml_entries(view)
+    feeds: dict[str, set[str]] = {}
+    for kind, entry, _path in entries:
+        if kind == "metric":
+            measures, metrics = metric_inputs(entry)
+            for name in (*measures, *metrics):
+                feeds.setdefault(name, set()).add(str(entry["name"]))
+
+    def metrics_on(measure: str) -> list[str]:
+        """Every metric drawing on ``measure``, through other metrics too."""
+
+        found: set[str] = set()
+        pending = [measure]
+        while pending:
+            for metric in feeds.get(pending.pop(), set()):
+                if metric not in found:
+                    found.add(metric)
+                    pending.append(metric)
+        return sorted(found)
+
+    disabled_off = (
+        set(off.manifest.get("disabled") or {})
+        - set(off.manifest.get("semantic_models") or {})
+        if off.failure is None
+        else set()
+    )
+    roles = (
+        ("dimensions", "dimension"),
+        ("measures", "measure"),
+        ("entities", "entity"),
+    )
+    for label, columns in sorted(producers.items()):
+        base = label.split(".")[0]
+        governed = {c.lower() for c in columns}
+        paths = {
+            hit.path
+            for column in governed
+            for hit in hits_of.get((label, column), [])
+            if hit.form == "semantic_expr" and hit.owner == base
+        }
+        for kind, entry, path in entries:
+            if kind != "semantic_model" or path not in paths:
+                continue
+            if _relation_from(entry.get("model")) != base:
+                continue
+            if f"semantic_model.{project}.{entry['name']}" in disabled_off:
+                continue
+            for role, item_kind in roles:
+                for item in entry.get(role) or []:
+                    column = physical_column(item)
+                    if not column or column.lower() not in governed:
+                        continue
+                    item_name = str(item.get("name"))
+                    line = next(
+                        (
+                            int(hit.line)
+                            for hit in index.references_to(item_name, item_kind)[0]
+                            if hit.path == path
+                            and hit.form
+                            in ("semantic_definition", "semantic_entity_ref")
+                        ),
+                        None,
+                    )
+                    metrics = metrics_on(item_name) if item_kind == "measure" else []
+                    where = f"{path}:{line}" if line else path
+                    sites.setdefault(label, []).append(
+                        {
+                            "check": "governed_column_in_semantic_layer",
+                            "detail": (
+                                f"the {item_kind} '{item_name}' of semantic model "
+                                f"'{entry['name']}' at {where} is defined over "
+                                f"'{label}.{column.lower()}', which is gone with the "
+                                "flag off, so it stops resolving"
+                                + (
+                                    f", and with it the metric(s) {', '.join(metrics)}"
+                                    if metrics
+                                    else ""
+                                )
+                            ),
+                            "path": path,
+                            "line": line,
+                            "column": column.lower(),
+                            "kind": item_kind,
+                            "definition": item_name,
+                            "semantic_model": str(entry["name"]),
+                            "metrics": metrics,
+                        }
+                    )
+        for hit in index.indeterminate_for("column"):
+            if hit.form == "semantic_expr" and hit.owner == base and not hit.package:
+                limits.append(
+                    f"{hit.path}:{hit.line}: the {hit.note or 'expression'} over "
+                    f"'{label}' could not be resolved to a column, so whether it "
+                    "reads a governed column is unknown"
+                )
 
 
 def _report(
@@ -891,7 +1285,7 @@ def plan_warnings(variable: str, analysis: Mapping[str, Any]) -> list[str]:
                 f"({record['reason_code']}), which is not clean"
             )
     for limit in analysis.get("limits") or []:
-        out.append(f"toggle '{variable}': not every read could be judged: {limit}")
+        out.append(f"toggle '{variable}': the project was not read in full: {limit}")
     scope = analysis.get("package_scope") or {}
     if scope.get("readers") or scope.get("dynamic_readers"):
         out.append(

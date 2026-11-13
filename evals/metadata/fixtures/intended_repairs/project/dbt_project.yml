@@ -1,0 +1,11 @@
+name: ops
+version: "1.0.0"
+profile: ops
+model-paths: ["models"]
+
+models:
+  ops:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

@@ -86,6 +86,7 @@ _EXPORTS = {
     "DexError": "errors",
     "DialectDependencyError": "guards.dialect",
     "Document": "storage",
+    "ExpectationError": "transform.expected_change",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
     "IncompatibleArtifactsError": "transform.artifact_runtime",
@@ -94,7 +95,10 @@ _EXPORTS = {
     "MaintainStore": "storage",
     "MemoryStore": "storage",
     "MermaidDiagram": "explore.diagram",
+    "MetricViewDependencyError": "metric_views.dependency",
     "MissingPackagesError": "transform.build",
+    "PlanDeclaresMissingPackagesError": "transform.build",
+    "RepairRefusedError": "transform.package_repair",
     "ModelVersionError": "transform.model_versions",
     "NoBaselineError": "maintain.commands",
     "NoConnectorSelectedError": "errors",
@@ -196,6 +200,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.snapshot import Snapshot
+    from .metric_views.dependency import MetricViewDependencyError
     from .ossie.loader import OssieDependencyError
     from .results import (
         BudgetExhaustedError,
@@ -219,9 +224,14 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         StoreFactory,
     )
     from .transform.artifact_runtime import IncompatibleArtifactsError
-    from .transform.build import MissingPackagesError
+    from .transform.build import (
+        MissingPackagesError,
+        PlanDeclaresMissingPackagesError,
+    )
     from .transform.evidence import BuildEvidenceError
+    from .transform.expected_change import ExpectationError
     from .transform.model_versions import ModelVersionError
+    from .transform.package_repair import RepairRefusedError
     from .transform.plans import PlanError, PlanNotFoundError
     from .transform.portable import PlanDigestMismatchError, PlanDocumentError
     from .transform.scaffold import (
@@ -275,6 +285,7 @@ __all__ = [
     "DexError",
     "DialectDependencyError",
     "Document",
+    "ExpectationError",
     "ExploreStore",
     "FilesystemStore",
     "IncompatibleArtifactsError",
@@ -283,6 +294,7 @@ __all__ = [
     "MaintainStore",
     "MemoryStore",
     "MermaidDiagram",
+    "MetricViewDependencyError",
     "MissingPackagesError",
     "ModelVersionError",
     "NoBaselineError",
@@ -290,6 +302,7 @@ __all__ = [
     "OssieDependencyError",
     "OverCeilingError",
     "Paradigm",
+    "PlanDeclaresMissingPackagesError",
     "PlanDigestMismatchError",
     "PlanDocumentError",
     "PlanError",
@@ -298,6 +311,7 @@ __all__ = [
     "ProjectError",
     "QueryRefusedError",
     "Relationship",
+    "RepairRefusedError",
     "RepoRootRequiredError",
     "RequestError",
     "Result",

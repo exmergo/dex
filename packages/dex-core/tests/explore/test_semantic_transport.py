@@ -63,3 +63,21 @@ def test_hosted_table_decoder_drops_the_pandas_index():
     assert result["columns"] == ["sessions"]
     assert result["types"] == ["number"]
     assert result["cells"] == [[3]]
+
+
+def test_a_failed_hosted_query_never_carries_the_value_it_failed_on():
+    """dbt Cloud relays the warehouse's words, which can quote a row's value
+    (#1070)."""
+
+    def post(query: str):
+        return {
+            "query": {
+                "status": "FAILED",
+                "error": "Numeric value 'zq_sentinel_7' is not recognized",
+            }
+        }
+
+    with pytest.raises(SemanticBackendError) as raised:
+        await_result(post, environment_id="123", query_id="q", attempts=1, interval=0)
+    assert "zq_sentinel_7" not in str(raised.value)
+    assert "Numeric value <value withheld> is not recognized" in str(raised.value)

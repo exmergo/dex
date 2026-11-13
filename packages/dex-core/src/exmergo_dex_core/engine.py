@@ -37,7 +37,7 @@ its filesystem at all can supply the connection instead; see ``connection=`` and
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -117,6 +117,7 @@ if TYPE_CHECKING:
         PreflightResult,
         PropagationResult,
         RefactorComparisonResult,
+        RepairResult,
     )
     from .transform.semantic import DefinitionEdit
 
@@ -1182,19 +1183,27 @@ class DexEngine:
         *,
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryResult:
         """One SELECT through the query firewall.
 
         In values-free mode only an aggregate-only statement runs (see
         :mod:`.guards.values_free_shape`); any other shape is refused with a
         :class:`~.values_free.ValuesFreeError` naming the rule, and no cell.
+        ``target='dev'`` also reads the dev namespace for this call (#1133).
         """
 
         from .explore import commands as explore
 
         mode = self.resolve_result_mode(result_mode)
         return call_withholding(
-            mode, explore.query, self, sql, auto_profile=auto_profile, result_mode=mode
+            mode,
+            explore.query,
+            self,
+            sql,
+            auto_profile=auto_profile,
+            result_mode=mode,
+            target=target,
         )
 
     def query_batch(
@@ -1202,6 +1211,7 @@ class DexEngine:
         *sql: str,
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryBatchResult:
         """Several statements in one call, each with its own verdict.
 
@@ -1221,6 +1231,7 @@ class DexEngine:
             list(sql),
             auto_profile=auto_profile,
             result_mode=mode,
+            target=target,
         )
 
     def query_across(
@@ -1229,11 +1240,14 @@ class DexEngine:
         targets: list[str],
         auto_profile: bool | None = None,
         result_mode: ResultMode | str | None = None,
+        target: str | None = None,
     ) -> QueryBatchResult:
         """Each statement once per target dataset, in one call (#545).
 
         Each statement names its dataset as ``{ds}``; every result carries the
         ``target`` it ran against. See :func:`.explore.commands.query_across`.
+        ``target='dev'`` is the dbt dev target, not an ``--across`` dataset: it
+        also reads the dev namespace for this call (#1133).
         """
 
         from .explore import commands as explore
@@ -1247,6 +1261,7 @@ class DexEngine:
             targets,
             auto_profile=auto_profile,
             result_mode=mode,
+            target=target,
         )
 
     def cluster(
@@ -1456,8 +1471,13 @@ class DexEngine:
         key_columns: list[str] | None = None,
         target: str | None = None,
         accepted_type_changes: list[str] | None = None,
+        expectation: dict[str, Any] | str | None = None,
     ) -> RefactorComparisonResult:
-        """One model before and after a stored plan, on the same dev inputs."""
+        """One model before and after a stored plan, on the same dev inputs.
+
+        ``expectation`` states an intended change (#1157), and the verdict is
+        then ``as_expected`` or ``unexpected``.
+        """
 
         from .transform.refactor_compare import compare
 
@@ -1469,6 +1489,7 @@ class DexEngine:
             key_columns=key_columns,
             target=target,
             accepted_type_changes=accepted_type_changes,
+            expectation=expectation,
         )
 
     def apply(self, plan_id: str | None = None) -> ApplyResult:
@@ -1601,11 +1622,19 @@ class DexEngine:
             self, models, declarations=declarations, limit=limit, intent=intent
         )
 
+    def repair(self, nodes: str | Sequence[str]) -> RepairResult:
+        """Draft the project overrides that repair failing package models
+        (#1229), stored as one plan and never applied."""
+
+        from .transform import commands as transform
+
+        return transform.repair(self, nodes)
+
     def build(
         self,
         *,
         target: str | None = None,
-        select: str | None = None,
+        select: str | Sequence[str] | None = None,
         verify: bool = False,
         for_plan: str | None = None,
         for_plan_document: Any = None,
@@ -1824,6 +1853,21 @@ class DexEngine:
 
         return self.semantic_native(
             "cube", mode, intent, edits, declarations=declarations
+        )
+
+    def semantic_databricks(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic databricks`: :meth:`semantic_native` for Databricks Metric
+        View YAML files (#1258). Nothing is deployed to a workspace."""
+
+        return self.semantic_native(
+            "databricks", mode, intent, edits, declarations=declarations
         )
 
     # --- lifecycle ------------------------------------------------------------

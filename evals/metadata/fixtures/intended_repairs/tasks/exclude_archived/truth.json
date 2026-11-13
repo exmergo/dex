@@ -1,0 +1,48 @@
+{
+  "models": {
+    "workspace_memberships": {
+      "grain": [
+        "membership_id"
+      ],
+      "columns": {
+        "membership_id": {
+          "role": "key"
+        },
+        "workspace_id": {
+          "role": "foreign_key"
+        },
+        "user_id": {
+          "role": "foreign_key"
+        }
+      }
+    }
+  },
+  "checks": [
+    {
+      "name": "no membership of an archived workspace",
+      "expect": 0,
+      "sql": "select count(*) from main.workspace_memberships m join raw.workspaces w using (workspace_id) where w.is_archived"
+    },
+    {
+      "name": "every other membership is kept, unlisted workspaces included",
+      "expect": 0,
+      "sql": "select count(*) from raw.memberships m where m.workspace_id not in (select workspace_id from raw.workspaces where is_archived) and m.membership_id not in (select membership_id from main.workspace_memberships)"
+    }
+  ],
+  "procedure": {
+    "compare_expected_before_apply": true,
+    "build_after_apply": true
+  },
+  "expected_change": {
+    "model": "workspace_memberships",
+    "key": "membership_id",
+    "expect": {
+      "added": "none",
+      "removed": {
+        "where": "workspace_id in (select workspace_id from ref('stg_workspaces') where is_archived)"
+      },
+      "changed_columns": [],
+      "key": "unchanged"
+    }
+  }
+}

@@ -37,7 +37,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -59,6 +59,12 @@ from ..semantic_declarations import Population as Population
 from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
+from .package_overrides import (
+    DocumentedOverride,
+    documented_overrides,
+    override_refusal,
+)
+from .package_targets import find_package_target
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     RewriteError,
@@ -103,6 +109,121 @@ def schema_path(files: Mapping[str, str], model: str) -> str | None:
             if block.form == "yaml_model_entry" and block.name == model:
                 return path
     return None
+
+
+def yaml_entry_paths(files: Mapping[str, str], model: str) -> list[str]:
+    """Every YAML file whose ``models:`` list has an entry named ``model``.
+
+    :func:`schema_path` stops at the first; this names them all, for a refusal
+    that has to point at every file dbt would read (#1161).
+    """
+
+    found: list[str] = []
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        if any(
+            block.form == "yaml_model_entry" and block.name == model
+            for block in yaml_blocks(files[path])
+        ):
+            found.append(path)
+    return found
+
+
+def package_documented_overrides(
+    view: DbtProjectView, files: Mapping[str, str], models: Iterable[str]
+) -> dict[str, DocumentedOverride]:
+    """The models in ``models`` that are, after the plan, project overrides of a
+    package model the package documents (see :mod:`.package_overrides`).
+
+    A version label is never one: a versioned package model is not overridable.
+    """
+
+    root = getattr(view, "root", None)
+    if not root:
+        return {}
+    wanted = {m for m in models if mv.split_label(m)[1] is None}
+    paths = _planned_model_paths(view.model_paths, files.get("dbt_project.yml"))
+    candidates = {m for m in wanted if model_sql_path(files, paths, m) is not None}
+    # A Python model is not on dex's editable surface, but an existing one is an
+    # override all the same, and its YAML entry collides just as a SQL one's does.
+    candidates |= _python_models(Path(root), paths, wanted - candidates)
+    if not candidates:
+        return {}
+    return documented_overrides(root, candidates, files.get("dbt_project.yml"))
+
+
+def _planned_model_paths(current: Iterable[str], project_yml: str | None) -> list[str]:
+    """The model paths now and as the plan's ``dbt_project.yml`` leaves them."""
+
+    paths = list(current)
+    try:
+        loaded = yaml.safe_load(project_yml or "") or {}
+    except yaml.YAMLError:
+        return paths
+    planned = loaded.get("model-paths") if isinstance(loaded, dict) else None
+    for path in planned if isinstance(planned, list) else []:
+        if isinstance(path, str) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _python_models(root: Path, model_paths: Iterable[str], names: set[str]) -> set[str]:
+    """The names in ``names`` a ``.py`` file under the project's model paths defines."""
+
+    found: set[str] = set()
+    if not names:
+        return found
+    for model_path in model_paths:
+        base = root / model_path
+        if not base.is_dir():
+            continue
+        found.update(p.stem for p in base.rglob("*.py") if p.stem in names)
+    return found
+
+
+def refuse_package_documented_entries(
+    view: DbtProjectView, edits: list[PlanEdit]
+) -> None:
+    """Refuse a plan that leaves a project YAML entry dbt would apply on top of
+    a package's.
+
+    An override of a model its package documents takes the package's entry, so
+    any project entry for the same name fails dbt's parse as a duplicate. This
+    says so in dex's words, naming both files, before dbt runs (#1161). Only the
+    names this plan touches are judged (a model it writes, an entry in a YAML
+    file it writes, or every entry once it edits ``dbt_project.yml``), so a plan
+    elsewhere in the project is not refused for a conflict it did not make.
+    """
+
+    files = post_change_files(view, edits)
+    touched_project = any(e.path == "dbt_project.yml" for e in edits)
+    touched_yaml = {
+        e.path
+        for e in edits
+        if e.op is EditOp.UPSERT and e.path.endswith((".yml", ".yaml"))
+    }
+    touched = {
+        PurePosixPath(e.path).stem
+        for e in edits
+        if e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT
+    }
+    entries: dict[str, list[str]] = {}
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        for block in yaml_blocks(files[path]):
+            if block.form != "yaml_model_entry" or not block.name:
+                continue
+            entries.setdefault(block.name, []).append(path)
+            if path in touched_yaml:
+                touched.add(block.name)
+    judged = set(entries) if touched_project else set(entries) & touched
+    overrides = package_documented_overrides(view, files, judged)
+    for model in sorted(overrides):
+        raise DeclarationError(
+            override_refusal(overrides[model], sorted(set(entries[model])))
+        )
 
 
 def model_sql_path(
@@ -166,6 +287,17 @@ def apply_declarations(
     """
 
     files = post_change_files(view, edits)
+    overrides = package_documented_overrides(
+        view, files, [d.model for d in declarations]
+    )
+    for declaration in declarations:
+        override = overrides.get(declaration.model)
+        if override is not None:
+            sql_path = model_sql_path(files, view.model_paths, declaration.model)
+            paths = yaml_entry_paths(files, declaration.model) or [
+                _default_schema_path(sql_path or "", declaration.model)
+            ]
+            raise DeclarationError(override_refusal(override, paths, declaring=True))
     warnings: list[str] = []
     for declaration in declarations:
         warnings.extend(
@@ -222,6 +354,17 @@ def undeclared_model_warnings(
     files = post_change_files(view, edits)
     vmap = mv.cached_version_map(files, view.model_paths)
     named = mv.expand(declared, vmap)
+    # An override of a model its package documents takes the package's entry
+    # and can carry no declaration of its own, so none is owed (#1161).
+    overrides = package_documented_overrides(
+        view,
+        files,
+        [
+            PurePosixPath(e.path).stem
+            for e in edits
+            if e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT
+        ],
+    )
     warnings: list[str] = []
     for edit in edits:
         if (
@@ -231,7 +374,7 @@ def undeclared_model_warnings(
         ):
             continue
         model = mv.label_for_file(edit.path, vmap) or PurePosixPath(edit.path).stem
-        if model in named or _carries_declaration(files, model):
+        if model in named or model in overrides or _carries_declaration(files, model):
             continue
         warnings.append(
             f"{edit.path}: this plan writes '{model}' and declares nothing about what "
@@ -309,7 +452,9 @@ def _check(
 
     for name, column in declaration.columns.items():
         if column.references is not None:
-            _check_reference(model, name, column.references, files, view)
+            warnings.extend(
+                _check_reference(model, name, column.references, files, view)
+            )
         elif column.role is Role.FOREIGN_KEY:
             warnings.append(
                 f"'{model}.{name}' is a foreign_key with no `references`, so no "
@@ -459,8 +604,17 @@ def _check_reference(
     view: DbtProjectView,
     *,
     claim: str | None = None,
-) -> None:
-    """Refuse a reference whose parent or parent column the project lacks.
+) -> list[str]:
+    """Refuse a reference whose parent or parent column neither the project nor
+    an installed package has, and return the warnings for what could not be
+    checked.
+
+    The project is looked up first, so a project override of a package model is
+    the parent, as it is for ``ref()``. A package model, seed or snapshot is the
+    parent only when the project defines none of that name (#1155): its column
+    is checked against the package's SQL where that can be read, and is
+    reported as unchecked where it cannot, since a staging model that lists its
+    columns through a macro is no reason to refuse a real parent.
 
     ``claim`` is how the refusal names what made the reference, so a
     ``population.parent`` key reads as that rather than as a column's
@@ -477,12 +631,62 @@ def _check_reference(
             raise DeclarationError(
                 f"{said}, and {parent_sql} does not produce a column '{parent_column}'"
             )
-        return
+        return []
     if _is_seed_or_snapshot(files, view, parent):
-        return
-    raise DeclarationError(
-        f"{said}, and the project has no model, seed or snapshot named '{parent}'"
+        return []
+    packaged = find_package_target(
+        view.root,
+        parent,
+        project_yml=files.get("dbt_project.yml"),
+        manifest=view.manifest,
     )
+    if packaged is not None:
+        if not packaged.enabled:
+            raise DeclarationError(
+                f"{said}, and {packaged.described()} is disabled in this project's "
+                "dbt_project.yml with no project model of that name, so dbt builds "
+                "no node called that; name the model that replaces it"
+            )
+        if packaged.columns is None:
+            return [
+                f"{said}: the columns of {packaged.described()} could not be read "
+                f"({packaged.unread}), so whether it produces '{parent_column}' was "
+                "not checked here; `transform build --verify` reads the built "
+                "relation"
+            ]
+        if parent_column.lower() not in packaged.columns:
+            raise DeclarationError(
+                f"{said}, and {packaged.described()} does not produce a column "
+                f"'{parent_column}'"
+            )
+        return []
+    raise DeclarationError(
+        f"{said}, and neither the project nor an installed package has a model, "
+        f"seed or snapshot named '{parent}'{_source_hint(files, parent)}"
+    )
+
+
+def _source_hint(files: Mapping[str, str], name: str) -> str:
+    """A clause saying ``name`` is a source, which a declaration cannot name."""
+
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        try:
+            loaded = yaml.safe_load(files[path])
+        except yaml.YAMLError:
+            continue
+        sources = loaded.get("sources") if isinstance(loaded, dict) else None
+        for source in sources if isinstance(sources, list) else []:
+            tables = source.get("tables") if isinstance(source, dict) else None
+            for table in tables if isinstance(tables, list) else []:
+                if isinstance(table, dict) and table.get("name") == name:
+                    return (
+                        f" ('{name}' is a table of source '{source.get('name')}', "
+                        "and a source is not a supported parent: name the staging "
+                        "model that selects from it)"
+                    )
+    return ""
 
 
 def _check_parent(
@@ -516,8 +720,9 @@ def _check_parent(
                 f"{', '.join(unknown)} that its SELECT list does not produce; the "
                 "key maps output columns to the parent's"
             )
+    warnings: list[str] = []
     for output_column, parent_column in parent.key.items():
-        _check_reference(
+        warnings += _check_reference(
             model,
             output_column,
             f"{parent.model}.{parent_column}",
@@ -532,12 +737,13 @@ def _check_parent(
     keys = [k.lower() for k in parent.key]
     if grain and sorted(grain) != sorted(keys):
         return [
+            *warnings,
             f"'{model}' declares population.parent keyed on {', '.join(parent.key)} "
             f"but its grain is {', '.join(declaration.grain or [])}; the parent "
             "check counts entities by the key, so the two describe different rows "
-            "unless the key is the grain"
+            "unless the key is the grain",
         ]
-    return []
+    return warnings
 
 
 def _check_history(
@@ -793,6 +999,7 @@ def render(
         return _render_version(content, declaration, base, version, notes)
     text = _with_entry(content, model)
     entry = lambda root: _model_entry(root, model)  # noqa: E731
+    text = _restyle_flow_entry(text, entry)
 
     if declaration.description is not None:
         text = _set_key(text, entry, "description", declaration.description)
@@ -832,7 +1039,7 @@ def _render_version(
     """
 
     item = lambda root: _version_item(root, base, version)  # noqa: E731
-    text = content
+    text = _restyle_flow_entry(content, item)
     if item(_compose(text)) is None:
         raise RewriteError(f"it has no version {version} under '{base}'")
     label = f"{base}.v{version}"
@@ -1121,6 +1328,122 @@ def _compose(text: str) -> Any:
         ) from exc
 
 
+def _carries_anchor(root: Any, node: Any) -> bool:
+    """True when the subtree is aliased: used more than once.
+
+    PyYAML resolves an alias to the anchored node object itself, so a node
+    that appears more than once in the document is an aliased one: a restyle
+    re-renders the subtree from its parsed value, which would drop the
+    anchor and break a reference written elsewhere (#1203). Such a mapping
+    keeps refusing, with the reason named; an anchor that nothing aliases
+    does not, because no reference can break.
+    """
+
+    counts: dict[int, int] = {}
+
+    def count(current: Any, seen: set[int]) -> None:
+        # every VISIT counts, even one the seen-set skips: an aliased node is
+        # precisely one that is reached twice, and a revisit must not be
+        # mistaken for a cycle before it is counted
+        counts[id(current)] = counts.get(id(current), 0) + 1
+        if id(current) in seen:
+            return
+        seen.add(id(current))
+        if isinstance(current, yaml.MappingNode):
+            for k, v in current.value:
+                count(k, seen)
+                count(v, seen)
+        elif isinstance(current, yaml.SequenceNode):
+            for item in current.value:
+                count(item, seen)
+
+    count(root, set())
+
+    def carries(current: Any, seen: set[int]) -> bool:
+        if id(current) in seen:
+            return False
+        seen.add(id(current))
+        if counts.get(id(current), 0) > 1:
+            return True
+        if isinstance(current, yaml.MappingNode):
+            return any(carries(k, seen) or carries(v, seen) for k, v in current.value)
+        if isinstance(current, yaml.SequenceNode):
+            return any(carries(item, seen) for item in current.value)
+        return False
+
+    return carries(node, set())
+
+
+def _restyle_flow_entry(text: str, locate) -> str:
+    """``text`` with the located entry restyled from flow style to block style.
+
+    A declaration is written INTO the entry, so a flow-style entry blocks it
+    whole: the entry is converted to block style in the same edit instead,
+    keeping its keys and values, and every byte outside its span (other
+    entries, comments) exactly as the author wrote it (#1203). An entry
+    nested in a flow-style list is left untouched: a block entry cannot sit
+    inside one, and the downstream refusal names that.
+    """
+
+    root = _compose(text)
+    node = locate(root)
+    if (
+        node is None
+        or not isinstance(node, yaml.MappingNode)
+        or not node.flow_style
+        or not node.value
+    ):
+        return text
+    if _carries_anchor(root, node):
+        raise RewriteError(
+            "the entry is a flow-style mapping that is aliased; a restyle "
+            "would break its YAML anchor, rewrite it in block style"
+        )
+    start, end = _span(node)
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    if prefix.strip() != "-":
+        return text
+    body = _dump(yaml.safe_load(yaml.serialize(node))).strip("\n")
+    lines = body.split("\n")
+    indent = " " * len(prefix)
+    rendered = lines[0] + "".join(f"\n{indent}{ln}" for ln in lines[1:])
+    return splice(text, [(start, end, rendered)])
+
+
+def _restyle_flow_value(text: str, root: Any, parent: Any, key: str) -> str:
+    """``text`` with ``parent``'s flow-style ``key`` value restyled to block.
+
+    A block mapping cannot sit inside a flow one, so the value's own keys and
+    values are re-rendered one level under the parent's; every byte outside
+    the pair is untouched. An empty flow mapping holds nothing to keep: its
+    pair is dropped, and the caller writes the key fresh (#1203).
+    """
+
+    found = _child(parent, key)
+    if found is None:
+        return text
+    k, v = found
+    if not isinstance(v, yaml.MappingNode) or not v.flow_style:
+        return text
+    if _carries_anchor(root, v):
+        raise RewriteError(
+            f"'{key}' is a flow-style mapping that is aliased; a restyle "
+            "would break its YAML anchor, rewrite it in block style"
+        )
+    if not v.value:
+        line_start = text.rfind("\n", 0, k.start_mark.index) + 1
+        if text[line_start : k.start_mark.index].strip():
+            raise RewriteError(f"'{key}' shares its line with the entry's bullet")
+        start, end = _pair_span(text, _span(k), v)
+        return splice(text, [(start, end, "")])
+    body = _dump(yaml.safe_load(yaml.serialize(v))).strip("\n")
+    indent = " " * (parent.value[0][0].start_mark.column + 2)
+    start, end = _span(v)
+    rendered = "\n" + "\n".join(f"{indent}{ln}" for ln in body.split("\n"))
+    return splice(text, [(start, end, rendered)])
+
+
 def _child(mapping: Any, key: str) -> tuple[Any, Any] | None:
     if not isinstance(mapping, yaml.MappingNode):
         return None
@@ -1176,6 +1499,7 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
     key under ``config.meta`` is untouched.
     """
 
+    text = _restyle_flow_entry(text, locate)
     root = _compose(text)
     node = locate(root)
     plain = yaml.safe_load(yaml.serialize(node)) if node is not None else None
@@ -1185,6 +1509,19 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         merged = _merge_population(existing, merged)
 
     config = _child(node, "config")
+    if (
+        config is not None
+        and isinstance(config[1], yaml.MappingNode)
+        and config[1].flow_style
+    ):
+        # `config: {...}` written in flow style: the mapping is restyled to
+        # block style in the same edit, so the steps below write into a
+        # block mapping instead of refusing (#1203). An empty `{}` holds
+        # nothing to keep: the pair is dropped and written fresh below.
+        text = _restyle_flow_value(text, root, node, "config")
+        root = _compose(text)
+        node = locate(root)
+        config = _child(node, "config")
     if config is None:
         return _set_key(text, locate, "config", {"meta": {DEX_META_KEY: merged}})
 
@@ -1193,6 +1530,24 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         return found[1] if found else None
 
     meta = _child(config[1], "meta")
+    if (
+        meta is not None
+        and isinstance(meta[1], yaml.MappingNode)
+        and meta[1].flow_style
+    ):
+        # `config.meta` in flow style: same restyle, one level down.
+        text = _restyle_flow_value(text, root, config[1], "meta")
+        root = _compose(text)
+        node = locate(root)
+        config = _child(node, "config")
+        meta = _child(config[1], "meta") if config is not None else None
+    if config is not None and not (
+        isinstance(config[1], yaml.MappingNode) and config[1].value
+    ):
+        # `config` is null or empty after the restyles (an only `meta: {}`
+        # pair is dropped): writing it fresh keeps nothing that was there,
+        # and `_set_key` could not write into a null anyway.
+        return _set_key(text, locate, "config", {"meta": {DEX_META_KEY: merged}})
     if meta is None:
         return _set_key(text, config_node, "meta", {DEX_META_KEY: merged})
 

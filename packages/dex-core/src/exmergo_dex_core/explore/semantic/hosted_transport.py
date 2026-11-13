@@ -10,6 +10,7 @@ from typing import Any
 from ... import envelope as env
 from ...config import QueryLimits
 from ...semantic_hosts import SemanticHostRefusedError, check_semantic_layer_host
+from ...value_mask import mask_values
 from .backend import SemanticBackendError
 from .policy import cap_columnar
 
@@ -63,7 +64,10 @@ def post_graphql(
         ) from exc
     if body.get("errors"):
         joined = "; ".join(str(item.get("message", item)) for item in body["errors"])
-        raise SemanticBackendError(f"semantic layer error: {env.redact(joined)}")
+        # dbt Cloud relays the warehouse's words, which can quote a value (#1070).
+        raise SemanticBackendError(
+            f"semantic layer error: {env.redact(mask_values(joined))}"
+        )
     return body.get("data") or {}
 
 
@@ -107,7 +111,8 @@ def await_result(
             return result.get("jsonResult")
         if status == "FAILED":
             raise SemanticBackendError(
-                f"semantic layer query failed: {env.redact(str(result.get('error')))}"
+                "semantic layer query failed: "
+                f"{env.redact(mask_values(str(result.get('error'))))}"
             )
         time.sleep(interval)
     raise SemanticBackendError(f"timed out waiting for semantic layer query {query_id}")

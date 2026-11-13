@@ -145,7 +145,11 @@ the nodes the plan changed were built, failed, skipped, missing or stale (and,
 when dbt reports a status Dex does not recognize, such as a microbatch model's
 `partial success`, `unrecognized`), and `blocked` names what stopped each one. A skipped report is not done, even if dev
 still holds a table from an earlier run. `assurance.build_only` lists what built
-with nothing checking its rows. Without `--for-plan`, `coverage` is `unknown`.
+with nothing checking its rows, and `assurance.failed_checks.checks` says which
+kind of check failed on each model: a data test by name, or a verification
+record such as `join_coverage` with its finding and join. An INNER join used as
+a filter is not a failure when the declaration says so: name the driving key in
+an assumption's `column` or a `population.filters` entry. Without `--for-plan`, `coverage` is `unknown`.
 
 `data.verification.scope` lists the models this run built successfully;
 `scope_not_built` names the other reported models. In the evidence block,

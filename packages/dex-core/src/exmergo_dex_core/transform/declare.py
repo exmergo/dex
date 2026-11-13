@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .. import model_scope
 from .. import model_versions as mv
 from . import declarations as declarations_mod
 from .declarations import Declaration, DeclarationError
@@ -87,11 +88,11 @@ def select_models(
 ) -> Selection:
     """The models ``objects`` names, the way ``maintain verify`` reads them.
 
-    Model names, repeatable and comma-separated, case-insensitive; none at all
-    selects every model. Read from the repository alone, so no compile is
-    needed. Unlike ``verify``, a name that matches nothing is reported rather
-    than dropped: a declaration that silently did not happen reads like one that
-    did.
+    Model names, repeatable and comma-separated, or in one quoted argument
+    separated by spaces, case-insensitive; none at all selects every model. Read
+    from the repository alone, so no compile is needed. Unlike ``verify``, a name
+    that matches nothing is reported rather than dropped: a declaration that
+    silently did not happen reads like one that did.
     """
 
     files = {path: source.content for path, source in view.files.items()}
@@ -99,9 +100,7 @@ def select_models(
     vmap = mv.cached_version_map(files, view.model_paths)
     by_name = {Path(path).stem.lower(): Path(path).stem for path in sql}
 
-    wanted = [
-        name.strip() for raw in objects or [] for name in raw.split(",") if name.strip()
-    ]
+    wanted = model_scope.model_names(objects)
     selection = Selection()
     names: list[str] = []
     if not wanted:
@@ -134,7 +133,28 @@ def select_models(
                 selection.skipped.append(_unmatched(name, view, root))
             elif found not in names:
                 names.append(found)
-    selection.models.extend(names)
+    # An override of a model its package documents takes the package's YAML
+    # entry, and dbt allows it no entry of its own, so nothing is proposed for
+    # it (#1161).
+    overrides = declarations_mod.package_documented_overrides(view, files, names)
+    for name in names:
+        override = overrides.get(name)
+        if override is None:
+            selection.models.append(name)
+            continue
+        selection.skipped.append(
+            {
+                "model": name,
+                "reason": "package_documented",
+                "missing": [],
+                "detail": (
+                    f"it overrides the model {override.package} documents in "
+                    f"{override.package_entry}; dbt applies that entry to the "
+                    "override and allows it no YAML entry of its own, so it "
+                    "takes no declaration"
+                ),
+            }
+        )
     return selection
 
 
@@ -332,7 +352,8 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
 
     A join to a raw source table is verified evidence, but a declaration's
     ``references`` renders ``ref('<parent>')``, so it is proposed only once a
-    model, seed or snapshot of this project stands for the parent.
+    model, seed or snapshot of this project, or of a package it installs
+    (#1155), stands for the parent.
     """
 
     parent, _, column = reference.rpartition(".")
@@ -340,7 +361,21 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
         return False
     if declarations_mod.model_sql_path(files, view.model_paths, parent) is not None:
         return True
-    return declarations_mod._is_seed_or_snapshot(files, view, parent)
+    if declarations_mod._is_seed_or_snapshot(files, view, parent):
+        return True
+    from .package_targets import find_package_target
+
+    packaged = find_package_target(
+        view.root,
+        parent,
+        project_yml=files.get("dbt_project.yml"),
+        manifest=getattr(view, "manifest", None),
+    )
+    return (
+        packaged is not None
+        and packaged.enabled
+        and (packaged.columns is None or column.lower() in packaged.columns)
+    )
 
 
 def _merge(

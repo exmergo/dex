@@ -70,7 +70,9 @@ _STORAGE_ONLY = {
 }
 
 #: Reader warnings that refuse a model this plan edits.
-_STRICT_RULES = frozenset({"unknown_column", "unknown_key"})
+_STRICT_RULES = frozenset(
+    {"unknown_column", "unknown_key", "aggregation_not_applicable"}
+)
 
 #: Said on every conflict this writer reports, because SLayer's own storage is
 #: the likeliest author of a change to a file dex wrote.

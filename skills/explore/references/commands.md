@@ -110,7 +110,7 @@ column named `window`, which DuckDB reserves and dbt must quote).
   Values-free mode withholds the rule and all population filter values. In full
   mode, any PII-flagged filter withholds the entire rule and that filter's values,
   at any confidence, named in `withheld_fields`.
-- A native semantic layer (Ossie, SLayer, Cube) answers `--use-project` the same
+- A native semantic layer (Ossie, SLayer, Cube, Databricks Metric Views) answers `--use-project` the same
   way, with no dbt project in the repository. Its `primary_key` is the declared
   grain at either arity, overriding a measured key; a `unique_keys` entry or a
   `unique` flag is measured and never reported as the grain. The rest comes from
@@ -122,10 +122,12 @@ column named `window`, which DuckDB reserves and dbt must quote).
   `maintain verify --target dev` does. Use it when a model's only build is the
   dev one and the source allowlist does not reach the namespace dbt writes into:
   `transform declare` and `transform plan` name exactly this command for such an
-  input (`explore profile <dev namespace>.<model> --target dev`). `--scope` still
-  only narrows, nothing is written to `.dex/config.yml`, and the scan is priced
-  as usual. On DuckDB the dev target is the file already read, so the flag
-  widens nothing and a note says so.
+  input (`explore profile <dev namespace>.<model> --target dev`). It also reads
+  the namespaces dbt derives from the dev one for the project's models (a
+  package's `+schema`), named in `notes`. `--scope` still only narrows, nothing
+  is written to `.dex/config.yml`, and the scan is priced as usual. On DuckDB
+  the dev target is the file already read, so the flag widens nothing and a note
+  says so. `explore query --target dev` reads the same namespaces.
 - A requested object whose cached profile is still fresh (same connector, schema
   unchanged, within `profile_freshness_hours`, default 24) is served from the
   cache (`cache_hit_count`) instead of re-scanned. `--refresh` forces a re-scan
@@ -210,6 +212,29 @@ string are refused. Two or more statements return `data.results`, one entry per
 statement, each with its own `status` (`ok`, `refused`, `failed`, `skipped`).
 Results are capped (rows, cell width, bytes), and `query.max_payload_bytes` is
 the budget for the whole call.
+
+A statement the warehouse refuses returns the warehouse's own words, so a
+misspelled column or a missing table reads as such. A conversion, parse or range
+failure quotes the value it could not handle, and that value is masked
+(`Could not convert string <value withheld> to INT32`): the failure is a cast
+your SQL or the warehouse made implicitly, such as comparing a text key to an
+integer key. Profile the column (`explore profile`) to learn its shapes rather
+than retrying to see the value.
+
+`--target dev` reads a model `transform build` just wrote, for this one command,
+as `explore profile --target dev` does: the dev namespace, and the namespaces
+dbt derives from it for the project's models (a package's `+schema` builds into
+`<dev schema>_<name>`), named in `notes`. Check a built model with an aggregate
+there, such as a duplicate count over `dbt_dev.fct_orders`. The firewall, the PII gate, values-free mode and the
+cost handshake are unchanged, `--scope` still only narrows, nothing is written
+to `.dex/config.yml`, and a prod-looking target is refused. Without the flag, a
+statement naming a relation in the dev namespace outside the source scope is
+refused naming that namespace and `--target dev`, and a later command without
+it cannot read the namespace. On DuckDB the dev target is the file already read,
+so the flag widens nothing and a note says so. Where the connection cannot be
+opened (a DuckDB file another process holds locked), a refusal for a relation
+the cache cannot speak for says why, rather than naming `explore map`, which
+needs the same connection.
 
 Example envelopes (columnar; never `rows`):
 
@@ -526,6 +551,16 @@ it as `execution` (`dex` or `vendor`).
   grouping is `--group-by orders.ordered_at__month`; `--where` is Cube's JSON
   filter (`'{"member": "orders.status", "operator": "equals", "values":
   ["paid"]}'`).
+- `semantic.vendor: databricks` reads the Databricks Metric View YAML files
+  named in `semantic.databricks.files` statically (needs the `[metric-views]`
+  extra; no workspace connection, nothing deployed), each validated by Dex's own
+  port of the Metric View YAML 1.1 rules. Each file is one view, named after its
+  stem. `list` and `--for-dimension` answer: a field token is `view.field`, a
+  single-aggregate measure is a measure and a metric named `view.measure`, and a
+  joined field carries no `column` (its joined table's column reaches the PII
+  gate). Joins and `rely.at_most_one_match` keys reach `--use-project`. `query`
+  and `values` refuse by name until #964; profile the relations the catalog names
+  instead.
 - `semantic.vendor: slayer` reads the SLayer model files named in
   `semantic.slayer.models` (needs the `[slayer]` extra). `list` and
   `--for-dimension` answer: a metric is a saved measure named `model.measure`,
@@ -538,6 +573,13 @@ it as `execution` (`dex` or `vendor`).
     refused;
  - `--group-by` takes that model's own columns (`orders.status`); a column
     reached through a join is not groupable;
+ - a list column (`type: ARRAY`) groups by its elements, `posts.tags.value`,
+    listed with a type from its `element_type`; each row counts the parents
+    holding that element (SLayer's `associate`), so rows overlap and a note
+    says so. The whole list (`posts.tags`) is listed with `groupable: false`,
+    and grouping by it or reading its values is refused, naming the `.value`
+    token. `contains`, `contains_any`, `contains_all` and `tags.value = ...`
+    filters are screened as the list column. Redshift refuses a list column;
  - `--grain` buckets the model's `default_time_dimension` at a built-in SLayer
     grain (`day`, `week`, `month`, ...), and a model with none refuses it;
  - `--where` is SLayer's filter syntax, not Jinja: `status = 'paid'`, read

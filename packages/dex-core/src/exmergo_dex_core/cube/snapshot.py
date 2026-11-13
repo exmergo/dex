@@ -17,6 +17,9 @@ a physical column is decided once, whichever channel asks.
 **What the content hash covers.** The element as written, keys normalized to
 snake_case, so respelling ``sqlTable`` as ``sql_table`` is not a change and
 ``meta`` is excluded: it is free-form and carries nothing a definition means.
+The ``dex`` block inside it is the cube's declaration, fingerprinted per field
+on its own (``declarations``, #995), so a changed population is reported as
+the declaration it is rather than as a changed definition.
 
 **Compiled-only definitions** (a ``.js`` model, a Jinja-templated file, a cube
 or view with ``extends``) are only Cube's compiler's to read, so nothing
@@ -39,11 +42,13 @@ from typing import TYPE_CHECKING, Any
 import yaml
 
 from ..maintain.snapshot import (
+    DeclarationFingerprint,
     MetricDef,
     OpaqueDef,
     RelationshipDef,
     SemanticLayerSnapshot,
     SemanticModelDef,
+    native_declaration_fingerprint,
 )
 from . import catalog as catalog_mod
 from .model import Cube, View
@@ -82,6 +87,7 @@ def semantic_layer(
             **_provenance(),
             opaque_definitions=opaque,
             opaque_captured=repo_root is not None,
+            declarations={},
             notes=notes,
         )
 
@@ -93,9 +99,15 @@ def semantic_layer(
     models: list[SemanticModelDef] = []
     metrics: list[MetricDef] = []
     relationships: list[RelationshipDef] = []
+    declarations: dict[str, DeclarationFingerprint] = {}
     for cube in loaded.cubes:
         if cube.dimensions or cube.measures or cube.joins:
             models.append(_cube_def(cube, resolved))
+        declared = native_declaration_fingerprint(
+            *catalog_mod.declaration_inputs(cube, resolved), path=cube.file
+        )
+        if declared is not None:
+            declarations[cube.name] = declared
         metrics.extend(
             MetricDef(
                 name=catalog_mod.member_token(cube.name, measure.name),
@@ -133,6 +145,7 @@ def semantic_layer(
         opaque_definitions=opaque,
         opaque_captured=repo_root is not None,
         **_provenance(),
+        declarations=declarations,
         notes=notes,
     )
 

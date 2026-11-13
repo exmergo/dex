@@ -31,6 +31,7 @@ import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ..dbt_project import DbtProjectView, jinja_calls
+from ..errors import PrerequisiteError
 from ..semantic_declarations import Assumption, _Strict
 from .plans import EditKind, EditOp, PlanEdit
 
@@ -138,7 +139,11 @@ def contract_of(stored: Mapping[str, Any]) -> RetirementContract:
     """The contract a stored form carries, without its bookkeeping keys."""
 
     return RetirementContract.model_validate(
-        {k: v for k, v in stored.items() if k not in ("variable", "discovery")}
+        {
+            k: v
+            for k, v in stored.items()
+            if k not in ("variable", "discovery", "column_reads")
+        }
     )
 
 
@@ -311,7 +316,7 @@ def discovery_report(
     resolve.
     """
 
-    from ..references import ReferenceIndex
+    from ..references import ReferenceIndex, column_parse_limit
     from .build import packages_dir
 
     index = ReferenceIndex(view)
@@ -338,8 +343,14 @@ def discovery_report(
     after = ReferenceIndex(_project_after_edits(view, edits), scan_packages=False)
     dynamic = sorted(f"{ref.path}:{ref.line}" for ref in after.indeterminate_for("var"))
     incomplete = bool(limits or unread or dynamic)
+    # Column-parse limits alone no longer refuse the full contract (#1172); they
+    # are counted apart so a reader can tell the scoped route is optional there.
+    column = {column_parse_limit(path) for path in index.column_unread}
     report: dict[str, Any] = {
         "status": "unchecked" if incomplete else "complete",
+        "column_only": bool(limits)
+        and all(limit in column for limit in limits)
+        and not (unread or dynamic),
         "limits": local[:MAX_LIMITS],
         "limits_elided": max(0, len(local) - MAX_LIMITS),
         "package_limits": dict(sorted(package_limits.items())),
@@ -521,7 +532,19 @@ def analyze(
 
     boolean = isinstance(contract.retained_value, bool)
     compiled: dict[str, dict[str, _Compiled]] = {}
+    trees: dict[str, Any] = {}
     failure: str | None = None
+    cached: list[Any] = []
+
+    def cache() -> Any:
+        """the exploration cache, read once and only when a star needs it."""
+
+        if not cached:
+            from ..storage import readable_cache
+
+            cached.append(readable_cache(engine.store))
+        return cached[0]
+
     try:
         compiled["retained"] = _compile_tree(
             engine,
@@ -531,6 +554,8 @@ def analyze(
             models,
             connector,
             vars_={variable: contract.retained_value},
+            cache=cache,
+            trees=trees,
         )
         if boolean:
             compiled["other"] = _compile_tree(
@@ -541,9 +566,19 @@ def analyze(
                 models,
                 connector,
                 vars_={variable: not contract.retained_value},
+                cache=cache,
+                trees=trees,
             )
         compiled["proposed"] = _compile_tree(
-            engine, stored, project, view, models, connector, proposed=True
+            engine,
+            stored,
+            project,
+            view,
+            models,
+            connector,
+            proposed=True,
+            cache=cache,
+            trees=trees,
         )
     except Exception as exc:
         failure = type(exc).__name__
@@ -556,10 +591,23 @@ def analyze(
             _uncheck(record, "compile_unavailable")
     else:
         for model, record in records.items():
+            if _disabled_everywhere(model, trees):
+                # dbt compiles no SQL for a disabled model, so there is nothing
+                # to hold to its outputs: owed, never missing (#1156).
+                _uncheck(record, "not_compiled")
+                record["reason"] = (
+                    f"dbt leaves '{model}' disabled, so its output was never "
+                    "compiled; enable it to have it judged, or delete it if it is "
+                    "retired"
+                )
+                continue
             _judge(model, record, contract, compiled, connector)
 
     after = _files_after(view, edits)
     surviving, orphaned = _references_after(view, edits, contract, compiled)
+    column_reads = _column_reads(
+        view, edits, contract, trees.get("proposed"), connector, surviving
+    )
     for model, columns in surviving.items():
         record = records.setdefault(model, _record(model))
         for column, where in columns.items():
@@ -581,6 +629,7 @@ def analyze(
         if any(r["status"] == "contradicted" for r in records_list)
         else "unchecked"
         if any(r["status"] == "unchecked" for r in records_list)
+        or column_reads["coverage"] == "partial"
         else "satisfied"
     )
     return {
@@ -589,23 +638,39 @@ def analyze(
         "models": [records[m] for m in sorted(records)],
         "metrics": metrics,
         "orphaned_models": orphaned,
+        "column_reads": column_reads,
         "yaml_reads": yaml_left,
         "project_scoped_definition_left": definition_left,
     }
 
 
 class _Compiled:
+    """One judged model's compiled form in one tree."""
+
     def __init__(
         self,
         columns: list[str] | None,
         reason: str | None,
         reads: set[str],
         sql: str,
+        *,
+        failed: bool = False,
     ) -> None:
+        """Its columns (or why they are unknown), its parents and its SQL."""
+
         self.columns = columns
         self.reason = reason
         self.reads = reads
         self.sql = sql
+        self.failed = failed
+
+
+class CompileUnavailableError(PrerequisiteError):
+    """Nothing in one tree compiled: dbt absent, no profile, or a parse error.
+
+    Never reaches a caller: :func:`analyze` turns it into ``compile_unavailable``
+    records.
+    """
 
 
 def _compile_tree(
@@ -618,57 +683,84 @@ def _compile_tree(
     *,
     vars_: Mapping[str, Any] | None = None,
     proposed: bool = False,
+    cache: Callable[[], Any] | None = None,
+    trees: dict[str, Any] | None = None,
 ) -> dict[str, _Compiled]:
-    """Compile ``models`` from one tree, inlining what the plan touches.
+    """Compile ``models`` from one tree, resolving stars through the catalog.
 
-    Touched models are ephemeral, as in ``transform compare``, so a star over a
-    model this plan rewrites resolves to this tree's columns rather than to a
-    dev relation built from an earlier one.
+    Shared with the toggle check (:mod:`.compiled_tree`, #1170): a ``*`` over
+    a model compiled in this tree, a seed or a profiled source is read, and an
+    unprofiled source names the profile that would supply it. The judged models
+    and their ancestors are compiled (``+model``), and the proposal also their
+    descendants, which is where a removed column can still be read (#1172). A
+    model whose own compile fails is set aside, so it never takes the rest of
+    the tree with it. ``trees`` receives each tree's branch, keyed
+    ``proposed``, ``retained`` or ``other``.
     """
 
     from ..adapters import get_dialect
-    from .mutation import EPHEMERAL_HEADER
-    from .refactor_compare import _shadow, _touched
-    from .select_list import resolve_select_list
+    from .compiled_tree import Catalog, compile_branch
 
-    target = engine.config.dbt_target or "dev"
     dialect = get_dialect(connector) if connector else None
-    with _shadow(engine, project, target, connector or "") as shadow:
-        shadow.strip_run_hooks()
-        if proposed:
-            for edit in stored.edits:
-                if edit.op is EditOp.DELETE:
-                    shadow.remove(edit.path)
-                else:
-                    shadow.write(edit.path, edit.new_content or "")
-        for edit in _touched(stored):
-            if proposed:
-                content = edit.new_content if edit.op is EditOp.UPSERT else None
-            else:
-                source = view.files.get(edit.path)
-                content = source.content if source is not None else None
-            if content is None or not edit.path.endswith(".sql"):
-                continue
-            shadow.write(edit.path, content + "\n" + EPHEMERAL_HEADER + "\n")
-            shadow.strip_semantic_models(Path(edit.path).stem)
-        manifest = shadow.compile(" ".join(models), vars_=vars_)
+    selector = (
+        " ".join(f"+{m}+" if proposed else f"+{m}" for m in models) if models else None
+    )
+    branch = compile_branch(
+        engine,
+        stored,
+        project,
+        view,
+        connector,
+        vars_=vars_,
+        proposed=proposed,
+        select=selector,
+    )
+    if branch.failure is not None:
+        raise CompileUnavailableError(branch.failure)
+    if trees is not None:
+        side = "proposed" if proposed else "retained"
+        if not proposed and "retained" in trees:
+            side = "other"
+        trees[side] = branch
+    # A proposed tree reads the plan's own seeds; the others the project's.
+    seen = _project_after_edits(view, list(stored.edits)) if proposed else view
+    catalog = Catalog(branch, seen, dialect, cache or (lambda: None))
     out: dict[str, _Compiled] = {}
-    for uid, node in (manifest.get("nodes") or {}).items():
-        if not uid.startswith("model.") or node.get("name") not in models:
+    for label, model in branch.models.items():
+        base = label.rsplit(".v", 1)[0]
+        if label not in models and base not in models:
             continue
-        sql = (node.get("compiled_code") or "").strip().rstrip(";")
-        read = resolve_select_list(sql, dialect=dialect) if sql else None
-        reads = {
-            parent.split(".")[-1]
-            for parent in (node.get("depends_on") or {}).get("nodes") or []
-        }
-        out[str(node["name"])] = _Compiled(
-            sorted(c.lower() for c in read.columns) if read and read.columns else None,
-            read.reason if read else "no compiled SQL",
-            reads,
-            sql,
+        catalog.resolve(label)
+        out.setdefault(
+            base,
+            _Compiled(
+                model.columns,
+                model.reason,
+                {parent.split(".")[-1] for parent in model.parents},
+                model.sql,
+            ),
         )
+    for label, reason in branch.failed.items():
+        base = label.rsplit(".v", 1)[0]
+        if (label in models or base in models) and base not in out:
+            out[base] = _Compiled(
+                None, f"dbt could not compile it: {reason}", set(), "", failed=True
+            )
     return out
+
+
+def _disabled_everywhere(model: str, trees: Mapping[str, Any]) -> bool:
+    """Whether ``model`` is disabled, and compiled, in no tree."""
+
+    branches = [b for b in trees.values() if b is not None]
+    if not branches:
+        return False
+    for branch in branches:
+        names = {label.rsplit(".v", 1)[0] for label in branch.disabled}
+        compiled = {label.rsplit(".v", 1)[0] for label in branch.models}
+        if model not in names or model in compiled:
+            return False
+    return True
 
 
 def _judge(
@@ -697,7 +789,7 @@ def _judge(
         "proposed": proposed.columns,
     }
     if proposed.columns is None:
-        _uncheck(record, "unreadable_select")
+        _uncheck(record, "compile_failed" if proposed.failed else "unreadable_select")
         record["reason"] = proposed.reason
     else:
         columns = set(proposed.columns)
@@ -718,7 +810,11 @@ def _judge(
                     "named the wrong branch",
                 )
         elif retained is not None:
-            _uncheck(record, "unreadable_select")
+            _uncheck(
+                record, "compile_failed" if retained.failed else "unreadable_select"
+            )
+            if retained.reason and "reason" not in record:
+                record["reason"] = retained.reason
         declared = contract.outputs.get(model)
         if declared is not None:
             expected = {c.lower() for c in declared.expected}
@@ -747,7 +843,11 @@ def _judge(
                     f"'{model}' outputs {', '.join(extra)}, which the contract "
                     "neither expects nor removes",
                 )
-    if retained is not None and proposed.reads != retained.reads:
+    if (
+        retained is not None
+        and not (retained.failed or proposed.failed)
+        and proposed.reads != retained.reads
+    ):
         kept = sorted(proposed.reads - retained.reads)
         lost = sorted(retained.reads - proposed.reads)
         if kept:
@@ -845,6 +945,8 @@ def _references_after(
 
     dropped: set[str] = set()
     for model, proposed in (compiled.get("proposed") or {}).items():
+        if proposed.failed:
+            continue
         before: set[str] = set()
         for side in ("retained", "other"):
             entry = (compiled.get(side) or {}).get(model)
@@ -863,6 +965,161 @@ def _references_after(
         ]
     )
     return surviving, orphaned
+
+
+def _column_reads(
+    view: DbtProjectView,
+    edits: list[PlanEdit],
+    contract: RetirementContract,
+    branch: Any,
+    connector: str | None,
+    surviving: dict[str, dict[str, list[str]]],
+) -> dict[str, Any]:
+    """How far ``removed_column_still_read`` reached, and the reads it adds (#1172).
+
+    The source scan blanks Jinja before parsing, and a file it cannot parse
+    names no column. Each such file is read again from what dbt compiled for
+    it in the proposal: a model downstream of a declared model whose compiled
+    SQL names a removed column is a surviving read, added to ``surviving`` by
+    its path. A macro's columns land in the models that call it, so it needs
+    no read of its own. Any other file (a model that did not compile, a
+    disabled one, a test or an analysis) is ``unchecked``, never clean.
+    """
+
+    from ..adapters import get_dialect
+    from .compiled_tree import identifiers, macro_callers, project_name
+
+    removed = {
+        (model, column.lower())
+        for model, declared in contract.outputs.items()
+        for column in declared.removed
+    }
+    report: dict[str, Any] = {
+        "coverage": "not_applicable",
+        "unchecked": [],
+        "unchecked_elided": 0,
+        "read_from_compiled": [],
+    }
+    if not removed:
+        return report
+    index = _index_after(view, edits)
+    unread = sorted(set(index.column_unread))
+    macro_bases = [p.rstrip("/") + "/" for p in view.macro_paths]
+    models = dict(branch.models) if branch is not None else {}
+    by_path = {model.path: (label, model) for label, model in models.items()}
+    dialect = get_dialect(connector) if connector else None
+    unchecked: list[str] = []
+    compiled_from: list[str] = []
+
+    def read(label: str, model: Any) -> bool:
+        """Hold one compiled model's SQL to the removed columns; False if unread."""
+
+        names = identifiers(model.sql, dialect)
+        if names is None:
+            return False
+        if model.path not in compiled_from:
+            compiled_from.append(model.path)
+        parents = {
+            uid.split(".")[2]
+            for uid in model.parents
+            if uid.startswith("model.") and len(uid.split(".")) > 2
+        }
+        for declared, column in sorted(removed):
+            if label.rsplit(".v", 1)[0] == declared or declared not in parents:
+                continue
+            if column not in names:
+                continue
+            where = surviving.setdefault(declared, {}).setdefault(column, [])
+            if not any(
+                site.startswith(f"{model.path}:") or site == model.path
+                for site in where
+            ):
+                where.append(model.path)
+        return True
+
+    callers = macro_callers(branch, project_name(view)) if branch is not None else {}
+    for path in unread:
+        if any(path.startswith(base) for base in macro_bases):
+            # A macro's columns land in the models that call it, whose own
+            # source scan sees only the call: read each caller's compiled SQL.
+            if branch is None:
+                unchecked.append(path)
+                continue
+            for label in callers.get(path, []):
+                model = models[label]
+                if model.sql and not read(label, model) and model.path not in unchecked:
+                    unchecked.append(model.path)
+            # A caller that did not compile has no SQL to read, whatever its
+            # own source shows: owed, never clean.
+            for failed in _failed_callers(branch, project_name(view), path):
+                if failed not in unchecked:
+                    unchecked.append(failed)
+            continue
+        found = by_path.get(path)
+        if found is not None and not found[1].sql:
+            # The proposal compiles the declared models and their descendants,
+            # so an enabled model it left uncompiled reads none of them.
+            continue
+        if found is None or not read(*found):
+            unchecked.append(path)
+    report["coverage"] = "partial" if unchecked else "complete"
+    report["unchecked"] = unchecked[:MAX_LIMITS]
+    report["unchecked_elided"] = max(0, len(unchecked) - MAX_LIMITS)
+    report["read_from_compiled"] = compiled_from[:MAX_LIMITS]
+    return report
+
+
+def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
+    """Files of models nothing compiled that call ``macro_path``'s macro.
+
+    Those whose compile was set aside, and those dbt leaves disabled, read from
+    the manifest's parsed nodes, which keep ``depends_on`` for both. Both
+    lookups are held to this project's package: a package's paths are relative
+    to its own root, so one can share a path with a project file.
+    """
+
+    from .compiled_tree import macro_closure
+
+    manifest = branch.manifest
+    macros = manifest.get("macros") or {}
+    nodes = manifest.get("nodes") or {}
+
+    def calls(node: Any) -> bool:
+        reached = macro_closure(
+            macros, (node.get("depends_on") or {}).get("macros") or ()
+        )
+        return any(
+            (macros.get(uid) or {}).get("package_name") == project
+            and str((macros.get(uid) or {}).get("original_file_path") or "")
+            == macro_path
+            for uid in reached
+        )
+
+    # A set-aside file with no node to read dependencies from may call it.
+    out = list(branch.unmatched_failed)
+    for path in sorted(branch.failed_paths.values()):
+        node = next(
+            (
+                n
+                for uid, n in nodes.items()
+                if uid.startswith("model.")
+                and n.get("package_name") == project
+                and str(n.get("original_file_path") or "") == path
+            ),
+            None,
+        )
+        if node is None or calls(node):
+            out.append(path)
+    # A disabled model compiles in no tree, so only its source was read, and
+    # that sees the call, not the columns the macro writes.
+    for uid, entries in sorted((manifest.get("disabled") or {}).items()):
+        if not uid.startswith(f"model.{project}."):
+            continue
+        for node in entries if isinstance(entries, list) else [entries]:
+            path = str(node.get("original_file_path") or "")
+            if path and path not in out and calls(node):
+                out.append(path)
+    return out
 
 
 def metric_records(index: Any, contract: RetirementContract) -> list[dict[str, Any]]:
@@ -914,6 +1171,17 @@ def plan_warnings(variable: str, analysis: Mapping[str, Any]) -> list[str]:
             f"retirement of '{variable}': dbt_project.yml still sets it under this "
             "project's own `vars:` scope, which `transform remove` does not edit; "
             "remove that entry with a project_yml edit in this payload"
+        )
+    reads = analysis.get("column_reads") or {}
+    if reads.get("coverage") == "partial":
+        files = list(reads.get("unchecked") or [])
+        more = int(reads.get("unchecked_elided") or 0)
+        out.append(
+            f"retirement of '{variable}': whether a removed column is still read "
+            f"is unchecked in {', '.join(files)}"
+            + (f" and {more} more" if more else "")
+            + ": Dex could not read their columns from source or from compiled "
+            "SQL. `data.retirement.column_reads` names them; read each one"
         )
     for model in analysis.get("orphaned_models") or []:
         out.append(
@@ -1059,6 +1327,17 @@ def verify_outputs(
                 )
             )
     records.extend(metric_records(index, contract))
+    reads = stored.get("column_reads") or {}
+    if reads.get("coverage") == "partial":
+        records.append(
+            {
+                "model": str(stored.get("variable")),
+                "check": "removed_column_reads",
+                "status": "unchecked",
+                "reason_code": "column_reads_partial",
+                "unchecked": list(reads.get("unchecked") or []),
+            }
+        )
     if contract.scope == "authored":
         records.append(discovery_record(str(stored.get("variable")), stored))
     return findings, records

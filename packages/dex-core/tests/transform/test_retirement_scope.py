@@ -137,13 +137,37 @@ def test_the_digest_moves_when_only_the_scope_changes():
 # --- the full path keeps refusing, and names the route ------------------------
 
 
-def test_the_full_retirement_still_refuses_an_incomplete_scan(root: Path):
+def test_the_full_retirement_runs_when_only_column_parsing_is_short(root: Path):
+    """A column-parse limit cannot hide a var read, so it no longer refuses (#1172)."""
+
     _write(root / "macros/unioned.sql", UNPARSEABLE)
+    propagation = _propagate(root, _edit())
+    assert propagation.edits
+
+
+def test_the_full_retirement_still_refuses_unread_yaml(root: Path):
+    _write(root / "macros/unioned.sql", UNPARSEABLE)
+    _write(root / "models/broken.yml", "models: [\n  - name: x\n")
     with pytest.raises(PropagationRefusedError) as refused:
         _propagate(root, _edit())
     message = str(refused.value)
-    assert "macros/unioned.sql" in message
+    assert "models/broken.yml" in message
     assert '"scope": "authored"' in message
+
+
+def test_incomplete_scan_names_the_requested_verb(root: Path):
+    _write(root / "macros/unioned.sql", UNPARSEABLE)
+    with pytest.raises(PropagationRefusedError) as exc_rename:
+        propagate(load_project(root), root, "var", FLAG, "new_flag")
+    rename_msg = str(exc_rename.value)
+    assert "a rename applied to most of a project still compiles" in rename_msg
+    assert '"scope": "authored"' not in rename_msg
+
+    with pytest.raises(PropagationRefusedError) as exc_remove:
+        propagate(load_project(root), root, "var", FLAG)
+    remove_msg = str(exc_remove.value)
+    assert "a removal applied to most of a project still compiles" in remove_msg
+    assert '"scope": "authored"' not in remove_msg
 
 
 def test_a_scoped_retirement_reports_a_dynamic_read_instead_of_refusing(

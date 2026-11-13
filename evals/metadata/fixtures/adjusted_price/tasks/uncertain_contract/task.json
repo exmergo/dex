@@ -1,0 +1,5 @@
+{
+  "kind": "diagnose",
+  "models": ["product_pricing"],
+  "prompt": "The pricing team says `avg_adjusted_price` for product 12 in `product_pricing` looks off. Check it, and fix the model if something is wrong."
+}

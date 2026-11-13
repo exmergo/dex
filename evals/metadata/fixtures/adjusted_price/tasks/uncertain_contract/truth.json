@@ -1,0 +1,36 @@
+{
+  "checks": [
+    {
+      "name": "avg_adjusted_price is the average of each line's discounted price",
+      "expect": 0,
+      "sql": "select count(*) from main.product_pricing p left join (select product_id, avg(list_price * (1 - discount_rate)) as adjusted from raw.order_lines group by product_id) r using (product_id) where r.adjusted is null or abs(p.avg_adjusted_price - r.adjusted) > 1e-9"
+    },
+    {
+      "name": "avg_list_price is the average list price",
+      "expect": 0,
+      "sql": "select count(*) from main.product_pricing p left join (select product_id, avg(list_price) as listed from raw.order_lines group by product_id) r using (product_id) where r.listed is null or abs(p.avg_list_price - r.listed) > 1e-9"
+    },
+    {
+      "name": "every product keeps one row and every line is counted",
+      "expect": 0,
+      "sql": "select (select count(distinct product_id) from raw.order_lines) - (select count(*) from main.product_pricing) + (select count(*) from raw.order_lines) - (select sum(order_lines) from main.product_pricing)"
+    }
+  ],
+  "diagnosis": {
+    "verdict": "unresolved",
+    "fields": [
+      "avg_adjusted_price"
+    ],
+    "evidence": [
+      [
+        "refund",
+        "refunds",
+        "refunded",
+        "is_refunded"
+      ],
+      [
+        "12"
+      ]
+    ]
+  }
+}

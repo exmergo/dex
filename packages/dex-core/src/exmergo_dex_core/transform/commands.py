@@ -24,8 +24,9 @@ import json
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import yaml
 
@@ -70,6 +71,7 @@ from .results import (
     PlanResult,
     PreflightResult,
     PropagationResult,
+    RepairResult,
     TestScaffoldResult,
 )
 
@@ -367,7 +369,7 @@ def plan(
         # The secret-guard runs first, so an inlined credential is never handed
         # to the dbt subprocess.
         from ..dbt_project import load as load_project
-        from .build import assert_packages_installed, shadow_parse
+        from .build import assert_plan_packages_installed, shadow_parse
         from .validate import assert_profiles_safe
 
         project = engine.project_dir()
@@ -397,6 +399,11 @@ def plan(
         # hard gate; the parse below is the authoritative backstop.
         if has_delete:
             plans_mod.validate_deletions(view, edits)
+        # A project YAML entry on an override of a model its package documents is
+        # a duplicate dbt's parse refuses; say so with both files named (#1161).
+        from . import declarations as declarations_mod
+
+        declarations_mod.refuse_package_documented_entries(view, edits)
         # Native model versions (#859): what dbt would build wrong or drop
         # silently is refused here, before the parse, since dbt only warns
         # about a version with no file. What survives is confirmed against the
@@ -407,6 +414,19 @@ def plan(
         version_report, version_notes = versions_mod.analyze(
             view, edits, dialect=dialect
         )
+        # dbt refuses to parse a project whose declared packages are not
+        # installed, and its message names raw `dbt deps`. Refuse first with the
+        # verb this project has; plan installs nothing because deps can reach
+        # the network. An installed git package whose directory name dex cannot
+        # know is not a reason to refuse the whole plan: the parse either runs or
+        # degrades to a warning. Read against the post-edit tree, so a package
+        # this plan's own `packages_yml` edit declares is checked too (#1166),
+        # and ahead of the derivation, whose own parse would otherwise fail on
+        # it first (twice) before the gate below said so.
+        if (
+            has_delete or parser_owned or version_report is not None
+        ) and _unparseable_reason(view, edits) is None:
+            assert_plan_packages_installed(project, edits)
         # After the guards above, because a derivation is checked by dbt's
         # parse of a copy of the project with these edits in it.
         derived = _derive_semantic(engine, view, edits)
@@ -427,13 +447,7 @@ def plan(
             elif blocker := _unparseable_reason(view, edits):
                 parse_result = {"available": False, "reason": blocker}
             else:
-                # dbt refuses to parse a project whose declared packages are not
-                # installed, and its message names raw `dbt deps`. Refuse first
-                # with the verb this project has; plan installs nothing because
-                # deps can reach the network. An installed git package whose
-                # directory name dex cannot know is not a reason to refuse the
-                # whole plan: the parse either runs or degrades to a warning.
-                assert_packages_installed(project, unverifiable_is_fatal=False)
+                # The package check ran ahead of the derivation (#1166).
                 parse_result = shadow_parse(
                     project,
                     edits,
@@ -782,13 +796,24 @@ def _draft(
         return {}, []
 
     try:
+        documented = declarations_mod.package_documented_overrides(view, files, models)
         return drafting.draft(
             models,
             files,
             view.model_paths,
-            **_drafting_inputs(engine, view),
+            **{
+                **_drafting_inputs(engine, view),
+                # Package models are enabled or disabled by the project file as
+                # the plan leaves it.
+                "packaged": _package_lookup(view, files.get("dbt_project.yml")),
+            },
             index=lambda: _post_change_index(view, edits),
+            key_facts=lambda: _post_change_key_facts(view, edits),
             prior={path: source.content for path, source in view.files.items()},
+            package_documented={
+                name: {"package": o.package, "package_entry": o.package_entry}
+                for name, o in documented.items()
+            },
         )
     except Exception as exc:
         return {}, [
@@ -826,7 +851,49 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         },
         "cache_note": note,
         "dev_namespace": _dev_namespace(engine),
+        "packaged": _package_lookup(view),
     }
+
+
+def _package_lookup(
+    view: Any, project_yml: str | None = None
+) -> Callable[[str], str | None]:
+    """The installed package that builds a name, for a drafted ``references``
+    whose parent the project itself does not define (#1155). Read from the
+    repository on first use and remembered per name; opens nothing.
+
+    ``project_yml`` is the project's ``dbt_project.yml`` as a plan leaves it,
+    which decides whether a package model is enabled; without one, the file as
+    it stands."""
+
+    from .package_targets import find_package_target
+
+    current = view.files.get("dbt_project.yml")
+    text = (
+        project_yml
+        if project_yml is not None
+        else (current.content if current is not None else None)
+    )
+    seen: dict[str, str | None] = {}
+    targets: dict[str, Any] = {}
+
+    def lookup(name: str) -> str | None:
+        """The package that builds ``name``, or ``None``; remembered per name."""
+        if name not in seen:
+            found = find_package_target(
+                view.root, name, project_yml=text, manifest=view.manifest
+            )
+            targets[name] = found if found is not None and found.enabled else None
+            seen[name] = targets[name].package if targets[name] is not None else None
+        return seen[name]
+
+    def get_target(name: str) -> Any:
+        """the target node of an installed package called ``name``."""
+        lookup(name)
+        return targets.get(name)
+
+    lookup.target = get_target  # type: ignore[attr-defined]
+    return lookup
 
 
 def _dev_namespace(engine: DexEngine) -> str | None:
@@ -844,12 +911,28 @@ def _dev_namespace(engine: DexEngine) -> str | None:
 
 
 def _post_change_index(view: Any, edits: list[PlanEdit]) -> Any:
-    """The reference index of the project as it reads once ``edits`` land."""
+    """The reference index of the project as it reads once ``edits`` land.
+
+    Installed packages are scanned too, so a declared parent that is a package
+    model has its ``ref()`` lineage read (#1155); the project queries drafting
+    asks (precedent's readers) leave package files out on their own.
+    """
 
     from ..references import ReferenceIndex
     from .propagate import _project_after_edits
 
-    return ReferenceIndex(_project_after_edits(view, edits), scan_packages=False)
+    return ReferenceIndex(_project_after_edits(view, edits))
+
+
+def _post_change_key_facts(view: Any, edits: list[PlanEdit]) -> Any:
+    """The keys and joins the project states once ``edits`` land: its YAML as
+    the plan leaves it, and the compiled manifest for an installed package's
+    tests (#1228)."""
+
+    from .population_inference import facts_for
+    from .propagate import _project_after_edits
+
+    return facts_for(_project_after_edits(view, edits), view.manifest)
 
 
 def _plan_decisions(
@@ -945,6 +1028,13 @@ def _offer_refactor_comparison(
                         "status": b.status,
                         "owner": "package" if b.package else "project",
                         **({"package": b.package} if b.package else {}),
+                        # The command that drafts the repair, so the offer
+                        # names one rather than a key a plan never emits (#1229).
+                        **(
+                            {"repair": f"dex transform repair {b.model}"}
+                            if b.package and b.status != "skipped"
+                            else {}
+                        ),
                     }
                     for b in blocked
                 ]
@@ -990,7 +1080,16 @@ def _offer_refactor_comparison(
         "models": ordered,
         "command": (
             f"transform compare {result.plan_id} --model {shlex.quote(ordered[0])} "
-            "[--map old=new] [--key column]"
+            "[--map old=new] [--key column] [--expect-file <expected-change.json>]"
+        ),
+        # A change meant to alter results is compared too, against what it
+        # is meant to change, rather than skipped (#1157).
+        "intended_change": (
+            "if the plan is meant to change rows, compare with --expect, stating "
+            "which rows may be added and removed, which columns may change, and "
+            "that the key holds: "
+            '{"added": "none"|"any"|{"where": "<predicate>"}, "removed": ..., '
+            '"changed_columns": [...], "key": "unchanged"}'
         ),
     }
     if mixed:
@@ -1246,6 +1345,8 @@ def _report_change_scope(
             and edit.new_content is not None
             and edit.path in view.files
         ]
+        earlier, against, parents = _redrive_baselines(engine, view, edits, result)
+        rewrites.extend(earlier)
         if not rewrites:
             return
         report = change_scope.analyze(
@@ -1253,6 +1354,8 @@ def _report_change_scope(
             result.decisions or [],
             get_dialect(engine.connector or engine.config.connector),
             view.vars,
+            parents=parents,
+            against=against,
         )
     except Exception as exc:
         result.warnings.append(
@@ -1272,6 +1375,114 @@ def _report_change_scope(
         stored = store.load_plan(result.plan_id)
         stored.change_scope = per_model
         store.save_plan(stored)
+
+
+def _redrive_baselines(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], result: PlanResult
+) -> tuple[list[tuple[str, str, str]], dict[str, str], dict[str, Any]]:
+    """What re-driving is judged against (#1228): for a model only an earlier
+    unapplied plan wrote, that plan's SQL as the prior version; and for every
+    model this plan writes, its declared ``population.parent`` before (on disk,
+    or in that earlier plan) and after. Never raises."""
+
+    from . import declarations as declarations_mod
+    from .contradictions import _declared_parent
+    from .drafting import read_declared
+
+    earlier: list[tuple[str, str, str]] = []
+    against: dict[str, str] = {}
+    parents: dict[str, Any] = {}
+    written = [
+        edit
+        for edit in edits
+        if edit.kind is EditKind.MODEL_SQL
+        and edit.op is EditOp.UPSERT
+        and edit.new_content is not None
+        and edit.path.endswith(".sql")
+    ]
+    before_files = {path: source.content for path, source in view.files.items()}
+    after_files = declarations_mod.post_change_files(view, edits)
+    # A declaration-only edit can remove or replace a parent with the SQL left
+    # as it is; that model is judged on its unchanged SQL and its parents.
+    sql_written = {edit.path for edit in written}
+    for name in _yaml_models(edits):
+        path = declarations_mod.model_sql_path(before_files, view.model_paths, name)
+        if path is None or path in sql_written:
+            continue
+        moved = (
+            _declared_parent(read_declared(before_files, name)),
+            _declared_parent(read_declared(after_files, name)),
+        )
+        if moved[0] is not None and (moved[1] or "").lower() != moved[0].lower():
+            earlier.append((path, before_files[path], before_files[path]))
+            parents[path] = moved
+    if not written:
+        return earlier, against, parents
+    previous = _earlier_plans(engine, result.plan_id)
+    for edit in written:
+        model = Path(edit.path).stem
+        baseline_files = before_files
+        if edit.path not in view.files:
+            plan = next(
+                (
+                    p
+                    for p in previous
+                    if any(
+                        e.path == edit.path
+                        and e.op is EditOp.UPSERT
+                        and e.new_content is not None
+                        for e in p.edits
+                    )
+                ),
+                None,
+            )
+            if plan is None:
+                continue
+            prior_sql = next(
+                e.new_content
+                for e in plan.edits
+                if e.path == edit.path and e.new_content is not None
+            )
+            earlier.append((edit.path, prior_sql, edit.new_content or ""))
+            against[edit.path] = "earlier_plan"
+            baseline_files = declarations_mod.post_change_files(view, list(plan.edits))
+        parents[edit.path] = (
+            _declared_parent(read_declared(baseline_files, model)),
+            _declared_parent(read_declared(after_files, model)),
+        )
+    return earlier, against, parents
+
+
+def _yaml_models(edits: list[PlanEdit]) -> set[str]:
+    """The model names the plan's YAML edits carry an entry for."""
+
+    import yaml
+
+    names: set[str] = set()
+    for edit in edits:
+        if edit.kind is not EditKind.SCHEMA_YML or edit.new_content is None:
+            continue
+        with contextlib.suppress(yaml.YAMLError):
+            parsed = yaml.safe_load(edit.new_content)
+            if not isinstance(parsed, dict):
+                continue
+            for entry in parsed.get("models") or []:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    names.add(entry["name"])
+    return names
+
+
+def _earlier_plans(engine: DexEngine, plan_id: str | None) -> list[Any]:
+    """The stored unapplied plans other than ``plan_id``, newest first."""
+
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("reading earlier plans")
+        return [
+            plan
+            for plan in store.list_plans()
+            if plan.plan_id != plan_id and plan.applied_at is None
+        ]
+    return []
 
 
 def _contradiction_warnings(result: PlanResult) -> None:
@@ -1456,6 +1667,12 @@ def _retire(
     analysis = retirement_mod.analyze(
         engine, stored, Path(project), view, contract, name
     )
+    if (analysis.get("column_reads") or {}).get("coverage") == "partial":
+        # Carried on the plan so a build for it keeps the unread files among its
+        # unchecked obligations (#1172).
+        stated = {**stated, "column_reads": analysis["column_reads"]}
+        stored.retirement = stated
+        store.save_plan(stored)
     result.retirement = {
         **analysis,
         "contract": stated,
@@ -1737,10 +1954,15 @@ def declare(
     files = {path: source.content for path, source in view.files.items()}
     inputs = _drafting_inputs(engine, view)
 
+    from .population_inference import facts_for
+
+    def facts_fn():
+        return facts_for(view, getattr(view, "manifest", None))
+
     def draft_one(model: str) -> tuple[dict[str, Any] | None, list[str]]:
         try:
             drafts, warnings = drafting.draft(
-                [model], files, view.model_paths, **inputs
+                [model], files, view.model_paths, **inputs, key_facts=facts_fn
             )
         except Exception as exc:
             return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
@@ -1822,6 +2044,316 @@ def cmd_declare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
         return env.error_for(exc)
+
+
+def _failed_package_node(
+    project: Path, name: str
+) -> tuple[str, dict[str, Any], dict[str, Any], Any]:
+    """The failed package node named ``name``: its unique id, manifest node,
+    the manifest, and its latest attempt. Refuses whatever is not one."""
+
+    from .artifact_runtime import latest_node_runs
+    from .evidence import FAILED_STATUSES
+    from .package_repair import RepairRefusedError
+
+    runs = latest_node_runs(project)
+    if runs.manifest is None:
+        raise RepairRefusedError(
+            f"no build has run here, so there is no failure of {name} to repair: "
+            "run `dex transform build --target dev` first"
+        )
+    manifest = json.loads(runs.manifest.read_text(encoding="utf-8"))
+    root = (manifest.get("metadata") or {}).get("project_name")
+    wanted = name.split(".")[-1].lower()
+    candidates = [
+        (uid, node)
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if isinstance(node, dict)
+        and str(node.get("name") or "").lower() == wanted
+        and (len(name.split(".")) == 1 or uid.split(".")[1] == name.split(".")[0])
+    ]
+    if not candidates:
+        disabled = [
+            uid
+            for uid, entries in (manifest.get("disabled") or {}).items()
+            if uid.split(".")[-1].lower() == wanted
+        ]
+        if disabled:
+            raise RepairRefusedError(
+                f"{name} is disabled in the project already, so an override is in "
+                "place: the project owns the model now, so fix it with "
+                "`dex transform plan`"
+            )
+        raise RepairRefusedError(
+            f"no node named {name} is in the latest build's manifest"
+        )
+    failed = [
+        (uid, node)
+        for uid, node in candidates
+        if (run := runs.nodes.get(uid)) is not None and run.status in FAILED_STATUSES
+    ]
+    if not failed:
+        statuses = sorted(
+            {runs.nodes[uid].status for uid, _ in candidates if uid in runs.nodes}
+        )
+        raise RepairRefusedError(
+            f"the latest build attempt of {name} did not fail"
+            + (f" ({', '.join(statuses)})" if statuses else " (never attempted)")
+            + ": `transform repair` drafts a fix for a failed package model; "
+            "build it first to see whether it fails"
+        )
+    unique_id, node = failed[0]
+    if node.get("package_name") == root:
+        path = node.get("original_file_path") or name
+        raise RepairRefusedError(
+            f"the project owns {name} ({path}), so it is repaired with an ordinary "
+            "`dex transform plan` on that file, not an override"
+        )
+    return unique_id, node, manifest, runs.nodes[unique_id]
+
+
+def repair(engine: DexEngine, names: str | Sequence[str] | None) -> RepairResult:
+    """Draft the project overrides that repair failing package models (#1229).
+
+    Every node named goes into one plan: each override disables its package node
+    in the same ``dbt_project.yml``, so separate plans would conflict on apply.
+    Reads the latest build attempt and its manifest, the project and the
+    exploration cache. dbt's compile of the drafts answers column listings from
+    metadata, and the bind check reads no row. The drafts are an ordinary plan:
+    every gate ``transform plan`` runs, runs on them.
+    """
+
+    from ..dbt_project import load as load_project
+    from . import package_repair as repair_mod
+    from .prerequisites import _override_option
+    from .validate import EditValidationError
+
+    wanted = list(
+        dict.fromkeys(
+            name.strip()
+            for name in ([names] if isinstance(names, str) else list(names or []))
+            for name in name.split(",")
+            if name.strip()
+        )
+    )
+    if not wanted:
+        raise repair_mod.RepairRefusedError(
+            "transform repair needs the failing node: `transform repair <model>`"
+        )
+    project = Path(engine.project_dir())
+    view = load_project(project)
+    project_file = project / "dbt_project.yml"
+    project_text = (
+        project_file.read_text(encoding="utf-8") if project_file.is_file() else ""
+    )
+    raw_project = yaml.safe_load(project_text or "") or {}
+    root_vars = raw_project.get("vars") if isinstance(raw_project, dict) else None
+    try:
+        cache = readable_cache(engine.store)
+    except Exception:
+        cache = None
+    connector = str(engine.connector or engine.config.connector or "")
+    installed = repair_mod.installed_names(project)
+
+    drafts: list[repair_mod.Draft] = []
+    manifests: dict[str, dict[str, Any]] = {}
+    for name in wanted:
+        unique_id, node, manifest, run = _failed_package_node(project, name)
+        if any(d.unique_id == unique_id for d in drafts):
+            continue
+        nodes = {
+            **(manifest.get("nodes") or {}),
+            **(manifest.get("unit_tests") or {}),
+        }
+        option = _override_option(unique_id, node, nodes, _install_dir(project))
+        if not option.get("supported"):
+            raise repair_mod.RepairRefusedError(
+                f"{node.get('package_name')}.{node.get('name')} cannot be "
+                f"overridden: {option.get('reason')}"
+            )
+        target = repair_mod.override_path(view.model_paths, str(node["name"]))
+        clash = next(
+            (
+                path
+                for path in view.files
+                if path.endswith(".sql")
+                and Path(path).stem.lower() == str(node["name"]).lower()
+                and path != target
+            ),
+            None,
+        )
+        if clash is not None:
+            raise repair_mod.RepairRefusedError(
+                f"the project already has a file named {Path(clash).name} "
+                f"({clash}); an override would be a second model of that name"
+            )
+        package = str(node.get("package_name"))
+        drafted = repair_mod.draft(
+            node=node,
+            unique_id=unique_id,
+            manifest=manifest,
+            message=run.message,
+            # Each draft writes into the project file the previous one left.
+            project_yml=drafts[-1].project_yml if drafts else project_text,
+            root_project=view.project_name,
+            root_vars=root_vars if isinstance(root_vars, dict) else {},
+            package_vars=repair_mod.package_vars(project, package),
+            installed=installed,
+            model_paths=view.model_paths,
+            cache=cache,
+            connector=connector,
+        )
+        drafts.append(drafted)
+        manifests[unique_id] = manifest
+
+    def drafted_edits() -> list[PlanEdit]:
+        """The plan's edits as the drafts stand: the overrides, then the project."""
+
+        return [
+            *(
+                PlanEdit(
+                    path=d.override_path,
+                    kind=EditKind.MODEL_SQL,
+                    new_content=d.override_sql,
+                )
+                for d in drafts
+            ),
+            PlanEdit(
+                path="dbt_project.yml",
+                kind=EditKind.PROJECT_YML,
+                new_content=drafts[-1].project_yml,
+            ),
+        ]
+
+    compile_notes: list[str] = []
+    compiled_ok: bool | None = None
+    adapter = None
+    # Compile the drafts, then bind each on dev reading no row; each typing
+    # error a bind reveals is one more failure to convert, as successive builds
+    # would reveal them one rebuild at a time.
+    for _pass in range(repair_mod.MAX_PASSES):
+        edits = drafted_edits()
+        try:
+            from .compile import compile_models
+
+            compiled, broker = compile_models(
+                engine, edits, force={d.override_path for d in drafts}
+            )
+            broker.settle()
+            compile_notes.extend(broker.warnings)
+            compiled_ok = True
+        except EditValidationError as exc:
+            if "require dbt" in str(exc):
+                compiled_ok = False
+                compile_notes.append(
+                    "dbt is not installed, so the drafts were neither compiled nor "
+                    "bound before they were stored; `transform build` compiles them"
+                )
+                for d in drafts:
+                    d.bind_check = {
+                        "status": "not_checked",
+                        "reason": "dbt is not installed",
+                    }
+                break
+            raise repair_mod.RepairRefusedError(
+                "the drafted override of "
+                + ", ".join(f"{d.package}.{d.name}" for d in drafts)
+                + f" does not compile, so no plan was stored: {exc}"
+            ) from exc
+        progressed = False
+        for d in drafts:
+            if d.bind_check.get("status") == "bound":
+                continue
+            try:
+                if adapter is None:
+                    adapter = engine._adapter("transform repair", reads_dev_target=True)
+                outcome, detail, text = repair_mod.bind_check(
+                    adapter, connector, compiled[d.override_path].sql
+                )
+            except Exception as exc:
+                outcome, text = "not_checked", None
+                detail = f"no connection to bind the draft on ({type(exc).__name__})"
+            d.bind_check = {"status": outcome}
+            if detail:
+                d.bind_check["detail" if outcome == "failed" else "reason"] = detail
+            if outcome == "failed" and repair_mod.add_failure(
+                d,
+                text or detail,
+                source="bind_check",
+                manifest=manifests[d.unique_id],
+                cache=cache,
+                connector=connector,
+            ):
+                progressed = True
+        if not progressed:
+            break
+    edits = drafted_edits()
+    records = [repair_mod.finish(d) for d in drafts]
+    conversions = ", ".join(
+        f"{record['node']}.{c['column']} {c['kind']}"
+        for record in records
+        for c in record["conversions"]
+        if c.get("status") == "resolved"
+    )
+    intent = (
+        "repair "
+        + ", ".join(f"{d.package}.{d.name}" for d in drafts)
+        + " with a project override"
+        + (f" ({conversions})" if conversions else "")
+    )
+    planned = plan(engine, intent, edits=edits)
+    statuses = {record["status"] for record in records}
+    overall = (
+        "unresolved"
+        if "unresolved" in statuses
+        else "unbound"
+        if "unbound" in statuses
+        else "resolved"
+    )
+    build_step = (
+        f"`dex transform apply {planned.plan_id}` and `dex transform build "
+        f"--target dev --verify --for-plan {planned.plan_id} --cold-deps`"
+    )
+    summary: dict[str, Any] = {
+        "status": overall,
+        "plan_id": planned.plan_id,
+        "compiled": compiled_ok,
+        "nodes": records,
+        "next": {
+            "resolved": f"review the diff, then {build_step}",
+            "unbound": "every failure was converted, but nothing checked the "
+            "draft's types on dev (see each node's `bind_check.reason`): review "
+            f"the diff with that in mind, then {build_step}, which is the check",
+            "unresolved": "edit each unresolved conversion in the draft (or "
+            "profile the input it names and repair again) before applying it",
+        }[overall],
+    }
+    result = RepairResult(**planned.model_dump(), repair=summary)
+    # The compile and the parse run dbt twice over one tree, so its own
+    # warnings arrive twice; each is said once.
+    result.warnings = list(
+        dict.fromkeys(
+            [*(w for d in drafts for w in d.warnings), *compile_notes, *result.warnings]
+        )
+    )
+    with contextlib.suppress(Exception):
+        store = engine.require_full_store("recording a repair")
+        stored = store.load_plan(planned.plan_id)
+        stored.repair = summary
+        store.save_plan(stored)
+    return result
+
+
+def cmd_repair(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """CLI shim for `transform repair`: draft the overrides and wrap the result."""
+
+    try:
+        result = repair(engine, getattr(args, "nodes", None))
+    except DbtParseError as exc:
+        return env.error_for(exc, warnings=exc.warnings)
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result, hints={"next": result.repair.get("next", "")})
 
 
 def _split_targets(raw: list[str] | None) -> list[str]:
@@ -2102,8 +2634,14 @@ def test_mutations(
                     f"(`transform test --scaffold {model}` scaffolds a unit test), "
                     "then measure it" + below.no_tests_hint()
                 )
-            prepared, batch = _plan_mutants(
-                shadow, node, model_path, cap, get_dialect(connector), mutation_mod
+            prepared, batch, incremental_reason = _plan_mutants(
+                shadow,
+                node,
+                model_path,
+                cap,
+                get_dialect(connector),
+                mutation_mod,
+                select=below.select,
             )
             warnings.extend(prepared.notes)
             if batch.unparsed:
@@ -2111,25 +2649,61 @@ def test_mutations(
                     f"{batch.unparsed} mutant(s) did not survive a re-read and "
                     "were dropped rather than run"
                 )
-            if not batch.mutants:
+            if incremental_reason:
+                warnings.append(
+                    f"'{model}' has an is_incremental() branch, but "
+                    f"{incremental_reason}"
+                )
+            branch = batch.incremental
+            if not batch.mutants and not (branch is not None and branch.mutants):
                 raise mutation_mod.MutationError(
                     f"'{model}' has no SQL dex knows how to plant a defect in "
                     "(no comparison, filter, join, CASE, division, window frame "
                     "or aggregate), so there is nothing to measure its tests against"
                     + _unsupported_frames_clause(batch.unsupported)
+                    + (
+                        f". It has an is_incremental() branch, but {incremental_reason}"
+                        if incremental_reason
+                        else ""
+                    )
                 )
 
-            equivalence = _EquivalenceCheck.prepare(
-                shadow,
-                node,
-                model_path,
-                batch,
-                select=below.select,
-                requested=check_equivalence,
-                paradigm=paradigm,
-                connector=connector,
-                mutation_mod=mutation_mod,
+            # The branch is another program, so the unit tests that run it
+            # answer only for its mutants and never for the full build's (#1132).
+            incremental_tests = (
+                _incremental_unit_tests(shadow.manifest(), node)
+                if branch is not None
+                else []
             )
+            full_tests = bool(below.tests) or _runs_full_build(
+                shadow.manifest(), node, incremental_tests
+            )
+            if not batch.mutants:
+                equivalence = _EquivalenceCheck(
+                    reason=(
+                        "the full build has no SQL dex plants a defect in, so "
+                        "nothing is compared with the model on the dev data"
+                    )
+                )
+            elif not full_tests:
+                equivalence = _EquivalenceCheck(
+                    reason=(
+                        "no test runs the full build, so no mutant of it ran and "
+                        "nothing is compared with the model on the dev data"
+                    )
+                )
+            else:
+                equivalence = _EquivalenceCheck.prepare(
+                    shadow,
+                    node,
+                    model_path,
+                    batch,
+                    select=below.select,
+                    requested=check_equivalence,
+                    paradigm=paradigm,
+                    connector=connector,
+                    mutation_mod=mutation_mod,
+                )
 
             estimate = None
             prices: dict[str, float] = {}
@@ -2145,6 +2719,7 @@ def test_mutations(
                     equivalence=equivalence,
                     reads=below.selected_ids,
                     skip=below.excluded_names,
+                    incremental_tests=incremental_tests,
                 )
                 warnings.extend(price_notes)
                 if estimate is not None:
@@ -2173,6 +2748,8 @@ def test_mutations(
                 uptime=getattr(adapter, "warehouse_uptime", None),
                 adapter=adapter,
                 downstream=below,
+                incremental_tests=incremental_tests,
+                full_tests=full_tests,
             )
             runs, spend, run_warnings = result.pop("_meta")
             warnings.extend(run_warnings)
@@ -2192,12 +2769,22 @@ def test_mutations(
 
     warnings.extend(_survivor_warnings(result["counts"], result["equivalence"]))
     warnings.extend(below.warnings(result["counts"]))
+    warnings.extend(_incremental_warnings(result["incremental"]))
     if batch.unsupported:
         warnings.append(_unsupported_frames_warning(batch.unsupported))
-    if batch.elided_total:
+    elided = dict(batch.elided)
+    if branch is not None:
+        for operator, cut in branch.elided.items():
+            elided[operator] = elided.get(operator, 0) + cut
+    if sum(elided.values()):
         warnings.append(
-            f"{batch.elided_total} further mutant(s) were not run: the cap is "
+            f"{sum(elided.values())} further mutant(s) were not run: the cap is "
             f"{batch.cap}, and what it cut is in data.cap.elided, per defect class"
+            + (
+                ", with the incremental branch's share in data.incremental.cap"
+                if branch is not None and branch.elided_total
+                else ""
+            )
         )
 
     return MutationCoverageResult(
@@ -2208,15 +2795,20 @@ def test_mutations(
         counts=result["counts"],
         score=result["score"],
         score_with_downstream=result["score_with_downstream"],
+        # The whole run's cap: it binds the full build and the incremental
+        # branch together, and data.incremental.cap holds the branch's share.
         cap={
             "limit": batch.cap,
-            "generated": len(batch.mutants),
-            "considered": batch.considered,
-            "elided": batch.elided,
+            "generated": len(batch.mutants)
+            + (len(branch.mutants) if branch is not None else 0),
+            "considered": batch.considered
+            + (branch.considered if branch is not None else 0),
+            "elided": elided,
         },
         unsupported_sites=batch.unsupported,
         runs=runs,
         equivalence=result["equivalence"],
+        incremental=result["incremental"],
         downstream=below.summary(),
         spend=spend,
         cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
@@ -2294,6 +2886,33 @@ def _survivor_warnings(counts: dict, equivalence: dict | None) -> list[str]:
     return [
         sentence + ". They are in data.mutants, the ones the data tells apart "
         "first, each with the test that would catch it"
+    ]
+
+
+def _incremental_warnings(block: dict | None) -> list[str]:
+    """The pointer line for the incremental branch's survivors (#1132).
+
+    Its own line because its own score: a reader of ``data.score`` alone would
+    otherwise never learn that the watermark went untested.
+    """
+
+    if not block:
+        return []
+    survivors = block["counts"].get("survived", 0)
+    if not survivors:
+        return []
+    if not block["tests"]:
+        return [
+            f"{survivors} planted defect(s) in the is_incremental() branch survive "
+            "by construction: no unit test overrides is_incremental to true, so "
+            "nothing runs the branch. They are in data.incremental.mutants, each "
+            "with the test that would catch it"
+        ]
+    return [
+        f"{survivors} planted defect(s) in the is_incremental() branch survived "
+        "the unit tests that override is_incremental to true. They are in "
+        "data.incremental.mutants, scored apart from the full build in "
+        "data.incremental.score"
     ]
 
 
@@ -2392,10 +3011,181 @@ def _attached_tests(manifest: dict, node: dict) -> list[str]:
     return attached
 
 
-def _plan_mutants(shadow, node, model_path, cap, dialect, mutation_mod):
-    """The compiled model, references restored, and the defects to plant in it."""
+def _plan_mutants(
+    shadow, node, model_path, cap, dialect, mutation_mod, *, select: str | None = None
+):
+    """The compiled model, references restored, and the defects to plant in it.
 
-    manifest = shadow.manifest()
+    Also the incremental branch's (#1132): returns ``(prepared, batch,
+    reason)``, where ``batch.incremental`` holds the branch's mutants and
+    ``reason`` says why a branch the model has was not read. ``select`` is
+    what the copy was last compiled with, which the branch's compile restores.
+    """
+
+    parents = _parent_relations(shadow.manifest(), node, mutation_mod)
+    prepared = mutation_mod.prepare(
+        node.get("compiled_code") or "", dialect=dialect, parents=parents
+    )
+    incremental, reason = _incremental_program(
+        shadow,
+        node,
+        model_path,
+        parents,
+        dialect,
+        mutation_mod,
+        select=select or node["name"],
+    )
+    if incremental is not None:
+        prepared.notes.extend(
+            note for note in incremental.notes if note not in prepared.notes
+        )
+    batch = mutation_mod.enumerate_mutants(prepared, cap=cap, incremental=incremental)
+    return prepared, batch, reason
+
+
+def _incremental_program(
+    shadow, node, model_path, parents, dialect, mutation_mod, *, select: str
+):
+    """The model compiled with its ``is_incremental()`` branch taken, or why not.
+
+    An ephemeral model is never incremental, so the compile every mutant comes
+    from renders the branch false and the watermark never reaches it (#1132).
+    This writes the model file with each ``is_incremental()`` call as ``true``
+    and ``{{ this }}`` as a sentinel, compiles it, and puts the file back,
+    compiling ``select`` again so everything after reads the copy exactly as it
+    was. Returns ``(None, None)`` for a model with no branch, or one that is
+    not incremental, whose branch never runs; ``(None, reason)`` when dbt or
+    dex could not read the branch.
+    """
+
+    from .build import DbtRunError
+    from .test_scaffold import _model_materialization
+
+    view = shadow.view
+    file = view.files.get(model_path) if view is not None else None
+    if file is None:
+        return None, None
+    content = file.content
+    source = mutation_mod.incremental_source(content)
+    if source is None:
+        return None, None
+    if _model_materialization(view, node["name"], content, model_path) != (
+        "incremental"
+    ):
+        return None, None
+
+    header = "\n" + mutation_mod.EPHEMERAL_HEADER + "\n"
+    compiled = None
+    shadow.write(model_path, source + header)
+    try:
+        manifest = shadow.compile(select)
+        compiled = (manifest.get("nodes", {}).get(node.get("unique_id")) or {}).get(
+            "compiled_code"
+        )
+    except DbtRunError:
+        compiled = None
+    finally:
+        shadow.write(model_path, content + header)
+    shadow.compile(select)
+    if not compiled:
+        return None, (
+            "dbt would not compile it with is_incremental() taken, so its "
+            "comparisons and filters are not measured"
+        )
+    try:
+        prepared = mutation_mod.prepare(
+            compiled,
+            dialect=dialect,
+            parents=[
+                *parents,
+                mutation_mod.ParentRelation(
+                    rendered=mutation_mod.THIS_SENTINEL, jinja="{{ this }}"
+                ),
+            ],
+        )
+    except mutation_mod.MutationError as exc:
+        return None, f"dex could not read it ({exc})"
+    return prepared, None
+
+
+class IncrementalUnitTest(NamedTuple):
+    """One unit test that runs the incremental branch, as dbt knows it.
+
+    ``name`` is the test as a run reports it, ``select`` the name dbt's
+    ``unit_test:`` selector matches. They differ on a versioned model: dbt
+    reports each version's instance as ``<name>_v<version>`` while the
+    selector matches the definition's ``<name>`` and so every version of it,
+    which is why a run's statuses are read for ``name`` alone.
+    """
+
+    unique_id: str
+    name: str
+    select: str
+
+
+def _covers(unit: dict, node: dict) -> bool:
+    """Whether this unit test runs ``node`` rather than another version of it.
+
+    dbt binds each unit test instance to one model through ``depends_on``,
+    one instance per version on a versioned model. The model name is a
+    fallback only for an unversioned model, where it cannot name another one.
+    """
+
+    if node.get("unique_id") in (unit.get("depends_on") or {}).get("nodes", []):
+        return True
+    return node.get("version") is None and unit.get("model") == node.get("name")
+
+
+def _incremental_unit_tests(manifest: dict, node: dict) -> list[IncrementalUnitTest]:
+    """The unit tests on this model that run its ``is_incremental()`` branch.
+
+    dbt runs the branch in a unit test only where the test overrides the
+    ``is_incremental`` macro to true; every other test runs the full build.
+    On a versioned model, only the instances that test this version.
+    """
+
+    found = []
+    for unique_id, unit in (manifest.get("unit_tests") or {}).items():
+        if not _covers(unit, node) or not unit.get("name"):
+            continue
+        value = ((unit.get("overrides") or {}).get("macros") or {}).get(
+            "is_incremental"
+        )
+        if value is not True and str(value).lower() != "true":
+            continue
+        version = unit.get("version")
+        found.append(
+            IncrementalUnitTest(
+                unique_id=unique_id,
+                name=unit["name"] if version is None else f"{unit['name']}_v{version}",
+                select=unit["name"],
+            )
+        )
+    return sorted(found, key=lambda test: test.name)
+
+
+def _runs_full_build(
+    manifest: dict, node: dict, incremental: Sequence[IncrementalUnitTest]
+) -> bool:
+    """Whether any test of the model's own runs its full build.
+
+    Compared by unique id, which is what tells one version's unit test from
+    another's: a unit test that tests another version of the model, or one that
+    runs the incremental branch, does not count.
+    """
+
+    branch = {test.unique_id for test in incremental}
+    units = manifest.get("unit_tests") or {}
+    return any(
+        unique_id not in branch
+        and (unique_id not in units or _covers(units[unique_id], node))
+        for unique_id in _attached_tests(manifest, node)
+    )
+
+
+def _parent_relations(manifest: dict, node: dict, mutation_mod) -> list:
+    """Each input of the model, as compiled SQL names it and as a ref."""
+
     parents = []
     for uid in node.get("depends_on", {}).get("nodes", []):
         parent = manifest.get("nodes", {}).get(uid) or manifest.get("sources", {}).get(
@@ -2418,10 +3208,7 @@ def _plan_mutants(shadow, node, model_path, cap, dialect, mutation_mod):
                 ephemeral=ephemeral,
             )
         )
-    prepared = mutation_mod.prepare(
-        node.get("compiled_code") or "", dialect=dialect, parents=parents
-    )
-    return prepared, mutation_mod.enumerate_mutants(prepared, cap=cap)
+    return parents
 
 
 def _reference_jinja(parent: dict, unique_id: str) -> str:
@@ -2438,6 +3225,11 @@ def _reference_jinja(parent: dict, unique_id: str) -> str:
 #: only the survivors will run one and nobody knows which those are yet.
 _EQUIVALENCE_LINE = "(equivalence checks, if every mutant survives)"
 
+#: The incremental branch's baseline run, keyed the way the run loop asks for
+#: its price, and the per-table line its unit test runs are shown under.
+_INCREMENTAL_BASELINE = "(incremental baseline)"
+_INCREMENTAL_LINE = "(incremental branch unit tests)"
+
 
 def _price_mutations(
     adapter,
@@ -2450,6 +3242,7 @@ def _price_mutations(
     equivalence=None,
     reads: set[str] | None = None,
     skip: frozenset[str] | set[str] = frozenset(),
+    incremental_tests: Sequence[IncrementalUnitTest] = (),
 ):
     """Price the whole batch upfront, per statement, as one number to confirm.
 
@@ -2536,12 +3329,22 @@ def _price_mutations(
     quoted = uptime.quote() if uptime is not None else 0.0
     if quoted > 0:
         per_table[UPTIME_LINE] = quoted
-    with contextlib.suppress(Exception):
-        per_table["(baseline)"] = prices["(baseline)"] = price(batch.identity_compiled)
+    if batch.mutants:
+        with contextlib.suppress(Exception):
+            per_table["(baseline)"] = prices["(baseline)"] = price(
+                batch.identity_compiled
+            )
     for mutant in batch.mutants:
         with contextlib.suppress(Exception):
             cost = price(mutant.compiled)
             per_table[f"{mutant.id} {mutant.operator}"] = prices[mutant.id] = cost
+    branch = getattr(batch, "incremental", None)
+    if branch is not None and branch.mutants and incremental_tests:
+        # The branch runs only unit tests, which read their fixtures and never
+        # the warehouse, so each of its runs is priced at zero, as a unit test
+        # on the full build is. A line of its own says they are in the batch.
+        per_table[_INCREMENTAL_LINE] = prices[_INCREMENTAL_BASELINE] = 0.0
+        prices.update({mutant.id: 0.0 for mutant in branch.mutants})
 
     if equivalence is not None and equivalence.enabled:
         comparison = equivalence.compiled
@@ -2595,6 +3398,8 @@ def _run_mutants(
     uptime=None,
     adapter=None,
     downstream: _DownstreamTests | None = None,
+    incremental_tests: Sequence[IncrementalUnitTest] = (),
+    full_tests: bool = True,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
 
@@ -2605,10 +3410,19 @@ def _run_mutants(
     ``downstream`` widens every run, the baseline included, to the tests on the
     models the mutant is routed through, and tells :func:`classify` which tests
     those are so a catch there is kept apart from one by the model's own tests.
+
+    ``incremental_tests`` are the unit tests that override ``is_incremental``
+    to true. They run the branch rather than the full build, so the full
+    build's runs leave them out and they run only against ``batch.incremental``
+    afterwards (#1132). ``full_tests`` false means no other test runs the full
+    build: its mutants then survive by construction, without a run.
     """
 
     select = downstream.select if downstream is not None else model
-    exclude = downstream.exclude if downstream is not None else []
+    exclude = [
+        *(downstream.exclude if downstream is not None else []),
+        *sorted({f"unit_test:{test.select}" for test in incremental_tests}),
+    ]
     below = set(downstream.tests) if downstream is not None else set()
     warnings: list[str] = []
     meter = _BatchSpend(
@@ -2624,26 +3438,6 @@ def _run_mutants(
         adapter=adapter,
     )
 
-    shadow.write(model_path, batch.identity)
-    baseline_summary = shadow.test(select, exclude=exclude)
-    meter.settle(baseline_summary, "(baseline)")
-    baseline = _test_statuses(baseline_summary)
-    excluded = [
-        {"name": name, "status": status, "reason": _exclusion_reason(status)}
-        for name, status in sorted(baseline.items())
-        if status != "pass"
-    ]
-    if not any(status == "pass" for status in baseline.values()):
-        raise mutation_mod.MutationError(
-            f"no test of '{model}' passes against the unmutated model, so there is "
-            "nothing that could catch a defect. Build its parents first "
-            f"(`transform build --select +{model}`) and fix the failing tests, "
-            "then measure them"
-        )
-
-    if equivalence is not None:
-        equivalence.run_self_check(meter, mutation_mod)
-
     mutants: list[dict] = []
     counts = {
         "killed": 0,
@@ -2652,9 +3446,14 @@ def _run_mutants(
         "rejected": 0,
         "not_run": 0,
     }
+    baseline: dict[str, str] = {}
+    excluded: list[dict[str, str]] = []
     tested = 0
+    exhausted = False
 
     def stop(remaining) -> None:
+        nonlocal exhausted
+        exhausted = True
         for mutant in remaining:
             mutants.append(
                 {**mutant.payload(), "status": "not_run", "equivalence": None}
@@ -2666,37 +3465,98 @@ def _run_mutants(
             "--budget, or narrow the run with --max-mutants"
         )
 
-    for index, mutant in enumerate(batch.mutants):
-        if not meter.affords(mutant.id):
-            stop(batch.mutants[index:])
-            break
-        shadow.write(model_path, mutant.body)
-        summary = shadow.test(select, exclude=exclude)
-        tested += 1
-        meter.settle(summary, mutant.id)
-        verdict = mutation_mod.classify(
-            baseline, _test_statuses(summary), downstream=below
+    if batch.mutants and full_tests:
+        shadow.write(model_path, batch.identity)
+        baseline_summary = shadow.test(select, exclude=exclude)
+        meter.settle(baseline_summary, "(baseline)")
+        baseline = _test_statuses(baseline_summary)
+        excluded = [
+            {"name": name, "status": status, "reason": _exclusion_reason(status)}
+            for name, status in sorted(baseline.items())
+            if status != "pass"
+        ]
+        if not any(status == "pass" for status in baseline.values()):
+            raise mutation_mod.MutationError(
+                f"no test of '{model}' passes against the unmutated model, so there "
+                "is nothing that could catch a defect. Build its parents first "
+                f"(`transform build --select +{model}`) and fix the failing tests, "
+                "then measure them"
+            )
+
+        if equivalence is not None:
+            equivalence.run_self_check(meter, mutation_mod)
+
+        for index, mutant in enumerate(batch.mutants):
+            if not meter.affords(mutant.id):
+                stop(batch.mutants[index:])
+                break
+            shadow.write(model_path, mutant.body)
+            summary = shadow.test(select, exclude=exclude)
+            tested += 1
+            meter.settle(summary, mutant.id)
+            verdict = mutation_mod.classify(
+                baseline, _test_statuses(summary), downstream=below
+            )
+            counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
+            record = {
+                **mutant.payload(),
+                "status": verdict.outcome,
+                "caught_by": verdict.caught_by,
+                "caught_downstream_by": verdict.caught_downstream,
+                "warn_only": verdict.warn_only,
+                "equivalence": None,
+            }
+            mutants.append(record)
+            if verdict.outcome != "survived" or equivalence is None:
+                continue
+            label = equivalence.check(meter, mutant.id, mutation_mod)
+            record["equivalence"] = label.payload()
+            record["suggested_test"] = mutation_mod.suggested_test(
+                mutant.operator, label.status, frame=mutant.frame
+            )
+            if equivalence.out_of_budget:
+                stop(batch.mutants[index + 1 :])
+                break
+    elif batch.mutants:
+        # Every test of the model runs the incremental branch, so nothing runs
+        # the full build: its defects survive by construction, and a run would
+        # spend a dbt invocation each to say so.
+        warnings.append(
+            f"no test of '{model}' runs its full build (each one overrides "
+            "is_incremental to true), so every defect planted in the full build "
+            "survives by construction"
         )
-        counts[verdict.outcome] = counts.get(verdict.outcome, 0) + 1
-        record = {
-            **mutant.payload(),
-            "status": verdict.outcome,
-            "caught_by": verdict.caught_by,
-            "caught_downstream_by": verdict.caught_downstream,
-            "warn_only": verdict.warn_only,
-            "equivalence": None,
-        }
-        mutants.append(record)
-        if verdict.outcome != "survived" or equivalence is None:
-            continue
-        label = equivalence.check(meter, mutant.id, mutation_mod)
-        record["equivalence"] = label.payload()
-        record["suggested_test"] = mutation_mod.suggested_test(
-            mutant.operator, label.status, frame=mutant.frame
+        for mutant in batch.mutants:
+            label = (
+                equivalence.check(meter, mutant.id, mutation_mod)
+                if equivalence is not None
+                else None
+            )
+            mutants.append(
+                {
+                    **mutant.payload(),
+                    "status": "survived",
+                    "caught_by": [],
+                    "caught_downstream_by": [],
+                    "warn_only": False,
+                    "equivalence": label.payload() if label is not None else None,
+                }
+            )
+            counts["survived"] += 1
+
+    incremental = None
+    if batch.incremental is not None:
+        incremental = _run_incremental(
+            shadow,
+            model_path,
+            batch.incremental,
+            model=model,
+            tests=list(incremental_tests),
+            meter=meter,
+            mutation_mod=mutation_mod,
+            exhausted=exhausted,
+            warnings=warnings,
         )
-        if equivalence.out_of_budget:
-            stop(batch.mutants[index + 1 :])
-            break
 
     mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
     # The model's own score counts a defect only downstream tests caught as a
@@ -2722,7 +3582,157 @@ def _run_mutants(
             else None
         ),
         "equivalence": equivalence.summary() if equivalence is not None else None,
+        "incremental": incremental,
         "_meta": (meter.runs, meter.spend, warnings),
+    }
+
+
+def _run_incremental(
+    shadow,
+    model_path,
+    branch,
+    *,
+    model: str,
+    tests: list[IncrementalUnitTest],
+    meter: _BatchSpend,
+    mutation_mod,
+    exhausted: bool,
+    warnings: list[str],
+) -> dict[str, Any]:
+    """The incremental branch's mutants, against the tests that run the branch.
+
+    Only a unit test that overrides ``is_incremental`` to true executes the
+    branch, so those are the whole selection, and the baseline is the
+    branch-taken model file rather than the full build. With no such test,
+    nothing could catch a defect there, so every one survives without a run and
+    names that test as the one to write (#1132).
+
+    Its survivors are never compared on the dev data: the branch reads
+    ``{{ this }}``, which is the model itself. Each says so in ``equivalence``,
+    as ``not_checked`` with that reason, exactly as any survivor that was not
+    compared does. Nothing is routed downstream, since a downstream test reads
+    the full build.
+    """
+
+    counts = {"killed": 0, "survived": 0, "rejected": 0, "not_run": 0}
+    mutants: list[dict] = []
+    baseline: dict[str, str] = {}
+    reason: str | None = None
+    unchecked = mutation_mod.Equivalence.unchecked(
+        mutation_mod.INCREMENTAL_NOT_COMPARED
+    ).payload()
+
+    def record(mutant, status: str, verdict=None) -> None:
+        """Book one branch mutant's outcome into the counts and the report."""
+
+        counts[status] = counts.get(status, 0) + 1
+        mutants.append(
+            {
+                **mutant.payload(),
+                "status": status,
+                "caught_by": verdict.caught_by if verdict is not None else [],
+                "warn_only": verdict.warn_only if verdict is not None else False,
+                "equivalence": unchecked if status == "survived" else None,
+            }
+        )
+
+    def not_run(remaining, why: str) -> None:
+        """Report the remaining branch mutants not_run, with the reason why."""
+
+        for mutant in remaining:
+            record(mutant, "not_run")
+        warnings.append(why)
+
+    select = " ".join(sorted({f"unit_test:{test.select}" for test in tests}))
+    ids = {test.unique_id for test in tests}
+
+    def statuses(summary) -> dict[str, str]:
+        """This model's branch tests' statuses, read by unique id.
+
+        The selector matches a unit test by name, which is unique only per
+        model, and on a versioned model it matches every version's instance.
+        Only the instances that test this model and version may testify.
+        """
+
+        mine = [
+            node
+            for node in (summary or {}).get("nodes", [])
+            if node.get("unique_id") in ids
+        ]
+        return _test_statuses({"nodes": mine})
+
+    if not branch.mutants:
+        pass
+    elif not tests:
+        reason = (
+            f"no unit test of '{model}' overrides is_incremental to true, so "
+            "nothing runs the branch and every defect planted in it survives"
+        )
+        for mutant in branch.mutants:
+            record(mutant, "survived")
+    elif exhausted or not meter.affords(_INCREMENTAL_BASELINE):
+        reason = "the confirmed budget ran out before the incremental branch ran"
+        not_run(
+            branch.mutants,
+            "the confirmed budget ran out before the incremental branch ran; its "
+            "mutants are reported as not_run",
+        )
+    else:
+        shadow.write(model_path, branch.identity)
+        summary = shadow.test(select)
+        meter.settle(summary, _INCREMENTAL_BASELINE)
+        baseline = statuses(summary)
+        if not any(status == "pass" for status in baseline.values()):
+            reason = (
+                "no unit test that overrides is_incremental to true passes against "
+                "the unmutated branch, so nothing could catch a defect there"
+            )
+            not_run(
+                branch.mutants,
+                f"no unit test of '{model}' that overrides is_incremental to true "
+                "passes against the unmutated branch, so its mutants are reported "
+                "as not_run; fix those tests, then measure them",
+            )
+        else:
+            for index, mutant in enumerate(branch.mutants):
+                if not meter.affords(mutant.id):
+                    not_run(
+                        branch.mutants[index:],
+                        f"the confirmed budget covered {index} of "
+                        f"{len(branch.mutants)} incremental branch mutants; the "
+                        "rest are reported as not_run",
+                    )
+                    break
+                shadow.write(model_path, mutant.body)
+                summary = shadow.test(select)
+                meter.settle(summary, mutant.id)
+                verdict = mutation_mod.classify(baseline, statuses(summary))
+                record(mutant, verdict.outcome, verdict)
+
+    mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
+    decided = counts["killed"] + counts["survived"]
+    return {
+        "tests": [test.name for test in tests],
+        "reason": reason,
+        "baseline": {
+            "tests": [
+                {"name": name, "status": status}
+                for name, status in sorted(baseline.items())
+            ],
+            "excluded": [
+                {"name": name, "status": status, "reason": _exclusion_reason(status)}
+                for name, status in sorted(baseline.items())
+                if status != "pass"
+            ],
+        },
+        "mutants": mutants,
+        "counts": {"generated": len(branch.mutants), **counts},
+        "score": (counts["killed"] / decided) if decided else None,
+        "cap": {
+            "generated": len(branch.mutants),
+            "considered": branch.considered,
+            "elided": dict(branch.elided),
+        },
     }
 
 
@@ -3440,6 +4450,8 @@ def _merge_spend(running: dict | None, latest: dict | None) -> dict | None:
 
 
 def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    """``transform compare``: one model before and after a plan."""
+
     from .refactor_compare import compare
 
     try:
@@ -3452,10 +4464,26 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 key_columns=getattr(args, "key", None),
                 target=getattr(args, "target", None),
                 accepted_type_changes=getattr(args, "accept_type", None),
+                expectation=_expectation_arg(args),
             )
         )
     except ValueError as exc:
         return env.error_for(exc, **_resolution_error(exc))
+
+
+def _expectation_arg(args: argparse.Namespace) -> str | None:
+    """``--expect``'s JSON, inline or read from ``--expect-file`` (``-`` is stdin)."""
+
+    inline = getattr(args, "expect", None)
+    path = getattr(args, "expect_file", None)
+    if path is None:
+        return inline
+    if path == "-":
+        return sys.stdin.read()
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"--expect-file could not be read: {exc}") from exc
 
 
 def _column_map(pairs: list[str] | None) -> dict[str, str] | None:
@@ -3656,7 +4684,7 @@ def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
     unproven = [
         f"{s['model']} ({s.get('reason_code') or s.get('status')})"
         for s in states or []
-        if s.get("status") in {"different", "not_checked"}
+        if s.get("status") in {"different", "not_checked", "unexpected"}
     ]
     notes: list[str] = []
     if uncompared:
@@ -3668,8 +4696,8 @@ def _comparison_notes(states: list[dict[str, Any]] | None) -> list[str]:
         )
     if unproven:
         notes.append(
-            "the last comparison did not establish equivalence for: "
-            + ", ".join(unproven)
+            "the last comparison did not establish the results were kept or "
+            "changed only as expected for: " + ", ".join(unproven)
         )
     return notes
 
@@ -4172,7 +5200,7 @@ def build(
     engine: DexEngine,
     *,
     target: str | None = None,
-    select: str | None = None,
+    select: str | Sequence[str] | None = None,
     verify: bool = False,
     for_plan: str | None = None,
     for_plan_document: Any = None,
@@ -4206,6 +5234,8 @@ def build(
         "pass the plan id the build is for, or omit the flag to build with no "
         "plan coverage",
     )
+    if select is not None and not isinstance(select, str):
+        select = " ".join(select)
     kwargs: dict[str, Any] = {
         "target": target,
         "select": select,
@@ -4521,6 +5551,8 @@ def _build_project(
     if dependencies is DependencyPolicy.REFUSE:
         assert_packages_installed(project)
 
+    from .verify import plan_models
+
     estimate, per_node, price_notes, upper_bounds, adapter = _price_build(
         engine,
         checkout,
@@ -4529,6 +5561,11 @@ def _build_project(
         verify=verify,
         artifact_directory=artifacts_dir,
         full_refresh=full_refresh,
+        focus=(
+            plan_models(_plan_edits(engine, for_plan, for_plan_document))
+            if verify
+            else None
+        ),
     )
     if estimate is not None:
         command_args.billed_handshake(
@@ -4807,12 +5844,15 @@ def _for_plan_document(args: argparse.Namespace) -> Any:
 
 
 def cmd_build(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    select = getattr(args, "select", None)
+    if select is not None and not isinstance(select, str):
+        select = " ".join(select)
     try:
         return to_envelope(
             build(
                 engine,
                 target=getattr(args, "target", None),
-                select=getattr(args, "select", None),
+                select=select,
                 verify=getattr(args, "verify", False),
                 for_plan=getattr(args, "for_plan", None),
                 for_plan_document=_for_plan_document(args),
@@ -5401,6 +6441,7 @@ def _price_build(
     verify: bool = False,
     artifact_directory: Path | None = None,
     full_refresh: bool = False,
+    focus: set[str] | None = None,
 ):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
@@ -5513,7 +6554,7 @@ def _price_build(
                     adapter, Path(project), scope=scope, recomputed=recomputed
                 )
                 facts, facts_notes = price_declared_facts(
-                    adapter, Path(project), scope=scope
+                    adapter, Path(project), scope=scope, engine=engine, focus=focus
                 )
                 joins, join_notes = price_join_contract(
                     adapter, Path(project), scope=scope
@@ -5553,7 +6594,7 @@ def _price_build(
         if cloud_capacity_required and not cloud_capacity_proved:
             raise
         note = (
-            f"could not price this build upfront ({type(exc).__name__}: {exc}); "
+            f"could not price this build upfront ({env.failure_text(exc)}); "
             "the budget and the server-side per-statement cap still bind"
         )
         return None, {}, [env.redact(note)], {}, adapter
@@ -5827,6 +6868,19 @@ def _cold_with_outcome(
     }
 
 
+def _install_dir(project: Any) -> str | None:
+    """Where the project installs packages, relative to it, or ``None``."""
+
+    if not project:
+        return None
+    from .build import packages_dir
+
+    try:
+        return packages_dir(project).relative_to(Path(project)).as_posix()
+    except (ValueError, OSError, TypeError):
+        return None
+
+
 def _attach_prerequisites(
     result: BuildResult, inputs: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -5861,6 +6915,7 @@ def _attach_prerequisites(
         ),
         edits=inputs.get("edits"),
         previous_run=inputs.get("previous_run"),
+        install_dir=_install_dir(inputs.get("project")),
     )
     found.sort(
         key=lambda entry: (
@@ -5946,12 +7001,64 @@ def _attach_completion(
             prose_population=_prose_population(result, inputs),
             identifier_conversions=inputs.get("identifier_conversions"),
             change_scope=inputs.get("change_scope"),
+            incremental_replay=_incremental_replay_inputs(result, inputs),
+            repair=inputs.get("repair"),
         )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _incremental_replay_inputs(
+    result: BuildResult, inputs: dict[str, Any]
+) -> dict[str, dict[str, Any]] | None:
+    """Each incremental model the plan edited, with the unit tests that run its
+    ``is_incremental()`` branch and whether this build full-refreshed it (#1130).
+
+    Read from the plan's model edits and this build's manifest, matched on the
+    file a model is defined in, so a model the plan only reads carries nothing.
+    Keyed on dbt's label for the node; ``answers`` holds every name a required
+    deliverable may use for it.
+    """
+
+    from ..dbt_project import manifest_node_label
+
+    edits = inputs.get("edits")
+    manifest = inputs.get("manifest")
+    if not edits or not isinstance(manifest, dict):
+        return None
+    edited = {
+        Path(edit.path).as_posix()
+        for edit in edits
+        if getattr(edit, "kind", None) is EditKind.MODEL_SQL
+        and getattr(edit, "op", None) is not EditOp.DELETE
+    }
+    if not edited:
+        return None
+    refresh = result.summary.get("full_refresh") or {}
+    refreshed = set(refresh.get("models") or []) if refresh.get("requested") else set()
+    found: dict[str, dict[str, Any]] = {}
+    for unique_id, node in (manifest.get("nodes") or {}).items():
+        if not isinstance(node, dict) or node.get("resource_type") != "model":
+            continue
+        if (node.get("config") or {}).get("materialized") != "incremental":
+            continue
+        path = str(node.get("original_file_path") or "")
+        if not path or not any(
+            path == candidate or candidate.endswith("/" + path) for candidate in edited
+        ):
+            continue
+        label = manifest_node_label(unique_id, node)
+        found[label] = {
+            "tests": [
+                test.unique_id for test in _incremental_unit_tests(manifest, node)
+            ],
+            "full_refreshed": label in refreshed,
+            "answers": sorted({label, str(node.get("name") or ""), Path(path).stem}),
+        }
+    return found or None
 
 
 def _completion_inputs(
@@ -5982,6 +7089,7 @@ def _completion_inputs(
                 getattr(stored, "identifier_conversions", None) or {}
             )
             inputs["change_scope"] = getattr(stored, "change_scope", None) or {}
+            inputs["repair"] = getattr(stored, "repair", None)
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):
@@ -6066,6 +7174,12 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
                 pii_overrides=overrides,
                 defer_compilation=True,
             )
+        # dbt compile refuses a project whose declared packages are not
+        # installed, in words naming raw `dbt deps`; the parse gate's check,
+        # read against the post-edit tree, refuses first in Dex's (#1166).
+        from .build import assert_plan_packages_installed
+
+        assert_plan_packages_installed(project, edits)
         compiled_models, compilation = compile_models(engine, edits)
     try:
         stored, diffs, warnings = plans_mod.plan(
@@ -6131,6 +7245,8 @@ def _semantic_plan(
     no_parse: bool = False,
     declarations: list[Any] | None = None,
 ) -> PlanResult:
+    """Validate, parse-gate, and construct a semantic plan across authoring modes."""
+
     from ..dbt_project import load as load_project
 
     project = engine.project_dir()
@@ -6223,8 +7339,9 @@ def _semantic_plan(
     elif spine_warning:
         parse_warning = "dbt parse skipped until the project has a time spine"
     else:
-        from .build import shadow_parse
+        from .build import assert_plan_packages_installed, shadow_parse
 
+        assert_plan_packages_installed(project, edits)
         parse_result = shadow_parse(project, edits, target=engine.config.dbt_target)
         if not parse_result["available"]:
             parse_warning = parse_result["reason"]

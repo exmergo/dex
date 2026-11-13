@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ..config import RedshiftTarget
@@ -56,6 +56,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -293,7 +294,7 @@ class RedshiftAdapter:
         from redshift_connector import error as rs_errors
 
         self._rs_errors = rs_errors
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._database: str | None = None
         self._notes: dict[str, list[str]] = {}
@@ -569,7 +570,7 @@ class RedshiftAdapter:
         # Re-learned with the inventory it was learned from.
         self._size_facts_denied = False
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_schema``, the schema this command's build writes into,
         or stop reading it with ``None``.
 
@@ -580,7 +581,7 @@ class RedshiftAdapter:
         changed.
         """
 
-        scope = scope.strip() if scope else None
+        scope = dev_target_entries(scope, str)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()

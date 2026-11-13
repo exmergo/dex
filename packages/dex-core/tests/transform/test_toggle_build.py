@@ -204,7 +204,7 @@ def test_gating_only_the_mart_names_every_other_producer(repo: Path, capsys) -> 
     """Gating only the mart names every other producer."""
 
     out = _plan(repo, capsys, MART_ONLY)
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     toggle = out["data"]["toggle"]
     assert toggle["verdict"] == "contradicted"
     models = _models(out)
@@ -242,7 +242,7 @@ def test_every_producer_gated_is_satisfied_and_builds_clean(repo: Path, capsys) 
     """Every producer gated is satisfied and builds clean."""
 
     out = _plan(repo, capsys, GATED)
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     toggle = out["data"]["toggle"]
     assert toggle["verdict"] == "satisfied", toggle
     assert toggle["completeness"] == "complete"
@@ -334,7 +334,12 @@ def test_an_on_build_keeps_every_producer(repo: Path, capsys) -> None:
 def test_a_dropped_on_column_and_a_dynamic_read_are_reported(
     repo: Path, capsys
 ) -> None:
-    """A dropped on column and a dynamic read are reported."""
+    """A dropped on column is contradicted; a dynamic read is attributed.
+
+    The compile passes the flag's value to every ``var()``, dynamic or not, so
+    the read is judged inside its model's compiled SQL and is not a limit
+    (#1156).
+    """
 
     dropped = dict(GATED)
     dropped["ledger_entries"] = "select 'L1' as entry_id, 50 as debit\n"
@@ -348,8 +353,10 @@ def test_a_dropped_on_column_and_a_dynamic_read_are_reported(
     toggle = out["data"]["toggle"]
     models = _models(out)
     assert models["ledger_entries"]["finding"] == "governed_column_lost_when_on"
-    assert toggle["completeness"] == "incomplete"
-    assert any("rpt_dynamic.sql" in limit for limit in toggle["limits"])
+    assert not any("rpt_dynamic.sql" in limit for limit in toggle["limits"])
+    (dynamic_read,) = toggle["dynamic_reads"]
+    assert dynamic_read["path"] == "models/rpt_dynamic.sql"
+    assert dynamic_read["models"] == ["rpt_dynamic"]
 
 
 def test_refusals(repo: Path, capsys) -> None:
@@ -426,7 +433,7 @@ def test_a_failed_analysis_keeps_the_plan_and_its_contract(
 
     monkeypatch.setattr(toggle_mod, "analyze", broken)
     out = _plan(repo, capsys, GATED)
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     assert out["data"]["toggle"]["verdict"] == "unchecked"
     assert "KeyError" in out["data"]["toggle"]["limits"][0]
     exported = _run(repo, capsys, "transform", "export", out["data"]["plan_id"])
@@ -509,7 +516,7 @@ def test_compare_refuses_a_parent_only_the_on_branch_reads(repo: Path, capsys) -
         joined,
         toggle={**TOGGLE, "columns": ["fee_amount", "fees", "fee_rate"]},
     )
-    assert out["status"] == "ok", out
+    assert out["status"] == "ok", out["errors"]
     compared = _run(
         repo,
         capsys,
@@ -523,3 +530,274 @@ def test_compare_refuses_a_parent_only_the_on_branch_reads(repo: Path, capsys) -
     assert compared["data"]["reason_code"] == "inputs_unsynchronized"
     assert "read only with" in compared["data"]["detail"]
     assert "fee_rates" in compared["data"]["detail"]
+
+
+# --- compiled SQL is the judge (#1156) -------------------------------------
+
+#: A select list and a group-by count gated together: blanking the Jinja
+#: leaves ``group by`` with nothing after it, so the source scan cannot parse
+#: the file, while the compiled SQL is plain at either value.
+BY_ORDER = (
+    "select order_id, amount\n" + ON + ", fee_amount{% endif %}\n"
+    ", count(*) as line_count\n"
+    "from {{ ref('stg_orders') }}\n"
+    "group by " + ON + "1, 2, 3{% else %}1, 2{% endif %}\n"
+)
+FEE_MACRO = "{% macro fee_columns() %}" + ON + ", fee_amount{% endif %}{% endmacro %}\n"
+VIA_MACRO = "select order_id {{ fee_columns() }}\nfrom {{ ref('stg_orders') }}\n"
+DISABLED = (
+    "{{ config(enabled=false) }}\nselect 1 as order_id\n"
+    + ON
+    + ", 1 as fee_amount{% endif %}\n"
+)
+
+
+def _extra(files: dict[str, str]) -> list[dict]:
+    """Edits writing ``files``, each as the kind its path calls for."""
+
+    return [
+        {
+            "path": path,
+            "kind": "macro_sql" if path.startswith("macros/") else "model_sql",
+            "content": text,
+        }
+        for path, text in files.items()
+    ]
+
+
+def test_a_gated_select_list_a_macro_read_and_a_disabled_model(
+    repo: Path, capsys
+) -> None:
+    """Judged from compiled SQL at both values, with only the disabled model owed.
+
+    The fixture the issue asks for: a conditional select list with its
+    conditional group-by count, a flag read inside a project macro, and a
+    disabled model that reads the flag.
+    """
+
+    out = _plan(
+        repo,
+        capsys,
+        GATED,
+        extra=_extra(
+            {
+                "models/rpt_by_order.sql": BY_ORDER,
+                "macros/fee_columns.sql": FEE_MACRO,
+                "models/rpt_via_macro.sql": VIA_MACRO,
+                "models/legacy_fees.sql": DISABLED,
+            }
+        ),
+    )
+    assert out["status"] == "ok", out["errors"]
+    toggle = out["data"]["toggle"]
+    models = _models(out)
+    # Judged at both values, not unchecked.
+    by_order = models["rpt_by_order"]
+    assert by_order["status"] == "satisfied", by_order
+    assert by_order["branches"] == {
+        "on": ["amount", "fee_amount", "line_count", "order_id"],
+        "off": ["amount", "line_count", "order_id"],
+    }
+    assert models["rpt_via_macro"]["produces"] == ["fee_amount"]
+    assert models["rpt_via_macro"]["status"] == "satisfied"
+    assert not any("could not parse" in limit for limit in toggle["limits"])
+    # The macro's read is attributed to the model that calls it.
+    (macro,) = [
+        r for r in toggle["macro_reads"] if r["path"] == "macros/fee_columns.sql"
+    ]
+    assert macro["models"] == ["rpt_via_macro"]
+    # Only the disabled model is owed.
+    assert toggle["not_compiled"] == [
+        {"model": "legacy_fees", "path": "models/legacy_fees.sql"}
+    ]
+    assert models["legacy_fees"]["reason_code"] == "not_compiled"
+    assert toggle["completeness"] == "incomplete"
+    assert toggle["verdict"] == "unchecked"
+    (limit,) = toggle["limits"]
+    assert "legacy_fees" in limit
+
+
+def test_one_model_that_does_not_compile_leaves_the_rest_judged(
+    repo: Path, capsys
+) -> None:
+    """dbt stops a compile at the first failing node; Dex sets it aside."""
+
+    broken = "select {{ no_such_macro() }} as order_id\n"
+    out = _plan(repo, capsys, GATED, extra=_extra({"models/rpt_broken.sql": broken}))
+    assert out["status"] == "ok", out["errors"]
+    models = _models(out)
+    assert models["rpt_broken"]["status"] == "unchecked"
+    assert models["rpt_broken"]["reason_code"] == "compile_failed"
+    assert "no_such_macro" in models["rpt_broken"]["reason"]
+    assert models["rpt_revenue"]["status"] == "satisfied"
+    assert models["rpt_revenue"]["produces"] == ["fees"]
+    assert models["rpt_lines_wide"]["status"] == "satisfied"
+
+
+# --- tests and semantic definitions over a governed column (#1169) -------------
+
+#: A not_null on a gated producer's fee column, which still runs with the flag
+#: off; the same test disabled at the off value; and one on the exempt staging
+#: model, which keeps the column off.
+FEE_TESTS = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_order_lines\n"
+    "    columns:\n"
+    "      - name: fee_amount\n"
+    "        data_tests:\n"
+    "          - not_null\n"
+    "  - name: ledger_entries\n"
+    "    columns:\n"
+    "      - name: fee_amount\n"
+    "        data_tests:\n"
+    "          - not_null:\n"
+    "              config:\n"
+    "                enabled: \"{{ var('" + FLAG + "') }}\"\n"
+    "  - name: stg_orders\n"
+    "    columns:\n"
+    "      - name: fee_amount\n"
+    "        data_tests:\n"
+    "          - not_null\n"
+)
+
+#: A gated producer with a time column, so a semantic model can sit on it.
+FEE_DAYS = (
+    "select order_id, cast('2024-01-01' as date) as order_day\n"
+    + ON
+    + ", fee_amount{% endif %}\nfrom {{ ref('stg_orders') }}\n"
+)
+SPINE = "select cast('2024-01-01' as date) as date_day\n"
+SPINE_DOCS = (
+    "version: 2\nmodels:\n  - name: metricflow_time_spine\n    time_spine:\n"
+    "      standard_granularity_column: date_day\n    columns:\n"
+    "      - name: date_day\n        granularity: day\n"
+)
+FEE_SEMANTIC = (
+    "version: 2\n"
+    "semantic_models:\n"
+    "  - name: fee_days\n"
+    "    model: ref('fct_fee_days')\n"
+    "    defaults:\n"
+    "      agg_time_dimension: order_day\n"
+    "    entities:\n"
+    "      - name: order_id\n"
+    "        type: primary\n"
+    "    dimensions:\n"
+    "      - name: order_day\n"
+    "        type: time\n"
+    "        type_params:\n"
+    "          time_granularity: day\n"
+    "      - name: fee_band\n"
+    "        type: categorical\n"
+    "        expr: fee_amount\n"
+    "    measures:\n"
+    "      - name: total_fees\n"
+    "        agg: sum\n"
+    "        expr: fee_amount\n"
+    "      - name: doubled_fees\n"
+    "        agg: sum\n"
+    "        expr: fee_amount * 2\n"
+    "metrics:\n"
+    "  - name: fee_revenue\n"
+    "    label: Fee revenue\n"
+    "    type: simple\n"
+    "    type_params:\n"
+    "      measure: total_fees\n"
+)
+
+
+def _line(text: str, needle: str) -> int:
+    """The 1-based line of ``needle``'s only occurrence in ``text``."""
+
+    found = [n for n, line in enumerate(text.splitlines(), 1) if needle in line]
+    assert len(found) == 1, (needle, found)
+    return found[0]
+
+
+def _checks(record: dict, code: str) -> list[dict]:
+    """The checks of ``code`` a toggle record carries."""
+
+    return [c for c in record.get("checks") or [] if c["check"] == code]
+
+
+def test_a_test_still_running_off_on_a_governed_column_is_named(
+    repo: Path, capsys
+) -> None:
+    """A not_null on a governed column fails the off build, so the plan names it
+    with its file and line; one disabled at the off value, and one on an exempt
+    model, are not reported."""
+
+    tests = {
+        "path": "models/_fee_tests.yml",
+        "kind": "schema_yml",
+        "content": FEE_TESTS,
+    }
+    out = _plan(repo, capsys, GATED, extra=[tests])
+    assert out["status"] == "ok", out
+    toggle = out["data"]["toggle"]
+    assert toggle["verdict"] == "contradicted", toggle
+    models = _models(out)
+    found = _checks(models["fct_order_lines"], "governed_column_tested_when_off")
+    assert len(found) == 1, models["fct_order_lines"]
+    assert found[0]["path"] == "models/_fee_tests.yml"
+    # The first bare not_null, under fct_order_lines.fee_amount.
+    assert found[0]["line"] == FEE_TESTS.splitlines().index("          - not_null") + 1
+    assert found[0]["column"] == "fee_amount"
+    assert found[0]["test"] == "not_null"
+    assert models["fct_order_lines"]["status"] == "contradicted"
+    # Disabled with the flag off: dbt never runs it there.
+    assert not _checks(
+        models.get("ledger_entries", {}), "governed_column_tested_when_off"
+    )
+    # Exempt: the column stays with the flag off, so the test still passes.
+    assert not _checks(models.get("stg_orders", {}), "governed_column_tested_when_off")
+    assert any(
+        "models/_fee_tests.yml:" in w and "not_null" in w for w in out["warnings"]
+    ), out["warnings"]
+
+
+def test_a_semantic_definition_over_a_governed_column_is_named(
+    repo: Path, capsys
+) -> None:
+    """A dimension or measure over a governed column stops resolving with the flag
+    off, so the plan names it, with the metric on it; a computed expression the
+    index cannot resolve is listed in the limits."""
+
+    extra = [
+        {"path": "models/fct_fee_days.sql", "kind": "model_sql", "content": FEE_DAYS},
+        {
+            "path": "models/metricflow_time_spine.sql",
+            "kind": "model_sql",
+            "content": SPINE,
+        },
+        {"path": "models/_spine.yml", "kind": "schema_yml", "content": SPINE_DOCS},
+        {
+            "path": "models/_fee_semantic.yml",
+            "kind": "semantic_yml",
+            "content": FEE_SEMANTIC,
+        },
+    ]
+    out = _plan(repo, capsys, GATED, extra=extra)
+    assert out["status"] == "ok", out
+    toggle = out["data"]["toggle"]
+    assert toggle["verdict"] == "contradicted", toggle
+    record = _models(out)["fct_fee_days"]
+    found = {
+        c["definition"]: c for c in _checks(record, "governed_column_in_semantic_layer")
+    }
+    assert set(found) == {"fee_band", "total_fees"}, record
+    assert found["fee_band"]["kind"] == "dimension"
+    assert found["fee_band"]["path"] == "models/_fee_semantic.yml"
+    assert found["fee_band"]["line"] == _line(FEE_SEMANTIC, "- name: fee_band")
+    assert found["total_fees"]["kind"] == "measure"
+    assert found["total_fees"]["line"] == _line(FEE_SEMANTIC, "- name: total_fees")
+    assert found["total_fees"]["metrics"] == ["fee_revenue"]
+    assert all(c["column"] == "fee_amount" for c in found.values())
+    # The computed measure is unresolved, so it is a limit, never dropped.
+    assert toggle["completeness"] == "incomplete"
+    assert any(
+        "models/_fee_semantic.yml:" in limit and "doubled_fees" in limit
+        for limit in toggle["limits"]
+    ), toggle["limits"]
+    assert any("fee_band" in w for w in out["warnings"]), out["warnings"]

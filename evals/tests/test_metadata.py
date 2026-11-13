@@ -21,6 +21,7 @@ What is held:
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -72,8 +73,14 @@ DIGESTS = {
     "incremental_watermark": "708724ae33e4abd42360c359667364542bbf75beac5b3bd7a385cac1f8b15d0f",
     "trailing_window": "9bc38c6d85e6e7bcfa81ad11926d7c7207ce20265dc699b9c1f9f4f444c37a74",
     "optional_fees": "4becda5d5ad945ba188d20567e2a874f66c6de1df6c370b3403739839ed5f10d",
+    "gated_fees": "c905e6c4e0677485c46eeb5c5e13d8b37995e65805d0fe33017909043070b92b",
     "sandbox_scope": "c39e1d55a470611137dcbd0b62fdbd617ea8abc183f202b06e51b7d46ea2a07a",
     "visit_coverage": "89f49a8cfb57454f2bccea7e679f82bdecddb20494fb4822077249ee8190c124",
+    "package_parent": "ba531ac5af7723884ac87e3d665d2e802efa79b0ed969723b6295a6de723c6bf",
+    "trial_events": "74e1c40cadf83d6cdfb83caef52b94855393764cf05c340d2806bd69cb662d6a",
+    "adjusted_price": "a5f757536249ad0a1a9d3834b8e2005838de6588726b3e1ce9be2cebe15282d3",
+    "intended_repairs": "f85cf9bda1ccac17b11c024cbee3e351047b425a5f60dfc178f3fce4e3133b8a",
+    "reviewed_listings": "77e9d59322d5207ce8a7bc5954156cefe28b27afe51b37f97d03403e2f21892b",
 }
 # The holdout a fixture's gate grades on, where it differs from the agent's data.
 GRADING_DIGESTS = {
@@ -101,7 +108,7 @@ def _edit_yaml(path: Path, edit) -> None:
 def test_the_suite_covers_the_issues_five_cases_with_build_and_fix_tasks():
     assert {fx.name for fx in FIXTURES} == set(DIGESTS)
     assert len(TASKS) >= 7
-    assert {t.kind for t in TASKS} == {"build", "fix", "test"}
+    assert {t.kind for t in TASKS} == {"build", "fix", "test", "diagnose"}
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=lambda fx: fx.name)
@@ -135,9 +142,16 @@ def test_every_reference_answer_scores_perfect(task, tmp_path):
     workspace = materialize(task, fixture, tmp_path / "ws", reference=True)
     score = score_workspace(task, fixture, workspace, reference=True)
     assert score.status == "scored", score.gate
-    assert (score.completeness, score.correctness, score.checks_passed) == (1, 1, 1), (
-        score.to_dict()
-    )
+    if task.kind == "diagnose":
+        # A diagnosis authors no declaration: no vacuous pass is averaged in.
+        assert (score.completeness, score.correctness) == (None, None)
+        assert score.checks_passed == 1, score.checks
+    else:
+        assert (
+            score.completeness,
+            score.correctness,
+            score.checks_passed,
+        ) == (1, 1, 1), score.to_dict()
     if task.truth.get("privacy"):
         assert score.privacy["passed"], score.privacy
         assert score.privacy["transcript_checked"] is False
@@ -146,6 +160,7 @@ def test_every_reference_answer_scores_perfect(task, tmp_path):
     )
     # A reference run has no final message to grade.
     assert score.report is None
+    assert score.diagnosis is None
     if task.truth.get("planted_defects"):
         assert score.defects_caught == 1, score.planted_defects
 
@@ -1437,6 +1452,53 @@ def test_a_report_driven_from_the_child_passes_on_dev_and_fails_the_holdout(tmp_
         "every subscription is present, including one with no activity",
         "a subscription with no activity counts zero, not NULL",
     }
+
+
+def test_a_mart_driven_from_the_package_parts_holds_the_wrong_conversations(tmp_path):
+    """Driven from the package's parts table, the mart builds, keeps two deleted
+    conversations and misses three real ones, though the counts it does hold
+    are right (#1155)."""
+
+    task, fixture, workspace = _reference(tmp_path, "package_parent/build_threads")
+    assert (workspace / "dbt_packages/tiny_inbox/models").is_dir(), (
+        "the agent starts with the package installed"
+    )
+    (workspace / "models/marts/inbox__threads.sql").write_text(
+        "select p.conversation_id, max(c.state) as state, count(*) as part_count,\n"
+        "    max(p.part_created_at) as last_part_at\n"
+        "from {{ ref('stg_inbox__conversation_parts') }} p\n"
+        "left join {{ ref('stg_inbox__conversations') }} c\n"
+        "  on c.conversation_id = p.conversation_id\n"
+        "group by p.conversation_id\n"
+    )
+    _edit_yaml(
+        workspace / "models/marts/inbox__threads.yml",
+        lambda doc: doc["models"][0]["columns"][0].update(data_tests=["not_null"]),
+    )
+    score = score_workspace(task, fixture, workspace, reference=True)
+    assert score.status == "scored"
+    assert set(_failed(score)) == {
+        "every conversation is in the mart, including the three with no parts",
+        "no deleted conversation is in the mart",
+        "a conversation with no parts counts zero, not NULL",
+    }
+
+
+def test_a_declared_parts_parent_is_graded_wrong(tmp_path):
+    """The declared population.parent is graded against truth's parent."""
+
+    task, fixture, workspace = _reference(tmp_path, "package_parent/build_threads")
+
+    def swap(doc):
+        """Declare the parts table as the mart's parent."""
+        population = doc["models"][0]["config"]["meta"]["dex"]["population"]
+        population["parent"]["model"] = "stg_inbox__conversation_parts"
+
+    _edit_yaml(workspace / "models/marts/inbox__threads.yml", swap)
+    score = score_workspace(task, fixture, workspace, reference=True)
+    fields = score.models["inbox__threads"]["correctness"]
+    assert fields["population_parent"] is False
+    assert score.correctness < 1
 
 
 def test_each_dex_call_records_its_flags():
@@ -2853,6 +2915,119 @@ def test_package_blocked_refactor_flow(tmp_path, monkeypatch, capsys):
     )
 
 
+# --- #1161: an override of a model its package documents ---------------------
+
+_OVERRIDE_TASKS = (
+    "package_prerequisite/adapt_project",
+    REFACTOR_PREREQUISITE,
+)
+
+
+@pytest.mark.parametrize("name", _OVERRIDE_TASKS)
+def test_the_package_documents_the_model_the_reference_overrides(name):
+    """dbt gives a package's entry to the project's override and refuses a
+    second, so these fixtures keep the condition #1161 is about: the model the
+    agent has to override is documented by its package."""
+
+    task = _task(name)
+    fixture_dir = task.directory.parent.parent
+    overridden = {
+        p.stem
+        for p in (task.directory / "reference" / "models" / "overrides").glob("*.sql")
+    }
+    assert overridden
+    documented = {
+        entry["name"]
+        for path in (fixture_dir / "packages").glob("*/models/**/*.yml")
+        for entry in (yaml.safe_load(path.read_text()) or {}).get("models", [])
+    }
+    assert overridden <= documented
+
+
+def test_declaring_a_documented_override_is_refused_and_its_readers_are_not(
+    tmp_path, monkeypatch, capsys
+):
+    """Real CLI on the #1114 fixture: the override route names the package's
+    entry, a declaration on the override is refused in dex's words naming both
+    files, and the same repair without it plans with no declaration owed."""
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(REFACTOR_PREREQUISITE)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    entry = "dbt_packages/tiny_roster/models/roster_member.yml"
+
+    def dex(*args, expected="ok"):
+        """Run the fixture CLI and check its expected envelope status."""
+
+        main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        return envelope
+
+    blocked = dex("transform", "build", "--target", "dev", expected="error")
+    [override] = [
+        o
+        for p in blocked["data"]["prerequisites"]
+        if p["node"] == "roster_member"
+        for o in p["options"]
+        if o["kind"] == "project_override"
+    ]
+    assert override["package_entry"] == entry
+
+    reference = task.directory / "reference"
+    edits = [
+        {
+            "path": path,
+            "kind": kind,
+            "content": (reference / path).read_text(),
+        }
+        for path, kind in (
+            ("models/overrides/roster_member.sql", "model_sql"),
+            ("dbt_project.yml", "project_yml"),
+        )
+    ]
+    declared = workspace / "declared.json"
+    declared.write_text(
+        json.dumps(
+            {
+                "edits": edits,
+                "declarations": [
+                    {
+                        "model": "roster_member",
+                        "description": "One row per member.",
+                        "grain": ["member_id"],
+                    }
+                ],
+            }
+        )
+    )
+    refused = dex(
+        "transform", "plan", "repair", "--edits-file", str(declared), expected="error"
+    )
+    [message] = refused["errors"]
+    assert entry in message
+    assert "models/overrides/roster_member.yml" in message
+
+    plain = workspace / "plain.json"
+    plain.write_text(json.dumps({"edits": edits}))
+    planned = dex("transform", "plan", "repair", "--edits-file", str(plain))
+    owed = [
+        w
+        for w in planned["warnings"]
+        if "roster_member" in w and ("declares nothing" in w or "declares no " in w)
+    ]
+    assert owed == []
+    assert planned["data"]["declarations"]["roster_member"]["package_documented"] == {
+        "package": "tiny_roster",
+        "package_entry": entry,
+    }
+
+
 # --- scope (#1115): which populations a repair changes, and what it keeps -------
 
 _SANDBOX = "sandbox_scope"
@@ -3116,3 +3291,668 @@ def test_a_shifted_range_that_drops_a_visit_day_fails_the_unchanged_check(tmp_pa
     )
     score = _visits_with(tmp_path, shifted)
     assert "days with visits are unchanged" in _failed(score)
+
+
+# --- the toggle check judges compiled SQL (#1156) ---------------------------
+
+_GATED = "gated_fees/close_fee_leak"
+
+
+@needs_dbt
+def test_the_starting_ledger_leaks_its_fee_total_off(tmp_path):
+    """The negative control: the project as it starts fails only the off build,
+    on the ledger; every gated shape (the macro, the gated group-by count, the
+    disabled report) already holds."""
+
+    task, fixture, workspace = _reference(tmp_path, _GATED)
+    path = "models/finance/ledger_daily.sql"
+    (workspace / path).write_text(
+        (fixture.project / path).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored"
+    assert _failed(score) == [
+        "fees_off: no reporting model exposes a fee column",
+        "fees_off: the ledger has exactly its other columns",
+    ]
+
+
+@needs_dbt
+def test_the_toggle_check_judges_every_gated_shape_in_the_fixture(
+    tmp_path, monkeypatch, capsys
+):
+    """Real CLI on the fixture: the reference fix planned with a toggle contract.
+
+    The merchant report's gated group-by count leaves its source unparseable
+    once the Jinja is blanked, the order fact reads the flag through a macro, and
+    the retired report is disabled. Each is judged, attributed or named on its
+    own, and only the disabled report is left owed.
+    """
+
+    import json
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(_GATED)
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    path = "models/finance/ledger_daily.sql"
+    payload = workspace / "payload.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": path,
+                        "kind": "model_sql",
+                        "content": (task.directory / "reference" / path).read_text(),
+                    }
+                ],
+                "toggle": {
+                    "variable": "enable_platform_fees",
+                    "on_value": True,
+                    "off_value": False,
+                    "columns": [
+                        "platform_fee",
+                        "net_amount",
+                        "platform_fees",
+                        "high_fee",
+                        "total_fees",
+                        "lifetime_fees",
+                    ],
+                    "exempt_models": ["stg_orders", "stg_ledger_postings"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    main(
+        [
+            "--repo-root",
+            str(workspace),
+            "transform",
+            "plan",
+            "close the fee leak",
+            "--edits-file",
+            str(payload),
+        ]
+    )
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["status"] == "ok", envelope.get("errors")
+    toggle = envelope["data"]["toggle"]
+    models = {r["model"]: r for r in toggle["models"]}
+    assert not any("could not parse" in limit for limit in toggle["limits"])
+    for name in ("fct_orders", "rpt_merchant_revenue", "ledger_daily"):
+        assert models[name]["status"] == "satisfied", models[name]
+    assert models["rpt_merchant_revenue"]["produces"] == ["high_fee", "platform_fees"]
+    (macro,) = toggle["macro_reads"]
+    assert macro["path"] == "macros/fee_columns.sql"
+    assert macro["models"] == ["fct_orders"]
+    assert toggle["not_compiled"] == [
+        {"model": "rpt_fee_history", "path": "models/legacy/rpt_fee_history.sql"}
+    ]
+    assert toggle["verdict"] == "unchecked"
+    assert len(toggle["limits"]) == 1
+
+
+# --- diagnosis (#1048, #1116) -------------------------------------------------
+
+from evals.metadata.score import diagnosis_rubric  # noqa: E402
+
+_TRIAL = "trial_events/trial_subtotal"
+_UNUSED = "adjusted_price/unused_adjustment"
+
+_DEFECT_FOUND = (
+    "Subscription 1007 is present and its event_count is right, so no row is "
+    "missing. Its trial_event_count is wrong: stg_events maps the tier_code "
+    "`trl` to nothing, so those events never reach the trial predicate. "
+    "The event_tier_codes seed maps trl to trial; I restored that mapping."
+)
+_ROW_ONLY = (
+    "Subscription 1007 is present in subscription_activity and every event is "
+    "counted, so nothing is missing. Nothing is wrong with the model."
+)
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("key", "setup_file"),
+    [
+        (_TRIAL, "models/staging/stg_events.sql"),
+        (_UNUSED, "models/marts/product_pricing.sql"),
+        ("adjusted_price/alias_swap", "models/marts/product_pricing.sql"),
+    ],
+)
+def test_a_fix_tasks_broken_start_fails_its_checks(tmp_path, key, setup_file):
+    """The defect is real on the data: the starting SQL builds green and fails
+    the row checks, so a passing check is a repair and not the fixture."""
+
+    task, fixture, workspace = _reference(tmp_path, key)
+    shutil.copyfile(task.directory / "setup" / setup_file, workspace / setup_file)
+    # The setup is the starting state: one trailing newline makes it differ
+    # from it, so the task is scored rather than `no_models`.
+    (workspace / setup_file).write_text(
+        (workspace / setup_file).read_text(encoding="utf-8") + "\n", encoding="utf-8"
+    )
+    score = score_workspace(task, fixture, workspace)
+    assert score.status == "scored", score.gate
+    assert score.checks_passed < 1, score.checks
+
+
+def test_a_row_count_alone_does_not_pass_a_diagnosis():
+    """#1048's stopping error: finding the entity and its total is not the
+    answer, and it fails localization and evidence as well as the verdict."""
+
+    truth = _task(_TRIAL).truth["diagnosis"]
+    graded = diagnosis_rubric(truth, _ROW_ONLY, ["stg_events"], [])
+    assert graded["passed"] is False
+    assert graded["checks"]["localized"] is False
+    assert graded["checks"]["evidenced"] is False
+    assert diagnosis_rubric(truth, _DEFECT_FOUND, ["stg_events"], [])["passed"]
+
+
+def test_a_correct_intermediate_does_not_localize_the_delivered_column():
+    """#1116's stopping error: judging the intermediate formula, and never the
+    column the mart returns, misses the delivered expression."""
+
+    truth = _task(_UNUSED).truth["diagnosis"]
+    intermediate_only = (
+        "int_line_prices computes adjusted_price as the list price times one "
+        "minus discount_rate, which is correct."
+    )
+    graded = diagnosis_rubric(truth, intermediate_only, [], [])
+    assert graded["checks"]["localized"] is False and not graded["passed"]
+    delivered = (
+        "avg_adjusted_price averages list_price instead of adjusted_price, so the "
+        "discount from int_line_prices is never applied to the delivered column."
+    )
+    assert diagnosis_rubric(truth, delivered, [], [])["passed"]
+
+
+def test_an_identifier_is_matched_whole():
+    """`adjusted_price` is not evidence when only `avg_adjusted_price` is said."""
+
+    truth = {"verdict": "defect", "evidence": [["adjusted_price"]]}
+    assert not diagnosis_rubric(truth, "avg_adjusted_price is wrong.", [], [])[
+        "checks"
+    ]["evidenced"]
+
+
+@pytest.mark.parametrize(
+    ("final", "passed"),
+    [
+        (
+            "avg_adjusted_price for product 12 averages every line, refunded "
+            "ones included. Whether refunds belong is not documented anywhere, "
+            "so this stays unresolved; I left the model unchanged.",
+            True,
+        ),
+        (
+            "avg_adjusted_price for product 12 includes refunded lines. "
+            "The model is correct.",
+            False,
+        ),
+        (
+            "avg_adjusted_price for product 12 looks right. Nothing is wrong.",
+            False,
+        ),
+    ],
+)
+def test_an_open_question_is_reported_as_unresolved(final, passed):
+    truth = _task("adjusted_price/uncertain_contract").truth["diagnosis"]
+    assert diagnosis_rubric(truth, final, [], ["product_pricing"])["passed"] is passed
+
+
+def test_a_model_that_needed_no_repair_must_stay_unchanged():
+    truth = _task("trial_events/legitimate_exclusion").truth["diagnosis"]
+    final = (
+        "Subscription 1013 is internal (is_internal is true), and "
+        "subscription_activity declares that internal subscriptions are excluded."
+    )
+    models = ["subscription_activity"]
+    assert diagnosis_rubric(truth, final, [], models)["passed"]
+    edited = diagnosis_rubric(truth, final, ["subscription_activity"], models)
+    assert edited["checks"]["unchanged"] is False and not edited["passed"]
+
+
+def test_no_message_grades_no_diagnosis():
+    assert diagnosis_rubric({"verdict": "defect"}, None, [], []) is None
+    assert diagnosis_rubric(None, "anything", [], []) is None
+
+
+@needs_dbt
+def test_a_diagnosis_scores_on_an_unchanged_workspace(tmp_path):
+    """A diagnose task with nothing changed is scored, not `no_models`, and its
+    diagnosis is graded apart from the build."""
+
+    task = _task("trial_events/missing_entity")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    final = (
+        "Subscription 1099 does not exist in raw.subscriptions, so "
+        "subscription_activity cannot hold it; the model is not at fault."
+    )
+    score = score_workspace(task, fixture, workspace, final=final)
+    assert score.status == "scored", score.gate
+    assert score.completeness is None and score.diagnosis["passed"], score.diagnosis
+    vague = score_workspace(task, fixture, workspace, final="Nothing is wrong.")
+    assert vague.status == "scored" and not vague.diagnosis["passed"]
+
+
+def test_the_summary_leaves_a_diagnosis_out_of_the_declaration_averages(capsys):
+    """A diagnose row's `None` axes are neither a pass nor a crash, and its
+    diagnosis is averaged on its own."""
+
+    from evals.metadata.cli import _aggregate, _print_table
+
+    base = {
+        "status": "scored",
+        "checks_passed": 1.0,
+        "attribution": None,
+        "workspace_checks": None,
+    }
+    rows = [
+        {"score": {**base, "task": "a/fix", "completeness": 0.5, "correctness": 1.0}},
+        {
+            "score": {
+                **base,
+                "task": "a/diagnose",
+                "completeness": None,
+                "correctness": None,
+                "diagnosis": {"passed": False, "checks": {}},
+            }
+        },
+    ]
+    aggregate = _aggregate(rows)
+    assert (aggregate["completeness"], aggregate["correctness"]) == (0.5, 1.0)
+    assert aggregate["diagnosis"] == 0
+    _print_table({"results": rows, "aggregate": aggregate})
+    out = capsys.readouterr().out
+    assert "a/diagnose" in out and "FAIL" in out and "diagnosis 0.00" in out
+
+
+@pytest.mark.parametrize(
+    ("key", "final"),
+    [
+        (
+            "adjusted_price/uncertain_contract",
+            "I made no change. The avg_adjusted_price calculation for product 12 is "
+            "correct as the model is written. Whether it should count refunded lines "
+            "is a business question, and the project doesn't answer it.",
+        ),
+        (
+            "adjusted_price/uncertain_contract",
+            "I found no defect in avg_adjusted_price, but one question about "
+            "refunded lines for product 12 is still open: that is a business "
+            "decision. Unless the team wants refunds excluded, the figure is "
+            "correct as the model defines it.",
+        ),
+        (
+            _UNUSED,
+            "avg_adjusted_price was computed wrongly: it was avg(list_price). "
+            "int_line_prices.adjusted_price already applies discount_rate, but "
+            "nothing used it.",
+        ),
+        (
+            "trial_events/missing_entity",
+            "Subscription 1099 isn't in the source data: raw.subscriptions holds "
+            "ids 1001 to 1060, so the model isn't dropping it.",
+        ),
+    ],
+)
+def test_live_phrasings_of_a_right_diagnosis_pass(key, final):
+    """Phrasings from the first live run (#1048, #1116) that a narrower rubric
+    read as misses, although each diagnosis was right."""
+
+    task = _task(key)
+    graded = diagnosis_rubric(task.truth["diagnosis"], final, [], task.models)
+    assert graded["passed"], graded
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "trial_event_count reads stg_events, whose event_tier maps trl. "
+        "I found no defect.",
+        "trial_event_count reads stg_events and trl is mapped. Nothing is wrong "
+        "with the model.",
+        "trial_event_count reads stg_events and trl. No row is missing.",
+    ],
+)
+def test_a_negated_defect_word_does_not_qualify_a_defect(final):
+    """A clean verdict that names the field and the evidence is not a defect
+    named, whatever defect words it negates."""
+
+    truth = _task(_TRIAL).truth["diagnosis"]
+    graded = diagnosis_rubric(truth, final, ["stg_events"], [])
+    assert graded["checks"]["qualified"] is False, graded
+
+
+def test_a_mixed_sentence_still_names_the_defect():
+    truth = _task(_UNUSED).truth["diagnosis"]
+    final = (
+        "The intermediate is correct, but avg_adjusted_price is wrong: it averages "
+        "list_price, not adjusted_price from int_line_prices."
+    )
+    assert diagnosis_rubric(truth, final, [], [])["checks"]["qualified"]
+
+
+def test_a_clean_build_statement_does_not_swallow_a_defect_claim():
+    truth = _task(_UNUSED).truth["diagnosis"]
+    final = (
+        "The build has no errors but avg_adjusted_price is wrong: it averages "
+        "list_price, not adjusted_price from int_line_prices."
+    )
+    assert diagnosis_rubric(truth, final, [], [])["checks"]["qualified"]
+
+
+def test_a_no_defect_verdict_that_calls_the_model_wrong_fails():
+    """Naming the filter that explains the symptom is not enough when the same
+    message calls the model wrong."""
+
+    truth = _task("trial_events/legitimate_exclusion").truth["diagnosis"]
+    models = ["subscription_activity"]
+    contradicted = (
+        "subscription_activity is wrong: subscription 1013 is filtered out "
+        "because is_internal is true."
+    )
+    graded = diagnosis_rubric(truth, contradicted, [], models)
+    assert graded["checks"]["qualified"] is False
+    consistent = (
+        "Subscription 1013 is missing because is_internal is true, and "
+        "subscription_activity declares internal subscriptions excluded."
+    )
+    assert diagnosis_rubric(truth, consistent, [], models)["passed"]
+    # A fault word about something else is no contradiction (a live phrasing).
+    elsewhere = consistent + " If you expected it, the id you were given is wrong."
+    assert diagnosis_rubric(truth, elsewhere, [], models)["passed"]
+
+
+# --- intended repairs (#1157): a change meant to move rows, held to its statement --
+
+_INTENDED = ("backfill_days", "exclude_archived", "late_arrivals")
+
+
+@pytest.mark.parametrize(
+    ("calls", "passed"),
+    [
+        # Compared with no expectation: a change meant to move rows reads
+        # `different`, which says nothing about which rows moved.
+        ([("compare", "p1", "different", []), ("apply", "p1")], False),
+        ([("compare", "p1", "as_expected", ["expect"]), ("apply", "p1")], True),
+        ([("compare", "p1", "as_expected", ["expect-file"]), ("apply", "p1")], True),
+        # An unexpected change applied as it was.
+        ([("compare", "p1", "unexpected", ["expect"]), ("apply", "p1")], False),
+        # Fixed, planned again, compared again, then applied.
+        (
+            [
+                ("compare", "p1", "unexpected", ["expect"]),
+                ("compare", "p2", "as_expected", ["expect"]),
+                ("apply", "p2"),
+            ],
+            True,
+        ),
+        ([("compare", "p1", "not_checked", ["expect"]), ("apply", "p1")], False),
+        # Compared only after the apply: the baseline is gone.
+        ([("apply", "p1"), ("compare", "p1", "as_expected", ["expect"])], False),
+        # A verdict the agent's pipe hid.
+        ([("compare", "p1", None, ["expect"]), ("apply", "p1")], True),
+    ],
+)
+def test_an_intended_change_is_compared_against_its_statement(calls, passed):
+    """The step needs an ``--expect`` comparison of the applied plan that read ``as_expected``."""
+
+    from evals.metadata.score import procedure_steps
+
+    def call(verb, plan=None, verdict=None, flags=()):
+        return {
+            "label": f"transform {verb}",
+            "plan": plan,
+            "verdict": verdict,
+            "flags": list(flags),
+        }
+
+    graded = procedure_steps(
+        {"compare_expected_before_apply": True}, [call(*spec) for spec in calls]
+    )
+    assert graded["passed"] is passed
+
+
+def test_the_expected_change_verdicts_are_read_from_an_envelope():
+    """The two new verdicts are read from a comparison's envelope."""
+
+    from evals.metadata.live import _compare_verdict
+
+    for verdict in ("as_expected", "unexpected"):
+        text = json.dumps({"status": "ok", "data": {"status": verdict}})
+        assert _compare_verdict({"content": text}) == verdict
+
+
+def test_each_intended_repair_states_a_change_its_truth_can_check():
+    """Each task states its change, grades the step, and ships an over-broad variant."""
+
+    for name in _INTENDED:
+        task = _task(f"intended_repairs/{name}")
+        stated = task.truth["expected_change"]
+        assert stated["model"] in task.models
+        assert task.truth["procedure"]["compare_expected_before_apply"] is True
+        assert (task.directory / "overbroad").is_dir()
+
+
+@needs_dbt
+@pytest.mark.parametrize("name", _INTENDED)
+def test_compare_expect_passes_the_repair_and_flags_its_over_broad_variant(
+    name, tmp_path, monkeypatch, capsys
+):
+    """Each repair is ``as_expected`` against the change its truth states, and
+    its over-broad variant, which passes its own build, is ``unexpected``."""
+
+    from exmergo_dex_core.cli import main
+
+    task = _task(f"intended_repairs/{name}")
+    fixture = fixture_of(task, FIXTURES)
+    workspace = materialize(task, fixture, tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    stated = task.truth["expected_change"]
+    expect = workspace / "expected_change.json"
+    expect.write_text(json.dumps(stated["expect"]), encoding="utf-8")
+
+    def dex(*args, expected="ok"):
+        main(["--repo-root", str(workspace), *args])
+        envelope = json.loads(capsys.readouterr().out)
+        assert envelope["status"] == expected, envelope.get("errors")
+        return envelope
+
+    dex("transform", "build", "--target", "dev", "--confirm")
+    verdicts = {}
+    for variant in ("reference", "overbroad"):
+        root = task.directory / variant
+        edits = [
+            {
+                "path": str(path.relative_to(root)),
+                "kind": "model_sql" if path.suffix == ".sql" else "schema_yml",
+                "content": path.read_text(encoding="utf-8"),
+            }
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        ]
+        payload = workspace / f"{variant}.json"
+        payload.write_text(json.dumps({"edits": edits}), encoding="utf-8")
+        planned = dex("transform", "plan", name, "--edits-file", str(payload))
+        compared = dex(
+            "transform",
+            "compare",
+            planned["data"]["plan_id"],
+            "--model",
+            stated["model"],
+            "--key",
+            stated["key"],
+            "--expect-file",
+            str(expect),
+        )
+        verdicts[variant] = compared["data"]
+    assert verdicts["reference"]["status"] == "as_expected", verdicts["reference"]
+    assert verdicts["overbroad"]["status"] == "unexpected", verdicts["overbroad"]
+    assert verdicts["overbroad"]["expectation"]["findings"]
+
+
+# --- #1228: a population no declaration states, measured anyway --------------------
+
+_THREE_CASES = {
+    # Orphan child keys: the setup of the "fix" task, driven from the tickets.
+    "orphans": (
+        "parent_zero_children/build_account_summary",
+        "models/marts/account_ticket_summary.sql",
+        "select t.account_id, a.account_name, count(*) as ticket_count,\n"
+        "    max(t.opened_on) as last_ticket_opened_on\n"
+        "from {{ ref('stg_tickets') }} as t\n"
+        "left join {{ ref('stg_accounts') }} as a using (account_id)\n"
+        "group by 1, 2\n",
+    ),
+    # Parents kept with no children, where the request keeps only reviewed ones.
+    "zero_children": (
+        "reviewed_listings/build_listing_reviews",
+        "models/marts/listing_review_summary.sql",
+        "with reviews as (\n"
+        "    select listing_id, count(*) as review_count, avg(rating) as avg_rating\n"
+        "    from {{ ref('stg_reviews') }} group by listing_id\n"
+        ")\n"
+        "select l.listing_id, l.listing_name, r.review_count, r.avg_rating\n"
+        "from {{ ref('stg_listings') }} as l\n"
+        "left join reviews as r on r.listing_id = l.listing_id\n",
+    ),
+    # An extraction refactor whose intermediate drops the accounts with no users.
+    "extraction": (
+        "refactor_compare/extract_intermediate",
+        "models/intermediate/int_account_users.sql",
+        "select a.account_id, count(us.user_id) as user_count,\n"
+        "    count(d.user_id) as named_users\n"
+        "from {{ ref('stg_accounts') }} as a\n"
+        "inner join {{ ref('stg_users') }} as us on us.account_id = a.account_id\n"
+        "left join {{ ref('stg_display_names') }} as d on d.user_id = us.user_id\n"
+        "group by a.account_id\n",
+    ),
+}
+
+
+def _dex(capsys, *argv: str) -> dict:
+    from exmergo_dex_core.cli import main
+
+    main(list(argv))
+    return json.loads(capsys.readouterr().out)
+
+
+def _measure(workspace: Path, edits: list[tuple[str, str]], capsys) -> dict:
+    """Plan ``edits`` with no declaration, apply and build them with --verify."""
+
+    payload = workspace / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {"path": path, "kind": "model_sql", "content": sql}
+                    for path, sql in edits
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    planned = _dex(capsys, "transform", "plan", "eval", "--edits-file", str(payload))
+    assert planned["status"] == "ok", planned["errors"]
+    plan_id = planned["data"]["plan_id"]
+    assert _dex(capsys, "transform", "apply", plan_id)["status"] == "ok"
+    built = _dex(
+        capsys,
+        "transform",
+        "build",
+        "--target",
+        "dev",
+        "--verify",
+        "--for-plan",
+        plan_id,
+    )
+    assert built["status"] == "ok", built["errors"]
+    return built
+
+
+def _delta(built: dict, model: str) -> dict:
+    [record] = [
+        r
+        for r in built["data"]["verification"].get("population_delta") or []
+        if r["model"] == model
+    ]
+    return record
+
+
+@needs_dbt
+@pytest.mark.parametrize(
+    ("case", "model", "asks", "severity"),
+    [
+        (
+            "orphans",
+            "account_ticket_summary",
+            ["orphan_keys", "missing_parents"],
+            "high",
+        ),
+        ("zero_children", "listing_review_summary", ["empty_rows"], "low"),
+        ("extraction", "int_account_users", ["missing_parents"], "medium"),
+    ],
+)
+def test_dex_flags_each_population_no_declaration_states(
+    case, model, asks, severity, tmp_path, monkeypatch, capsys
+):
+    """The issue's three cases on the fixtures' own data, with nothing declared:
+    Dex drafts the parent and the --verify build asks which rows belong."""
+
+    key, path, sql = _THREE_CASES[case]
+    task = _task(key)
+    workspace = materialize(task, fixture_of(task, FIXTURES), tmp_path / "ws")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
+    built = _measure(workspace, [(path, sql)], capsys)
+    record = _delta(built, model)
+    assert record["status"] == "needs_decision", record
+    assert record["asks"] == asks
+    severities = {
+        f["identifier"]: f["severity"]
+        for f in built["data"]["verification"]["findings"]
+        if f["code"] == "population_delta"
+    }
+    assert severities[model] == severity
+    assert model in {
+        o["model"] for o in built["data"]["completion"]["obligations"]["needs_decision"]
+    }
+
+
+@needs_dbt
+def test_the_reviewed_listings_answer_is_settled_by_its_request(
+    tmp_path, monkeypatch, capsys
+):
+    """The reference drops the unreviewed listings on the request's word, which
+    its assumption records, so the counts that would ask are settled."""
+
+    task = _task("reviewed_listings/build_listing_reviews")
+    workspace = materialize(task, fixture_of(task, FIXTURES), tmp_path / "ws")
+    reference = task.directory / "reference" / "models" / "marts"
+    shutil.copy(
+        reference / "listing_review_summary.yml",
+        workspace / "models" / "marts" / "listing_review_summary.yml",
+    )
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("DEX_ALLOW_UNSERIALIZED_LEDGER", "1")
+    built = _measure(
+        workspace,
+        [
+            (
+                "models/marts/listing_review_summary.sql",
+                (reference / "listing_review_summary.sql").read_text(encoding="utf-8"),
+            )
+        ],
+        capsys,
+    )
+    record = _delta(built, "listing_review_summary")
+    assert record["status"] == "settled"
+    assert record["asks"] == ["missing_parents"]
+    assert record["measured"]["orphan_keys"] == 0
+    assert record["settled_by"]["evidence"] == "request"

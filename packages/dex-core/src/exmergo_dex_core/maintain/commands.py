@@ -28,13 +28,15 @@ instead and degrades to proposal-only when a format declines it.
 from __future__ import annotations
 
 import argparse
+import contextlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
-from .. import command_args
+from .. import command_args, model_scope
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
@@ -626,6 +628,11 @@ def snapshot(engine: DexEngine, *, project_only: bool = False) -> SnapshotResult
             LayerFingerprint(
                 semantic_model_count=len(semantic_layer.semantic_models),
                 metric_count=len(semantic_layer.metrics),
+                declared_model_count=(
+                    len(semantic_layer.declarations)
+                    if semantic_layer.declarations is not None
+                    else None
+                ),
             )
             if semantic_layer is not None
             else None
@@ -910,6 +917,20 @@ def _combined_scan_handshake(adapter, join_cost, facts_cost=None):
     return asker("row_population"), asker("join_contract"), asker("declared_facts")
 
 
+def _dev_relations(model_relations: Mapping[str, str], project_dir: Any) -> list[str]:
+    """Every relation the project builds for the dev target: its models, and
+    the manifest's seeds and snapshots, which a declared parent may name too
+    (#1155)."""
+
+    relations = list(model_relations.values())
+    if project_dir is not None:
+        from ..transform.verify import _manifest_relations
+
+        with contextlib.suppress(OSError, ValueError):
+            relations.extend(_manifest_relations(Path(project_dir)))
+    return relations
+
+
 def verify(
     engine: DexEngine,
     objects: list[str] | None = None,
@@ -1061,15 +1082,11 @@ def verify(
         if build_notes:
             suppressed["build_status"] = build_notes[0]
 
+    # A scope may be spelled as separate arguments, comma-separated, or as one
+    # quoted argument with the names separated by spaces: `a b`, `"a b"` and
+    # `a,b` all name the same models (#1243).
     wanted = (
-        {
-            name.strip().lower()
-            for raw in objects
-            for name in raw.split(",")
-            if name.strip()
-        }
-        if objects
-        else None
+        {name.lower() for name in model_scope.model_names(objects)} if objects else None
     )
     cost = None
     adapter = None
@@ -1077,6 +1094,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    grain_coverage: list[dict] | None = None
     if not definitions.present:
         reason = "the project format returned no readable project declarations"
         suppressed["no_relation"] = reason
@@ -1106,6 +1124,20 @@ def verify(
         try:
             if reads_dev_target:
                 adapter = engine._adapter("maintain verify", reads_dev_target=True)
+                # The namespaces dbt derives from the dev namespace (a package's
+                # `+schema`) hold this target's own output too (#1155).
+                from .. import connect as _connect
+
+                derived = _connect.widen_dev_reads(
+                    adapter,
+                    engine.config,
+                    _dev_relations(model_relations, project_dir),
+                )
+                if derived:
+                    notes.append(
+                        "also read the namespace(s) dbt derived from the dev "
+                        f"namespace for this project's models: {', '.join(derived)}"
+                    )
             else:
                 adapter = engine._adapter("maintain verify")
         except DexError as exc:
@@ -1190,6 +1222,12 @@ def verify(
                 else ([], [])
             )
             proven_grains: dict[str, dict] = {}
+            grain_coverage = []
+            spine_or_generated = (
+                verify_mod.spine_or_generated_models(project_dir, adapter.dialect)
+                if project_dir is not None
+                else set()
+            )
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1198,6 +1236,8 @@ def verify(
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
+                records=grain_coverage,
+                spine_or_generated=spine_or_generated,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1277,6 +1317,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
                 findings = verify_mod.damp_fanout(
@@ -1296,6 +1337,10 @@ def verify(
 
     if wanted and join_coverage is not None:
         join_coverage = [r for r in join_coverage if r["model"].lower() in wanted]
+    if grain_coverage is not None:
+        grain_coverage = _complete_grain_coverage(
+            definitions, grain_coverage, scope=wanted
+        )
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
@@ -1307,6 +1352,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        grain_coverage=grain_coverage,
     )
     if cost is not None:
         result.cost = cost
@@ -1334,9 +1380,8 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
     running and then being discarded by that later filter.
     """
 
-    declared_by_model, undeclared, plan_notes = verify_mod.column_contract_plan(
-        project_dir, scope=scope
-    )
+    plan = verify_mod.column_contract_plan(project_dir, scope=scope)
+    declared_by_model, undeclared, plan_notes = plan
     if not declared_by_model and not undeclared:
         reason = (
             plan_notes[0]
@@ -1351,6 +1396,7 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
         model_relations,
         [o.identifier for o in live],
         undeclared,
+        package_entries=getattr(plan, "package_entries", None),
     )
     return findings, plan_notes + finding_notes, None
 
@@ -1364,6 +1410,8 @@ def _grain_contract(
     scope=None,
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1402,8 +1450,45 @@ def _grain_contract(
         [o.identifier for o in live],
         scoped_models,
         proven=proven,
+        records=records,
+        spine_or_generated=spine_or_generated,
     )
     return findings, notes, None
+
+
+def _complete_grain_coverage(
+    definitions, records: list[dict], *, scope: set[str] | None = None
+) -> list[dict]:
+    """``grain_coverage`` as the result carries it (#1223): the records the
+    grain axis and the declared-fact statement wrote, a ``not_planned`` record
+    for each declared key the priority rule left out, and an ``unchecked``
+    record (``not_measured``) for any planned key neither path reached, so no
+    declared key is ever absent. Sorted by model, then source rank."""
+
+    declared = verify_mod.declared_grain_candidates(definitions, scope=scope)
+    planned = verify_mod.grain_plan(definitions, scope=scope)
+    seen = {
+        (r["model"], r["source"], tuple(c.lower() for c in r["columns"]))
+        for r in records
+    }
+    complete = list(records)
+    for model, candidates in planned.items():
+        for candidate in candidates:
+            marker = (
+                model,
+                candidate.source,
+                tuple(c.lower() for c in candidate.columns),
+            )
+            if marker not in seen:
+                complete.append(
+                    verify_mod.grain_record(
+                        model, candidate, "unchecked", "not_measured"
+                    )
+                )
+    complete.extend(verify_mod.not_planned_grain_records(declared, planned))
+    if scope:
+        complete = [r for r in complete if r["model"].lower() in scope]
+    return verify_mod.sort_grain_records(complete)
 
 
 def _join_contract(
@@ -1930,10 +2015,10 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # A repository whose only layer is a semantic one (#912) still has
             # that layer's own findings to reconcile, through its own route;
             # only the project's half has nowhere to land.
-            if not any(
-                semantic_source is not None and semantic_source.handles_finding(f)
-                for f in findings
-            ):
+            # A semantic vendor with no project beside it is that repository's
+            # one layer: its findings on the other axes (a contradicted key on
+            # grain, say) are advisory there too, never a refusal (#1259).
+            if semantic_source is None:
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(
                 f"no transformation project to edit ({exc}), so every proposal "
@@ -2057,7 +2142,13 @@ def _reconcile_semantic(
                     proposal.paths = []
         else:
             result.diffs = [*result.diffs, *planned.diffs]
-            result.warnings.extend([*planned.warnings, *planned.notes])
+            # The plan re-reads the layer, so its notes repeat what the report
+            # already carried; each is said once.
+            result.warnings.extend(
+                w
+                for w in dict.fromkeys([*planned.warnings, *planned.notes])
+                if w not in result.warnings
+            )
             result.semantic_plan_id = planned.plan_id
     result.proposals = _mechanical_first([*result.proposals, *proposals])
 
@@ -2397,41 +2488,98 @@ def _declaration_drift(
     to tell the two apart without parsing a warning. The warning is left out
     where there is no transformation project on either side, since there is
     nothing there that could have been declared.
+
+    A native semantic layer's declarations (#995) are judged beside the
+    project's. With no transformation project on either side, the status is the
+    layer's own, with its ``vendor``. With both, the status is the project's,
+    the layer's rides under ``semantic_layer``, and ``checked`` is true only when
+    both were compared, so neither half reads clean on the other's account.
     """
+
+    findings = _semantic_scope(
+        drift_mod.declaration_drift(current_transform, snap, current_semantic),
+        scope_names,
+    )
+    status, warnings = _transform_declaration_status(current_transform, snap)
+    native = _native_declaration_status(current_semantic, snap)
+    if native is None:
+        return findings, status, warnings
+    if snap.transform_layer is None and current_transform is None:
+        status, warnings = native, []
+    else:
+        status["semantic_layer"] = native
+        if not native["checked"] and status["checked"]:
+            status["checked"] = False
+            status["reason"] = native["reason"]
+    if not native["checked"]:
+        warnings.append(
+            "declaration drift was not checked for the semantic layer: "
+            f"{native['reason']}"
+            if "semantic_layer" in status
+            else f"declaration drift was not checked: {native['reason']}"
+        )
+    return findings, status, warnings
+
+
+def _transform_declaration_status(
+    current_transform: TransformLayer | None, snap: snapshot_mod.Snapshot
+) -> tuple[dict[str, object], list[str]]:
+    """Whether the transformation project's declarations were compared."""
 
     checked, reason = drift_mod.declaration_drift_status(current_transform, snap)
     baseline = snap.transform_layer
     status: dict[str, object] = {"checked": checked}
     if checked:
         if baseline is None or current_transform is None:
-            return [], status, []
+            return status, []
         status["baseline_declared_models"] = len(baseline.declarations or {})
         status["declared_models"] = len(current_transform.declarations or {})
-        findings = _semantic_scope(
-            drift_mod.declaration_drift(current_transform, snap, current_semantic),
-            scope_names,
-        )
         rekeyed = drift_mod.rekeyed_versioned_declarations(current_transform, snap)
         if not rekeyed:
-            return findings, status, []
+            return status, []
         status["unchecked_models"] = rekeyed
         status["unchecked_reason"] = "baseline_predates_versions"
-        return (
-            findings,
-            status,
-            [
-                "declaration drift was not checked for "
-                + ", ".join(rekeyed)
-                + ": the baseline keyed each versioned model's declaration by its "
-                "bare name, and declarations are now read per version "
-                "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
-                "baseline them per version"
-            ],
-        )
+        return status, [
+            "declaration drift was not checked for "
+            + ", ".join(rekeyed)
+            + ": the baseline keyed each versioned model's declaration by its "
+            "bare name, and declarations are now read per version "
+            "(`<model>.v<N>`); re-run `maintain snapshot --project-only` to "
+            "baseline them per version"
+        ]
     status["reason"] = reason
     if baseline is None and current_transform is None:
-        return [], status, []
-    return [], status, [f"declaration drift was not checked: {reason}"]
+        return status, []
+    return status, [f"declaration drift was not checked: {reason}"]
+
+
+def _native_declaration_status(
+    current_semantic: SemanticLayer | None, snap: snapshot_mod.Snapshot
+) -> dict[str, object] | None:
+    """Whether a native semantic layer's declarations were compared, or
+    ``None`` where no native layer holds any on either side."""
+
+    native = drift_mod.native_declaration_drift_status(current_semantic, snap)
+    if native is None:
+        return None
+    checked, reason = native
+    baseline = snap.semantic_layer
+    vendor = (current_semantic.vendor if current_semantic is not None else None) or (
+        baseline.vendor if baseline is not None else None
+    )
+    status: dict[str, object] = {"checked": checked}
+    if vendor:
+        status["vendor"] = vendor
+    if not checked:
+        status["reason"] = reason
+        return status
+    status["baseline_declared_models"] = len(
+        (baseline.declarations if baseline is not None else None) or {}
+    )
+    status["declared_models"] = len(
+        (current_semantic.declarations if current_semantic is not None else None) or {}
+    )
+    return status
 
 
 def _semantic_names(scope_names: list[str]) -> set[str]:

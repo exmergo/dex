@@ -126,7 +126,7 @@ fixture projects built so each declaration has a known right answer.
 
 ### The fixtures
 
-Nineteen fixture projects, written for this suite and derived from no benchmark task,
+Written for this suite and derived from no benchmark task,
 with tasks phrased the way users ask:
 
 | Fixture | Task | What it holds the agent to |
@@ -145,7 +145,7 @@ with tasks phrased the way users ask:
 | `refactor_compare` | `extract_intermediate`: a pure refactor of `account_user_summary` into an intermediate | the counts unchanged (an inner join to display names drops the unnamed users while every account survives), and `transform compare` run before `transform apply` (#1049). The mart counts users through a project macro, so static row attribution cannot settle it |
 | `refactor_compare` | `blocked_baseline`: the same refactor, with `stg_users` failing on a text code | the prerequisite repaired without dropping a user, the counts unchanged (three display names belong to users who are gone, and are never counted), the comparison run before apply and after a build of the repair, and the intermediate and refactored mart deployed in the agent's own dev warehouse |
 | `refactor_prerequisite` | `package_blocked_refactor`: the same kind of refactor of `team_member_summary`, where an upgraded package (`tiny_roster`) fails on an all-NULL integer column, the raw tables cannot change, and "do not install or upgrade any tools" | nothing downstream of the package builds, so the refactor has no baseline until the project repairs the prerequisite (#1114). Graded: a durable project repair (an edit under `dbt_packages/` fails the gate), every team kept with zero counts where it has no members, no member dropped, handles of members the roster does not have never counted, the comparison usable and run after the repair's own apply and build (`rebuilt_before_compare`), `--cold-deps` after the repair, and both models deployed in the agent's own dev warehouse. A ban on tool updates does not forbid installing the packages the project already declares |
-| `refactor_compare` | `intentional_change`: exclude test users from both counts | the new counts; no comparison is required, since the change is meant to alter results |
+| `refactor_compare` | `intentional_change`: exclude test users from both counts | the new counts, and `transform compare --expect` before `transform apply` (`as_expected`): a change meant to alter results is compared against what it states (#1157) |
 | `blocked_report` | `finish_team_activity`: add a column to a report behind forty staging models | a membership intermediate fails on a date stored as text, so a build skips the report while every staging model succeeds (#855): the intermediate repaired without dropping a member, the report rebuilt with the new column |
 | `protected_report` | `preserve_comments`: build a report whose explicit output contract includes protected text | the comments column and its type, values, NULLs and empty strings preserved without retrieving examples; a read refusal does not authorize redaction (#1084) |
 | `protected_report` | `redact_comments`: the user expressly requests typed NULL comments | the same schema and every report preserved, with comments redacted because the request requires it |
@@ -154,6 +154,8 @@ with tasks phrased the way users ask:
 | `seeded_prerequisite` | `repair_seed_data`: the same request, where `task_data` is a seed the project owns | the data repaired through `+column_types` and a build: the seed relation's `due_at` is a timestamp both on the gate's build and in the agent's dev warehouse. A project override alone builds the report and fails (#1083) |
 | `seeded_prerequisite` | `preserve_seed_data`: leave the seed and its types alone and adapt the project | the seed's `due_at` still an integer in both places, the report built through a project repair, and `--cold-deps` after the last apply |
 | `incremental_watermark` | `missed_scans`: scans the feed delivers late with the latest loaded timestamp never reach an incremental fact table | the next incremental run, which the gate's cold build never executes: replays insert new rows into the gate's own scratch copy of the source (never the agent's) and run the model without `--full-refresh`. Scans on the watermark must arrive, none may load twice, and an empty target must still load. A full build passes on the setup's strict `>`; a naive `>=` with no `unique_key` duplicates. The incremental unit test and a non-refresh build after the apply are graded apart from the rows (#1111) |
+| `package_parent` | `build_threads`: a conversation-level mart over an installed package's staging models (`tiny_inbox`, built into its own `+schema`) | the package's parts table keeps parts of deleted conversations and some conversations have none, so a mart driven from the parts holds two conversations that do not exist and misses three that do. Graded: every current conversation present with zero counts where it has no parts, no deleted one, and the declared `population.parent` naming the package's conversations model, which `transform plan` accepts and `build --verify` measures (#1155) |
+| `reviewed_listings` | `build_listing_reviews`: one row per listing that has at least one review | eight listings were never reviewed and five reviews name listings since taken down. Driven from the listings with the reviews left-joined, the mart keeps the unreviewed listings with NULL ratings (the ADE-bench airbnb007 failure); driven from the reviews, it keeps the removed ones. Graded: the reviewed listings only, the request recorded as the assumption's tier. `build --verify` measures it against the parent Dex drafts with nothing declared, and `evals/tests` holds Dex to asking on this case, on orphan tickets (`parent_zero_children`) and on an extraction that drops accounts (`refactor_compare`) (#1228) |
 | `subscription_activity` | `build_last_activity`: a report the project declares as one row per subscription (`population.parent`) | on the agent's data every subscription has one activity, so a report driven from the activity table passes every runtime check; only `transform plan`'s `population_parent` contradiction catches it (#1029). The gate grades on a holdout with a subscription that has no activity and one with two |
 | `trailing_window` | `author`: add unit tests that pin a trailing seven-day count written as `RANGE BETWEEN INTERVAL '6 day' PRECEDING` | the tests catch three planted defects (the window a day wider, a day narrower, and counted in rows), which needs fixture rows on the last included day, the first excluded day and across a gap in the dates; and `transform test --mutate` after the last apply (#1112) |
 | `trailing_window` | `strengthen`: the same model, starting from a unit test on consecutive days | the same. The starting test catches none of the three, which is the negative control |
@@ -162,6 +164,9 @@ with tasks phrased the way users ask:
 | `sandbox_scope` | `broad`: remove sandbox tenants from every mart, the directory included | all three marts exclude them, each with an assumption at `request`; a directory left whole fails Scope |
 | `sandbox_scope` | `ambiguous`: "our account metrics should not count sandbox tenants" | the usage and summary metrics exclude them; whether the directory does is the agent's call. Either passes Scope when the declared population matches the rows, and an exclusion must be recorded as a `default` (or `precedent`), not as the request. An undocumented directory filter passes every data check and fails Scope |
 | `visit_coverage` | `fill_missing_days`: a daily table skips days with no visits; give every day a row | the missing days added while keeping what the model meant: an empty day counts zero visits (not the one `count(*)` over a left join gives, not NULL), its average stays NULL (not a coalesced zero), days with visits are unchanged, and the columns and types match the visible `data_type` contract (#1115) |
+| `trial_events` | five reports about one subscription each (#1048): `trial_subtotal` (fix), and `legitimate_exclusion`, `missing_entity`, `optional_attribute` and `insufficient_evidence` (diagnose) | finding the entity is a branch, not the verdict. In the fix task every subscription and event survives, but the staging mapping drops the `trl` code the tier-code seed maps to `trial`, so the trial subtotal is wrong: the repair restores the mapping (or maps it downstream), keeps totals, paid counts and rows, and leaves the unplaced `pro-trial` code out of trials. The diagnose tasks are a declared exclusion, a subscription absent from the feed, an active subscription's NULL cancellation date, and a code nothing in the project places, where the answer is unresolved and the project is left as it is |
+| `adjusted_price` | four questions about one average (#1116): `unused_adjustment` and `alias_swap` (fix), `correct_implementation` and `uncertain_contract` (diagnose) | the expression the mart returns under `avg_adjusted_price`, not the intermediate that computes the discounted price. The fixes route the delivered column to the intermediate's value (or undo swapped aliases); the diagnose tasks are a correct model, which must be confirmed from its delivered expression, and a refund policy nothing in the project settles, which is reported unresolved |
+| `intended_repairs` | `backfill_days`, `exclude_archived`, `late_arrivals`: three repairs meant to change rows (#1157) | the stated change and nothing else: a zero-ticket row for every quiet day, the memberships of archived workspaces gone while those of unlisted workspaces stay, and every late shipment added with every other shipment unchanged. Each task's `truth.expected_change` is the statement a `transform compare --expect` holds the plan to, and graded `compare_expected_before_apply` needs an `as_expected` verdict of the applied plan. Each also has an `overbroad/` overlay, the kind of repair ADE-bench agents shipped uncompared (every day crossed with every channel, an inner join that drops unlisted workspaces, every shipment re-dated by its load), which the eval tests hold to `unexpected` |
 
 Each fixture is `fixture.json`, `warehouse.py` (seeded, pinned by a digest in
 `tests/test_metadata.py`), the starting dbt `project/`, and per task a
@@ -224,6 +229,21 @@ serve the prerequisite tasks:
   performed, and contain no sentence claiming the source or the data now changed
   without a negation. A deterministic, bounded heuristic over sentences, not a
   judge of prose: a paraphrase it does not recognise reads as a miss.
+- **Diagnosis** (pass or fail, live runs only, on tasks that grade one): whether
+  the final message localizes and qualifies its diagnosis (#1048, #1116), graded
+  apart from the build and the row checks, since a green build and an untouched
+  project are both consistent with a diagnosis that never looked at the value
+  asked about. It reports four checks on their own: `localized` (the delivered
+  column is named), `evidenced` (each group of derivation terms has one, such
+  as the source code a mapping drops or the intermediate a column should read),
+  `qualified` (a `defect` is named as one, a `no_defect` names what explains
+  the symptom, and an `unresolved` question says what stayed open with no
+  unqualified clean verdict) and, for `no_defect` and `unresolved`, `unchanged`
+  (no listed model was edited). Terms match whole identifiers, so
+  `adjusted_price` is not found inside `avg_adjusted_price`. A task of kind
+  `diagnose` asks about a model that may be right: it is scored even when
+  nothing changed, and its completeness and correctness are `-` rather than a
+  vacuous pass. Sentence heuristics, like Report, not a judge of prose.
 - **Attribution** (0 to 1, only on tasks that grade it, `-` otherwise): whether
   every assumption about the decision the task turns on carries the tier that
   actually settled it (#1026). It is graded apart from correctness and checks, so
@@ -250,6 +270,11 @@ serve the prerequisite tasks:
   both calls name a plan the ids must match, and where either does not, no other
   apply may sit between them. `not_checked` and a comparison that never ran are
   not usable; a verdict the agent's own pipe hid gets the benefit of the doubt.
+  `compare_expected_before_apply` is the same for a change meant to alter
+  results (#1157): the comparison must carry `--expect` (or `--expect-file`)
+  and its verdict must be `as_expected` (or hidden by the agent's pipe); an
+  `unexpected` comparison applied as it was is a miss, and one fixed and
+  compared again before the apply passes.
   `rebuilt_before_compare` passes when that usable comparison also follows an
   earlier apply (the prerequisite repair, its own plan) and a build after the
   latest such apply that did not fail (#1114): a repair bundled into the refactor's own plan leaves

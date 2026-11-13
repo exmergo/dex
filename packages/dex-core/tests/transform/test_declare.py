@@ -104,6 +104,13 @@ def test_the_selector_reads_names_the_way_maintain_verify_does():
     assert selection.models == ["stg_orders", "fct_orders"]
 
 
+def test_a_quoted_list_selects_every_model_it_names():
+    """One quoted argument, names separated by spaces, names the same models."""
+    selection = declare_mod.select_models(_view(_shop()), ["stg_orders fct_orders"])
+    assert selection.models == ["stg_orders", "fct_orders"]
+    assert selection.skipped == []
+
+
 def test_a_name_that_matches_no_model_is_named_rather_than_dropped():
     selection = declare_mod.select_models(_view(_shop()), ["fct_ordrs"])
     assert selection.models == []
@@ -771,3 +778,21 @@ def test_a_build_in_its_own_schema_gets_references_to_the_built_parent(
     assert customer["role"]["value"] == "foreign_key"
     assert customer["references"]["value"] == "stg_customers.customer_id"
     assert "dbt_dev.stg_customers" in customer["references"]["evidence"]
+
+
+def test_declare_proposes_grain_from_tested_input_without_profile(shop: Path, capsys):
+    """#1252: transform declare carries grain from an input's unique test."""
+
+    (shop / "analytics" / "models" / "marts" / "customer_summary.sql").write_text(
+        "select customer_id, region from {{ ref('stg_customers') }}\n",
+        encoding="utf-8",
+    )
+    envelope = _dex(shop, ["transform", "declare", "customer_summary"], capsys)
+    assert envelope["status"] == "ok", envelope
+    (proposed,) = envelope["data"]["proposed"]
+    assert proposed["fields"]["grain"]["value"] == ["customer_id"]
+    evidence = proposed["fields"]["grain"]["evidence"]
+    assert (
+        "customer_id has a unique test on stg_customers, carried through unchanged"
+        in evidence
+    )

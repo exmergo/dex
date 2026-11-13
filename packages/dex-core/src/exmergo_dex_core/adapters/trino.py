@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import sqlglot
@@ -66,6 +66,7 @@ from .base import (
     ValueDomainSample,
     affordable_combinations,
     blame,
+    dev_target_entries,
     distinct_combination_sql,
     is_blob_type,
     is_integer_type,
@@ -356,7 +357,7 @@ class TrinoAdapter:
         import trino.exceptions as trino_errors
 
         self._errors = trino_errors
-        self._dev_target: str | None = None
+        self._dev_target: tuple[str, ...] | None = None
         self.forget_metadata()
         self._notes: dict[str, list[str]] = {}
         # The session properties this adapter last set, or None when they are
@@ -638,7 +639,7 @@ class TrinoAdapter:
         self._resolved_scopes: list[tuple[str, str | None]] | None = None
         self._schemas_by_catalog: dict[str, set[str]] = {}
 
-    def read_dev_target(self, scope: str | None) -> None:
+    def read_dev_target(self, scope: str | Sequence[str] | None) -> None:
         """Also read ``dev_catalog.dev_schema``, the schema this command's build
         writes into, or stop reading it with ``None``.
 
@@ -647,7 +648,7 @@ class TrinoAdapter:
         may not exist yet (see :func:`~exmergo_dex_core.adapters.base.with_dev_target`).
         """
 
-        scope = scope.strip().lower() if scope else None
+        scope = dev_target_entries(scope, str.lower)
         if scope != self._dev_target:
             self._dev_target = scope
             self.forget_metadata()

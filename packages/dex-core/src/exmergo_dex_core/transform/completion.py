@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from itertools import zip_longest
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -52,6 +53,8 @@ from .evidence import (
 __all__ = [
     "COMPLETION_BUDGET_BYTES",
     "BuildCompletion",
+    "FailedCheck",
+    "FailedChecks",
     "NameList",
     "node_answers",
     "summarize_completion",
@@ -87,6 +90,7 @@ _RECORD_KINDS = (
     "join_coverage",
     "parent_population",
     "temporal_contracts",
+    "population_delta",
     "retirement",
     "toggle",
     "model_versions",
@@ -115,6 +119,29 @@ class NameList(BaseModel):
     count: int = 0
     names: list[str] = Field(default_factory=list)
     elided: int = 0
+
+
+class FailedCheck(BaseModel):
+    """One check that failed on a built model, and which kind it was (#1162).
+
+    ``kind`` is ``data_test`` for a dbt data test, named in ``name``, or the
+    verification record list that judged it ``contradicted``
+    (``join_coverage``, ``parent_population``, ...), with the ``finding`` it
+    raised and, for a join, the ``join`` as the model writes it. A join
+    measured against a default threshold is then not read as a failed test.
+    """
+
+    model: str
+    kind: str
+    name: str | None = None
+    finding: str | None = None
+    join: str | None = None
+
+
+class FailedChecks(NameList):
+    """The models a check failed on, and each failed check, kind first."""
+
+    checks: list[FailedCheck] = Field(default_factory=list)
 
 
 class ChangeRef(BaseModel):
@@ -168,8 +195,9 @@ class Assurance(BaseModel):
 
     basis: Literal["required", "built_models"] = "built_models"
     asserted: NameList = Field(default_factory=NameList)
-    #: Built, and a data test or a verification record on it failed.
-    failed_checks: NameList = Field(default_factory=NameList)
+    #: Built, and a data test or a verification record on it failed; each
+    #: failure is under ``checks`` with its kind (#1162).
+    failed_checks: FailedChecks = Field(default_factory=FailedChecks)
     build_only: NameList = Field(default_factory=NameList)
 
 
@@ -183,6 +211,11 @@ class Blocker(BaseModel):
     plan_relation: str | None = None
     previous_status: str | None = None
     message: str | None = None
+    #: The one command that repairs it, kept ahead of the cut a truncating
+    #: reader makes (#1229): `repair: dex transform repair <node>` for a
+    #: package model the project can override, `repair: transform plan on
+    #: <path>` for the project's own.
+    next: str | None = None
 
 
 class FindingRef(BaseModel):
@@ -232,6 +265,10 @@ class Obligations(BaseModel):
     by_status: dict[str, int] = Field(default_factory=dict)
     contradicted: list[Obligation] = Field(default_factory=list)
     unchecked: list[Obligation] = Field(default_factory=list)
+    #: Populations measured against a drafted parent whose counts ask which
+    #: rows the model is for, with no assumption recording the answer (#1228):
+    #: orphan keys, missing parents, or parents kept with no children.
+    needs_decision: list[Obligation] | None = None
     no_declared_columns: NameList = Field(default_factory=NameList)
     #: Required models whose declared population is a sentence: nothing can run
     #: it, as distinct from a parent or filter a record above measured (#1029).
@@ -245,6 +282,27 @@ class Obligations(BaseModel):
     #: cast, aggregate or NULL treatment), or an edit dex could not read
     #: (`unchecked`), as the plan recorded them (#1115).
     change_scope: list[Obligation] | None = None
+    #: Each required incremental model the plan edited, and whether a unit
+    #: test overriding ``is_incremental`` to true passed in this build
+    #: (``satisfied``), failed (``contradicted``), or never ran (``unchecked``:
+    #: ``full_refresh_only`` where the build only full-refreshed the model,
+    #: ``no_incremental_test`` otherwise). A full refresh runs only the full
+    #: program, so it never answers the next incremental run (#1130).
+    incremental_replay: list[Obligation] | None = None
+    #: Each required model the plan rewrote, held to its recorded
+    #: ``transform compare`` verdict: ``equivalent`` or ``as_expected`` is
+    #: ``satisfied``, ``different`` or ``unexpected`` is ``contradicted``, and
+    #: no verdict (``not_compared``) or ``not_checked`` is ``unchecked``. Only a
+    #: stored plan records verdicts, so a ``--for-plan-file`` build carries no
+    #: such key (#1157).
+    comparison: list[Obligation] | None = None
+    #: A package override `transform repair` drafted, held to what a repair has
+    #: to show (#1229): `repair_built`, `repair_tests` (the package's own tests,
+    #: run on the override), `repair_cold_deps` (only a `--cold-deps` build that
+    #: lost no installed edit satisfies it), `repair_row_count` (no row
+    #: finding on the override, whose draft moves no rows), and
+    #: `repair_conversion` while a conversion stayed unresolved.
+    repair: list[Obligation] | None = None
 
 
 class ColdSummary(BaseModel):
@@ -534,6 +592,7 @@ def _blockers(
                 diagnosed.get(n.unique_id, {}).get("previous_run", {}).get("status")
             ),
             message=(n.message[:_MESSAGE] if n.message else None),
+            next=diagnosed.get(n.unique_id, {}).get("next"),
         )
         for n in failed
     ]
@@ -543,9 +602,10 @@ def _checked(
     evidence: BuildEvidence,
     graph: Mapping[str, list[str]],
     verification: Mapping[str, Any] | None,
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], set[str], dict[str, list[FailedCheck]]]:
     """Models whose built rows something in this run checked: those every
-    check passed on, and those a check failed on.
+    check passed on, those a check failed on, and each model's failed checks
+    with their kind.
 
     Data tests and verification records read the built relation. A unit test
     reads fixtures, so it vouches for the SQL and not for the rows, and is not
@@ -555,29 +615,49 @@ def _checked(
     label_of = {n.unique_id: n.name for n in evidence.nodes}
     passed: set[str] = set()
     failed: set[str] = set()
+    failures: dict[str, list[FailedCheck]] = {}
     for node in evidence.nodes:
         if not node.unique_id.startswith("test."):
             continue
         status = node.status.lower()
-        if status in _PASSING_TEST:
-            target = passed
-        elif status in FAILED_STATUSES or status == "warn":
-            target = failed
-        else:
+        failing = status in FAILED_STATUSES or status == "warn"
+        if not failing and status not in _PASSING_TEST:
             continue
         for parent in graph.get(node.unique_id, []):
-            if parent.startswith("model."):
-                target.add(label_of.get(parent) or parent.split(".")[2])
+            if not parent.startswith("model."):
+                continue
+            model = label_of.get(parent) or parent.split(".")[2]
+            if not failing:
+                passed.add(model)
+                continue
+            failed.add(model)
+            failures.setdefault(model, []).append(
+                FailedCheck(model=model, kind="data_test", name=node.name)
+            )
     if verification and verification.get("ran"):
         for kind in _RECORD_KINDS:
             for record in verification.get(kind) or []:
                 if not record.get("model"):
                     continue
+                model = str(record["model"])
                 if record.get("status") == "satisfied":
-                    passed.add(str(record["model"]))
+                    passed.add(model)
                 elif record.get("status") == "contradicted":
-                    failed.add(str(record["model"]))
-    return passed - failed, failed
+                    failed.add(model)
+                    join = record.get("join")
+                    failures.setdefault(model, []).append(
+                        FailedCheck(
+                            model=model,
+                            kind=kind,
+                            finding=record.get("finding"),
+                            join=_bounded(join) if isinstance(join, str) else None,
+                        )
+                    )
+    return passed - failed, failed, failures
+
+
+def _bounded(text: str, limit: int = _MESSAGE) -> str:
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _verification(
@@ -615,6 +695,7 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
     by_status: Counter[str] = Counter()
     contradicted: list[Obligation] = []
     unchecked: list[Obligation] = []
+    needs_decision: list[Obligation] = []
     for kind in _RECORD_KINDS:
         for record in verification.get(kind) or []:
             status = str(record.get("status") or "unknown")
@@ -628,6 +709,8 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
             )
             if status == "contradicted":
                 contradicted.append(entry)
+            elif status == "needs_decision":
+                needs_decision.append(entry)
             elif status == "unchecked":
                 unchecked.append(entry)
     contract = verification.get("column_contract") or {}
@@ -646,6 +729,7 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
         by_status=dict(sorted(by_status.items())),
         contradicted=contradicted,
         unchecked=unchecked,
+        needs_decision=needs_decision or None,
         no_declared_columns=_names(contract.get("no_declared_columns") or []),
     )
 
@@ -665,6 +749,8 @@ def summarize_completion(
     prose_population: Iterable[str] = (),
     identifier_conversions: Mapping[str, list[Mapping[str, Any]]] | None = None,
     change_scope: Mapping[str, list[Mapping[str, Any]]] | None = None,
+    incremental_replay: Mapping[str, Mapping[str, Any]] | None = None,
+    repair: Mapping[str, Any] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -679,13 +765,17 @@ def summarize_completion(
     (messages, then lists, then names), and every cut is counted under
     ``elided``. ``prerequisites`` is :func:`~.prerequisites.diagnose`'s answer and
     ``cold`` is what ``--cold-deps`` reported, both summarized here with the rest
-    under their own keys in ``data``.
+    under their own keys in ``data``. ``incremental_replay`` maps each
+    incremental model the plan edited to ``tests`` (the unique ids of its unit
+    tests that override ``is_incremental`` to true) and ``full_refreshed``
+    (whether this build full-refreshed it) (#1130).
     """
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
     blockers = _blockers(evidence, causes, prerequisites or ())
-    asserted, failed_checks = _checked(evidence, graph, verification)
+    asserted, failed_checks, failures = _checked(evidence, graph, verification)
+    failed_names = list(dict.fromkeys(n for n in built_names if n in failed_checks))
     statuses = Counter(n.status.lower() for n in evidence.nodes)
     completion = BuildCompletion(
         outcome=evidence.outcome.value,
@@ -701,7 +791,10 @@ def summarize_completion(
         assurance=Assurance(
             basis="required" if deliverables.coverage == "known" else "built_models",
             asserted=_names(n for n in built_names if n in asserted),
-            failed_checks=_names(n for n in built_names if n in failed_checks),
+            failed_checks=FailedChecks(
+                **_names(failed_names).model_dump(),
+                checks=_one_per_model_first(failed_names, failures),
+            ),
             build_only=_names(
                 n for n in built_names if n not in asserted and n not in failed_checks
             ),
@@ -719,6 +812,15 @@ def summarize_completion(
     )
     completion.obligations.change_scope = (
         _scope_obligations(change_scope, evidence) or None
+    )
+    completion.obligations.incremental_replay = (
+        _replay_obligations(incremental_replay, evidence) or None
+    )
+    completion.obligations.comparison = (
+        _comparison_obligations(comparisons, evidence) or None
+    )
+    completion.obligations.repair = (
+        _repair_obligations(repair, evidence, graph, verification, cold) or None
     )
     if prerequisites:
         completion.details = ["data.prerequisites", *completion.details]
@@ -792,6 +894,290 @@ def _scope_obligations(
     return out
 
 
+#: A unit test's status in run results that means it ran and passed.
+_PASSED = frozenset({"pass", "success"})
+#: Statuses that mean it ran and did not pass: the build evidence's own set.
+_FAILED = FAILED_STATUSES
+
+
+def _required(evidence: BuildEvidence) -> set[str] | None:
+    """The models the change requires, or None where coverage is unknown."""
+
+    coverage = evidence.coverage
+    return set(coverage.required) if coverage is not None else None
+
+
+def _replay_obligations(
+    recorded: Mapping[str, Mapping[str, Any]] | None,
+    evidence: BuildEvidence,
+) -> list[Obligation]:
+    """Whether this build ran each edited incremental model's next run (#1130).
+
+    The only evidence that the ``is_incremental()`` branch works is a unit test
+    that overrides it to true. A failing one is ``contradicted``, even beside a
+    passing one, and otherwise a passing one is ``satisfied``. With none in the
+    build the obligation is ``unchecked``, and the reason says whether a full
+    refresh is what stood in for it.
+    """
+
+    if not recorded:
+        return []
+    required = _required(evidence)
+    statuses = {node.unique_id: node.status.lower() for node in evidence.nodes}
+    out = []
+    for model, facts in sorted(recorded.items()):
+        answers = set(facts.get("answers") or ()) | {model}
+        if required and not answers & required:
+            continue
+        ran = [statuses[uid] for uid in facts.get("tests") or () if uid in statuses]
+        # A failing test wins over a passing one: the branch is wrong for the
+        # case that test pins, whatever another test shows.
+        if any(status in _FAILED for status in ran):
+            out.append(
+                Obligation(
+                    model=model,
+                    kind="incremental_replay",
+                    status="contradicted",
+                    finding="incremental_test_failed",
+                )
+            )
+        elif any(status in _PASSED for status in ran):
+            out.append(
+                Obligation(model=model, kind="incremental_replay", status="satisfied")
+            )
+        else:
+            out.append(
+                Obligation(
+                    model=model,
+                    kind="incremental_replay",
+                    status="unchecked",
+                    reason_code=(
+                        "full_refresh_only"
+                        if facts.get("full_refreshed")
+                        else "no_incremental_test"
+                    ),
+                )
+            )
+    return out
+
+
+#: A recorded comparison verdict, as the obligation it settles (#1157).
+_COMPARISON_STATUS = {
+    "equivalent": ("satisfied", None),
+    "as_expected": ("satisfied", None),
+    "different": ("contradicted", "different"),
+    "unexpected": ("contradicted", "unexpected_change"),
+}
+
+
+def _comparison_obligations(
+    comparisons: list[ComparisonState] | None,
+    evidence: BuildEvidence,
+) -> list[Obligation]:
+    """Each required rewritten model, held to its recorded comparison (#1157).
+
+    A rewrite that was never compared is ``unchecked`` (``not_compared``),
+    whether or not it was meant to change rows: an intended change is compared
+    with ``--expect``, and ``different`` is a defect until an expectation says
+    which difference was meant.
+    """
+
+    if not comparisons:
+        return []
+    required = _required(evidence)
+    # A comparison of another rewrite in the plan (a mart downstream of a
+    # rewritten intermediate) may be what checks the results the request
+    # keeps; the uncompared model stays open, but says so (#1049).
+    elsewhere = any(state.status != "not_compared" for state in comparisons)
+    out = []
+    for state in comparisons:
+        if required and state.model not in required:
+            continue
+        status, finding = _COMPARISON_STATUS.get(state.status, ("unchecked", None))
+        out.append(
+            Obligation(
+                model=state.model,
+                kind="comparison",
+                status=status,
+                finding=finding,
+                reason_code=(
+                    None
+                    if status != "unchecked"
+                    else (
+                        ("compared_elsewhere" if elsewhere else "not_compared")
+                        if state.status == "not_compared"
+                        else state.reason_code or state.status
+                    )
+                ),
+            )
+        )
+    return out
+
+
+_ROW_FINDINGS = frozenset({"row_loss", "row_fanout"})
+
+
+def _repair_obligations(
+    repair: Mapping[str, Any] | None,
+    evidence: BuildEvidence,
+    graph: Mapping[str, list[str]] | None,
+    verification: Mapping[str, Any] | None,
+    cold: Mapping[str, Any] | None,
+) -> list[Obligation]:
+    """What the build shows about a drafted package override (#1229).
+
+    The override is the project's model of the package model's name; the
+    package's tests attach to it, since dbt gives it the package's YAML entry.
+    """
+
+    if not repair:
+        return []
+    # One plan can repair several package models; each is held on its own.
+    # A model whose every check holds is one `repair: satisfied` entry, and an
+    # open one lists only what is open, so the bounded block keeps every model.
+    if repair.get("nodes"):
+        out: list[Obligation] = []
+        for record in repair["nodes"]:
+            if not isinstance(record, Mapping):
+                continue
+            held = _repair_obligations(record, evidence, graph, verification, cold)
+            if held and all(o.status == "satisfied" for o in held):
+                out.append(
+                    Obligation(model=held[0].model, kind="repair", status="satisfied")
+                )
+            else:
+                out.extend(o for o in held if o.status != "satisfied")
+        return out
+    if not repair.get("node"):
+        return []
+    name = str(repair["node"])
+    package = str(repair.get("package") or "")
+    node = next(
+        (
+            n
+            for n in evidence.nodes
+            if n.unique_id.startswith("model.")
+            and n.name == name
+            and n.unique_id.split(".")[1] != package
+        ),
+        None,
+    )
+
+    def obligation(kind: str, status: str, **extra: Any) -> Obligation:
+        """One repair obligation on this override."""
+
+        return Obligation(model=name, kind=kind, status=status, **extra)
+
+    out: list[Obligation] = []
+    status = node.status.lower() if node is not None else None
+    if status is None:
+        out.append(obligation("repair_built", "unchecked", reason_code="not_built"))
+    elif status in _PASSED:
+        out.append(obligation("repair_built", "satisfied"))
+    elif status in _FAILED:
+        out.append(
+            obligation("repair_built", "contradicted", finding="override_failed")
+        )
+    else:
+        out.append(obligation("repair_built", "unchecked", reason_code=status))
+
+    statuses = {n.unique_id: n.status.lower() for n in evidence.nodes}
+    tests = [
+        uid
+        for uid, parents in (graph or {}).items()
+        if uid.startswith(("test.", "unit_test."))
+        and node is not None
+        and node.unique_id in parents
+        and uid in statuses
+    ]
+    ran = [statuses[uid] for uid in tests]
+    if any(s in _FAILED for s in ran):
+        out.append(
+            obligation("repair_tests", "contradicted", finding="package_test_failed")
+        )
+    elif any(s in _PASSED for s in ran):
+        out.append(obligation("repair_tests", "satisfied"))
+    else:
+        out.append(obligation("repair_tests", "unchecked", reason_code="no_tests"))
+
+    if cold is None:
+        out.append(obligation("repair_cold_deps", "unchecked", reason_code="not_cold"))
+    elif not cold.get("reinstalled"):
+        out.append(
+            obligation("repair_cold_deps", "unchecked", reason_code="not_reinstalled")
+        )
+    else:
+        edits = cold.get("installed_edits") or {}
+        lost = sum(
+            int((edits.get(part) or {}).get("count") or 0)
+            for part in ("changed", "added", "removed")
+        )
+        out.append(
+            obligation("repair_cold_deps", "contradicted", finding="installed_edits")
+            if lost
+            else obligation("repair_cold_deps", "satisfied")
+        )
+
+    findings = (verification or {}).get("findings") or []
+    row = next(
+        (
+            f
+            for f in findings
+            if isinstance(f, Mapping)
+            and f.get("code") in _ROW_FINDINGS
+            and f.get("identifier") == name
+        ),
+        None,
+    )
+    if row is not None:
+        out.append(
+            obligation("repair_row_count", "contradicted", finding=str(row["code"]))
+        )
+    elif not (verification or {}).get("ran"):
+        out.append(
+            obligation(
+                "repair_row_count", "unchecked", reason_code="verification_not_run"
+            )
+        )
+    elif status not in _PASSED:
+        out.append(obligation("repair_row_count", "unchecked", reason_code="not_built"))
+    elif repair.get("population") != "kept":
+        out.append(
+            obligation(
+                "repair_row_count", "unchecked", reason_code="population_unchecked"
+            )
+        )
+    else:
+        out.append(obligation("repair_row_count", "satisfied"))
+
+    # An `unbound` draft is checked by the build itself: once the override
+    # builds, its types bound; until then the conversion stays open.
+    if repair.get("status") == "unresolved" or (
+        repair.get("status") == "unbound" and status not in _PASSED
+    ):
+        out.append(
+            obligation(
+                "repair_conversion", "unchecked", reason_code=str(repair["status"])
+            )
+        )
+    return out
+
+
+def _one_per_model_first(
+    names: list[str], failures: Mapping[str, list[FailedCheck]]
+) -> list[FailedCheck]:
+    """Each model's failed checks, taken breadth first in ``names`` order.
+
+    The list is capped, and every cut keeps a prefix. Taking each model's first
+    check before anyone's second means a prefix that covers the first ``n``
+    names gives each of them a kind, instead of one model with many failures
+    filling the list.
+    """
+
+    rounds = zip_longest(*(failures.get(n, []) for n in names))
+    return [check for round_ in rounds for check in round_ if check is not None]
+
+
 def _bounded_change(change: ChangeRef) -> ChangeRef:
     selector = change.selector
     if selector is not None and len(selector) > _SELECTOR:
@@ -821,19 +1207,24 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     cap_list(completion.obligations, "contradicted", _NAMES, "obligations.contradicted")
     cap_list(completion.obligations, "unchecked", _NAMES, "obligations.unchecked")
     cap_list(
+        completion.obligations, "needs_decision", _NAMES, "obligations.needs_decision"
+    )
+    cap_list(
         completion.obligations,
         "identifier_conversions",
         _NAMES,
         "obligations.identifier_conversions",
     )
-    cap_list(
-        completion.obligations,
-        "change_scope",
-        _NAMES,
-        "obligations.change_scope",
-    )
+    for listed in ("change_scope", "incremental_replay", "comparison", "repair"):
+        cap_list(completion.obligations, listed, _NAMES, f"obligations.{listed}")
     if completion.refactor_comparison is not None:
         cap_list(completion, "refactor_comparison", _NAMES, "refactor_comparison")
+    cap_list(
+        completion.assurance.failed_checks,
+        "checks",
+        _NAMES,
+        "assurance.failed_checks.checks",
+    )
     completion.elided = dict(elided)
     if completion.size() <= budget:
         return
@@ -854,17 +1245,27 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         cap_list(completion.obligations, "unchecked", keep, "obligations.unchecked")
         cap_list(
             completion.obligations,
+            "needs_decision",
+            max(keep, 1),
+            "obligations.needs_decision",
+        )
+        cap_list(
+            completion.obligations,
             "identifier_conversions",
             max(keep, 1),
             "obligations.identifier_conversions",
         )
-        cap_list(
-            completion.obligations,
-            "change_scope",
-            max(keep, 1),
-            "obligations.change_scope",
-        )
+        for listed in ("change_scope", "incremental_replay", "comparison", "repair"):
+            cap_list(
+                completion.obligations, listed, max(keep, 1), f"obligations.{listed}"
+            )
         cap_list(completion.verification, "top", keep, "verification.top")
+        cap_list(
+            completion.assurance.failed_checks,
+            "checks",
+            keep,
+            "assurance.failed_checks.checks",
+        )
         # The first blocked deliverable is the last thing to go: it is the
         # answer to "is the change done", which is what the block is for.
         cap_list(
@@ -893,6 +1294,23 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
                     listed.elided += len(listed.names) - floor
                     elided["names"] += len(listed.names) - floor
                     listed.names = listed.names[:floor]
+        completion.elided = dict(elided)
+        if completion.size() <= budget:
+            return
+
+    # The last resort: the per-model obligation lists keep one entry each above,
+    # and with long model names those can still overflow. Each goes whole, its
+    # count kept under `elided`, since a block over budget is cut by the reader
+    # where nothing counts it.
+    for listed in (
+        "needs_decision",
+        "identifier_conversions",
+        "change_scope",
+        "incremental_replay",
+        "comparison",
+        "repair",
+    ):
+        cap_list(completion.obligations, listed, 0, f"obligations.{listed}")
         completion.elided = dict(elided)
         if completion.size() <= budget:
             return

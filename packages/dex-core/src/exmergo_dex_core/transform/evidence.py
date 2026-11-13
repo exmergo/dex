@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from ..edits import EditOp
 from ..model_versions import expand, label_for_file, version_map
+from ..value_mask import mask_values
 from .plans import EditKind, PlanEdit, PlanError
 
 #: dbt node statuses that mean the node did not produce a good relation. `fail`
@@ -85,13 +86,14 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _node_message(message: object) -> str | None:
-    """dbt's message on one node, bounded, with its color codes removed and
-    the blank lines a unit test diff opens with trimmed (#1111)."""
+    """dbt's message on one node, bounded, with its color codes removed, the
+    blank lines a unit test diff opens with trimmed (#1111), and any value a
+    warehouse conversion error quotes masked (#1070)."""
 
     if not message:
         return None
     text = _ANSI_ESCAPE.sub("", str(message)).replace("\r\n", "\n").strip()
-    return text[:400] or None
+    return mask_values(text)[:400] or None
 
 
 class BuildOutcome(str, Enum):
@@ -301,6 +303,32 @@ class BuildEvidence(BaseModel):
         if self.coverage is not None:
             payload["coverage"] = self.coverage.model_dump(mode="json")
         return payload
+
+
+def _disabled_models(manifest: Any) -> set[str]:
+    """The models a manifest lists as disabled, by name and version label."""
+
+    names: set[str] = set()
+    if not isinstance(manifest, dict):
+        return names
+    # A bare name is exempt only when no enabled model answers to it: one
+    # disabled version does not excuse a build of the version still enabled.
+    enabled = {
+        str(node.get("name"))
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if str(uid).startswith("model.") and isinstance(node, dict)
+    }
+    for uid, entries in (manifest.get("disabled") or {}).items():
+        if not str(uid).startswith("model."):
+            continue
+        for node in entries if isinstance(entries, list) else [entries]:
+            if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                continue
+            if node["name"] not in enabled:
+                names.add(node["name"])
+            if node.get("version") is not None:
+                names.add(f"{node['name']}.v{node['version']}")
+    return names
 
 
 def _file_digest(path: Path) -> str | None:
@@ -911,6 +939,16 @@ def build_evidence(
     if edits is not None:
         drift = plan_drift(edits, root)
         required, basis, undetermined = required_nodes(edits, root)
+        # dbt never builds a disabled model, so a plan that edits one (to drop a
+        # flag read from it, say) does not owe a build of it (#1156).
+        disabled = _disabled_models(manifest)
+        idle = [name for name in required if name in disabled and name not in answers]
+        if idle:
+            required = [name for name in required if name not in idle]
+            basis = [
+                *basis,
+                *(f"'{name}' is disabled, so no build runs it" for name in idle),
+            ]
         covered = [name for name in required if name in answers]
         successful = [name for name in covered if name not in unsuccessful_answers]
         coverage = BuildCoverage(

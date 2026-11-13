@@ -221,40 +221,65 @@ def test_group_by_reports_its_expressions_as_written():
     assert sql_shape.group_by(tree) == ["a"]
 
 
-def test_group_by_keys_drops_table_qualifiers_and_folds_case():
-    tree = _parse("select s.a, count(*) from t as s group by s.a, s.B")
-    assert sql_shape.group_by_keys(tree) == ["a", "b"]
-    assert sql_shape.group_by(tree) == ["s.a", "s.B"]
+def test_bigquery_group_by_alias_expands_only_in_the_outer_query_scope():
+    """An outer alias must not replace a same-named nested-query column."""
+
+    tree = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers "
+        "group by (select last_name from archive)",
+        read="bigquery",
+    )
+
+    (key,) = sql_shape.group_by_key(tree, "bigquery")
+
+    assert "upper" not in key.lower()
+    assert "last_name" in key.lower()
 
 
-def test_group_by_keys_preserves_string_literal_case():
+def test_bigquery_group_by_outer_projection_alias_keeps_its_expression():
+    """The projection alias expands before source-column canonicalization."""
+
+    alias = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers group by last_name",
+        read="bigquery",
+    )
+    source_column = sqlglot.parse_one(
+        "select upper(last_name) as last_name from singers group by singers.last_name",
+        read="bigquery",
+    )
+
+    (alias_key,) = sql_shape.group_by_key(alias, "bigquery")
+    (source_key,) = sql_shape.group_by_key(source_column, "bigquery")
+
+    assert "upper" in alias_key.lower()
+    assert alias_key != source_key
+
+
+def test_group_by_key_preserves_string_literal_case():
     upper = _parse(
         "select count(*) from t group by case when status = 'US' then 1 else 0 end"
     )
     lower = _parse(
         "select count(*) from t group by case when status = 'us' then 1 else 0 end"
     )
-    assert sql_shape.group_by_keys(upper) != sql_shape.group_by_keys(lower)
+    assert sql_shape.group_by_key(upper) != sql_shape.group_by_key(lower)
 
 
-def test_group_by_keys_distinguishes_different_joined_relations():
-    tree_a = _parse(
-        "select a.id from t_a as a join t_b as b on a.x = b.x group by a.id"
-    )
-    tree_b = _parse(
-        "select b.id from t_a as a join t_b as b on a.x = b.x group by b.id"
-    )
-    assert sql_shape.group_by_keys(tree_a) != sql_shape.group_by_keys(tree_b)
+def test_group_by_key_preserves_quoted_identifier_case():
+    upper = _parse('select count(*) from t group by "Status"')
+    lower = _parse('select count(*) from t group by "status"')
+    assert sql_shape.group_by_key(upper) != sql_shape.group_by_key(lower)
 
 
-def test_group_by_keys_normalizes_joined_relation_alias_renames():
-    tree_1 = _parse(
-        "select a1.id from t_a as a1 join t_b as b on a1.x = b.x group by a1.id"
-    )
-    tree_2 = _parse(
-        "select a2.id from t_a as a2 join t_b as b on a2.x = b.x group by a2.id"
-    )
-    assert sql_shape.group_by_keys(tree_1) == sql_shape.group_by_keys(tree_2)
+def test_group_by_key_folds_unquoted_identifier_case():
+    upper = _parse("select count(*) from t group by STATUS")
+    lower = _parse("select count(*) from t group by status")
+    assert sql_shape.group_by_key(upper) == sql_shape.group_by_key(lower)
+
+
+def test_group_by_keys_compatibility_alias():
+    tree = _parse("select s.a, count(*) from t as s group by s.a")
+    assert sql_shape.group_by_keys(tree) == sql_shape.group_by_key(tree)
 
 
 def test_scopes_includes_set_operation_ctes():

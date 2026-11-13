@@ -252,12 +252,141 @@ def test_rendering_the_same_declaration_twice_changes_nothing_the_second_time():
     assert render(once, declaration) == once
 
 
-def test_a_flow_style_entry_is_refused_rather_than_reflowed():
-    [declaration] = parse_declarations([{"model": "fct_orders", "description": "x"}])
+def test_a_flow_style_entry_is_rewritten_in_block_style():
+    """#1203: the entry that would hold the declaration is converted to block
+    style in the same edit, keeping its keys, instead of refusing the plan."""
+    [declaration] = parse_declarations(
+        [{"model": "fct_orders", "description": "x", "grain": ["order_id"]}]
+    )
+
+    out = render("models:\n  - {name: fct_orders}\n", declaration)
+
+    assert "- {name: fct_orders}" not in out
+    assert "name: fct_orders" in out
+    entry = _entry(out)
+    assert entry["description"] == "x"
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+
+
+def test_a_flow_style_config_is_restyled_and_the_rest_of_the_file_kept():
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  # hand-written, keep me\n"
+        "  - name: fct_orders\n"
+        "    config: {meta: {team: analytics, dex: {grain: [event_id]}}}\n"
+        "  - name: other_model\n"
+        "    description: untouched\n"
+    )
+
+    out = render(content, declaration)
+
+    assert "# hand-written, keep me" in out
+    assert "team: analytics" in out
+    assert "- name: other_model" in out
+    assert "description: untouched" in out
+    entry = _entry(out)
+    dex = entry["config"]["meta"]["dex"]
+    assert dex["grain"] == ["order_id"]  # the declaration's key wins
+    assert "{meta:" not in out  # the restyled mapping is block style now
+
+
+def test_a_flow_style_meta_mapping_is_restyled():
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    content = (
+        "models:\n  - name: fct_orders\n    config:\n      meta: {team: analytics}\n"
+    )
+
+    out = render(content, declaration)
+
+    entry = _entry(out)
+    assert entry["config"]["meta"]["team"] == "analytics"
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+    assert "{team: analytics}" not in out
+
+
+def test_a_flow_style_dex_mapping_is_replaced_wholesale():
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    content = (
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex: {grain: [event_id]}\n"
+    )
+
+    out = render(content, declaration)
+
+    entry = _entry(out)
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+    assert "{grain:" not in out
+
+
+def test_an_empty_flow_config_is_dropped_and_written_fresh():
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    content = "models:\n  - name: fct_orders\n    config: {}\n"
+
+    out = render(content, declaration)
+
+    entry = _entry(out)
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+    assert "config: {}" not in out
+
+
+def test_an_empty_flow_meta_leaves_a_config_that_is_written_fresh():
+    """`config: {meta: {}}`: the restyle drops the only `meta` pair, so the
+    `config` it leaves behind is null, and the declaration writes `config`
+    afresh instead of refusing (#1203)."""
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    content = "models:\n  - name: fct_orders\n    config: {meta: {}}\n"
+
+    out = render(content, declaration)
+
+    entry = _entry(out)
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+
+
+def test_an_empty_flow_pair_on_a_bullet_line_still_refuses():
+    """Dropping an empty flow pair that shares its line with the entry's
+    bullet would swallow the bullet and the keys after it (#1203)."""
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    from exmergo_dex_core.transform.rewrite import RewriteError
+
+    content = "models:\n  - config: {}\n    name: fct_orders\n"
+    with pytest.raises(RewriteError, match="shares its line"):
+        render(content, declaration)
+
+
+def test_a_flow_style_entry_that_uses_an_alias_still_refuses():
+    """An aliased node cannot be restyled: the re-render would leave the
+    anchor's other reference pointing at nothing (#1203)."""
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    from exmergo_dex_core.transform.rewrite import RewriteError
+
+    content = "shared: &keep {a: 1}\nmodels:\n  - {name: fct_orders, meta: *keep}\n"
+    with pytest.raises(RewriteError, match="anchor"):
+        render(content, declaration)
+
+
+def test_a_flow_style_entry_with_an_unused_anchor_renders():
+    """An anchor nothing aliases is dropped by the restyle; nothing else
+    references it, so the render is safe."""
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+
+    out = render("models:\n  - {name: &me fct_orders}\n", declaration)
+
+    entry = _entry(out)
+    assert entry["name"] == "fct_orders"
+    assert entry["config"]["meta"]["dex"]["grain"] == ["order_id"]
+
+
+def test_an_entry_nested_in_a_flow_style_models_list_still_refuses():
+    [declaration] = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
     from exmergo_dex_core.transform.rewrite import RewriteError
 
     with pytest.raises(RewriteError, match="flow style"):
-        render("models:\n  - {name: fct_orders}\n", declaration)
+        render("models: [{name: fct_orders}]\n", declaration)
 
 
 # --- where it lands -------------------------------------------------------------
@@ -312,7 +441,7 @@ def test_a_declaration_folds_into_the_schema_edit_the_payload_already_carries():
                 "model": "fct_orders",
                 "columns": {"customer_id": {"references": "dim_people.id"}},
             },
-            "no model, seed or snapshot named 'dim_people'",
+            "an installed package has a model, seed or snapshot named 'dim_people'",
         ),
         (
             {
@@ -855,7 +984,7 @@ def test_a_malformed_population_parent_is_refused_naming_the_field(parent, expec
     [
         (
             {"model": "dim_people", "key": {"customer_id": "customer_id"}},
-            "no model, seed or snapshot named 'dim_people'",
+            "an installed package has a model, seed or snapshot named 'dim_people'",
         ),
         (
             {"model": "dim_customers", "key": {"customer_id": "cust_key"}},

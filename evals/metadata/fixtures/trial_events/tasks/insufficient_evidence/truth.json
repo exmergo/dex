@@ -1,0 +1,35 @@
+{
+  "checks": [
+    {
+      "name": "the event totals still count every event",
+      "expect": 0,
+      "sql": "select count(*) from main.subscription_activity a left join (select subscription_id, count(*) as events from raw.billing_events group by subscription_id) r using (subscription_id) where a.event_count is distinct from coalesce(r.events, 0)"
+    },
+    {
+      "name": "the unplaced pro-trial code is not counted as a trial",
+      "expect": 0,
+      "sql": "select count(*) from main.stg_events e join raw.billing_events r using (event_id) where lower(trim(r.tier_code)) = 'pro-trial' and e.event_tier = 'trial'"
+    }
+  ],
+  "diagnosis": {
+    "verdict": "unresolved",
+    "fields": [
+      "pro-trial"
+    ],
+    "evidence": [
+      [
+        "1034"
+      ],
+      [
+        "paid_event_count",
+        "trial_event_count"
+      ],
+      [
+        "event_tier_codes",
+        "seed",
+        "mapping",
+        "tier_code"
+      ]
+    ]
+  }
+}

@@ -496,6 +496,49 @@ def test_a_time_spine_alone_is_a_note(tmp_path: Path):
     assert result.suppressed["row_population"] == generated
 
 
+def test_a_model_driven_off_the_time_spine_is_a_note_on_a_build(tmp_path: Path):
+    """#988: a build's sweep skips the spine-driven comparison with a note, no
+    row count and no row-population finding."""
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.metricflow_time_spine": {
+                "name": "metricflow_time_spine",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."metricflow_time_spine"',
+                "compiled_code": 'select date_day from "warehouse"."raw"."dates"',
+            },
+            "model.shop.fct_weekly": {
+                "name": "fct_weekly",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."fct_weekly"',
+                "compiled_code": (
+                    "select s.date_day, o.id from "
+                    '"warehouse"."dbt_dev"."metricflow_time_spine" s '
+                    'cross join "warehouse"."raw"."orders" o'
+                ),
+            },
+        },
+        results=[{"unique_id": "model.shop.fct_weekly", "status": "success"}],
+    )
+    adapter = _StubAdapter(
+        [_Meta("warehouse.dbt_dev.fct_weekly")],
+        counts={"warehouse.dbt_dev.fct_weekly": 10},
+    )
+    result = _sweep(tmp_path, _summary([_node("model.shop.fct_weekly")]), adapter)
+    note = (
+        "row population was not compared for fct_weekly (its driving parent "
+        "'metricflow_time_spine' is the project's time spine, which supplies "
+        "anchors rather than a population the model is expected to preserve)"
+    )
+    assert note in result.notes
+    assert note not in result.warnings
+    assert result.suppressed.get("row_population") == note
+    assert not [q for q in adapter.queries if "count(" in q.lower()], adapter.queries
+    assert not [f for f in result.findings if f.code in {"row_fanout", "row_loss"}]
+
+
 def test_a_model_whose_final_cte_is_a_union_is_suppressed_with_reason(tmp_path: Path):
     sql = (
         "with named as (select 1 as id), "
@@ -779,6 +822,53 @@ def test_a_cold_dev_target_degrades_to_a_note_rather_than_failing(tmp_path: Path
     assert len(notes) == 1
     assert "could not price this build's verification upfront" in notes[0]
     assert "priced again after the build" in notes[0]
+
+
+def test_bigquery_cold_target_pricing_warning_is_single_line_without_url(
+    tmp_path: Path,
+):
+    """bigquery cold target pricing warning is one line naming the relation.
+
+    when bigquery upfront preflight hits notfound for an unbuilt relation,
+    the warning is reported in one line naming the relation without leaking
+    the request url or job id (issue #1209).
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.adapters.base import warehouse_refusal
+    from exmergo_dex_core.adapters.bigquery import _api_error_message
+    from exmergo_dex_core.errors import StatementStage
+    from exmergo_dex_core.transform.verify import price_verification
+
+    _priceable_manifest(tmp_path, materialized="view")
+    raw_404 = (
+        "404 POST https://bigquery.googleapis.com/bigquery/v2/projects/test-proj/"
+        "jobs?prettyPrint=false: Not found: Table test-proj:dbt_dev.fct_orders "
+        "was not found in location US\n\nLocation: None\nJob ID: fake-job-1234"
+    )
+
+    class _BigQueryEstimator:
+        """fake estimator translating bigquery notfound via warehouse_refusal."""
+
+        dialect = "bigquery"
+
+        def query_estimate(self, sql: str) -> float:
+            """dry-run estimator that raises translated notfound."""
+            exc = api_exceptions.NotFound(raw_404)
+            raise warehouse_refusal(_api_error_message(exc), stage=StatementStage.PLAN)
+
+    price, notes = price_verification(
+        _BigQueryEstimator(), tmp_path, scope={"model.p.fct_orders"}
+    )
+    assert price == 0.0
+    assert len(notes) == 1
+    (warning,) = notes
+    assert "https://" not in warning
+    assert "Job ID" not in warning
+    assert "\n" not in warning
+    assert "test-proj:dbt_dev.fct_orders" in warning
+    assert "could not price this build's verification upfront" in warning
 
 
 def test_a_connector_with_no_dry_run_prices_nothing_and_says_nothing(tmp_path: Path):
@@ -1884,3 +1974,143 @@ def test_a_build_measures_a_join_through_a_filtered_cte_over_its_filter(
     assert record["status"] == "contradicted"
     assert record["measured"]["matched_rows"] == 0
     assert record["effective_input"]["to"]["filters"] == ['"is_active"']
+
+
+# --- a check that fails on a value says so without the value (#1070) ----------
+
+_SENTINEL = "zq_sentinel_7"
+_MASKED = "Could not convert string <value withheld> to INT32"
+
+
+def test_a_built_view_that_fails_on_a_cast_names_the_failure_not_the_value(
+    tmp_path: Path,
+):
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.raw_orders AS SELECT CAST(i AS VARCHAR) AS ref, "
+        "'paid' AS status FROM range(5) t(i)"
+    )
+    conn.execute("INSERT INTO dbt_dev.raw_orders VALUES (?, 'paid')", [_SENTINEL])
+    conn.execute(
+        "CREATE VIEW dbt_dev.fct_orders AS SELECT CAST(ref AS INTEGER) AS order_id, "
+        "1 AS line, status, 0.5 AS share FROM dbt_dev.raw_orders"
+    )
+    conn.close()
+    _declared_manifest(tmp_path)
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.fct_orders")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+    said = json.dumps(
+        {
+            "payload": result.payload(),
+            "warnings": result.warnings,
+            "suppressed": result.suppressed,
+        },
+        default=str,
+    )
+    assert _SENTINEL not in said
+    assert _MASKED in said
+
+
+class _DriverErrorAdapter(_StubAdapter):
+    """A count whose driver error escaped the adapter's translation."""
+
+    def run_query(self, sql, max_rows=None, timeout_seconds=None):
+        raise RuntimeError(f"Bad int64 value: {_SENTINEL}; error in writing field")
+
+
+def test_a_driver_error_on_the_row_counts_is_masked(tmp_path: Path):
+    project = tmp_path
+    _artifacts(
+        project,
+        nodes={
+            "model.p.stg": {
+                "name": "stg",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.src",
+            }
+        },
+        results=[{"unique_id": "model.p.stg", "status": "success"}],
+    )
+    adapter = _DriverErrorAdapter(
+        [_Meta("wh.dbt_dev.stg"), _Meta("wh.raw.src", row_count=None)]
+    )
+    result = _sweep(project, _summary([_node("model.p.stg")]), adapter)
+    said = json.dumps(
+        {"warnings": result.warnings, "suppressed": result.suppressed}, default=str
+    )
+    assert _SENTINEL not in said
+    assert "Bad int64 value: <value withheld>" in said
+
+
+def test_a_node_that_failed_on_a_cast_is_named_without_the_value(tmp_path: Path):
+    """Found by the dogfood: `node_failed` relays dbt's message, which for a
+    model that failed on a cast quotes the row's value (#1070)."""
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.shop.fct_orders": {"name": "fct_orders", "resource_type": "model"}
+        },
+        results=[
+            {
+                "unique_id": "model.shop.fct_orders",
+                "status": "error",
+                "message": "Runtime Error in model fct_orders\n  Conversion Error: "
+                f"Could not convert string '{_SENTINEL}' to INT32",
+            }
+        ],
+    )
+    result = _sweep(tmp_path, _summary([_node("model.shop.fct_orders")]))
+    (failed,) = [f for f in result.findings if f.code == "node_failed"]
+    assert _SENTINEL not in failed.detail
+    assert _MASKED in failed.detail
+
+
+def test_a_row_count_failure_that_escapes_the_counter_is_suppressed_masked(
+    tmp_path: Path, monkeypatch
+):
+    """A failure `relation_counts` does not catch itself (a pricing or guard
+    error) reaches the sweep's own handler, which names it masked (#1070)."""
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    def refuse(*args, **kwargs):
+        raise RuntimeError(f"Bad int64 value: {_SENTINEL}")
+
+    monkeypatch.setattr(verify_mod, "relation_counts", refuse)
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.stg": {
+                "name": "stg",
+                "resource_type": "model",
+                "relation_name": "wh.dbt_dev.stg",
+                "config": {"materialized": "view"},
+                "compiled_code": "select * from wh.raw.src",
+            }
+        },
+        results=[{"unique_id": "model.p.stg", "status": "success"}],
+    )
+    adapter = _StubAdapter([_Meta("wh.dbt_dev.stg"), _Meta("wh.raw.src")])
+    result = _sweep(tmp_path, _summary([_node("model.p.stg")]), adapter)
+    said = json.dumps({"w": result.warnings, "s": result.suppressed}, default=str)
+    assert _SENTINEL not in said
+    assert (
+        "the row counts could not be read "
+        "(RuntimeError: Bad int64 value: <value withheld>)" in said
+    )

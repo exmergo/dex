@@ -1,0 +1,5 @@
+{
+  "kind": "fix",
+  "models": ["product_pricing"],
+  "prompt": "Finance says `avg_adjusted_price` in `product_pricing` never seems to reflect discounts. Check whether it is computed correctly, fix it if it is not, and build it on dev."
+}

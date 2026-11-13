@@ -260,6 +260,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "databricks-metric-views-compatibility.md",
+        "semantic-layers/databricks-metric-views",
+        PageMeta(
+            "Databricks Metric View compatibility",
+            "How dex reads and validates Databricks Metric View YAML with no "
+            "workspace connection: the ported 1.1 rules, the catalog mapping and "
+            "what it declines to claim.",
+            "Databricks Metric Views",
+        ),
+    ),
+    ReferencePage(
         "ossie-walkthrough.md",
         "guides/ossie-semantic-layer",
         PageMeta(

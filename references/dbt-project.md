@@ -27,8 +27,22 @@ Missing or failed compilation stores no plan.
 Compile-time `run_query`, statement blocks and `adapter.execute` SELECTs run
 through Dex's scoped read-only connector, query firewall, PII gate and result
 limits. `get_relation()` and `is_incremental()` use Dex's scoped, scan-free inventory.
-Direct database handles and other unsupported adapter introspection refuse;
-truncated macro results refuse too. The first discovered query is priced before
+`adapter.get_columns_in_relation()` (what `dbt_utils.star`,
+`get_filtered_columns_in_relation` and Fivetran's `fill_staging_columns` call) is
+answered from the same inventory's column metadata: names and types, never a row,
+free on every connector. The columns are built by the adapter's own dbt column
+class, so a macro reads the `data_type` a real build would give it; on BigQuery a
+nested column keeps its `STRUCT<...>` or `ARRAY<...>` type, built from the table's
+field tree. Each listing counts toward `query.max_statements` and is
+named once in the plan's warnings, and a relation the inventory does not hold
+(outside the source scope, or not built yet) is answered with no columns, as dbt
+answers a missing relation, with a warning naming it. The SQL spellings of the
+same read stay refused: a top-level or nested `DESCRIBE`, `SUMMARIZE`, `SHOW`,
+`PRAGMA` or an `information_schema` read, including the one the dispatched
+`get_columns_in_relation` macro issues when called directly, and the refusal names
+`adapter.get_columns_in_relation` as the supported route. Direct database handles
+and other unsupported adapter introspection refuse; truncated macro results refuse
+too. The first discovered query is priced before
 spend and later queries share its command and daily ceilings. See
 [cost controls](cost-controls.md#queries-discovered-during-model-compilation).
 No model materialization runs during planning.

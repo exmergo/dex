@@ -48,6 +48,7 @@ from .declarations import DEX_META_KEY, model_sql_path, snapshot_defined
 
 if TYPE_CHECKING:
     from ..references import ReferenceIndex
+    from .population_inference import Draft, KeyFacts
 
 #: The model-level intent fields every declaration is expected to state, in the
 #: order a reader would ask about them.
@@ -139,6 +140,12 @@ class _Reading:
     incomplete: list[str] = field(default_factory=list)
     #: Placeholder identifier -> the dbt relation name it stands for.
     tokens: dict[str, str] = field(default_factory=dict)
+    #: Output columns an aggregate produces, followed through CTEs: the columns
+    #: that read NULL or zero on a parent with no children (#1228).
+    aggregated: list[str] = field(default_factory=list)
+    #: Output columns carried from the outer side of a join, which read NULL
+    #: where the join found no match (#1228).
+    outer_joined: list[str] = field(default_factory=list)
 
 
 def draft(
@@ -155,6 +162,10 @@ def draft(
     dev_namespace: str | None = None,
     index: Callable[[], ReferenceIndex] | None = None,
     prior: Mapping[str, str] | None = None,
+    package_documented: Mapping[str, Mapping[str, str]] | None = None,
+    packaged: Callable[[str], str | None] | None = None,
+    package_target: Callable[[str], Any] | None = None,
+    key_facts: Callable[[], KeyFacts | None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Each model's ``drafted``/``declared``/``missing``, and the warnings.
 
@@ -170,6 +181,13 @@ def draft(
     ``prior`` is the project as it reads before the plan; with it, a model that
     already exists also carries ``contradictions`` (see :mod:`.contradictions`),
     whose warnings the caller renders once row attribution has run.
+    ``package_documented`` names, by model, the overrides of a package model
+    the package documents (``package`` and ``package_entry``): dbt gives such an
+    override the package's YAML entry and allows it none of its own, so it owes
+    no intent and its entry says where its documentation lives (#1161).
+    ``key_facts`` builds the keys and joins the project states (see
+    :mod:`.population_inference`), called at most once; with it, a model that
+    declares no ``population.parent`` gets a drafted one (#1228).
     """
 
     model_paths = list(model_paths)
@@ -178,6 +196,9 @@ def draft(
     warnings: list[str] = []
     built: list[ReferenceIndex] = []
 
+    if package_target is None:
+        package_target = getattr(packaged, "target", None)
+
     def reference_index() -> ReferenceIndex | None:
         if index is None:
             return None
@@ -185,11 +206,22 @@ def draft(
             built.append(index())
         return built[0]
 
+    facts_read: list[KeyFacts | None] = []
+
+    def facts() -> KeyFacts | None:
+        if not facts_read:
+            if key_facts is not None:
+                facts_read.append(key_facts())
+            else:
+                facts_read.append(_facts_from_files(files, model_paths))
+        return facts_read[0]
+
     for model in sorted(set(models)):
         sql_path = model_sql_path(files, model_paths, model)
         if sql_path is None:
             continue
         declared = read_declared(files, model)
+        stated = facts()
         reading = read(
             files[sql_path],
             cache,
@@ -197,6 +229,7 @@ def draft(
             vars=vars,
             files=files,
             model_paths=model_paths,
+            known_keys=stated.known_keys() if stated is not None else None,
         )
         drafted = _drafted(
             reading,
@@ -208,6 +241,9 @@ def draft(
             cumulative=cumulative,
             cache_note=cache_note,
             dev_namespace=dev_namespace,
+            packaged=packaged,
+            package_target=package_target,
+            prior=prior,
         )
         if reading.usages and (found := reference_index()) is not None:
             precedent = _precedent(
@@ -215,7 +251,26 @@ def draft(
             )
             if precedent:
                 drafted["precedent"] = precedent
-        missing = _missing(declared, reading)
+        documented = (package_documented or {}).get(model)
+        parent_draft = None
+        if not documented and (stated := facts()) is not None:
+            parent_draft = _draft_parent(
+                model,
+                reading,
+                declared,
+                files,
+                model_paths,
+                cache,
+                stated,
+                reference_index,
+                packaged,
+                dialect,
+                vars,
+                warnings,
+            )
+            if parent_draft is not None:
+                drafted["population_parent"] = parent_draft.as_dict()
+        missing = [] if documented else _missing(declared, reading)
         found = _contradictions(
             model,
             reading,
@@ -239,8 +294,12 @@ def draft(
             grain_judged=any(c["check"] == "grain" for c in found or []),
         )
         model_warnings.extend(_literal_warnings(model, reading, cache))
-        if not declared.get("history") and _reads_snapshot_history(
-            files[sql_path], files
+        if parent_draft is not None and parent_draft.model is not None:
+            model_warnings.append(_parent_draft_warning(model, parent_draft))
+        if (
+            not documented
+            and not declared.get("history")
+            and _reads_snapshot_history(files[sql_path], files)
         ):
             missing.append("history")
             model_warnings.append(
@@ -254,12 +313,123 @@ def draft(
             "declared": declared,
             "missing": _untoken(missing, reading.tokens),
         }
+        if documented:
+            out[model]["package_documented"] = dict(documented)
         if isinstance(declared.get("population"), dict):
             out[model]["population_contract"] = population_contract(declared)
         if found is not None:
             out[model]["contradictions"] = found
         warnings.extend(_untoken(model_warnings, reading.tokens))
     return out, warnings
+
+
+def _facts_from_files(
+    files: Mapping[str, str],
+    model_paths: Iterable[str],
+    manifest: Mapping[str, Any] | None = None,
+) -> KeyFacts | None:
+    """Build key facts directly from project files and manifest when
+    key_facts is not supplied."""
+
+    from types import SimpleNamespace
+
+    from ..dbt_project import _declared_from_manifest, _declared_from_yaml
+    from ..project_definitions import ProjectDefinitions
+    from .population_inference import key_facts
+
+    defs_list: list[ProjectDefinitions] = []
+    try:
+        from_yaml = ProjectDefinitions(present=True)
+        view = SimpleNamespace(
+            files={p: SimpleNamespace(path=p, content=c) for p, c in files.items()},
+            model_paths=list(model_paths),
+        )
+        _declared_from_yaml(view, from_yaml)
+        defs_list.append(from_yaml)
+    except Exception:  # noqa: S110 - a key fact is evidence, never a failure
+        pass
+    if manifest and isinstance(manifest.get("nodes"), dict):
+        try:
+            compiled = ProjectDefinitions(present=True)
+            _declared_from_manifest(dict(manifest), compiled)
+            defs_list.append(compiled)
+        except Exception:  # noqa: S110 - a key fact is evidence, never a failure
+            pass
+    return key_facts(*defs_list) if defs_list else None
+
+
+def _draft_parent(
+    model: str,
+    reading: _Reading,
+    declared: dict[str, Any],
+    files: Mapping[str, str],
+    model_paths: list[str],
+    cache: DexCache | None,
+    stated: KeyFacts,
+    index: Callable[[], ReferenceIndex | None],
+    packaged: Callable[[str], str | None] | None,
+    dialect: str,
+    vars: Mapping[str, Any] | None,
+    warnings: list[str],
+) -> Draft | None:
+    """The parent drafted for a model that declares none (#1228); commentary,
+    so a defect is a warning naming the exception and never a missing draft."""
+
+    from .population_inference import draft_parent
+
+    try:
+        if not reading.grain and stated.unique:
+            path = model_sql_path(files, model_paths, model)
+            if path is not None:
+                reading = read(
+                    files[path],
+                    cache,
+                    dialect=dialect,
+                    vars=vars,
+                    files=files,
+                    model_paths=model_paths,
+                    known_keys=stated.known_keys(),
+                )
+        return draft_parent(
+            model,
+            reading,
+            declared=declared,
+            files=files,
+            model_paths=model_paths,
+            cache=cache,
+            facts=stated,
+            index=index(),
+            packaged=packaged,
+            dialect=dialect,
+            vars=vars,
+        )
+    except Exception as exc:
+        warnings.append(
+            f"could not draft the parent of '{model}' ({type(exc).__name__}: "
+            f"{exc}); the plan itself is unaffected"
+        )
+        return None
+
+
+def _parent_draft_warning(model: str, draft: Draft) -> str:
+    """One sentence naming the drafted parent, what it rests on, and what the
+    build will do with it."""
+
+    key = ", ".join(f"{o} -> {draft.model}.{p}" for o, p in draft.key.items())
+    sentence = (
+        f"'{model}' declares no population.parent; dex drafts {draft.model} "
+        f"({key}) from {draft.evidence} evidence. `transform build --verify` "
+        "measures the model against it (orphan keys, missing parents, parents "
+        "with no children); declare the parent, or record the population you "
+        "intend as an assumption"
+    )
+    if draft.drives_from_parent is False:
+        sentence += (
+            f". Its rows are driven from {', '.join(draft.driving)}, outside "
+            f"{draft.model}'s lineage, so its keys are whatever that relation "
+            "holds"
+        )
+    return sentence
 
 
 def _contradictions(
@@ -434,12 +604,15 @@ def read(
     vars: Mapping[str, Any] | None,
     files: Mapping[str, str] | None = None,
     model_paths: list[str] | None = None,
+    known_keys: Mapping[str, Any] | None = None,
 ) -> _Reading:
     """Read one model's SQL statically.
 
     ``files`` and ``model_paths`` let profile lookups resolve a relation to the
     model's configured alias; readers without them still read everything that
-    needs no alias.
+    needs no alias. ``known_keys`` maps a lowered relation name to keys the
+    project tests or declares unique on it, which stand in where the cache has
+    no profile (#1228, #1252).
     """
     reading = _Reading()
     try:
@@ -484,7 +657,13 @@ def read(
         return reading
 
     _Lineage(
-        tree, relations, cache, reading, files=files, model_paths=model_paths
+        tree,
+        relations,
+        cache,
+        reading,
+        files=files,
+        model_paths=model_paths,
+        known_keys=known_keys,
     ).run()
     return reading
 
@@ -509,8 +688,11 @@ class _Lineage:
         reading: _Reading,
         files: Mapping[str, str] | None = None,
         model_paths: list[str] | None = None,
+        known_keys: Mapping[str, Any] | None = None,
     ) -> None:
         from .. import sql_shape
+
+        self.known_keys = known_keys or {}
 
         self.shape = sql_shape
         self.tree = tree
@@ -557,6 +739,7 @@ class _Lineage:
                 origin = self.origin(self.tree, expression)
                 if origin is not None:
                     self.reading.origins[name] = origin
+            self._read_children(outputs)
 
         keys, evidence = self.keys(self.tree)
         if keys:
@@ -642,6 +825,64 @@ class _Lineage:
                         "its driving relation is generated in SQL or is not a "
                         "table or subquery dex can follow"
                     )
+
+    def _read_children(self, outputs: dict[str, Any]) -> None:
+        """Which output columns describe a child rather than the row's entity:
+        those an aggregate produces, and those carried from the outer side of a
+        join. A parent kept with no children reads NULL or zero in all of them,
+        which is what verification counts (#1228). Commentary only: a column
+        whose lineage cannot be followed is simply not listed, and nothing it
+        tried is recorded as incomplete."""
+
+        noted = len(self.reading.incomplete)
+        for name, expression in outputs.items():
+            found = self._child_kind(self.tree, expression, 0)
+            if found == "aggregate":
+                self.reading.aggregated.append(name)
+            elif found == "outer":
+                self.reading.outer_joined.append(name)
+        del self.reading.incomplete[noted:]
+
+    def _child_kind(self, select: Any, expression: Any, depth: int) -> str | None:
+        """``aggregate`` where ``expression`` is computed by an aggregate,
+        through any CTE or subquery, ``outer`` where it reads a column from the
+        outer side of a join, otherwise ``None``."""
+
+        from sqlglot import expressions as exp
+
+        if depth > 32 or expression is None:
+            return None
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            return None
+        if any(
+            node.find_ancestor(exp.Select) in (None, select)
+            for node in expression.find_all(exp.AggFunc)
+        ):
+            return "aggregate"
+        outer = False
+        for column in expression.find_all(exp.Column):
+            if isinstance(column.this, exp.Star):
+                continue
+            found = self.source_of(select, column)
+            if found is None:
+                continue
+            _alias, relation, join = found
+            if self.outer_join(select, join) is not None and join is not None:
+                outer = True
+            kind, target = self.target(relation)
+            if kind != "scope":
+                continue
+            inner_outputs = self.outputs(target)
+            inner = (
+                None
+                if inner_outputs is None
+                else inner_outputs.get(column.name.lower())
+            )
+            deeper = self._child_kind(target, inner, depth + 1)
+            if deeper == "aggregate":
+                return "aggregate"
+            outer = outer or deeper == "outer"
+        return "outer" if outer else None
 
     @staticmethod
     def _output_order(outputs: dict[str, Any] | None):
@@ -1038,20 +1279,59 @@ class _Lineage:
         if kind != "physical":
             return [], "its driving relation is not one dex can follow"
         dataset = dataset_for(self.cache, target)
-        if dataset is None or not dataset.columns:
-            return [], f"{target} is not profiled, so no key of it is proven"
-        proven = proven_keys(dataset)
-        if not proven:
+        if dataset is not None and dataset.columns:
+            proven = proven_keys(dataset)
+            if proven:
+                lowered = [frozenset(c.lower() for c in key) for key in proven]
+                shown = " + ".join(", ".join(key) for key in proven)
+                verb = (
+                    "is a proven unique key"
+                    if len(proven) == 1
+                    else "are proven unique keys"
+                )
+                return lowered, f"{shown} {verb} of {target}"
             return [], f"{target} has no proven unique key in the cache"
-        lowered = [frozenset(c.lower() for c in key) for key in proven]
-        # The evidence cites every proven key, not just the first: the grain
-        # choice may prefer a later candidate (a PII-flagged first key, #1079),
-        # and the citation must name the key it proves.
-        shown = " + ".join(", ".join(key) for key in proven)
-        verb = (
-            "is a proven unique key" if len(proven) == 1 else "are proven unique keys"
-        )
-        return lowered, f"{shown} {verb} of {target}"
+
+        stated_raw = self.known_keys.get(target.rsplit(".", 1)[-1].lower())
+        if stated_raw:
+            stated: list[tuple[list[str], str]] = []
+            for item in stated_raw:
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 2
+                    and isinstance(item[1], str)
+                ):
+                    stated.append((list(item[0]), item[1]))
+                else:
+                    stated.append((list(item), "a unique test"))
+
+            lowered = [frozenset(c.lower() for c in key) for key, _ in stated]
+            evidences = []
+            for key, source in stated:
+                col_names = ", ".join(key)
+                if source == "its declared grain":
+                    evidences.append(f"{col_names} is the declared grain of {target}")
+                elif source == "its primary entity":
+                    evidences.append(f"{col_names} is the primary entity of {target}")
+                elif source in ("its primary key", "a primary key"):
+                    evidences.append(f"{col_names} is the primary key of {target}")
+                elif source == "a unique test":
+                    evidences.append(f"{col_names} has a unique test on {target}")
+                elif source in (
+                    "a unique_combination_of_columns test",
+                    "a combination test",
+                ):
+                    evidences.append(
+                        f"{col_names} has a unique_combination_of_columns test "
+                        f"on {target}"
+                    )
+                elif source.startswith("a ") and source.endswith(" test"):
+                    evidences.append(f"{col_names} has {source} on {target}")
+                else:
+                    evidences.append(f"{col_names} ({source}) on {target}")
+            return lowered, "; ".join(evidences)
+
+        return [], f"{target} is not profiled, so no key of it is proven"
 
     def _equated(self, join: Any, joined_alias: str) -> frozenset[str]:
         """Joined-side columns the ON (or USING) requires equal to something."""
@@ -1413,6 +1693,38 @@ def _column(dataset: Dataset | None, name: str) -> ColumnProfile | None:
     return next((c for c in dataset.columns if c.name.lower() == name.lower()), None)
 
 
+def _is_plan_created_or_edited(
+    files: Mapping[str, str],
+    prior: Mapping[str, str] | None,
+    model_paths: list[str],
+    relation: str,
+) -> bool:
+    """whether ``relation`` is created or edited by the current plan."""
+
+    if prior is None:
+        return False
+    current_path = model_sql_path(files, model_paths, relation)
+    if current_path is None:
+        return False
+    prior_path = model_sql_path(prior, model_paths, relation)
+    if prior_path is None:
+        return True
+    return prior.get(prior_path) != files.get(current_path)
+
+
+_MACRO_GENERATE_SCHEMA_NAME = re.compile(r"\{%-?\s*macro\s+generate_schema_name\b")
+
+
+def _has_custom_generate_schema_name(files: Mapping[str, str]) -> bool:
+    """whether the project overrides dbt's default ``generate_schema_name``."""
+
+    return any(
+        bool(_MACRO_GENERATE_SCHEMA_NAME.search(content))
+        for path, content in files.items()
+        if path.endswith(".sql")
+    )
+
+
 # --- assembling the draft -------------------------------------------------------------
 
 
@@ -1427,6 +1739,9 @@ def _drafted(
     cache_note: str | None,
     model: str | None = None,
     dev_namespace: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
+    package_target: Callable[[str], Any] | None = None,
+    prior: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     drafted: dict[str, Any] = {}
     if reading.grain:
@@ -1448,6 +1763,7 @@ def _drafted(
             model_paths,
             cumulative=cumulative,
             model=model,
+            packaged=packaged,
         )
         if facts:
             columns[name] = facts
@@ -1484,6 +1800,17 @@ def _drafted(
                     f"({', '.join(ambiguous)}), and a ref() is read by name, so "
                     "no profile run can settle which one it means"
                 )
+            elif _is_plan_created_or_edited(files, prior, model_paths, relation):
+                built = _alias_of_model(files, model_paths, relation) or relation
+                if dev_namespace is not None:
+                    build_cmd = "transform build --target dev"
+                    target_cmd = f"explore profile {dev_namespace}.{built} --target dev"
+                else:
+                    build_cmd = "transform build"
+                    target_cmd = f"explore profile {built}"
+                entry["reason"] = (
+                    f"it is built by this plan; run `{build_cmd}`, then `{target_cmd}`"
+                )
             elif (
                 dev_namespace is not None
                 and model_sql_path(files, model_paths, relation) is not None
@@ -1499,6 +1826,45 @@ def _drafted(
                 entry["command"] = (
                     f"explore profile {dev_namespace}.{built} --target dev"
                 )
+            elif dev_namespace is not None and (
+                (packaged is not None and packaged(relation) is not None)
+                or (package_target is not None and package_target(relation) is not None)
+            ):
+                # an installed package model or seed. under dbt's default
+                # generate_schema_name, a custom schema is appended to the dev
+                # target's schema (<target.schema>_<custom>). when the project
+                # overrides generate_schema_name, the effective dev namespace
+                # cannot be safely determined, so withhold the command.
+                target = (
+                    package_target(relation) if package_target is not None else None
+                )
+                custom = getattr(target, "schema", None) if target is not None else None
+                if custom:
+                    if _has_custom_generate_schema_name(files):
+                        entry["reason"] = cache_note or (
+                            "the cache has not profiled it, and the project overrides "
+                            "generate_schema_name so its dev namespace cannot be "
+                            "determined"
+                        )
+                    else:
+                        parts = dev_namespace.split(".")
+                        derived = ".".join([*parts[:-1], f"{parts[-1]}_{custom}"])
+                        entry["reason"] = cache_note or (
+                            "the cache has not profiled it, and its dev build in "
+                            f"{derived} is outside the source allowlist"
+                        )
+                        entry["command"] = (
+                            f"explore profile {derived}.{relation} --target dev"
+                        )
+                else:
+                    derived = dev_namespace
+                    entry["reason"] = cache_note or (
+                        "the cache has not profiled it, and its dev build in "
+                        f"{derived} is outside the source allowlist"
+                    )
+                    entry["command"] = (
+                        f"explore profile {derived}.{relation} --target dev"
+                    )
             else:
                 entry["reason"] = cache_note or "the cache has not profiled it"
                 entry["command"] = f"explore profile {relation}"
@@ -1520,6 +1886,7 @@ def _column_facts(
     *,
     cumulative: Mapping[str, set[str]],
     model: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     facts: dict[str, Any] = {}
     if origin is not None:
@@ -1539,18 +1906,32 @@ def _column_facts(
         }
     elif origin is not None and dataset is not None and cache is not None:
         reference = _verified_reference(
-            cache, dataset, origin.column, files, model_paths, model=model
+            cache,
+            dataset,
+            origin.column,
+            files,
+            model_paths,
+            model=model,
+            packaged=packaged,
         )
-        if model is not None and not _reachable(reference, files, model_paths):
+        if model is not None and not _reachable(
+            reference, files, model_paths, packaged
+        ):
             # A staging model's column comes from a raw table, whose joins on a
             # warehouse reach only other raw tables (#892). Once the model is
             # built, its own relation's joins reach the models beside it.
             built = _dataset_for_model(cache, model, files, model_paths)
             if built is not None and built is not dataset:
                 own = _verified_reference(
-                    cache, built, name, files, model_paths, model=model
+                    cache,
+                    built,
+                    name,
+                    files,
+                    model_paths,
+                    model=model,
+                    packaged=packaged,
                 )
-                if _reachable(own, files, model_paths):
+                if _reachable(own, files, model_paths, packaged):
                     reference = own
         if reference is not None and reference[0] is not None:
             facts["role"] = {"value": "foreign_key", "evidence": reference[1]}
@@ -1705,6 +2086,7 @@ def _verified_reference(
     model_paths: list[str],
     *,
     model: str | None = None,
+    packaged: Callable[[str], str | None] | None = None,
 ) -> tuple[str | None, str] | None:
     """The reference a verified join supports: ``(target, evidence)``, or
     ``(None, why)`` for a join that was measured and did not hold.
@@ -1720,8 +2102,10 @@ def _verified_reference(
     measured not unique is no key to reference, and the model itself is no
     parent. Of the clean joins left, a model of this project comes first (a
     ``references`` names something ``ref()`` can reach), then a seed or snapshot,
-    then the model nearest this one in the project tree, so a mart references
-    the dimension beside it and a staging model the staging model beside it.
+    then a model, seed or snapshot of an installed package (``packaged`` names
+    its package, #1155), then the model nearest this one in the project tree,
+    so a mart references the dimension beside it and a staging model the
+    staging model beside it.
     """
 
     candidates = [
@@ -1749,8 +2133,10 @@ def _verified_reference(
             kind = 0
         elif _is_seed_or_snapshot(files, model_paths, parent):
             kind = 1
-        else:
+        elif packaged is not None and packaged(parent) is not None:
             kind = 2
+        else:
+            kind = 3
         shared = 0
         if path is not None and here is not None:
             for a, b in zip(
@@ -1802,7 +2188,10 @@ def _verified_reference(
         parent_column = parent_column.lower()
     target = f"{parent}.{parent_column}"
     evidence = f"{joined(edge)} was verified, no orphans"
-    if model_sql_path(files, model_paths, parent) is None:
+    package = packaged(parent) if packaged is not None else None
+    if package is not None and model_sql_path(files, model_paths, parent) is None:
+        evidence += f"; {parent} is defined by the installed package {package}"
+    elif model_sql_path(files, model_paths, parent) is None:
         evidence += (
             f"; {parent} is not a model of this project, so declare `references` "
             "only once one stands for it"
@@ -1819,16 +2208,20 @@ def _reachable(
     reference: tuple[str | None, str] | None,
     files: Mapping[str, str],
     model_paths: list[str],
+    packaged: Callable[[str], str | None] | None = None,
 ) -> bool:
     """Whether a drafted reference names something ``ref()`` reaches: a model,
-    seed or snapshot of this project, rather than a raw table."""
+    seed or snapshot of this project or of an installed package, rather than a
+    raw table."""
 
     if reference is None or reference[0] is None:
         return False
     parent = reference[0].rsplit(".", 1)[0]
-    return model_sql_path(
-        files, model_paths, parent
-    ) is not None or _is_seed_or_snapshot(files, model_paths, parent)
+    return (
+        model_sql_path(files, model_paths, parent) is not None
+        or _is_seed_or_snapshot(files, model_paths, parent)
+        or (packaged is not None and packaged(parent) is not None)
+    )
 
 
 def _project_name(

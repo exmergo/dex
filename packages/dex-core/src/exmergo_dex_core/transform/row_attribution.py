@@ -658,8 +658,10 @@ def _rejoin_on(select: exp.Select, key: str, on: exp.Expression | None) -> None:
 
 
 def _grain_changes(
-    scope: str, prior: exp.Select, authored: exp.Select
+    scope: str, prior: exp.Select, authored: exp.Select, dialect: str
 ) -> list[_Change]:
+    """Report DISTINCT or GROUP BY edits that can change a scope's row grain."""
+
     changes: list[_Change] = []
     was_distinct = prior.args.get("distinct") is not None
     is_distinct = authored.args.get("distinct") is not None
@@ -679,7 +681,9 @@ def _grain_changes(
         )
 
     before, after = sql_shape.group_by(prior), sql_shape.group_by(authored)
-    if sql_shape.group_by_keys(prior) != sql_shape.group_by_keys(authored):
+    if sql_shape.group_by_key(prior, dialect) != sql_shape.group_by_key(
+        authored, dialect
+    ):
         group = authored.args.get("group")
         changes.append(
             _Change(
@@ -746,6 +750,29 @@ def _source_changes(
     ]
 
 
+def changed_set_operations(
+    prior: Mapping[str, exp.Expression], authored: Mapping[str, exp.Expression]
+) -> list[str]:
+    """Scopes both versions share where either side is a set operation and the
+    two differ, sorted.
+
+    A UNION, INTERSECT or EXCEPT on either side counts, so a scope that becomes
+    a set operation or stops being one is here too. Table qualifiers and case
+    are ignored, so re-aliasing a branch is not a change.
+    """
+
+    return sorted(
+        name
+        for name in prior.keys() & authored.keys()
+        if not (
+            isinstance(prior[name], exp.Select)
+            and isinstance(authored[name], exp.Select)
+        )
+        and sql_shape.unqualified_key(prior[name])
+        != sql_shape.unqualified_key(authored[name])
+    )
+
+
 def classify(
     prior_sql: str, authored_sql: str, dialect: str
 ) -> tuple[list[_Change], list[RowPopulationChange]]:
@@ -805,6 +832,26 @@ def classify(
         )
         for name in sorted(prior_scopes.keys() - authored_scopes.keys())
     )
+    # The comparison below reads SELECT against SELECT, so a changed set
+    # operation would otherwise report nothing and read as an edit that moves no
+    # rows (#1163).
+    unresolved.extend(
+        RowPopulationChange(
+            scope=name,
+            kind="unattributable",
+            detail=(
+                f"the set operation in `{name}` changed and its branches were "
+                "not compared"
+            ),
+            attributed=False,
+            reason=(
+                "row attribution compares a SELECT with a SELECT, and a UNION, "
+                "INTERSECT or EXCEPT is not compared branch by branch, so any "
+                "row-population effect it has is folded into the whole-model net"
+            ),
+        )
+        for name in changed_set_operations(prior_scopes, authored_scopes)
+    )
 
     for name in prior_scopes.keys() & authored_scopes.keys():
         before, after = prior_scopes[name], authored_scopes[name]
@@ -814,7 +861,7 @@ def classify(
         for clause in ("where", "having", "qualify"):
             changes.extend(_clause_changes(name, before, after, clause, dialect))
         changes.extend(_join_changes(name, before, after, prior_ctes, authored_ctes))
-        changes.extend(_grain_changes(name, before, after))
+        changes.extend(_grain_changes(name, before, after, dialect))
 
     # A stable order so a re-plan of the same edit reports the same sequence:
     # the final select last, since that is where a reader ends up looking.
