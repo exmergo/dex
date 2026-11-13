@@ -454,6 +454,16 @@ def test_quoted_identifier_case_difference_in_group_by_is_reported_as_grain_chan
     assert changes[0].kind == "group_by_changed"
 
 
+def test_quoted_identifier_case_difference_in_group_by_is_silent_in_duckdb():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = 'select count(*) from t group by "Status"'
+    authored = 'select count(*) from t group by "status"'
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert unattr == []
+
+
 def test_unquoted_identifier_case_difference_in_group_by_reports_no_change():
     from exmergo_dex_core.transform.row_attribution import classify
 

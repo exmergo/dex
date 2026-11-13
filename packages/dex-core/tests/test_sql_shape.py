@@ -265,10 +265,20 @@ def test_group_by_key_preserves_string_literal_case():
     assert sql_shape.group_by_key(upper) != sql_shape.group_by_key(lower)
 
 
-def test_group_by_key_preserves_quoted_identifier_case():
+def test_group_by_key_preserves_postgres_quoted_identifier_case():
     upper = _parse('select count(*) from t group by "Status"')
     lower = _parse('select count(*) from t group by "status"')
-    assert sql_shape.group_by_key(upper) != sql_shape.group_by_key(lower)
+    assert sql_shape.group_by_key(upper, "postgres") != sql_shape.group_by_key(
+        lower, "postgres"
+    )
+
+
+def test_group_by_key_folds_duckdb_quoted_identifier_case():
+    upper = _parse('select count(*) from t group by "Status"')
+    lower = _parse('select count(*) from t group by "status"')
+    assert sql_shape.group_by_key(upper, "duckdb") == sql_shape.group_by_key(
+        lower, "duckdb"
+    )
 
 
 def test_group_by_key_folds_unquoted_identifier_case():
