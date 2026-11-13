@@ -275,6 +275,61 @@ def query_columns(source: str) -> tuple[list[str], list[str]] | None:
     return found, ambiguous
 
 
+def _has_aggregate(select: exp.Select) -> bool:
+    """Whether the select list aggregates its rows, outside window functions.
+
+    A window function keeps the row count, so the windowed function itself
+    does not count; neither does an aggregate inside a subquery, which
+    aggregates that query's rows rather than this one's. But an aggregate
+    nested inside a windowed function's arguments, its FILTER or WITHIN
+    GROUP operands, or its window specification aggregates the rows before
+    the window runs, so it does count.
+    """
+
+    pending = list(select.expressions)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (exp.Subquery, exp.Select)):
+            continue
+        if isinstance(node, exp.Window):
+            pending.extend(_window_parts(node))
+            continue
+        if isinstance(node, exp.AggFunc):
+            return True
+        pending.extend(node.iter_expressions())
+    return False
+
+
+def _window_parts(window: exp.Window) -> list[exp.Expression]:
+    """The parts of a window function that may hide an aggregate.
+
+    The windowed function itself is left out: it keeps the row count, so it
+    does not count. What is checked is its arguments, its FILTER predicate
+    and WITHIN GROUP operand, and its window specification (partition and
+    order), where a nested aggregate would run before the window. Null
+    treatment modifiers (IGNORE NULLS, RESPECT NULLS) wrap the windowed
+    function and are unwrapped first, so the function itself is still left
+    out rather than counted as an aggregate.
+    """
+
+    func = window.this
+    parts: list[exp.Expression] = []
+    while isinstance(
+        func, (exp.Filter, exp.WithinGroup, exp.IgnoreNulls, exp.RespectNulls)
+    ):
+        if isinstance(func, (exp.Filter, exp.WithinGroup)) and (
+            func.expression is not None
+        ):
+            parts.append(func.expression)
+        func = func.this
+    if func is not None:
+        parts.extend(func.iter_expressions())
+    parts.extend(
+        child for child in window.iter_expressions() if child is not window.this
+    )
+    return parts
+
+
 def source_relation(source: str) -> SourceRelation:
     """A ``source`` as the relation behind it.
 
@@ -307,6 +362,8 @@ def source_relation(source: str) -> SourceRelation:
         for name, present in (
             ("a join", bool(tree.args.get("joins"))),
             ("a GROUP BY", tree.args.get("group") is not None),
+            ("an aggregate", _has_aggregate(tree)),
+            ("a HAVING", tree.args.get("having") is not None),
             ("DISTINCT", tree.args.get("distinct") is not None),
             ("a LIMIT", tree.args.get("limit") is not None),
             (

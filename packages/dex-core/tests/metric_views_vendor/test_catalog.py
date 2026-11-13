@@ -236,6 +236,65 @@ def test_a_projection_query_source_is_its_table_and_a_filtered_one_is_not(
     assert any("filters `demo.main.orders`" in n for n in catalog.notes)
 
 
+def test_an_aggregating_query_source_claims_no_relation_and_a_windowed_one_keeps_it(
+    tmp_path: Path,
+):
+    """An aggregate or HAVING with no GROUP BY claims no relation; a window
+    function keeps the row count, so it keeps the claim."""
+    aggregated = view(
+        "SELECT SUM(amount) AS total FROM demo.main.orders",
+        fields=[{"name": "total", "expr": "total"}],
+    )
+    having = view(
+        "SELECT order_id FROM demo.main.orders HAVING SUM(amount) > 0",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
+    windowed = view(
+        "SELECT order_id, SUM(amount) OVER (PARTITION BY status) AS running "
+        "FROM demo.main.orders",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
+    nested = view(
+        "SELECT SUM(SUM(amount)) OVER () AS total FROM demo.main.orders",
+        fields=[{"name": "total", "expr": "total"}],
+    )
+    ignore_nulls = view(
+        "SELECT order_id, FIRST_VALUE(amount) IGNORE NULLS OVER () AS "
+        "first_amount FROM demo.main.orders",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
+    respect_nulls = view(
+        "SELECT order_id, FIRST_VALUE(amount) RESPECT NULLS OVER () AS "
+        "first_amount FROM demo.main.orders",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
+    layer = source(
+        tmp_path,
+        aggregated=aggregated,
+        having=having,
+        windowed=windowed,
+        nested=nested,
+        ignore_nulls=ignore_nulls,
+        respect_nulls=respect_nulls,
+    )
+    catalog = layer.semantic_catalog()
+    models = _by(catalog.semantic_models)
+    notes = " ".join(catalog.notes)
+
+    assert models["aggregated"].relation is None
+    assert models["having"].relation is None
+    assert models["windowed"].relation == "demo.main.orders"
+    # The inner SUM aggregates the table to one row before the outer window
+    # runs, so the nested windowed aggregate claims no relation either.
+    assert models["nested"].relation is None
+    # A windowed FIRST_VALUE with a null-treatment modifier is still a
+    # row-preserving window function, so it keeps the claim.
+    assert models["ignore_nulls"].relation == "demo.main.orders"
+    assert models["respect_nulls"].relation == "demo.main.orders"
+    assert "has an aggregate" in notes
+    assert "has a HAVING" in notes
+
+
 def test_a_field_reading_an_earlier_field_resolves_through_it(tmp_path: Path):
     """A bare name matching an earlier field is that field."""
     body = view(
