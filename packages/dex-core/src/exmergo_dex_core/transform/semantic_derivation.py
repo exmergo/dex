@@ -952,6 +952,7 @@ class MetricFlowDerivation:
         ]
 
         derivations: list[Derivation] = []
+        claimed: dict[str, str] = {}
         for declaration in request.declarations:
             model, sql_path = declaration.model, declaration.source_path
             derivation = derive(
@@ -966,6 +967,19 @@ class MetricFlowDerivation:
             check_collisions(derivation, docs, on_ref)
             if derivation.status in ("skipped", "failed"):
                 continue
+            name = (derivation.body or {}).get("name")
+            if name:
+                claimed_by = claimed.get(name)
+                if claimed_by is not None:
+                    derivation.status = "failed"
+                    derivation.blocked = (
+                        f"semantic model name '{name}' is already derived for "
+                        f"{claimed_by} in this plan; two marts that normalize to the "
+                        "same name would replace each other, so rename one of them "
+                        "(dex does not rename either)"
+                    )
+                    continue
+                claimed[name] = derivation.model
             place(derivation, sql_path, docs, edits)
             try:
                 splice(derivation, files)

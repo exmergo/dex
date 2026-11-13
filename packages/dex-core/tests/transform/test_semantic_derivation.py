@@ -940,7 +940,7 @@ def test_a_mart_named_with_double_underscore_derives_single_underscore_name():
 
 
 def test_a_double_underscore_mart_gets_proposal_passing_metricflow_validation(
-    dbt_project_dir: Path, tmp_path: Path, capsys
+    dbt_project_dir: Path, tmp_path: Path, capsys, real_dbt
 ):
     """End-to-end plan with a double-underscore mart proposes valid MetricFlow
     YAML (#1207)."""
@@ -972,3 +972,58 @@ def test_a_double_underscore_mart_gets_proposal_passing_metricflow_validation(
     assert "ref('intercom__threads')" in model_data["content"]
     assert "name: intercom_threads" in model_data["content"]
     assert not any("regex" in w.lower() for w in envelope.get("warnings", []))
+
+
+def test_two_marts_that_normalize_to_one_name_cannot_both_derive(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`intercom__threads` and `intercom_threads` derive one MetricFlow name, so
+    the second is refused rather than spliced over the first (#1207)."""
+    thread_mart = {
+        "description": "One row per thread.",
+        "grain": ["order_id"],
+        "columns": {
+            "order_id": {"role": "key"},
+            "status": {"role": "dimension"},
+            "order_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/intercom__threads.sql",
+                "kind": "model_sql",
+                "content": MART_SQL,
+            },
+            {
+                "path": "models/marts/intercom_threads.sql",
+                "kind": "model_sql",
+                "content": MART_SQL,
+            },
+        ],
+        "declarations": [
+            {**thread_mart, "model": "intercom__threads"},
+            {**thread_mart, "model": "intercom_threads"},
+        ],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "threads",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    first = models["intercom__threads"]
+    second = models["intercom_threads"]
+    assert first["status"] in ("proposed", "unvalidated")
+    assert second["status"] == "failed"
+    assert "already derived for intercom__threads" in second["reason"]
+    assert "semantic model name 'intercom_threads'" in second["reason"]
