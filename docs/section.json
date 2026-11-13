@@ -84,6 +84,7 @@
           {
             "group": "Semantic layer compatibility",
             "pages": [
+              "semantic-layers/dex-semantics",
               "semantic-layers/overview",
               "semantic-layers/ossie",
               "semantic-layers/cube",

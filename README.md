@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/preview-dark.png" />
-  <img alt="Dex: let your agent build your analytics. Explore, transform, maintain." src="assets/preview-light.png" />
+  <img alt="Dex: let your agent build your analytics. Explore, transform, maintain. Connects to your data and authors your semantic layer: dbt, SLayer, Cube, Apache Ossie, Snowflake Semantic Views and Databricks Metric Views." src="assets/preview-light.png" />
 </picture>
 
 > *Most deadly errors arise from obsolete assumptions.*
@@ -273,6 +273,35 @@ in `.dex/config.yml`; Ossie, SLayer, and Cube need no dbt project.
 | <img src="assets/cube-logo.png" width="20" height="20" alt=""> **[Cube](https://github.com/cube-js/cube)**                                                                                  | ✅          | 🚧      | ✅         | `cube` / `local`               | Plain YAML model files, read statically with no Node or Cube server; querying asks a running Cube server to render, Dex runs it under the cost guard          | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#cube-models-vendor-cube)                     |
 
 **Coming next:** hosted Cube, hosted SLayer, hosted & queryable Snowflake Semantic View, hosted and & queryable Databricks Metric Views and Looker / LookML.
+
+## Dex Semantics
+
+**Let your agent build analytics with 25% fewer errors**, thanks to data that
+explains itself to your coding agent.
+
+A join can keep running after the source changes underneath it, and quietly
+count every row twice. Dex Semantics keeps each model's meaning with the model,
+as code, so that kind of error is caught instead of shipped:
+
+- **Declare the rules.** Every model your agent creates or changes carries a
+  declaration: what one row is, which rows belong, how each number adds up, and
+  the assumptions behind it. Dex drafts what it measured; the intent is yours.
+- **Check the results.** `transform build --verify` holds the built data to the
+  declaration: duplicate keys, rows the population excludes, a running total
+  summed across time.
+- **Keep the context.** The declaration becomes dbt tests, is read back by the
+  next agent session, and derives the semantic model for any layer above.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/semantics-dark.png" />
+  <img width="760" height="340" alt="Dex Semantics: the declaration lives with your models (one row per shipment; production counts harvests; revenue uses the agreed price), Dex checks the built data (S01 and S02: expected 1 row, found 2; without Dex 200 t, with Dex 100 t), and the meaning flows to tests, semantic models and the next agent session" src="assets/readme/semantics-light.png" />
+</picture>
+
+25% fewer failed tasks on [ADE-bench](benchmarks/ade_bench/README.md) with
+Claude Sonnet 5.5 (15 against 20 of 75). The image is an illustrated workflow on
+synthetic data.
+
+[Dex Semantics](references/dex-semantics.md) · [declarations](skills/transform/references/declarations.md) · [the film](https://www.youtube.com/watch?v=-iYwYuzZFg0)
 
 ## See it on a real project
 
