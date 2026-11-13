@@ -391,6 +391,89 @@ def test_re_aliasing_a_relation_is_not_a_source_change(
     )
 
 
+def test_qualifying_a_group_by_key_is_not_reported_as_a_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select visit_date, count(*) from stg_visits group by visit_date"
+    authored = "select s.visit_date, count(*) from stg_visits s group by s.visit_date"
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert unattr == []
+
+
+def test_a_real_group_by_change_is_reported_by_classify():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select visit_date, count(*) from stg_visits group by visit_date"
+    authored = (
+        "select s.visit_date, count(*) from stg_visits s "
+        "group by s.visit_date, s.channel"
+    )
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+    assert (
+        "the GROUP BY changed from (visit_date) to (s.visit_date, s.channel)"
+        in changes[0].detail
+    )
+
+
+def test_swapping_joined_table_group_by_keys_is_reported_as_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select a.id from t_a a join t_b b on a.x = b.x group by a.id"
+    authored = "select b.id from t_a a join t_b b on a.x = b.x group by b.id"
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+
+
+def test_literal_case_difference_in_group_by_is_reported_as_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select count(*) from t group by case when status = 'US' then 1 else 0 end"
+    authored = (
+        "select count(*) from t group by case when status = 'us' then 1 else 0 end"
+    )
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+
+
+def test_quoted_identifier_case_difference_in_group_by_is_reported_as_grain_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = 'select count(*) from t group by "Status"'
+    authored = 'select count(*) from t group by "status"'
+    changes, unattr = classify(prior, authored, "postgres")
+    assert len(changes) == 1
+    assert unattr == []
+    assert changes[0].kind == "group_by_changed"
+
+
+def test_quoted_identifier_case_difference_in_group_by_is_silent_in_duckdb():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = 'select count(*) from t group by "Status"'
+    authored = 'select count(*) from t group by "status"'
+    changes, unattr = classify(prior, authored, "duckdb")
+    assert changes == []
+    assert unattr == []
+
+
+def test_unquoted_identifier_case_difference_in_group_by_reports_no_change():
+    from exmergo_dex_core.transform.row_attribution import classify
+
+    prior = "select count(*) from t group by status"
+    authored = "select count(*) from t group by STATUS"
+    changes, unattr = classify(prior, authored, "postgres")
+    assert changes == []
+    assert unattr == []
+
+
 def test_authoring_a_new_model_produces_no_findings_and_opens_nothing(
     attributable_project, plan_edit, capsys, monkeypatch
 ):

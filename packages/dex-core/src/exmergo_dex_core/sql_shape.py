@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sqlglot import expressions as exp
+from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
 from sqlglot.generator import Generator
 
 from .errors import DexError
@@ -230,8 +231,31 @@ def unqualified_key(node: exp.Expression) -> str:
     for select in bare.find_all(exp.Select):
         for relation in _relations(select):
             relation.set("alias", None)
+    return _render_expression_key(bare)
+
+
+def _case_sensitive_quoted_identifiers(dialect: str) -> bool:
+    """Whether quoted identifiers retain their case under ``dialect``."""
+
+    if not dialect:
+        return True
+    try:
+        resolved = Dialect.get(dialect.lower())
+    except (ValueError, KeyError, AttributeError):
+        resolved = None
+    if resolved is not None:
+        return resolved.NORMALIZATION_STRATEGY != NormalizationStrategy.CASE_INSENSITIVE
+    return dialect.lower() not in ("duckdb", "bigquery")
+
+
+def _render_expression_key(bare: exp.Expression, dialect: str = "") -> str:
+    """Render an expression key with unquoted identifiers folded to lowercase,
+    while preserving the case of quoted identifiers on case-sensitive dialects,
+    string literals, and quoted function names."""
+
+    fold_quoted = not _case_sensitive_quoted_identifiers(dialect)
     for identifier in bare.find_all(exp.Identifier):
-        if not identifier.quoted:
+        if not identifier.quoted or fold_quoted:
             identifier.set("this", identifier.this.lower())
     generator = Generator(comments=False, normalize_functions="lower")
     # A quoted function name keeps its case: in Postgres ``"IsActive"(id)`` and
@@ -241,7 +265,7 @@ def unqualified_key(node: exp.Expression) -> str:
     # a Generator subclass: sqlglot's compiled build (sqlglotc) refuses one.
     for call in reversed(list(bare.find_all(exp.Anonymous))):
         name = call.this
-        if not (isinstance(name, exp.Identifier) and name.quoted):
+        if not (isinstance(name, exp.Identifier) and name.quoted and not fold_quoted):
             continue
         rendered = exp.var(
             generator.func(
@@ -255,12 +279,14 @@ def unqualified_key(node: exp.Expression) -> str:
     return generator.generate(bare).strip()
 
 
-def _name_key(name: exp.Expression | str | None) -> str:
+def _name_key(name: exp.Expression | str | None, dialect: str = "") -> str:
     """A name as SQL resolves it here: an unquoted one folded to lower case, a
-    quoted one exactly as written, since ``"A"`` and ``"a"`` can be two aliases."""
+    quoted one exactly as written unless the dialect is case-insensitive."""
 
     if isinstance(name, exp.Identifier):
-        return name.this if name.quoted else name.this.lower()
+        if not name.quoted or not _case_sensitive_quoted_identifiers(dialect):
+            return name.this.lower()
+        return name.this
     return name.lower() if isinstance(name, str) else ""
 
 
@@ -385,7 +411,11 @@ def group_by_key(select: exp.Select, dialect: str = "") -> list[str]:
     sources = _relations(select)
     by_qualifier: dict[str, tuple[int, exp.Expression] | None] = {}
     for position, relation in enumerate(sources):
-        qualifier = relation.alias_or_name.lower()
+        alias = relation.args.get("alias")
+        name = alias.this if isinstance(alias, exp.TableAlias) else relation.this
+        if not isinstance(name, exp.Identifier):
+            name = relation.alias_or_name
+        qualifier = _name_key(name, dialect)
         if qualifier in by_qualifier:
             by_qualifier[qualifier] = None
         else:
@@ -407,7 +437,7 @@ def group_by_key(select: exp.Select, dialect: str = "") -> list[str]:
     )
 
     return [
-        _group_expression_key(expression, sources, by_qualifier, aliases)
+        _group_expression_key(expression, sources, by_qualifier, aliases, dialect)
         for expression in group.expressions
     ]
 
@@ -417,6 +447,7 @@ def _group_expression_key(
     sources: list[exp.Expression],
     by_qualifier: dict[str, tuple[int, exp.Expression] | None],
     aliases: dict[str, exp.Expression],
+    dialect: str = "",
 ) -> str:
     """Normalize only columns whose source relation this SELECT can establish."""
 
@@ -444,7 +475,7 @@ def _group_expression_key(
             continue
 
         if column.table:
-            source = by_qualifier.get(column.table.lower())
+            source = by_qualifier.get(_name_key(column.args.get("table"), dialect))
         elif len(sources) == 1:
             source = (0, sources[0])
         else:
@@ -462,12 +493,15 @@ def _group_expression_key(
         relation_db = relation.args.get("db")
         relation_catalog = relation.args.get("catalog")
         if column.db and (
-            relation_db is None or column.db.lower() != relation_db.name.lower()
+            relation_db is None
+            or _name_key(column.args.get("db"), dialect)
+            != _name_key(relation_db, dialect)
         ):
             continue
         if column.catalog and (
             relation_catalog is None
-            or column.catalog.lower() != relation_catalog.name.lower()
+            or _name_key(column.args.get("catalog"), dialect)
+            != _name_key(relation_catalog, dialect)
         ):
             continue
 
@@ -480,7 +514,13 @@ def _group_expression_key(
             "catalog", relation_catalog.copy() if relation_catalog is not None else None
         )
 
-    return match_key(bare)
+    return _render_expression_key(bare, dialect)
+
+
+def group_by_keys(select: exp.Select, dialect: str = "") -> list[str]:
+    """Compatibility alias for :func:`group_by_key`."""
+
+    return group_by_key(select, dialect)
 
 
 def _is_nested_select_column(column: exp.Column, expression: exp.Expression) -> bool:
