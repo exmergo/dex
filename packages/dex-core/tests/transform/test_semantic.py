@@ -2030,3 +2030,127 @@ def test_validate_semantic_yaml_falls_back_to_structural_check(monkeypatch):
         EditValidationError, match="needs at least name, type, and type_params"
     ):
         validate_semantic_yaml("models/semantic/customers.yml", bad_metric)
+
+
+def test_semantic_plan_refuses_uninstalled_packages_before_parse(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """A project with declared uninstalled packages refuses with reason prerequisite
+    and runs no dbt parse (#1206)."""
+    import importlib
+
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    calls = []
+
+    def fake(project_dir, edits, **_kwargs):
+        calls.append(list(edits))
+        return {"available": True, "reason": None, "success": True, "messages": []}
+
+    monkeypatch.setattr(build_module, "shadow_parse", fake)
+
+    # Give the project a time spine so authoring proceeds past the spine check to parse.
+    (dbt_project_dir / "models" / "metricflow_time_spine.sql").write_text(
+        "select cast(range as date) as date_day\n"
+        "from range(date '2020-01-01', date '2030-01-01', interval 1 day)\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "metricflow_time_spine.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: metricflow_time_spine\n"
+        "    time_spine:\n"
+        "      standard_granularity_column: date_day\n"
+        "    columns:\n"
+        "      - name: date_day\n"
+        "        granularity: day\n",
+        encoding="utf-8",
+    )
+
+    (dbt_project_dir / "packages.yml").write_text(
+        "packages:\n  - package: dbt-labs/dbt_utils\n    version: 1.3.0\n",
+        encoding="utf-8",
+    )
+
+    # 1. semantic plan refuses
+    payload = _payload_file(tmp_path, _VALID_SEMANTIC_YAML, name="plan.json")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "plan",
+            "add customers",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error", envelope
+    assert envelope["reason"] == "prerequisite"
+    message = envelope["errors"][0]
+    assert "dbt-labs/dbt_utils" in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    assert calls == []
+
+    # 2. semantic define refuses
+    payload_def = _payload_file(tmp_path, _VALID_SEMANTIC_YAML, name="def.json")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "define customers",
+            "--edits-file",
+            str(payload_def),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error", envelope
+    assert envelope["reason"] == "prerequisite"
+    assert "dbt-labs/dbt_utils" in envelope["errors"][0]
+    assert "transform deps" in envelope["errors"][0]
+    assert calls == []
+
+    # 3. semantic update refuses (when target definition exists in project)
+    (dbt_project_dir / "models" / "semantic").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "models" / "semantic" / "customers.yml").write_text(
+        _VALID_SEMANTIC_YAML, encoding="utf-8"
+    )
+    updated = _VALID_SEMANTIC_YAML.replace("Customer count", "Count of customers")
+    payload_upd = _payload_file(tmp_path, updated, name="upd.json")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "update",
+            "update customers",
+            "--edits-file",
+            str(payload_upd),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error", envelope
+    assert envelope["reason"] == "prerequisite"
+    assert "dbt-labs/dbt_utils" in envelope["errors"][0]
+    assert "transform deps" in envelope["errors"][0]
+    assert calls == []
+
+    # 4. --no-parse is unchanged and bypasses the check
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "plan",
+            "no parse plan",
+            "--no-parse",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope
+    assert calls == []
