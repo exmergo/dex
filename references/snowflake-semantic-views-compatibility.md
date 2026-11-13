@@ -244,9 +244,13 @@ metadata.
 | `declared_type_conflict` | `SUM`/`AVG` over text, a time dimension over a column that is not temporal, a declared `data_type` in another family than the column's |
 | `declared_dependency_dropped` | what the reader refuses once those go, to a fixpoint |
 
-Each finding names the view, the element (`tables['orders'].dimensions['region']`,
-`relationships['orders_customers']`, `tables['customers'].unique_keys[0]`) and the
-column. Probed on an account, Snowflake accepts all three type conflicts when the
+Each finding names the view and the element. `declared_column_missing` and
+`declared_type_conflict` name it in `data.element`
+(`tables['orders'].dimensions['region']`, `relationships['orders_customers']`,
+`tables['customers'].unique_keys[0]`) and carry the column. A
+`declared_relation_missing` names the logical table and has no column. One
+`declared_dependency_dropped` per relation lists each element it takes, with the
+reason, under `data.reasons`. Probed on an account, Snowflake accepts all three type conflicts when the
 view is created. What happens after that sets each one's severity and remedy:
 
 | Conflict | Snowflake | Dex |

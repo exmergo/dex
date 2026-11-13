@@ -187,7 +187,7 @@ def semantic_layer(
                     path=view.file,
                 )
                 if declared is not None:
-                    declarations[model_name] = declared
+                    declarations[model_name.lower()] = declared
             models.append(
                 SemanticModelDef(
                     name=model_name.lower(),

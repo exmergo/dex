@@ -838,3 +838,76 @@ def test_the_schema_axis_reads_snowflake_metadata(tmp_path):
     revenue = by_element["tables['orders'].metrics['revenue']"]
     assert revenue.code == "declared_type_conflict"
     assert revenue.data["declared"] == "SUM"
+
+
+# --- review fixes ------------------------------------------------------------------
+
+
+def test_a_dependency_is_reported_against_the_relation_that_caused_it(
+    warehouse, capsys
+):
+    """`orders.customer_region` reads `customers.region`; it goes because
+    customers lost a column, so a run scoped to customers keeps it."""
+
+    found, _ = _drift(capsys, warehouse, "ALTER TABLE customers DROP COLUMN region")
+
+    (cascade,) = _by_code(found)["declared_dependency_dropped"]
+    assert cascade["identifier"] == "demo.main.customers"
+    assert "customer_region" in " ".join(cascade["data"]["reasons"])
+
+
+def test_declarations_are_keyed_as_the_models_are(tmp_path):
+    from .conftest import source
+
+    view = yaml.safe_load(SALES_YAML.replace("name: sales", "name: SALES", 1))
+    layer = source(tmp_path, view).semantic_layer()
+
+    names = {m.name for m in layer.semantic_models}
+    assert set(layer.declarations) <= names
+    assert "sales.orders" in layer.declarations
+
+
+def test_a_quoted_read_keeps_its_spelling_on_snowflake(tmp_path):
+    """Snowflake folds an unquoted name to upper case and keeps a quoted one,
+    so an unquoted `note` is not the quoted column `"note"`."""
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+
+    from .conftest import source
+
+    text = SALES_YAML.replace(
+        "      - name: note\n        expr: note\n",
+        "      - name: note\n        expr: note\n"
+        "      - name: quoted_note\n        expr: '\"note\"'\n",
+    )
+    columns = [
+        ("ORDER_ID", "NUMBER"),
+        ("CUSTOMER_ID", "NUMBER"),
+        ("STATUS", "TEXT"),
+        ("note", "TEXT"),
+        ("AMOUNT", "NUMBER"),
+        ("PLACED_AT", "DATE"),
+    ]
+    datasets = [
+        Dataset(
+            identifier="DEMO.MAIN.ORDERS",
+            columns=[ColumnProfile(name=n, data_type=t) for n, t in columns],
+        ),
+        Dataset(
+            identifier="DEMO.MAIN.CUSTOMERS",
+            columns=[
+                ColumnProfile(name=n, data_type="TEXT")
+                for n in ("CUSTOMER_KEY", "REGION", "EMAIL")
+            ],
+        ),
+    ]
+    layer = source(tmp_path, yaml.safe_load(text), connector="snowflake")
+
+    findings, _notes = layer.declared_schema_drift(datasets, datasets)
+
+    missing = {
+        f.data["element"]: f.column
+        for f in findings
+        if f.code == "declared_column_missing"
+    }
+    assert missing == {"tables['orders'].dimensions['note']": "NOTE"}

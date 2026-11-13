@@ -69,6 +69,8 @@ class Read:
     qualifier: str | None
     name: str
     depth: int
+    #: Whether the name was written quoted, which keeps its spelling.
+    quoted: bool = False
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,11 @@ def _read(node: exp.Column) -> Read | None:
         if isinstance(parent, exp.AggFunc):
             depth += 1
         parent = parent.parent
-    return Read(qualifier=node.table or None, name=node.name, depth=depth)
+    identifier = node.this
+    quoted = bool(getattr(identifier, "quoted", False))
+    return Read(
+        qualifier=node.table or None, name=node.name, depth=depth, quoted=quoted
+    )
 
 
 def reads(sql: str) -> list[Read] | None:

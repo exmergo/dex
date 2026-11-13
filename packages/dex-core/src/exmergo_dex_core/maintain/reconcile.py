@@ -521,13 +521,16 @@ def _advisory(
             # key the referenced table declares (#1293).
             command = _semantic_update_command(source)
             where = f" with `{command}`" if command is not None else " in its file"
+            # The side that failed: a one-to-one relationship can fail on
+            # its left table too, not only on the one it references.
+            side = finding.data.get("side_model") or "the table"
             actions["join_cardinality_exceeded"] = (
                 f"{inferred} reads this relationship as "
-                f"{finding.data.get('claim')} from the key the referenced table "
-                "declares, and the data does not hold it, so measures aggregated "
-                "across it are inflated: dedup that table, or change its key or "
-                f"the relationship{where}. dex proposes no edit, because which "
-                "of the two is right is a decision"
+                f"{finding.data.get('claim')} from the keys its tables declare, "
+                f"and ({finding.column}) on {side} is not unique, so measures "
+                f"aggregated across it are inflated: dedup {side}, or change its "
+                f"key or the relationship{where}. dex proposes no edit, because "
+                "which of the two is right is a decision"
             )
     if finding.code == "key_lost_uniqueness" and finding.data.get("declared_by"):
         # The key lapsed, and a semantic layer still claims it (#1293): the

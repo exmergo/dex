@@ -118,6 +118,10 @@ class _Live:
 
     identifier: str
     types: dict[str, str]
+    #: Whether a name must match as spelled: on a connector that folds an
+    #: unquoted name to upper case (Snowflake), `CUSTOMER_ID` is not the
+    #: quoted column `"customer_id"`, so no case-insensitive fallback applies.
+    exact: bool = False
     folded: dict[str, list[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -125,12 +129,14 @@ class _Live:
             self.folded.setdefault(name.lower(), []).append(name)
 
     def find(self, column: str) -> str | None:
-        """The warehouse's spelling of ``column``: exact, else the one column
-        matching ignoring case, which is how Snowflake resolves an unquoted
-        name."""
+        """The warehouse's spelling of ``column``: exact, else, on a
+        connector that does not fold to upper case, the one column matching
+        ignoring case. ``column`` comes already folded where it was unquoted."""
 
         if column in self.types:
             return column
+        if self.exact:
+            return None
         found = self.folded.get(column.lower(), [])
         return found[0] if len(found) == 1 else None
 
@@ -156,6 +162,8 @@ class _ViewState:
     members: dict[_Key, _Cause] = field(default_factory=dict)
     data_types: dict[_Key, _Cause] = field(default_factory=dict)
     relationships: dict[str, _Cause] = field(default_factory=dict)
+    #: Each live logical table (lowered) to its warehouse identifier.
+    identifiers: dict[str, str] = field(default_factory=dict)
     #: Conflicts reported and left for a person, never cut.
     advised: dict[_Key, _Cause] = field(default_factory=dict)
     #: Logical tables whose relation is gone, lowered, to the baseline's id.
@@ -271,8 +279,10 @@ def declared_schema_drift(
             live = _Live(
                 identifier=dataset.identifier,
                 types={c.name: c.data_type for c in dataset.columns},
+                exact=fold("a") == "A",
             )
             live_tables[lowered] = live
+            state.identifiers[lowered] = live.identifier
             for column in definition_reads or []:
                 if live.find(fold(column)) is None:
                     state.held.append(
@@ -321,10 +331,13 @@ def declared_schema_drift(
                     target = resolve_read(view, member, read.qualifier, read.name)
                     if target.column is None:
                         continue
-                    if live.find(fold(target.column)) is None:
+                    # A quoted name is the column as spelled; only an unquoted
+                    # one folds.
+                    spelled = target.column if read.quoted else fold(target.column)
+                    if live.find(spelled) is None:
                         state.members[_key(member)] = _Cause(
                             code="declared_column_missing",
-                            column=fold(target.column),
+                            column=spelled,
                             identifier=live.identifier,
                         )
                         break
@@ -480,6 +493,7 @@ def _cascade(state: _ViewState) -> None:
                     state.members[key] = _Cause(
                         code="declared_dependency_dropped",
                         reason=f"it reads `{_token(before[lost])}`, which goes",
+                        identifier=state.members[lost].identifier,
                     )
                     added = True
         removal = _removal_lists(state)
@@ -503,15 +517,20 @@ def _cascade(state: _ViewState) -> None:
                 reason=why.get(
                     _element(member), "the reader refuses it once the rest goes"
                 ),
+                identifier=_origin(state, member.table),
             )
             added = True
         kept = {r.name.lower() for r in reread.relationships}
         for name in relationships - kept - set(state.relationships):
+            relationship = view.relationship(name)
             state.relationships[name] = _Cause(
                 code="declared_dependency_dropped",
                 reason=why.get(
                     f"relationships['{name}']",
                     "the reader refuses it once the rest goes",
+                ),
+                identifier=_origin(
+                    state, relationship.left_table if relationship else None
                 ),
             )
             added = True
@@ -519,6 +538,22 @@ def _cascade(state: _ViewState) -> None:
             break
     if before and set(before) <= set(state.members):
         state.held.append({"reason": "empties_view", "element": "(root)"})
+
+
+def _origin(state: _ViewState, table: str | None) -> str | None:
+    """The relation a cascaded element is reported against: its own table's,
+    else (a derived metric) the relation of the first direct removal."""
+
+    if table is not None and table.lower() in state.identifiers:
+        return state.identifiers[table.lower()]
+    return next(
+        (
+            cause.identifier
+            for cause in (*state.members.values(), *state.relationships.values())
+            if cause.code != "declared_dependency_dropped" and cause.identifier
+        ),
+        None,
+    )
 
 
 def _member_reads(view: SemanticView) -> dict[_Key, list[_Key]]:
@@ -605,7 +640,9 @@ def _view_findings(
         context["removal"] = removal
     consequence = _consequence(removal or {})
     findings: list[DriftFinding] = []
-    cascaded: list[str] = []
+    # Each cascaded element by the relation it is reported against, so a
+    # scoped run keeps the dependency it caused (#1293).
+    cascaded: dict[str | None, list[str]] = {}
 
     for held in (removal or {}).get("held") or []:
         reason = held.get("reason")
@@ -656,7 +693,9 @@ def _view_findings(
                 )
             )
         else:
-            cascaded.append(f"{element}: {cause.reason}")
+            cascaded.setdefault(cause.identifier, []).append(
+                f"{element}: {cause.reason}"
+            )
     for member in _members(view):
         element = _element(member)
         cause = (
@@ -672,7 +711,9 @@ def _view_findings(
             "member_kind": member.kind,
         }
         if cause.code == "declared_dependency_dropped":
-            cascaded.append(f"{element}: {cause.reason}")
+            cascaded.setdefault(cause.identifier, []).append(
+                f"{element}: {cause.reason}"
+            )
         elif cause.code == "declared_column_missing":
             findings.append(
                 _column_finding(
@@ -687,19 +728,18 @@ def _view_findings(
             )
         else:
             findings.append(_type_finding(view, member, element, cause, member_context))
-    if cascaded:
-        first = next(iter(live_tables.values()), None)
+    for identifier, reasons in cascaded.items():
         findings.append(
             DriftFinding(
                 axis="schema",
                 code="declared_dependency_dropped",
-                identifier=first.identifier if first else None,
+                identifier=identifier,
                 severity="medium",
                 detail=(
                     f"view '{view.name}' would lose part of its definition because "
-                    f"something it depends on was dropped ({'; '.join(cascaded)})"
+                    f"something it depends on was dropped ({'; '.join(reasons)})"
                 ),
-                data={**context, "reasons": cascaded},
+                data={**context, "reasons": reasons},
             )
         )
     return findings
