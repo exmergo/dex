@@ -1752,8 +1752,8 @@ def coverage(
             "not reflected"
         )
 
-    names = model_scope.model_names(objects) if objects else None
-    inventory = coverage_mod.inventory(manifest, selector=names, full=full)
+    selector = model_scope.model_names(objects) if objects else None
+    inventory = coverage_mod.inventory(manifest, selector=selector, full=full)
     return CoverageResult(
         summary=inventory.summary,
         scope=inventory.scope,

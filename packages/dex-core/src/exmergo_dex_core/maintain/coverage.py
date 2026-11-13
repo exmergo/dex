@@ -201,6 +201,7 @@ def inventory(
     # through the whole project, since a selected model's protection comes from
     # models the selector did not name.
     wanted = {name.lower() for name in selector or []}
+    scope: dict[str, Any]
     if wanted:
         matched: set[str] = set()
         selected: set[str] = set()
@@ -297,19 +298,19 @@ def inventory(
         if project and unit.get("package_name") not in (None, project):
             package_tests += 1
             continue
-        owners = [
+        unit_owners = [
             uid
             for uid, resource in resources.items()
             if resource.resource_type == "model"
             and dbt_tests.covers(unit, resource.node)
         ]
-        if not owners:
+        if not unit_owners:
             tests_on_excluded += 1
             continue
-        if not set(owners) & selected:
+        if not set(unit_owners) & selected:
             continue
         totals["unit"] += 1
-        for owner in owners:
+        for owner in unit_owners:
             resource = resources[owner]
             resource.test_ids.add(unique_id)
             record = {"kind": "unit", "name": unit.get("name")}
