@@ -258,12 +258,24 @@ def test_an_aggregating_query_source_claims_no_relation_and_a_windowed_one_keeps
         "SELECT SUM(SUM(amount)) OVER () AS total FROM demo.main.orders",
         fields=[{"name": "total", "expr": "total"}],
     )
+    ignore_nulls = view(
+        "SELECT order_id, FIRST_VALUE(amount) IGNORE NULLS OVER () AS "
+        "first_amount FROM demo.main.orders",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
+    respect_nulls = view(
+        "SELECT order_id, FIRST_VALUE(amount) RESPECT NULLS OVER () AS "
+        "first_amount FROM demo.main.orders",
+        fields=[{"name": "order_id", "expr": "order_id"}],
+    )
     layer = source(
         tmp_path,
         aggregated=aggregated,
         having=having,
         windowed=windowed,
         nested=nested,
+        ignore_nulls=ignore_nulls,
+        respect_nulls=respect_nulls,
     )
     catalog = layer.semantic_catalog()
     models = _by(catalog.semantic_models)
@@ -275,6 +287,10 @@ def test_an_aggregating_query_source_claims_no_relation_and_a_windowed_one_keeps
     # The inner SUM aggregates the table to one row before the outer window
     # runs, so the nested windowed aggregate claims no relation either.
     assert models["nested"].relation is None
+    # A windowed FIRST_VALUE with a null-treatment modifier is still a
+    # row-preserving window function, so it keeps the claim.
+    assert models["ignore_nulls"].relation == "demo.main.orders"
+    assert models["respect_nulls"].relation == "demo.main.orders"
     assert "has an aggregate" in notes
     assert "has a HAVING" in notes
 

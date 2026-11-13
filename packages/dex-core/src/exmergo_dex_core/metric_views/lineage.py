@@ -306,13 +306,20 @@ def _window_parts(window: exp.Window) -> list[exp.Expression]:
     The windowed function itself is left out: it keeps the row count, so it
     does not count. What is checked is its arguments, its FILTER predicate
     and WITHIN GROUP operand, and its window specification (partition and
-    order), where a nested aggregate would run before the window.
+    order), where a nested aggregate would run before the window. Null
+    treatment modifiers (IGNORE NULLS, RESPECT NULLS) wrap the windowed
+    function and are unwrapped first, so the function itself is still left
+    out rather than counted as an aggregate.
     """
 
     func = window.this
     parts: list[exp.Expression] = []
-    while isinstance(func, (exp.Filter, exp.WithinGroup)):
-        if func.expression is not None:
+    while isinstance(
+        func, (exp.Filter, exp.WithinGroup, exp.IgnoreNulls, exp.RespectNulls)
+    ):
+        if isinstance(func, (exp.Filter, exp.WithinGroup)) and (
+            func.expression is not None
+        ):
             parts.append(func.expression)
         func = func.this
     if func is not None:
