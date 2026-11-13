@@ -1582,9 +1582,14 @@ def _through_ctes(node, cte_scopes: dict, sql_shape, seen: set[str] | None = Non
     seen.add(name)
     target_scope = cte_scopes[name]
     if sql_shape.SET_OPERATIONS and isinstance(target_scope, sql_shape.SET_OPERATIONS):
-        return None
+        return node
     return _through_ctes(
-        sql_shape.from_relation(target_scope), cte_scopes, sql_shape, seen
+        sql_shape.from_relation(target_scope)
+        if isinstance(target_scope, exp.Select)
+        else None,
+        cte_scopes,
+        sql_shape,
+        seen,
     )
 
 
@@ -1717,11 +1722,12 @@ def _driving_parent(tree, sql_shape):
     if not isinstance(tree, exp.Select):
         return None, [], [], False, "its compiled SQL is not a SELECT", {}
 
-    cte_scopes = {
-        name: scope
-        for name, scope in sql_shape.scopes(tree).items()
-        if name != sql_shape.MAIN_SCOPE
-    }
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    cte_scopes = (
+        {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        if with_clause is not None
+        else {}
+    )
     reducers: list[str] = []
     found_joins: list = []
     multiplies = sql_shape.multiplies_rows(tree)
@@ -1779,13 +1785,14 @@ def _driving_parent(tree, sql_shape):
                     "its driving relation is not a table or a subquery dex can follow",
                     cte_scopes,
                 )
-            cte_scopes.update(
-                {
-                    name: scope
-                    for name, scope in sql_shape.scopes(inner).items()
-                    if name != sql_shape.MAIN_SCOPE
-                }
-            )
+            with_inner = inner.args.get("with_") or inner.args.get("with")
+            if with_inner is not None:
+                cte_scopes.update(
+                    {
+                        cte.alias_or_name.lower(): cte.this
+                        for cte in with_inner.expressions
+                    }
+                )
             current = inner
             continue
         if isinstance(relation, exp.Values) or _generates_rows(relation):
