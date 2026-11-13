@@ -1688,7 +1688,7 @@ def coverage(
     parse_skipped: str | None = None
     missing = missing_packages(project_dir)
     if missing:
-        names = ", ".join(sorted(package.name for package in missing))
+        names = ", ".join(sorted(package.describe() for package in missing))
         parse_skipped = (
             f"declared package(s) not installed ({names}); run `dex transform "
             "deps` to install them"

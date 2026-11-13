@@ -1429,7 +1429,11 @@ class DexEngine:
 
         from .maintain import commands as maintain
 
-        return maintain.coverage(self, objects, full=full)
+        result = maintain.coverage(self, objects, full=full)
+        # The CLI stamps its envelope; a library caller reads the result, so
+        # the mode the engine is pinned to is stamped here too.
+        result.result_mode = self.resolve_result_mode(None)
+        return result
 
     # --- transform --------------------------------------------------------
     #

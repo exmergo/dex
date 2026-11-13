@@ -319,3 +319,30 @@ def test_values_free_mode_withholds_the_parse_error(repo: Path, capsys):
     assert [f["code"] for f in data["findings"]] == ["project_does_not_compile"]
     assert data["findings"][0]["data"] == {}
     assert "zq7x" not in json.dumps(envelope)
+
+
+def test_a_values_free_engine_stamps_its_mode_on_the_result(repo: Path):
+    from exmergo_dex_core.results import to_envelope
+
+    with DexEngine.from_repo(str(repo), result_mode="values_free") as engine:
+        result = engine.coverage()
+    assert to_envelope(result).data["result_mode"] == "values_free"
+
+
+def test_a_missing_git_package_is_named_without_its_credentials(repo: Path, capsys):
+    project = repo / "analytics"
+    (project / "packages.yml").write_text(
+        "packages:\n  - local: helpers\n"
+        "  - git: https://s3cr3t-token@github.com/org/private-pkg.git\n"
+        "    revision: main\n",
+        encoding="utf-8",
+    )
+    # With nothing installed, every declaration is missing, the git one too
+    # (dex cannot tell a git package's install name otherwise).
+    import shutil
+
+    shutil.rmtree(project / "dbt_packages")
+    envelope = _run(repo, capsys)
+    assert "github.com/org/private-pkg" in json.dumps(envelope)
+    assert "s3cr3t" not in json.dumps(envelope)
+    assert "transform deps" in json.dumps(envelope)

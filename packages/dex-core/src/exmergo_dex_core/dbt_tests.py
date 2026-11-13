@@ -158,14 +158,21 @@ def generic_test_targets(test: dict[str, Any]) -> list[str]:
     """The resources a generic test is attached to.
 
     ``attached_node`` names it on a model, a seed or a snapshot. A test on a
-    source carries none, and its only dependency is the source it tests.
+    source carries none: it is the source's when the source is its only
+    dependency, or the only source among several (a ``relationships`` test on a
+    source column also reads the model it points at).
     """
 
     attached = test.get("attached_node")
     if attached:
         return [attached]
-    reads = (test.get("depends_on") or {}).get("nodes") or []
-    return list(reads) if len(reads) == 1 else []
+    reads = list((test.get("depends_on") or {}).get("nodes") or [])
+    if len(reads) == 1:
+        return reads
+    # A source column's `relationships` test reads the source and the model
+    # it points at; it is the source's test.
+    sources = [uid for uid in reads if str(uid).startswith("source.")]
+    return sources if len(sources) == 1 else []
 
 
 def test_reads(test: dict[str, Any]) -> list[str]:

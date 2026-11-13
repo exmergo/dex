@@ -416,6 +416,11 @@ def _cap(record: dict[str, Any], elided: dict[str, int]) -> None:
         if len(columns[key]) > COLUMN_CAP:
             elided["columns"] += len(columns[key]) - COLUMN_CAP
             columns[key] = columns[key][:COLUMN_CAP]
+    incremental = record.get("incremental")
+    if incremental and len(incremental["incremental_branch_tests"]) > TEST_CAP:
+        branch = incremental["incremental_branch_tests"]
+        elided["tests"] += len(branch) - TEST_CAP
+        incremental["incremental_branch_tests"] = branch[:TEST_CAP]
     if len(record["tests"]) > TEST_CAP:
         elided["tests"] += len(record["tests"]) - TEST_CAP
         record["tests"] = record["tests"][:TEST_CAP]

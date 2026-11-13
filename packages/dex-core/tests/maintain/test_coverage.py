@@ -451,3 +451,49 @@ def test_a_per_resource_test_cut_is_counted():
     assert len(orders["tests"]) == coverage_mod.TEST_CAP
     assert orders["own_tests"]["singular"] == coverage_mod.TEST_CAP + 4
     assert inv.elided["tests"] == 4
+
+
+def test_a_source_relationships_test_is_the_sources_own():
+    source = f"source.{PROJECT}.raw.orders"
+    manifest = _manifest(
+        nodes={
+            f"{M}.customers": _model("customers", columns=["id"]),
+            # No attached_node, and it reads both the source and the model.
+            "test.r": _generic(
+                "relationships",
+                None,
+                "customer_id",
+                reads=[f"{M}.customers", source],
+            ),
+        },
+        sources={source: _source("orders", columns=["customer_id"])},
+    )
+    inv = coverage_mod.inventory(manifest)
+    orders = _record(inv, "sources", "raw.orders")
+    assert orders["own_tests"]["generic"] == 1
+    assert orders["columns"]["asserted"] == 1
+    assert inv.excluded["tests"]["on_excluded_resource"] == 0
+    assert _record(inv, "models", "customers")["downstream_tests"]["count"] == 1
+
+
+def test_the_incremental_branch_test_names_are_capped_and_counted():
+    extra = 3
+    units = {
+        f"unit_test.{index}": _unit(f"ut_{index:02d}", "fct", incremental=True)
+        for index in range(coverage_mod.TEST_CAP + extra)
+    }
+    manifest = _manifest(
+        nodes={f"{M}.fct": _model("fct", materialized="incremental")}, units=units
+    )
+    inv = coverage_mod.inventory(manifest)
+    incremental = _record(inv, "models", "fct")["incremental"]
+    assert len(incremental["incremental_branch_tests"]) == coverage_mod.TEST_CAP
+    assert incremental["unit_tests"] == coverage_mod.TEST_CAP + extra
+    assert incremental["incremental_branch_tested"] is True
+    # The branch names and the tests list are each cut by `extra`.
+    assert inv.elided["tests"] == 2 * extra
+    full = coverage_mod.inventory(manifest, full=True)
+    assert (
+        len(_record(full, "models", "fct")["incremental"]["incremental_branch_tests"])
+        == coverage_mod.TEST_CAP + extra
+    )
