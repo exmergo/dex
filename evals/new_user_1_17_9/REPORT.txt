@@ -1,0 +1,97 @@
+Dex 1.17.9 fresh-user end-to-end acceptance test
+
+Run from the repository root:
+
+  python3 evals/new_user_1_17_9/run.py /private/tmp/dex-1.17.9-fresh
+
+The destination must not exist. Requires git, npx, uv and network access to
+GitHub/npm/PyPI. Runs against published packages, without importing this checkout
+or changing the engine. All warehouse inspection goes through Dex. Every dbt
+project edit goes through a Dex plan and apply. No paid connector is used.
+
+The original exploratory run used exactly `npx skills add exmergo/dex` in a new
+git repository. Its installed wrapper pinned 1.17.9. The repeatable runner uses
+exmergo/dex@v1.17.9 and checks the engine pin to preserve this historical test.
+
+Project delivered
+
+  staging_dev.stg_customers: non-personal customer analytics attributes
+  staging_dev.stg_orders: all orders, with parsed TIMESTAMP ordered_at
+  intermediate_dev.int_orders_enriched: orders left joined to customer country
+  intermediate_dev.metricflow_time_spine: complete daily calendar, 2020-2035
+  marts_dev.fct_orders: one row per order, additive amount and order_count
+  marts_dev.dim_customers: all customers, including zero-order customers
+
+MetricFlow semantic model is derived by Dex from fct_orders declarations.
+Authored metrics: orders, booked_amount and average_order_value (ratio).
+The test executes totals and country/month groupings through Dex's local
+MetricFlow backend and checks that the additive grouped results reconcile.
+
+Data and test results
+
+  6 models built successfully.
+  29 passing dbt tests: 24 declaration-generated checks, 4 singular
+  reconciliation assertions, and 1 customer-rollup unit test.
+  5,000 unique orders; booked amount 2,338,243.40; AOV 467.64868.
+  1,200 customers, including 18 without orders; their totals remain zero.
+  5,844 unique calendar days, with both endpoints checked.
+  Both planted customer-rollup mutants killed: LEFT -> INNER and SUM -> MAX.
+
+The assertions reconcile source-to-staging, source-to-order-mart, and the full
+customer roster and per-customer aggregates. Fixtures independently exercise
+multiple orders, cancelled orders and customers without orders.
+
+Maintenance coverage
+
+The runner verifies the project, profiles the final state, snapshots it, checks
+the baseline, changes a metric label through semantic plan/apply, requires a
+semantic definition_changed finding, restores the original definition through
+another plan, and checks the unchanged baseline again. It does not accept new
+drift by taking a replacement snapshot.
+
+Recorded decisions (defaults, not supplied business rules)
+
+Keep every order status, including cancelled; booked amount is not recognized
+revenue. Retain all customers and represent no-order totals as zero. Avoid an
+invented currency code: amounts are declared as demo_currency_units. Select
+non-personal customer attributes for this new analytics project. Parse the
+order timestamp because profiling verified its format on every source row.
+
+Limits and findings in 1.17.9
+
+Dex reports test-only build plans as coverage_undetermined, even when their
+tests pass. The runner checks their node results and requires a final validated
+build anchored to the original six-model plan.
+
+Automatic join coverage is unchecked for dim_customers because its joined CTE
+contains GROUP BY (filtered_cte). The independent row reconciliation and unit
+fixture pass; they do not change Dex's reported unchecked status.
+
+Staging populations and the generated spine have no draftable model parent;
+their population_delta checks remain unchecked (no_parent_drafted), with prose
+population declarations. The independent source and calendar assertions cover
+this project's intended rows. The spine's DATE cast also has an unchecked
+identifier conversion (probe_refused: generated series is outside query rules).
+
+Dex cannot infer additivity for the customer aggregate without an entity/time
+series, or for constant order_count with insufficient observation pairs.
+Tests and arithmetic reconciliation support the authored definitions; these
+automatic additivity checks remain unverified. Unit, filter-population and
+history checks that do not apply are retained in the saved suppressions.
+
+An unchanged maintain check still reports a low-severity no_rows finding for
+the demo's deliberately empty, unused main.returns table. The test allows only
+that specific baseline finding, not arbitrary findings.
+
+Exploration also correctly reports duplicate order_item_id values, mixed SKU
+identifier schemes, timestamp type issues, and the web_events/customer join
+with 100% orphans. This order analytics project does not consume the flawed
+order-items or web-events relations or alter their source data.
+
+Evidence
+
+Each run stores every subprocess command, stdout and stderr under evidence/.
+acceptance.json is written only after all acceptance assertions pass. The
+checked-in results.json summarizes the completed fresh-user run, including
+automatic verification limits. The complete dbt project and warehouse remain
+in the run destination for inspection.

@@ -1,0 +1,21 @@
+# warns: many_to_many
+# A relationship whose columns are a key on neither side: Snowflake accepts it as
+# many-to-many, and refuses only an expression that reads across it.
+name: many_to_many_relationship
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: customer
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: CUSTOMER}
+    primary_key: {columns: [c_custkey]}
+    dimensions:
+      - {name: segment, expr: c_mktsegment}
+relationships:
+  - name: orders_customer
+    left_table: orders
+    right_table: customer
+    relationship_columns: [{left_column: o_custkey, right_column: c_nationkey}]

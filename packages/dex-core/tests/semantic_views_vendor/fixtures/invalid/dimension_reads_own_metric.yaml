@@ -1,0 +1,12 @@
+# expect: row_level
+# A dimension reading a metric of its own table.
+name: dimension_reads_own_metric
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+    dimensions:
+      - {name: count_copy, expr: orders.order_count}

@@ -1,0 +1,48 @@
+name: TABLE_CYCLE
+tables:
+  - name: CUSTOMERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: CUSTOMER
+    primary_key:
+      columns:
+        - C_CUSTKEY
+    dimensions:
+      - name: MARKET_SEGMENT
+        expr: c_mktsegment
+        data_type: VARCHAR(10)
+        access_modifier: public_access
+    metrics:
+      - name: AVG_ORDER_VALUE
+        expr: AVG(SUM(orders.total_price))
+        access_modifier: public_access
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: SEGMENT
+        expr: customers.market_segment
+        data_type: VARCHAR(10)
+        access_modifier: public_access
+    facts:
+      - name: TOTAL_PRICE
+        expr: o_totalprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: ORDER_COUNT
+        expr: COUNT(o_orderkey)
+        access_modifier: public_access
+relationships:
+  - name: ORDERS_CUSTOMERS
+    left_table: ORDERS
+    right_table: CUSTOMERS
+    relationship_columns:
+      - left_column: O_CUSTKEY
+        right_column: C_CUSTKEY

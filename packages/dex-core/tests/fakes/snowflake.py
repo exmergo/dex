@@ -304,6 +304,15 @@ class FakeCursor:
                 if like is None or w.name.upper() == like.upper()
             ]
             self._emit(rows)
+        elif upper.startswith("SHOW SEMANTIC VIEWS"):
+            # Checked live: a semantic view is listed only here (and by SHOW
+            # OBJECTS), never by SHOW VIEWS or SHOW TABLES.
+            rows = [
+                {"name": t.name, "database_name": t.database, "schema_name": t.schema}
+                for t in self._scoped(sql)
+                if t.kind == "semantic_view"
+            ]
+            self._emit(rows)
         elif upper.startswith("SHOW TABLES") or upper.startswith("SHOW VIEWS"):
             kind = "table" if upper.startswith("SHOW TABLES") else "view"
             rows = [
@@ -328,6 +337,11 @@ class FakeCursor:
                             "database_name": t.database,
                             "schema_name": t.schema,
                             "column_name": col,
+                            # A semantic view's members carry their own kind,
+                            # as the real driver reports them.
+                            "kind": "DIMENSION"
+                            if t.kind == "semantic_view"
+                            else "COLUMN",
                             "data_type": (
                                 f'{{"type":"{type_token}",'
                                 f'"nullable":{str(nullable).lower()}}}'

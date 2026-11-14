@@ -1,0 +1,22 @@
+# expect: granularity
+# A fact reading a finer table with no aggregate.
+name: finer_reference_unaggregated
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    facts:
+      - {name: line_price, expr: lineitem.extended_price}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    facts:
+      - {name: extended_price, expr: l_extendedprice}
+relationships:
+  - name: lineitem_orders
+    left_table: lineitem
+    right_table: orders
+    relationship_columns: [{left_column: l_orderkey, right_column: o_orderkey}]

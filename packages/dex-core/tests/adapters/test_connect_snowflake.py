@@ -1824,6 +1824,50 @@ def test_list_namespace_objects_lists_tables_and_views(multi_db_connection):
     assert data_statements(multi_db_connection) == []
 
 
+def test_list_namespace_objects_counts_a_semantic_view_as_content(
+    multi_db_connection,
+):
+    """`SHOW VIEWS` leaves a semantic view out (checked live), and a schema
+    holding one is still not empty: the existence check lists it."""
+    from fakes.snowflake import FakeSnowflakeTable
+
+    multi_db_connection.tables.append(
+        FakeSnowflakeTable(
+            database="RAW",
+            schema="STAGING_DEV",
+            name="SALES_SV",
+            columns=[("REGION", "TEXT", True)],
+            kind="semantic_view",
+        )
+    )
+    adapter = make_adapter(multi_db_connection)
+
+    assert adapter.list_namespace_objects("raw", "staging_dev") == ["SALES_SV"]
+    assert data_statements(multi_db_connection) == []
+
+
+def test_a_deployed_semantic_view_is_never_inventoried(fake_sf_connection):
+    """Nor are its members, which `SHOW COLUMNS` lists with their own kind:
+    a plain SELECT on a semantic view fails, so it is never profiled or
+    probed (#1291)."""
+    from fakes.snowflake import FakeSnowflakeTable
+
+    fake_sf_connection.tables.append(
+        FakeSnowflakeTable(
+            database="SHOP",
+            schema="PUBLIC",
+            name="SALES_SV",
+            columns=[("REGION", "TEXT", True)],
+            kind="semantic_view",
+        )
+    )
+    adapter = make_adapter(fake_sf_connection)
+
+    identifiers = {o.identifier for o in adapter.list_objects()}
+    assert identifiers and "SHOP.PUBLIC.SALES_SV" not in identifiers
+    assert "SHOP.PUBLIC.SALES_SV" not in adapter._columns
+
+
 def test_list_namespace_objects_reads_an_absent_schema_as_empty(multi_db_connection):
     adapter = make_adapter(multi_db_connection)
     assert adapter.list_namespace_objects("RAW", "NOT_THERE") == []

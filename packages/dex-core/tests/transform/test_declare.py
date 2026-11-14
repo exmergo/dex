@@ -104,6 +104,13 @@ def test_the_selector_reads_names_the_way_maintain_verify_does():
     assert selection.models == ["stg_orders", "fct_orders"]
 
 
+def test_a_quoted_list_selects_every_model_it_names():
+    """One quoted argument, names separated by spaces, names the same models."""
+    selection = declare_mod.select_models(_view(_shop()), ["stg_orders fct_orders"])
+    assert selection.models == ["stg_orders", "fct_orders"]
+    assert selection.skipped == []
+
+
 def test_a_name_that_matches_no_model_is_named_rather_than_dropped():
     selection = declare_mod.select_models(_view(_shop()), ["fct_ordrs"])
     assert selection.models == []
@@ -771,3 +778,102 @@ def test_a_build_in_its_own_schema_gets_references_to_the_built_parent(
     assert customer["role"]["value"] == "foreign_key"
     assert customer["references"]["value"] == "stg_customers.customer_id"
     assert "dbt_dev.stg_customers" in customer["references"]["evidence"]
+
+
+def test_ambiguous_ref_resolves_through_compiled_manifest(shop: Path, capsys):
+    """#989: with legacy.stg_orders and staging_dev.stg_orders both profiled,
+    fct_orders is skipped as ambiguous with no manifest. With a fresh manifest
+    compiled for target dev pointing to staging_dev.stg_orders, it resolves and
+    is proposed."""
+
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect(str(shop / "shop.duckdb"))
+    conn.execute("create schema legacy")
+    conn.execute("create schema staging_dev")
+    conn.execute(
+        "create table legacy.stg_orders as select order_id, customer_id, status, "
+        "amount from main.raw_orders"
+    )
+    conn.execute(
+        "create table staging_dev.stg_orders as select order_id, customer_id, status, "
+        "amount from main.raw_orders"
+    )
+    conn.close()
+    for argv in (
+        ["explore", "map", "--full"],
+        ["explore", "relationships", "--verify"],
+    ):
+        assert main([*argv, "--repo-root", str(shop)]) == 0, argv
+        capsys.readouterr()
+
+    # 1. With no manifest, fct_orders is skipped as ambiguous with no command
+    envelope = _dex(shop, ["transform", "declare", "fct_orders"], capsys)
+    assert envelope["status"] == "ok", envelope
+    assert envelope["data"]["proposed"] == []
+    (skipped,) = envelope["data"]["skipped"]
+    assert skipped["model"] == "fct_orders"
+    assert skipped["reason"] == "unprofiled_inputs"
+    assert skipped["commands"] == []
+    assert "it matches 2 relations in the cache" in skipped["detail"]
+    assert "no profile run can settle which one it means" in skipped["detail"]
+
+    # 2. With a fresh manifest compiled for target dev, fct_orders resolves through it
+    manifest = {
+        "metadata": {
+            "project_name": "shop",
+            "target_name": "dev",
+            "generated_at": "2099-01-01T00:00:00Z",
+        },
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"staging_dev"."stg_orders"',
+            }
+        },
+    }
+    target = shop / "analytics" / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    envelope = _dex(shop, ["transform", "declare", "fct_orders"], capsys)
+    assert envelope["status"] == "ok", envelope
+    assert envelope["data"]["skipped"] == []
+    (proposed,) = envelope["data"]["proposed"]
+    assert proposed["model"] == "fct_orders"
+    assert proposed["fields"]["grain"]["value"] == ["order_id"]
+
+    # 3. With a stale manifest, fct_orders is skipped as ambiguous again
+    stale_manifest = {
+        **manifest,
+        "metadata": {
+            **manifest["metadata"],
+            "generated_at": "2000-01-01T00:00:00Z",
+        },
+    }
+    (target / "manifest.json").write_text(json.dumps(stale_manifest), encoding="utf-8")
+    envelope = _dex(shop, ["transform", "declare", "fct_orders"], capsys)
+    assert envelope["status"] == "ok", envelope
+    assert envelope["data"]["proposed"] == []
+    (skipped,) = envelope["data"]["skipped"]
+    assert skipped["model"] == "fct_orders"
+    assert skipped["reason"] == "unprofiled_inputs"
+    assert "no profile run can settle which one it means" in skipped["detail"]
+
+
+def test_declare_proposes_grain_from_tested_input_without_profile(shop: Path, capsys):
+    """#1252: transform declare carries grain from an input's unique test."""
+
+    (shop / "analytics" / "models" / "marts" / "customer_summary.sql").write_text(
+        "select customer_id, region from {{ ref('stg_customers') }}\n",
+        encoding="utf-8",
+    )
+    envelope = _dex(shop, ["transform", "declare", "customer_summary"], capsys)
+    assert envelope["status"] == "ok", envelope
+    (proposed,) = envelope["data"]["proposed"]
+    assert proposed["fields"]["grain"]["value"] == ["customer_id"]
+    evidence = proposed["fields"]["grain"]["evidence"]
+    assert (
+        "customer_id has a unique test on stg_customers, carried through unchanged"
+        in evidence
+    )

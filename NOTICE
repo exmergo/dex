@@ -5,3 +5,13 @@ This product includes software developed by Exmergo, Inc. (https://exmergo.com).
 
 Licensed under the Apache License, Version 2.0. See the LICENSE file for the full
 license text.
+
+The Ossie bridge (packages/dex-core/src/exmergo_dex_core/metric_views/ossie_bridge)
+is a port of the `databricks` converter of Apache Ossie, from
+https://github.com/apache/ossie-converters, which carries this notice:
+
+  Apache Ossie (incubating)
+  Copyright 2026 The Apache Software Foundation
+
+  This product includes software developed at
+  The Apache Software Foundation (http://www.apache.org/).

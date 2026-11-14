@@ -160,11 +160,16 @@ def _semantic_model_def(
     # column is left out (the catalog's note says so); a rename of a key field
     # still moves the dataset's content hash, which covers the raw dataset.
     keys: list[list[str]] = []
-    for declared in (dataset.get("primary_key"), *(dataset.get("unique_keys") or [])):
+    claims: list[str] = []
+    declared_keys = [("primary", dataset.get("primary_key"))] + [
+        ("unique", key) for key in dataset.get("unique_keys") or []
+    ]
+    for claim, declared in declared_keys:
         resolved = catalog_mod.field_columns(dataset, declared or [], connector)
         columns = [column for _, column in resolved]
         if columns and all(columns):
             keys.append([str(c) for c in columns])
+            claims.append(claim)
 
     return (
         SemanticModelDef(
@@ -174,6 +179,7 @@ def _semantic_model_def(
             relation=relation,
             dimensions=dimensions,
             keys=keys,
+            key_claims=claims,
         ),
         notes,
     )

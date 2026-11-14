@@ -1,0 +1,33 @@
+# A composite primary key (partsupp) referenced by a two-column relationship.
+name: composite_key
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    facts:
+      - name: quantity
+        expr: l_quantity
+    metrics:
+      - name: units_sold
+        expr: SUM(lineitem.quantity)
+  - name: partsupp
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: PARTSUPP}
+    primary_key: {columns: [ps_partkey, ps_suppkey]}
+    dimensions:
+      - name: part_key
+        expr: ps_partkey
+    facts:
+      - name: supply_cost
+        expr: ps_supplycost
+      - name: available_quantity
+        expr: ps_availqty
+    metrics:
+      - name: total_available
+        expr: SUM(partsupp.available_quantity)
+relationships:
+  - name: lineitem_partsupp
+    left_table: lineitem
+    right_table: partsupp
+    relationship_columns:
+      - {left_column: l_partkey, right_column: ps_partkey}
+      - {left_column: l_suppkey, right_column: ps_suppkey}

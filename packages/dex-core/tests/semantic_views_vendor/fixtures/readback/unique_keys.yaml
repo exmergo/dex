@@ -1,0 +1,47 @@
+name: UNIQUE_KEYS
+tables:
+  - name: SUPPLIER
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: SUPPLIER
+    primary_key:
+      columns:
+        - S_SUPPKEY
+    unique_keys:
+      - columns:
+          - S_NAME
+    dimensions:
+      - name: SUPPLIER_NAME
+        expr: s_name
+        data_type: VARCHAR(25)
+        access_modifier: public_access
+    metrics:
+      - name: SUPPLIER_COUNT
+        expr: COUNT(s_suppkey)
+        access_modifier: public_access
+  - name: SUPPLIER_NOTES
+    description: Supplier rows keyed by name instead of key.
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: SUPPLIER
+    primary_key:
+      columns:
+        - S_SUPPKEY
+    facts:
+      - name: ACCOUNT_BALANCE
+        expr: s_acctbal
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: TOTAL_BALANCE
+        expr: SUM(supplier_notes.account_balance)
+        access_modifier: public_access
+relationships:
+  - name: NOTES_BY_NAME
+    left_table: SUPPLIER_NOTES
+    right_table: SUPPLIER
+    relationship_columns:
+      - left_column: S_NAME
+        right_column: S_NAME

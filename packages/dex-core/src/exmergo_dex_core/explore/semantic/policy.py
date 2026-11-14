@@ -253,11 +253,20 @@ def sub_threshold_note(
 
 
 def screen_values_request(
-    dimension: str, *, meta_lookup: Callable[[str], Any] | None = None
+    dimension: str,
+    *,
+    meta_lookup: Callable[[str], Any] | None = None,
+    aliases: Mapping[str, list[str]] | None = None,
 ) -> list[str]:
-    """Refuse a PII value domain and return notes for heuristic-only screening."""
+    """Refuse a PII value domain and return notes for heuristic-only screening.
 
-    blocked = screen_dimension_refs([dimension], meta_lookup=meta_lookup)
+    ``aliases`` is :func:`screen_dimension_refs`'s: the tokens ``dimension`` is
+    also screened as.
+    """
+
+    blocked = screen_dimension_refs(
+        [dimension], meta_lookup=meta_lookup, aliases=aliases
+    )
     if blocked:
         _ref, reason = blocked[0]
         raise SemanticQueryRefusedError(

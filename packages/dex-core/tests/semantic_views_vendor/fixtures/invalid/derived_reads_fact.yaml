@@ -1,0 +1,14 @@
+# expect: derived_metric
+# A derived metric reading a fact.
+name: derived_reads_fact
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    facts:
+      - {name: price, expr: o_totalprice}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+metrics:
+  - {name: odd, expr: orders.price / orders.order_count}

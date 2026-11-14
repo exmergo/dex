@@ -48,6 +48,7 @@ class ObjectMeta:
     row_count: int | None
     byte_size: int | None
     column_count: int
+    database: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,11 @@ class ColumnMeta:
     data_type: str
     nullable: bool
     ordinal: int
+    # A connector can mark an extension type as not safely groupable.  It remains
+    # part of the reported schema, but refactor comparison stops before running.
+    groupable: bool = True
+    # A connector may require a stable representation for exact comparison.
+    comparison_type: str | None = None
 
 
 @dataclass(frozen=True)

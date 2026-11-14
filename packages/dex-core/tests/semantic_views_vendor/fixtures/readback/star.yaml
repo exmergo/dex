@@ -1,0 +1,121 @@
+name: STAR
+description: Orders with their line items and the customers who placed them.
+tables:
+  - name: CUSTOMER
+    description: One row per customer.
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: CUSTOMER
+    primary_key:
+      columns:
+        - C_CUSTKEY
+    dimensions:
+      - name: MARKET_SEGMENT
+        synonyms:
+          - segment
+        expr: c_mktsegment
+        data_type: VARCHAR(10)
+        access_modifier: public_access
+    metrics:
+      - name: CUSTOMER_COUNT
+        expr: COUNT(c_custkey)
+        access_modifier: public_access
+  - name: LINEITEM
+    description: One row per order line.
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: LINEITEM
+    primary_key:
+      columns:
+        - L_ORDERKEY
+        - L_LINENUMBER
+    dimensions:
+      - name: SHIP_MODE
+        expr: l_shipmode
+        data_type: VARCHAR(10)
+        access_modifier: public_access
+    facts:
+      - name: NET_PRICE
+        description: Extended price less the discount.
+        expr: l_extendedprice * (1 - l_discount)
+        data_type: "NUMBER(25,4)"
+        access_modifier: public_access
+      - name: QUANTITY
+        expr: l_quantity
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: NET_REVENUE
+        expr: SUM(lineitem.net_price)
+        access_modifier: public_access
+      - name: TOTAL_QUANTITY
+        expr: SUM(lineitem.quantity)
+        access_modifier: public_access
+    time_dimensions:
+      - name: SHIP_DATE
+        expr: l_shipdate
+        data_type: DATE
+        access_modifier: public_access
+  - name: ORDERS
+    synonyms:
+      - purchases
+      - sales orders
+    description: One row per order.
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: ORDER_PRIORITY
+        expr: o_orderpriority
+        data_type: VARCHAR(15)
+        access_modifier: public_access
+      - name: ORDER_STATUS
+        synonyms:
+          - status
+        description: "F, O or P."
+        expr: o_orderstatus
+        data_type: VARCHAR(1)
+        access_modifier: public_access
+    facts:
+      - name: TOTAL_PRICE
+        description: The order's total price.
+        expr: o_totalprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: ORDER_COUNT
+        synonyms:
+          - number of orders
+        description: How many orders.
+        expr: COUNT(o_orderkey)
+        access_modifier: public_access
+      - name: REVENUE
+        expr: SUM(orders.total_price)
+        access_modifier: public_access
+    time_dimensions:
+      - name: ORDER_DATE
+        synonyms:
+          - placed on
+        description: When the order was placed.
+        expr: o_orderdate
+        data_type: DATE
+        access_modifier: public_access
+relationships:
+  - name: LINEITEM_TO_ORDERS
+    left_table: LINEITEM
+    right_table: ORDERS
+    relationship_columns:
+      - left_column: L_ORDERKEY
+        right_column: O_ORDERKEY
+  - name: ORDERS_TO_CUSTOMER
+    left_table: ORDERS
+    right_table: CUSTOMER
+    relationship_columns:
+      - left_column: O_CUSTKEY
+        right_column: C_CUSTKEY

@@ -1,0 +1,12 @@
+# expect: member
+# A dimension with no `expr`.
+name: member_without_expr
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: status}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

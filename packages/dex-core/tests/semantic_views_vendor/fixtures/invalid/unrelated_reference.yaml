@@ -1,0 +1,17 @@
+# expect: reference
+# An expression reading a table no relationship reaches.
+name: unrelated_reference
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: segment, expr: customer.segment}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: customer
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: CUSTOMER}
+    primary_key: {columns: [c_custkey]}
+    dimensions:
+      - {name: segment, expr: c_mktsegment}

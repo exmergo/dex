@@ -1,0 +1,5 @@
+{
+  "name": "adjusted_price",
+  "description": "Order lines with discounts and refunds, where an intermediate computes the discounted price correctly and the question is whether the mart's column delivers it.",
+  "seed": 11160
+}

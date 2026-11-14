@@ -73,18 +73,36 @@ _PATCHABLE = {"column_added", "column_dropped", "column_retyped", "nullability_c
 _MECHANICAL = {"column_added", "column_dropped", "nullability_changed"}
 
 
-def _semantic_update_command(vendor: str | None) -> str:
+def _semantic_update_command(vendor: str | None) -> str | None:
     """Authoring command for the configured semantic vendor (#974).
 
-    MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer and Cube each have
-    their own ``semantic <vendor> update`` route; naming the dbt command under
-    those vendors sends the operator to the wrong place.
+    MetricFlow/dbt keeps ``semantic update``. Ossie, SLayer, Cube and Databricks
+    Metric Views (#1258) each have their own ``semantic <vendor> update`` route;
+    naming the dbt command under those vendors sends the operator to the wrong
+    place. ``None`` for a vendor dex reads but does not author: there is no route
+    to name.
     """
+
+    from ..config import SEMANTIC_DOCUMENT_AUTHORING
 
     name = (vendor or "dbt").lower()
     if name == "dbt":
         return "semantic update"
+    if name not in SEMANTIC_DOCUMENT_AUTHORING:
+        return None
     return f"semantic {name} update"
+
+
+def _semantic_update_hint(vendor: str | None) -> str:
+    """How to update a semantic definition, for an advisory proposal."""
+
+    command = _semantic_update_command(vendor)
+    if command is None:
+        return (
+            "edit the semantic definition in its file (dex does not author the "
+            f"{(vendor or '').lower()} layer yet)"
+        )
+    return f"update the semantic definition with `{command}`"
 
 
 def _placed(placement: PlacingProject | None, kind: EditKind, table: str) -> str | None:
@@ -268,7 +286,10 @@ def build(
             pii_overrides,
         )
 
-    warnings.extend(_grain_test_edits(proposals, declarations, definitions))
+    if view is not None:
+        # With no project to edit there is nowhere a `unique` test could go,
+        # which the warning above already says once (#1293).
+        warnings.extend(_grain_test_edits(proposals, declarations, definitions))
     edits.extend(declarations.edits())
     warnings.extend(declarations.warnings)
     _drop_empty_proposals(proposals, {edit.path for edit in edits})
@@ -420,9 +441,8 @@ def _advisory(
             "judge it against a before"
         ),
         "dangling_reference": (
-            "update the semantic definition with `"
-            + _semantic_update_command(semantic_vendor)
-            + "`, or restore the model/column it references"
+            _semantic_update_hint(semantic_vendor)
+            + ", or restore the model/column it references"
         ),
         "join_cardinality_exceeded": (
             "the semantic layer declares an arity this join does not have, so "
@@ -464,6 +484,92 @@ def _advisory(
             "re-run `maintain snapshot --project-only` to accept it"
         ),
     }
+    if finding.code == "semantic_format_changed" and finding.data.get("path"):
+        actions["semantic_format_changed"] = (
+            f"{finding.data['path']} moved from format version "
+            f"{finding.data.get('format_version_before')} to "
+            f"{finding.data.get('format_version_after')}. If dex does not read "
+            "the new version, restore the old one or upgrade dex before "
+            "re-running `maintain snapshot`, since a baseline taken now accepts "
+            "a definition nothing checks"
+        )
+    if finding.code == "declared_grain_not_unique" and (
+        finding.data.get("claim") == "primary"
+    ):
+        source = finding.data.get("declared_by") or "semantic"
+        command = _semantic_update_command(source)
+        # A vendor dex reads but does not author yet has no route to name, so
+        # the key is changed in its file (#1291).
+        where = (
+            f"with `{command}`"
+            if command is not None and source != "semantic"
+            else "in its file"
+        )
+        actions["declared_grain_not_unique"] = (
+            f"the {source} semantic layer declares these columns its primary key "
+            "and the data says otherwise: dedup the table, or change the primary "
+            f"key {where}. dex proposes no edit, because which side is wrong is "
+            "a decision"
+        )
+    if finding.code == "join_cardinality_exceeded":
+        from .drift import ARITY_INFERRED_BY
+
+        source = str(finding.data.get("declared_by") or "")
+        inferred = ARITY_INFERRED_BY.get(source)
+        if inferred is not None:
+            # No cardinality is written to change: the arity follows from the
+            # key the referenced table declares (#1293).
+            command = _semantic_update_command(source)
+            where = f" with `{command}`" if command is not None else " in its file"
+            # The side that failed: a one-to-one relationship can fail on
+            # its left table too, not only on the one it references.
+            side = finding.data.get("side_model") or "the table"
+            actions["join_cardinality_exceeded"] = (
+                f"{inferred} reads this relationship as "
+                f"{finding.data.get('claim')} from the keys its tables declare, "
+                f"and ({finding.column}) on {side} is not unique, so measures "
+                f"aggregated across it are inflated: dedup {side}, or change its "
+                f"key or the relationship{where}. dex proposes no edit, because "
+                "which of the two is right is a decision"
+            )
+    if finding.code == "key_lost_uniqueness" and finding.data.get("declared_by"):
+        # The key lapsed, and a semantic layer still claims it (#1293): the
+        # claim is what a query trusts, so the advice names where to change it.
+        source = str(finding.data["declared_by"])
+        command = _semantic_update_command(source)
+        what = "its primary key" if finding.data.get("claim") == "primary" else "unique"
+        where = f" with `{command}`" if command is not None else " in its file"
+        actions["key_lost_uniqueness"] = (
+            f"the {source} semantic layer declares these columns {what}, and they "
+            "no longer are: dedup the table, or change the key"
+            f"{where}. dex proposes no edit, because which side is wrong is a "
+            "decision"
+        )
+    if finding.code == "declared_grain_not_unique" and (
+        finding.data.get("claim") == "unique"
+    ):
+        # A semantic layer's uniqueness claim is not the grain (#1259): a Metric
+        # View's `rely.at_most_one_match` asserts the join matches at most one
+        # row, and Databricks trusts it.
+        declared_by = finding.data.get("declared_by") or "semantic"
+        command = (
+            _semantic_update_command(declared_by) if declared_by != "semantic" else None
+        )
+        actions["declared_grain_not_unique"] = (
+            f"the {declared_by} layer asserts "
+            "these columns are unique and the data says otherwise: dedup the "
+            "table, or drop the claim"
+            + (
+                " (`rely.at_most_one_match` on the join, with `semantic "
+                "databricks update`), since Databricks trusts the flag and can "
+                "count a row more than once while it is false"
+                if declared_by == "databricks"
+                else f" with `{command}`"
+                if command is not None
+                else ""
+            )
+            + ". dex proposes no edit, because which side is wrong is a decision"
+        )
     return Proposal(
         axis=finding.axis,
         kind="advisory",
@@ -870,6 +976,17 @@ def _drop_empty_proposals(proposals: list[Proposal], written: set[str]) -> None:
 #: in that order and only this side knows the answer.
 _TEST_EDIT_CLAUSE = "; the unique test keeps the break visible in builds"
 
+#: Appended where the declaration already tests the key, so the reader learns why
+#: there is no test edit. Which test should be failing is named only where the finding
+#: is on the model's own relation and the test is a plain `unique`; even then the
+#: finding counts NULL keys and dbt's `unique` does not, so the clause says so. A
+#: source's drift, or a configured test (a `where` filter), only says the test exists.
+_FAILING_TEST_CLAUSE = (
+    "; the existing unique test on {column} in {path} fails on these duplicates "
+    "unless they are NULL keys, which dbt's unique test ignores"
+)
+_EXISTING_TEST_CLAUSE = "; {path} already declares a unique test on {column}"
+
 
 def _grain_test_edits(
     proposals: list[Proposal],
@@ -920,7 +1037,11 @@ def _grain_test_edits(
             )
             continue
         if "unique" in current.values:
-            continue  # already alerting
+            failing = placed.built and "unique" in current.spans
+            proposal.action += (
+                _FAILING_TEST_CLAUSE if failing else _EXISTING_TEST_CLAUSE
+            ).format(column=proposal.column, path=placed.path)
+            continue
         composite, unresolved = _declared_grain(
             definitions, placed.model, proposal.column
         )

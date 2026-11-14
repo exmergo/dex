@@ -1,0 +1,11 @@
+# expect: row_level
+# A dimension that aggregates with no column read at all.
+name: dimension_count_star
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: n, expr: COUNT(*)}
+    metrics:
+      - {name: order_count, expr: COUNT(o_orderkey)}

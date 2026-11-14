@@ -401,7 +401,12 @@ def test_profile_carries_the_declaration_only_under_use_project(
     repo = _repo(tmp_path)
     bare = _orders(_run(_args("profile", warehouse, repo, "fct_orders"), capsys))
     assert "declaration" not in bare
-    assert bare["grain"] != ["order_id", "line_no"]
+    # The bare grain is the measurement's, whichever proven pair ranks first:
+    # (order_id, line_no) and (amount, line_no) are both unique here, and the
+    # order between them rests on approximate distinct counts that differ
+    # across DuckDB releases.
+    assert bare["grain"] == bare["candidate_keys"][0]
+    assert not any("model's declaration" in n for n in bare["data_quality"])
 
     payload = _run(
         _args("profile", warehouse, repo, "fct_orders", "--use-project"), capsys
@@ -453,7 +458,7 @@ def test_a_removed_declaration_clears_on_the_next_run(
         _run(_args("profile", warehouse, repo, "fct_orders", "--use-project"), capsys)
     )
     assert "declaration" not in again
-    assert again["grain"] != ["order_id", "line_no"]
+    assert again["grain"] == again["candidate_keys"][0]
     assert not any("model's declaration" in n for n in again["data_quality"])
 
 

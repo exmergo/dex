@@ -2,9 +2,9 @@
 
 The rule every surgical YAML edit in the engine shares: the schema.yml and
 semantic rewrites under ``transform/`` and the ``.dex/config.yml`` editor. It
-lives on its own, with nothing but the standard library, because the config
-editor has to run on a base install that carries no dialect engine, and the
-rewrite module that first grew these helpers imports one at the top.
+lives on its own, with nothing but the standard library and PyYAML, because the
+config editor has to run on a base install that carries no dialect engine, and
+the rewrite module that first grew these helpers imports one at the top.
 
 PyYAML's ``end_mark`` on a block collection is where the parser stopped reading,
 which is inside the *next* entry, so it cannot bound an entry. Indentation can:
@@ -12,6 +12,8 @@ an entry owns every following line indented deeper than the line it starts on.
 """
 
 from __future__ import annotations
+
+import yaml
 
 
 def indent_of(content: str, line_start: int) -> int:
@@ -98,3 +100,21 @@ def sequence_item_span(content: str, item_start: int) -> tuple[int, int] | None:
     if lead.strip() != "-" or lead.rstrip().count("-") != 1:
         return None
     return line_start, block_end(content, line_start, indent_of(content, line_start))
+
+
+def uses_anchors_or_aliases(text: str) -> bool:
+    """Does this YAML define an anchor or use an alias (a ``<<: *x`` merge too)?
+
+    Read from the parse events, never from the text: ``*active*`` in a comment or
+    a description is Markdown emphasis, not an alias, and only the parser can
+    tell the two apart. An edit that splices by offset cannot be trusted through
+    an alias, which expands somewhere the offsets do not describe.
+
+    A document that does not parse raises :class:`yaml.YAMLError`; what an
+    unreadable file means is the caller's to say.
+    """
+
+    return any(
+        isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None)
+        for event in yaml.parse(text, Loader=yaml.SafeLoader)
+    )

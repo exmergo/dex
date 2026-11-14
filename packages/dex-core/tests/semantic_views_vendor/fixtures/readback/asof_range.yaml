@@ -1,0 +1,99 @@
+name: ASOF_RANGE
+tables:
+  - name: CUSTOMER_ORDERS
+    description: "Each customer's orders, for an as-of lookup by date."
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    unique_keys:
+      - columns:
+          - O_CUSTKEY
+          - O_ORDERDATE
+    dimensions:
+      - name: ORDER_PRIORITY
+        expr: o_orderpriority
+        data_type: VARCHAR(15)
+        access_modifier: public_access
+  - name: LINEITEM
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: LINEITEM
+    primary_key:
+      columns:
+        - L_ORDERKEY
+        - L_LINENUMBER
+    facts:
+      - name: EXTENDED_PRICE
+        expr: l_extendedprice
+        data_type: "NUMBER(12,2)"
+        access_modifier: public_access
+    metrics:
+      - name: LINE_COUNT
+        expr: COUNT(l_linenumber)
+        access_modifier: public_access
+    time_dimensions:
+      - name: SHIP_DATE
+        expr: l_shipdate
+        data_type: DATE
+        access_modifier: public_access
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: CUSTOMER_KEY
+        expr: o_custkey
+        data_type: "NUMBER(38,0)"
+        access_modifier: public_access
+  - name: PRICE_BANDS
+    base_table:
+      database: DEX_SV
+      schema: FIXTURES
+      table: PRICE_BANDS
+    primary_key:
+      columns:
+        - BAND_ID
+    constraints:
+      - name: BAND_RANGE
+        distinct_range:
+          start_column: BAND_START
+          end_column: BAND_END
+    dimensions:
+      - name: BAND_NAME
+        expr: band_name
+        data_type: VARCHAR(16777216)
+        access_modifier: public_access
+relationships:
+  - name: LINES_TO_ORDERS
+    left_table: LINEITEM
+    right_table: ORDERS
+    relationship_columns:
+      - left_column: L_ORDERKEY
+        right_column: O_ORDERKEY
+  - name: PRICE_BAND
+    left_table: LINEITEM
+    right_table: PRICE_BANDS
+    relationship_columns:
+      - left_column: L_EXTENDEDPRICE
+        type: range
+        right_range:
+          start_column: BAND_START
+          end_column: BAND_END
+  - name: LATEST_CUSTOMER_ORDER
+    left_table: ORDERS
+    right_table: CUSTOMER_ORDERS
+    relationship_columns:
+      - left_column: O_CUSTKEY
+        right_column: O_CUSTKEY
+      - left_column: O_ORDERDATE
+        right_column: O_ORDERDATE
+        type: asof

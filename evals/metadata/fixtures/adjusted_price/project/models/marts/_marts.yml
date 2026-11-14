@@ -1,0 +1,53 @@
+version: 2
+models:
+- name: product_pricing
+  description: One row per product, with its average list price and its average price after
+    discounts.
+  config:
+    meta:
+      dex:
+        grain:
+        - product_id
+        population:
+          rule: Every product with at least one order line.
+        assumptions:
+        - decision: Which lines a product's averages read
+          chosen: every order line of the product
+          evidence: default
+          detail: the conventional unfiltered average over a product's lines
+  columns:
+  - name: product_id
+    data_tests:
+    - unique
+    - not_null
+    config:
+      meta:
+        dex:
+          role: key
+          null_rule: never
+  - name: order_lines
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: sum
+          additivity: additive
+          unit: count
+  - name: avg_list_price
+    description: Average list price of the product's order lines.
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: avg
+          additivity: non_additive
+          unit: currency:USD
+  - name: avg_adjusted_price
+    description: Average price after discounts of the product's order lines.
+    config:
+      meta:
+        dex:
+          role: measure
+          aggregation: avg
+          additivity: non_additive
+          unit: currency:USD

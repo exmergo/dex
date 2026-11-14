@@ -177,6 +177,11 @@ class VerifyResult(Result):
     parent_population: list[dict] | None = None
     #: One record per declared ``history`` temporal contract (#1027).
     temporal_contracts: list[dict] | None = None
+    #: One record per declared grain key (#1223): ``proven``, ``broken``,
+    #: ``not_applicable``, ``unchecked`` or ``not_planned``, each with a
+    #: ``reason`` code where it was not judged. ``None`` when the grain class
+    #: did not run at all, which ``suppressed["grain"]`` then says.
+    grain_coverage: list[dict] | None = None
     #: One record per declared foreign key a project format with no dbt
     #: artifacts supplies (#1197): satisfied, contradicted, not applicable or
     #: unchecked. ``None`` when the axis did not run (always, on dbt).
@@ -188,6 +193,8 @@ class VerifyResult(Result):
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.grain_coverage is not None:
+            payload["grain_coverage"] = self.grain_coverage
         if self.join_coverage is not None:
             payload["join_coverage"] = self.join_coverage
         if self.foreign_key_coverage is not None:
@@ -202,6 +209,52 @@ class VerifyResult(Result):
             payload["judged_namespace"] = self.judged_namespace
         if self.manifest_target is not None:
             payload["manifest_target"] = self.manifest_target
+        return payload
+
+
+class CoverageResult(Result):
+    """Which project resources the dbt tests reach (#1280).
+
+    Read from a parsed manifest alone. ``summary`` leads the payload, so a read
+    cut off after a few kilobytes still gets every total, and each of its
+    ratios carries its own numerator, denominator and what the denominator is:
+    presence, unit tests, downstream-only protection, incremental branches and
+    asserted columns are separate questions and never blended into one number.
+    ``suppressed`` names the inventory when it could not run (a project that
+    does not compile, no manifest to read), so an empty inventory is never read
+    as a project with no tests.
+    """
+
+    always_reports_notes: ClassVar[bool] = True
+
+    summary: dict[str, Any] | None = None
+    scope: dict[str, Any] | None = None
+    sections: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    excluded: dict[str, Any] | None = None
+    elided: dict[str, int] | None = None
+    findings: list[DriftFinding] = Field(default_factory=list)
+    suppressed: dict[str, str] = Field(default_factory=dict)
+    #: Where the manifest came from: ``parsed`` (a fresh ``dbt parse`` of the
+    #: tree as it stands) or ``artifact`` (the newest one on disk, which a
+    #: warning dates), with ``generated_at`` where dbt recorded it.
+    manifest: dict[str, Any] | None = None
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.summary is not None:
+            payload["summary"] = self.summary
+        payload["suppressed"] = self.suppressed
+        if self.findings:
+            payload["findings"] = [f.model_dump(mode="json") for f in self.findings]
+        if self.scope is not None:
+            payload["scope"] = self.scope
+        if self.manifest is not None:
+            payload["manifest"] = self.manifest
+        payload.update(self.sections)
+        if self.excluded is not None:
+            payload["excluded"] = self.excluded
+        if self.elided is not None:
+            payload["elided"] = self.elided
         return payload
 
 

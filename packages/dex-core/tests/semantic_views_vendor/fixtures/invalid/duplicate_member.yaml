@@ -1,0 +1,14 @@
+# expect: duplicate_name
+# A dimension and a fact with one name in one table.
+name: duplicate_member
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: status, expr: o_orderstatus}
+    facts:
+      - {name: status, expr: o_totalprice}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

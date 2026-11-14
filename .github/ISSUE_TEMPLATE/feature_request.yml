@@ -1,7 +1,13 @@
 name: Feature request
-description: Suggest a capability or improvement.
+description: Suggest a capability or improvement. Requests drafted by an agent on a person's behalf are welcome.
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for the idea. A refusal that stopped a legitimate change, or a
+        workaround you keep repeating, is a good reason to file one.
+        `dex feedback` prints a link that prefills this form.
   - type: textarea
     id: problem
     attributes:
@@ -20,6 +26,7 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
+      description: Including any workaround you use today.
   - type: dropdown
     id: area
     attributes:
@@ -27,11 +34,32 @@ body:
       options:
         - Explore
         - Transform
-        - Model
-        - Reconcile
+        - Maintain
+        - Semantic layer
         - Connectors
+        - Setup and install (dex init, skills, plugins)
         - DexEngine / command contract
         - Evals / benchmarks
         - Other
     validations:
       required: true
+  - type: dropdown
+    id: filed-by
+    attributes:
+      label: Filed by
+      options:
+        - A person
+        - An agent, on a person's behalf
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dex-core version
+      description: Optional. The `exmergo-dex-core` version (`dex feedback` prints it).
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Optional. Paste `data.environment` from `dex feedback`.
+      render: text

@@ -118,6 +118,55 @@ def test_list_objects_uses_free_rest_metadata_only(fake_databricks):
     assert fake_databricks.connect_count == 0
 
 
+def test_a_deployed_metric_view_is_not_inventoried(fake_databricks):
+    """Databricks refuses a plain SELECT of a Metric View's measures, so a
+    profile or a grain probe over one would fail the command (#1259)."""
+
+    from fakes.databricks import FakeDatabricksTable
+
+    fake_databricks.workspace._tables.append(
+        FakeDatabricksTable(
+            catalog="shop",
+            schema="core",
+            name="orders_mv",
+            columns=[("revenue", "decimal(10,2)", True)],
+            kind="metric_view",
+        )
+    )
+    adapter = make_adapter(fake_databricks)
+
+    assert "shop.core.orders_mv" not in {o.identifier for o in adapter.list_objects()}
+
+
+def test_a_metric_view_typed_by_the_sdk_enum_is_not_inventoried(fake_databricks):
+    """The SDK's `table_type` is an enum, whose `str()` is `TableType.METRIC_VIEW`."""
+
+    from enum import Enum
+
+    from exmergo_dex_core.adapters.databricks import DatabricksAdapter
+
+    class TableType(Enum):
+        METRIC_VIEW = "METRIC_VIEW"
+
+    adapter = make_adapter(fake_databricks)
+    assert isinstance(adapter, DatabricksAdapter)
+    adapter._register(
+        type(
+            "Info",
+            (),
+            {
+                "full_name": "shop.core.mv",
+                "name": "mv",
+                "schema_name": "core",
+                "table_type": TableType.METRIC_VIEW,
+                "columns": None,
+            },
+        )()
+    )
+
+    assert "shop.core.mv" not in adapter._objects
+
+
 def test_catalog_allowlist_scopes_inventory(fake_databricks):
     from fakes.databricks import FakeDatabricksTable
 

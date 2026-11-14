@@ -1,0 +1,8 @@
+# Only facts, no dimension and no metric: Snowflake accepts it from YAML.
+name: facts_only
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    facts:
+      - {name: price, expr: o_totalprice}

@@ -141,13 +141,40 @@ _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _PLACEHOLDER = "__dex_jinja__"
 
 
-def needs_compilation(content: str) -> bool:
+_CONTROL_FLOW_STMT = re.compile(r"\{%\s*-?\s*(?:for|if)\b")
+_COLUMN_LISTING = re.compile(
+    r"(?<!\.)\b(?:"
+    r"dbt_utils\.star\s*\("
+    r"|star\s*\("
+    r"|dbt_utils\.get_filtered_columns_in_relation\s*\("
+    r"|(?:adapter|dbt_utils)\.get_columns_in_relation\s*\("
+    r"|adapter\.get_relation_columns\s*\("
+    r"|fivetran_utils\.fill_staging_columns\s*\("
+    r")"
+)
+
+
+def has_control_flow(content: str) -> bool:
     """Control flow cannot be reduced to SQL by deleting its delimiters."""
 
     return any(
-        re.match(r"\{%\s*-?\s*(?:for|if)\b", block)
+        _CONTROL_FLOW_STMT.match(block)
         for block in _JINJA_STMT.findall(_JINJA_COMMENT.sub("", content))
     )
+
+
+def lists_columns(content: str) -> bool:
+    """Column-introspection macros expand to column lists at compile time."""
+
+    cleaned = _JINJA_COMMENT.sub("", content)
+    blocks = _JINJA_STMT.findall(cleaned) + _JINJA_EXPR.findall(cleaned)
+    return any(_COLUMN_LISTING.search(block) for block in blocks)
+
+
+def needs_compilation(content: str) -> bool:
+    """Control flow or compile-time column listing requires dbt compilation."""
+
+    return has_control_flow(content) or lists_columns(content)
 
 
 @dataclass(frozen=True)
@@ -328,14 +355,32 @@ def strip_jinja(sql: str) -> str:
     depth = 0
     for line_number, line in enumerate(text.splitlines(), start=1):
         if line.strip() == _PLACEHOLDER:
-            if depth > 0:
+            if depth > 0 and _opens_a_query("\n".join(lines)):
                 lines.append(line.replace(_PLACEHOLDER, f"select {_PLACEHOLDER}"))
+            elif depth > 0:
+                # A macro rendering part of a select list inside a CTE (a
+                # Fivetran staging model's `fill_staging_columns`), so it stays
+                # an expression (#1229).
+                lines.append(line)
             elif query_start_line is not None and line_number >= query_start_line:
                 lines.append(line)
             continue
         depth += line.count("(") - line.count(")")
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_QUERY_OPENERS = re.compile(
+    r"(\(|\bunion(\s+all|\s+distinct)?|\bintersect|\bexcept)\s*$", re.IGNORECASE
+)
+
+
+def _opens_a_query(before: str) -> bool:
+    """Whether SQL ending in ``before`` expects a whole query next: right after
+    an open paren or a set operator, as opposed to inside a select list."""
+
+    return bool(_QUERY_OPENERS.search(_SQL_COMMENT.sub("", before).rstrip()))
 
 
 # A seed is data entering git, and it stays there. dbt itself warns against
@@ -870,7 +915,7 @@ def validate_edit(
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:
-        if needs_compilation(edit.new_content):
+        if has_control_flow(edit.new_content):
             if compiled is not None:
                 compiled.check(edit)
                 warnings.extend(
@@ -881,6 +926,11 @@ def validate_edit(
                     f"{edit.path}: Jinja control flow requires dbt compilation; "
                     "use transform plan with an installed dbt adapter and a dev profile"
                 )
+        elif compiled is not None:
+            compiled.check(edit)
+            warnings.extend(
+                _external_read_warnings(edit.path, compiled.sql, "compiled model")
+            )
         else:
             warnings.extend(_assert_query_only(edit.path, edit.new_content, "model"))
     else:

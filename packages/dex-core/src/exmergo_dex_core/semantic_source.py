@@ -221,6 +221,10 @@ class DeclaredReference:
     parent_column: str | None = None
     parent_identifier: str | None = None
     parent_relation: str | None = None
+    #: The grain the parent's own declaration states, where it states one, so a
+    #: layer that can assert a join matches at most one parent row (a Metric
+    #: View's ``rely.at_most_one_match``) asserts it only on a declared key.
+    parent_grain: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)

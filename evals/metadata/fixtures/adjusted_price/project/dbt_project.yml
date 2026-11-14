@@ -1,0 +1,13 @@
+name: pricing
+version: "1.0.0"
+profile: pricing
+model-paths: ["models"]
+
+models:
+  pricing:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table

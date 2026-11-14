@@ -1,0 +1,19 @@
+# expect: row_level
+# A dimension reading a metric of a table it is joined to one-to-one.
+name: one_to_one_reads_metric
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: copied, expr: orders_copy.copy_count}
+  - name: orders_copy
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - {name: copy_count, expr: COUNT(o_orderkey)}
+relationships:
+  - name: orders_to_copy
+    left_table: orders
+    right_table: orders_copy
+    relationship_columns: [{left_column: o_orderkey, right_column: o_orderkey}]

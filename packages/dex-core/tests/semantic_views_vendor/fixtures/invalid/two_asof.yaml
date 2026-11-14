@@ -1,0 +1,24 @@
+# expect: asof
+# Two ASOF columns in one relationship.
+name: two_asof
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    metrics:
+      - {name: line_count, expr: COUNT(l_linenumber)}
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    unique_keys:
+      - columns: [o_custkey, o_orderdate, o_totalprice]
+    dimensions:
+      - {name: priority, expr: o_orderpriority}
+relationships:
+  - name: lines_orders
+    left_table: lineitem
+    right_table: orders
+    relationship_columns:
+      - {left_column: l_suppkey, right_column: o_custkey}
+      - {left_column: l_shipdate, right_column: o_orderdate, type: asof}
+      - {left_column: l_extendedprice, right_column: o_totalprice, type: asof}

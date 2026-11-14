@@ -1,0 +1,46 @@
+{
+  "models": {
+    "listing_review_summary": {
+      "grain": [
+        "listing_id"
+      ],
+      "columns": {
+        "listing_id": {
+          "role": "key"
+        },
+        "review_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count"
+        }
+      },
+      "assumption_evidence": "request"
+    }
+  },
+  "checks": [
+    {
+      "name": "every reviewed listing, and only those",
+      "expect": 22,
+      "sql": "select count(*) from main.listing_review_summary"
+    },
+    {
+      "name": "no listing without a review",
+      "expect": 0,
+      "sql": "select count(*) from main.listing_review_summary where listing_id not in (select listing_id from raw.reviews) or review_count is null or review_count = 0 or avg_rating is null"
+    },
+    {
+      "name": "no review of a removed listing",
+      "expect": 0,
+      "sql": "select count(*) from main.listing_review_summary where listing_id not in (select listing_id from raw.listings)"
+    },
+    {
+      "name": "review counts and ratings match",
+      "expect": 0,
+      "sql": "select count(*) from main.listing_review_summary s join (select r.listing_id, count(*) as n, avg(r.rating) as a from raw.reviews r join raw.listings l using (listing_id) group by 1) e using (listing_id) where s.review_count is distinct from e.n or abs(s.avg_rating - e.a) > 1e-9"
+    }
+  ],
+  "procedure": {
+    "build_after_apply": true
+  }
+}

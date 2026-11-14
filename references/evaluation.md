@@ -92,8 +92,8 @@ declared no ceiling (#797), and `duckdb-1x` keeps the 1.5 floor tested now that
 the lock is on 2.x. They run weekly on every supported Python rather than
 per pull request (`.github/workflows/upstream-deps-canaries.yml`): the question they
 answer is about an upstream release, and a week is soon enough to learn it.
-`mermaid-syntax` renders `explore diagram` output and parses it with the real
-Mermaid package from npm.
+The Mermaid steps of `docs-checks` render `explore diagram` output and parse it
+with the real Mermaid package from npm.
 
 The last one is worth explaining, because it is the one place CI reaches outside
 Python. dex emits Mermaid text and never renders it, so no declared dependency

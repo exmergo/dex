@@ -1,0 +1,27 @@
+version: 2
+models:
+  - name: stg_calendar
+    description: One row per calendar day.
+    columns:
+      - name: day
+        data_tests: [unique, not_null]
+  - name: stg_tickets
+    description: One row per support ticket.
+    columns:
+      - name: ticket_id
+        data_tests: [unique, not_null]
+  - name: stg_workspaces
+    description: One row per workspace.
+    columns:
+      - name: workspace_id
+        data_tests: [unique, not_null]
+  - name: stg_memberships
+    description: One row per membership.
+    columns:
+      - name: membership_id
+        data_tests: [unique, not_null]
+  - name: stg_shipments
+    description: One row per shipment.
+    columns:
+      - name: shipment_id
+        data_tests: [unique, not_null]

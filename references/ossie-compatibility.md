@@ -220,6 +220,7 @@ behind it is drift.
 | `maintain snapshot` baseline over the layer | yes | `drift_baseline` |
 | free definition, key, and relationship drift against that baseline | yes | `drift_baseline`, `drift_changed` |
 | `semantic ossie define\|update\|plan`, applied with `transform apply` | yes, confined to the exact paths in `semantic.ossie.files` | see [Authoring native documents](semantic-layer.md#authoring-native-documents) |
+| a document proposed from a Databricks Metric View (`--from-metric-view`), and a view from a document (`semantic databricks --from-ossie`) | yes, through Dex's port of the apache/ossie-converters `databricks` spoke | see [The Ossie bridge](databricks-metric-views-compatibility.md#the-ossie-bridge) |
 | model declarations derived into the layer, or annotating a dataset | yes, see [Declarations](#declarations) | see `tests/ossie/test_derivation.py` |
 
 `adversarial_composite` is the case worth reading. Its child tuples are
@@ -279,7 +280,10 @@ Decisions behind the mapping:
 - **`ai_context`, never `custom_extensions`.** `custom_extensions.data` is an
   opaque string, and a declaration encoded into a string inside YAML cannot be
   reviewed in a diff. `ai_context` takes an object with any further keys, so the
-  declaration stays structured.
+  declaration stays structured. The one writer of `custom_extensions` is the
+  [Ossie bridge](databricks-metric-views-compatibility.md#the-ossie-bridge),
+  which writes the converter's own `DATABRICKS` entry so a document it writes
+  reads back through the converter.
 - **A population is metadata, never a filter.** Ossie has no filter on a dataset
   or a metric, and the dataset sits on the mart, whose SQL already enforces it.
 - **Nothing is guessed.** `median` (no portable aggregate) and `semi_additive`

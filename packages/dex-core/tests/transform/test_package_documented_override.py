@@ -283,6 +283,36 @@ def test_the_undeclared_override_plans_builds_and_keeps_the_package_entry(
     assert node["description"] == PACKAGE_DESCRIPTION
     assert node["patch_path"] == "tiny_pkg://models/pkg_task.yml"
 
+    findings = built["data"]["verification"]["findings"]
+    [gap] = [f for f in findings if f["code"] == "column_undeclared"]
+    assert gap["identifier"] == "pkg_task"
+    assert gap["severity"] == "low"
+    assert PACKAGE_ENTRY in gap["detail"]
+    assert "the project cannot declare the override" in gap["detail"]
+    assert "schema.yml" not in gap["detail"]
+    assert gap["data"]["package_entry"] == PACKAGE_ENTRY
+    assert gap["data"]["columns"] == ["created_ts"]
+
+    target = project / "target"
+    target.mkdir(exist_ok=True)
+    shutil.copy(
+        Path(built["data"]["artifact_directory"]) / "manifest.json",
+        target / "manifest.json",
+    )
+
+    swept = _dex(capsys, "maintain", "verify", "--target", "dev", "pkg_task")
+    assert swept["status"] == "ok", swept["errors"]
+    [swept_gap] = [
+        f for f in swept["data"]["findings"] if f["code"] == "column_undeclared"
+    ]
+    assert swept_gap["identifier"] == "pkg_task"
+    assert swept_gap["severity"] == "low"
+    assert PACKAGE_ENTRY in swept_gap["detail"]
+    assert "the project cannot declare the override" in swept_gap["detail"]
+    assert "schema.yml" not in swept_gap["detail"]
+    assert swept_gap["data"]["package_entry"] == PACKAGE_ENTRY
+    assert swept_gap["data"]["columns"] == ["created_ts"]
+
     reader = project / "reader.json"
     reader.write_text(
         json.dumps(

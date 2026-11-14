@@ -14,9 +14,18 @@ Standard library only, so it imports on a base install.
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
-__all__ = ["NUMERIC", "TEXT", "UNPLACEABLE", "Bucket", "bucket", "spelled"]
+__all__ = [
+    "NUMERIC",
+    "TEXT",
+    "UNPLACEABLE",
+    "Bucket",
+    "bucket",
+    "list_element",
+    "spelled",
+]
 
 #: The kinds of value a column can be read as.
 Bucket = Literal["temporal", "numeric", "text", "boolean"]
@@ -76,6 +85,47 @@ def spelled(raw: str | None) -> str:
     """The type's name as the buckets compare it: upper case, no parameters."""
 
     return (raw or "").upper().split("(")[0].strip()
+
+
+# A list suffix: DuckDB's and Postgres's `T[]`, DuckDB's fixed-size `T[3]`.
+_LIST_SUFFIX = re.compile(r"^(?P<element>.+?)\s*\[\s*\d*\s*\]$", re.DOTALL)
+
+# A list wrapper: BigQuery's `ARRAY<T>`, Snowflake's structured `ARRAY(T)`,
+# Trino's `array(T)`, ClickHouse's `Array(T)`.
+_LIST_WRAPPER = re.compile(
+    r"^ARRAY\s*(?:<(?P<angle>.*)>|\((?P<paren>.*)\))$", re.IGNORECASE | re.DOTALL
+)
+
+
+def list_element(raw: str | None) -> str | None:
+    """The element spelling of a list type, ``""`` for an unknown element, or
+    ``None`` when ``raw`` is not a list.
+
+    ``VARCHAR[]`` and ``text[]`` are ``VARCHAR`` and ``text``; ``ARRAY<STRING>``
+    and ``array(varchar)`` are ``STRING`` and ``varchar``. A bare ``ARRAY``
+    (Snowflake's semi-structured array) is a list of unknown elements, and so is
+    a list of lists or of structs, since neither element is a scalar a layer
+    can type. Redshift's ``SUPER`` is a document, not a list.
+    """
+
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.upper() == "ARRAY":
+        return ""
+    found = _LIST_SUFFIX.match(text)
+    if found:
+        element = found.group("element").strip()
+    else:
+        wrapped = _LIST_WRAPPER.match(text)
+        if not wrapped:
+            return None
+        element = (wrapped.group("angle") or wrapped.group("paren") or "").strip()
+    if not element or list_element(element) is not None:
+        return ""
+    if spelled(element).startswith(UNPLACEABLE):
+        return ""
+    return element
 
 
 def bucket(raw: str | None) -> Bucket | None:

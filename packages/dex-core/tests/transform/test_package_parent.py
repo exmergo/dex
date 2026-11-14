@@ -299,6 +299,46 @@ def test_a_custom_packages_install_path_is_followed(tmp_path):
     assert found.path.startswith("vendor_packages/tiny_inbox/")
 
 
+def test_package_target_reads_schema_from_package_or_project(tmp_path):
+    """#1199: find_package_target reads the custom schema for package models."""
+
+    pkg_dbt = (
+        "name: tiny_inbox\nversion: '1.0'\nconfig-version: 2\n"
+        "model-paths: [models]\nmodels:\n  tiny_inbox:\n    +schema: inbox\n"
+    )
+    root = _project(
+        tmp_path / "p",
+        extra={"dbt_packages/tiny_inbox/dbt_project.yml": pkg_dbt},
+    )
+    found = find_package_target(
+        root,
+        "stg_inbox__conversations",
+        project_yml=(root / "dbt_project.yml").read_text(),
+    )
+    assert found is not None
+    assert found.schema == "inbox"
+
+    override_yml = (
+        root / "dbt_project.yml"
+    ).read_text() + "models:\n  tiny_inbox:\n    +schema: custom_inbox\n"
+    overridden = find_package_target(
+        root,
+        "stg_inbox__conversations",
+        project_yml=override_yml,
+    )
+    assert overridden is not None
+    assert overridden.schema == "custom_inbox"
+
+
+def test_sql_schema_does_not_match_other_config_keys_ending_in_schema():
+    """#1199: _sql_schema requires a word boundary before schema."""
+
+    from exmergo_dex_core.transform.package_targets import _sql_schema
+
+    assert _sql_schema("{{ config(some_schema='ignored', schema='real') }}") == "real"
+    assert _sql_schema("{{ config(some_schema='ignored') }}") is None
+
+
 def test_a_source_is_still_refused_and_says_so(tmp_path):
     """A source table is not a parent."""
     root = _project(tmp_path / "p")
@@ -510,6 +550,36 @@ def test_a_package_macro_that_may_read_a_relation_is_unchecked(tmp_path):
             id="postgres-schema-only-the-derived-one",
         ),
         pytest.param(
+            "dbt_dev",
+            [
+                "`acme-dw`.`staging_dev`.`stg_orders`",
+                "`acme-dw`.`intermediate_dev`.`int_orders`",
+                "`acme-dw`.`marts_dev`.`fct_orders`",
+            ],
+            ["intermediate_dev", "marts_dev", "staging_dev"],
+            id="bigquery-layered-schemas",
+        ),
+        pytest.param(
+            "ANALYTICS.DEV",
+            [
+                '"ANALYTICS"."STAGING_DEV"."STG_ORDERS"',
+                '"ANALYTICS"."INTERMEDIATE_DEV"."INT_ORDERS"',
+                '"ANALYTICS"."MARTS_DEV"."FCT_ORDERS"',
+            ],
+            [
+                "ANALYTICS.INTERMEDIATE_DEV",
+                "ANALYTICS.MARTS_DEV",
+                "ANALYTICS.STAGING_DEV",
+            ],
+            id="snowflake-layered-schemas",
+        ),
+        pytest.param(
+            "dev",
+            ['"staging_dev"."stg_orders"', '"marts_dev"."fct_orders"'],
+            ["marts_dev", "staging_dev"],
+            id="postgres-layered-schemas",
+        ),
+        pytest.param(
             "dev.dbt_dev",
             ["prod.dbt_dev_inbox.x", "dev.dbt_devious.y", "dev.dbt_dev.z"],
             [],
@@ -519,10 +589,37 @@ def test_a_package_macro_that_may_read_a_relation_is_unchecked(tmp_path):
     ],
 )
 def test_derived_dev_scopes(dev, relations, expected):
-    """Namespaces dbt derives from the dev one, per connector spelling."""
+    """namespaces dbt derives from the dev one, per connector spelling."""
     from exmergo_dex_core.connect import derived_dev_scopes
 
     assert derived_dev_scopes(dev, relations) == expected
+
+
+def test_derived_dev_scopes_with_explicit_target_name():
+    """a custom dbt_target derives layer schemas ending with that target name."""
+    from exmergo_dex_core.connect import derived_dev_scopes
+
+    relations = [
+        "`acme-dw`.`staging_local`.`stg_orders`",
+        "`acme-dw`.`marts_local`.`fct_orders`",
+    ]
+    assert derived_dev_scopes("dbt_local", relations, target_name="local") == [
+        "marts_local",
+        "staging_local",
+    ]
+
+
+def test_derived_dev_scopes_excludes_dev_suffix_with_explicit_target_name():
+    """a schema ending in _dev is excluded when an explicit target name is set."""
+    from exmergo_dex_core.connect import derived_dev_scopes
+
+    relations = [
+        "`acme-dw`.`finance_dev`.`fct_revenue`",
+        "`acme-dw`.`staging_local`.`stg_orders`",
+    ]
+    assert derived_dev_scopes("dbt_local", relations, target_name="local") == [
+        "staging_local",
+    ]
 
 
 def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
@@ -543,6 +640,10 @@ def test_widen_dev_reads_reads_the_dev_namespace_and_what_derives_from_it():
     assert seen == [["dbt_dev", "dbt_dev_inbox"]]
     assert widen_dev_reads(adapter, config, ["p.dbt_dev.x"]) == []
     assert len(seen) == 1, "nothing derived, so the adapter's dev read is untouched"
+
+    added_layered = widen_dev_reads(adapter, config, ["p.staging_dev.x"])
+    assert added_layered == ["staging_dev"]
+    assert seen == [["dbt_dev", "dbt_dev_inbox"], ["dbt_dev", "staging_dev"]]
 
 
 def test_with_dev_target_folds_every_existing_entry_once():

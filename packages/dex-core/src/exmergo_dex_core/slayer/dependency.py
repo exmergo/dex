@@ -32,7 +32,7 @@ SLAYER_DISTRIBUTION = "motley-slayer"
 #: in pyproject.toml by a test: SLayer's stored model format is versioned and
 #: moves between releases, so a release dex was not built against is refused
 #: rather than read.
-SLAYER_VERSION = "1.2.0"
+SLAYER_VERSION = "1.8.2"
 
 _INSTALL = 'pip install "exmergo-dex-core[slayer]"'
 

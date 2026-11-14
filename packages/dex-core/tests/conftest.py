@@ -53,7 +53,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption(
         "--ci-group",
         choices=sorted(ci_groups.GROUPS),
-        help="run only the test files tests/ci_groups.py assigns to this group",
+        help="run only the tests tests/ci_groups.py assigns to this group",
     )
     group.addoption(
         "--ci-group-report",
@@ -76,8 +76,12 @@ def pytest_collection_modifyitems(
     root = config.rootpath
     keep, drop = [], []
     for item in items:
+        # The test id relative to the package, wherever pytest put its rootdir,
+        # so a ``file::test`` prefix in ci_groups.py can carve out one test.
         path = item.path.relative_to(root).as_posix()
-        (keep if ci_groups.group_of(path) == group else drop).append(item)
+        _, sep, rest = item.nodeid.partition("::")
+        nodeid = path + sep + rest
+        (keep if ci_groups.group_of(nodeid) == group else drop).append(item)
     if drop:
         config.hook.pytest_deselected(items=drop)
     items[:] = keep

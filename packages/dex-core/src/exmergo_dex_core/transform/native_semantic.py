@@ -262,6 +262,9 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
     try:
         # Before the payload, so a mismatch is refused without reading a file.
         require_configured_vendor(engine, vendor)
+        bridged = _bridge_source(args)
+        if bridged is not None:
+            return _cmd_bridge(args, engine, vendor, bridged)
         edits, declarations = payload_from_file(
             getattr(args, "edits_file", None),
             default_kind=EditKind.SEMANTIC_DOCUMENT,
@@ -279,7 +282,64 @@ def cmd_semantic_native(args: argparse.Namespace, engine: DexEngine) -> env.Enve
         return env.error_for(exc)
 
 
+def _bridge_source(args: argparse.Namespace) -> str | None:
+    """The files a bridge flag names (the flags are the bridge table's)."""
+
+    from .semantic_bridge import BRIDGES
+
+    return next(
+        (
+            value
+            for bridge in BRIDGES.values()
+            if (value := getattr(args, bridge.dest, None))
+        ),
+        None,
+    )
+
+
+def _cmd_bridge(
+    args: argparse.Namespace, engine: DexEngine, vendor: str, source: str
+) -> env.Envelope:
+    """The bridge (#1260): the configured layer proposed from another format."""
+
+    from .semantic_bridge import BRIDGES, BridgeError, semantic_bridge
+
+    if getattr(args, "edits_file", None):
+        return env.error_for(
+            ValueError(
+                "--edits-file and the bridge flag both supply the documents: pass "
+                "one. The bridge writes the whole converted document"
+            )
+        )
+    options = {
+        dest: getattr(args, dest)
+        for bridge in BRIDGES.values()
+        for _, dest, _ in bridge.options
+        if hasattr(args, dest)
+    }
+    try:
+        result = semantic_bridge(
+            engine,
+            vendor,
+            args.mode or "plan",
+            getattr(args, "argument", None) or "",
+            source,
+            **options,
+        )
+    except BridgeError as exc:
+        return env.error_for(exc, data={"bridge": exc.bridge})
+    except (DexError, ValueError) as exc:
+        return env.error_for(exc)
+    return to_envelope(result, hints=plan_hint(result))
+
+
 def plan_hint(result: PlanResult) -> dict[str, str]:
+    """The plan envelope's `next`: what to compare, repair or apply, in order."""
+
+    bridge = getattr(result, "bridge", None)
+    if bridge is not None and not result.plan_id:
+        # A proposal only: nothing is stored, so there is nothing to apply.
+        return {"next": bridge.get("next") or "adopt the output path, then run again"}
     companion = (getattr(result, "semantic_proposal", None) or {}).get("plan_id")
     if companion:
         # Named both explicitly: a bare `transform apply` takes the latest
@@ -309,12 +369,28 @@ def plan_hint(result: PlanResult) -> dict[str, str]:
                 for b in m.get("blocked_inputs") or []
             }
         )
+        failed_packages = sorted(
+            {
+                b["model"]
+                for m in offer["per_model"]
+                for b in m.get("blocked_inputs") or []
+                if b.get("repair")
+            }
+        )
         if blocked and not offer.get("mixed_with_repair"):
-            # The comparison cannot run until its baseline builds (#1114).
+            # The comparison cannot run until its baseline builds (#1114); a
+            # failed package model's repair is drafted by one command naming
+            # every such model, since the overrides share dbt_project.yml (#1229).
+            how = (
+                f" (`dex transform repair {' '.join(failed_packages)}` drafts it)"
+                if failed_packages
+                else ""
+            )
             step = (
                 f"the baseline does not build ({', '.join(blocked)}): repair it in "
-                "its own plan, apply and build that plan (`--cold-deps` where a "
-                "package owns the node), and leave this plan unapplied; then " + step
+                f"its own plan{how}, apply and build that plan (`--cold-deps` "
+                "where a package owns the node), and leave this plan unapplied; "
+                "then " + step
             )
         elif offer.get("mixed_with_repair"):
             step = (

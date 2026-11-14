@@ -92,6 +92,7 @@ _EXPORTS = {
     "DependencyPolicy": "transform.build",
     "MissingPackagesError": "transform.build",
     "PlanDeclaresMissingPackagesError": "transform.build",
+    "RepairRefusedError": "transform.package_repair",
     "declared_packages": "transform.build",
     "installed_packages": "transform.build",
     "missing_packages": "transform.build",
@@ -192,6 +193,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         packages_digest,
         source_digest,
     )
+    from ..transform.package_repair import RepairRefusedError
     from ..transform.plans import (
         EditKind,
         PlanEdit,
@@ -257,6 +259,7 @@ __all__ = [
     "ProviderControl",
     "Reason",
     "RefusalReason",
+    "RepairRefusedError",
     "StatementVerdict",
     "TransformPlan",
     "UnresolvedReference",

@@ -44,13 +44,23 @@ def test_the_catch_all_exists_and_names_no_prefix():
     assert ci_groups.GROUPS[ci_groups.CATCH_ALL] == ()
 
 
+def _names_a_test(prefix: str, files: list[str]) -> bool:
+    file, sep, name = prefix.partition("::")
+    if not sep:
+        return any(path.startswith(prefix) for path in files)
+    # A test prefix names a test function its file defines, so a renamed test
+    # cannot leave a group cut around nothing (and its tests in the catch-all).
+    source = (PACKAGE / file).read_text(encoding="utf-8") if file in files else ""
+    return f"def {name}(" in source
+
+
 def test_every_prefix_names_a_test_file_and_no_two_groups_share_one():
     files = _test_files()
     owner: dict[str, str] = {}
     for group, prefixes in ci_groups.GROUPS.items():
         for prefix in prefixes:
-            assert any(path.startswith(prefix) for path in files), (
-                f"{group!r} prefix {prefix!r} names no test file"
+            assert _names_a_test(prefix, files), (
+                f"{group!r} prefix {prefix!r} names no test file or test"
             )
             assert prefix not in owner, (
                 f"{prefix!r} is in both {owner[prefix]!r} and {group!r}"
@@ -66,7 +76,7 @@ def test_the_longest_prefix_decides():
         "transform-retirement"
     )
     assert ci_groups.group_of("tests/transform/test_retirement_plan.py") == (
-        "transform-contracts"
+        "transform-retirement-plan"
     )
     assert ci_groups.group_of("tests/transform/test_retirement_scoped.py") == (
         "transform-retirement-scoped"
@@ -88,8 +98,25 @@ def test_real_mutation_cases_run_in_separate_groups(area):
 
 
 def test_every_group_has_test_files():
-    owners = {ci_groups.group_of(path) for path in _test_files()}
+    # A group cut test by test owns no whole file, so its test prefixes count.
+    owners = {ci_groups.group_of(path) for path in _test_files()} | {
+        ci_groups.group_of(prefix)
+        for prefixes in ci_groups.GROUPS.values()
+        for prefix in prefixes
+        if "::" in prefix
+    }
     assert owners == set(ci_groups.GROUPS)
+
+
+def test_a_test_prefix_carves_one_test_out_of_its_file():
+    toggle = "tests/transform/test_toggle_build.py"
+    carved = f"{toggle}::test_compare_refuses_a_parent_that_moves_with_the_flag"
+    assert ci_groups.group_of(carved) == "transform-toggle-compare"
+    assert ci_groups.group_of(f"{carved}[param]") == "transform-toggle-compare"
+    # Not a longer name that happens to begin with it, nor another test.
+    assert ci_groups.group_of(f"{carved}_too") == "transform-toggle"
+    assert ci_groups.group_of(f"{toggle}::test_refusals") == "transform-toggle"
+    assert ci_groups.group_of(toggle) == "transform-toggle"
 
 
 def test_a_file_no_prefix_names_lands_in_the_catch_all():

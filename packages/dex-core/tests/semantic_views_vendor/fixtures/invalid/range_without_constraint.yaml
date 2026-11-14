@@ -1,0 +1,22 @@
+# expect: range
+# A range relationship to a table with no distinct_range constraint.
+name: range_without_constraint
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    metrics:
+      - {name: line_count, expr: COUNT(l_linenumber)}
+  - name: price_bands
+    base_table: {database: DEX_SV, schema: FIXTURES, table: PRICE_BANDS}
+    primary_key: {columns: [band_id]}
+    dimensions:
+      - {name: band_name, expr: band_name}
+relationships:
+  - name: price_band
+    left_table: lineitem
+    right_table: price_bands
+    relationship_columns:
+      - left_column: l_extendedprice
+        type: range
+        right_range: {start_column: band_start, end_column: band_end}

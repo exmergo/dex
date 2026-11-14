@@ -1,0 +1,19 @@
+name: ORDERS_BY_STATUS
+tables:
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: ORDER_STATUS
+        expr: o_orderstatus
+        data_type: VARCHAR(1)
+        access_modifier: public_access
+    metrics:
+      - name: ORDER_COUNT
+        expr: COUNT(o_orderkey)
+        access_modifier: public_access

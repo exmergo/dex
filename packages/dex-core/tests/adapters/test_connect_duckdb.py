@@ -215,3 +215,75 @@ def test_profile_never_counts_a_nested_column_exactly(tmp_path: Path):
         assert columns[name].null_fraction == 0.0
         assert columns[name].distinct_count is None
     assert candidate_keys(dataset) == [["amount"]]
+
+
+def test_duckdb_relations_with_dots_in_table_or_schema_name(tmp_path: Path):
+    """a table or schema name containing dots can be inventoried, profiled,
+    and queried."""
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.config import DexConfig, DuckDBTarget
+    from exmergo_dex_core.engine import DexEngine
+
+    path = tmp_path / "dots.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute('CREATE SCHEMA "x.y"')
+    conn.execute('CREATE TABLE "x.y".t (id INTEGER, val VARCHAR)')
+    conn.execute("INSERT INTO \"x.y\".t VALUES (1, 'hello'), (2, 'world')")
+    conn.execute('CREATE TABLE main."a.b" (id INTEGER, amount DOUBLE)')
+    conn.execute('INSERT INTO main."a.b" VALUES (10, 3.14), (20, 6.28)')
+    conn.close()
+
+    adapter = DuckDBAdapter(path)
+    try:
+        objs = adapter.list_objects()
+        by_ident = {o.identifier: o for o in objs}
+        db = adapter._current_database()
+
+        ab_ident = f"{db}.main.a.b"
+        xy_ident = f"{db}.x.y.t"
+        assert ab_ident in by_ident
+        assert xy_ident in by_ident
+
+        assert by_ident[ab_ident].schema == "main"
+        assert by_ident[ab_ident].name == "a.b"
+        assert by_ident[ab_ident].database == db
+
+        assert by_ident[xy_ident].schema == "x.y"
+        assert by_ident[xy_ident].name == "t"
+        assert by_ident[xy_ident].database == db
+
+        meta_ab, cols_ab = adapter.table_metadata(ab_ident)
+        assert meta_ab.schema == "main"
+        assert meta_ab.name == "a.b"
+        assert meta_ab.row_count == 2
+        assert [c.name for c in cols_ab] == ["id", "amount"]
+
+        meta_xy, cols_xy = adapter.table_metadata(xy_ident)
+        assert meta_xy.schema == "x.y"
+        assert meta_xy.name == "t"
+        assert meta_xy.row_count == 2
+        assert [c.name for c in cols_xy] == ["id", "val"]
+
+        assert adapter.exact_distinct_counts(ab_ident, ["id"]) == {"id": 2}
+        assert adapter.exact_distinct_counts(xy_ident, ["val"]) == {"val": 2}
+
+        combos_ab = adapter.distinct_combination_counts(ab_ident, [["id", "amount"]])
+        assert combos_ab == {("id", "amount"): 2}
+
+        datasets = profile(adapter, [ab_ident, xy_ident])
+        assert len(datasets) == 2
+        dataset_by_ident = {d.identifier: d for d in datasets}
+        assert dataset_by_ident[ab_ident].row_count == 2
+        assert dataset_by_ident[xy_ident].row_count == 2
+    finally:
+        adapter.close()
+
+    cfg = DexConfig(connector="duckdb", duckdb=DuckDBTarget(path=str(path)))
+    engine = DexEngine(connector="duckdb", path=str(path), config=cfg)
+    res_xy = engine.query('SELECT * FROM "x.y".t ORDER BY id')
+    assert res_xy.columns == ["id", "val"]
+    assert res_xy.cells == [[1, "hello"], [2, "world"]]
+
+    res_ab = engine.query('SELECT * FROM main."a.b" ORDER BY id')
+    assert res_ab.columns == ["id", "amount"]
+    assert res_ab.cells == [[10, 3.14], [20, 6.28]]

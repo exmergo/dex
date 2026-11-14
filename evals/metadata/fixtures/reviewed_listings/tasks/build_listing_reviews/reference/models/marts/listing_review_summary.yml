@@ -1,0 +1,27 @@
+version: 2
+models:
+  - name: listing_review_summary
+    description: One row per listing that has at least one review, with how many reviews it has and their mean rating.
+    config:
+      meta:
+        dex:
+          grain: [listing_id]
+          population:
+            rule: Listings on the site with at least one review; unreviewed listings and reviews of removed listings are left out.
+          assumptions:
+            - decision: Whether listings with no reviews belong
+              chosen: no, only listings with at least one review
+              evidence: request
+              column: listing_id
+    columns:
+      - name: listing_id
+        data_tests: [unique, not_null]
+        config: {meta: {dex: {role: key}}}
+      - name: listing_name
+        config: {meta: {dex: {role: attribute}}}
+      - name: review_count
+        description: Reviews the listing has received; at least one.
+        config: {meta: {dex: {role: measure, aggregation: sum, additivity: additive, unit: count, null_rule: never}}}
+      - name: avg_rating
+        description: The mean rating of the listing's reviews, from 1 to 5.
+        config: {meta: {dex: {role: measure, aggregation: avg, additivity: non_additive, unit: stars, null_rule: never}}}

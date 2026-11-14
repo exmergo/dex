@@ -31,9 +31,10 @@ a standalone sweep:
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from ..engine import DexEngine
     from ..maintain.drift import DriftFinding
     from ..results import ConfirmationRequest
+    from .finding_attribution import AttributionInput
 
 # What a build's findings are worth reading in one sitting. A build that trips
 # this many detectors has one upstream cause, and the tail is the same cause
@@ -83,6 +85,9 @@ class BuildVerification:
     parent_population: list[dict] = field(default_factory=list)
     #: One record per declared ``history`` among the built models (#1027).
     temporal_contracts: list[dict] = field(default_factory=list)
+    #: One record per built model measured against a drafted parent, and per
+    #: model the plan is about that no parent could be drafted for (#1228).
+    population_delta: list[dict] = field(default_factory=list)
     #: Which built models had their declared columns compared (#1002); ``None``
     #: when the comparison never reached a model (see ``suppressed``).
     column_contract: dict[str, Any] | None = None
@@ -97,6 +102,16 @@ class BuildVerification:
     #: Findings ranked below :data:`MAX_FINDINGS` and left out of ``findings``,
     #: counted so a summary can say the list is not the whole answer.
     dropped: int = 0
+    #: Which findings the plan introduced (#1230): one entry per finding in
+    #: ``findings``, in the same order, and empty when no plan was named.
+    finding_attribution: list[Any] = field(default_factory=list)
+    #: The introduced findings, as references into ``findings``, and what the
+    #: classification rested on; ``None`` when no plan was named.
+    introduced: list[dict[str, Any]] | None = None
+    attribution: dict[str, Any] | None = None
+    #: Every finding's fingerprint, the capped tail included, which is what the
+    #: sweep history records as the next build's baseline.
+    fingerprints: list[str] = field(default_factory=list)
 
     def payload(self) -> dict[str, Any]:
         """Serialize the measured build checks and their explicit suppressions."""
@@ -107,16 +122,23 @@ class BuildVerification:
             "ran": True,
             "scope": self.scope,
             "scope_not_built": self.scope_not_built,
-            "findings": [f.model_dump(mode="json") for f in self.findings],
+            "findings": self._findings(),
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.attribution is not None:
+            # Ahead of the per-record lists: what the plan introduced is the
+            # part of the sweep a reader must not miss (#1230).
+            payload["introduced"] = self.introduced or []
+            payload["attribution"] = self.attribution
         if self.join_coverage is not None:
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:
             payload["parent_population"] = self.parent_population
         if self.temporal_contracts:
             payload["temporal_contracts"] = self.temporal_contracts
+        if self.population_delta:
+            payload["population_delta"] = self.population_delta
         if self.column_contract is not None:
             payload["column_contract"] = self.column_contract
         if self.retirement:
@@ -126,6 +148,16 @@ class BuildVerification:
         if self.model_versions:
             payload["model_versions"] = self.model_versions
         return payload
+
+    def _findings(self) -> list[dict[str, Any]]:
+        """Each finding, with its attribution where the build named a plan."""
+
+        dumped = [f.model_dump(mode="json") for f in self.findings]
+        if len(self.finding_attribution) == len(dumped):
+            for entry, judged in zip(dumped, self.finding_attribution, strict=True):
+                entry["attribution"] = judged.attribution
+                entry["attribution_basis"] = judged.basis
+        return dumped
 
 
 def built_models(summary: dict[str, Any]) -> dict[str, str]:
@@ -281,6 +313,7 @@ def verify_build(
     toggle: dict[str, Any] | None = None,
     plan_edits: list[Any] | None = None,
     selection: str | None = None,
+    attribution: AttributionInput | None = None,
 ) -> BuildVerification:
     """Sweep the nodes this build ran, and report what it could not sweep.
 
@@ -296,6 +329,10 @@ def verify_build(
 
     ``selection`` carries the build selector, when one was used, so
     declared-fact checks can attribute missing parents to narrow selection.
+
+    ``attribution`` is the named plan's edits and the sweep recorded before it
+    was applied: with it, each finding is classified ``introduced``,
+    ``unattributed`` or ``existing`` before the list is capped (#1230).
 
     Never raises except on a cost-guard refusal, which is re-raised untouched:
     a build that has already run must report what it found, so every other
@@ -401,6 +438,7 @@ def verify_build(
         adapter_once,
         result,
         selection=effective_selection,
+        focus=plan_models(plan_edits),
     )
     # A grain this build proved, by its own passing uniqueness test or by the
     # declared-fact count, ranks a fan-out on that model as intended (#841).
@@ -409,9 +447,16 @@ def verify_build(
     result.findings = verify_mod.damp_fanout(result.findings, proven)
 
     result.findings = drift_mod.rank_findings(findings + result.findings)
+    _attribute(project_dir, attribution, result)
     if len(result.findings) > MAX_FINDINGS:
         dropped = len(result.findings) - MAX_FINDINGS
         result.dropped = dropped
+        if result.attribution is not None:
+            cut = Counter(
+                a.attribution for a in result.finding_attribution[MAX_FINDINGS:]
+            )
+            result.attribution["dropped"] = dict(sorted(cut.items()))
+            result.finding_attribution = result.finding_attribution[:MAX_FINDINGS]
         result.findings = result.findings[:MAX_FINDINGS]
         result.warnings.append(
             f"{dropped} further finding(s) are not listed: a build reporting "
@@ -419,6 +464,45 @@ def verify_build(
             "model, so fix the ranked ones and re-run"
         )
     return result
+
+
+def _attribute(
+    project_dir: Path,
+    given: AttributionInput | None,
+    result: BuildVerification,
+) -> None:
+    """Split the ranked findings into what the plan introduced and the rest
+    (#1230), before the cap, so an introduced finding is never the one cut.
+
+    Introduced findings lead, then the ones nothing can place, then the ones
+    that were there before, each class keeping its own ranking. Total: a
+    manifest that cannot be read only loses the lineage rule.
+    """
+
+    from . import finding_attribution as attr
+
+    result.fingerprints = [attr.fingerprint(f) for f in result.findings]
+    if given is None:
+        return
+    reach: attr.Reach | None = None
+    try:
+        import json
+
+        from ..dbt_project import manifest_file
+
+        manifest = json.loads(manifest_file(project_dir).read_text(encoding="utf-8"))
+        reach = attr.plan_reach(given.edits, manifest)
+    except (OSError, ValueError):
+        reach = None
+    ordered, judged = attr.attribute(result.findings, given.baseline, reach)
+    result.findings = ordered
+    result.finding_attribution = judged
+    result.introduced = attr.introduced_refs(ordered, judged)
+    result.attribution = attr.summary(ordered, judged, given, reach)
+    # Read before the findings cap, which can cut them from `findings`.
+    result.attribution["unattributed_high"] = attr.unattributed_high_refs(
+        ordered, judged
+    )
 
 
 def _judgeable(
@@ -667,9 +751,8 @@ def _column_contract(
             "an earlier run's output rather than this build's"
         )
 
-    declared, _undeclared, plan_notes = verify_mod.column_contract_plan(
-        project_dir, scope=scope
-    )
+    plan = verify_mod.column_contract_plan(project_dir, scope=scope)
+    declared, _undeclared, plan_notes = plan
     if plan_notes:
         result.warnings.extend(plan_notes)
         return plan_notes[0]
@@ -702,7 +785,12 @@ def _column_contract(
     relations = verify_mod.built_model_relations(project_dir, scope)
     # The no-columns count is reported by name in the record above.
     check = verify_mod.column_contract_check(
-        adapter, declared, relations, [meta.identifier for meta in live], 0
+        adapter,
+        declared,
+        relations,
+        [meta.identifier for meta in live],
+        0,
+        package_entries=getattr(plan, "package_entries", None),
     )
     result.findings.extend(check.findings)
     result.warnings.extend(check.notes)
@@ -796,7 +884,8 @@ def _row_population(
             f"(dex sees {len(identifiers)} object(s), none of them the "
             "relations this build produced); --verify reads the configured dev "
             "namespace, so a relation built anywhere else, such as a custom "
-            "schema, is not judged"
+            "schema or generate_schema_name that lands outside the dev "
+            "namespace's naming, is not judged"
         )
 
     wanted = sorted({relation for check in checks for relation in check.relations})
@@ -976,10 +1065,14 @@ def _declared_facts(
     resolve_adapter: Callable[[], Adapter],
     result: BuildVerification,
     selection: str | None = None,
+    focus: set[str] | None = None,
 ) -> dict[str, dict]:
     """What the built models' declarations say, checked against what dbt wrote
     (#496): unit, additivity, population, and a declared grain no ``unique``
-    test in this build covers.
+    test in this build covers. A built model that declares no parent is
+    measured against the one :mod:`.population_inference` drafts (#1228);
+    ``focus`` names the models the plan is about, which alone are drafted when
+    it is given.
 
     ``selection`` carries the build selector, when one was used, so
     declared-fact checks can attribute missing parents to narrow selection.
@@ -1012,7 +1105,12 @@ def _declared_facts(
         suppress("this build ran no models")
         return {}
 
-    models, plan_notes = facts_mod.plan(project_dir, scope=scope)
+    drafts = draft_parents(engine, project_dir, scope, focus)
+    result.notes.extend(drafts.notes)
+    _withheld_records(drafts, result)
+    models, plan_notes = facts_mod.plan(
+        project_dir, scope=scope, drafted=drafts.parents
+    )
     result.warnings.extend(plan_notes)
     if plan_notes:
         suppress(plan_notes[0])
@@ -1086,6 +1184,7 @@ def _declared_facts(
     result.warnings.extend(facts.notes)
     result.parent_population = facts.parent_coverage
     result.temporal_contracts = facts.temporal_contracts
+    result.population_delta.extend(facts.population_delta)
     for finding_class, reason in facts.suppressed.items():
         result.suppressed[finding_class] = reason
     if grain_models and facts.offer is not None:
@@ -1095,6 +1194,130 @@ def _declared_facts(
     return facts.proven_grains
 
 
+def plan_models(plan_edits: list[Any] | None) -> set[str] | None:
+    """The models a plan writes SQL for, lowered: the ones a build for it drafts
+    a parent for (#1228). ``None`` where the build answers for no plan."""
+
+    if plan_edits is None:
+        return None
+    from .plans import EditKind, EditOp
+
+    return {
+        PurePosixPath(edit.path).stem.lower()
+        for edit in plan_edits
+        if getattr(edit, "kind", None) is EditKind.MODEL_SQL
+        and getattr(edit, "op", None) is EditOp.UPSERT
+        and str(edit.path).endswith(".sql")
+    }
+
+
+def draft_parents(
+    engine: DexEngine,
+    project_dir: Path,
+    scope: set[str],
+    focus: set[str] | None,
+) -> Any:
+    """The parents drafted for the models in ``scope`` (unique ids or lowered
+    labels) that declare none, read from the tree and the stored cache (#1228).
+    Never raises: a draft is evidence, and a defect in it is a note."""
+
+    from ..dbt_project import manifest_node_label
+    from ..maintain.verify import _manifest_nodes
+    from .population_inference import BuildDrafts, draft_for_build
+
+    try:
+        nodes = _manifest_nodes(project_dir) or {}
+        own = _root_package(project_dir)
+        labels = [
+            manifest_node_label(uid, node)
+            for uid, node in sorted(nodes.items())
+            if isinstance(node, dict)
+            and node.get("resource_type") == "model"
+            and (own is None or node.get("package_name") == own)
+            and (uid in scope or manifest_node_label(uid, node).lower() in scope)
+        ]
+        if focus is not None:
+            # A plan names files; a version's file stem (`dim_teams_v2`) is
+            # the manifest's label (`dim_teams.v2`), so match by the file.
+            focus = set(focus) | {
+                manifest_node_label(uid, node).lower()
+                for uid, node in nodes.items()
+                if isinstance(node, dict)
+                and node.get("resource_type") == "model"
+                and Path(str(node.get("original_file_path") or "")).stem.lower()
+                in focus
+            }
+        return draft_for_build(
+            project_dir,
+            labels,
+            cache=_drafting_cache(engine),
+            dialect=_dialect(engine),
+            focus=focus,
+        )
+    except Exception as exc:
+        if focus is None:
+            return BuildDrafts()
+        return BuildDrafts(
+            notes=[
+                "no parent was drafted for this build's models "
+                f"({type(exc).__name__}); their population was not measured "
+                "against one"
+            ]
+        )
+
+
+def _root_package(project_dir: Path) -> str | None:
+    """The project's own package name, so a package's models are not drafted:
+    their population is the package's, not this project's to decide."""
+
+    from ..dbt_project import load
+
+    try:
+        return load(project_dir).project_name
+    except Exception:
+        return None
+
+
+def _drafting_cache(engine: DexEngine):
+    from ..cache import mask_overridden
+    from ..config import pii_override_paths
+
+    try:
+        from ..storage import readable_cache
+
+        cache = readable_cache(engine.store)
+        overrides = engine.config.pii_overrides
+    except Exception:
+        return None
+    if cache is None:
+        return None
+    return mask_overridden(cache, pii_override_paths(overrides))
+
+
+def _dialect(engine: DexEngine) -> str:
+    from ..adapters import get_dialect
+
+    config = getattr(engine, "config", None)
+    connector = getattr(engine, "connector", None) or getattr(config, "connector", None)
+    return get_dialect(connector or "duckdb")
+
+
+def _withheld_records(drafts: Any, result: BuildVerification) -> None:
+    """An ``unchecked`` record for each model the plan is about that no parent
+    could be drafted for, so its population reads as not measured rather than
+    as clean (#1228)."""
+
+    for model, why in sorted(drafts.withheld.items()):
+        result.population_delta.append(
+            {
+                "model": model,
+                "status": "unchecked",
+                "reason_code": "no_parent_drafted",
+                "reason": why,
+            }
+        )
+
+
 def _pii_overrides(engine: DexEngine):
     from ..config import pii_override_paths
 
@@ -1102,7 +1325,12 @@ def _pii_overrides(engine: DexEngine):
 
 
 def price_declared_facts(
-    adapter: Adapter, project_dir: Path, *, scope: set[str]
+    adapter: Adapter,
+    project_dir: Path,
+    *,
+    scope: set[str],
+    engine: DexEngine | None = None,
+    focus: set[str] | None = None,
 ) -> tuple[float, list[str]]:
     """What the declared-fact checks this build will need would cost, priced
     before it runs and folded into the build's estimate the way
@@ -1120,7 +1348,12 @@ def price_declared_facts(
     if estimator is None:
         return 0.0, []
     try:
-        models, _ = facts_mod.plan(project_dir, scope=scope)
+        drafted = (
+            draft_parents(engine, project_dir, scope, focus).parents
+            if engine is not None
+            else None
+        )
+        models, _ = facts_mod.plan(project_dir, scope=scope, drafted=drafted)
         if not models:
             return 0.0, []
         prepared = facts_mod.prepare(adapter, models, None, check_grain=True)

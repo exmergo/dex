@@ -1,0 +1,13 @@
+# expect: expression_cycle
+# Two facts reading each other.
+name: expression_cycle
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    facts:
+      - {name: a, expr: orders.b + 1}
+      - {name: b, expr: orders.a + 1}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

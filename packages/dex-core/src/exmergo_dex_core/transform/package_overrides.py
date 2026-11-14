@@ -59,6 +59,34 @@ def models_config(project_yml: str | None) -> dict[str, Any]:
     return {}
 
 
+def seeds_config(project_yml: str | None) -> dict[str, Any]:
+    """the ``seeds:`` block of a ``dbt_project.yml``'s text, or empty."""
+
+    with contextlib.suppress(yaml.YAMLError, AttributeError, TypeError):
+        loaded = yaml.safe_load(project_yml or "") or {}
+        if isinstance(loaded, dict) and isinstance(loaded.get("seeds"), dict):
+            return loaded["seeds"]
+    return {}
+
+
+def package_custom_schema(
+    project_config: Mapping[str, Any], package: str, parts: Iterable[str]
+) -> str | None:
+    """the custom schema configured for a package node under ``+schema``."""
+
+    custom = None
+    level: Any = project_config.get(package)
+    for part in [None, *parts]:
+        if part is not None:
+            level = level.get(part) if isinstance(level, dict) else None
+        if not isinstance(level, dict):
+            break
+        for key in ("+schema", "schema"):
+            if isinstance(level.get(key), str):
+                custom = level[key]
+    return custom
+
+
 def package_enabled(
     project_config: Mapping[str, Any], package: str, parts: Iterable[str]
 ) -> bool:

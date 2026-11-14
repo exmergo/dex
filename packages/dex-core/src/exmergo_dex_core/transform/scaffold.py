@@ -32,6 +32,7 @@ from ..dbt_project import load as load_dbt_project
 from ..errors import ConfigurationError, DexError, PrerequisiteError
 from ..guards.pii_meta import stamp_lines
 from ..storage import ExploreStore, readable_cache
+from ..yaml_spans import uses_anchors_or_aliases
 from .plans import EditKind, PlanEdit
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
@@ -504,10 +505,7 @@ def _merge_sources(
             edits.append(
                 (len(original), len(original), prefix + "sources:" + newline + addition)
             )
-    if edits and any(
-        isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None)
-        for event in yaml.parse(original)
-    ):
+    if edits and uses_anchors_or_aliases(original):
         raise SourcesFileError(
             "cannot extend YAML anchors or aliases; expand them first"
         )

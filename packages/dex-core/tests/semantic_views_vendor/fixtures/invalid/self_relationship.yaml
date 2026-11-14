@@ -1,0 +1,15 @@
+# expect: self_relationship
+# A table related to itself.
+name: self_relationship
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+relationships:
+  - name: orders_orders
+    left_table: orders
+    right_table: orders
+    relationship_columns: [{left_column: o_custkey, right_column: o_orderkey}]

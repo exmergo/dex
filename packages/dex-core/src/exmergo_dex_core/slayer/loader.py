@@ -67,8 +67,10 @@ __all__ = [
     "Diagnostic",
     "LoadResult",
     "LoadedModel",
+    "UnaggregatableMeasure",
     "formula_problems",
     "load_models",
+    "unaggregatable_measures",
     "validate_model_contents",
 ]
 
@@ -146,6 +148,56 @@ class LoadedModel:
             return None
         refs = _aggregated_refs(spec)
         return None if refs is None else [ref.measure_name for ref in refs]
+
+
+#: SLayer's built-in aggregations whose result can be one of their input's values
+#: (`min`, `max`, `first`, `last`; `median` over an odd count, and `percentile`,
+#: which at 0 or 1 is the minimum or maximum) or all of them (`collect`, a list).
+#: A model's own custom aggregation is read as one too, since dex cannot say what
+#: its SQL returns.
+VALUE_AGGREGATIONS: frozenset[str] = frozenset(
+    {"min", "max", "first", "last", "median", "percentile", "collect"}
+)
+
+
+def value_aggregated_columns(loaded: LoadedModel, measure: Any) -> list[str] | None:
+    """The column references a saved measure returns values of, as written.
+
+    A count or a sum answers a number about a column; ``max(email)`` or
+    ``collect(email.value)`` answers with the column's own values, which is
+    what the PII gate screens. So the references aggregated by a value-returning
+    aggregation are returned, for the caller to resolve and screen as it would a
+    grouped column (``email``, ``tags.value``, ``customers.email``). ``*`` reads
+    no column. ``None`` means the formula was not read, which is unscreened
+    rather than clean.
+    """
+
+    if find_spec("sqlglot") is None:
+        return None
+    from slayer.core.enums import normalize_aggregation_name
+    from slayer.core.formula import parse_formula
+
+    model = loaded.model
+    custom = frozenset(a.name for a in model.aggregations)
+    named = {
+        m.name: m.formula for m in model.measures if m.name and m.name != measure.name
+    }
+    try:
+        spec = parse_formula(
+            measure.formula, extra_agg_names=custom, named_measures=named
+        )
+    except (ValueError, RecursionError):
+        return None
+    refs = _aggregated_refs(spec)
+    if refs is None:
+        return None
+    found: list[str] = []
+    for ref in refs:
+        written = ref.aggregation_name
+        agg = written if written in custom else normalize_aggregation_name(written)
+        if (agg in VALUE_AGGREGATIONS or agg in custom) and ref.measure_name != "*":
+            found.append(ref.measure_name)
+    return found
 
 
 def _aggregated_refs(spec: Any) -> list[Any] | None:
@@ -689,9 +741,10 @@ def _warnings(loaded: LoadedModel) -> list[Diagnostic]:
     """What dex reads past and says so."""
 
     model = loaded.model
+    found: list[Diagnostic] = []
     declared = model.default_time_dimension
     if declared and model.get_column(declared) is None:
-        return [
+        found.append(
             Diagnostic(
                 file=loaded.file,
                 element="default_time_dimension",
@@ -703,8 +756,123 @@ def _warnings(loaded: LoadedModel) -> list[Diagnostic]:
                     "reports no time dimension for it"
                 ),
             )
-        ]
-    return []
+        )
+    found.extend(
+        Diagnostic(
+            file=loaded.file,
+            element=f"measures[{problem.measure!r}].formula",
+            rule="aggregation_not_applicable",
+            severity=WARNING,
+            message=(
+                f"model '{model.name}' saves measure '{problem.measure}', "
+                f"which aggregates column '{problem.column}' with "
+                f"'{problem.aggregation}', and SLayer refuses that at query "
+                f"time: {problem.reason} The metric is listed, and every "
+                "query of it fails. Change the column's type, or remove or "
+                "rewrite the measure"
+            ),
+        )
+        for problem in unaggregatable_measures(loaded) or []
+    )
+    return found
+
+
+@dataclass(frozen=True)
+class UnaggregatableMeasure:
+    """A saved measure SLayer would refuse to aggregate, and why."""
+
+    measure: str
+    column: str
+    aggregation: str
+    reason: str
+
+
+def unaggregatable_measures(
+    loaded: LoadedModel, retyped: Mapping[str, Any] | None = None
+) -> list[UnaggregatableMeasure] | None:
+    """Every saved measure whose aggregation SLayer refuses on its column.
+
+    SLayer checks this only when it binds a query (``AggregationNotAllowedError``),
+    so a model that saves ``amount:sum`` over a TEXT column validates, is listed,
+    and fails on every query. The gate is restated here from SLayer's public
+    pieces, in its order: a sole primary key takes only
+    ``PRIMARY_KEY_AGGREGATIONS``; a column's ``allowed_aggregations`` is a
+    whitelist; otherwise the type's ``DEFAULT_AGGREGATIONS_BY_TYPE`` decides, and
+    a model's own custom aggregation is exempt. A test holds this to SLayer's
+    binding gate, so a release that moves the rule fails there first.
+
+    ``retyped`` overrides a column's declared type (``{column: DataType}``), which
+    is how a retype asks what a proposed type would break. ``None`` means the
+    formulas were not read (no ``[sql]`` extra): unchecked, not clean. A
+    reference through a join, ``*``, and a formula SLayer's parser refuses are
+    left to their own checks.
+    """
+
+    if find_spec("sqlglot") is None:
+        return None
+    from slayer.core.enums import (
+        DEFAULT_AGGREGATIONS_BY_TYPE,
+        PRIMARY_KEY_AGGREGATIONS,
+        normalize_aggregation_name,
+    )
+    from slayer.core.formula import parse_formula
+    from slayer.core.models import is_identifier
+
+    model = loaded.model
+    custom = frozenset(a.name for a in model.aggregations)
+    named = {m.name: m.formula for m in model.measures if m.name}
+    columns = {c.name: c for c in model.columns}
+    found: list[UnaggregatableMeasure] = []
+    for measure in model.measures:
+        others = {k: v for k, v in named.items() if k != measure.name}
+        try:
+            spec = parse_formula(
+                measure.formula, extra_agg_names=custom, named_measures=others
+            )
+        except (ValueError, RecursionError):
+            continue
+        for ref in _aggregated_refs(spec) or []:
+            col = columns.get(ref.measure_name)
+            if col is None:
+                continue
+            written = ref.aggregation_name
+            agg = written if written in custom else normalize_aggregation_name(written)
+            col_type = (retyped or {}).get(col.name, col.type)
+            if is_identifier(column=col, columns=model.columns):
+                if agg in PRIMARY_KEY_AGGREGATIONS:
+                    continue
+                reason = (
+                    f"'{col.name}' is the model's primary key, which aggregates "
+                    f"only with {', '.join(sorted(PRIMARY_KEY_AGGREGATIONS))}."
+                )
+            elif col.allowed_aggregations is not None:
+                if agg in col.allowed_aggregations:
+                    continue
+                reason = (
+                    f"'{col.name}' restricts allowed_aggregations to "
+                    f"{', '.join(sorted(col.allowed_aggregations))}."
+                )
+            else:
+                allowed = DEFAULT_AGGREGATIONS_BY_TYPE.get(col_type, frozenset())
+                # A model's custom aggregation is exempt from the type defaults
+                # only: SLayer still holds it to a primary key's and a column's
+                # `allowed_aggregations` (`binding._column_agg_refusal`).
+                if agg in custom or agg in allowed:
+                    continue
+                spelled = getattr(col_type, "value", col_type)
+                reason = (
+                    f"'{agg}' is not applicable to a {spelled} column, which "
+                    f"aggregates only with {', '.join(sorted(allowed))}."
+                )
+            found.append(
+                UnaggregatableMeasure(
+                    measure=measure.name or "",
+                    column=col.name,
+                    aggregation=agg,
+                    reason=reason,
+                )
+            )
+    return found
 
 
 def formula_problems(loaded: LoadedModel) -> list[Diagnostic] | None:

@@ -616,6 +616,126 @@ def test_an_estimate_for_a_statement_bigquery_will_not_plan_is_a_typed_refusal(
     assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
 
 
+def test_an_estimate_for_a_missing_relation_is_a_typed_refusal_without_url_or_job_id(
+    fake_bq_client, monkeypatch
+):
+    """dry-run notfound error translates to one clean line without url or job id.
+
+    on a cold target, dry-running against an unbuilt relation raises notfound
+    with a multi-line error including the request url and job id. this must
+    translate to a warehousequeryerror on one line naming the relation, with
+    no request url or job id (issue #1209).
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.envelope import failure_text
+    from exmergo_dex_core.errors import StatementStage, WarehouseQueryError
+
+    raw_message = (
+        "404 POST https://bigquery.googleapis.com/bigquery/v2/projects/test-proj/"
+        "jobs?prettyPrint=false: Not found: Table test-proj:shop.unbuilt was not "
+        "found in location US\n\nLocation: None\nJob ID: fake-job-uuid-1234"
+    )
+    plan = fake_bq_client.query
+
+    def refuse(sql, job_config=None, location=None):
+        """fake query method raising notfound on dry run."""
+        if job_config is not None and job_config.dry_run:
+            raise api_exceptions.NotFound(raw_message)
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse)
+    adapter = make_adapter(fake_bq_client)
+
+    with pytest.raises(WarehouseQueryError) as exc_info:
+        adapter.query_estimate("SELECT count(*) FROM `test-proj`.`shop`.`unbuilt`")
+
+    exc = exc_info.value
+    assert reason_for(exc) is Reason.EXECUTION_FAILURE
+    assert exc.stage == StatementStage.PLAN
+    assert (
+        "Not found: Table test-proj:shop.unbuilt was not found in location US"
+        in str(exc)
+    )
+    assert "https://" not in str(exc)
+    assert "Job ID" not in str(exc)
+    assert "\n" not in str(exc)
+
+    warning = failure_text(exc)
+    assert "https://" not in warning
+    assert "Job ID" not in warning
+    assert "\n" not in warning
+    assert "test-proj:shop.unbuilt" in warning
+
+
+def test_a_run_whose_dry_run_hits_not_found_is_a_typed_plan_refusal(
+    fake_bq_client, monkeypatch
+):
+    """run_query dry-run notfound error translates to plan door refusal.
+
+    verifies that an unbuilt relation dry-run failure during run_query translates
+    into a warehousequeryerror with statementstage.plan, naming the relation
+    without leaking the request url or job id (issue #1209).
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.errors import StatementStage, WarehouseQueryError
+
+    raw_message = (
+        "404 POST https://bigquery.googleapis.com/bigquery/v2/projects/test-proj/"
+        "jobs?prettyPrint=false: Not found: Table test-proj:shop.unbuilt was not "
+        "found in location US\n\nLocation: None\nJob ID: fake-job-uuid-1234"
+    )
+    plan = fake_bq_client.query
+
+    def refuse(sql, job_config=None, location=None):
+        """fake query method raising notfound on dry run."""
+        if job_config is not None and job_config.dry_run:
+            raise api_exceptions.NotFound(raw_message)
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse)
+    adapter = make_adapter(fake_bq_client)
+
+    with pytest.raises(WarehouseQueryError) as exc_info:
+        adapter.run_query(
+            "SELECT * FROM `test-proj`.`shop`.`unbuilt`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+
+    exc = exc_info.value
+    assert reason_for(exc) is Reason.EXECUTION_FAILURE
+    assert exc.stage == StatementStage.PLAN
+    assert "https://" not in str(exc)
+    assert "Job ID" not in str(exc)
+    assert "test-proj:shop.unbuilt" in str(exc)
+
+
+def test_structured_error_message_is_preferred_over_unstructured_string():
+    """structured error message in exc.errors takes precedence.
+
+    verifies that when google api client attaches structured error dicts in
+    exc.errors, _api_error_message extracts that clean message (issue #1209).
+    """
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.adapters.bigquery import _api_error_message
+
+    exc = api_exceptions.NotFound(
+        "404 POST https://bigquery.googleapis.com/...: messy string",
+        errors=[
+            {"message": ("Not found: Table proj:ds.tbl was not found in location US")}
+        ],
+    )
+    assert _api_error_message(exc) == (
+        "Not found: Table proj:ds.tbl was not found in location US"
+    )
+
+
 def test_a_run_whose_dry_run_is_refused_is_the_same_typed_refusal(
     fake_bq_client, monkeypatch
 ):
@@ -1239,6 +1359,141 @@ def test_profile_never_counts_a_skipped_column_exactly(fake_bq_client):
     statements = " ".join(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
     for name in ("user_geom", "attrs", "labels"):
         assert f"COUNT(DISTINCT `{name}`)" not in statements
+
+
+def test_exact_distinct_counts_skips_nested_types(fake_bq_client):
+    """exact_distinct_counts excludes nested and complex columns (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+            bigquery.SchemaField("attrs", "JSON"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 95}]
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.exact_distinct_counts(
+        table.identifier, ["id", "user_geom", "attrs"]
+    )
+    assert counts == {"id": 95}
+    statements = " ".join(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
+    assert "COUNT(DISTINCT `id`)" in statements
+    assert "COUNT(DISTINCT `user_geom`)" not in statements
+    assert "COUNT(DISTINCT `attrs`)" not in statements
+
+
+def test_exact_distinct_counts_returns_empty_when_all_nested(fake_bq_client):
+    """exact_distinct_counts returns empty without querying when all columns
+    are nested (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+            bigquery.SchemaField("attrs", "JSON"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.exact_distinct_counts(table.identifier, ["user_geom", "attrs"])
+    assert counts == {}
+    assert not fake_bq_client.query_calls
+
+
+def test_distinct_combination_counts_skips_nested_types(fake_bq_client):
+    """distinct_combination_counts skips combinations containing nested
+    columns (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("email", "STRING"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 90}]
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.distinct_combination_counts(
+        table.identifier, [["id", "user_geom"], ["id", "email"]]
+    )
+    assert counts == {("id", "email"): 90}
+    statements = " ".join(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
+    assert "`user_geom`" not in statements
+
+
+def test_value_domain_counts_skips_nested_types(fake_bq_client):
+    """value_domain_counts skips nested columns (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    adapter = make_adapter(fake_bq_client)
+    counts = adapter.value_domain_counts(table.identifier, ["user_geom"], limit=10)
+    assert counts == {}
+    assert not fake_bq_client.query_calls
+
+
+def test_table_probe_skips_nested_types(fake_bq_client):
+    """table_probe skips nested columns from distinct and combinations (#925)."""
+
+    from fakes.bigquery import FakeTable
+
+    table = FakeTable(
+        project="test-proj",
+        dataset_id="shop",
+        table_id="users",
+        schema=[
+            bigquery.SchemaField("id", "INTEGER"),
+            bigquery.SchemaField("user_geom", "GEOGRAPHY"),
+        ],
+        num_rows=100,
+        num_bytes=5_000,
+    )
+    fake_bq_client.tables[table.identifier] = table
+    fake_bq_client.row_resolver = lambda sql: [{"n_total": 100, "kd_0": 95}]
+    adapter = make_adapter(fake_bq_client)
+    probe = adapter.table_probe(
+        table.identifier,
+        distinct=["id", "user_geom"],
+        combinations=[["id", "user_geom"]],
+        null_columns=[],
+    )
+    assert probe is not None
+    assert probe.distinct == {"id": 95}
+    assert probe.combinations == {}
 
 
 def test_profile_of_a_refused_batch_stays_metadata_only(fake_bq_client, monkeypatch):

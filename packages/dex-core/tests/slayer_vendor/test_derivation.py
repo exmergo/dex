@@ -612,3 +612,67 @@ def test_a_population_parent_that_names_nothing_is_refused(
     assert rc != 0
     assert "no_such_model" in " ".join(envelope["errors"])
     assert _stored_plans(tmp_path) == []
+
+
+# --- list columns (#1246) ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spelled", "expected"),
+    [
+        # DuckDB
+        ("VARCHAR[]", ("ARRAY", "TEXT")),
+        ("BIGINT[]", ("ARRAY", "INT")),
+        ("TIMESTAMP[]", ("ARRAY", "TIMESTAMP")),
+        ("DATE[]", ("ARRAY", "DATE")),
+        ("DOUBLE[]", ("ARRAY", "DOUBLE")),
+        ("VARCHAR[][]", ("ARRAY", "UNKNOWN")),
+        ("STRUCT(a INTEGER)[]", ("ARRAY", "UNKNOWN")),
+        # BigQuery, as dex reads a REPEATED field
+        ("ARRAY<STRING>", ("ARRAY", "TEXT")),
+        ("ARRAY<INT64>", ("ARRAY", "INT")),
+        ("ARRAY<STRUCT<a INT64>>", ("ARRAY", "UNKNOWN")),
+        # Snowflake: semi-structured, and structured
+        ("ARRAY", ("ARRAY", "UNKNOWN")),
+        ("ARRAY(VARCHAR)", ("ARRAY", "TEXT")),
+        # Postgres and Redshift: `format_type` spellings, and SUPER, which is a
+        # document rather than a list
+        ("text[]", ("ARRAY", "TEXT")),
+        ("character varying[]", ("ARRAY", "TEXT")),
+        ("integer[]", ("ARRAY", "INT")),
+        ("SUPER", (None, None)),
+        # A scalar keeps its type and gets no element type.
+        ("VARCHAR", ("TEXT", None)),
+    ],
+)
+def test_a_warehouse_list_type_derives_as_array_with_its_element(spelled, expected):
+    from exmergo_dex_core.semantic_source import SemanticDeclaration
+    from exmergo_dex_core.slayer.derivation import _column_type, _element_type
+
+    declaration = SemanticDeclaration(model="m", declared={}, data_types={"c": spelled})
+
+    slayer_type, _note = _column_type("c", {"role": "dimension"}, declaration)
+    assert (slayer_type, _element_type("c", declaration)) == expected
+
+
+def test_a_derived_list_column_is_declared_array_and_validates(
+    project: Path, capsys, no_storage_or_warehouse
+):
+    from exmergo_dex_core.slayer.loader import validate_model_contents
+
+    _layer(project, configure_fct=False, sibling_table="demo.main.stg_customers")
+    sql = MART_SQL.rstrip() + ",\n  cast(['a'] as varchar[]) as tags\n"
+    declaration = copy.deepcopy(POPULATED)
+    declaration["columns"]["tags"] = {"role": "dimension"}
+
+    rc, envelope = _plan(project, capsys, declaration, sql=sql)
+
+    assert rc == 0, envelope["errors"]
+    content = _proposed(envelope)["models"]["fct_orders"]["content"]
+    columns = {c["name"]: c for c in yaml.safe_load(content)["columns"]}
+    assert columns["tags"]["type"] == "ARRAY"
+    assert columns["tags"]["element_type"] == "TEXT"
+    result = validate_model_contents(
+        {FCT: content, CUSTOMERS: dump(customers(sql_table="demo.main.stg_customers"))}
+    )
+    assert not result.errors, result.notes()

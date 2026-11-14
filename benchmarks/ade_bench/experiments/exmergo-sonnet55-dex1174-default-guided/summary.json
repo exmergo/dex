@@ -1,0 +1,401 @@
+{
+  "blocking_reason": null,
+  "batch": "/Users/marcociavarella/Projects/ade-bench/experiments/exmergo-sonnet55-dex1174-default-guided",
+  "benchmark_condition": "dex-guided-v1",
+  "updated_at": "2026-11-05T22:36:55.024587+00:00",
+  "total": 75,
+  "counts": {
+    "pass": 60,
+    "fail": 15,
+    "error": 0,
+    "pending": 0,
+    "running": 0
+  },
+  "reported_cost_usd_all_attempts": 11.913012,
+  "dex_loaded_tasks": 75,
+  "dex_command_invoked_tasks": 74,
+  "dex_skill_invoked_tasks": 74,
+  "dex_cli_invoked_tasks": 15,
+  "dex_wrapper_invoked_tasks": 60,
+  "dex_successful_operation_tasks": 74,
+  "dex_execution_telemetry_tasks": 75,
+  "dex_usage_scope": "latest attempt per task; every attempt retained in dex-usage.json",
+  "accuracy_over_all_tasks": 0.8,
+  "tasks": [
+    {
+      "task_id": "airbnb001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb002.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb003.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb004.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb005.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb006.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb007.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb008.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb009.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb010.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb011.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb011.hint",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb012.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "airbnb013.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering002.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering002.medium",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering003.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering004.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering005.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering006.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering007.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering007.medium",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "analytics_engineering008.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "asana001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "asana002.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "asana003.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "asana004.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "asana005.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "asana005.hard",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1002.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1003.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1003.hard",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1004.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1005.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1005.medium",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1006.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1006.hard",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1007.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1007.medium",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1007.hard",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1009.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1010.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1010.medium",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "f1011.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas002.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas003.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas004.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas004.no_hint",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas005.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas006.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas007.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas007.no_location_hint",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas008.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas009.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas010.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas011.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas011.hard",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas012.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas012.hard",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas013.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas015.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas015.low",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas016.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas017.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "helixops_saas018.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "intercom001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "intercom002.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "intercom003.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "quickbooks001.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "quickbooks002.base",
+      "status": "pass",
+      "attempts": 1
+    },
+    {
+      "task_id": "quickbooks003.base",
+      "status": "fail",
+      "attempts": 1
+    },
+    {
+      "task_id": "quickbooks004.base",
+      "status": "pass",
+      "attempts": 1
+    }
+  ]
+}

@@ -47,15 +47,18 @@ from .evidence import (
     SKIPPED_STATUSES,
     BuildEvidence,
     BuildNode,
+    BuildOutcome,
     status_kind,
 )
 
 __all__ = [
+    "BUILT_UNVERIFIED",
     "COMPLETION_BUDGET_BYTES",
     "BuildCompletion",
     "FailedCheck",
     "FailedChecks",
     "NameList",
+    "Unverified",
     "node_answers",
     "summarize_completion",
 ]
@@ -90,6 +93,7 @@ _RECORD_KINDS = (
     "join_coverage",
     "parent_population",
     "temporal_contracts",
+    "population_delta",
     "retirement",
     "toggle",
     "model_versions",
@@ -210,12 +214,39 @@ class Blocker(BaseModel):
     plan_relation: str | None = None
     previous_status: str | None = None
     message: str | None = None
+    #: The one command that repairs it, kept ahead of the cut a truncating
+    #: reader makes (#1229): `repair: dex transform repair <node>` for a
+    #: package model the project can override, `repair: transform plan on
+    #: <path>` for the project's own.
+    next: str | None = None
 
 
 class FindingRef(BaseModel):
     code: str
     identifier: str
     severity: str
+    #: ``introduced``, ``unattributed`` or ``existing`` on a ``--for-plan``
+    #: build (#1230); absent otherwise.
+    attribution: str | None = None
+
+
+class Unverified(BaseModel):
+    """One reason a build that validated is still not a finished change (#1230).
+
+    ``reason`` is ``comparison_not_run`` (a rewrite applied uncompared while
+    its baseline was ready), ``comparison_contradicted`` (a recorded
+    ``different`` or ``unexpected`` verdict), ``undeclared_population_change``
+    (a population change no assumption records and apply did not accept),
+    ``introduced_high_finding`` (a high-severity finding this plan introduced)
+    or ``unattributed_high_finding`` (a high-severity finding on a model the
+    plan edited that no baseline places before the plan).
+    """
+
+    model: str
+    reason: str
+    #: The change-scope kind, or the finding code, the reason is about.
+    detail: str | None = None
+    column: str | None = None
 
 
 class VerificationSummary(BaseModel):
@@ -224,6 +255,11 @@ class VerificationSummary(BaseModel):
 
     ran: bool = False
     reason: str | None = None
+    #: On a ``--for-plan`` build (#1230): the findings this plan introduced,
+    #: ahead of ``top``, and every finding counted by attribution. The baseline
+    #: they were judged against is under ``data.verification.attribution``.
+    introduced: list[FindingRef] | None = None
+    by_attribution: dict[str, int] | None = None
     finding_count: int = 0
     findings_dropped: int = 0
     by_severity: dict[str, int] = Field(default_factory=dict)
@@ -259,6 +295,10 @@ class Obligations(BaseModel):
     by_status: dict[str, int] = Field(default_factory=dict)
     contradicted: list[Obligation] = Field(default_factory=list)
     unchecked: list[Obligation] = Field(default_factory=list)
+    #: Populations measured against a drafted parent whose counts ask which
+    #: rows the model is for, with no assumption recording the answer (#1228):
+    #: orphan keys, missing parents, or parents kept with no children.
+    needs_decision: list[Obligation] | None = None
     no_declared_columns: NameList = Field(default_factory=NameList)
     #: Required models whose declared population is a sentence: nothing can run
     #: it, as distinct from a parent or filter a record above measured (#1029).
@@ -272,6 +312,27 @@ class Obligations(BaseModel):
     #: cast, aggregate or NULL treatment), or an edit dex could not read
     #: (`unchecked`), as the plan recorded them (#1115).
     change_scope: list[Obligation] | None = None
+    #: Each required incremental model the plan edited, and whether a unit
+    #: test overriding ``is_incremental`` to true passed in this build
+    #: (``satisfied``), failed (``contradicted``), or never ran (``unchecked``:
+    #: ``full_refresh_only`` where the build only full-refreshed the model,
+    #: ``no_incremental_test`` otherwise). A full refresh runs only the full
+    #: program, so it never answers the next incremental run (#1130).
+    incremental_replay: list[Obligation] | None = None
+    #: Each required model the plan rewrote, held to its recorded
+    #: ``transform compare`` verdict: ``equivalent`` or ``as_expected`` is
+    #: ``satisfied``, ``different`` or ``unexpected`` is ``contradicted``, and
+    #: no verdict (``not_compared``) or ``not_checked`` is ``unchecked``. Only a
+    #: stored plan records verdicts, so a ``--for-plan-file`` build carries no
+    #: such key (#1157).
+    comparison: list[Obligation] | None = None
+    #: A package override `transform repair` drafted, held to what a repair has
+    #: to show (#1229): `repair_built`, `repair_tests` (the package's own tests,
+    #: run on the override), `repair_cold_deps` (only a `--cold-deps` build that
+    #: lost no installed edit satisfies it), `repair_row_count` (no row
+    #: finding on the override, whose draft moves no rows), and
+    #: `repair_conversion` while a conversion stayed unresolved.
+    repair: list[Obligation] | None = None
 
 
 class ColdSummary(BaseModel):
@@ -297,12 +358,18 @@ class ComparisonState(BaseModel):
     #: invocation, when it ran, and whether it was a `--cold-deps` build. One
     #: run; other inputs may come from earlier builds.
     inputs_built_by: dict[str, Any] | None = None
+    #: Whether the plan's comparison offer found the baseline ready to compare
+    #: (#1114); recorded at plan time, ``None`` on a plan stored before it.
+    baseline_ready: bool | None = None
 
 
 class BuildCompletion(BaseModel):
     """The bounded lead of a build payload. See the module docstring."""
 
     outcome: str
+    #: Why a build whose evidence reads ``validated`` is ``built_unverified``
+    #: (#1230): each unfinished part of the change, by model. Absent when none.
+    unverified: list[Unverified] | None = None
     process: dict[str, Any] = Field(default_factory=dict)
     change: ChangeRef = Field(default_factory=ChangeRef)
     deliverables: Deliverables = Field(default_factory=Deliverables)
@@ -561,6 +628,7 @@ def _blockers(
                 diagnosed.get(n.unique_id, {}).get("previous_run", {}).get("status")
             ),
             message=(n.message[:_MESSAGE] if n.message else None),
+            next=diagnosed.get(n.unique_id, {}).get("next"),
         )
         for n in failed
     ]
@@ -639,19 +707,39 @@ def _verification(
         )
     findings = list(verification.get("findings") or [])
     severities = Counter(str(f.get("severity") or "unknown") for f in findings)
-    return VerificationSummary(
-        ran=True,
-        finding_count=len(findings) + dropped,
-        findings_dropped=dropped,
-        by_severity=dict(sorted(severities.items())),
-        top=[
+    attribution = verification.get("attribution")
+
+    def ref(f: Mapping[str, Any]) -> FindingRef:
+        return FindingRef(
+            code=str(f.get("code") or ""),
+            identifier=str(f.get("identifier") or ""),
+            severity=str(f.get("severity") or ""),
+            attribution=f.get("attribution"),
+        )
+
+    introduced = None
+    by_attribution = None
+    if isinstance(attribution, Mapping):
+        # Every introduced finding, the ones past the findings cap too: the
+        # sweep lists them ahead of the rest, so the cap cuts existing first.
+        introduced = [
             FindingRef(
                 code=str(f.get("code") or ""),
                 identifier=str(f.get("identifier") or ""),
                 severity=str(f.get("severity") or ""),
             )
-            for f in findings[:_NAMES]
-        ],
+            for f in verification.get("introduced") or []
+        ][:_NAMES]
+        # Counted before the findings cap, so a cut finding is still counted.
+        by_attribution = dict(sorted((attribution.get("counts") or {}).items()))
+    return VerificationSummary(
+        ran=True,
+        introduced=introduced,
+        by_attribution=by_attribution,
+        finding_count=len(findings) + dropped,
+        findings_dropped=dropped,
+        by_severity=dict(sorted(severities.items())),
+        top=[ref(f) for f in findings[:_NAMES]],
         suppressed=sorted((verification.get("suppressed") or {}).keys()),
         offered=offered,
     )
@@ -663,6 +751,7 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
     by_status: Counter[str] = Counter()
     contradicted: list[Obligation] = []
     unchecked: list[Obligation] = []
+    needs_decision: list[Obligation] = []
     for kind in _RECORD_KINDS:
         for record in verification.get(kind) or []:
             status = str(record.get("status") or "unknown")
@@ -676,6 +765,8 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
             )
             if status == "contradicted":
                 contradicted.append(entry)
+            elif status == "needs_decision":
+                needs_decision.append(entry)
             elif status == "unchecked":
                 unchecked.append(entry)
     contract = verification.get("column_contract") or {}
@@ -694,6 +785,7 @@ def _obligations(verification: Mapping[str, Any] | None) -> Obligations:
         by_status=dict(sorted(by_status.items())),
         contradicted=contradicted,
         unchecked=unchecked,
+        needs_decision=needs_decision or None,
         no_declared_columns=_names(contract.get("no_declared_columns") or []),
     )
 
@@ -713,6 +805,9 @@ def summarize_completion(
     prose_population: Iterable[str] = (),
     identifier_conversions: Mapping[str, list[Mapping[str, Any]]] | None = None,
     change_scope: Mapping[str, list[Mapping[str, Any]]] | None = None,
+    incremental_replay: Mapping[str, Mapping[str, Any]] | None = None,
+    repair: Mapping[str, Any] | None = None,
+    population_accepted: Mapping[str, Any] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -727,8 +822,19 @@ def summarize_completion(
     (messages, then lists, then names), and every cut is counted under
     ``elided``. ``prerequisites`` is :func:`~.prerequisites.diagnose`'s answer and
     ``cold`` is what ``--cold-deps`` reported, both summarized here with the rest
-    under their own keys in ``data``.
+    under their own keys in ``data``. ``incremental_replay`` maps each
+    incremental model the plan edited to ``tests`` (the unique ids of its unit
+    tests that override ``is_incremental`` to true) and ``full_refreshed``
+    (whether this build full-refreshed it) (#1130).
+
+    ``population_accepted`` is what ``transform apply
+    --accept-population-change`` recorded on the plan: the reason and the
+    population changes it accepted (#1230). ``outcome`` is
+    ``built_unverified`` where the evidence reads ``validated`` and any reason
+    under ``unverified`` stands; the evidence's own outcome is unchanged.
     """
+
+    from .scope_gate import accepted_key
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
@@ -769,9 +875,28 @@ def summarize_completion(
     completion.obligations.identifier_conversions = (
         _conversion_obligations(identifier_conversions, evidence) or None
     )
+    accepted = {
+        accepted_key(entry)
+        for entry in (population_accepted or {}).get("changes") or []
+        if isinstance(entry, Mapping)
+    }
     completion.obligations.change_scope = (
-        _scope_obligations(change_scope, evidence) or None
+        _scope_obligations(change_scope, evidence, accepted) or None
     )
+    completion.obligations.incremental_replay = (
+        _replay_obligations(incremental_replay, evidence) or None
+    )
+    completion.obligations.comparison = (
+        _comparison_obligations(comparisons, evidence) or None
+    )
+    completion.obligations.repair = (
+        _repair_obligations(repair, evidence, graph, verification, cold) or None
+    )
+    completion.unverified = (
+        _unverified(completion, comparisons, verification, evidence) or None
+    )
+    if completion.unverified and completion.outcome == BuildOutcome.VALIDATED.value:
+        completion.outcome = BUILT_UNVERIFIED
     if prerequisites:
         completion.details = ["data.prerequisites", *completion.details]
     if cold is not None:
@@ -816,14 +941,23 @@ def _conversion_obligations(
 def _scope_obligations(
     recorded: Mapping[str, list[Mapping[str, Any]]] | None,
     evidence: BuildEvidence,
+    accepted: Iterable[tuple[str, str, str]] = (),
 ) -> list[Obligation]:
     """The plan's change-scope entries no assumption settles, on the models the
-    change requires (every recorded model where coverage is unknown)."""
+    change requires (every recorded model where coverage is unknown).
+
+    A population change ``transform apply --accept-population-change`` accepted
+    is ``accepted`` rather than ``undeclared`` (#1230): settled by a recorded
+    decision, and still listed so the decision stays in view.
+    """
+
+    from .scope_gate import accepted_key, is_population_change
 
     if not recorded:
         return []
     coverage = evidence.coverage
     required = set(coverage.required) if coverage is not None else None
+    taken = set(accepted)
     out = []
     for model, changes in sorted(recorded.items()):
         if required and model not in required:
@@ -832,6 +966,12 @@ def _scope_obligations(
             status = str(change.get("status") or "unknown")
             if status == "declared":
                 continue
+            if (
+                status == "undeclared"
+                and is_population_change(change)
+                and accepted_key({**change, "model": model}) in taken
+            ):
+                status = "accepted"
             out.append(
                 Obligation(
                     model=model,
@@ -841,6 +981,372 @@ def _scope_obligations(
                     change=change.get("kind"),
                 )
             )
+    return out
+
+
+#: A unit test's status in run results that means it ran and passed.
+_PASSED = frozenset({"pass", "success"})
+#: Statuses that mean it ran and did not pass: the build evidence's own set.
+_FAILED = FAILED_STATUSES
+
+
+def _required(evidence: BuildEvidence) -> set[str] | None:
+    """The models the change requires, or None where coverage is unknown."""
+
+    coverage = evidence.coverage
+    return set(coverage.required) if coverage is not None else None
+
+
+def _replay_obligations(
+    recorded: Mapping[str, Mapping[str, Any]] | None,
+    evidence: BuildEvidence,
+) -> list[Obligation]:
+    """Whether this build ran each edited incremental model's next run (#1130).
+
+    The only evidence that the ``is_incremental()`` branch works is a unit test
+    that overrides it to true. A failing one is ``contradicted``, even beside a
+    passing one, and otherwise a passing one is ``satisfied``. With none in the
+    build the obligation is ``unchecked``, and the reason says whether a full
+    refresh is what stood in for it.
+    """
+
+    if not recorded:
+        return []
+    required = _required(evidence)
+    statuses = {node.unique_id: node.status.lower() for node in evidence.nodes}
+    out = []
+    for model, facts in sorted(recorded.items()):
+        answers = set(facts.get("answers") or ()) | {model}
+        if required and not answers & required:
+            continue
+        ran = [statuses[uid] for uid in facts.get("tests") or () if uid in statuses]
+        # A failing test wins over a passing one: the branch is wrong for the
+        # case that test pins, whatever another test shows.
+        if any(status in _FAILED for status in ran):
+            out.append(
+                Obligation(
+                    model=model,
+                    kind="incremental_replay",
+                    status="contradicted",
+                    finding="incremental_test_failed",
+                )
+            )
+        elif any(status in _PASSED for status in ran):
+            out.append(
+                Obligation(model=model, kind="incremental_replay", status="satisfied")
+            )
+        else:
+            out.append(
+                Obligation(
+                    model=model,
+                    kind="incremental_replay",
+                    status="unchecked",
+                    reason_code=(
+                        "full_refresh_only"
+                        if facts.get("full_refreshed")
+                        else "no_incremental_test"
+                    ),
+                )
+            )
+    return out
+
+
+#: A recorded comparison verdict, as the obligation it settles (#1157).
+_COMPARISON_STATUS = {
+    "equivalent": ("satisfied", None),
+    "as_expected": ("satisfied", None),
+    "different": ("contradicted", "different"),
+    "unexpected": ("contradicted", "unexpected_change"),
+}
+
+
+def _comparison_obligations(
+    comparisons: list[ComparisonState] | None,
+    evidence: BuildEvidence,
+) -> list[Obligation]:
+    """Each required rewritten model, held to its recorded comparison (#1157).
+
+    A rewrite that was never compared is ``unchecked`` (``not_compared``),
+    whether or not it was meant to change rows: an intended change is compared
+    with ``--expect``, and ``different`` is a defect until an expectation says
+    which difference was meant.
+    """
+
+    if not comparisons:
+        return []
+    required = _required(evidence)
+    # A comparison of another rewrite in the plan (a mart downstream of a
+    # rewritten intermediate) may be what checks the results the request
+    # keeps; the uncompared model stays open, but says so (#1049).
+    elsewhere = any(state.status != "not_compared" for state in comparisons)
+    out = []
+    for state in comparisons:
+        if required and state.model not in required:
+            continue
+        status, finding = _COMPARISON_STATUS.get(state.status, ("unchecked", None))
+        out.append(
+            Obligation(
+                model=state.model,
+                kind="comparison",
+                status=status,
+                finding=finding,
+                reason_code=(
+                    None
+                    if status != "unchecked"
+                    else (
+                        ("compared_elsewhere" if elsewhere else "not_compared")
+                        if state.status == "not_compared"
+                        else state.reason_code or state.status
+                    )
+                ),
+            )
+        )
+    return out
+
+
+#: The outcome of a build that validated with part of the change unfinished
+#: (#1230). Between ``validated`` and a failure: dbt built every deliverable,
+#: and something the change owed is still open. ``failed`` stays reserved for
+#: a build that failed.
+BUILT_UNVERIFIED = "built_unverified"
+
+
+def _unverified(
+    completion: BuildCompletion,
+    comparisons: list[ComparisonState] | None,
+    verification: Mapping[str, Any] | None,
+    evidence: BuildEvidence,
+) -> list[Unverified]:
+    """What keeps a validated build of a named change from being finished.
+
+    Read from the obligations already summarized and the sweep's attribution,
+    so it can never disagree with them. Only a build for a named plan has a
+    change to be unfinished.
+    """
+
+    from .scope_gate import is_population_change
+
+    if completion.deliverables.coverage != "known":
+        return []
+    ready = {state.model: state.baseline_ready for state in comparisons or []}
+    # `compared_elsewhere` is a comparison of another rewrite in the plan,
+    # which may be what checks the results this one keeps (#1049). It excuses
+    # this one only when that comparison held: a `not_checked` or `different`
+    # verdict elsewhere established nothing about these results.
+    held_elsewhere = any(
+        state.status in ("equivalent", "as_expected") for state in comparisons or []
+    )
+    comparisons_owed = completion.obligations.comparison or []
+    out = [
+        Unverified(model=item.model, reason="comparison_not_run")
+        for item in comparisons_owed
+        if ready.get(item.model) is True
+        and (
+            item.reason_code == "not_compared"
+            or (item.reason_code == "compared_elsewhere" and not held_elsewhere)
+        )
+    ]
+    # A recorded `different` or `unexpected` verdict is a defect until the SQL
+    # or an expectation says otherwise (#1157).
+    out.extend(
+        Unverified(
+            model=item.model, reason="comparison_contradicted", detail=item.finding
+        )
+        for item in comparisons_owed
+        if item.status == "contradicted"
+    )
+    out.extend(
+        Unverified(
+            model=item.model,
+            reason="undeclared_population_change",
+            detail=item.change,
+            column=item.column,
+        )
+        for item in completion.obligations.change_scope or []
+        if item.status == "undeclared" and is_population_change({"kind": item.change})
+    )
+    if not verification or not verification.get("ran"):
+        return out
+    out.extend(
+        Unverified(
+            model=str(ref.get("identifier") or ""),
+            reason="introduced_high_finding",
+            detail=ref.get("code"),
+            column=ref.get("column"),
+        )
+        for ref in verification.get("introduced") or []
+        if ref.get("severity") == "high"
+    )
+    # Without a baseline, a high finding on a model the plan edited cannot be
+    # shown to predate it; the plan's own models are where that matters.
+    required = _required(evidence) or set()
+    out.extend(
+        Unverified(
+            model=str(finding["identifier"]),
+            reason="unattributed_high_finding",
+            detail=finding.get("code"),
+            column=finding.get("column"),
+        )
+        for finding in _unattributed_high(verification)
+        if finding.get("identifier") in required
+    )
+    # One entry per model and reason: the findings themselves are listed
+    # under `verification`, and the block's bytes are better spent there.
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for item in out:
+        if (item.model, item.reason) not in seen:
+            seen.add((item.model, item.reason))
+            unique.append(item)
+    return unique
+
+
+_ROW_FINDINGS = frozenset({"row_loss", "row_fanout"})
+
+
+def _repair_obligations(
+    repair: Mapping[str, Any] | None,
+    evidence: BuildEvidence,
+    graph: Mapping[str, list[str]] | None,
+    verification: Mapping[str, Any] | None,
+    cold: Mapping[str, Any] | None,
+) -> list[Obligation]:
+    """What the build shows about a drafted package override (#1229).
+
+    The override is the project's model of the package model's name; the
+    package's tests attach to it, since dbt gives it the package's YAML entry.
+    """
+
+    if not repair:
+        return []
+    # One plan can repair several package models; each is held on its own.
+    # A model whose every check holds is one `repair: satisfied` entry, and an
+    # open one lists only what is open, so the bounded block keeps every model.
+    if repair.get("nodes"):
+        out: list[Obligation] = []
+        for record in repair["nodes"]:
+            if not isinstance(record, Mapping):
+                continue
+            held = _repair_obligations(record, evidence, graph, verification, cold)
+            if held and all(o.status == "satisfied" for o in held):
+                out.append(
+                    Obligation(model=held[0].model, kind="repair", status="satisfied")
+                )
+            else:
+                out.extend(o for o in held if o.status != "satisfied")
+        return out
+    if not repair.get("node"):
+        return []
+    name = str(repair["node"])
+    package = str(repair.get("package") or "")
+    node = next(
+        (
+            n
+            for n in evidence.nodes
+            if n.unique_id.startswith("model.")
+            and n.name == name
+            and n.unique_id.split(".")[1] != package
+        ),
+        None,
+    )
+
+    def obligation(kind: str, status: str, **extra: Any) -> Obligation:
+        """One repair obligation on this override."""
+
+        return Obligation(model=name, kind=kind, status=status, **extra)
+
+    out: list[Obligation] = []
+    status = node.status.lower() if node is not None else None
+    if status is None:
+        out.append(obligation("repair_built", "unchecked", reason_code="not_built"))
+    elif status in _PASSED:
+        out.append(obligation("repair_built", "satisfied"))
+    elif status in _FAILED:
+        out.append(
+            obligation("repair_built", "contradicted", finding="override_failed")
+        )
+    else:
+        out.append(obligation("repair_built", "unchecked", reason_code=status))
+
+    statuses = {n.unique_id: n.status.lower() for n in evidence.nodes}
+    tests = [
+        uid
+        for uid, parents in (graph or {}).items()
+        if uid.startswith(("test.", "unit_test."))
+        and node is not None
+        and node.unique_id in parents
+        and uid in statuses
+    ]
+    ran = [statuses[uid] for uid in tests]
+    if any(s in _FAILED for s in ran):
+        out.append(
+            obligation("repair_tests", "contradicted", finding="package_test_failed")
+        )
+    elif any(s in _PASSED for s in ran):
+        out.append(obligation("repair_tests", "satisfied"))
+    else:
+        out.append(obligation("repair_tests", "unchecked", reason_code="no_tests"))
+
+    if cold is None:
+        out.append(obligation("repair_cold_deps", "unchecked", reason_code="not_cold"))
+    elif not cold.get("reinstalled"):
+        out.append(
+            obligation("repair_cold_deps", "unchecked", reason_code="not_reinstalled")
+        )
+    else:
+        edits = cold.get("installed_edits") or {}
+        lost = sum(
+            int((edits.get(part) or {}).get("count") or 0)
+            for part in ("changed", "added", "removed")
+        )
+        out.append(
+            obligation("repair_cold_deps", "contradicted", finding="installed_edits")
+            if lost
+            else obligation("repair_cold_deps", "satisfied")
+        )
+
+    findings = (verification or {}).get("findings") or []
+    row = next(
+        (
+            f
+            for f in findings
+            if isinstance(f, Mapping)
+            and f.get("code") in _ROW_FINDINGS
+            and f.get("identifier") == name
+        ),
+        None,
+    )
+    if row is not None:
+        out.append(
+            obligation("repair_row_count", "contradicted", finding=str(row["code"]))
+        )
+    elif not (verification or {}).get("ran"):
+        out.append(
+            obligation(
+                "repair_row_count", "unchecked", reason_code="verification_not_run"
+            )
+        )
+    elif status not in _PASSED:
+        out.append(obligation("repair_row_count", "unchecked", reason_code="not_built"))
+    elif repair.get("population") != "kept":
+        out.append(
+            obligation(
+                "repair_row_count", "unchecked", reason_code="population_unchecked"
+            )
+        )
+    else:
+        out.append(obligation("repair_row_count", "satisfied"))
+
+    # An `unbound` draft is checked by the build itself: once the override
+    # builds, its types bound; until then the conversion stays open.
+    if repair.get("status") == "unresolved" or (
+        repair.get("status") == "unbound" and status not in _PASSED
+    ):
+        out.append(
+            obligation(
+                "repair_conversion", "unchecked", reason_code=str(repair["status"])
+            )
+        )
     return out
 
 
@@ -884,21 +1390,22 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             setattr(owner, field, items[:keep])
 
     cap_list(completion, "blockers", _NAMES, "blockers")
+    if completion.unverified is not None:
+        cap_list(completion, "unverified", _NAMES, "unverified")
     cap_list(completion.deliverables, "blocked", _NAMES, "deliverables.blocked")
     cap_list(completion.obligations, "contradicted", _NAMES, "obligations.contradicted")
     cap_list(completion.obligations, "unchecked", _NAMES, "obligations.unchecked")
+    cap_list(
+        completion.obligations, "needs_decision", _NAMES, "obligations.needs_decision"
+    )
     cap_list(
         completion.obligations,
         "identifier_conversions",
         _NAMES,
         "obligations.identifier_conversions",
     )
-    cap_list(
-        completion.obligations,
-        "change_scope",
-        _NAMES,
-        "obligations.change_scope",
-    )
+    for listed in ("change_scope", "incremental_replay", "comparison", "repair"):
+        cap_list(completion.obligations, listed, _NAMES, f"obligations.{listed}")
     if completion.refactor_comparison is not None:
         cap_list(completion, "refactor_comparison", _NAMES, "refactor_comparison")
     cap_list(
@@ -927,17 +1434,32 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         cap_list(completion.obligations, "unchecked", keep, "obligations.unchecked")
         cap_list(
             completion.obligations,
+            "needs_decision",
+            max(keep, 1),
+            "obligations.needs_decision",
+        )
+        cap_list(
+            completion.obligations,
             "identifier_conversions",
             max(keep, 1),
             "obligations.identifier_conversions",
         )
-        cap_list(
-            completion.obligations,
-            "change_scope",
-            max(keep, 1),
-            "obligations.change_scope",
-        )
+        for listed in ("change_scope", "incremental_replay", "comparison", "repair"):
+            cap_list(
+                completion.obligations, listed, max(keep, 1), f"obligations.{listed}"
+            )
         cap_list(completion.verification, "top", keep, "verification.top")
+        # What the plan introduced and why the change is unfinished are the
+        # answer the block is for, so each keeps one entry to the end (#1230).
+        if completion.verification.introduced is not None:
+            cap_list(
+                completion.verification,
+                "introduced",
+                max(keep, 1),
+                "verification.introduced",
+            )
+        if completion.unverified is not None:
+            cap_list(completion, "unverified", max(keep, 1), "unverified")
         cap_list(
             completion.assurance.failed_checks,
             "checks",
@@ -975,3 +1497,42 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         completion.elided = dict(elided)
         if completion.size() <= budget:
             return
+
+    # The last resort: the per-model obligation lists keep one entry each above,
+    # and with long model names those can still overflow. Each goes whole, its
+    # count kept under `elided`, since a block over budget is cut by the reader
+    # where nothing counts it.
+    for listed in (
+        "needs_decision",
+        "identifier_conversions",
+        "change_scope",
+        "incremental_replay",
+        "comparison",
+        "repair",
+    ):
+        cap_list(completion.obligations, listed, 0, f"obligations.{listed}")
+        completion.elided = dict(elided)
+        if completion.size() <= budget:
+            return
+    # Then the introduced findings and the unfinished reasons, last of all:
+    # `outcome` still says `built_unverified`, and `elided` counts what went.
+    if completion.verification.introduced is not None:
+        cap_list(completion.verification, "introduced", 0, "verification.introduced")
+    if completion.unverified is not None:
+        cap_list(completion, "unverified", 0, "unverified")
+    completion.elided = dict(elided)
+
+
+def _unattributed_high(verification: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The high-severity findings nothing placed, from the list the sweep took
+    before its findings cap (#1230), or from ``findings`` where a payload
+    predates that list."""
+
+    attribution = verification.get("attribution")
+    if isinstance(attribution, Mapping) and "unattributed_high" in attribution:
+        return [f for f in attribution["unattributed_high"] if isinstance(f, Mapping)]
+    return [
+        f
+        for f in verification.get("findings") or []
+        if f.get("attribution") == "unattributed" and f.get("severity") == "high"
+    ]

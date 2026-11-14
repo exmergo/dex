@@ -7,9 +7,9 @@ from the PyPI package had none of them. The text now lives once, in
 sits between the two markers below, so a copy can be found, checked against
 this text, and refreshed.
 
-The engine never writes a copy. ``dex procedure --block`` returns the
-paste-ready block and the human, or a harness, places it, the way
-``explore diagram`` returns a diagram without writing one. ``check`` only reads.
+``dex procedure --block`` returns the paste-ready block without writing it.
+``dex init`` can install or refresh that same managed section while preserving
+other instructions. ``check`` only reads.
 """
 
 from __future__ import annotations

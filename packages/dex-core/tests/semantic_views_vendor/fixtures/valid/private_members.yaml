@@ -1,0 +1,27 @@
+# Private facts and metrics: usable by other expressions, never queried directly.
+name: private_members
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    dimensions:
+      - name: return_flag
+        expr: l_returnflag
+    facts:
+      - name: discount
+        access_modifier: private_access
+        expr: l_discount
+      - name: extended_price
+        access_modifier: public_access
+        expr: l_extendedprice
+      - name: discounted_price
+        expr: lineitem.extended_price * (1 - lineitem.discount)
+    metrics:
+      - name: gross
+        access_modifier: private_access
+        expr: SUM(lineitem.extended_price)
+      - name: net
+        expr: SUM(lineitem.discounted_price)
+metrics:
+  - name: discount_share
+    expr: 1 - lineitem.net / lineitem.gross

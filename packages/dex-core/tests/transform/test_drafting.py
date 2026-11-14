@@ -10,7 +10,9 @@ from is the one `explore` writes.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -148,7 +150,14 @@ DIM_USERS = Dataset(
 )
 
 
-def _draft(sql: str, *, yml: str | None = None, cache: DexCache | None = CACHE):
+def _draft(
+    sql: str,
+    *,
+    yml: str | None = None,
+    cache: DexCache | None = CACHE,
+    manifest: Mapping[str, Any] | None = None,
+    manifest_stale: bool = False,
+):
     files = {"models/marts/fct.sql": sql}
     if yml is not None:
         files["models/marts/_marts.yml"] = yml
@@ -163,6 +172,8 @@ def _draft(sql: str, *, yml: str | None = None, cache: DexCache | None = CACHE):
             for d in (cache.datasets if cache else [])
         },
         domain_cap=25,
+        manifest=manifest,
+        manifest_stale=manifest_stale,
     )
     return drafts["fct"], warnings
 
@@ -887,6 +898,429 @@ def test_an_ambiguous_input_names_no_command_and_says_why():
     [warning] = [w for w in warnings if "stg_orders" in w and "profiled" in w]
     assert "explore profile" not in warning
     assert "no profile run can settle" in warning
+
+
+def test_an_ambiguous_input_resolves_through_compiled_manifest():
+    """#989: when the input matches several profiled relations, resolve it through
+    the compiled manifest's relation_name for the compiled target."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [input_entry] = entry["drafted"]["inputs"]
+    assert input_entry["profiled"] is True
+    assert input_entry["identifier"] == "warehouse.dbt_dev.stg_orders"
+    assert input_entry["evidence"] == (
+        "resolved through the compiled manifest's relation for target `dev`"
+    )
+    assert entry["drafted"]["grain"]["value"] == ["order_id"]
+    assert not any("profile run can settle" in w for w in warnings)
+
+
+def test_an_ambiguous_input_with_stale_manifest_keeps_unprofiled_reason():
+    """#989: when the manifest is stale, keep the unprofiled reason."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+        manifest_stale=True,
+    )
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["profiled"] is False
+    assert "command" not in missing_input
+    assert "no profile run can settle which one it means" in missing_input["reason"]
+
+
+def test_an_ambiguous_input_with_manifest_matching_no_candidate_keeps_unprofiled():
+    """#989: when the manifest relation matches no candidate, keep unprofiled."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."other_schema"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [missing_input] = entry["drafted"]["inputs"]
+    assert missing_input["profiled"] is False
+    assert "command" not in missing_input
+    assert "no profile run can settle which one it means" in missing_input["reason"]
+
+
+def test_literal_table_does_not_inherit_manifest_relation():
+    """#989: literal table name does not resolve through compiled manifest."""
+
+    twin = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = CACHE.model_copy(update={"datasets": [*CACHE.datasets, twin]})
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from stg_orders\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [input_entry] = entry["drafted"]["inputs"]
+    assert input_entry["profiled"] is False
+    assert "resolved through the compiled manifest" not in input_entry.get(
+        "evidence", ""
+    )
+    assert "no profile run can settle which one it means" in input_entry["reason"]
+
+
+def test_model_names_resolve_before_aliases_and_collisions_remain_ambiguous():
+    """#989: model names take precedence over aliases and collisions stay ambiguous."""
+
+    legacy = ORDERS.model_copy(update={"identifier": "warehouse.legacy.stg_orders"})
+    dev = ORDERS.model_copy(update={"identifier": "warehouse.dbt_dev.stg_orders"})
+    cache = DexCache(datasets=[legacy, dev])
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.old_orders": {
+                "name": "old_orders",
+                "alias": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."legacy"."stg_orders"',
+            },
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            },
+        },
+    }
+    entry, _warnings = _draft(
+        "select order_id from {{ ref('stg_orders') }}\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    [input_entry] = entry["drafted"]["inputs"]
+    assert input_entry["profiled"] is True
+    assert input_entry["identifier"] == "warehouse.dbt_dev.stg_orders"
+    assert "resolved through the compiled manifest" in input_entry["evidence"]
+
+
+def test_query_using_both_ref_and_literal_table_preserves_distinct_provenance():
+    """#989: when a query uses both ref('model') and literal 'model',
+    provenance is preserved."""
+
+    main_orders = Dataset(
+        identifier="warehouse.main.stg_orders",
+        columns=[
+            _col("order_id", "integer", null_fraction=0.5),
+            _col("status", "varchar"),
+        ],
+    )
+    dev_orders = Dataset(
+        identifier="warehouse.dbt_dev.stg_orders",
+        columns=[
+            _key("order_id"),
+            _col("amount", "double"),
+        ],
+    )
+    cache = DexCache(datasets=[main_orders, dev_orders])
+    manifest = {
+        "metadata": {"project_name": "shop", "target_name": "dev"},
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."dbt_dev"."stg_orders"',
+            }
+        },
+    }
+    entry, _warnings = _draft(
+        "select r.order_id, l.status\n"
+        "from {{ ref('stg_orders') }} r\n"
+        "join stg_orders l on r.order_id = l.order_id\n"
+        "where r.order_id > 10\n",
+        cache=cache,
+        manifest=manifest,
+    )
+    inputs = entry["drafted"]["inputs"]
+    assert len(inputs) == 2
+    ref_input = next(i for i in inputs if i.get("profiled") is True)
+    literal_input = next(i for i in inputs if i.get("profiled") is False)
+
+    assert ref_input["identifier"] == "warehouse.dbt_dev.stg_orders"
+    assert "resolved through the compiled manifest" in ref_input["evidence"]
+
+    assert "no profile run can settle" in literal_input["reason"]
+
+    # order_id comes from ref('stg_orders') and resolves to dev_orders
+    # where null_fraction=0.0
+    assert entry["drafted"]["columns"]["order_id"]["nullable"]["value"] is False
+
+    # status comes from literal stg_orders which is ambiguous without manifest
+    assert "nullable" not in entry["drafted"]["columns"].get("status", {})
+
+    # domain resolves for ref column
+    [domain] = entry["drafted"]["domains"]
+    assert domain["column"] == "stg_orders.order_id"
+
+
+def test_a_package_input_names_derived_dev_namespace_on_warehouse():
+    """#1199: a package model with custom schema derives the namespace."""
+
+    from types import SimpleNamespace
+
+    target = SimpleNamespace(schema="inbox", package="tiny_inbox")
+    drafts, warnings = draft(
+        ["fct"],
+        {"models/marts/fct.sql": "select id from {{ ref('stg_inbox') }}\n"},
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        package_target=lambda name: target if name == "stg_inbox" else None,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input == {
+        "relation": "stg_inbox",
+        "profiled": False,
+        "reason": (
+            "the cache has not profiled it, and its dev build in "
+            "SHOP.DBT_DEV_inbox is outside the source allowlist"
+        ),
+        "command": "explore profile SHOP.DBT_DEV_inbox.stg_inbox --target dev",
+    }
+    assert any(
+        "`explore profile SHOP.DBT_DEV_inbox.stg_inbox --target dev`" in w
+        for w in warnings
+    )
+
+
+def test_a_package_input_without_custom_schema_names_dev_namespace():
+    """#1199: a package model without custom schema uses the dev namespace."""
+
+    drafts, warnings = draft(
+        ["fct"],
+        {"models/marts/fct.sql": "select id from {{ ref('stg_inbox') }}\n"},
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        packaged=lambda name: "tiny_inbox" if name == "stg_inbox" else None,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input["command"] == (
+        "explore profile SHOP.DBT_DEV.stg_inbox --target dev"
+    )
+    assert any(
+        "`explore profile SHOP.DBT_DEV.stg_inbox --target dev`" in w for w in warnings
+    )
+
+
+def test_a_package_input_with_custom_schema_withholds_command_when_macro_overridden():
+    """#1199: an override of generate_schema_name withholds the profile hint."""
+
+    from types import SimpleNamespace
+
+    target = SimpleNamespace(schema="inbox", package="tiny_inbox")
+    drafts, warnings = draft(
+        ["fct"],
+        {
+            "models/marts/fct.sql": "select id from {{ ref('stg_inbox') }}\n",
+            "macros/generate_schema_name.sql": (
+                "{% macro generate_schema_name(custom_schema_name, node) %}"
+                "{{ custom_schema_name }}_{{ target.name }}{% endmacro %}\n"
+            ),
+        },
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        package_target=lambda name: target if name == "stg_inbox" else None,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert "project overrides generate_schema_name" in missing_input["reason"]
+    assert any("generate_schema_name" in w for w in warnings)
+
+
+def test_commands_draft_package_model_with_custom_schema(tmp_path, monkeypatch):
+    """#1199: commands._draft resolves package schema through lookup target."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.dbt_project import load as load_project
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage.memory import MemoryStore
+    from exmergo_dex_core.transform import commands
+    from exmergo_dex_core.transform.plans import EditKind, EditOp, PlanEdit
+
+    pkg_dbt = (
+        "name: tiny_inbox\nversion: '1.0'\nconfig-version: 2\n"
+        "model-paths: [models]\nmodels:\n  tiny_inbox:\n    +schema: inbox\n"
+    )
+    pkg_model = "select 1 as id\n"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "dbt_project.yml").write_text(
+        "name: p\nversion: '1.0'\nconfig-version: 2\nmodel-paths: [models]\n"
+    )
+    (project_dir / "models").mkdir()
+    pkg_dir = project_dir / "dbt_packages" / "tiny_inbox"
+    (pkg_dir / "models").mkdir(parents=True)
+    (pkg_dir / "dbt_project.yml").write_text(pkg_dbt)
+    (pkg_dir / "models" / "stg_inbox.sql").write_text(pkg_model)
+
+    view = load_project(project_dir)
+    engine = DexEngine(
+        config=DexConfig(connector="snowflake"),
+        store=MemoryStore(),
+        repo_root=str(tmp_path),
+    )
+    monkeypatch.setattr(commands, "_dev_namespace", lambda _eng: "SHOP.DBT_DEV")
+
+    edits = [
+        PlanEdit(
+            path="models/fct.sql",
+            kind=EditKind.MODEL_SQL,
+            op=EditOp.UPSERT,
+            new_content="select id from {{ ref('stg_inbox') }}\n",
+        )
+    ]
+    drafts, warnings = commands._draft(engine, view, edits, ["fct"])
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert missing_input["command"] == (
+        "explore profile SHOP.DBT_DEV_inbox.stg_inbox --target dev"
+    )
+    assert any("SHOP.DBT_DEV_inbox" in w for w in warnings)
+
+
+def test_an_input_created_by_plan_names_post_build_command_and_has_no_command():
+    """#1199: an input created by the plan carries no command and names post-build."""
+
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('time_spine') }}\n",
+        "models/staging/time_spine.sql": "select 1 as id\n",
+    }
+    prior = {"models/marts/fct.sql": "select 1 as id\n"}
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        prior=prior,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["profiled"] is False
+    assert missing_input["reason"] == (
+        "it is built by this plan; run `transform build --target dev`, then "
+        "`explore profile SHOP.DBT_DEV.time_spine --target dev`"
+    )
+    [warning] = [w for w in warnings if "time_spine" in w and "profiled" in w]
+    assert "it is built by this plan" in warning
+    assert (
+        "run `transform build --target dev`, then "
+        "`explore profile SHOP.DBT_DEV.time_spine --target dev`"
+    ) in warning
+
+
+def test_an_input_created_by_plan_on_duckdb_names_plain_post_build_command():
+    """#1199: on duckdb an input created by the plan names post-build without dev."""
+
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('time_spine') }}\n",
+        "models/staging/time_spine.sql": "select 1 as id\n",
+    }
+    prior = {}
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="duckdb",
+        prior=prior,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["profiled"] is False
+    assert missing_input["reason"] == (
+        "it is built by this plan; run `transform build`, then "
+        "`explore profile time_spine`"
+    )
+    [warning] = [w for w in warnings if "time_spine" in w and "profiled" in w]
+    assert "it is built by this plan" in warning
+    assert "run `transform build`, then `explore profile time_spine`" in warning
+
+
+def test_an_input_created_by_plan_with_alias_names_alias_in_post_build_command():
+    """#1199: an input created by the plan with an alias uses the alias."""
+
+    files = {
+        "models/marts/fct.sql": "select id from {{ ref('time_spine') }}\n",
+        "models/staging/time_spine.sql": (
+            "{{ config(alias='dim_time') }}\nselect 1 as id\n"
+        ),
+    }
+    prior = {}
+    drafts, warnings = draft(
+        ["fct"],
+        files,
+        ["models"],
+        CACHE,
+        dialect="snowflake",
+        dev_namespace="SHOP.DBT_DEV",
+        prior=prior,
+    )
+    [missing_input] = drafts["fct"]["drafted"]["inputs"]
+    assert "command" not in missing_input
+    assert missing_input["reason"] == (
+        "it is built by this plan; run `transform build --target dev`, then "
+        "`explore profile SHOP.DBT_DEV.dim_time --target dev`"
+    )
+    [warning] = [w for w in warnings if "time_spine" in w and "profiled" in w]
+    assert "it is built by this plan" in warning
+    assert "dim_time" in warning
 
 
 def test_a_time_spine_from_range_is_not_told_to_profile_an_empty_relation():
@@ -1755,3 +2189,296 @@ def test_a_replace_and_a_rename_on_one_column_stack():
     )
     assert reading.produced == ["new_id", "extra"]
     assert reading.expressions["new_id"].sql() == "0 AS new_id"
+
+
+def test_an_input_with_unique_test_drafts_grain_without_warehouse_profile():
+    """#1252: unique test on an unprofiled input drafts grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        data_tests:
+          - unique
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted["grain"]["value"] == ["project_id"]
+    evidence = drafted["grain"]["evidence"]
+    assert (
+        "project_id has a unique test on stg_projects, carried through unchanged"
+        in evidence
+    )
+    assert any("declares no grain; dex drafted [project_id]" in w for w in warnings)
+
+
+def test_an_input_with_unique_combination_of_columns_drafts_composite_grain():
+    """#1252: unique_combination_of_columns drafts composite grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_memberships
+    tests:
+      - unique_combination_of_columns:
+          combination_of_columns: [org_id, user_id]
+""",
+        "models/marts/fct_memberships.sql": (
+            "select org_id, user_id, role from {{ ref('stg_memberships') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_memberships"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_memberships"]["drafted"]
+    assert drafted["grain"]["value"] == ["org_id", "user_id"]
+    evidence = drafted["grain"]["evidence"]
+    assert (
+        "org_id, user_id has a unique_combination_of_columns test on "
+        "stg_memberships, carried through unchanged" in evidence
+    )
+    assert any(
+        "declares no grain; dex drafted [org_id, user_id]" in w for w in warnings
+    )
+
+
+def test_an_input_with_declared_grain_drafts_grain_without_warehouse_profile():
+    """#1252: declared meta.dex.grain on unprofiled input drafts grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_accounts
+    meta:
+      dex:
+        grain: [account_id]
+""",
+        "models/marts/fct_accounts.sql": (
+            "select account_id, name from {{ ref('stg_accounts') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_accounts"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_accounts"]["drafted"]
+    assert drafted["grain"]["value"] == ["account_id"]
+    evidence = drafted["grain"]["evidence"]
+    assert (
+        "account_id is the declared grain of stg_accounts, carried through unchanged"
+        in evidence
+    )
+    assert any("declares no grain; dex drafted [account_id]" in w for w in warnings)
+
+
+def test_draft_reports_drafted_grain_instead_of_unresolved_grain_warning():
+    """#1252: draft indicates drafted grain in warning when drafted from key."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    meta:
+      dex:
+        grain: [project_id]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    _drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    assert not any(w == "'fct_projects' declares no grain" for w in warnings)
+    assert any("declares no grain; dex drafted [project_id]" in w for w in warnings)
+
+
+def test_an_input_with_no_key_evidence_withholds_grain():
+    """#1252: an unprofiled input with no tests or declared grain withholds grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+      - name: project_name
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted.get("grain", {}).get("value") is None
+    assert "not profiled" in drafted.get("grain", {}).get("withheld", "")
+    assert any(
+        "'fct_projects' declares no grain" in w and "dex drafted" not in w
+        for w in warnings
+    )
+
+
+def test_transformed_key_column_does_not_inherit_grain():
+    """#1252: a transformed key expression does not carry grain forward."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        data_tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select coalesce(project_id, 0) as project_id "
+            "from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted.get("grain", {}).get("value") is None
+    assert "not selected unchanged" in drafted.get("grain", {}).get("withheld", "")
+
+
+def test_grain_evidence_identifies_exact_source_unambiguously():
+    """#1252: evidence identifies exact source and never implies test execution."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    evidence = drafted["grain"]["evidence"]
+    assert "passed" not in evidence.lower()
+    assert "ran" not in evidence.lower()
+    assert (
+        evidence
+        == "project_id has a unique test on stg_projects, carried through unchanged"
+    )
+
+
+def test_unprofiled_input_with_aliased_key_column_drafts_aliased_grain():
+    """#1252: aliased key column carries forward the new alias as grain."""
+
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id as pid, project_name from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, _ = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=None,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted["grain"]["value"] == ["pid"]
+    assert (
+        drafted["grain"]["evidence"]
+        == "project_id has a unique test on stg_projects, carried through unchanged"
+    )
+
+
+def test_contradictory_measured_profile_takes_precedence_over_declared_key():
+    """#1252: profiled dataset with non-unique key does not fall back to stated key."""
+
+    dataset = Dataset(
+        identifier="warehouse.main.stg_projects",
+        columns=[
+            _col("project_id", "integer", is_unique=False, null_fraction=0.1),
+        ],
+    )
+    cache = DexCache(datasets=[dataset])
+    files = {
+        "models/staging/_staging.yml": """
+version: 2
+models:
+  - name: stg_projects
+    columns:
+      - name: project_id
+        tests: [unique]
+""",
+        "models/marts/fct_projects.sql": (
+            "select project_id from {{ ref('stg_projects') }}\n"
+        ),
+    }
+    drafts, warnings = draft(
+        ["fct_projects"],
+        files,
+        ["models"],
+        cache=cache,
+        dialect="duckdb",
+    )
+    drafted = drafts["fct_projects"]["drafted"]
+    assert drafted.get("grain", {}).get("value") is None
+    assert "no proven unique key" in drafted.get("grain", {}).get("withheld", "")
+    assert any(
+        "'fct_projects' declares no grain" in w and "dex drafted" not in w
+        for w in warnings
+    )

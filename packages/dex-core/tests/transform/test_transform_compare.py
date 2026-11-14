@@ -242,7 +242,7 @@ def test_an_edit_since_planning_is_not_checked(project):
 def test_an_applied_plan_is_not_checked(project):
     engine = _engine(project)
     plan_id = _plan(engine, project, ("models/team_activity.sql", _EQUIVALENT))
-    engine.apply(plan_id)
+    engine.apply(plan_id, accept_population_change="applied under test")
     result = engine.compare(plan_id)
     assert result.reason_code == "plan_applied"
 
@@ -257,7 +257,7 @@ def test_an_applied_plan_that_created_a_model_needs_no_model_flag(project):
         ("models/int_counts.sql", _INTERMEDIATE),
         ("models/team_activity.sql", _EXTRACTED),
     )
-    engine.apply(plan_id)
+    engine.apply(plan_id, accept_population_change="applied under test")
     result = engine.compare(plan_id)
     assert result.reason_code == "plan_applied"
     assert result.model == ""

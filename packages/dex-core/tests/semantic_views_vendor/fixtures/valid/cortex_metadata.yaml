@@ -1,0 +1,37 @@
+# Cortex Analyst metadata: sample values, verified queries, custom instructions,
+# module instructions and a filter. Carried by dex, never surfaced.
+name: cortex_metadata
+description: Order analytics for Cortex Analyst.
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - name: order_status
+        expr: o_orderstatus
+        data_type: VARCHAR
+        is_enum: true
+        sample_values: ['F', 'O', 'P']
+      - name: clerk
+        expr: o_clerk
+        data_type: VARCHAR
+        sample_values: ['Clerk#000000951']
+    time_dimensions:
+      - name: order_date
+        expr: o_orderdate
+        data_type: DATE
+        sample_values: ['1995-01-01']
+    filters:
+      - name: open_orders
+        description: Orders still open.
+        expr: o_orderstatus = 'O'
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+verified_queries:
+  - name: orders by status
+    question: How many orders are there per status?
+    sql: SELECT o_orderstatus, COUNT(*) FROM __orders GROUP BY 1
+    verified_at: 1767225600
+    verified_by: maintainer
+custom_instructions: Treat order status F as fulfilled.

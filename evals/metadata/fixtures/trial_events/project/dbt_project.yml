@@ -1,0 +1,12 @@
+name: billing
+version: "1.0.0"
+profile: billing
+model-paths: ["models"]
+seed-paths: ["seeds"]
+
+models:
+  billing:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table

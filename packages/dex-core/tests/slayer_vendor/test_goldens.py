@@ -27,6 +27,9 @@ Needs the real `[slayer]` extra, so it skips without it; the `tests` CI job
 is where it runs.
 """
 
+# The list goldens are SLayer's output verbatim, and some of its lines are long.
+# ruff: noqa: E501
+
 from __future__ import annotations
 
 import re
@@ -90,9 +93,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM shop.main.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM shop.main.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -107,9 +116,15 @@ SELECT
   DATE_TRUNC(orders.ordered_at, MONTH) AS `orders___ordered_at`,
   CAST(SUM(orders.amount) AS FLOAT64) AS `orders___revenue`,
   COUNT(*) AS `orders___order_count`
-FROM `dex-ci-project`.shop.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM `dex-ci-project`.shop.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   `orders___status`,
   `orders___ordered_at`
@@ -122,9 +137,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -137,9 +158,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE PRECISION) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -152,9 +179,15 @@ SELECT
   DATE_TRUNC('MONTH', orders.ordered_at) AS "orders.ordered_at",
   CAST(SUM(orders.amount) AS DOUBLE PRECISION) AS "orders.revenue",
   COUNT(*) AS "orders.order_count"
-FROM dev.public.orders AS orders
+FROM (
+  SELECT
+    orders.*
+  FROM dev.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 WHERE
-  orders.status <> 'test' AND orders.status = 'paid'
+  orders.status = 'paid'
 GROUP BY
   orders.status,
   DATE_TRUNC('MONTH', orders.ordered_at)
@@ -281,11 +314,17 @@ SNOWFLAKE_WEEKS = {
 SELECT
   DATEADD(DAY, 1 - DAYOFWEEKISO(orders.ordered_at), DATE_TRUNC('DAY', orders.ordered_at)) AS "orders.ordered_at",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
-WHERE
-  orders.status <> 'test'
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 GROUP BY
-  DATEADD(DAY, 1 - DAYOFWEEKISO(orders.ordered_at), DATE_TRUNC('DAY', orders.ordered_at))""",  # noqa: E501
+  DATEADD(DAY, 1 - DAYOFWEEKISO(orders.ordered_at), DATE_TRUNC('DAY', orders.ordered_at))
+ORDER BY
+  "orders.ordered_at" ASC""",
     # The Monday week of the next day, moved back one: Sunday, once the Monday
     # it is built from no longer depends on the account.
     "week_sunday": """\
@@ -300,9 +339,13 @@ SELECT
     )
   ) AS "orders.ordered_at",
   COUNT(*) AS "orders.order_count"
-FROM shop.public.orders AS orders
-WHERE
-  orders.status <> 'test'
+FROM (
+  SELECT
+    orders.*
+  FROM shop.public.orders AS orders
+  WHERE
+    orders.status <> 'test'
+) AS orders
 GROUP BY
   DATEADD(
     DAY,
@@ -312,7 +355,9 @@ GROUP BY
       1 - DAYOFWEEKISO(CAST(DATEADD(DAY, 1, orders.ordered_at) AS TIMESTAMP)),
       DATE_TRUNC('DAY', CAST(DATEADD(DAY, 1, orders.ordered_at) AS TIMESTAMP))
     )
-  )""",
+  )
+ORDER BY
+  "orders.ordered_at" ASC""",
 }
 
 
@@ -448,3 +493,359 @@ def test_two_keys_redshift_would_fold_together_are_refused_by_name():
     message = str(caught.value)
     assert "'orders.Revenue' and 'orders.revenue'" in message
     assert "differ only in case" in message
+
+
+# --- list columns (#1246) ----------------------------------------------------------
+
+#: The model above with a list column, `type: ARRAY` of TEXT.
+LIST_COLUMNS = [
+    *orders("")["columns"],
+    {"name": "tags", "type": "ARRAY", "element_type": "TEXT"},
+]
+
+#: A measure grouped by a list's elements, filtered by membership: the element
+#: walk (a lateral unnest), SLayer's `associate` handling (the measure counted
+#: per element over each parent once, never the whole total on every row), and
+#: `contains_any`, in each dialect with native lists.
+LIST_QUERY = SemanticQuery(
+    metrics=["orders.order_count"],
+    group_by=["orders.tags.value"],
+    where=["contains_any(tags, ['a', 'b'])"],
+)
+
+LIST_GOLDENS = {
+    "duckdb": """\
+WITH _base AS (
+  SELECT
+    tags.value AS "orders.tags.value"
+  FROM (
+    SELECT
+      orders.*
+    FROM shop.main.orders AS orders
+    WHERE
+      orders.status <> 'test'
+  ) AS orders
+  CROSS JOIN LATERAL (
+    SELECT
+      __slayer_u.value
+    FROM UNNEST(orders.tags) AS __slayer_u(value)
+    WHERE
+      __slayer_u.value IS NOT NULL
+  ) AS tags
+  WHERE
+    CASE
+      WHEN orders.tags IS NULL OR ['a', 'b'] IS NULL
+      THEN NULL
+      ELSE LIST_HAS_ANY(
+        [__slayer_e FOR __slayer_e IN orders.tags IF __slayer_e IS NOT NULL],
+        [__slayer_e FOR __slayer_e IN ['a', 'b'] IF __slayer_e IS NOT NULL]
+      )
+    END
+  GROUP BY
+    tags.value
+), _cm_orders___count AS (
+  SELECT
+    _base."orders.tags.value" AS "orders.tags.value",
+    COUNT(*) AS "orders._count_host"
+  FROM (
+    SELECT
+      tags.value AS "orders.tags.value"
+    FROM (
+      SELECT
+        orders.*
+      FROM shop.main.orders AS orders
+      WHERE
+        orders.status <> 'test'
+    ) AS orders
+    CROSS JOIN LATERAL (
+      SELECT DISTINCT
+        __slayer_u.value
+      FROM UNNEST(orders.tags) AS __slayer_u(value)
+      WHERE
+        __slayer_u.value IS NOT NULL
+    ) AS tags
+    WHERE
+      CASE
+        WHEN orders.tags IS NULL OR ['a', 'b'] IS NULL
+        THEN NULL
+        ELSE LIST_HAS_ANY(
+          [__slayer_e FOR __slayer_e IN orders.tags IF __slayer_e IS NOT NULL],
+          [__slayer_e FOR __slayer_e IN ['a', 'b'] IF __slayer_e IS NOT NULL]
+        )
+      END
+  ) AS _base
+  GROUP BY
+    _base."orders.tags.value"
+)
+SELECT
+  _base."orders.tags.value",
+  COALESCE(_cm_orders___count."orders._count_host", 0) AS "orders.order_count"
+FROM _base
+LEFT JOIN _cm_orders___count
+  ON _base."orders.tags.value" IS NOT DISTINCT FROM _cm_orders___count."orders.tags.value"
+ORDER BY
+  _base."orders.tags.value" ASC""",
+    "bigquery": """\
+WITH _base AS (
+  SELECT
+    tags.value AS `orders___tags___value`
+  FROM (
+    SELECT
+      orders.*
+    FROM `dex-ci-project`.shop.orders AS orders
+    WHERE
+      orders.status <> 'test'
+  ) AS orders
+  CROSS JOIN UNNEST(ARRAY(
+    SELECT AS STRUCT
+      __slayer_e AS value
+    FROM UNNEST(orders.tags) AS __slayer_e
+    WHERE
+      __slayer_e IS NOT NULL
+  )) AS tags
+  WHERE
+    CASE
+      WHEN orders.tags IS NULL OR ['a', 'b'] IS NULL
+      THEN NULL
+      ELSE EXISTS(
+        SELECT
+          __slayer_w
+        FROM UNNEST(orders.tags) AS __slayer_w
+        WHERE
+          EXISTS(
+            SELECT
+              __slayer_e
+            FROM UNNEST(['a', 'b']) AS __slayer_e
+            WHERE
+              __slayer_e = __slayer_w
+          )
+      )
+    END
+  GROUP BY
+    tags.value
+), _cm_orders___count AS (
+  SELECT
+    _base.`orders___tags___value` AS `orders___tags___value`,
+    COUNT(*) AS `orders____count_host`
+  FROM (
+    SELECT
+      tags.value AS `orders___tags___value`
+    FROM (
+      SELECT
+        orders.*
+      FROM `dex-ci-project`.shop.orders AS orders
+      WHERE
+        orders.status <> 'test'
+    ) AS orders
+    CROSS JOIN UNNEST(ARRAY(
+      SELECT DISTINCT AS STRUCT
+        __slayer_e AS value
+      FROM UNNEST(orders.tags) AS __slayer_e
+      WHERE
+        __slayer_e IS NOT NULL
+    )) AS tags
+    WHERE
+      CASE
+        WHEN orders.tags IS NULL OR ['a', 'b'] IS NULL
+        THEN NULL
+        ELSE EXISTS(
+          SELECT
+            __slayer_w
+          FROM UNNEST(orders.tags) AS __slayer_w
+          WHERE
+            EXISTS(
+              SELECT
+                __slayer_e
+              FROM UNNEST(['a', 'b']) AS __slayer_e
+              WHERE
+                __slayer_e = __slayer_w
+            )
+        )
+      END
+  ) AS _base
+  GROUP BY
+    _base.`orders___tags___value`
+)
+SELECT
+  _base.`orders___tags___value`,
+  COALESCE(_cm_orders___count.`orders____count_host`, 0) AS `orders___order_count`
+FROM _base
+LEFT JOIN _cm_orders___count
+  ON _base.`orders___tags___value` IS NOT DISTINCT FROM _cm_orders___count.`orders___tags___value`
+ORDER BY
+  _base.`orders___tags___value` ASC NULLS LAST""",
+    "snowflake": """\
+WITH _base AS (
+  SELECT
+    tags.value AS "orders.tags.value"
+  FROM (
+    SELECT
+      orders.*
+    FROM shop.public.orders AS orders
+    WHERE
+      orders.status <> 'test'
+  ) AS orders
+  CROSS JOIN TABLE(
+    FLATTEN(INPUT => CAST(ARRAY_COMPACT(CAST(orders.tags AS ARRAY)) AS ARRAY(VARCHAR)))
+  ) AS tags
+  WHERE
+    CASE
+      WHEN orders.tags IS NULL OR ['a', 'b'] IS NULL
+      THEN NULL
+      ELSE ARRAYS_OVERLAP(
+        ARRAY_COMPACT(CAST(orders.tags AS ARRAY)),
+        ARRAY_COMPACT(CAST(['a', 'b'] AS ARRAY))
+      )
+    END
+  GROUP BY
+    tags.value
+), _cm_orders___count AS (
+  SELECT
+    _base."orders.tags.value" AS "orders.tags.value",
+    COUNT(*) AS "orders._count_host"
+  FROM (
+    SELECT
+      tags.value AS "orders.tags.value"
+    FROM (
+      SELECT
+        orders.*
+      FROM shop.public.orders AS orders
+      WHERE
+        orders.status <> 'test'
+    ) AS orders
+    CROSS JOIN TABLE(
+      FLATTEN(
+        INPUT => CAST(ARRAY_DISTINCT(ARRAY_COMPACT(CAST(orders.tags AS ARRAY))) AS ARRAY(VARCHAR))
+      )
+    ) AS tags
+    WHERE
+      CASE
+        WHEN orders.tags IS NULL OR ['a', 'b'] IS NULL
+        THEN NULL
+        ELSE ARRAYS_OVERLAP(
+          ARRAY_COMPACT(CAST(orders.tags AS ARRAY)),
+          ARRAY_COMPACT(CAST(['a', 'b'] AS ARRAY))
+        )
+      END
+  ) AS _base
+  GROUP BY
+    _base."orders.tags.value"
+)
+SELECT
+  _base."orders.tags.value",
+  COALESCE(_cm_orders___count."orders._count_host", 0) AS "orders.order_count"
+FROM _base
+LEFT JOIN _cm_orders___count
+  ON _base."orders.tags.value" IS NOT DISTINCT FROM _cm_orders___count."orders.tags.value"
+ORDER BY
+  _base."orders.tags.value" ASC""",
+    "postgres": """\
+WITH _base AS (
+  SELECT
+    tags.value AS "orders.tags.value"
+  FROM (
+    SELECT
+      orders.*
+    FROM shop.public.orders AS orders
+    WHERE
+      orders.status <> 'test'
+  ) AS orders
+  CROSS JOIN LATERAL (
+    SELECT
+      __slayer_u.value
+    FROM UNNEST(orders.tags) AS __slayer_u(value)
+    WHERE
+      __slayer_u.value IS NOT NULL
+  ) AS tags
+  WHERE
+    CASE
+      WHEN CAST(orders.tags AS TEXT[]) IS NULL OR CAST(ARRAY['a', 'b'] AS TEXT[]) IS NULL
+      THEN NULL
+      ELSE CAST(orders.tags AS TEXT[]) && CAST(ARRAY['a', 'b'] AS TEXT[])
+    END
+  GROUP BY
+    tags.value
+), _cm_orders___count AS (
+  SELECT
+    _base."orders.tags.value" AS "orders.tags.value",
+    COUNT(*) AS "orders._count_host"
+  FROM (
+    SELECT
+      tags.value AS "orders.tags.value"
+    FROM (
+      SELECT
+        orders.*
+      FROM shop.public.orders AS orders
+      WHERE
+        orders.status <> 'test'
+    ) AS orders
+    CROSS JOIN LATERAL (
+      SELECT DISTINCT
+        __slayer_u.value
+      FROM UNNEST(orders.tags) AS __slayer_u(value)
+      WHERE
+        __slayer_u.value IS NOT NULL
+    ) AS tags
+    WHERE
+      CASE
+        WHEN CAST(orders.tags AS TEXT[]) IS NULL OR CAST(ARRAY['a', 'b'] AS TEXT[]) IS NULL
+        THEN NULL
+        ELSE CAST(orders.tags AS TEXT[]) && CAST(ARRAY['a', 'b'] AS TEXT[])
+      END
+  ) AS _base
+  GROUP BY
+    _base."orders.tags.value"
+)
+SELECT
+  _base."orders.tags.value",
+  COALESCE(_cm_orders___count."orders._count_host", 0) AS "orders.order_count"
+FROM _base
+LEFT JOIN _cm_orders___count
+  ON _base."orders.tags.value" IS NOT DISTINCT FROM _cm_orders___count."orders.tags.value"
+ORDER BY
+  _base."orders.tags.value" ASC""",
+}
+
+
+def test_every_connector_with_native_lists_has_a_list_golden():
+    """Redshift has no native lists: SLayer refuses there, and dex refuses first."""
+
+    assert set(LIST_GOLDENS) == set(SLAYER_TYPES) - {"redshift"}
+
+
+@pytest.mark.parametrize("connector", sorted(LIST_GOLDENS))
+def test_a_list_query_renders_to_its_golden(connector):
+    result = rendered(connector, LIST_QUERY, columns=LIST_COLUMNS)
+
+    assert result.sql == LIST_GOLDENS[connector]
+
+
+@pytest.mark.parametrize("connector", sorted(LIST_GOLDENS))
+def test_dex_s_guards_read_the_list_golden_in_its_dialect(connector):
+    """The unnest is not a relation: the pre-check finds only the model's table."""
+
+    dialect = get_dialect(connector)
+    sql = LIST_GOLDENS[connector]
+
+    assert_select_only(sql, dialect=dialect)
+    (relation,) = referenced_relations(sql, dialect=dialect)
+    assert match_identifier(relation, [TABLES[connector]]) == [TABLES[connector]]
+
+
+@pytest.mark.parametrize("connector", sorted(LIST_GOLDENS))
+def test_a_list_query_is_sent_associated(connector):
+    """Each element counts its own parents: the measure is grouped by the element
+    inside its own CTE and joined back on it, not computed once and broadcast."""
+
+    sql = LIST_GOLDENS[connector]
+
+    assert "_count_host" in sql
+    assert "IS NOT DISTINCT FROM" in sql
+
+
+def test_slayer_still_refuses_list_elements_on_redshift():
+    """The tripwire for dex's own Redshift refusal: a SLayer release that reads
+    lists on Redshift fails here, and its SQL is read before dex lets it through."""
+
+    with pytest.raises(Exception, match="native lists"):
+        rendered("redshift", LIST_QUERY, columns=LIST_COLUMNS)

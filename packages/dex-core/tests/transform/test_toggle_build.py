@@ -632,3 +632,172 @@ def test_one_model_that_does_not_compile_leaves_the_rest_judged(
     assert models["rpt_revenue"]["status"] == "satisfied"
     assert models["rpt_revenue"]["produces"] == ["fees"]
     assert models["rpt_lines_wide"]["status"] == "satisfied"
+
+
+# --- tests and semantic definitions over a governed column (#1169) -------------
+
+#: A not_null on a gated producer's fee column, which still runs with the flag
+#: off; the same test disabled at the off value; and one on the exempt staging
+#: model, which keeps the column off.
+FEE_TESTS = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_order_lines\n"
+    "    columns:\n"
+    "      - name: fee_amount\n"
+    "        data_tests:\n"
+    "          - not_null\n"
+    "  - name: ledger_entries\n"
+    "    columns:\n"
+    "      - name: fee_amount\n"
+    "        data_tests:\n"
+    "          - not_null:\n"
+    "              config:\n"
+    "                enabled: \"{{ var('" + FLAG + "') }}\"\n"
+    "  - name: stg_orders\n"
+    "    columns:\n"
+    "      - name: fee_amount\n"
+    "        data_tests:\n"
+    "          - not_null\n"
+)
+
+#: A gated producer with a time column, so a semantic model can sit on it.
+FEE_DAYS = (
+    "select order_id, cast('2024-01-01' as date) as order_day\n"
+    + ON
+    + ", fee_amount{% endif %}\nfrom {{ ref('stg_orders') }}\n"
+)
+SPINE = "select cast('2024-01-01' as date) as date_day\n"
+SPINE_DOCS = (
+    "version: 2\nmodels:\n  - name: metricflow_time_spine\n    time_spine:\n"
+    "      standard_granularity_column: date_day\n    columns:\n"
+    "      - name: date_day\n        granularity: day\n"
+)
+FEE_SEMANTIC = (
+    "version: 2\n"
+    "semantic_models:\n"
+    "  - name: fee_days\n"
+    "    model: ref('fct_fee_days')\n"
+    "    defaults:\n"
+    "      agg_time_dimension: order_day\n"
+    "    entities:\n"
+    "      - name: order_id\n"
+    "        type: primary\n"
+    "    dimensions:\n"
+    "      - name: order_day\n"
+    "        type: time\n"
+    "        type_params:\n"
+    "          time_granularity: day\n"
+    "      - name: fee_band\n"
+    "        type: categorical\n"
+    "        expr: fee_amount\n"
+    "    measures:\n"
+    "      - name: total_fees\n"
+    "        agg: sum\n"
+    "        expr: fee_amount\n"
+    "      - name: doubled_fees\n"
+    "        agg: sum\n"
+    "        expr: fee_amount * 2\n"
+    "metrics:\n"
+    "  - name: fee_revenue\n"
+    "    label: Fee revenue\n"
+    "    type: simple\n"
+    "    type_params:\n"
+    "      measure: total_fees\n"
+)
+
+
+def _line(text: str, needle: str) -> int:
+    """The 1-based line of ``needle``'s only occurrence in ``text``."""
+
+    found = [n for n, line in enumerate(text.splitlines(), 1) if needle in line]
+    assert len(found) == 1, (needle, found)
+    return found[0]
+
+
+def _checks(record: dict, code: str) -> list[dict]:
+    """The checks of ``code`` a toggle record carries."""
+
+    return [c for c in record.get("checks") or [] if c["check"] == code]
+
+
+def test_a_test_still_running_off_on_a_governed_column_is_named(
+    repo: Path, capsys
+) -> None:
+    """A not_null on a governed column fails the off build, so the plan names it
+    with its file and line; one disabled at the off value, and one on an exempt
+    model, are not reported."""
+
+    tests = {
+        "path": "models/_fee_tests.yml",
+        "kind": "schema_yml",
+        "content": FEE_TESTS,
+    }
+    out = _plan(repo, capsys, GATED, extra=[tests])
+    assert out["status"] == "ok", out
+    toggle = out["data"]["toggle"]
+    assert toggle["verdict"] == "contradicted", toggle
+    models = _models(out)
+    found = _checks(models["fct_order_lines"], "governed_column_tested_when_off")
+    assert len(found) == 1, models["fct_order_lines"]
+    assert found[0]["path"] == "models/_fee_tests.yml"
+    # The first bare not_null, under fct_order_lines.fee_amount.
+    assert found[0]["line"] == FEE_TESTS.splitlines().index("          - not_null") + 1
+    assert found[0]["column"] == "fee_amount"
+    assert found[0]["test"] == "not_null"
+    assert models["fct_order_lines"]["status"] == "contradicted"
+    # Disabled with the flag off: dbt never runs it there.
+    assert not _checks(
+        models.get("ledger_entries", {}), "governed_column_tested_when_off"
+    )
+    # Exempt: the column stays with the flag off, so the test still passes.
+    assert not _checks(models.get("stg_orders", {}), "governed_column_tested_when_off")
+    assert any(
+        "models/_fee_tests.yml:" in w and "not_null" in w for w in out["warnings"]
+    ), out["warnings"]
+
+
+def test_a_semantic_definition_over_a_governed_column_is_named(
+    repo: Path, capsys
+) -> None:
+    """A dimension or measure over a governed column stops resolving with the flag
+    off, so the plan names it, with the metric on it; a computed expression the
+    index cannot resolve is listed in the limits."""
+
+    extra = [
+        {"path": "models/fct_fee_days.sql", "kind": "model_sql", "content": FEE_DAYS},
+        {
+            "path": "models/metricflow_time_spine.sql",
+            "kind": "model_sql",
+            "content": SPINE,
+        },
+        {"path": "models/_spine.yml", "kind": "schema_yml", "content": SPINE_DOCS},
+        {
+            "path": "models/_fee_semantic.yml",
+            "kind": "semantic_yml",
+            "content": FEE_SEMANTIC,
+        },
+    ]
+    out = _plan(repo, capsys, GATED, extra=extra)
+    assert out["status"] == "ok", out
+    toggle = out["data"]["toggle"]
+    assert toggle["verdict"] == "contradicted", toggle
+    record = _models(out)["fct_fee_days"]
+    found = {
+        c["definition"]: c for c in _checks(record, "governed_column_in_semantic_layer")
+    }
+    assert set(found) == {"fee_band", "total_fees"}, record
+    assert found["fee_band"]["kind"] == "dimension"
+    assert found["fee_band"]["path"] == "models/_fee_semantic.yml"
+    assert found["fee_band"]["line"] == _line(FEE_SEMANTIC, "- name: fee_band")
+    assert found["total_fees"]["kind"] == "measure"
+    assert found["total_fees"]["line"] == _line(FEE_SEMANTIC, "- name: total_fees")
+    assert found["total_fees"]["metrics"] == ["fee_revenue"]
+    assert all(c["column"] == "fee_amount" for c in found.values())
+    # The computed measure is unresolved, so it is a limit, never dropped.
+    assert toggle["completeness"] == "incomplete"
+    assert any(
+        "models/_fee_semantic.yml:" in limit and "doubled_fees" in limit
+        for limit in toggle["limits"]
+    ), toggle["limits"]
+    assert any("fee_band" in w for w in out["warnings"]), out["warnings"]

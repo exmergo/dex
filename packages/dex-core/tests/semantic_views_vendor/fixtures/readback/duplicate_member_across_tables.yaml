@@ -1,0 +1,39 @@
+name: DUPLICATE_MEMBER_ACROSS_TABLES
+tables:
+  - name: CUSTOMER
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: CUSTOMER
+    primary_key:
+      columns:
+        - C_CUSTKEY
+    dimensions:
+      - name: SEGMENT
+        expr: c_mktsegment
+        data_type: VARCHAR(10)
+        access_modifier: public_access
+  - name: ORDERS
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns:
+        - O_ORDERKEY
+    dimensions:
+      - name: SEGMENT
+        expr: o_orderpriority
+        data_type: VARCHAR(15)
+        access_modifier: public_access
+    metrics:
+      - name: ORDER_COUNT
+        expr: COUNT(o_orderkey)
+        access_modifier: public_access
+relationships:
+  - name: ORDERS_CUSTOMER
+    left_table: ORDERS
+    right_table: CUSTOMER
+    relationship_columns:
+      - left_column: O_CUSTKEY
+        right_column: C_CUSTKEY

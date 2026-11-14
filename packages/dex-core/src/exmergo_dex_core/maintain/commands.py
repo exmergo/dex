@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
-from .. import command_args
+from .. import command_args, model_scope
 from .. import envelope as env
 from ..adapters.base import name_list
 from ..config import pii_override_paths
@@ -58,6 +58,7 @@ from . import foreign_keys as fk_mod
 from . import snapshot as snapshot_mod
 from . import verify as verify_mod
 from .results import (
+    CoverageResult,
     DriftResult,
     LayerFingerprint,
     ReconcileResult,
@@ -266,6 +267,17 @@ def _semantic_schema_source(engine: DexEngine):
             f"the warehouse schema: {exc}"
         )
     return (source if isinstance(source, SemanticSchemaSource) else None), None
+
+
+def _native_semantic_vendor(engine: DexEngine) -> bool:
+    """Whether a native semantic vendor (not dbt) owns the layer, so a repository
+    with no transformation project is a semantic-only repository rather than a
+    misconfigured one."""
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    return vendor in SEMANTIC_SOURCE_FACTORIES
 
 
 def _declared_schema_drift(
@@ -1131,15 +1143,11 @@ def verify(
         if build_notes:
             suppressed["build_status"] = build_notes[0]
 
+    # A scope may be spelled as separate arguments, comma-separated, or as one
+    # quoted argument with the names separated by spaces: `a b`, `"a b"` and
+    # `a,b` all name the same models (#1243).
     wanted = (
-        {
-            name.strip().lower()
-            for raw in objects
-            for name in raw.split(",")
-            if name.strip()
-        }
-        if objects
-        else None
+        {name.lower() for name in model_scope.model_names(objects)} if objects else None
     )
     cost = None
     adapter = None
@@ -1147,6 +1155,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    grain_coverage: list[dict] | None = None
     foreign_key_coverage: list[dict] | None = None
     fk_offer: ConfirmationRequest | None = None
     if not definitions.present:
@@ -1280,6 +1289,12 @@ def verify(
                 else ([], [])
             )
             proven_grains: dict[str, dict] = {}
+            grain_coverage = []
+            spine_or_generated = (
+                verify_mod.spine_or_generated_models(project_dir, adapter.dialect)
+                if project_dir is not None
+                else set()
+            )
             grain_findings, grain_warnings, grain_reason = _grain_contract(
                 adapter,
                 definitions,
@@ -1288,6 +1303,8 @@ def verify(
                 scope=wanted,
                 counted_elsewhere={m.model for m in facts_plan if m.grain},
                 proven=proven_grains,
+                records=grain_coverage,
+                spine_or_generated=spine_or_generated,
             )
             findings.extend(grain_findings)
             warnings.extend(grain_warnings)
@@ -1398,6 +1415,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
                 findings = verify_mod.damp_fanout(
@@ -1418,6 +1436,10 @@ def verify(
 
     if wanted and join_coverage is not None:
         join_coverage = [r for r in join_coverage if r["model"].lower() in wanted]
+    if grain_coverage is not None:
+        grain_coverage = _complete_grain_coverage(
+            definitions, grain_coverage, scope=wanted
+        )
     result = VerifyResult(
         findings=drift_mod.rank_findings(findings),
         suppressed=suppressed,
@@ -1429,6 +1451,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        grain_coverage=grain_coverage,
         foreign_key_coverage=foreign_key_coverage,
     )
     if cost is not None:
@@ -1457,9 +1480,8 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
     running and then being discarded by that later filter.
     """
 
-    declared_by_model, undeclared, plan_notes = verify_mod.column_contract_plan(
-        project_dir, scope=scope
-    )
+    plan = verify_mod.column_contract_plan(project_dir, scope=scope)
+    declared_by_model, undeclared, plan_notes = plan
     if not declared_by_model and not undeclared:
         reason = (
             plan_notes[0]
@@ -1474,6 +1496,7 @@ def _column_contract(project_dir, adapter, model_relations, live, *, scope=None)
         model_relations,
         [o.identifier for o in live],
         undeclared,
+        package_entries=getattr(plan, "package_entries", None),
     )
     return findings, plan_notes + finding_notes, None
 
@@ -1487,6 +1510,8 @@ def _grain_contract(
     scope=None,
     counted_elsewhere: set[str] | None = None,
     proven: dict[str, dict] | None = None,
+    records: list[dict] | None = None,
+    spine_or_generated: set[str] | None = None,
 ):
     """The grain half of `maintain verify`, end to end (#229).
 
@@ -1525,8 +1550,45 @@ def _grain_contract(
         [o.identifier for o in live],
         scoped_models,
         proven=proven,
+        records=records,
+        spine_or_generated=spine_or_generated,
     )
     return findings, notes, None
+
+
+def _complete_grain_coverage(
+    definitions, records: list[dict], *, scope: set[str] | None = None
+) -> list[dict]:
+    """``grain_coverage`` as the result carries it (#1223): the records the
+    grain axis and the declared-fact statement wrote, a ``not_planned`` record
+    for each declared key the priority rule left out, and an ``unchecked``
+    record (``not_measured``) for any planned key neither path reached, so no
+    declared key is ever absent. Sorted by model, then source rank."""
+
+    declared = verify_mod.declared_grain_candidates(definitions, scope=scope)
+    planned = verify_mod.grain_plan(definitions, scope=scope)
+    seen = {
+        (r["model"], r["source"], tuple(c.lower() for c in r["columns"]))
+        for r in records
+    }
+    complete = list(records)
+    for model, candidates in planned.items():
+        for candidate in candidates:
+            marker = (
+                model,
+                candidate.source,
+                tuple(c.lower() for c in candidate.columns),
+            )
+            if marker not in seen:
+                complete.append(
+                    verify_mod.grain_record(
+                        model, candidate, "unchecked", "not_measured"
+                    )
+                )
+    complete.extend(verify_mod.not_planned_grain_records(declared, planned))
+    if scope:
+        complete = [r for r in complete if r["model"].lower() in scope]
+    return verify_mod.sort_grain_records(complete)
 
 
 def _join_contract(
@@ -1653,6 +1715,157 @@ def cmd_verify(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             engine,
             getattr(args, "objects", None),
             target=getattr(args, "target", None),
+        )
+    )
+
+
+def coverage(
+    engine: DexEngine,
+    objects: list[str] | None = None,
+    *,
+    full: bool = False,
+) -> CoverageResult:
+    """Which project resources the dbt tests reach, from the manifest alone (#1280).
+
+    Free and connectionless on every connector: the manifest comes from a
+    ``dbt parse`` of a throwaway copy of the project (the same parse ``maintain
+    verify`` runs as its compile check), which opens no warehouse connection
+    and writes nothing into the project, so the inventory describes the tree
+    as it stands rather than whatever ``target/manifest.json`` a past run left.
+    A project that does not parse is reported first and suppresses the
+    inventory, as on ``maintain verify``. Where dbt cannot parse at all (dbt or
+    ``profiles.yml`` missing, a declared package not installed), the newest
+    manifest on disk is read instead and a warning dates it.
+
+    ``objects`` is the selector ``maintain verify`` takes: names, repeated,
+    comma- or space-separated, matching models (and their versions), sources
+    (``source.table``), snapshots and seeds. ``full`` lifts every list cap.
+    Reports, never gates: low coverage is not an error in this release.
+    """
+
+    import json
+
+    from ..transform.artifact_runtime import readable_artifact_dir
+    from ..transform.build import missing_packages, shadow_parse
+    from . import coverage as coverage_mod
+
+    project, project_reason = _read_project(engine)
+    if project is not None and project.name != "dbt":
+        project_reason = (
+            f"the '{project.name}' project format declares no dbt tests to inventory"
+        )
+        project = None
+    if project is None:
+        reason = project_reason or "no readable project format found"
+        return CoverageResult(
+            suppressed={"inventory": reason},
+            warnings=[f"maintain coverage could not read the project: {reason}"],
+        )
+    try:
+        project_dir = Path(engine.project_dir())
+    except (ProjectError, RepoRootRequiredError) as exc:
+        reason = f"the dbt project could not be located: {exc}"
+        return CoverageResult(
+            suppressed={"inventory": reason},
+            warnings=[f"maintain coverage could not read the project: {reason}"],
+        )
+
+    warnings: list[str] = []
+    manifest: dict[str, Any] | None = None
+    origin: dict[str, Any] | None = None
+    parse_skipped: str | None = None
+    missing = missing_packages(project_dir)
+    if missing:
+        names = ", ".join(sorted(package.describe() for package in missing))
+        parse_skipped = (
+            f"declared package(s) not installed ({names}); run `dex transform "
+            "deps` to install them"
+        )
+    else:
+        parsed = shadow_parse(project_dir, [], keep_manifest=True)
+        if parsed["available"] and not parsed["success"]:
+            finding, _ = verify_mod.compile_failure(parsed)
+            if finding is not None and _values_free(engine):
+                # dbt's parse error can quote the YAML it failed on, test
+                # arguments included, so the mode keeps the code alone.
+                finding = finding.model_copy(
+                    update={
+                        "detail": "dbt could not parse the project (its message "
+                        "is withheld in values-free mode)",
+                        "data": {},
+                    }
+                )
+            reason = "the project does not compile"
+            return CoverageResult(
+                findings=[finding] if finding is not None else [],
+                suppressed={"inventory": reason},
+                warnings=[
+                    "maintain coverage reported no inventory: the project does "
+                    "not compile, so its manifest cannot be trusted"
+                ],
+            )
+        if parsed["available"]:
+            manifest = parsed.get("manifest")
+            if manifest is None:
+                parse_skipped = "dbt parsed the project but wrote no readable manifest"
+            else:
+                origin = {"source": "parsed"}
+        else:
+            parse_skipped = str(parsed["reason"])
+
+    if manifest is None:
+        path = readable_artifact_dir(project_dir) / "manifest.json"
+        loaded = None
+        if path.is_file():
+            with contextlib.suppress(OSError, ValueError):
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            reason = (
+                f"dex could not parse the project ({parse_skipped}) and found no "
+                "manifest.json on disk to read instead"
+            )
+            return CoverageResult(
+                suppressed={"inventory": reason},
+                warnings=[f"maintain coverage reported no inventory: {reason}"],
+            )
+        manifest = loaded
+        generated = (manifest.get("metadata") or {}).get("generated_at")
+        origin = {"source": "artifact"}
+        if generated:
+            origin["generated_at"] = generated
+        warnings.append(
+            f"maintain coverage read the manifest on disk"
+            f"{f' generated at {generated}' if generated else ''}, not a fresh "
+            f"parse ({parse_skipped}): tests added or removed since then are "
+            "not reflected"
+        )
+
+    selector = model_scope.model_names(objects) if objects else None
+    inventory = coverage_mod.inventory(manifest, selector=selector, full=full)
+    return CoverageResult(
+        summary=inventory.summary,
+        scope=inventory.scope,
+        sections=inventory.sections,
+        excluded=inventory.excluded,
+        elided=inventory.elided,
+        manifest=origin,
+        notes=inventory.notes,
+        warnings=[*warnings, *inventory.warnings],
+    )
+
+
+def _values_free(engine: DexEngine) -> bool:
+    from ..values_free import ResultMode
+
+    return getattr(engine, "result_mode", None) is ResultMode.VALUES_FREE
+
+
+def cmd_coverage(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    return to_envelope(
+        coverage(
+            engine,
+            getattr(args, "objects", None),
+            full=bool(getattr(args, "full", False)),
         )
     )
 
@@ -2053,10 +2266,13 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
             # A repository whose only layer is a semantic one (#912) still has
             # that layer's own findings to reconcile, through its own route;
             # only the project's half has nowhere to land.
-            if not any(
-                semantic_source is not None and semantic_source.handles_finding(f)
-                for f in findings
-            ):
+            # A semantic vendor with no project beside it is that repository's
+            # one layer: its findings on the other axes (a contradicted key on
+            # grain, say) are advisory there too, never a refusal (#1259). That
+            # holds for a native vendor whose source has no schema channel as
+            # well: the layer is still the repository's one layer, and its
+            # findings still have nowhere to land but a person's edit.
+            if semantic_source is None and not _native_semantic_vendor(engine):
                 raise ProjectError(f"reconcile edits a project: {exc}") from exc
             warnings.append(
                 f"no transformation project to edit ({exc}), so every proposal "
@@ -2180,7 +2396,13 @@ def _reconcile_semantic(
                     proposal.paths = []
         else:
             result.diffs = [*result.diffs, *planned.diffs]
-            result.warnings.extend([*planned.warnings, *planned.notes])
+            # The plan re-reads the layer, so its notes repeat what the report
+            # already carried; each is said once.
+            result.warnings.extend(
+                w
+                for w in dict.fromkeys([*planned.warnings, *planned.notes])
+                if w not in result.warnings
+            )
             result.semantic_plan_id = planned.plan_id
     result.proposals = _mechanical_first([*result.proposals, *proposals])
 

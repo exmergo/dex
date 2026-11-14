@@ -47,6 +47,11 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     procedural = [s["procedure"] for s in scored if s.get("procedure") is not None]
     private = [s for s in scored if s.get("privacy") is not None]
     reported = [s["report"]["passed"] for s in scored if s.get("report") is not None]
+    diagnosed = [
+        s["diagnosis"]["passed"] for s in scored if s.get("diagnosis") is not None
+    ]
+    # A diagnose task authors no declaration, so it has none to average in.
+    declared = [s for s in scored if s.get("completeness") is not None]
     tested = [
         s["incremental_test"]["passed"]
         for s in scored
@@ -62,8 +67,16 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "no_models": no_models,
         # Left blocked on the prerequisite the task allows, and reported (#1083).
         "blocked_reported": blocked,
-        "completeness": round(sum(s["completeness"] for s in scored) / n, 4),
-        "correctness": round(sum(s["correctness"] for s in scored) / n, 4),
+        "completeness": (
+            round(sum(s["completeness"] for s in declared) / len(declared), 4)
+            if declared
+            else None
+        ),
+        "correctness": (
+            round(sum(s["correctness"] for s in declared) / len(declared), 4)
+            if declared
+            else None
+        ),
         "checks_passed": round(sum(s["checks_passed"] for s in scored) / n, 4),
         # Over the tasks that grade it, so the others cannot inflate or dilute it.
         "attribution": (
@@ -90,6 +103,9 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if any(not c["passed"] for c in s.get("workspace_checks") or [])
         ],
         "report": round(sum(reported) / len(reported), 4) if reported else None,
+        # Localized, evidenced and qualified diagnoses (#1048, #1116), over the
+        # tasks that grade one, apart from whether anything built.
+        "diagnosis": round(sum(diagnosed) / len(diagnosed), 4) if diagnosed else None,
         # An incremental model's next run tested at all (#1111), apart from
         # whether the replays found its rows right.
         "incremental_test": (round(sum(tested) / len(tested), 4) if tested else None),
@@ -97,6 +113,12 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         # plant any: a statement about the tests, never about the model.
         "defects_caught": round(sum(caught) / len(caught), 4) if caught else None,
     }
+
+
+def _number(value: float | None, width: int) -> str:
+    """A score to two places, or ``-`` where the task grades none."""
+
+    return f"{value:{width}.2f}" if value is not None else f"{'-':>{width}}"
 
 
 def _verdict(passed: bool) -> str:
@@ -111,13 +133,13 @@ def _print_table(report: dict[str, Any]) -> None:
     print(
         f"{'task':48} {'status':12} {'complete':>8} {'correct':>8} {'checks':>7} "
         f"{'attrib':>7} {'scope':>5} {'proc':>5} {'privacy':>7} {'wspace':>6} "
-        f"{'report':>6} {'inctest':>7} {'defects':>7}"
+        f"{'report':>6} {'diagnose':>8} {'inctest':>7} {'defects':>7}"
     )
     for row in report["results"]:
         s = row["score"]
         print(
-            f"{s['task']:48} {s['status']:12} {s['completeness']:8.2f} "
-            f"{s['correctness']:8.2f} {s['checks_passed']:7.2f} "
+            f"{s['task']:48} {s['status']:12} {_number(s['completeness'], 8)} "
+            f"{_number(s['correctness'], 8)} {s['checks_passed']:7.2f} "
             + (
                 f"{s['attribution']:7.2f}"
                 if s.get("attribution") is not None
@@ -145,6 +167,11 @@ def _print_table(report: dict[str, Any]) -> None:
                 else f" {'-':>6}"
             )
             + (
+                f" {_verdict(s['diagnosis']['passed']):>8}"
+                if s.get("diagnosis") is not None
+                else f" {'-':>8}"
+            )
+            + (
                 f" {_verdict(s['incremental_test']['passed']):>7}"
                 if s.get("incremental_test") is not None
                 else f" {'-':>7}"
@@ -158,8 +185,8 @@ def _print_table(report: dict[str, Any]) -> None:
     agg = report["aggregate"]
     print(
         f"\n{agg['tasks']} tasks; build gate {agg['build_gate_pass_rate']:.0%}; "
-        f"completeness {agg['completeness']:.2f}; "
-        f"correctness {agg['correctness']:.2f}; "
+        f"completeness {_number(agg['completeness'], 0)}; "
+        f"correctness {_number(agg['correctness'], 0)}; "
         f"checks {agg['checks_passed']:.2f}"
         + (
             f"; attribution {agg['attribution']:.2f}"
@@ -184,6 +211,11 @@ def _print_table(report: dict[str, Any]) -> None:
             else ""
         )
         + (f"; report {agg['report']:.2f}" if agg.get("report") is not None else "")
+        + (
+            f"; diagnosis {agg['diagnosis']:.2f}"
+            if agg.get("diagnosis") is not None
+            else ""
+        )
         + (
             f"; defects caught {agg['defects_caught']:.2f}"
             if agg.get("defects_caught") is not None
@@ -332,8 +364,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.reference and any(
         r["score"]["status"] != "scored"
         or min(
-            r["score"]["completeness"],
-            r["score"]["correctness"],
+            1 if r["score"]["completeness"] is None else r["score"]["completeness"],
+            1 if r["score"]["correctness"] is None else r["score"]["correctness"],
             r["score"]["checks_passed"],
             1 if r["score"]["attribution"] is None else r["score"]["attribution"],
             1 if r["score"].get("scope") is None else r["score"]["scope"],

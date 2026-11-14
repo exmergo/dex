@@ -1,0 +1,1443 @@
+{
+  "status": "passed",
+  "version": "1.17.9",
+  "models": 6,
+  "tests": 29,
+  "mutants_killed": 2,
+  "metrics": {
+    "orders": 5000,
+    "booked_amount": 2338243.4,
+    "average_order_value": 467.64867999999996
+  },
+  "limitations": {
+    "checked": true,
+    "by_status": {
+      "satisfied": 4,
+      "unchecked": 4
+    },
+    "contradicted": [],
+    "unchecked": [
+      {
+        "model": "dim_customers",
+        "kind": "join_coverage",
+        "status": "unchecked",
+        "reason_code": "filtered_cte"
+      },
+      {
+        "model": "metricflow_time_spine",
+        "kind": "population_delta",
+        "status": "unchecked",
+        "reason_code": "no_parent_drafted"
+      },
+      {
+        "model": "stg_customers",
+        "kind": "population_delta",
+        "status": "unchecked",
+        "reason_code": "no_parent_drafted"
+      },
+      {
+        "model": "stg_orders",
+        "kind": "population_delta",
+        "status": "unchecked",
+        "reason_code": "no_parent_drafted"
+      }
+    ],
+    "no_declared_columns": {
+      "count": 0,
+      "names": [],
+      "elided": 0
+    },
+    "prose_population": {
+      "count": 3,
+      "names": [
+        "metricflow_time_spine",
+        "stg_customers",
+        "stg_orders"
+      ],
+      "elided": 0
+    },
+    "identifier_conversions": [
+      {
+        "model": "metricflow_time_spine",
+        "kind": "identifier_conversion",
+        "status": "unchecked",
+        "column": "date_day",
+        "reason_code": "probe_refused"
+      }
+    ]
+  },
+  "project": "/private/tmp/dex-new-user-1.17.9-acceptance/demo_analytics",
+  "initial_install": {
+    "command": "npx skills add exmergo/dex",
+    "directory": "/private/tmp/dex-new-user-1.17.9",
+    "installed_engine_pin": "1.17.9"
+  },
+  "replay_install": {
+    "source": "exmergo/dex@v1.17.9",
+    "directory": "/private/tmp/dex-new-user-1.17.9-acceptance"
+  },
+  "evidence": {
+    "init": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/03-init.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "mode": "demo",
+        "project_dir": "demo_analytics",
+        "connector": "duckdb",
+        "created": [
+          "dex_demo.duckdb",
+          "demo_analytics/dbt_project.yml",
+          "demo_analytics/profiles.yml",
+          "demo_analytics/models/staging/.gitkeep",
+          "demo_analytics/models/marts/.gitkeep",
+          "demo_analytics/models/intermediate/.gitkeep",
+          "demo_analytics/macros/generate_schema_name.sql",
+          ".dex/config.yml",
+          "AGENTS.md",
+          ".dex/setup.json",
+          "README.md"
+        ],
+        "updated": [],
+        "missing_inputs": [],
+        "candidates": [],
+        "readiness": {
+          "configuration": {
+            "status": "passed"
+          },
+          "build": {
+            "status": "unchecked",
+            "reason_code": "not_run_during_setup"
+          },
+          "build_prerequisites": {
+            "status": "passed",
+            "dbt_adapter_installed": true
+          },
+          "connection": {
+            "status": "passed"
+          }
+        },
+        "next_steps": [
+          {
+            "command": "dex explore map",
+            "purpose": "explicit follow-up: explore the configured source scope"
+          }
+        ],
+        "skills": {
+          "detected": [
+            "explore",
+            "transform",
+            "maintain"
+          ],
+          "missing": [],
+          "installation_command": "npx skills add exmergo/dex"
+        },
+        "problems": [],
+        "failure_reason": null,
+        "enterprise": {
+          "description": "Scope analytics requests, open tested pull requests autonomously, and check for drift on a schedule. In your CI, owned by your team.",
+          "url": "https://www.exmergo.com/dex/enterprise"
+        }
+      }
+    },
+    "mutation": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/20-mutation.stdout",
+      "status": "ok",
+      "warnings": [
+        "no confirm handshake: this connector cannot bill, so there was nothing to confirm and the command ran without asking"
+      ],
+      "data": {
+        "model": "dim_customers",
+        "target": "dev",
+        "baseline": {
+          "tests": [
+            {
+              "name": "assert_customer_rollup_reconciles",
+              "status": "pass"
+            },
+            {
+              "name": "customer_rollup_preserves_empty_and_all_statuses",
+              "status": "pass"
+            },
+            {
+              "name": "not_null_dim_customers_booked_amount",
+              "status": "pass"
+            },
+            {
+              "name": "not_null_dim_customers_customer_id",
+              "status": "pass"
+            },
+            {
+              "name": "not_null_dim_customers_order_count",
+              "status": "pass"
+            },
+            {
+              "name": "unique_dim_customers_customer_id",
+              "status": "pass"
+            }
+          ],
+          "excluded": []
+        },
+        "mutants": [
+          {
+            "id": "m01",
+            "operator": "join_type",
+            "scope": "(final select)",
+            "defect": "the left join to orders AS o became an inner join, so every row whose match is missing is silently dropped from the model",
+            "before": "left join orders AS o",
+            "after": "inner join orders AS o",
+            "suggested_test": "a `relationships` test, or a row-count assertion against the parent",
+            "status": "killed",
+            "caught_by": [
+              "assert_customer_rollup_reconciles",
+              "customer_rollup_preserves_empty_and_all_statuses"
+            ],
+            "caught_downstream_by": [],
+            "warn_only": false,
+            "equivalence": null
+          },
+          {
+            "id": "m02",
+            "operator": "aggregate",
+            "scope": "orders",
+            "defect": "'SUM(order_total)' now reports the largest single value rather than the total, which agrees with it whenever a group holds exactly one row",
+            "before": "SUM(order_total)",
+            "after": "MAX(order_total)",
+            "suggested_test": "a unit test with more than one row per group",
+            "status": "killed",
+            "caught_by": [
+              "assert_customer_rollup_reconciles",
+              "customer_rollup_preserves_empty_and_all_statuses"
+            ],
+            "caught_downstream_by": [],
+            "warn_only": false,
+            "equivalence": null
+          }
+        ],
+        "counts": {
+          "generated": 2,
+          "killed": 2,
+          "caught_downstream": 0,
+          "survived": 0,
+          "rejected": 0,
+          "not_run": 0
+        },
+        "score": 1.0,
+        "score_with_downstream": null,
+        "cap": {
+          "limit": 20,
+          "generated": 2,
+          "considered": 2,
+          "elided": {}
+        },
+        "unsupported_sites": [],
+        "runs": 4,
+        "equivalence": {
+          "checked": true,
+          "self_check": "reproducible",
+          "distinguishable": 0,
+          "equivalent": 0,
+          "not_checked": 0,
+          "reason": null
+        },
+        "downstream": {
+          "enabled": false,
+          "requested": null,
+          "reason": "no model in this project reads 'dim_customers'",
+          "models": [],
+          "tests": [],
+          "excluded": [],
+          "cut": [],
+          "elided": 0
+        },
+        "incremental": null
+      }
+    },
+    "metric-total": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/21-metric-total.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "columns": [
+          "orders",
+          "booked_amount",
+          "average_order_value"
+        ],
+        "types": [
+          "HUGEINT",
+          "DECIMAL(38,2)",
+          "DOUBLE"
+        ],
+        "cells": [
+          [
+            5000,
+            2338243.4,
+            467.64867999999996
+          ]
+        ],
+        "row_count": 1,
+        "truncated": false,
+        "backend": "local",
+        "vendor": "dbt",
+        "deployment": "local",
+        "execution": "dex",
+        "notes": [
+          "PII screening fell back to the name heuristic: the .dex/ cache holds no profile for dex_demo.marts_dev.fct_orders. Run `explore profile dex_demo.marts_dev.fct_orders` for value-evidence screening."
+        ]
+      }
+    },
+    "metric-country": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/22-metric-country.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "columns": [
+          "order__country_code",
+          "orders",
+          "booked_amount"
+        ],
+        "types": [
+          "VARCHAR",
+          "HUGEINT",
+          "DECIMAL(38,2)"
+        ],
+        "cells": [
+          [
+            "FR",
+            658,
+            313430.18
+          ],
+          [
+            "IT",
+            730,
+            338484.59
+          ],
+          [
+            "BE",
+            638,
+            291536.07
+          ],
+          [
+            "PL",
+            570,
+            273263.52
+          ],
+          [
+            "DE",
+            615,
+            281378.66
+          ],
+          [
+            "SE",
+            591,
+            277884.67
+          ],
+          [
+            "ES",
+            634,
+            293766.01
+          ],
+          [
+            "NL",
+            564,
+            268499.7
+          ]
+        ],
+        "row_count": 8,
+        "truncated": false,
+        "backend": "local",
+        "vendor": "dbt",
+        "deployment": "local",
+        "execution": "dex",
+        "notes": [
+          "PII screening used the name heuristic alone for order__country_code: no authoritative source spoke to the columns behind them, so they passed on the shape of their names. Profile the columns behind them, or mark them in the project that declares them, to make the screening evidence-backed.",
+          "PII screening fell back to the name heuristic: the .dex/ cache holds no profile for dex_demo.marts_dev.fct_orders. Run `explore profile dex_demo.marts_dev.fct_orders` for value-evidence screening."
+        ]
+      }
+    },
+    "metric-month": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/23-metric-month.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "columns": [
+          "metric_time__month",
+          "orders",
+          "booked_amount"
+        ],
+        "types": [
+          "TIMESTAMP",
+          "HUGEINT",
+          "DECIMAL(38,2)"
+        ],
+        "cells": [
+          [
+            "2025-10-01T00:00:00",
+            390,
+            185956.13
+          ],
+          [
+            "2025-12-01T00:00:00",
+            355,
+            167218.23
+          ],
+          [
+            "2026-03-01T00:00:00",
+            392,
+            181427.79
+          ],
+          [
+            "2025-09-01T00:00:00",
+            346,
+            158376.46
+          ],
+          [
+            "2025-03-01T00:00:00",
+            375,
+            174469.36
+          ],
+          [
+            "2025-08-01T00:00:00",
+            349,
+            149341.56
+          ],
+          [
+            "2025-04-01T00:00:00",
+            354,
+            170618.52
+          ],
+          [
+            "2025-02-01T00:00:00",
+            258,
+            117319.98
+          ],
+          [
+            "2025-05-01T00:00:00",
+            367,
+            171995.23
+          ],
+          [
+            "2026-01-01T00:00:00",
+            355,
+            161990.07
+          ],
+          [
+            "2025-06-01T00:00:00",
+            364,
+            178749.82
+          ],
+          [
+            "2025-11-01T00:00:00",
+            373,
+            180150.98
+          ],
+          [
+            "2026-02-01T00:00:00",
+            348,
+            159341.03
+          ],
+          [
+            "2025-07-01T00:00:00",
+            374,
+            181288.24
+          ]
+        ],
+        "row_count": 14,
+        "truncated": false,
+        "backend": "local",
+        "vendor": "dbt",
+        "deployment": "local",
+        "execution": "dex",
+        "notes": [
+          "PII screening used the name heuristic alone for metric_time: no authoritative source spoke to the columns behind them, so they passed on the shape of their names. Profile the columns behind them, or mark them in the project that declares them, to make the screening evidence-backed.",
+          "PII screening fell back to the name heuristic: the .dex/ cache holds no profile for dex_demo.marts_dev.fct_orders. Run `explore profile dex_demo.marts_dev.fct_orders` for value-evidence screening."
+        ]
+      }
+    },
+    "customer-aggregate": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/24-customer-aggregate.stdout",
+      "status": "ok",
+      "warnings": [
+        "profiled 1 object(s) on demand: dex_demo.marts_dev.dim_customers. They are in the warehouse but the .dex/ cache could not speak for them, and the firewall reads PII flags from that cache. These are full profiles (same detection, same overrides, same cache write) and they are saved, so the next statement over them profiles nothing. Pass --no-auto-profile to be refused instead of profiled"
+      ],
+      "data": {
+        "shape": "columnar",
+        "columns": [
+          "customers",
+          "orders",
+          "empty_customers",
+          "booked_amount"
+        ],
+        "types": [
+          "BIGINT",
+          "HUGEINT",
+          "BIGINT",
+          "DECIMAL(38,2)"
+        ],
+        "cells": [
+          [
+            1200,
+            5000,
+            18,
+            2338243.4
+          ]
+        ],
+        "row_count": 1,
+        "truncated": false,
+        "tables": [
+          "dex_demo.marts_dev.dim_customers"
+        ],
+        "profiled_on_demand": [
+          "dex_demo.marts_dev.dim_customers"
+        ],
+        "notes": [
+          "--target dev widened nothing: DuckDB's dev target is the file this connection already reads"
+        ]
+      }
+    },
+    "maintain-verify": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/25-maintain-verify.stdout",
+      "status": "ok",
+      "warnings": [
+        "dim_customers: left join orders AS o on c.customer_id = o.customer_id: a join column is read through CTE `orders`, which reduces its rows with a shape dex does not carry into a probe (a GROUP BY), so probing the physical relation underneath would measure rows the model never joins",
+        "the declared additivity on dim_customers was not checked: there is no entity to order it by; declare a `time` role and a `foreign_key` role, or a composite grain naming both",
+        "the declared additivity of fct_orders.order_count was not checked: only 0 consecutive observation(s) within customer_id ordered by ordered_at, and the cumulative detector needs 20"
+      ],
+      "data": {
+        "findings": [],
+        "finding_count": 0,
+        "suppressed": {
+          "unit": "no model in scope declares a column's unit as fraction or percent",
+          "population": "no model in scope declares population filters with includes or excludes",
+          "temporal": "no model in scope declares a history temporal contract"
+        },
+        "grain_coverage": [
+          {
+            "model": "dim_customers",
+            "columns": [
+              "customer_id"
+            ],
+            "source": "declaration",
+            "status": "proven",
+            "reason": null,
+            "measured": {
+              "rows": 1200,
+              "distinct": 1200
+            }
+          },
+          {
+            "model": "fct_orders",
+            "columns": [
+              "order_id"
+            ],
+            "source": "declaration",
+            "status": "proven",
+            "reason": null,
+            "measured": {
+              "rows": 5000,
+              "distinct": 5000
+            }
+          },
+          {
+            "model": "int_orders_enriched",
+            "columns": [
+              "order_id"
+            ],
+            "source": "declaration",
+            "status": "proven",
+            "reason": null,
+            "measured": {
+              "rows": 5000,
+              "distinct": 5000
+            }
+          },
+          {
+            "model": "metricflow_time_spine",
+            "columns": [
+              "date_day"
+            ],
+            "source": "declaration",
+            "status": "proven",
+            "reason": null,
+            "measured": {
+              "rows": 5844,
+              "distinct": 5844
+            }
+          },
+          {
+            "model": "stg_customers",
+            "columns": [
+              "customer_id"
+            ],
+            "source": "declaration",
+            "status": "proven",
+            "reason": null,
+            "measured": {
+              "rows": 1200,
+              "distinct": 1200
+            }
+          },
+          {
+            "model": "stg_orders",
+            "columns": [
+              "order_id"
+            ],
+            "source": "declaration",
+            "status": "proven",
+            "reason": null,
+            "measured": {
+              "rows": 5000,
+              "distinct": 5000
+            }
+          }
+        ],
+        "join_coverage": [
+          {
+            "model": "dim_customers",
+            "join": "left join orders AS o on c.customer_id = o.customer_id",
+            "status": "unchecked",
+            "reason_code": "filtered_cte",
+            "reason": "a join column is read through CTE `orders`, which reduces its rows with a shape dex does not carry into a probe (a GROUP BY), so probing the physical relation underneath would measure rows the model never joins"
+          },
+          {
+            "model": "int_orders_enriched",
+            "join": "left join \"dex_demo\".\"staging_dev\".\"stg_customers\" AS c on o.customer_id = c.customer_id",
+            "side": "left",
+            "from_relation": "dex_demo.staging_dev.stg_orders",
+            "from_columns": [
+              "customer_id"
+            ],
+            "to_relation": "dex_demo.staging_dev.stg_customers",
+            "to_columns": [
+              "customer_id"
+            ],
+            "declared": {
+              "required": true,
+              "required_by": "customer_id is declared a foreign_key referencing stg_customers.customer_id",
+              "optional": false,
+              "null_keys": "excluded",
+              "null_keys_by": null,
+              "derived_columns": [
+                "country_code"
+              ]
+            },
+            "measured": {
+              "rows": 5000,
+              "null_key_rows": 0,
+              "eligible_rows": 5000,
+              "matched_rows": 5000,
+              "unmatched_rows": 0,
+              "eligible_keys": 1182,
+              "matched_keys": 1182,
+              "unmatched_keys": 0
+            },
+            "coverage": {
+              "rows": 1.0,
+              "keys": 1.0
+            },
+            "threshold_source": "contract",
+            "thresholds": {
+              "unmatched_rows": 0
+            },
+            "status": "satisfied"
+          }
+        ],
+        "parent_population": [
+          {
+            "model": "dim_customers",
+            "declared": {
+              "parent": "stg_customers",
+              "key": [
+                {
+                  "column": "customer_id",
+                  "parent_column": "customer_id"
+                }
+              ],
+              "filters_applied": [],
+              "filters_unapplied": []
+            },
+            "parent_relation": "dex_demo.staging_dev.stg_customers",
+            "status": "satisfied",
+            "measured": {
+              "output_rows": 1200,
+              "output_keys": 1200,
+              "output_null_key_rows": 0,
+              "parent_keys": 1200,
+              "eligible_parent_keys": 1200,
+              "excluded_by_filters": 0,
+              "parents_present": 1200,
+              "missing_parents": 0,
+              "unexpected_keys": 0,
+              "coverage": 1.0
+            }
+          },
+          {
+            "model": "fct_orders",
+            "declared": {
+              "parent": "stg_orders",
+              "key": [
+                {
+                  "column": "order_id",
+                  "parent_column": "order_id"
+                }
+              ],
+              "filters_applied": [],
+              "filters_unapplied": []
+            },
+            "parent_relation": "dex_demo.staging_dev.stg_orders",
+            "status": "satisfied",
+            "measured": {
+              "output_rows": 5000,
+              "output_keys": 5000,
+              "output_null_key_rows": 0,
+              "parent_keys": 5000,
+              "eligible_parent_keys": 5000,
+              "excluded_by_filters": 0,
+              "parents_present": 5000,
+              "missing_parents": 0,
+              "unexpected_keys": 0,
+              "coverage": 1.0
+            }
+          },
+          {
+            "model": "int_orders_enriched",
+            "declared": {
+              "parent": "stg_orders",
+              "key": [
+                {
+                  "column": "order_id",
+                  "parent_column": "order_id"
+                }
+              ],
+              "filters_applied": [],
+              "filters_unapplied": []
+            },
+            "parent_relation": "dex_demo.staging_dev.stg_orders",
+            "status": "satisfied",
+            "measured": {
+              "output_rows": 5000,
+              "output_keys": 5000,
+              "output_null_key_rows": 0,
+              "parent_keys": 5000,
+              "eligible_parent_keys": 5000,
+              "excluded_by_filters": 0,
+              "parents_present": 5000,
+              "missing_parents": 0,
+              "unexpected_keys": 0,
+              "coverage": 1.0
+            }
+          }
+        ],
+        "judged_namespace": "dex_demo.intermediate_dev, dex_demo.main, dex_demo.marts_dev, dex_demo.staging_dev",
+        "notes": [
+          "row population was not compared for metricflow_time_spine (generated in SQL; no parent relation to compare against)"
+        ]
+      }
+    },
+    "baseline-check": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/28-baseline-check.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "findings": [
+          {
+            "axis": "grain",
+            "code": "no_rows",
+            "identifier": "dex_demo.main.returns",
+            "column": null,
+            "severity": "low",
+            "detail": "dex_demo.main.returns has no rows; null fractions were not reported",
+            "exact": true,
+            "data": {
+              "row_count": 0
+            },
+            "impacted_models": [],
+            "impacted_metrics": []
+          }
+        ],
+        "finding_count": 1,
+        "axes_run": [
+          "grain",
+          "schema",
+          "semantic",
+          "volume"
+        ],
+        "axes": {
+          "schema": {
+            "run_at": "2026-11-13T13:48:52.207392+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          },
+          "volume": {
+            "run_at": "2026-11-13T13:48:52.207392+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          },
+          "grain": {
+            "run_at": "2026-11-13T13:48:52.207392+00:00",
+            "scope": null,
+            "findings": [
+              {
+                "axis": "grain",
+                "code": "no_rows",
+                "identifier": "dex_demo.main.returns",
+                "column": null,
+                "severity": "low",
+                "detail": "dex_demo.main.returns has no rows; null fractions were not reported",
+                "exact": true,
+                "data": {
+                  "row_count": 0
+                },
+                "impacted_models": [],
+                "impacted_metrics": []
+              }
+            ],
+            "finding_count": 1
+          },
+          "semantic": {
+            "run_at": "2026-11-13T13:48:52.207392+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          }
+        },
+        "baseline": {
+          "snapshot_created_at": "2026-11-13T13:48:51.674460+00:00",
+          "from": "cache"
+        },
+        "drift_path": "/private/tmp/dex-new-user-1.17.9-acceptance/.dex/drift.json",
+        "declaration_drift": {
+          "checked": true,
+          "baseline_declared_models": 6,
+          "declared_models": 6
+        },
+        "hint": "run `maintain reconcile [<class>]` for proposed fixes as reviewable diffs"
+      }
+    },
+    "detect-drift": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/31-detect-drift.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "findings": [
+          {
+            "axis": "semantic",
+            "code": "definition_changed",
+            "identifier": null,
+            "column": null,
+            "severity": "low",
+            "detail": "the definition of metric 'orders' changed since the baseline",
+            "exact": true,
+            "data": {
+              "kind": "metric",
+              "name": "orders",
+              "path": "models/marts/metrics.yml"
+            },
+            "impacted_models": [],
+            "impacted_metrics": [
+              "average_order_value",
+              "orders"
+            ]
+          },
+          {
+            "axis": "grain",
+            "code": "no_rows",
+            "identifier": "dex_demo.main.returns",
+            "column": null,
+            "severity": "low",
+            "detail": "dex_demo.main.returns has no rows; null fractions were not reported",
+            "exact": true,
+            "data": {
+              "row_count": 0
+            },
+            "impacted_models": [],
+            "impacted_metrics": []
+          }
+        ],
+        "finding_count": 2,
+        "axes_run": [
+          "grain",
+          "schema",
+          "semantic",
+          "volume"
+        ],
+        "axes": {
+          "schema": {
+            "run_at": "2026-11-13T13:48:56.025810+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          },
+          "volume": {
+            "run_at": "2026-11-13T13:48:56.025810+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          },
+          "grain": {
+            "run_at": "2026-11-13T13:48:56.025810+00:00",
+            "scope": null,
+            "findings": [
+              {
+                "axis": "grain",
+                "code": "no_rows",
+                "identifier": "dex_demo.main.returns",
+                "column": null,
+                "severity": "low",
+                "detail": "dex_demo.main.returns has no rows; null fractions were not reported",
+                "exact": true,
+                "data": {
+                  "row_count": 0
+                },
+                "impacted_models": [],
+                "impacted_metrics": []
+              }
+            ],
+            "finding_count": 1
+          },
+          "semantic": {
+            "run_at": "2026-11-13T13:48:56.025810+00:00",
+            "scope": null,
+            "findings": [
+              {
+                "axis": "semantic",
+                "code": "definition_changed",
+                "identifier": null,
+                "column": null,
+                "severity": "low",
+                "detail": "the definition of metric 'orders' changed since the baseline",
+                "exact": true,
+                "data": {
+                  "kind": "metric",
+                  "name": "orders",
+                  "path": "models/marts/metrics.yml"
+                },
+                "impacted_models": [],
+                "impacted_metrics": [
+                  "average_order_value",
+                  "orders"
+                ]
+              }
+            ],
+            "finding_count": 1
+          }
+        },
+        "baseline": {
+          "snapshot_created_at": "2026-11-13T13:48:51.674460+00:00",
+          "from": "cache"
+        },
+        "drift_path": "/private/tmp/dex-new-user-1.17.9-acceptance/.dex/drift.json",
+        "declaration_drift": {
+          "checked": true,
+          "baseline_declared_models": 6,
+          "declared_models": 6
+        },
+        "hint": "run `maintain reconcile [<class>]` for proposed fixes as reviewable diffs"
+      }
+    },
+    "restored-check": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/34-restored-check.stdout",
+      "status": "ok",
+      "warnings": [],
+      "data": {
+        "findings": [
+          {
+            "axis": "grain",
+            "code": "no_rows",
+            "identifier": "dex_demo.main.returns",
+            "column": null,
+            "severity": "low",
+            "detail": "dex_demo.main.returns has no rows; null fractions were not reported",
+            "exact": true,
+            "data": {
+              "row_count": 0
+            },
+            "impacted_models": [],
+            "impacted_metrics": []
+          }
+        ],
+        "finding_count": 1,
+        "axes_run": [
+          "grain",
+          "schema",
+          "semantic",
+          "volume"
+        ],
+        "axes": {
+          "schema": {
+            "run_at": "2026-11-13T13:48:59.231590+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          },
+          "volume": {
+            "run_at": "2026-11-13T13:48:59.231590+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          },
+          "grain": {
+            "run_at": "2026-11-13T13:48:59.231590+00:00",
+            "scope": null,
+            "findings": [
+              {
+                "axis": "grain",
+                "code": "no_rows",
+                "identifier": "dex_demo.main.returns",
+                "column": null,
+                "severity": "low",
+                "detail": "dex_demo.main.returns has no rows; null fractions were not reported",
+                "exact": true,
+                "data": {
+                  "row_count": 0
+                },
+                "impacted_models": [],
+                "impacted_metrics": []
+              }
+            ],
+            "finding_count": 1
+          },
+          "semantic": {
+            "run_at": "2026-11-13T13:48:59.231590+00:00",
+            "scope": null,
+            "findings": [],
+            "finding_count": 0
+          }
+        },
+        "baseline": {
+          "snapshot_created_at": "2026-11-13T13:48:51.674460+00:00",
+          "from": "cache"
+        },
+        "drift_path": "/private/tmp/dex-new-user-1.17.9-acceptance/.dex/drift.json",
+        "declaration_drift": {
+          "checked": true,
+          "baseline_declared_models": 6,
+          "declared_models": 6
+        },
+        "hint": "run `maintain reconcile [<class>]` for proposed fixes as reviewable diffs"
+      }
+    },
+    "final-build": {
+      "file": "/private/tmp/dex-new-user-1.17.9-acceptance/evidence/19-build.stdout",
+      "status": "ok",
+      "warnings": [
+        "no confirm handshake: this connector cannot bill, so there was nothing to confirm and the command ran without asking",
+        "dim_customers: left join orders AS o on c.customer_id = o.customer_id: a join column is read through CTE `orders`, which reduces its rows with a shape dex does not carry into a probe (a GROUP BY), so probing the physical relation underneath would measure rows the model never joins",
+        "the declared additivity on dim_customers was not checked: there is no entity to order it by; declare a `time` role and a `foreign_key` role, or a composite grain naming both",
+        "the declared additivity of fct_orders.order_count was not checked: only 0 consecutive observation(s) within customer_id ordered by ordered_at, and the cumulative detector needs 20"
+      ],
+      "completion": {
+        "outcome": "validated",
+        "process": {
+          "success": true,
+          "returncode": 0,
+          "node_counts": {
+            "pass": 29,
+            "success": 6
+          }
+        },
+        "change": {
+          "plan_id": "p07905817c3",
+          "source": "for_plan"
+        },
+        "deliverables": {
+          "coverage": "known",
+          "required": 6,
+          "built": {
+            "count": 6,
+            "names": [
+              "dim_customers",
+              "fct_orders",
+              "int_orders_enriched",
+              "metricflow_time_spine",
+              "stg_customers"
+            ],
+            "elided": 1
+          },
+          "failed": {
+            "count": 0,
+            "names": [],
+            "elided": 0
+          },
+          "skipped": {
+            "count": 0,
+            "names": [],
+            "elided": 0
+          },
+          "missing": {
+            "count": 0,
+            "names": [],
+            "elided": 0
+          },
+          "stale": {
+            "count": 0,
+            "names": [],
+            "elided": 0
+          },
+          "blocked": []
+        },
+        "blockers": [],
+        "assurance": {
+          "basis": "required",
+          "asserted": {
+            "count": 6,
+            "names": [
+              "dim_customers",
+              "fct_orders",
+              "int_orders_enriched",
+              "metricflow_time_spine",
+              "stg_customers"
+            ],
+            "elided": 1
+          },
+          "failed_checks": {
+            "count": 0,
+            "names": [],
+            "elided": 0,
+            "checks": []
+          },
+          "build_only": {
+            "count": 0,
+            "names": [],
+            "elided": 0
+          }
+        },
+        "verification": {
+          "ran": true,
+          "finding_count": 0,
+          "findings_dropped": 0,
+          "by_severity": {},
+          "top": [],
+          "suppressed": [
+            "grain",
+            "no_relation",
+            "population",
+            "temporal",
+            "unit"
+          ],
+          "offered": false
+        },
+        "obligations": {
+          "checked": true,
+          "by_status": {
+            "satisfied": 4,
+            "unchecked": 4
+          },
+          "contradicted": [],
+          "unchecked": [
+            {
+              "model": "dim_customers",
+              "kind": "join_coverage",
+              "status": "unchecked",
+              "reason_code": "filtered_cte"
+            },
+            {
+              "model": "metricflow_time_spine",
+              "kind": "population_delta",
+              "status": "unchecked",
+              "reason_code": "no_parent_drafted"
+            },
+            {
+              "model": "stg_customers",
+              "kind": "population_delta",
+              "status": "unchecked",
+              "reason_code": "no_parent_drafted"
+            },
+            {
+              "model": "stg_orders",
+              "kind": "population_delta",
+              "status": "unchecked",
+              "reason_code": "no_parent_drafted"
+            }
+          ],
+          "no_declared_columns": {
+            "count": 0,
+            "names": [],
+            "elided": 0
+          },
+          "prose_population": {
+            "count": 3,
+            "names": [
+              "metricflow_time_spine",
+              "stg_customers",
+              "stg_orders"
+            ],
+            "elided": 0
+          },
+          "identifier_conversions": [
+            {
+              "model": "metricflow_time_spine",
+              "kind": "identifier_conversion",
+              "status": "unchecked",
+              "column": "date_day",
+              "reason_code": "probe_refused"
+            }
+          ]
+        },
+        "details": [
+          "data.evidence",
+          "data.verification",
+          "data.nodes"
+        ],
+        "elided": {}
+      },
+      "decisions": [
+        {
+          "model": "int_orders_enriched",
+          "decision": "Population",
+          "chosen": "Every staging order, enriched with customer country.",
+          "evidence": "default",
+          "column": "order_id",
+          "detail": "Preserve every entity from the driving relation."
+        },
+        {
+          "model": "metricflow_time_spine",
+          "decision": "Population",
+          "chosen": "Every calendar day from 2020-01-01 through 2035-12-31 inclusive.",
+          "evidence": "default",
+          "column": "date_day",
+          "detail": "Preserve every entity from the driving relation."
+        },
+        {
+          "model": "dim_customers",
+          "decision": "Population",
+          "chosen": "Every customer, including customers with no orders; empty totals are zero.",
+          "evidence": "default",
+          "column": "customer_id",
+          "detail": "Preserve every entity from the driving relation."
+        },
+        {
+          "model": "fct_orders",
+          "decision": "Population",
+          "chosen": "One row per order, all statuses; booked amount is not recognized revenue.",
+          "evidence": "default",
+          "column": "order_id",
+          "detail": "Preserve every entity from the driving relation."
+        },
+        {
+          "model": "stg_customers",
+          "decision": "Population",
+          "chosen": "All source customers, with non-personal analytics attributes.",
+          "evidence": "default",
+          "column": "customer_id",
+          "detail": "Preserve every entity from the driving relation."
+        },
+        {
+          "model": "stg_orders",
+          "decision": "Order status scope",
+          "chosen": "Keep all statuses; metrics can be grouped by status.",
+          "evidence": "default",
+          "column": "status"
+        },
+        {
+          "model": "stg_orders",
+          "decision": "Timestamp conversion",
+          "chosen": "Parse placed_at as TIMESTAMP without removing rows.",
+          "evidence": "data",
+          "column": "ordered_at",
+          "detail": "Profile found every source value matches a timestamp format."
+        },
+        {
+          "model": "stg_orders",
+          "decision": "Amount unit",
+          "chosen": "demo_currency_units",
+          "evidence": "default",
+          "column": "order_total",
+          "detail": "The demo provides no currency code; do not assume USD."
+        }
+      ],
+      "verification": {
+        "ran": true,
+        "scope": [
+          "dim_customers",
+          "fct_orders",
+          "int_orders_enriched",
+          "metricflow_time_spine",
+          "stg_customers",
+          "stg_orders"
+        ],
+        "scope_not_built": [],
+        "findings": [],
+        "finding_count": 0,
+        "suppressed": {
+          "no_relation": "dbt's run results are authoritative for the nodes this build ran",
+          "grain": "no model this build ran declares a grain that a unique test in this build does not already check",
+          "unit": "no model this build ran declares a column's unit as fraction or percent",
+          "population": "no model this build ran declares population filters with includes or excludes",
+          "temporal": "no model this build ran declares a history temporal contract"
+        },
+        "join_coverage": [
+          {
+            "model": "dim_customers",
+            "join": "left join orders AS o on c.customer_id = o.customer_id",
+            "status": "unchecked",
+            "reason_code": "filtered_cte",
+            "reason": "a join column is read through CTE `orders`, which reduces its rows with a shape dex does not carry into a probe (a GROUP BY), so probing the physical relation underneath would measure rows the model never joins"
+          },
+          {
+            "model": "int_orders_enriched",
+            "join": "left join \"dex_demo\".\"staging_dev\".\"stg_customers\" AS c on o.customer_id = c.customer_id",
+            "side": "left",
+            "from_relation": "dex_demo.staging_dev.stg_orders",
+            "from_columns": [
+              "customer_id"
+            ],
+            "to_relation": "dex_demo.staging_dev.stg_customers",
+            "to_columns": [
+              "customer_id"
+            ],
+            "declared": {
+              "required": true,
+              "required_by": "customer_id is declared a foreign_key referencing stg_customers.customer_id",
+              "optional": false,
+              "null_keys": "excluded",
+              "null_keys_by": null,
+              "derived_columns": [
+                "country_code"
+              ]
+            },
+            "measured": {
+              "rows": 5000,
+              "null_key_rows": 0,
+              "eligible_rows": 5000,
+              "matched_rows": 5000,
+              "unmatched_rows": 0,
+              "eligible_keys": 1182,
+              "matched_keys": 1182,
+              "unmatched_keys": 0
+            },
+            "coverage": {
+              "rows": 1.0,
+              "keys": 1.0
+            },
+            "threshold_source": "contract",
+            "thresholds": {
+              "unmatched_rows": 0
+            },
+            "status": "satisfied"
+          }
+        ],
+        "parent_population": [
+          {
+            "model": "dim_customers",
+            "declared": {
+              "parent": "stg_customers",
+              "key": [
+                {
+                  "column": "customer_id",
+                  "parent_column": "customer_id"
+                }
+              ],
+              "filters_applied": [],
+              "filters_unapplied": []
+            },
+            "parent_relation": "dex_demo.staging_dev.stg_customers",
+            "status": "satisfied",
+            "measured": {
+              "output_rows": 1200,
+              "output_keys": 1200,
+              "output_null_key_rows": 0,
+              "parent_keys": 1200,
+              "eligible_parent_keys": 1200,
+              "excluded_by_filters": 0,
+              "parents_present": 1200,
+              "missing_parents": 0,
+              "unexpected_keys": 0,
+              "coverage": 1.0
+            }
+          },
+          {
+            "model": "fct_orders",
+            "declared": {
+              "parent": "stg_orders",
+              "key": [
+                {
+                  "column": "order_id",
+                  "parent_column": "order_id"
+                }
+              ],
+              "filters_applied": [],
+              "filters_unapplied": []
+            },
+            "parent_relation": "dex_demo.staging_dev.stg_orders",
+            "status": "satisfied",
+            "measured": {
+              "output_rows": 5000,
+              "output_keys": 5000,
+              "output_null_key_rows": 0,
+              "parent_keys": 5000,
+              "eligible_parent_keys": 5000,
+              "excluded_by_filters": 0,
+              "parents_present": 5000,
+              "missing_parents": 0,
+              "unexpected_keys": 0,
+              "coverage": 1.0
+            }
+          },
+          {
+            "model": "int_orders_enriched",
+            "declared": {
+              "parent": "stg_orders",
+              "key": [
+                {
+                  "column": "order_id",
+                  "parent_column": "order_id"
+                }
+              ],
+              "filters_applied": [],
+              "filters_unapplied": []
+            },
+            "parent_relation": "dex_demo.staging_dev.stg_orders",
+            "status": "satisfied",
+            "measured": {
+              "output_rows": 5000,
+              "output_keys": 5000,
+              "output_null_key_rows": 0,
+              "parent_keys": 5000,
+              "eligible_parent_keys": 5000,
+              "excluded_by_filters": 0,
+              "parents_present": 5000,
+              "missing_parents": 0,
+              "unexpected_keys": 0,
+              "coverage": 1.0
+            }
+          }
+        ],
+        "population_delta": [
+          {
+            "model": "metricflow_time_spine",
+            "status": "unchecked",
+            "reason_code": "no_parent_drafted",
+            "reason": "no model, seed or snapshot outside this model's own lineage is keyed by date_day (declared), and its driving relation is not one ref() reaches"
+          },
+          {
+            "model": "stg_customers",
+            "status": "unchecked",
+            "reason_code": "no_parent_drafted",
+            "reason": "no model, seed or snapshot outside this model's own lineage is keyed by customer_id (declared), and its driving relation is not one ref() reaches"
+          },
+          {
+            "model": "stg_orders",
+            "status": "unchecked",
+            "reason_code": "no_parent_drafted",
+            "reason": "no model, seed or snapshot outside this model's own lineage is keyed by order_id (declared), and its driving relation is not one ref() reaches"
+          }
+        ],
+        "column_contract": {
+          "checked": [
+            "dim_customers",
+            "fct_orders",
+            "int_orders_enriched",
+            "metricflow_time_spine",
+            "stg_customers",
+            "stg_orders"
+          ],
+          "no_declared_columns": [],
+          "unchecked": []
+        }
+      }
+    }
+  }
+}

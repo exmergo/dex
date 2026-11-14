@@ -1,0 +1,8 @@
+{
+  "kind": "fix",
+  "models": [
+    "stg_events",
+    "subscription_activity"
+  ],
+  "prompt": "Customer success says subscription 1007 is missing data in `subscription_activity`: its trial activity does not look right. Find out what is wrong, fix it, and build it on dev."
+}

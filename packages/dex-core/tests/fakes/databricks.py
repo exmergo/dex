@@ -215,7 +215,9 @@ class FakeWorkspaceClient:
             name=t.name,
             catalog_name=t.catalog,
             schema_name=t.schema,
-            table_type="VIEW" if t.kind == "view" else "MANAGED",
+            table_type={"view": "VIEW", "metric_view": "METRIC_VIEW"}.get(
+                t.kind, "MANAGED"
+            ),
             columns=columns,
         )
 

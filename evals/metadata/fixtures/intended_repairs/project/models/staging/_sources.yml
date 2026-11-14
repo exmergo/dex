@@ -1,0 +1,10 @@
+version: 2
+sources:
+  - name: raw
+    schema: raw
+    tables:
+      - name: calendar
+      - name: tickets
+      - name: workspaces
+      - name: memberships
+      - name: shipments

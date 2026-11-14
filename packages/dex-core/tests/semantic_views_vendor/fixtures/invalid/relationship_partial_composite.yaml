@@ -1,0 +1,21 @@
+# expect: one_to_many
+# A relationship whose left columns are a key and whose right columns are not:
+# one-to-many, which Snowflake refuses.
+name: relationship_partial_composite
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    metrics:
+      - {name: line_count, expr: COUNT(l_linenumber)}
+relationships:
+  - name: orders_lineitem
+    left_table: orders
+    right_table: lineitem
+    relationship_columns: [{left_column: o_orderkey, right_column: l_orderkey}]

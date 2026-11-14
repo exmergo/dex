@@ -246,6 +246,13 @@ class SemanticModelDef(BaseModel):
     categorical_dimensions: dict[str, str] = Field(default_factory=dict)
     measures: dict[str, str | None] = Field(default_factory=dict)
     keys: list[list[str]] = Field(default_factory=list)
+    #: What each entry of ``keys`` claims, by position: ``primary`` for a
+    #: primary key, ``unique`` for a uniqueness claim that is not the grain (a
+    #: Semantic View's ``unique_keys``, a Metric View's ``rely`` key), so a
+    #: contradicted key is worded as the claim its layer made (#1293). ``None``
+    #: on a baseline pinned before it was recorded, and for a format that does
+    #: not say, where the grain axis falls back to the vendor's convention.
+    key_claims: list[str] | None = None
 
     def referenced_columns(self) -> set[str]:
         return {
@@ -381,6 +388,11 @@ class SemanticLayerSnapshot(BaseModel):
     vendor: str | None = None
     vendor_release: str | None = None
     format_version: str | None = None
+    #: The format version each definition file declares, keyed by file, for a
+    #: layer whose files each name one (a Metric View's ``version``). A file
+    #: moving version is reported for that file alone, so the rest of the layer
+    #: is still compared by content (#1259). ``None`` is not captured.
+    definition_versions: dict[str, str] | None = None
     #: Definitions recorded by their bytes alone, and whether this layer records
     #: them: a baseline pinned before they were captured carries the list empty,
     #: which must not read as every one of them being new (#912).

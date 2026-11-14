@@ -1,0 +1,14 @@
+# expect: derived_metric
+# A derived metric with a window function.
+name: derived_window
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    time_dimensions:
+      - {name: order_date, expr: o_orderdate}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+metrics:
+  - {name: running, expr: 'SUM(orders.order_count) OVER (ORDER BY orders.order_date)'}

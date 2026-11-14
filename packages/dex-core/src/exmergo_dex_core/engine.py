@@ -37,7 +37,7 @@ its filesystem at all can supply the connection instead; see ``connection=`` and
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -91,16 +91,19 @@ if TYPE_CHECKING:
         SemanticValuesResult,
     )
     from .maintain.results import (
+        CoverageResult,
         DriftResult,
         ReconcileResult,
         SnapshotResult,
         VerifyResult,
     )
+    from .onboarding import SetupResult
     from .references import ReferencesResult
     from .semantic_source import SemanticCatalogSource
     from .transform.plans import PlanEdit
     from .transform.results import (
         ApplyResult,
+        BridgeResult,
         BuildResult,
         ClassificationResult,
         DeclareResult,
@@ -117,6 +120,7 @@ if TYPE_CHECKING:
         PreflightResult,
         PropagationResult,
         RefactorComparisonResult,
+        RepairResult,
     )
     from .transform.semantic import DefinitionEdit
 
@@ -1415,11 +1419,56 @@ class DexEngine:
 
         return maintain.verify(self, objects, target=target)
 
+    def coverage(
+        self,
+        objects: list[str] | None = None,
+        *,
+        full: bool = False,
+    ) -> CoverageResult:
+        """Which project resources the dbt tests reach, from the manifest (#1280)."""
+
+        from .maintain import commands as maintain
+
+        result = maintain.coverage(self, objects, full=full)
+        # The CLI stamps its envelope; a library caller reads the result, so
+        # the mode the engine is pinned to is stamped here too.
+        result.result_mode = self.resolve_result_mode(None)
+        return result
+
     # --- transform --------------------------------------------------------
     #
     # Every method here needs `repo_root`: the dbt project is the source of
     # truth and stays a git-reviewable filesystem artifact, so an engine that
     # was never told where the project lives refuses rather than inventing one.
+
+    def initialize(
+        self,
+        name: str | None = None,
+        *,
+        mode: str | None = None,
+        project_dir: str | None = None,
+        target: str | None = None,
+        dev_destination: str | None = None,
+        agent_files: list[str] | None = None,
+        no_agent_instructions: bool = False,
+        layered_schemas: bool = False,
+        in_place: bool = False,
+    ) -> SetupResult:
+        """Set up Dex, adopt an existing project, and verify its connection."""
+        from .onboarding import initialize
+
+        return initialize(
+            self,
+            name,
+            mode=mode,
+            project_dir=project_dir,
+            target=target,
+            dev_destination=dev_destination,
+            agent_files=agent_files,
+            no_agent_instructions=no_agent_instructions,
+            layered_schemas=layered_schemas,
+            in_place=in_place,
+        )
 
     def init_project(
         self,
@@ -1470,8 +1519,13 @@ class DexEngine:
         key_columns: list[str] | None = None,
         target: str | None = None,
         accepted_type_changes: list[str] | None = None,
+        expectation: dict[str, Any] | str | None = None,
     ) -> RefactorComparisonResult:
-        """One model before and after a stored plan, on the same dev inputs."""
+        """One model before and after a stored plan, on the same dev inputs.
+
+        ``expectation`` states an intended change (#1157), and the verdict is
+        then ``as_expected`` or ``unexpected``.
+        """
 
         from .transform.refactor_compare import compare
 
@@ -1483,12 +1537,27 @@ class DexEngine:
             key_columns=key_columns,
             target=target,
             accepted_type_changes=accepted_type_changes,
+            expectation=expectation,
         )
 
-    def apply(self, plan_id: str | None = None) -> ApplyResult:
+    def apply(
+        self,
+        plan_id: str | None = None,
+        *,
+        accept_population_change: str | None = None,
+    ) -> ApplyResult:
+        """Write a stored plan into the project.
+
+        A plan that changes a model's population with no assumption recording
+        it is refused unless ``accept_population_change`` states why, which is
+        recorded on the plan (#1230).
+        """
+
         from .transform import commands as transform
 
-        return transform.apply(self, plan_id)
+        return transform.apply(
+            self, plan_id, accept_population_change=accept_population_change
+        )
 
     def plans(self) -> PlanListResult:
         from .transform import commands as transform
@@ -1615,11 +1684,19 @@ class DexEngine:
             self, models, declarations=declarations, limit=limit, intent=intent
         )
 
+    def repair(self, nodes: str | Sequence[str]) -> RepairResult:
+        """Draft the project overrides that repair failing package models
+        (#1229), stored as one plan and never applied."""
+
+        from .transform import commands as transform
+
+        return transform.repair(self, nodes)
+
     def build(
         self,
         *,
         target: str | None = None,
-        select: str | None = None,
+        select: str | Sequence[str] | None = None,
         verify: bool = False,
         for_plan: str | None = None,
         for_plan_document: Any = None,
@@ -1840,6 +1917,69 @@ class DexEngine:
             "cube", mode, intent, edits, declarations=declarations
         )
 
+    def semantic_databricks(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic databricks`: :meth:`semantic_native` for Databricks Metric
+        View YAML files (#1258). Nothing is deployed to a workspace."""
+
+        return self.semantic_native(
+            "databricks", mode, intent, edits, declarations=declarations
+        )
+
+    def semantic_snowflake(
+        self,
+        mode: str,
+        intent: str,
+        edits: list[PlanEdit],
+        *,
+        declarations: list[Any] | None = None,
+    ) -> PlanResult:
+        """`semantic snowflake`: :meth:`semantic_native` for Snowflake Semantic
+        View YAML files (#1292). Nothing is deployed to an account."""
+
+        return self.semantic_native(
+            "snowflake", mode, intent, edits, declarations=declarations
+        )
+
+    def semantic_bridge(
+        self,
+        vendor: str,
+        mode: str,
+        intent: str,
+        source: str | list[str],
+        *,
+        fact: str | None = None,
+        name: str | None = None,
+        into: str | None = None,
+        dataset_metrics: bool = False,
+    ) -> BridgeResult:
+        """Propose the configured layer from one file of the other format (#1260).
+
+        ``vendor`` is the configured ``semantic.vendor`` and the layer written:
+        ``databricks`` reads Apache Ossie documents at ``source`` and proposes
+        a Metric View, ``ossie`` reads a Metric View file and proposes an Ossie
+        document, both through dex's port of apache/ossie-converters. ``fact``
+        names the dataset a view is on; ``name`` the model an import writes;
+        ``into`` the output path (default: beside the configured files);
+        ``dataset_metrics`` writes measures on the fact source as dataset-scoped
+        metrics. An output path off the write surface stores no plan and is
+        returned as a proposal.
+        """
+
+        from .transform.semantic_bridge import semantic_bridge
+
+        # Each direction takes its own options and refuses the other's by name,
+        # so only the ones set are passed.
+        options = {"fact": fact, "name": name, "into": into}
+        options["dataset_metrics"] = dataset_metrics or None
+        return semantic_bridge(self, vendor, mode, intent, source, **options)
+
     # --- lifecycle ------------------------------------------------------------
 
     def close(self) -> None:
@@ -1891,6 +2031,7 @@ _VALUES_FREE_METHODS = frozenset(
         "query_batch",
         "query_across",
         "semantic_list",
+        "coverage",
         # The engine's own plumbing.
         "resolve_result_mode",
         "connection_provenance",

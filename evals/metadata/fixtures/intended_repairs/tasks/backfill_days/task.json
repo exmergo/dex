@@ -1,0 +1,7 @@
+{
+  "kind": "fix",
+  "models": [
+    "daily_tickets"
+  ],
+  "prompt": "The support dashboard has gaps: `daily_tickets` has no row for days when no ticket was opened. Every day from the first to the last ticket should have a row, with zero tickets on a quiet day. Nothing else about the table should change. Build it on dev when you are done."
+}

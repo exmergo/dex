@@ -22,7 +22,8 @@ from . import BEGIN, END, CopyStatus, block, check, digest, text
 #: How to place the block, stated once so the envelope and the docs agree.
 PLACEMENT = (
     "Paste data.block into the repository's CLAUDE.md or AGENTS.md (or the agent "
-    "config a harness hands its agent). Dex never writes either file. Re-run "
+    "config a harness hands its agent), or use dex init to install a managed "
+    "procedure section while preserving other instructions. Re-run "
     "`dex procedure --check <file>` after upgrading Dex to find a stale copy."
 )
 

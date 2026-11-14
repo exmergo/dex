@@ -136,6 +136,7 @@ def derive(
 
     from ..config import SEMANTIC_SOURCE_FACTORIES
     from ..semantic_source import SemanticDerivationRequest, SemanticDerivationSource
+    from . import drafting
     from .semantic_derivation import MetricFlowDerivation
 
     files, found = candidates(view, edits, models, engine.config.transform.marts_paths)
@@ -186,12 +187,13 @@ def derive(
                 vars=view.vars,
                 relations=relations,
                 model_sql=_model_sql(files, view.model_paths),
+                declared_of=lambda name: drafting.read_declared(files, name),
             )
             for model, sql_path, declared in found
         ),
         documents=documents,
         project_identifiers={
-            name: _identifier(name, relations) for name in _model_names(view)
+            name: _identifier(name, relations) for name in _model_names(view, edits)
         },
         cache=cache,
         connector=engine.connector or engine.config.connector,
@@ -250,8 +252,13 @@ def declaration(
     vars: Mapping[str, Any] | None,
     relations: Mapping[str, tuple[str, str]],
     model_sql: Callable[[str], str | None] | None = None,
+    declared_of: Callable[[str], Mapping[str, Any]] | None = None,
 ) -> SemanticDeclaration:
-    """``declared`` with the facts a vendor needs that the YAML does not state."""
+    """``declared`` with the facts a vendor needs that the YAML does not state.
+
+    ``declared_of`` reads another model's declaration, so each reference carries
+    its parent's declared grain.
+    """
 
     from ..semantic_source import DeclaredReference, SemanticDeclaration
     from .semantic_derivation import column_types
@@ -299,6 +306,7 @@ def declaration(
                 parent_column=parent_column or None,
                 parent_identifier=_identifier(parent, relations),
                 parent_relation=relations.get(parent, (None, None))[0],
+                parent_grain=_grain_of(parent, declared_of),
             )
         )
     return SemanticDeclaration(
@@ -312,6 +320,24 @@ def declaration(
         references=tuple(references),
         source_path=sql_path,
     )
+
+
+def _grain_of(
+    model: str, declared_of: Callable[[str], Mapping[str, Any]] | None
+) -> tuple[str, ...] | None:
+    """The grain ``model``'s own declaration states, or ``None``."""
+
+    if declared_of is None:
+        return None
+    try:
+        grain = declared_of(model).get("grain")
+    except Exception:
+        # A parent whose YAML cannot be read declares nothing a vendor may rely on.
+        return None
+    if not isinstance(grain, list) or not grain:
+        return None
+    names = tuple(g for g in grain if isinstance(g, str))
+    return names if len(names) == len(grain) else None
 
 
 def manifest_relations(view: DbtProjectView) -> dict[str, tuple[str, str]]:
@@ -344,10 +370,26 @@ def _identifier(model: str, relations: Mapping[str, tuple[str, str]]) -> str:
     return relations.get(model, (None, model))[1] or model
 
 
-def _model_names(view: DbtProjectView) -> list[str]:
-    from ..dbt_project import node_files, node_name
+def _model_names(view: DbtProjectView, edits: Iterable[PlanEdit] = ()) -> list[str]:
+    """Every model the project builds once ``edits`` land.
 
-    return sorted({node_name(path) for path in node_files(view)})
+    The plan's own new models count: a staging model and the mart that reads it
+    are often written by one plan, and a layer places a derived definition by
+    the siblings it already has on this project's models (#1258).
+    """
+
+    from ..dbt_project import node_files, node_name
+    from .plans import EditKind, EditOp
+
+    names = {node_name(path) for path in node_files(view)}
+    for edit in edits:
+        if edit.kind != EditKind.MODEL_SQL or not edit.path.endswith(".sql"):
+            continue
+        if edit.op == EditOp.DELETE:
+            names.discard(node_name(edit.path))
+        else:
+            names.add(node_name(edit.path))
+    return sorted(names)
 
 
 #: How many of the project's own models a column is followed back through to

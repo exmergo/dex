@@ -1,0 +1,37 @@
+# expect: multiple_paths
+# Two paths from lineitem to orders, and `using_relationships` naming a third,
+# unrelated relationship.
+name: using_unrelated_relationship
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    metrics:
+      - name: ship_count
+        using_relationships: [lineitem_part]
+        expr: COUNT(orders.order_key)
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    facts:
+      - {name: order_key, expr: o_orderkey}
+    metrics:
+      - {name: order_count, expr: COUNT(o_orderkey)}
+  - name: part
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: PART}
+    primary_key: {columns: [p_partkey]}
+    dimensions:
+      - {name: brand, expr: p_brand}
+relationships:
+  - name: lineitem_orders
+    left_table: lineitem
+    right_table: orders
+    relationship_columns: [{left_column: l_orderkey, right_column: o_orderkey}]
+  - name: lineitem_orders_by_supplier
+    left_table: lineitem
+    right_table: orders
+    relationship_columns: [{left_column: l_suppkey, right_column: o_orderkey}]
+  - name: lineitem_part
+    left_table: lineitem
+    right_table: part
+    relationship_columns: [{left_column: l_partkey, right_column: p_partkey}]

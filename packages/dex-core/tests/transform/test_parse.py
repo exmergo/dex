@@ -506,3 +506,122 @@ def test_real_dbt_parse_accepts_a_clean_delete(
     assert len(_plans_on_disk(tmp_path)) == 1
     # The project is untouched; the plan is the only artifact.
     assert (dbt_project_dir / "models/staging/stg_customers.sql").exists()
+
+
+@pytest.mark.parametrize("subcommand", ["define", "plan"])
+def test_semantic_refuses_uninstalled_declared_packages_with_the_dex_verb(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch, subcommand: str
+):
+    """#1206: semantic commands refuse uninstalled packages before dbt parses."""
+
+    _add_time_spine(dbt_project_dir)
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+        encoding="utf-8",
+    )
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    parsed_calls = []
+
+    def fake(project_dir, edits, **_kwargs):
+        """Record the parse call and return a passing result."""
+        parsed_calls.append(list(edits))
+        return {"available": True, "reason": None, "success": True, "messages": []}
+
+    monkeypatch.setattr(build_module, "shadow_parse", fake)
+
+    payload = _payload_file(tmp_path, _SEMANTIC_YAML)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            subcommand,
+            "customer semantics",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    assert envelope["reason"] == "prerequisite"
+    message = envelope["errors"][0]
+    assert "dbt-labs/dbt_utils" in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    assert parsed_calls == []
+
+
+def test_semantic_update_refuses_uninstalled_declared_packages_with_the_dex_verb(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """#1206: semantic update also refuses uninstalled packages before dbt parses."""
+
+    _add_time_spine(dbt_project_dir)
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "semantic").mkdir(parents=True, exist_ok=True)
+    (dbt_project_dir / "models" / "semantic" / "customers.yml").write_text(
+        _SEMANTIC_YAML, encoding="utf-8"
+    )
+    build_module = importlib.import_module("exmergo_dex_core.transform.build")
+    parsed_calls = []
+
+    def fake(project_dir, edits, **_kwargs):
+        """Record the parse call and return a passing result."""
+        parsed_calls.append(list(edits))
+        return {"available": True, "reason": None, "success": True, "messages": []}
+
+    monkeypatch.setattr(build_module, "shadow_parse", fake)
+
+    payload = _payload_file(
+        tmp_path, _SEMANTIC_YAML.replace("Customer grain", "Updated customer grain")
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "update",
+            "customer semantics",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 1 and envelope["status"] == "error"
+    assert envelope["reason"] == "prerequisite"
+    message = envelope["errors"][0]
+    assert "dbt-labs/dbt_utils" in message
+    assert "transform deps" in message
+    assert "dbt deps" not in message
+    assert parsed_calls == []
+
+
+def test_semantic_no_parse_ignores_uninstalled_packages(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """#1206: --no-parse behaviour is unchanged and does not refuse."""
+
+    _add_time_spine(dbt_project_dir)
+    (dbt_project_dir / "packages.yml").write_text(
+        'packages:\n  - package: dbt-labs/dbt_utils\n    version: "1.3.0"\n',
+        encoding="utf-8",
+    )
+    payload = _payload_file(tmp_path, _SEMANTIC_YAML)
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "semantic",
+            "define",
+            "customer semantics",
+            "--edits-file",
+            str(payload),
+            "--no-parse",
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok"
+    assert len(_plans_on_disk(tmp_path)) == 1

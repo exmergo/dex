@@ -28,12 +28,51 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .package_overrides import _installed, models_config, package_enabled
+from .package_overrides import (
+    _installed,
+    models_config,
+    package_custom_schema,
+    package_enabled,
+    seeds_config,
+)
+
+_SQL_CONFIG_SCHEMA = re.compile(
+    r"""config\s*\([^)]*\bschema\s*=\s*['"]([^'"]+)['"]""",
+    re.IGNORECASE,
+)
+
+
+def _sql_schema(text: str) -> str | None:
+    """the custom schema a model's sql declares in ``config(schema=...)``."""
+
+    match = _SQL_CONFIG_SCHEMA.search(text)
+    return match.group(1) if match is not None else None
+
+
+def _manifest_schema(
+    manifest: Mapping[str, Any] | None, package: str, name: str
+) -> str | None:
+    """the custom schema from the compiled manifest for a package node."""
+
+    nodes = manifest.get("nodes") if isinstance(manifest, Mapping) else None
+    if not isinstance(nodes, Mapping):
+        return None
+    for node in nodes.values():
+        if (
+            isinstance(node, Mapping)
+            and node.get("package_name") == package
+            and node.get("name") == name
+        ):
+            config = node.get("config")
+            if isinstance(config, Mapping) and isinstance(config.get("schema"), str):
+                return config["schema"]
+    return None
 
 
 @dataclass(frozen=True)
@@ -54,6 +93,7 @@ class PackageTarget:
     columns: frozenset[str] | None
     unread: str | None = None
     enabled: bool = True
+    schema: str | None = None
 
     def described(self) -> str:
         """How a message names this node: its name, package and file."""
@@ -120,6 +160,9 @@ def _in_package(
         except ValueError:
             return absolute.as_posix()
 
+    pkg_yml_src = view.files.get("dbt_project.yml")
+    pkg_yml_text = pkg_yml_src.content if pkg_yml_src is not None else None
+
     sql_path = _model_sql_path(files, view.model_paths, name)
     if sql_path is not None:
         base = next(
@@ -132,6 +175,16 @@ def _in_package(
         )
         folders = list(Path(sql_path).relative_to(base).parent.parts)
         enabled = package_enabled(models_config(project_yml), package, [*folders, name])
+        schema = (
+            _manifest_schema(manifest, package, name)
+            or package_custom_schema(
+                models_config(project_yml), package, [*folders, name]
+            )
+            or _sql_schema(files[sql_path])
+            or package_custom_schema(
+                models_config(pkg_yml_text), package, [*folders, name]
+            )
+        )
         columns = _select_columns_if_available(files[sql_path])
         unread = None
         if columns is None:
@@ -156,11 +209,17 @@ def _in_package(
             columns=frozenset(columns) if columns is not None else None,
             unread=unread,
             enabled=enabled,
+            schema=schema,
         )
 
     seed = _seed_path(files, view.seed_paths, name)
     if seed is not None:
         header = _csv_header(files[seed])
+        schema = (
+            _manifest_schema(manifest, package, name)
+            or package_custom_schema(seeds_config(project_yml), package, [name])
+            or package_custom_schema(seeds_config(pkg_yml_text), package, [name])
+        )
         return PackageTarget(
             name=name,
             package=package,
@@ -168,9 +227,11 @@ def _in_package(
             path=shown(seed),
             columns=header,
             unread=None if header is not None else "its CSV header could not be read",
+            schema=schema,
         )
 
     if _is_seed_or_snapshot(files, view, name):
+        schema = _manifest_schema(manifest, package, name)
         return PackageTarget(
             name=name,
             package=package,
@@ -178,6 +239,7 @@ def _in_package(
             path=shown(""),
             columns=None,
             unread="a snapshot's columns are not read statically",
+            schema=schema,
         )
     return None
 

@@ -31,10 +31,12 @@ from .. import command_args
 from ..adapters.base import Adapter, ColumnMeta, QueryResult
 from ..cache import DexCache
 from ..config import QueryLimits
+from ..envelope import secret_like
 from ..errors import DexError
 from ..guards.cost_guard import CostGuardError
 from ..guards.query_firewall import QueryRefusedError, assert_query_shape, inspect_query
 from ..results import ConfirmationRequest
+from . import expected_change as xc
 
 #: Per dialect, the base type names a comparison cannot group, or cannot group
 #: with a meaning anyone could call equality. A column of one is reported as
@@ -128,6 +130,7 @@ ReasonCode = Literal[
     "plan_applied",
     "plan_stale",
     "invalid_type_acceptance",
+    "invalid_expectation",
 ]
 
 _VERDICT_CODES = frozenset(
@@ -160,6 +163,7 @@ _NOT_CHECKED_CODES = frozenset(
         "plan_applied",
         "plan_stale",
         "invalid_type_acceptance",
+        "invalid_expectation",
     }
 )
 
@@ -268,8 +272,13 @@ class RefactorCompareResult:
     keyed: KeyedCounts | None = None
     keyed_reason: KeyedReason | None = None
     pending: ConfirmationRequest | None = None
+    #: How the difference matches a stated expected change (#1157), present
+    #: only when one was stated and the comparison ran.
+    expectation: xc.ExpectationReport | None = None
 
     def __post_init__(self) -> None:
+        """Refuse a status, reason and payload that do not belong together."""
+
         schema_ok = self.schema is not None and self.schema.compatible
         rows_ok = self.multiset is not None and self.multiset.equivalent
         keys_ok = self.keyed is not None and (
@@ -280,6 +289,8 @@ class RefactorCompareResult:
         if self.keyed is not None and self.keyed_reason is not None:
             raise ValueError("a keyed verdict does not also explain a dropped key")
         if self.status == "not_checked":
+            if self.expectation is not None:
+                raise ValueError("not_checked carries no expectation verdict")
             if self.reason_code not in _NOT_CHECKED_CODES:
                 raise ValueError("not_checked requires a not-checked reason code")
             if self.multiset is not None or self.keyed is not None or self.keyed_reason:
@@ -341,6 +352,10 @@ class _MatchedColumn:
     right_name: str
     type_name: str
     right_type_name: str = ""
+    groupable: bool = True
+    right_groupable: bool = True
+    comparison_type: str | None = None
+    right_comparison_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -451,6 +466,7 @@ def compare_refactors(
     key_columns: Sequence[str] | None = None,
     prepriced: bool = False,
     accepted_type_changes: Sequence[str] | None = None,
+    expectation: xc.Expectation | None = None,
 ) -> RefactorCompareResult:
     """Compare two compiled SELECTs on schema, multiset, and an optional key.
 
@@ -474,6 +490,12 @@ def compare_refactors(
     ``prepriced`` says the caller already took this comparison through one
     handshake, as a command that had to profile the inputs first does. The
     statements still charge the gate as they run.
+
+    ``expectation`` states an intended change (#1157). The verdict is then also
+    judged against it, under ``expectation``: added, removed and changed keys
+    (rows, with no key) split into matching and not, and up to five keys per
+    unexpected class. An expectation that does not fit the compared columns is
+    ``not_checked`` with ``invalid_expectation``.
     """
 
     left, right = _require_sql(left_sql, right_sql)
@@ -491,6 +513,7 @@ def compare_refactors(
         keyed: KeyedCounts | None = None,
         keyed_reason: KeyedReason | None = None,
         pending: ConfirmationRequest | None = None,
+        expectation: xc.ExpectationReport | None = None,
     ) -> RefactorCompareResult:
         return RefactorCompareResult(
             baseline_id=baseline_id,
@@ -505,6 +528,7 @@ def compare_refactors(
             keyed=keyed,
             keyed_reason=keyed_reason,
             pending=pending,
+            expectation=expectation,
         )
 
     try:
@@ -520,6 +544,7 @@ def compare_refactors(
             finish,
             prepriced=prepriced,
             accepted=tuple(accepted_type_changes or ()),
+            expectation=expectation,
         )
     except _NotCheckedError as exc:
         return finish(
@@ -544,7 +569,10 @@ def _compare(
     *,
     prepriced: bool = False,
     accepted: tuple[str, ...] = (),
+    expectation: xc.Expectation | None = None,
 ):
+    """The comparison behind :func:`compare_refactors`."""
+
     _assert_shapes(left, right, adapter)
     if not callable(getattr(adapter, "describe_query", None)):
         raise _NotCheckedError(
@@ -555,7 +583,13 @@ def _compare(
     # statements are priced as written, which is what the comparison reads, and
     # nothing reaches the warehouse until that is confirmed.
     if not prepriced and not _describe_is_free(adapter):
-        raw_estimate = _raw_estimate(left, right, adapter, keyed=keys is not None)
+        raw_estimate = _raw_estimate(
+            left,
+            right,
+            adapter,
+            keyed=keys is not None,
+            expected=expectation is not None,
+        )
         pending = command_args.confirmation_request(
             command,
             adapter,
@@ -574,7 +608,14 @@ def _compare(
     aligned = _align(left_cols, right_cols, mapping, accepted)
     schema = aligned.schema
     if not schema.compatible:
-        return finish(status="different", reason_code="schemas_differ", schema=schema)
+        return finish(
+            status="different",
+            reason_code="schemas_differ",
+            schema=schema,
+            expectation=(
+                xc.schema_report(expectation) if expectation is not None else None
+            ),
+        )
 
     unsupported = _unsupported_column(aligned.matched, adapter.dialect)
     if unsupported is not None:
@@ -601,6 +642,7 @@ def _compare(
         column.left_name
         for column in aligned.matched
         if column.left_name.lower() in _RESERVED_COLUMNS
+        or (expectation is not None and _reserved_by_expectation(column.left_name))
     ]
     if reserved:
         raise _NotCheckedError(
@@ -612,25 +654,65 @@ def _compare(
     left_names = [column.left_name for column in aligned.matched]
     right_names = [column.right_name for column in aligned.matched]
     dialect = adapter.dialect
-    left_proj = _project(left, left_names, left_names, dialect)
-    right_proj = _project(right, right_names, left_names, dialect)
+    left_proj = _project(
+        left,
+        left_names,
+        left_names,
+        [column.comparison_type for column in aligned.matched],
+        dialect,
+    )
+    right_proj = _project(
+        right,
+        right_names,
+        left_names,
+        [column.right_comparison_type for column in aligned.matched],
+        dialect,
+    )
     statements = [_multiset_sql(left_proj, right_proj, left_names, dialect)]
     if keys is not None:
         statements.append(_keyed_sql(left_proj, right_proj, left_names, keys, dialect))
+    base_count = len(statements)
 
+    plan = None
+    if expectation is not None:
+        plan = _expectation_plan(
+            expectation, aligned, keys, left_proj, right_proj, dialect, schema
+        )
+        statements.extend(plan.statements)
+
+    sample_at = base_count + 2 if plan is not None and plan.keyed else None
     approved: list[str] = []
-    for sql in statements:
+    sample_refusal: str | None = None
+    for index, sql in enumerate(statements):
         try:
             inspected = inspect_query(sql, cache, limits, dialect=dialect)
         except QueryRefusedError as exc:
+            if plan is not None and index == sample_at:
+                # The key sample projects key values; a key the firewall will
+                # not show is withheld, and every count still stands.
+                sample_refusal = "firewall_refused"
+                continue
             raise _NotCheckedError("firewall_refused", str(exc), schema=schema) from exc
         approved.append(inspected.sql)
 
     if not prepriced:
         estimates = _estimates(approved, adapter, schema)
         per_table = {"(refactor comparison)": estimates[0]}
-        if len(estimates) == 2:
+        if base_count == 2:
             per_table["(refactor key comparison)"] = estimates[1]
+        if plan is not None:
+            labels = [
+                "(expected change rows)",
+                "(expected change keys)",
+                "(expected change key sample)",
+            ]
+            per_table.update(
+                zip(
+                    labels[: len(estimates) - base_count],
+                    estimates[base_count:],
+                    strict=True,
+                )
+            )
         pending = command_args.confirmation_request(
             command,
             adapter,
@@ -659,7 +741,7 @@ def _compare(
 
     keyed: KeyedCounts | None = None
     keyed_reason: KeyedReason | None = None
-    if len(approved) == 2:
+    if base_count == 2:
         try:
             keyed_row = adapter.run_query(
                 approved[1], max_rows=1, timeout_seconds=limits.timeout_seconds
@@ -671,6 +753,18 @@ def _compare(
                 "comparison_unreadable", type(exc).__name__, schema=schema
             ) from exc
         keyed, keyed_reason = _keyed_from_counts(_read_counts(keyed_row, 4))
+
+    report = None
+    if plan is not None:
+        report = _run_expectation(
+            plan,
+            approved[base_count:],
+            adapter,
+            limits,
+            schema,
+            keys,
+            sample_refusal=sample_refusal,
+        )
 
     rows_differ = not multiset.equivalent
     keys_differ = keyed is not None and (
@@ -685,6 +779,7 @@ def _compare(
             multiset=multiset,
             keyed=keyed,
             keyed_reason=keyed_reason,
+            expectation=report,
         )
     return finish(
         status="equivalent",
@@ -693,7 +788,128 @@ def _compare(
         multiset=multiset,
         keyed=keyed,
         keyed_reason=keyed_reason,
+        expectation=report,
     )
+
+
+@dataclass(frozen=True)
+class _ExpectationPlan:
+    """The statements an expectation adds, in order: rows, then (with a key)
+    the key counts and the key sample."""
+
+    resolved: xc.Resolved
+    statements: tuple[str, ...]
+    keyed_width: int = 0
+
+    @property
+    def keyed(self) -> bool:
+        """Whether the plan carries the key statements and the key sample."""
+
+        return len(self.statements) == 3
+
+
+def _reserved_by_expectation(name: str) -> bool:
+    """Whether an output name collides with a column the expectation adds."""
+
+    lowered = name.lower()
+    return lowered in xc.RESERVED_COLUMNS or bool(
+        re.fullmatch(r"dex_(?:[cn]|in)\d+", lowered)
+    )
+
+
+def _expectation_plan(
+    expectation: xc.Expectation,
+    aligned: _Aligned,
+    keys: tuple[str, ...] | None,
+    left_proj: str,
+    right_proj: str,
+    dialect: str,
+    schema: SchemaDiff,
+) -> _ExpectationPlan:
+    """The expectation bound to the compared columns, and its statements."""
+
+    left_names = [column.left_name for column in aligned.matched]
+    right_names = [column.right_name for column in aligned.matched]
+    try:
+        resolved = xc.resolve(
+            expectation,
+            output_names=left_names,
+            proposed_names=right_names,
+            keys=keys,
+            dialect=dialect,
+        )
+    except xc.ExpectationError as exc:
+        raise _NotCheckedError("invalid_expectation", str(exc), schema=schema) from exc
+    column_list = ", ".join(_quote(name, dialect) for name in left_names)
+    rows_cte = _rows_cte(left_proj, right_proj, column_list)
+    statements = [xc.rows_sql(rows_cte, resolved, dialect)]
+    width = 0
+    if keys is not None:
+        keyed, width = xc.keyed_sql(rows_cte, resolved, dialect)
+        statements.extend([keyed, xc.sample_sql(rows_cte, resolved, dialect)])
+    return _ExpectationPlan(resolved, tuple(statements), width)
+
+
+def _run_expectation(
+    plan: _ExpectationPlan,
+    approved: Sequence[str],
+    adapter: Adapter,
+    limits: QueryLimits,
+    schema: SchemaDiff,
+    keys: tuple[str, ...] | None,
+    *,
+    sample_refusal: str | None,
+) -> xc.ExpectationReport:
+    """Run and judge the expectation, sampling keys only when a class failed."""
+
+    def run(sql: str, rows: int) -> QueryResult:
+        """Run one statement, reporting a failure by its exception class alone."""
+
+        try:
+            return adapter.run_query(
+                sql, max_rows=rows, timeout_seconds=limits.timeout_seconds
+            )
+        except CostGuardError:
+            raise
+        except Exception as exc:
+            raise _NotCheckedError(
+                "comparison_unreadable", type(exc).__name__, schema=schema
+            ) from exc
+
+    rows = _read_counts(run(approved[0], 1), 4)
+    if keys is None:
+        return xc.judge_rows(
+            plan.resolved,
+            rows,
+            grain={"key_columns": [], "holds": None, "reason": "no_key"},
+        )
+    keyed_counts = _read_counts(run(approved[1], 1), plan.keyed_width)
+    report = xc.judge_keys(plan.resolved, keyed_counts)
+    if report is None:
+        return xc.judge_rows(
+            plan.resolved,
+            rows,
+            grain={
+                "key_columns": list(keys),
+                "holds": None,
+                "reason": "key_not_unique_on_baseline",
+            },
+            notes=[
+                "the key is not unique on the baseline, so a changed row reads "
+                "as one removed and one added row"
+            ],
+        )
+    if not set(report.findings) - {"grain_not_held"}:
+        return report
+    if any(secret_like(key) for key in keys):
+        # A sample is keyed by column name, and the envelope refuses a key that
+        # reads as a credential's name (`token_count`). Withheld, counts kept.
+        return xc.with_samples(report, withheld="key_name_withheld")
+    if sample_refusal is not None or len(approved) < 3:
+        return xc.with_samples(report, withheld=sample_refusal or "firewall_refused")
+    limit = xc.SAMPLE_PER_CLASS * 3
+    sample = run(approved[2], limit)
+    return xc.with_samples(report, samples=xc.read_samples(sample.cells, keys))
 
 
 def _require_sql(left_sql: str, right_sql: str) -> tuple[str, str]:
@@ -770,15 +986,21 @@ def _estimates(
         ) from exc
 
 
-def _raw_estimate(left: str, right: str, adapter: Adapter, *, keyed: bool) -> float:
+def _raw_estimate(
+    left: str, right: str, adapter: Adapter, *, keyed: bool, expected: bool = False
+) -> float:
     """The comparison priced from the two statements as written.
 
     The comparison reads each side once per statement, so this is what the schema
-    was not yet available to build.
+    was not yet available to build. An expectation adds one statement, and two
+    more with a key (#1157).
     """
 
     reads = sum(_estimates([left, right], adapter))
-    return reads * (2 if keyed else 1)
+    statements = 2 if keyed else 1
+    if expected:
+        statements += 3 if keyed else 1
+    return reads * statements
 
 
 def _describe_pair(
@@ -904,7 +1126,16 @@ def _align(
                 )
             accepted_changes.append(change)
         matched.append(
-            _MatchedColumn(column.name, right.name, column.data_type, right.data_type)
+            _MatchedColumn(
+                column.name,
+                right.name,
+                column.data_type,
+                right.data_type,
+                column.groupable,
+                right.groupable,
+                column.comparison_type,
+                right.comparison_type,
+            )
         )
     only_right = tuple(
         SchemaColumn(column.name, column.data_type)
@@ -956,10 +1187,16 @@ def _unsupported_column(columns: Sequence[_MatchedColumn], dialect: str) -> str 
             # here can say it groups.
             if base in refused or base.isdigit():
                 return f"{column.left_name} ({type_name})"
+        if not column.groupable:
+            return f"{column.left_name} ({column.type_name})"
+        if not column.right_groupable:
+            return f"{column.left_name} ({column.right_type_name})"
     return None
 
 
 def _quote(name: str, dialect: str) -> str:
+    """A quoted identifier in the dialect."""
+
     return exp.to_identifier(name, quoted=True).sql(dialect=dialect)
 
 
@@ -967,6 +1204,7 @@ def _project(
     sql: str,
     source_names: Sequence[str],
     output_names: Sequence[str],
+    comparison_types: Sequence[str | None],
     dialect: str,
 ) -> str:
     """Select ``source_names`` under ``output_names``, in that order.
@@ -975,13 +1213,23 @@ def _project(
     multiset comparison, so a rename or a reordering is not a changed row.
     """
 
-    pairs = zip(source_names, output_names, strict=True)
+    pairs = zip(source_names, output_names, comparison_types, strict=True)
     select_list = ", ".join(
-        f"{_quote(source, dialect)} as {_quote(output, dialect)}"
-        for source, output in pairs
+        f"{_comparison_expression(source, comparison_type, dialect)} "
+        f"as {_quote(output, dialect)}"
+        for source, output, comparison_type in pairs
     )
     # Names are quoted identifiers. sql already passed the SELECT shape check.
     return f"select {select_list} from ({sql}) as dex_proj"  # noqa: S608
+
+
+def _comparison_expression(name: str, comparison_type: str | None, dialect: str) -> str:
+    """Render a column using its adapter-required comparison representation."""
+
+    column = _quote(name, dialect)
+    if comparison_type == "text" and dialect == "postgres":
+        return f'({column}::text COLLATE "C")'
+    return column
 
 
 def _rows_cte(left_proj: str, right_proj: str, column_list: str) -> str:
@@ -1014,6 +1262,8 @@ def _rows_cte(left_proj: str, right_proj: str, column_list: str) -> str:
 def _count(expression: str, alias: str) -> str:
     # Cast because several warehouses widen a sum to a decimal, and json_safe
     # would carry a decimal as a float, which is not an exact count.
+    """An aggregate cast to an exact, non-NULL count."""
+
     return f"cast(coalesce({expression}, 0) as bigint) as {alias}"
 
 

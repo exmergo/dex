@@ -1,0 +1,12 @@
+# warns: dimension_access
+# Snowflake accepts access_modifier on a dimension; dex reads it and warns.
+name: access_modifier_on_dimension
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: status, expr: o_orderstatus, access_modifier: private_access}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

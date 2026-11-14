@@ -92,6 +92,15 @@ INTERNAL_REFUSALS = {
     "CubeRefusalError",
     "CubeTransportError",
     "StaleRendererError",
+    # Never leaves the Metric View validator: it stops reading one element, and
+    # the finding it carries is what a caller sees (#1257).
+    "_RefusedError",
+    # Never leaves Metric View annotation: it becomes the declaration's `failed`
+    # reason, which the native route refuses the plan with (#1258).
+    "_UnwritableError",
+    # Never leaves Semantic View derivation or annotation: it becomes the
+    # declaration's `failed` reason, which the native route refuses with (#1292).
+    "UnwritableError",
     # Connector-specific connection failures. A host catches the ConnectorError
     # family instead of importing eight names, one per warehouse it does not use.
     "BigQueryConnectionError",

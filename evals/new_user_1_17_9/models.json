@@ -1,0 +1,315 @@
+{
+  "edits": [
+    {
+      "path": "models/staging/stg_customers.sql",
+      "kind": "model_sql",
+      "content": "{{ config(materialized='view') }}\nselect customer_id, country_code, signup_date from {{ source('demo', 'customers') }}\n"
+    },
+    {
+      "path": "models/staging/stg_orders.sql",
+      "kind": "model_sql",
+      "content": "{{ config(materialized='view') }}\nselect order_id, customer_id, status, order_total, cast(placed_at as timestamp) as ordered_at from {{ source('demo', 'orders') }}\n"
+    },
+    {
+      "path": "models/intermediate/int_orders_enriched.sql",
+      "kind": "model_sql",
+      "content": "{{ config(materialized='view') }}\nselect o.order_id, o.customer_id, o.status, o.order_total, o.ordered_at, c.country_code\nfrom {{ ref('stg_orders') }} o\nleft join {{ ref('stg_customers') }} c on o.customer_id = c.customer_id\n"
+    },
+    {
+      "path": "models/marts/fct_orders.sql",
+      "kind": "model_sql",
+      "content": "{{ config(materialized='table') }}\nselect order_id, customer_id, status, order_total, ordered_at, country_code, cast(1 as bigint) as order_count\nfrom {{ ref('int_orders_enriched') }}\n"
+    },
+    {
+      "path": "models/marts/dim_customers.sql",
+      "kind": "model_sql",
+      "content": "{{ config(materialized='table') }}\nwith orders as (\n select customer_id, count(*) as order_count, sum(order_total) as booked_amount\n from {{ ref('stg_orders') }} group by customer_id\n)\nselect c.customer_id, c.country_code, c.signup_date,\n coalesce(o.order_count, cast(0 as bigint)) as order_count,\n coalesce(o.booked_amount, cast(0 as decimal(38,2))) as booked_amount\nfrom {{ ref('stg_customers') }} c\nleft join orders o on c.customer_id = o.customer_id\n"
+    },
+    {
+      "path": "models/intermediate/metricflow_time_spine.sql",
+      "kind": "model_sql",
+      "content": "{{ config(materialized='table') }}\nselect cast(date_day as date) as date_day\nfrom generate_series(date '2020-01-01', date '2035-12-31', interval 1 day) as dates(date_day)\n"
+    },
+    {
+      "path": "models/staging/sources.yml",
+      "kind": "schema_yml",
+      "content": "version: 2\nsources:\n  - name: demo\n    schema: main\n    tables:\n      - name: orders\n      - name: customers\n"
+    },
+    {
+      "path": "models/intermediate/metricflow_time_spine.yml",
+      "kind": "schema_yml",
+      "content": "version: 2\nmodels:\n  - name: metricflow_time_spine\n    time_spine:\n      standard_granularity_column: date_day\n    columns:\n      - name: date_day\n        granularity: day\n"
+    }
+  ],
+  "declarations": [
+    {
+      "model": "stg_customers",
+      "description": "All source customers, with non-personal analytics attributes.",
+      "grain": [
+        "customer_id"
+      ],
+      "population": {
+        "rule": "All source customers, with non-personal analytics attributes."
+      },
+      "columns": {
+        "customer_id": {
+          "role": "key"
+        },
+        "country_code": {
+          "role": "dimension"
+        },
+        "signup_date": {
+          "role": "time"
+        }
+      },
+      "assumptions": [
+        {
+          "decision": "Population",
+          "chosen": "All source customers, with non-personal analytics attributes.",
+          "evidence": "default",
+          "column": "customer_id",
+          "detail": "Preserve every entity from the driving relation."
+        }
+      ]
+    },
+    {
+      "model": "stg_orders",
+      "description": "All source orders, including cancelled orders.",
+      "grain": [
+        "order_id"
+      ],
+      "population": {
+        "rule": "All source orders, including cancelled orders."
+      },
+      "columns": {
+        "order_id": {
+          "role": "key"
+        },
+        "customer_id": {
+          "role": "foreign_key",
+          "references": "stg_customers.customer_id"
+        },
+        "status": {
+          "role": "dimension"
+        },
+        "order_total": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "demo_currency_units",
+          "null_rule": "never"
+        },
+        "ordered_at": {
+          "role": "time",
+          "null_rule": "never"
+        }
+      },
+      "assumptions": [
+        {
+          "decision": "Order status scope",
+          "chosen": "Keep all statuses; metrics can be grouped by status.",
+          "evidence": "default",
+          "column": "status"
+        },
+        {
+          "decision": "Timestamp conversion",
+          "chosen": "Parse placed_at as TIMESTAMP without removing rows.",
+          "evidence": "data",
+          "column": "ordered_at",
+          "detail": "Profile found every source value matches a timestamp format."
+        },
+        {
+          "decision": "Amount unit",
+          "chosen": "demo_currency_units",
+          "evidence": "default",
+          "column": "order_total",
+          "detail": "The demo provides no currency code; do not assume USD."
+        }
+      ]
+    },
+    {
+      "model": "int_orders_enriched",
+      "description": "Every staging order, enriched with customer country.",
+      "grain": [
+        "order_id"
+      ],
+      "population": {
+        "rule": "Every staging order, enriched with customer country.",
+        "parent": {
+          "model": "stg_orders",
+          "key": {
+            "order_id": "order_id"
+          }
+        }
+      },
+      "columns": {
+        "order_id": {
+          "role": "key"
+        },
+        "customer_id": {
+          "role": "foreign_key",
+          "references": "stg_customers.customer_id"
+        },
+        "status": {
+          "role": "dimension"
+        },
+        "order_total": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "demo_currency_units",
+          "null_rule": "never"
+        },
+        "ordered_at": {
+          "role": "time",
+          "null_rule": "never"
+        },
+        "country_code": {
+          "role": "dimension"
+        }
+      },
+      "assumptions": [
+        {
+          "decision": "Population",
+          "chosen": "Every staging order, enriched with customer country.",
+          "evidence": "default",
+          "column": "order_id",
+          "detail": "Preserve every entity from the driving relation."
+        }
+      ]
+    },
+    {
+      "model": "fct_orders",
+      "description": "One row per order, all statuses; booked amount is not recognized revenue.",
+      "grain": [
+        "order_id"
+      ],
+      "population": {
+        "rule": "One row per order, all statuses; booked amount is not recognized revenue.",
+        "parent": {
+          "model": "stg_orders",
+          "key": {
+            "order_id": "order_id"
+          }
+        }
+      },
+      "columns": {
+        "order_id": {
+          "role": "key"
+        },
+        "customer_id": {
+          "role": "foreign_key",
+          "references": "stg_customers.customer_id"
+        },
+        "status": {
+          "role": "dimension"
+        },
+        "order_total": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "demo_currency_units",
+          "null_rule": "never"
+        },
+        "ordered_at": {
+          "role": "time",
+          "null_rule": "never"
+        },
+        "country_code": {
+          "role": "dimension"
+        },
+        "order_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count",
+          "null_rule": "never"
+        }
+      },
+      "assumptions": [
+        {
+          "decision": "Population",
+          "chosen": "One row per order, all statuses; booked amount is not recognized revenue.",
+          "evidence": "default",
+          "column": "order_id",
+          "detail": "Preserve every entity from the driving relation."
+        }
+      ]
+    },
+    {
+      "model": "dim_customers",
+      "description": "Every customer, including customers with no orders; empty totals are zero.",
+      "grain": [
+        "customer_id"
+      ],
+      "population": {
+        "rule": "Every customer, including customers with no orders; empty totals are zero.",
+        "parent": {
+          "model": "stg_customers",
+          "key": {
+            "customer_id": "customer_id"
+          }
+        }
+      },
+      "columns": {
+        "customer_id": {
+          "role": "key"
+        },
+        "country_code": {
+          "role": "dimension"
+        },
+        "signup_date": {
+          "role": "time"
+        },
+        "order_count": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "count",
+          "null_rule": "never"
+        },
+        "booked_amount": {
+          "role": "measure",
+          "aggregation": "sum",
+          "additivity": "additive",
+          "unit": "demo_currency_units",
+          "null_rule": "never"
+        }
+      },
+      "assumptions": [
+        {
+          "decision": "Population",
+          "chosen": "Every customer, including customers with no orders; empty totals are zero.",
+          "evidence": "default",
+          "column": "customer_id",
+          "detail": "Preserve every entity from the driving relation."
+        }
+      ]
+    },
+    {
+      "model": "metricflow_time_spine",
+      "description": "Every calendar day from 2020-01-01 through 2035-12-31 inclusive.",
+      "grain": [
+        "date_day"
+      ],
+      "population": {
+        "rule": "Every calendar day from 2020-01-01 through 2035-12-31 inclusive."
+      },
+      "columns": {
+        "date_day": {
+          "role": "time",
+          "null_rule": "never"
+        }
+      },
+      "assumptions": [
+        {
+          "decision": "Population",
+          "chosen": "Every calendar day from 2020-01-01 through 2035-12-31 inclusive.",
+          "evidence": "default",
+          "column": "date_day",
+          "detail": "Preserve every entity from the driving relation."
+        }
+      ]
+    }
+  ]
+}

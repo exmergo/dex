@@ -353,6 +353,25 @@ scale and length are not recorded anywhere dex can compare. Two things follow:
 change, and `is_integer_type` treats `FIXED` as a known, accepted false negative
 rather than guessing at the scale behind it.
 
+## Semantic Views
+
+`semantic.vendor: snowflake` reads Snowflake Semantic View YAML files from the
+repository with no connection (see
+[Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md)).
+On the warehouse side, a deployed semantic view is never inventoried: `SHOW
+VIEWS` does not list one, `SHOW COLUMNS` lists its members with a `kind` other
+than `COLUMN` and the inventory skips them, and a plain `SELECT` on one fails.
+The dev-namespace existence check lists them with `SHOW SEMANTIC VIEWS`, so a
+schema holding one is not read as empty.
+
+Dogfooding against deployed views is a maintainer's setup, outside Dex:
+`scripts/setup_snowflake_semantic_views.sh` creates a capped warehouse and
+resource monitor, a transient scratch database, a deployer role, and read roles
+granted to the CI role (SELECT and REFERENCES, and a SELECT-only variant), and
+`scripts/snowflake_semantic_views.py` runs `verify_only` over the fixture
+corpus, deploys it, captures each view's read-back YAML, and tears it down. Dex
+itself never calls `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`.
+
 ## Testing
 
 Offline: a stateful fake connection (`tests/fakes/snowflake.py`) that records

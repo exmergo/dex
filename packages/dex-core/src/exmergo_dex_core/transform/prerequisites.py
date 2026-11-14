@@ -5,8 +5,9 @@ stopped it. Fixing that node well takes three more facts, all of them in the
 manifest: whether the project or an installed package owns it, whether the plan
 under validation could have caused it, and which repair routes dbt actually has.
 
-The options describe and never generate. An edit under ``dbt_packages/`` is not
-one of them, because the next ``dbt deps`` replaces it, and neither is a change
+The options describe; ``dex transform repair`` generates the override route as a
+plan (#1229), and each entry's ``next`` names it. An edit under ``dbt_packages/``
+is not one of them, because the next ``dbt deps`` replaces it, and neither is a change
 made only in the warehouse, because nothing reproduces it. A package model is not
 always overridable either: dbt resolves ``ref('pkg', 'model')`` to the package's
 own node, so disabling that node to shadow it fails to compile.
@@ -248,12 +249,16 @@ def _override_option(
             "compile"
         )
     how = (
-        f"a project model named {name} that restates its SQL with the repair, "
-        f"plus `+enabled: false` for {name} under models.{package} in "
-        "dbt_project.yml, in one plan; without the disable dbt refuses two "
-        "resources with one database representation"
+        f"`dex transform repair {name}` drafts it as a plan: a project model named "
+        f"{name} that restates its SQL with the repair, plus `+enabled: false` "
+        f"for {name} under models.{package} in dbt_project.yml; without the "
+        "disable dbt refuses two resources with one database representation"
     )
-    option: dict[str, Any] = {"kind": "project_override", "supported": True}
+    option: dict[str, Any] = {
+        "kind": "project_override",
+        "supported": True,
+        "repair": repair_command(name),
+    }
     entry = _package_entry(node, install_dir)
     if entry is not None:
         # dbt applies the package's entry to the override, and refuses a second
@@ -266,6 +271,23 @@ def _override_option(
         )
     option["how"] = how
     return option
+
+
+def repair_command(name: str) -> str:
+    """The command that drafts the override of package model ``name`` (#1229)."""
+
+    return f"dex transform repair {name}"
+
+
+def _next(entry: Mapping[str, Any]) -> str | None:
+    """The one line a truncating reader keeps: the command that repairs it."""
+
+    for option in entry.get("options") or ():
+        if option.get("kind") == "project_override" and option.get("supported"):
+            return f"repair: {option['repair']}"
+    if entry.get("owner") == "project":
+        return f"repair: transform plan on {entry.get('path') or entry.get('node')}"
+    return None
 
 
 def _dispatch_option(
@@ -413,5 +435,7 @@ def diagnose(
             entry["options"] = _options(
                 unique_id, node, owner, nodes, macros, root, install_dir
             )
+        if (pointer := _next(entry)) is not None:
+            entry["next"] = pointer
         out.append(entry)
     return out

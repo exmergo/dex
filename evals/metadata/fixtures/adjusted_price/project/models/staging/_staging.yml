@@ -1,0 +1,9 @@
+version: 2
+models:
+  - name: stg_order_lines
+    description: One row per order line.
+    columns:
+      - name: line_id
+        data_tests: [unique, not_null]
+      - name: discount_rate
+        description: The discount applied to the line, as a fraction of the list price.

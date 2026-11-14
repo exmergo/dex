@@ -637,6 +637,14 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # default) and executed by dex. Cube Cloud is a deployment of the same files
     # (#914), not read yet.
     "cube": ("local",),
+    # Databricks Unity Catalog Metric Views: the Metric View YAML bodies committed
+    # here, read statically. The views deployed in a workspace are a second copy
+    # dex neither reads nor writes in this release (#964 reads them, explicitly).
+    "databricks": ("local",),
+    # Snowflake Semantic Views: the Semantic View YAML documents committed here,
+    # read statically. The views deployed on an account are a second copy dex
+    # neither reads nor writes in this release (#1290 reads them, explicitly).
+    "snowflake": ("local",),
 }
 
 #: The factory that builds a vendor's own semantic source, for the vendors whose
@@ -661,6 +669,8 @@ SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
     "ossie": "exmergo_dex_core.ossie.project:build_semantic_layer",
     "slayer": "exmergo_dex_core.slayer.project:build_semantic_layer",
     "cube": "exmergo_dex_core.cube.project:build_semantic_layer",
+    "databricks": "exmergo_dex_core.metric_views.project:build_semantic_layer",
+    "snowflake": "exmergo_dex_core.semantic_views.project:build_semantic_layer",
 }
 
 #: The vendors whose native documents `semantic <vendor> define|update|plan`
@@ -671,7 +681,13 @@ SEMANTIC_SOURCE_FACTORIES: dict[str, str] = {
 #: before the layer implements it would exist only to refuse. The route takes
 #: no vendor name of its own; it reads the vendor off the subcommand, and refuses
 #: one that is not the configured `semantic.vendor`.
-SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = ("ossie", "slayer", "cube")
+SEMANTIC_DOCUMENT_AUTHORING: tuple[str, ...] = (
+    "ossie",
+    "slayer",
+    "cube",
+    "databricks",
+    "snowflake",
+)
 _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "local": "local",
     "dbt_cloud": "dbt_cloud",
@@ -961,16 +977,131 @@ def _check_cube_url(url: str) -> None:
         )
 
 
+#: The suffixes a Metric View YAML body is read from. The SQL that deploys one
+#: (``CREATE VIEW ... WITH METRICS LANGUAGE YAML AS $$ ... $$``) is a different
+#: artifact, and is refused by name rather than having its YAML guessed out of it.
+METRIC_VIEW_SUFFIXES = (".yaml", ".yml")
+
+
+class DatabricksSemanticConfig(BaseModel):
+    """The repository-confined Metric View files behind ``vendor: databricks``.
+
+    ``files`` is an exact allowlist with the rules ``semantic.ossie.files``
+    follows: no globs, no absolute paths, no ``..``, no duplicates, each written
+    relative to the repository root. Each file is one Metric View YAML body,
+    the document ``CREATE VIEW ... WITH METRICS LANGUAGE YAML`` holds between its
+    ``$$`` delimiters, and the view's name is the file's stem, because the YAML
+    carries none. The DDL itself (a ``.sql`` file) is refused by name: it bundles
+    deployment settings (``OR REPLACE``, ``TBLPROPERTIES``, column aliases) with
+    the definition, and dex reads definitions, never deployments.
+
+    Two files whose stems match would name one view twice, so they are refused
+    here rather than one shadowing the other.
+    """
+
+    LISTING: ClassVar[str] = "files"
+    LISTING_MEANS: ClassVar[str] = (
+        "the Metric View YAML files to read, named relative to the repository root"
+    )
+
+    files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check(self) -> DatabricksSemanticConfig:
+        stems: dict[str, list[str]] = {}
+        for name in self.files:
+            path = _repository_relative("semantic.databricks.files", name)
+            if path.suffix.lower() == ".sql":
+                raise ValueError(
+                    f"semantic.databricks.files: '{name}' is SQL. dex reads the "
+                    "Metric View YAML body, not the `CREATE VIEW ... WITH METRICS` "
+                    "statement that deploys it: keep the YAML between the `$$` "
+                    "delimiters in a .yaml file named after the view, and list that"
+                )
+            if not name.endswith(METRIC_VIEW_SUFFIXES):
+                raise ValueError(
+                    f"semantic.databricks.files: '{name}' is not a Metric View "
+                    "YAML file; they are named .yaml or .yml"
+                )
+            stems.setdefault(path.stem.lower(), []).append(name)
+        if duplicated := sorted({n for n in self.files if self.files.count(n) > 1}):
+            raise ValueError(
+                "semantic.databricks.files names the same file twice: "
+                f"{', '.join(duplicated)}"
+            )
+        if clashes := [names for names in stems.values() if len(names) > 1]:
+            raise ValueError(
+                "semantic.databricks.files names one Metric View twice, because a "
+                "view is named after its file's stem (ignoring case): "
+                + "; ".join(" and ".join(names) for names in clashes)
+            )
+        return self
+
+
+#: The suffixes a Semantic View YAML document is read from. The DDL that creates
+#: one (``CREATE SEMANTIC VIEW ...``) is a different artifact, and is refused by
+#: name rather than having a definition guessed out of it.
+SEMANTIC_VIEW_SUFFIXES = (".yaml", ".yml")
+
+
+class SnowflakeSemanticConfig(BaseModel):
+    """The repository-confined Semantic View files behind ``vendor: snowflake``.
+
+    ``files`` is an exact allowlist with the rules ``semantic.ossie.files``
+    follows: no globs, no absolute paths, no ``..``, no duplicates, each written
+    relative to the repository root. Each file is one document in Snowflake's
+    Semantic View YAML specification: the input of
+    ``SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`` and the output of
+    ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``. The view is named by the document's
+    own ``name``, so two files may not share a stem only where the documents say
+    so (the reader refuses two documents declaring one view). The DDL (a
+    ``.sql`` file, ``CREATE SEMANTIC VIEW ...``) is refused by name: dex reads the
+    YAML form, never a deployment statement.
+    """
+
+    LISTING: ClassVar[str] = "files"
+    LISTING_MEANS: ClassVar[str] = (
+        "the Semantic View YAML files to read, named relative to the repository root"
+    )
+
+    files: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check(self) -> SnowflakeSemanticConfig:
+        for name in self.files:
+            path = _repository_relative("semantic.snowflake.files", name)
+            if path.suffix.lower() == ".sql":
+                raise ValueError(
+                    f"semantic.snowflake.files: '{name}' is SQL. dex reads the "
+                    "Semantic View YAML document (what "
+                    "SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW returns), not the "
+                    "`CREATE SEMANTIC VIEW` statement: keep the YAML in a .yaml "
+                    "file and list that"
+                )
+            if not name.endswith(SEMANTIC_VIEW_SUFFIXES):
+                raise ValueError(
+                    f"semantic.snowflake.files: '{name}' is not a Semantic View "
+                    "YAML file; they are named .yaml or .yml"
+                )
+        if duplicated := sorted({n for n in self.files if self.files.count(n) > 1}):
+            raise ValueError(
+                "semantic.snowflake.files names the same file twice: "
+                f"{', '.join(duplicated)}"
+            )
+        return self
+
+
 class SemanticConfig(BaseModel):
     """How ``explore semantic`` reaches the semantic layer, on two axes.
 
     ``vendor`` is which semantic-layer format answers: ``dbt``/MetricFlow,
     ``ossie`` for native Apache Ossie documents in the repository, ``slayer``
-    for SLayer model files in the repository, or ``cube`` for Cube YAML model
-    files in the repository. It is
-    ambient per repo, chosen once, the same rule ``connector:`` follows: a repo
-    has one semantic layer, so there is no more reason to retype the vendor per
-    command than to retype the warehouse.
+    for SLayer model files in the repository, ``cube`` for Cube YAML model
+    files in the repository, or ``databricks`` for Databricks Unity Catalog
+    Metric View YAML files in the repository. It is ambient per repo, chosen
+    once, the same rule ``connector:`` follows: a repo has one semantic layer, so
+    there is no more reason to retype the vendor per command than to retype the
+    warehouse.
 
     ``deployment`` is which endpoint or artifact of that vendor is read. For dbt:
     ``local`` renders metric queries with MetricFlow and executes them through
@@ -998,6 +1129,9 @@ class SemanticConfig(BaseModel):
     ``cube.files`` is Cube's equivalent, with the same rules (see
     :class:`CubeSemanticConfig`): a dbt project beside them keeps the
     transformation tiers, and Cube is the repository's one semantic layer.
+
+    ``databricks.files`` is the Metric View equivalent (see
+    :class:`DatabricksSemanticConfig`), on the same terms.
 
     A third property, **who executes**, is derived from those two and never
     configured, because it is what decides whether the cost guard can apply at
@@ -1027,6 +1161,10 @@ class SemanticConfig(BaseModel):
     ossie: OssieSemanticConfig = Field(default_factory=OssieSemanticConfig)
     slayer: SlayerSemanticConfig = Field(default_factory=SlayerSemanticConfig)
     cube: CubeSemanticConfig = Field(default_factory=CubeSemanticConfig)
+    databricks: DatabricksSemanticConfig = Field(
+        default_factory=DatabricksSemanticConfig
+    )
+    snowflake: SnowflakeSemanticConfig = Field(default_factory=SnowflakeSemanticConfig)
 
     @model_validator(mode="after")
     def _check_axes(self) -> SemanticConfig:

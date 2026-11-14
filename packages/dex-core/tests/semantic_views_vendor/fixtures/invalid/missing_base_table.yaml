@@ -1,0 +1,9 @@
+# expect: base_table
+# A logical table with no base table.
+name: missing_base_table
+tables:
+  - name: orders
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

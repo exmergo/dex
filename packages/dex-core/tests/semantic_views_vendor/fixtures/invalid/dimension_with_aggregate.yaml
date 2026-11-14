@@ -1,0 +1,12 @@
+# expect: row_level
+# A dimension that aggregates its own table's columns.
+name: dimension_with_aggregate
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - {name: max_price, expr: MAX(o_totalprice)}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

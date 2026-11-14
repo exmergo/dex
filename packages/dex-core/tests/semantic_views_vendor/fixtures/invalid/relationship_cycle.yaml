@@ -1,0 +1,24 @@
+# expect: relationship_cycle
+# orders -> customer -> orders.
+name: relationship_cycle
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: customer
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: CUSTOMER}
+    primary_key: {columns: [c_custkey]}
+    dimensions:
+      - {name: segment, expr: c_mktsegment}
+relationships:
+  - name: orders_customer
+    left_table: orders
+    right_table: customer
+    relationship_columns: [{left_column: o_custkey, right_column: c_custkey}]
+  - name: customer_orders
+    left_table: customer
+    right_table: orders
+    relationship_columns: [{left_column: c_custkey, right_column: o_orderkey}]

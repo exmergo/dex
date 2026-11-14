@@ -1,0 +1,13 @@
+# expect: legacy_semantic_model
+# A legacy Cortex Analyst semantic model (`measures`). Snowflake accepts the file
+# and drops what it does not read; dex refuses it by name, as another format.
+name: legacy_cortex_model
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    measures:
+      - {name: total, expr: o_totalprice, default_aggregation: sum}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

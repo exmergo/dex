@@ -347,9 +347,79 @@ def test_a_retyped_column_conflicts_with_its_declared_type(repo: Path, capsys):
     conflict = _finding(payload, "declared_type_conflict", column="amount")
     assert conflict["data"]["declared_type"] == "DOUBLE"
     assert conflict["data"]["warehouse_type"] == "VARCHAR"
-    # SLayer's own cascade: the measure aggregating the column goes with it.
-    assert conflict["data"]["removal"]["columns"] == ["amount"]
-    assert conflict["data"]["removal"]["measures"] == ["revenue"]
+    # SLayer reports a retype and removes nothing: its remedy is the type.
+    assert "removal" not in conflict["data"]
+    assert conflict["data"]["remedy_kind"] == "set_type"
+    # Setting the type alone would leave `revenue` summing a TEXT column, which
+    # validates and fails every query, so the remedy names it.
+    assert conflict["data"]["breaks_measures"] == [
+        {"measure": "revenue", "aggregation": "sum"}
+    ]
+    assert conflict["data"]["remedy"].startswith("set the column's type to TEXT")
+    assert "revenue (sum)" in conflict["data"]["remedy"]
+
+
+def test_reconcile_proposes_a_retype_as_advisory_and_cuts_nothing(repo: Path, capsys):
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders ALTER amount TYPE VARCHAR")
+    _cli(repo, capsys, "maintain", "schema")
+    before = (repo / BASE / ORDERS).read_text()
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload["errors"]
+    proposals = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_type_conflict"
+    ]
+    assert proposals and all(p["kind"] == "advisory" for p in proposals)
+    assert "set the column's type to TEXT" in proposals[0]["action"]
+    assert "revenue (sum)" in proposals[0]["action"]
+    assert "semantic_plan_id" not in payload["data"]
+    assert (repo / BASE / ORDERS).read_text() == before
+
+
+def test_a_column_that_became_a_list_is_a_reingest_conflict(repo: Path, capsys):
+    """A list is SLayer's fifth type bucket (#1246): a scalar column the
+    warehouse now holds as a list is a re-type SLayer re-ingests, and dex states
+    the declaration that leads to, never `slayer ingest` on a file it owns."""
+
+    entry = _orders()
+    entry["measures"].append({"name": "statuses", "formula": "status:count_distinct"})
+    _write_model(repo, ORDERS, entry)
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE orders ALTER status TYPE VARCHAR[] USING [status]")
+
+    payload = _cli(repo, capsys, "maintain", "schema")
+
+    assert payload["_exit"] == 0, payload
+    conflict = _finding(payload, "declared_type_conflict", column="status")
+    assert conflict["data"]["declared_type"] == "TEXT"
+    assert conflict["data"]["warehouse_type"] == "VARCHAR[]"
+    assert conflict["data"]["slayer_type"] == "ARRAY"
+    assert conflict["data"]["remedy_kind"] == "reingest"
+    assert conflict["data"]["element_type"] == "TEXT"
+    # A list aggregates only by count: the distinct count would break.
+    assert conflict["data"]["breaks_measures"] == [
+        {"measure": "statuses", "aggregation": "count_distinct"}
+    ]
+    before = (repo / BASE / ORDERS).read_text()
+
+    payload = _cli(repo, capsys, "maintain", "reconcile")
+
+    assert payload["_exit"] == 0, payload["errors"]
+    (proposal,) = [
+        p
+        for p in payload["data"]["proposals"]
+        if p["finding_code"] == "declared_type_conflict"
+    ]
+    assert proposal["kind"] == "advisory"
+    assert "`type: ARRAY` with `element_type: TEXT`" in proposal["action"]
+    assert "status.value" in proposal["action"]
+    assert "statuses (count_distinct)" in proposal["action"]
+    assert "semantic slayer update" in proposal["action"]
+    assert (repo / BASE / ORDERS).read_text() == before
 
 
 def test_a_dropped_source_column_still_declared_is_caught(repo: Path, capsys):
@@ -470,7 +540,7 @@ def test_no_maintain_path_opens_a_slayer_datasource_or_storage(
     for name in (
         "validate_datasource",
         "_live_schema_for_datasource",
-        "_probe_connect",
+        "_live_schema_refs",
     ):
         monkeypatch.setattr(schema_drift, name, refuse)
 
@@ -515,7 +585,15 @@ def test_no_maintain_path_opens_a_slayer_datasource_or_storage(
         ("INTERVAL", None),
         ("JSON", None),
         ("STRUCT(a INTEGER)", None),
-        ("INTEGER[]", None),
+        # A list of anything is SLayer's ARRAY (#1246), whatever its element,
+        # on every connector's spelling of one; Redshift's SUPER is a document.
+        ("INTEGER[]", "ARRAY"),
+        ("text[]", "ARRAY"),
+        ("STRUCT(a INTEGER)[]", "ARRAY"),
+        ("ARRAY<STRING>", "ARRAY"),
+        ("ARRAY", "ARRAY"),
+        ("array(varchar)", "ARRAY"),
+        ("SUPER", None),
         ("GEOGRAPHY", None),
         ("", None),
     ],

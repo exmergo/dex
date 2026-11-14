@@ -165,6 +165,133 @@ after their column from declared aggregations, population and units in
 `declarations`, which annotate a cube the payload or the layer defines, rewriting
 only that cube's entry. See [declarations.md](declarations.md#cube-semanticvendor-cube).
 
+## Snowflake Semantic Views: `semantic snowflake define|update|plan`
+
+Under `semantic.vendor: snowflake`, the configured Semantic View YAML files are
+the semantic layer. Author them with
+`semantic snowflake define|update|plan <intent> --edits-file <path|->`. The
+wrapper installs the `[semantic-views]` extra (the dialect engine) for it. Dex
+never deploys a view: checking it with
+`SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('<database>.<schema>', $$ <file> $$, TRUE)`
+and creating it are the author's steps, outside Dex, and no authoring command
+opens a Snowflake connection.
+
+- Each edit is one **whole Semantic View YAML document** (what the procedure
+  takes), keyed exactly as `semantic.snowflake.files` lists it and written
+  byte-for-byte, keeping the file's mode. A view is named by its own `name`.
+- Only the listed files are writable. A path off the list, a `.sql` file (the
+  `CREATE SEMANTIC VIEW` DDL) and another suffix are refused by name, and so is a
+  delete. To add a view, propose `dex config set semantic.snowflake.files '[...,
+  <path>]'` first (the user confirms the diff).
+- The whole set is validated by Dex's port of Snowflake's rules, and every error
+  anywhere refuses the plan. Writing is stricter than reading: an unknown key,
+  `access_modifier` on a dimension (Snowflake keeps it private, hiding it from
+  every query) and `unresolved_member` refuse it. `unresolved_member` is a read
+  qualified with its own table that names no member (`SUM(orders.total_price)`
+  where `total_price` is not declared): declare the fact, or write the base
+  column unqualified. Every refusal names `file: element: [rule]`; fix that
+  element and re-plan.
+- The envelope classifies each logical table (`view.table`) and derived metric
+  (`view.metric`) as `defined`, `updated` or `unchanged` (reformatting is
+  `unchanged`); a change only to relationships or the view's own keys lists the
+  view itself as `updated`. `define` refuses an existing view and a removal,
+  `update` a new view. A file changed after planning makes `transform apply`
+  refuse the plan; remake it with `semantic snowflake plan`.
+
+**A declared mart derives its logical table.** Under `vendor: snowflake`,
+`transform plan` on a declared mart builds a logical table (the mart as
+`base_table`, the grain as `primary_key`, dimensions, time dimensions, facts and
+metrics from the roles and aggregations, a relationship per foreign key to a
+parent table keyed on that column) and splices it into the configured file that
+holds the tables its foreign keys reference, as a second plan beside the mart's.
+Where none does, it is a view of its own, `<dir>/<mart>.yaml`, proposed with the
+`dex config set` that adopts it. `base_table` needs the database and schema, so
+build or compile the project (or give a sibling model a logical table) before
+planning a mart. `semantic snowflake define|update|plan` also take
+`declarations`, which annotate the table they name, splicing only what changes.
+See [declarations.md](declarations.md#snowflake-semantic-views-semanticvendor-snowflake).
+
+## Databricks Metric Views: `semantic databricks define|update|plan`
+
+Under `semantic.vendor: databricks`, the configured Metric View YAML files are the
+semantic layer. Author them with
+`semantic databricks define|update|plan <intent> --edits-file <path|->`. The
+wrapper installs the `[metric-views]` extra (the dialect engine) for it. Dex
+never deploys a view: `CREATE VIEW ... WITH METRICS` is the author's step, outside
+Dex, and no authoring command opens a workspace connection.
+
+- Each edit is one **whole Metric View YAML body** (what `CREATE VIEW ... WITH
+  METRICS LANGUAGE YAML` holds between its `$$` delimiters), keyed exactly as
+  `semantic.databricks.files` lists it and written byte-for-byte. A file is one
+  view, named after its stem.
+- Only the listed files are writable. A path off the list, a `.sql` file, another
+  suffix and a stem another file already names are refused by name. To add a
+  view, propose `dex config set semantic.databricks.files '[..., <path>]'` first
+  (the user confirms the diff).
+- The whole set is validated by Dex's port of the Metric View YAML 1.1 rules.
+  Writing is stricter than reading: an unknown key (`rely` included) and a view
+  writing both `fields` and `dimensions` refuse the plan, because Databricks
+  refuses the first on `CREATE VIEW` and silently drops `fields` for the second.
+  Every refusal names `file: element: [rule]`; fix that element and re-plan.
+- Never write the YAML with a YAML 1.1 library (PyYAML's `safe_dump` of a parsed
+  view): it turns a join's `on:` into `true:`, which is refused naming `on:`.
+  Write the text, or read and write with YAML 1.2.
+- The envelope classifies each view as `defined`, `updated` or `unchanged`
+  (reformatting is `unchanged`). `define` refuses an existing view, `update` a new
+  one. A file changed after planning makes `transform apply` refuse the plan;
+  remake it with `semantic databricks plan`.
+
+**A declared mart derives its Metric View.** Under `vendor: databricks`,
+`transform plan` on a declared mart proposes `<dir>/<mart>.yaml` beside the
+configured files: the mart as `source`, every non-measure role as a field (a date
+or timestamp column with `format: {type: date|date_time}`), declared aggregations
+as measures `<column>_<agg>`, each foreign key a `many_to_one` join with
+`rely.at_most_one_match` only where the parent declares that column as its grain,
+and the description plus the population sentence as the view's `comment`. It is
+stored as a second plan when the path is already in `semantic.databricks.files`.
+A Metric View has no metadata key, so the NULL rule, additivity, assumptions and
+grain are named under `not_carried` rather than written. `semantic databricks
+define|update|plan` also take `declarations`, which annotate the view they name,
+splicing only what changes. See
+[declarations.md](declarations.md#databricks-metric-views-semanticvendor-databricks).
+
+**The Ossie bridge: one layer from the other.**
+`semantic databricks define|update|plan --from-ossie <file>` proposes a whole view
+from an Apache Ossie document. Under `semantic.vendor: ossie`,
+`semantic ossie define|update|plan --from-metric-view <file>` proposes a whole
+Ossie document from a Metric View file. The source file is only read and needs no configuration. Both go through
+Dex's port of the apache/ossie-converters `databricks` spoke.
+
+- **Read the notices before applying.** Every entry of `data.bridge.conversions`
+  (one per file) has its own `notices`, listing everything dropped or rewritten
+  for that file; read and relay them for every entry, not only the first. Each notice is `origin: converter` (the
+  converter's own words: `datatype`, `is_time`, object `ai_context` members,
+  synonyms past ten, diamond and one-to-many drops) or `origin: dex` (a
+  `key_only` field added for a join column, a field resolved to its column,
+  `expression.sql` read, a dataset metric exported or dropped). Relay the dropped
+  ones; they are not carried into the target.
+- **`--fact <dataset>`** names the dataset a view is on when the Ossie graph has
+  several roots (the refusal says so). **`--name <model>`** names the imported
+  model and its fact dataset (default: the source table's name).
+  **`--dataset-metrics`** writes each measure that reads only the fact source as
+  a dataset-scoped metric. **`--into <path>`** places the output.
+- **Several files at once.** Each flag takes several files. Use this when several
+  new paths are configured: the layer validates every configured file together,
+  so they can only be authored together.
+- **Each entry's `status` says where it went.** `included`: its output is a
+  configured file and is in the stored plan (`data.plan_id`), for
+  `transform apply`. `proposed`: its output is not configured, no plan writes it,
+  and the document is in that entry's own `content`. A batch can hold both: then
+  `data.plan_id` is set for the included ones, and `data.bridge.next` names the
+  `dex config set` that adopts the proposed paths (the user confirms it) and the
+  command to run again. With none included, `data.plan_id` is `null`.
+- **A refusal** names the converter's kind and reason (a cross or non-equi join,
+  a cyclic graph, mixed cardinalities in one branch). Fix the source, or author
+  the target by hand with `--edits-file`.
+
+Every adaptation and difference from the converter is in
+<https://github.com/exmergo/dex/blob/main/references/databricks-metric-views-compatibility.md#the-ossie-bridge>.
+
 ## SLayer models: `semantic slayer define|update|plan`
 
 Under `semantic.vendor: slayer`, the configured SLayer model files are the

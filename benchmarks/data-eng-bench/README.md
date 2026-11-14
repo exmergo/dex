@@ -68,8 +68,9 @@ bootstrap over tasks.
 
 ## What is committed
 
-Three files per run under `experiments/`, matching the convention in
-[`../ade_bench`](../ade_bench):
+Three files per run under `experiments/`.
+[ADE-bench](../ade_bench) also publishes results and provenance, with additional
+configuration and telemetry files for its guided Dex run:
 
 | File | Contents |
 |---|---|

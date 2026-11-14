@@ -1,0 +1,71 @@
+# A snowflake chain: lineitem -> orders -> customer -> nation -> region, with a
+# metric on a coarser table reading a finer one through a nested aggregate.
+name: snowflake_chain
+tables:
+  - name: lineitem
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: LINEITEM}
+    primary_key: {columns: [l_orderkey, l_linenumber]}
+    facts:
+      - name: extended_price
+        expr: l_extendedprice
+    metrics:
+      - name: gross_revenue
+        expr: SUM(lineitem.extended_price)
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    dimensions:
+      - name: order_status
+        expr: o_orderstatus
+    facts:
+      - name: order_key
+        expr: o_orderkey
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)
+  - name: customer
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: CUSTOMER}
+    primary_key: {columns: [c_custkey]}
+    dimensions:
+      - name: customer_name
+        expr: c_name
+    facts:
+      - name: lifetime_orders
+        description: Orders this customer placed, aggregated from the finer table.
+        expr: COUNT(orders.order_key)
+    metrics:
+      - name: average_orders_per_customer
+        expr: AVG(customer.lifetime_orders)
+  - name: nation
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: NATION}
+    primary_key: {columns: [n_nationkey]}
+    dimensions:
+      - name: nation_name
+        expr: n_name
+  - name: region
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: REGION}
+    primary_key: {columns: [r_regionkey]}
+    dimensions:
+      - name: region_name
+        expr: r_name
+    metrics:
+      - name: average_order_value
+        description: Nested aggregate over a finer table.
+        expr: AVG(SUM(lineitem.extended_price))
+relationships:
+  - name: lineitem_orders
+    left_table: lineitem
+    right_table: orders
+    relationship_columns: [{left_column: l_orderkey, right_column: o_orderkey}]
+  - name: orders_customer
+    left_table: orders
+    right_table: customer
+    relationship_columns: [{left_column: o_custkey, right_column: c_custkey}]
+  - name: customer_nation
+    left_table: customer
+    right_table: nation
+    relationship_columns: [{left_column: c_nationkey, right_column: n_nationkey}]
+  - name: nation_region
+    left_table: nation
+    right_table: region
+    relationship_columns: [{left_column: n_regionkey, right_column: r_regionkey}]

@@ -387,7 +387,15 @@ def derive(
         )
         return derivation
 
-    body: dict[str, Any] = {"name": model}
+    semantic_model_name = model
+    if "__" in model:
+        semantic_model_name = re.sub(r"_+", "_", model).strip("_")
+        notes.append(
+            f"semantic model named '{semantic_model_name}' instead of '{model}': "
+            "MetricFlow does not allow '__' in a semantic model name"
+        )
+
+    body: dict[str, Any] = {"name": semantic_model_name}
     description = with_population(
         declared.get("description"), declared.get("population")
     )
@@ -523,8 +531,10 @@ def _described(
 def _entity_name(column: str, model: str) -> str:
     stem = re.sub(r"_?id$", "", column, flags=re.IGNORECASE)
     if stem:
-        return stem.lower()
-    return _LAYER_PREFIX.sub("", model).lower() or model.lower()
+        candidate = stem.lower()
+    else:
+        candidate = _LAYER_PREFIX.sub("", model).lower() or model.lower()
+    return re.sub(r"_+", "_", candidate).strip("_")
 
 
 def _foreign_entity(
@@ -942,6 +952,7 @@ class MetricFlowDerivation:
         ]
 
         derivations: list[Derivation] = []
+        claimed: dict[str, str] = {}
         for declaration in request.declarations:
             model, sql_path = declaration.model, declaration.source_path
             derivation = derive(
@@ -956,6 +967,18 @@ class MetricFlowDerivation:
             check_collisions(derivation, docs, on_ref)
             if derivation.status in ("skipped", "failed"):
                 continue
+            name = (derivation.body or {}).get("name")
+            if name:
+                claimed_by = claimed.get(name)
+                if claimed_by is not None:
+                    derivation.status = "failed"
+                    derivation.blocked = (
+                        f"semantic model name '{name}' is already derived for "
+                        f"{claimed_by} in this plan; two marts that normalize to the "
+                        "same name would replace each other, so rename one of them "
+                        "(dex does not rename either)"
+                    )
+                    continue
             place(derivation, sql_path, docs, edits)
             try:
                 splice(derivation, files)
@@ -969,6 +992,10 @@ class MetricFlowDerivation:
                     if derivation.validation["schema"]["result"] == "not_run"
                     else "failed"
                 )
+            if name and derivation.status != "failed":
+                # Reserve the name only for a derivation that stays in the plan,
+                # so one that is rejected here cannot refuse a later mart.
+                claimed[name] = derivation.model
 
         ready = [d for d in derivations if d.status == "proposed"]
         derived_edits = _spliced_edits(ready, files, edits)

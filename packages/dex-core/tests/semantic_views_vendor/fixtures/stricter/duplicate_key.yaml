@@ -1,0 +1,12 @@
+# expect: malformed
+# A key written twice in one mapping. Snowflake keeps one and accepts the file;
+# dex refuses it, because which one a reader keeps is not something to guess.
+name: duplicate_key
+name: again
+tables:
+  - name: orders
+    base_table: {database: SNOWFLAKE_SAMPLE_DATA, schema: TPCH_SF1, table: ORDERS}
+    primary_key: {columns: [o_orderkey]}
+    metrics:
+      - name: order_count
+        expr: COUNT(o_orderkey)

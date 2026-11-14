@@ -1,0 +1,21 @@
+{
+  "diagnosis": {
+    "verdict": "no_defect",
+    "fields": [
+      "subscription_activity"
+    ],
+    "evidence": [
+      [
+        "1013"
+      ],
+      [
+        "is_internal",
+        "internal"
+      ]
+    ],
+    "explains": [
+      "is_internal",
+      "internal"
+    ]
+  }
+}
