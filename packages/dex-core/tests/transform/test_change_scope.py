@@ -1025,7 +1025,12 @@ def test_a_star_with_a_changed_cte_is_still_stored_unread():
         {"models": [scope.model_dump(mode="json", exclude_none=True)]}
     ) == {
         "site_daily": [
-            {"kind": "aggregate_changed", "column": "visits", "status": "declared"},
+            {
+                "axis": "output",
+                "kind": "aggregate_changed",
+                "column": "visits",
+                "status": "declared",
+            },
             {"kind": "unread", "status": "unchecked"},
         ]
     }
@@ -1255,7 +1260,12 @@ def test_plan_reports_an_undeclared_roster_filter_and_stores_it(
         (repo / ".dex" / "plans" / f"{plan_id}.json").read_text(encoding="utf-8")
     )
     assert stored["change_scope"]["dim_accounts"] == [
-        {"kind": "predicate_added", "status": "undeclared"}
+        {
+            "axis": "population",
+            "kind": "predicate_added",
+            "columns": ["is_sandbox"],
+            "status": "undeclared",
+        }
     ]
 
 
@@ -1408,7 +1418,12 @@ def test_a_removed_parent_is_redriven_even_with_the_sql_unchanged():
     assert change["kind"] == "redriven"
     assert "was removed" in change["detail"]
     assert cs.stored_form(report)["conversation_summary"] == [
-        {"kind": "redriven", "status": "undeclared", "reason": "redriven"}
+        {
+            "axis": "population",
+            "kind": "redriven",
+            "status": "undeclared",
+            "reason": "redriven",
+        }
     ]
 
 
@@ -1437,3 +1452,188 @@ def test_a_redrive_leads_so_no_cap_cuts_it():
     scope = _redrive(REDRIVE_FROM_PARTS, REDRIVE_FROM_PARENT)
     assert len([c for c in scope.changes if c.status == "undeclared"]) > 1
     assert scope.changes[0].kind == "redriven"
+
+
+# --- #1230: apply holds an undeclared population change to a decision ---------
+
+
+def _apply(repo: Path, warehouse: Path, plan_id: str, capsys, *flags: str) -> dict:
+    main(
+        [
+            "--repo-root",
+            str(repo),
+            "transform",
+            "apply",
+            plan_id,
+            *flags,
+            "--connector",
+            "duckdb",
+            "--path",
+            str(warehouse),
+        ]
+    )
+    return json.loads(capsys.readouterr().out)
+
+
+def _roster_filter_plan(repo: Path, warehouse: Path, capsys) -> str:
+    filtered = ROSTER.rstrip() + " where not is_sandbox\n"
+    envelope = _plan(
+        repo, warehouse, {"edits": [_edit("dim_accounts", filtered)]}, capsys
+    )
+    return envelope["data"]["plan_id"]
+
+
+def test_apply_refuses_an_undeclared_population_change(accounts_project, capsys):
+    repo, warehouse = accounts_project
+    plan_id = _roster_filter_plan(repo, warehouse, capsys)
+    refused = _apply(repo, warehouse, plan_id, capsys)
+    assert refused["status"] == "error"
+    assert refused["reason"] == "request"
+    assert refused["data"]["plan_id"] == plan_id
+    assert refused["data"]["undeclared_population_changes"] == [
+        {"model": "dim_accounts", "kind": "predicate_added", "columns": ["is_sandbox"]}
+    ]
+    (message,) = refused["errors"]
+    assert "dim_accounts (predicate_added reading is_sandbox)" in message
+    assert "--accept-population-change" in message
+    assert "assumption" in message
+    # Nothing was written: the roster still holds its sandbox accounts.
+    sql = (repo / "analytics" / "models" / "marts" / "dim_accounts.sql").read_text()
+    assert "is_sandbox" not in sql.split("from")[-1]
+
+
+def test_an_accepted_population_change_applies_and_is_recorded(
+    accounts_project, capsys
+):
+    repo, warehouse = accounts_project
+    plan_id = _roster_filter_plan(repo, warehouse, capsys)
+    applied = _apply(
+        repo,
+        warehouse,
+        plan_id,
+        capsys,
+        "--accept-population-change",
+        "the request says sandbox accounts leave the roster too",
+    )
+    assert applied["status"] == "ok", applied["errors"]
+    assert applied["data"]["written"] == ["models/marts/dim_accounts.sql"]
+    acceptance = applied["data"]["population_acceptance"]
+    assert acceptance["reason"] == (
+        "the request says sandbox accounts leave the roster too"
+    )
+    assert acceptance["changes"] == [
+        {"model": "dim_accounts", "kind": "predicate_added", "columns": ["is_sandbox"]}
+    ]
+    stored = json.loads(
+        (repo / ".dex" / "plans" / f"{plan_id}.json").read_text(encoding="utf-8")
+    )
+    assert stored["population_acceptance"] == acceptance
+
+
+def test_an_assumption_naming_the_column_needs_no_acceptance(accounts_project, capsys):
+    repo, warehouse = accounts_project
+    filtered = ROSTER.rstrip() + " where not is_sandbox\n"
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [_edit("dim_accounts", filtered)],
+            "declarations": [
+                {
+                    "model": "dim_accounts",
+                    "assumptions": [
+                        {
+                            "decision": "Sandbox accounts on the roster",
+                            "chosen": "excluded",
+                            "evidence": "request",
+                            "column": "is_sandbox",
+                        }
+                    ],
+                }
+            ],
+        },
+        capsys,
+    )
+    applied = _apply(repo, warehouse, envelope["data"]["plan_id"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    assert "population_acceptance" not in applied["data"]
+
+
+def test_a_blank_acceptance_is_refused(accounts_project, capsys):
+    repo, warehouse = accounts_project
+    plan_id = _roster_filter_plan(repo, warehouse, capsys)
+    refused = _apply(
+        repo, warehouse, plan_id, capsys, "--accept-population-change", "  "
+    )
+    assert refused["status"] == "error"
+    assert "empty --accept-population-change" in refused["errors"][0]
+
+
+def test_an_acceptance_with_nothing_to_accept_warns_and_records_nothing(
+    accounts_project, capsys
+):
+    repo, warehouse = accounts_project
+    # A comment only: nothing moves rows.
+    envelope = _plan(
+        repo,
+        warehouse,
+        {"edits": [_edit("dim_accounts", "-- the roster\n" + ROSTER)]},
+        capsys,
+    )
+    applied = _apply(
+        repo,
+        warehouse,
+        envelope["data"]["plan_id"],
+        capsys,
+        "--accept-population-change",
+        "just in case",
+    )
+    assert applied["status"] == "ok", applied["errors"]
+    assert "population_acceptance" not in applied["data"]
+    assert any("nothing was accepted" in w for w in applied["warnings"])
+
+
+def test_a_build_reports_an_accepted_change_as_accepted():
+    name = "dim_accounts"
+    nodes = [BuildNode(unique_id=_uid(name), name=name, status="success")]
+    recorded = {
+        name: [
+            {"axis": "population", "kind": "predicate_added", "status": "undeclared"}
+        ]
+    }
+    open_ = summarize_completion(
+        _evidence(nodes, required=[name]), None, change_scope=recorded
+    )
+    assert open_.outcome == "built_unverified"
+    assert [u.reason for u in open_.unverified] == ["undeclared_population_change"]
+
+    settled = summarize_completion(
+        _evidence(nodes, required=[name]),
+        None,
+        change_scope=recorded,
+        population_accepted={
+            "reason": "asked for",
+            "changes": [{"model": name, "kind": "predicate_added"}],
+        },
+    )
+    assert settled.outcome == "validated"
+    assert settled.unverified is None
+    (obligation,) = settled.obligations.change_scope
+    assert obligation.status == "accepted"
+
+
+def test_an_old_plan_without_an_axis_is_read_by_kind():
+    assert cs.is_population_change({"kind": "predicate_added"})
+    assert cs.is_population_change({"kind": "redriven"})
+    assert not cs.is_population_change({"kind": "column_removed"})
+    assert not cs.is_population_change({"kind": "unread"})
+    assert not cs.is_population_change({"axis": "output", "kind": "x"})
+    assert cs.undeclared_population_changes(
+        {
+            "m": [
+                {"kind": "predicate_added", "status": "undeclared"},
+                {"kind": "join_added", "status": "declared"},
+                {"kind": "column_removed", "status": "undeclared", "column": "c"},
+            ]
+        }
+    ) == [{"model": "m", "kind": "predicate_added"}]

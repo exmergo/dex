@@ -108,6 +108,11 @@ class TransformPlan(BaseModel):
     # recorded when the plan offered `transform compare` (#1049). None on a plan
     # that rewrites no existing model, and on plans stored before the field.
     refactor_models: dict[str, str] | None = None
+    # Per rewritten model, whether the offer found its baseline ready to compare
+    # (no upstream build attempt failed or skipped, #1114). A `--for-plan` build
+    # reads it: a rewrite applied uncompared while it could have been compared
+    # is unfinished work (#1230). None on plans stored before the field.
+    refactor_baseline_ready: dict[str, bool] | None = None
     # The last `transform compare` verdict per model (status, reason_code,
     # compared_at, input_scope, compiled digests), so `transform apply` and a
     # `--for-plan` build can say whether a rewrite was compared. Bookkeeping
@@ -126,6 +131,11 @@ class TransformPlan(BaseModel):
     # `undeclared`, plus `unchecked` where the edit could not be read.
     # Bookkeeping outside the digest, read by a `--for-plan` build.
     change_scope: dict[str, list[dict[str, Any]]] | None = None
+    # What `transform apply --accept-population-change "<reason>"` accepted
+    # (#1230): the reason, when, and the undeclared population changes it
+    # covered. Bookkeeping outside the digest like `change_scope`, read by a
+    # `--for-plan` build, which reports each as `accepted`.
+    population_acceptance: dict[str, Any] | None = None
     # A package override `transform repair` drafted (#1229): the node, the
     # conversions and what they rest on, read by a `--for-plan` build to hold the
     # repair to its obligations. Bookkeeping outside the digest, like the two above.

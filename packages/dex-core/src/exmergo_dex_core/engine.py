@@ -1540,10 +1540,24 @@ class DexEngine:
             expectation=expectation,
         )
 
-    def apply(self, plan_id: str | None = None) -> ApplyResult:
+    def apply(
+        self,
+        plan_id: str | None = None,
+        *,
+        accept_population_change: str | None = None,
+    ) -> ApplyResult:
+        """Write a stored plan into the project.
+
+        A plan that changes a model's population with no assumption recording
+        it is refused unless ``accept_population_change`` states why, which is
+        recorded on the plan (#1230).
+        """
+
         from .transform import commands as transform
 
-        return transform.apply(self, plan_id)
+        return transform.apply(
+            self, plan_id, accept_population_change=accept_population_change
+        )
 
     def plans(self) -> PlanListResult:
         from .transform import commands as transform

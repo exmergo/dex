@@ -119,6 +119,7 @@ _EXPORTS = {
     "Relationship": "cache",
     "RepoRootRequiredError": "errors",
     "RequestError": "errors",
+    "UndeclaredPopulationChangeError": "errors",
     "Result": "results",
     "ScaffoldError": "transform.scaffold",
     "ScaffoldPrerequisiteError": "transform.scaffold",
@@ -181,6 +182,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         RequestError,
         StatementStage,
         StoreRequiredError,
+        UndeclaredPopulationChangeError,
         WarehouseQueryError,
     )
     from .explore.cluster import ClusterDependencyError, ClusterError
@@ -347,6 +349,7 @@ __all__ = [
     "StoreContext",
     "StoreFactory",
     "StoreRequiredError",
+    "UndeclaredPopulationChangeError",
     "ValuesFreeCode",
     "ValuesFreeError",
     "WarehouseQueryError",

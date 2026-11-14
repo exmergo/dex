@@ -55,21 +55,17 @@ from .row_attribution import (
     render_model_sql,
 )
 
+# The kinds held to an assumption, and the stored-entry readers apply and a build
+# use, live in the parser-free scope_gate module (#1230); re-exported here.
+from .scope_gate import (  # noqa: F401
+    JUDGED,
+    accepted_key,
+    is_population_change,
+    undeclared_population_changes,
+)
+
 MAX_MODELS = 25
 MAX_CHANGES_PER_MODEL = 8
-
-#: Kinds held to an assumption. ``column_added`` and ``expression_changed`` are
-#: listed and never judged: adding a requested column and rewriting the formula
-#: a fix is about are what repairs do, and calling every one undeclared would
-#: bury the changes nobody asked for.
-JUDGED = frozenset(
-    {
-        "column_removed",
-        "type_changed",
-        "aggregate_changed",
-        "null_handling_changed",
-    }
-)
 
 _NULL_FUNCTIONS = ("coalesce", "ifnull", "nvl", "nullif", "nvl2", "zeroifnull")
 # Functions that turn one row into several when they sit in a select list
@@ -1249,8 +1245,12 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
             {
                 k: v
                 for k, v in (
+                    ("axis", c.get("axis")),
                     ("kind", c.get("kind")),
                     ("column", c.get("column")),
+                    # The columns a population change's predicate or join
+                    # reads: what the assumption that settles it names (#1230).
+                    ("columns", c.get("columns") or None),
                     ("status", c.get("status")),
                     ("reason", c.get("reason")),
                 )

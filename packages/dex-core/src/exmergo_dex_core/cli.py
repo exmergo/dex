@@ -1187,6 +1187,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         metavar="HEX",
                         help="refuse a plan document whose digest is not this one",
                     )
+                    sp.add_argument(
+                        "--accept-population-change",
+                        default=None,
+                        metavar="REASON",
+                        help=("apply an undeclared population change, stating why"),
+                    )
                 if group == "transform" and name == "classify":
                     sp.add_argument(
                         "--edits-file",

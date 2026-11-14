@@ -122,9 +122,11 @@ def _plan(capsys, root: Path, edits: list[tuple[str, str]], declarations=None):
     return planned
 
 
-def _apply_and_build(capsys, planned: dict) -> dict:
+def _apply_and_build(capsys, planned: dict, accept: str | None = None) -> dict:
     plan_id = planned["data"]["plan_id"]
-    assert _dex(capsys, "transform", "apply", plan_id)["status"] == "ok"
+    flags = ["--accept-population-change", accept] if accept else []
+    applied = _dex(capsys, "transform", "apply", plan_id, *flags)
+    assert applied["status"] == "ok", applied["errors"]
     built = _dex(
         capsys,
         "transform",
@@ -269,7 +271,12 @@ def test_an_extraction_that_drops_parents_is_flagged(project, capsys):
             ),
         ],
     )
-    built = _apply_and_build(capsys, planned)
+    # The extraction moves the roster's driving relation and records no
+    # assumption, so apply refuses it until the caller says why (#1230).
+    refused = _dex(capsys, "transform", "apply", planned["data"]["plan_id"])
+    assert refused["status"] == "error"
+    assert refused["data"]["undeclared_population_changes"]
+    built = _apply_and_build(capsys, planned, accept="extraction under test")
     record = _delta(built, "int_conversation_parts")
     assert record["status"] == "needs_decision"
     assert record["measured"]["missing_parents"] == 1
@@ -312,11 +319,24 @@ def test_redriving_an_applied_model_needs_a_request_or_contract(project, capsys)
         "conversation_summary"
         in planned["data"]["change_scope"]["population"]["changed"]
     )
-    built = _apply_and_build(capsys, planned)
+    refused = _dex(capsys, "transform", "apply", planned["data"]["plan_id"])
+    assert refused["status"] == "error"
+    assert {
+        "model": "conversation_summary",
+        "kind": "redriven",
+        "reason": "redriven",
+    } in (refused["data"]["undeclared_population_changes"])
+    built = _apply_and_build(capsys, planned, accept="re-driving under test")
     scope = built["data"]["completion"]["obligations"]["change_scope"]
-    assert {"model": "conversation_summary", "change": "redriven"}.items() <= next(
-        o for o in scope if o.get("change") == "redriven"
-    ).items()
+    redrive = next(o for o in scope if o.get("change") == "redriven")
+    assert {"model": "conversation_summary", "status": "accepted"}.items() <= (
+        redrive.items()
+    )
+    # Accepted, so it does not keep the change open.
+    assert not any(
+        u["reason"] == "undeclared_population_change"
+        for u in built["data"]["completion"].get("unverified") or []
+    )
 
 
 def test_redriving_a_model_an_earlier_plan_wrote_is_flagged(project, capsys):

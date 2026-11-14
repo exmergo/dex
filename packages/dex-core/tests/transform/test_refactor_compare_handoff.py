@@ -190,6 +190,7 @@ def test_the_inner_join_extraction_is_different_and_recorded(accounts):
         {
             "model": "account_summary",
             "static_attribution": "unattributed",
+            "baseline_ready": True,
             "status": "different",
             "reason_code": "rows_differ",
             "compared_at": result.compared_at,
@@ -282,6 +283,7 @@ def test_a_for_plan_build_carries_the_recorded_verdict(accounts):
             "inputs_built_by": engine.store.load_plan(planned.plan_id).comparisons[
                 "account_summary"
             ]["inputs_built_by"],
+            "baseline_ready": True,
         }
     ]
 

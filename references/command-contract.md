@@ -319,6 +319,10 @@ dex transform apply [plan-id]     -> write diffs into the dbt project (a reviewa
                                      Co-authored-by line the commit of those files ends with;
                                      data.refactor_comparison reports each rewritten model's recorded
                                      comparison verdict or not_compared, never enforced
+                                     A stored plan with an undeclared population change is refused
+                                     (reason: request, data.undeclared_population_changes) until an
+                                     assumption records it or --accept-population-change "<reason>"
+                                     accepts it, recorded on the plan (#1230)
 dex transform plans               -> list stored plans, pending and applied, newest first
 dex transform references <name>   -> where each name is used: model SQL, schema.yml, dbt_project.yml,
   [more...] [--kind K] [--full]      macros, semantic YAML, seed headers, installed packages. Repo-only
@@ -448,6 +452,12 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      stale, failed and not_run are all distinguishable from
                                      validated. A node status outside dbt's known words is
                                      indeterminate: never built, never validated, not a failure.
+                                     built_unverified replaces validated where a named plan left
+                                     part of the change open (data.completion.unverified, #1230);
+                                     data.evidence.outcome keeps validated. With --verify and a plan,
+                                     findings carry attribution (introduced, unattributed, existing),
+                                     introduced first, judged against the last --verify build before
+                                     the plan was applied (data.verification.introduced, .attribution)
                                      data.evidence carries the invocation, typed per-node statuses,
                                      the selection asked for against what it got, the manifest and
                                      run-results digests, the relations this run's successful nodes
@@ -1306,7 +1316,11 @@ default, or a filter or operator after it is refused. A key naming a location
 - `transform apply [plan-id]` re-hashes every file first. A file edited by a
   human after the plan was made is a **conflict**: nothing is written, the
   divergence is returned as diffs with `needs_confirmation`, and only an explicit
-  `--confirm` overrides it. An apply is all-or-nothing across the whole plan: one
+  `--confirm` overrides it. A stored plan whose change scope records an
+  undeclared population change is refused before anything is hashed (#1230),
+  naming each change under `data.undeclared_population_changes`; an assumption
+  naming its column, or `--accept-population-change "<reason>"` recorded on the
+  plan, settles it. An apply is all-or-nothing across the whole plan: one
   conflict refuses the set, so the clean edits beside it do not land either. The
   stored paths are re-checked against the project format's editing surface at the
   same time, and a path outside it is refused outright rather than surfaced for
@@ -1413,7 +1427,14 @@ default, or a filter or operator after it is refused. A key naming a location
   differently. `indeterminate` is a run where nothing failed and a node reported a
   status dex does not recognize (`partial success`, `no-op`): such a node is never
   counted as built and never read as a pass, and a required one is listed under
-  `data.completion.deliverables.unrecognized`. `data.evidence` is where the
+  `data.completion.deliverables.unrecognized`. `built_unverified` (#1230) is
+  `validated` with part of a named change still open, each reason under
+  `data.completion.unverified`: a rewrite applied uncompared while its baseline
+  was ready, an undeclared population change apply did not accept, or a
+  high-severity finding the plan introduced (or, with no baseline, one on a
+  model it edited). It is set on `data.outcome` and `data.completion.outcome`;
+  `data.evidence.outcome` keeps `validated`, since a host recomputes that one
+  from the evidence alone. `data.evidence` is where the
   reasoning lives: the dbt invocation, per-node status and materialization and
   relation, what the selection asked for against what it matched, the manifest
   and run-results digests, the relations the run's successful nodes generated

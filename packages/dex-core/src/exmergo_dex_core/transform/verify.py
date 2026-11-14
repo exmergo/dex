@@ -31,6 +31,7 @@ a standalone sweep:
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     from ..engine import DexEngine
     from ..maintain.drift import DriftFinding
     from ..results import ConfirmationRequest
+    from .finding_attribution import AttributionInput
 
 # What a build's findings are worth reading in one sitting. A build that trips
 # this many detectors has one upstream cause, and the tail is the same cause
@@ -100,6 +102,16 @@ class BuildVerification:
     #: Findings ranked below :data:`MAX_FINDINGS` and left out of ``findings``,
     #: counted so a summary can say the list is not the whole answer.
     dropped: int = 0
+    #: Which findings the plan introduced (#1230): one entry per finding in
+    #: ``findings``, in the same order, and empty when no plan was named.
+    finding_attribution: list[Any] = field(default_factory=list)
+    #: The introduced findings, as references into ``findings``, and what the
+    #: classification rested on; ``None`` when no plan was named.
+    introduced: list[dict[str, Any]] | None = None
+    attribution: dict[str, Any] | None = None
+    #: Every finding's fingerprint, the capped tail included, which is what the
+    #: sweep history records as the next build's baseline.
+    fingerprints: list[str] = field(default_factory=list)
 
     def payload(self) -> dict[str, Any]:
         """Serialize the measured build checks and their explicit suppressions."""
@@ -110,10 +122,15 @@ class BuildVerification:
             "ran": True,
             "scope": self.scope,
             "scope_not_built": self.scope_not_built,
-            "findings": [f.model_dump(mode="json") for f in self.findings],
+            "findings": self._findings(),
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.attribution is not None:
+            # Ahead of the per-record lists: what the plan introduced is the
+            # part of the sweep a reader must not miss (#1230).
+            payload["introduced"] = self.introduced or []
+            payload["attribution"] = self.attribution
         if self.join_coverage is not None:
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:
@@ -131,6 +148,16 @@ class BuildVerification:
         if self.model_versions:
             payload["model_versions"] = self.model_versions
         return payload
+
+    def _findings(self) -> list[dict[str, Any]]:
+        """Each finding, with its attribution where the build named a plan."""
+
+        dumped = [f.model_dump(mode="json") for f in self.findings]
+        if len(self.finding_attribution) == len(dumped):
+            for entry, judged in zip(dumped, self.finding_attribution, strict=True):
+                entry["attribution"] = judged.attribution
+                entry["attribution_basis"] = judged.basis
+        return dumped
 
 
 def built_models(summary: dict[str, Any]) -> dict[str, str]:
@@ -286,6 +313,7 @@ def verify_build(
     toggle: dict[str, Any] | None = None,
     plan_edits: list[Any] | None = None,
     selection: str | None = None,
+    attribution: AttributionInput | None = None,
 ) -> BuildVerification:
     """Sweep the nodes this build ran, and report what it could not sweep.
 
@@ -301,6 +329,10 @@ def verify_build(
 
     ``selection`` carries the build selector, when one was used, so
     declared-fact checks can attribute missing parents to narrow selection.
+
+    ``attribution`` is the named plan's edits and the sweep recorded before it
+    was applied: with it, each finding is classified ``introduced``,
+    ``unattributed`` or ``existing`` before the list is capped (#1230).
 
     Never raises except on a cost-guard refusal, which is re-raised untouched:
     a build that has already run must report what it found, so every other
@@ -415,9 +447,16 @@ def verify_build(
     result.findings = verify_mod.damp_fanout(result.findings, proven)
 
     result.findings = drift_mod.rank_findings(findings + result.findings)
+    _attribute(project_dir, attribution, result)
     if len(result.findings) > MAX_FINDINGS:
         dropped = len(result.findings) - MAX_FINDINGS
         result.dropped = dropped
+        if result.attribution is not None:
+            cut = Counter(
+                a.attribution for a in result.finding_attribution[MAX_FINDINGS:]
+            )
+            result.attribution["dropped"] = dict(sorted(cut.items()))
+            result.finding_attribution = result.finding_attribution[:MAX_FINDINGS]
         result.findings = result.findings[:MAX_FINDINGS]
         result.warnings.append(
             f"{dropped} further finding(s) are not listed: a build reporting "
@@ -425,6 +464,45 @@ def verify_build(
             "model, so fix the ranked ones and re-run"
         )
     return result
+
+
+def _attribute(
+    project_dir: Path,
+    given: AttributionInput | None,
+    result: BuildVerification,
+) -> None:
+    """Split the ranked findings into what the plan introduced and the rest
+    (#1230), before the cap, so an introduced finding is never the one cut.
+
+    Introduced findings lead, then the ones nothing can place, then the ones
+    that were there before, each class keeping its own ranking. Total: a
+    manifest that cannot be read only loses the lineage rule.
+    """
+
+    from . import finding_attribution as attr
+
+    result.fingerprints = [attr.fingerprint(f) for f in result.findings]
+    if given is None:
+        return
+    reach: attr.Reach | None = None
+    try:
+        import json
+
+        from ..dbt_project import manifest_file
+
+        manifest = json.loads(manifest_file(project_dir).read_text(encoding="utf-8"))
+        reach = attr.plan_reach(given.edits, manifest)
+    except (OSError, ValueError):
+        reach = None
+    ordered, judged = attr.attribute(result.findings, given.baseline, reach)
+    result.findings = ordered
+    result.finding_attribution = judged
+    result.introduced = attr.introduced_refs(ordered, judged)
+    result.attribution = attr.summary(ordered, judged, given, reach)
+    # Read before the findings cap, which can cut them from `findings`.
+    result.attribution["unattributed_high"] = attr.unattributed_high_refs(
+        ordered, judged
+    )
 
 
 def _judgeable(
