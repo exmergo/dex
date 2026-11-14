@@ -47,15 +47,18 @@ from .evidence import (
     SKIPPED_STATUSES,
     BuildEvidence,
     BuildNode,
+    BuildOutcome,
     status_kind,
 )
 
 __all__ = [
+    "BUILT_UNVERIFIED",
     "COMPLETION_BUDGET_BYTES",
     "BuildCompletion",
     "FailedCheck",
     "FailedChecks",
     "NameList",
+    "Unverified",
     "node_answers",
     "summarize_completion",
 ]
@@ -222,6 +225,27 @@ class FindingRef(BaseModel):
     code: str
     identifier: str
     severity: str
+    #: ``introduced``, ``unattributed`` or ``existing`` on a ``--for-plan``
+    #: build (#1230); absent otherwise.
+    attribution: str | None = None
+
+
+class Unverified(BaseModel):
+    """One reason a build that validated is still not a finished change (#1230).
+
+    ``reason`` is ``comparison_not_run`` (a rewrite applied uncompared while
+    its baseline was ready), ``undeclared_population_change`` (a population
+    change no assumption records and apply did not accept),
+    ``introduced_high_finding`` (a high-severity finding this plan introduced)
+    or ``unattributed_high_finding`` (a high-severity finding on a model the
+    plan edited that no baseline places before the plan).
+    """
+
+    model: str
+    reason: str
+    #: The change-scope kind, or the finding code, the reason is about.
+    detail: str | None = None
+    column: str | None = None
 
 
 class VerificationSummary(BaseModel):
@@ -230,6 +254,11 @@ class VerificationSummary(BaseModel):
 
     ran: bool = False
     reason: str | None = None
+    #: On a ``--for-plan`` build (#1230): the findings this plan introduced,
+    #: ahead of ``top``, and every finding counted by attribution. The baseline
+    #: they were judged against is under ``data.verification.attribution``.
+    introduced: list[FindingRef] | None = None
+    by_attribution: dict[str, int] | None = None
     finding_count: int = 0
     findings_dropped: int = 0
     by_severity: dict[str, int] = Field(default_factory=dict)
@@ -328,12 +357,18 @@ class ComparisonState(BaseModel):
     #: invocation, when it ran, and whether it was a `--cold-deps` build. One
     #: run; other inputs may come from earlier builds.
     inputs_built_by: dict[str, Any] | None = None
+    #: Whether the plan's comparison offer found the baseline ready to compare
+    #: (#1114); recorded at plan time, ``None`` on a plan stored before it.
+    baseline_ready: bool | None = None
 
 
 class BuildCompletion(BaseModel):
     """The bounded lead of a build payload. See the module docstring."""
 
     outcome: str
+    #: Why a build whose evidence reads ``validated`` is ``built_unverified``
+    #: (#1230): each unfinished part of the change, by model. Absent when none.
+    unverified: list[Unverified] | None = None
     process: dict[str, Any] = Field(default_factory=dict)
     change: ChangeRef = Field(default_factory=ChangeRef)
     deliverables: Deliverables = Field(default_factory=Deliverables)
@@ -671,19 +706,39 @@ def _verification(
         )
     findings = list(verification.get("findings") or [])
     severities = Counter(str(f.get("severity") or "unknown") for f in findings)
-    return VerificationSummary(
-        ran=True,
-        finding_count=len(findings) + dropped,
-        findings_dropped=dropped,
-        by_severity=dict(sorted(severities.items())),
-        top=[
+    attribution = verification.get("attribution")
+
+    def ref(f: Mapping[str, Any]) -> FindingRef:
+        return FindingRef(
+            code=str(f.get("code") or ""),
+            identifier=str(f.get("identifier") or ""),
+            severity=str(f.get("severity") or ""),
+            attribution=f.get("attribution"),
+        )
+
+    introduced = None
+    by_attribution = None
+    if isinstance(attribution, Mapping):
+        # Every introduced finding, the ones past the findings cap too: the
+        # sweep lists them ahead of the rest, so the cap cuts existing first.
+        introduced = [
             FindingRef(
                 code=str(f.get("code") or ""),
                 identifier=str(f.get("identifier") or ""),
                 severity=str(f.get("severity") or ""),
             )
-            for f in findings[:_NAMES]
-        ],
+            for f in verification.get("introduced") or []
+        ][:_NAMES]
+        # Counted before the findings cap, so a cut finding is still counted.
+        by_attribution = dict(sorted((attribution.get("counts") or {}).items()))
+    return VerificationSummary(
+        ran=True,
+        introduced=introduced,
+        by_attribution=by_attribution,
+        finding_count=len(findings) + dropped,
+        findings_dropped=dropped,
+        by_severity=dict(sorted(severities.items())),
+        top=[ref(f) for f in findings[:_NAMES]],
         suppressed=sorted((verification.get("suppressed") or {}).keys()),
         offered=offered,
     )
@@ -751,6 +806,7 @@ def summarize_completion(
     change_scope: Mapping[str, list[Mapping[str, Any]]] | None = None,
     incremental_replay: Mapping[str, Mapping[str, Any]] | None = None,
     repair: Mapping[str, Any] | None = None,
+    population_accepted: Mapping[str, Any] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -769,7 +825,15 @@ def summarize_completion(
     incremental model the plan edited to ``tests`` (the unique ids of its unit
     tests that override ``is_incremental`` to true) and ``full_refreshed``
     (whether this build full-refreshed it) (#1130).
+
+    ``population_accepted`` is what ``transform apply
+    --accept-population-change`` recorded on the plan: the reason and the
+    population changes it accepted (#1230). ``outcome`` is
+    ``built_unverified`` where the evidence reads ``validated`` and any reason
+    under ``unverified`` stands; the evidence's own outcome is unchanged.
     """
+
+    from .change_scope import accepted_key
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
@@ -810,8 +874,13 @@ def summarize_completion(
     completion.obligations.identifier_conversions = (
         _conversion_obligations(identifier_conversions, evidence) or None
     )
+    accepted = {
+        accepted_key(entry)
+        for entry in (population_accepted or {}).get("changes") or []
+        if isinstance(entry, Mapping)
+    }
     completion.obligations.change_scope = (
-        _scope_obligations(change_scope, evidence) or None
+        _scope_obligations(change_scope, evidence, accepted) or None
     )
     completion.obligations.incremental_replay = (
         _replay_obligations(incremental_replay, evidence) or None
@@ -822,6 +891,11 @@ def summarize_completion(
     completion.obligations.repair = (
         _repair_obligations(repair, evidence, graph, verification, cold) or None
     )
+    completion.unverified = (
+        _unverified(completion, comparisons, verification, evidence) or None
+    )
+    if completion.unverified and completion.outcome == BuildOutcome.VALIDATED.value:
+        completion.outcome = BUILT_UNVERIFIED
     if prerequisites:
         completion.details = ["data.prerequisites", *completion.details]
     if cold is not None:
@@ -866,14 +940,23 @@ def _conversion_obligations(
 def _scope_obligations(
     recorded: Mapping[str, list[Mapping[str, Any]]] | None,
     evidence: BuildEvidence,
+    accepted: Iterable[tuple[str, str, str]] = (),
 ) -> list[Obligation]:
     """The plan's change-scope entries no assumption settles, on the models the
-    change requires (every recorded model where coverage is unknown)."""
+    change requires (every recorded model where coverage is unknown).
+
+    A population change ``transform apply --accept-population-change`` accepted
+    is ``accepted`` rather than ``undeclared`` (#1230): settled by a recorded
+    decision, and still listed so the decision stays in view.
+    """
+
+    from .change_scope import accepted_key, is_population_change
 
     if not recorded:
         return []
     coverage = evidence.coverage
     required = set(coverage.required) if coverage is not None else None
+    taken = set(accepted)
     out = []
     for model, changes in sorted(recorded.items()):
         if required and model not in required:
@@ -882,6 +965,12 @@ def _scope_obligations(
             status = str(change.get("status") or "unknown")
             if status == "declared":
                 continue
+            if (
+                status == "undeclared"
+                and is_population_change(change)
+                and accepted_key({**change, "model": model}) in taken
+            ):
+                status = "accepted"
             out.append(
                 Obligation(
                     model=model,
@@ -1012,6 +1101,87 @@ def _comparison_obligations(
             )
         )
     return out
+
+
+#: The outcome of a build that validated with part of the change unfinished
+#: (#1230). Between ``validated`` and a failure: dbt built every deliverable,
+#: and something the change owed is still open. ``failed`` stays reserved for
+#: a build that failed.
+BUILT_UNVERIFIED = "built_unverified"
+
+
+def _unverified(
+    completion: BuildCompletion,
+    comparisons: list[ComparisonState] | None,
+    verification: Mapping[str, Any] | None,
+    evidence: BuildEvidence,
+) -> list[Unverified]:
+    """What keeps a validated build of a named change from being finished.
+
+    Read from the obligations already summarized and the sweep's attribution,
+    so it can never disagree with them. Only a build for a named plan has a
+    change to be unfinished.
+    """
+
+    from .change_scope import is_population_change
+
+    if completion.deliverables.coverage != "known":
+        return []
+    ready = {state.model: state.baseline_ready for state in comparisons or []}
+    # `compared_elsewhere` is a comparison of another rewrite in the plan,
+    # which may be what checks the results this one keeps (#1049), so only a
+    # plain `not_compared` counts, and only where the baseline was ready.
+    out = [
+        Unverified(model=item.model, reason="comparison_not_run")
+        for item in completion.obligations.comparison or []
+        if item.reason_code == "not_compared" and ready.get(item.model) is True
+    ]
+    out.extend(
+        Unverified(
+            model=item.model,
+            reason="undeclared_population_change",
+            detail=item.change,
+            column=item.column,
+        )
+        for item in completion.obligations.change_scope or []
+        if item.status == "undeclared" and is_population_change({"kind": item.change})
+    )
+    if not verification or not verification.get("ran"):
+        return out
+    out.extend(
+        Unverified(
+            model=str(ref.get("identifier") or ""),
+            reason="introduced_high_finding",
+            detail=ref.get("code"),
+            column=ref.get("column"),
+        )
+        for ref in verification.get("introduced") or []
+        if ref.get("severity") == "high"
+    )
+    # Without a baseline, a high finding on a model the plan edited cannot be
+    # shown to predate it; the plan's own models are where that matters.
+    required = _required(evidence) or set()
+    out.extend(
+        Unverified(
+            model=str(finding["identifier"]),
+            reason="unattributed_high_finding",
+            detail=finding.get("code"),
+            column=finding.get("column"),
+        )
+        for finding in verification.get("findings") or []
+        if finding.get("attribution") == "unattributed"
+        and finding.get("severity") == "high"
+        and finding.get("identifier") in required
+    )
+    # One entry per model and reason: the findings themselves are listed
+    # under `verification`, and the block's bytes are better spent there.
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for item in out:
+        if (item.model, item.reason) not in seen:
+            seen.add((item.model, item.reason))
+            unique.append(item)
+    return unique
 
 
 _ROW_FINDINGS = frozenset({"row_loss", "row_fanout"})
@@ -1203,6 +1373,8 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             setattr(owner, field, items[:keep])
 
     cap_list(completion, "blockers", _NAMES, "blockers")
+    if completion.unverified is not None:
+        cap_list(completion, "unverified", _NAMES, "unverified")
     cap_list(completion.deliverables, "blocked", _NAMES, "deliverables.blocked")
     cap_list(completion.obligations, "contradicted", _NAMES, "obligations.contradicted")
     cap_list(completion.obligations, "unchecked", _NAMES, "obligations.unchecked")
@@ -1260,6 +1432,17 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
                 completion.obligations, listed, max(keep, 1), f"obligations.{listed}"
             )
         cap_list(completion.verification, "top", keep, "verification.top")
+        # What the plan introduced and why the change is unfinished are the
+        # answer the block is for, so each keeps one entry to the end (#1230).
+        if completion.verification.introduced is not None:
+            cap_list(
+                completion.verification,
+                "introduced",
+                max(keep, 1),
+                "verification.introduced",
+            )
+        if completion.unverified is not None:
+            cap_list(completion, "unverified", max(keep, 1), "unverified")
         cap_list(
             completion.assurance.failed_checks,
             "checks",
@@ -1314,3 +1497,10 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         completion.elided = dict(elided)
         if completion.size() <= budget:
             return
+    # Then the introduced findings and the unfinished reasons, last of all:
+    # `outcome` still says `built_unverified`, and `elided` counts what went.
+    if completion.verification.introduced is not None:
+        cap_list(completion.verification, "introduced", 0, "verification.introduced")
+    if completion.unverified is not None:
+        cap_list(completion, "unverified", 0, "unverified")
+    completion.elided = dict(elided)

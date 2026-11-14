@@ -1249,8 +1249,12 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
             {
                 k: v
                 for k, v in (
+                    ("axis", c.get("axis")),
                     ("kind", c.get("kind")),
                     ("column", c.get("column")),
+                    # The columns a population change's predicate or join
+                    # reads: what the assumption that settles it names (#1230).
+                    ("columns", c.get("columns") or None),
                     ("status", c.get("status")),
                     ("reason", c.get("reason")),
                 )
@@ -1274,3 +1278,59 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
     for model in (report or {}).get("beyond_cap") or []:
         out[model] = [{"kind": "elided", "status": "unchecked"}]
     return out
+
+
+#: Stored entries that record what could not be read rather than a change.
+_UNREAD = frozenset({"unread", "elided"})
+
+
+def is_population_change(entry: Mapping[str, Any]) -> bool:
+    """Whether one stored change-scope entry moves the model's rows.
+
+    A plan stored before the entry carried its ``axis`` is read by kind: every
+    judged kind but the output ones is a population change.
+    """
+
+    axis = entry.get("axis")
+    if axis is not None:
+        return axis == "population"
+    kind = str(entry.get("kind") or "")
+    return bool(kind) and kind not in JUDGED and kind not in _UNREAD
+
+
+def undeclared_population_changes(
+    stored: Mapping[str, list[Mapping[str, Any]]] | None,
+) -> list[dict[str, Any]]:
+    """Each undeclared population change a plan recorded, as ``{model, kind,
+    column, reason}``: the changes ``transform apply`` holds to an assumption or
+    an explicit acceptance (#1230)."""
+
+    out: list[dict[str, Any]] = []
+    for model, entries in sorted((stored or {}).items()):
+        for entry in entries or []:
+            if entry.get("status") != "undeclared" or not is_population_change(entry):
+                continue
+            out.append(
+                {
+                    k: v
+                    for k, v in (
+                        ("model", model),
+                        ("kind", entry.get("kind")),
+                        ("column", entry.get("column")),
+                        ("columns", entry.get("columns") or None),
+                        ("reason", entry.get("reason")),
+                    )
+                    if v is not None
+                }
+            )
+    return out
+
+
+def accepted_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:
+    """How an accepted population change is matched to a stored entry."""
+
+    return (
+        str(entry.get("model") or ""),
+        str(entry.get("kind") or ""),
+        str(entry.get("column") or ""),
+    )

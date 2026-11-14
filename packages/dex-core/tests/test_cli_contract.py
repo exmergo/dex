@@ -714,6 +714,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "argument": _TRANSLATED,
             "plan_file": _TRANSLATED,
             "expect_digest": "expect_digest",
+            "accept_population_change": "accept_population_change",
         },
     },
     ("transform", "build"): {

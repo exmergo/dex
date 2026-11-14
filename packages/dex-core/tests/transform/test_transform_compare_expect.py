@@ -242,7 +242,8 @@ def test_the_recorded_verdict_settles_the_builds_comparison_obligation(project):
     engine = _engine(project)
     plan_id = _plan(engine, "scans", _ALL_SCANS)
     engine.compare(plan_id, key_columns=["scan_id"], expectation=LATE)
-    engine.apply(plan_id)
+    # An intended change: the expectation states which rows move (#1230).
+    engine.apply(plan_id, accept_population_change="late scans are the request")
     built = _engine(project).build(target="dev", for_plan=plan_id)
     obligations = built.data()["completion"]["obligations"]
     assert obligations["comparison"] == [
@@ -253,7 +254,8 @@ def test_the_recorded_verdict_settles_the_builds_comparison_obligation(project):
 def test_an_intended_change_applied_uncompared_is_an_open_obligation(project):
     engine = _engine(project)
     plan_id = _plan(engine, "scans", _ALL_SCANS)
-    engine.apply(plan_id)
+    # An intended change: the expectation states which rows move (#1230).
+    engine.apply(plan_id, accept_population_change="late scans are the request")
     built = _engine(project).build(target="dev", for_plan=plan_id)
     assert built.data()["completion"]["obligations"]["comparison"] == [
         {
