@@ -116,6 +116,10 @@ ALLOWED_COMMANDS = frozenset(
         "explore diagram",
         "explore query",
         "explore semantic list",
+        # Names and counts from the parsed manifest; a generic test is named by
+        # the test it applies, never by its node name, which can carry the
+        # values an accepted_values test accepts (#1280).
+        "maintain coverage",
         # Package text and marker checks on instruction files; no table is read.
         "procedure",
         # Versions, the platform and the connector's name; no table is read.

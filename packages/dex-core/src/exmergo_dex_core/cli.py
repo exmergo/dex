@@ -117,6 +117,9 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # verify: is the project correct right now, no baseline required
         # (#224), unlike every other maintain subcommand above.
         "verify",
+        # coverage: which resources the dbt tests reach, from the manifest
+        # alone (#1280); free and connectionless, no baseline required.
+        "coverage",
     ],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
@@ -554,6 +557,12 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "Check build status, column contracts, row population, grain and join "
         "contracts against the built relations. Mostly free metadata; view row "
         "counts and join probes are offered with an estimate.",
+    ),
+    ("maintain", "coverage"): (
+        "inventory the tests the dbt project declares",
+        "Count each model's, source's, snapshot's and seed's own tests by kind, "
+        "its downstream tests, incremental branch tests and asserted columns, "
+        "each against a stated denominator. Free; reads the manifest only.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -1641,6 +1650,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "grain",
                     "semantic",
                     "verify",
+                    "coverage",
                 }:
                     sp.add_argument(
                         "objects",
@@ -1650,6 +1660,9 @@ def _build_parser() -> argparse.ArgumentParser:
                             "model names: repeated, comma-separated or "
                             "space-separated (default: all)"
                             if name == "verify"
+                            else "model, source.table, snapshot or seed names "
+                            "(default: all)"
+                            if name == "coverage"
                             else "object to check (default: the whole project)"
                         ),
                     )
@@ -1661,6 +1674,13 @@ def _build_parser() -> argparse.ArgumentParser:
                             "dbt dev target to verify against; "
                             "prod-looking targets are refused"
                         ),
+                    )
+                if group == "maintain" and name == "coverage":
+                    sp.add_argument(
+                        "--full",
+                        action="store_true",
+                        default=False,
+                        help="lift the caps on every listed section and name",
                     )
                 if group == "maintain" and name == "reconcile":
                     sp.add_argument(
@@ -1796,7 +1816,11 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # Project-only snapshot refreshes use only the store and project seam;
         # requiring a warehouse dialect here would make a zero-connection path
         # depend on the very connector it deliberately does not touch.
-        if not (args.subcommand == "snapshot" and getattr(args, "project_only", False)):
+        # `coverage` reads a parsed manifest and nothing else (#1280).
+        connectionless = args.subcommand == "coverage" or (
+            args.subcommand == "snapshot" and getattr(args, "project_only", False)
+        )
+        if not connectionless:
             ensure_dialect_available()
         from .maintain import commands as maintain_cmds
 
@@ -1809,6 +1833,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "semantic": maintain_cmds.cmd_semantic,
             "reconcile": maintain_cmds.cmd_reconcile,
             "verify": maintain_cmds.cmd_verify,
+            "coverage": maintain_cmds.cmd_coverage,
         }
         return handlers[args.subcommand](args, engine)
 

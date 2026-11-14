@@ -1,0 +1,24 @@
+{
+  "definitions": [
+    {
+      "kind": "semantic_model",
+      "path": "models/marts/fct_orders_semantic.yml",
+      "content": "name: fct_orders\ndescription: 'One row per order, all statuses; booked amount is not recognized revenue. Population: One row per order, all statuses; booked amount is not recognized revenue.'\nmodel: ref('fct_orders')\ndefaults:\n  agg_time_dimension: ordered_at\nentities:\n  - name: order\n    type: primary\n    expr: order_id\n  - name: customer\n    type: foreign\n    expr: customer_id\ndimensions:\n  - name: status\n    type: categorical\n  - name: ordered_at\n    type: time\n    type_params:\n      time_granularity: day\n    config:\n      meta:\n        dex:\n          null_rule: never\n  - name: country_code\n    type: categorical\nmeasures:\n  - name: order_total\n    agg: sum\n    expr: order_total\n    config:\n      meta:\n        dex:\n          unit: demo_currency_units\n          null_rule: never\n  - name: order_count\n    agg: sum\n    expr: order_count\n    config:\n      meta:\n        dex:\n          unit: count\n          null_rule: never\nconfig:\n  meta:\n    dex:\n      population:\n        rule: One row per order, all statuses; booked amount is not recognized revenue.\n        parent:\n          model: stg_orders\n          key:\n            order_id: order_id\n      assumptions:\n        - decision: Population\n          chosen: One row per order, all statuses; booked amount is not recognized revenue.\n          evidence: default\n          detail: Preserve every entity from the driving relation.\n          column: order_id\n"
+    },
+    {
+      "kind": "metric",
+      "path": "models/marts/metrics.yml",
+      "content": "name: orders\nlabel: Orders\ndescription: All-status order analytics in demo currency units where applicable.\ntype: simple\ntype_params:\n  measure: order_count\n"
+    },
+    {
+      "kind": "metric",
+      "path": "models/marts/metrics.yml",
+      "content": "name: booked_amount\nlabel: Booked amount\ndescription: All-status order analytics in demo currency units where applicable.\ntype: simple\ntype_params:\n  measure: order_total\n"
+    },
+    {
+      "kind": "metric",
+      "path": "models/marts/metrics.yml",
+      "content": "name: average_order_value\nlabel: Average order value\ndescription: All-status order analytics in demo currency units where applicable.\ntype: ratio\ntype_params:\n  numerator: booked_amount\n  denominator: orders\n"
+    }
+  ]
+}

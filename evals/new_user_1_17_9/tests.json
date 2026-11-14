@@ -1,0 +1,29 @@
+{
+  "edits": [
+    {
+      "path": "models/marts/test_dim_customers.yml",
+      "kind": "schema_yml",
+      "content": "version: 2\nunit_tests:\n  - name: customer_rollup_preserves_empty_and_all_statuses\n    model: dim_customers\n    given:\n      - input: ref('stg_customers')\n        rows:\n          - {customer_id: 1, country_code: IT, signup_date: '2024-01-01'}\n          - {customer_id: 2, country_code: DE, signup_date: '2024-01-02'}\n          - {customer_id: 3, country_code: FR, signup_date: '2024-01-03'}\n      - input: ref('stg_orders')\n        rows:\n          - {order_id: 1, customer_id: 1, status: paid, order_total: 10, ordered_at: '2024-02-01 12:00:00'}\n          - {order_id: 2, customer_id: 1, status: cancelled, order_total: 25, ordered_at: '2024-02-02 12:00:00'}\n          - {order_id: 3, customer_id: 2, status: placed, order_total: 7, ordered_at: '2024-02-03 12:00:00'}\n    expect:\n      rows:\n        - {customer_id: 1, country_code: IT, signup_date: '2024-01-01', order_count: 2, booked_amount: 35}\n        - {customer_id: 2, country_code: DE, signup_date: '2024-01-02', order_count: 1, booked_amount: 7}\n        - {customer_id: 3, country_code: FR, signup_date: '2024-01-03', order_count: 0, booked_amount: 0}\n"
+    },
+    {
+      "path": "tests/assert_staging_preserves_sources.sql",
+      "kind": "test_sql",
+      "content": "with expected as (\n select order_id, customer_id, status, order_total, cast(placed_at as timestamp) as ordered_at from {{ source('demo', 'orders') }}\n), differences as (\n (select * from expected except all select * from {{ ref('stg_orders') }})\n union all\n (select * from {{ ref('stg_orders') }} except all select * from expected)\n)\nselect * from differences\n"
+    },
+    {
+      "path": "tests/assert_orders_reconcile_to_source.sql",
+      "kind": "test_sql",
+      "content": "with expected as (\n select o.order_id, o.customer_id, o.status, o.order_total, cast(o.placed_at as timestamp) as ordered_at, c.country_code, cast(1 as bigint) as order_count\n from {{ source('demo', 'orders') }} o left join {{ source('demo', 'customers') }} c on o.customer_id = c.customer_id\n), differences as (\n (select * from expected except all select * from {{ ref('fct_orders') }})\n union all\n (select * from {{ ref('fct_orders') }} except all select * from expected)\n)\nselect * from differences\n"
+    },
+    {
+      "path": "tests/assert_customer_rollup_reconciles.sql",
+      "kind": "test_sql",
+      "content": "with expected as (\n select c.customer_id, c.country_code, c.signup_date,\n count(o.order_id) as order_count, coalesce(sum(o.order_total),0) as booked_amount\n from {{ source('demo', 'customers') }} c left join {{ source('demo', 'orders') }} o on c.customer_id = o.customer_id\n group by c.customer_id, c.country_code, c.signup_date\n), differences as (\n (select * from expected except all select * from {{ ref('dim_customers') }})\n union all\n (select * from {{ ref('dim_customers') }} except all select * from expected)\n)\nselect * from differences\n"
+    },
+    {
+      "path": "tests/assert_time_spine_complete.sql",
+      "kind": "test_sql",
+      "content": "select count(*) as days from {{ ref('metricflow_time_spine') }}\nhaving count(*) <> 5844 or min(date_day) <> date '2020-01-01' or max(date_day) <> date '2035-12-31'\n or count(distinct date_day) <> count(*)\n"
+    }
+  ]
+}
