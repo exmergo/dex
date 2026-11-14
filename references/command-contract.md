@@ -672,8 +672,11 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      names: repeatable, comma-separated, or in one quoted argument
                                      separated by spaces ("a b"), none = every model. Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
-                                     through transitively skipped parents), nodes that warned rather
-                                     than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
+                                     through transitively skipped parents or a parent's failed test),
+                                     nodes with partial-success or unrecognized statuses (node_incomplete,
+                                     reported as incomplete rather than passed or failed), nodes that
+                                     warned rather than failed (node_warned), and models with no relation
+                                     in the warehouse. Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
                                      the compiled SQL through its CTE chain, naming each join beside
                                      its own key and stating both counts; a fan-out on a model whose

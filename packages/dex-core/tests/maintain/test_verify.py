@@ -160,11 +160,168 @@ def test_a_skipped_node_with_no_identifiable_cause_is_still_reported(tmp_path: P
 def test_a_successful_node_reports_nothing(tmp_path: Path):
     _write_artifacts(
         tmp_path,
-        nodes={"model.p.a": {"name": "a", "resource_type": "model"}},
-        results=[{"unique_id": "model.p.a", "status": "success"}],
+        nodes={
+            "model.p.a": {"name": "a", "resource_type": "model"},
+            "test.p.t": {"name": "t", "resource_type": "test"},
+        },
+        results=[
+            {"unique_id": "model.p.a", "status": "success"},
+            {"unique_id": "test.p.t", "status": "pass"},
+        ],
     )
     findings, notes = build_status_findings(tmp_path)
     assert findings == [] and notes == []
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["error", "runtime error", "fail", "failed", "Runtime Error", "FAILED"],
+)
+def test_known_failure_statuses_report_node_failed_and_trace_skipped_descendants(
+    tmp_path: Path, status: str
+):
+    """Issue #1317: build_status_findings reuses the shared failure allow-list
+    rather than {error, fail}, and skipped descendants walk back to the real
+    failed ancestor."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.grandparent": {"name": "grandparent", "resource_type": "model"},
+            "model.p.parent": {
+                "name": "parent",
+                "resource_type": "model",
+                "depends_on": {"nodes": ["model.p.grandparent"]},
+            },
+            "model.p.child": {
+                "name": "child",
+                "resource_type": "model",
+                "depends_on": {"nodes": ["model.p.parent"]},
+            },
+        },
+        results=[
+            {
+                "unique_id": "model.p.grandparent",
+                "status": status,
+                "message": "Database Error: boom",
+            },
+            {"unique_id": "model.p.parent", "status": "skipped"},
+            {"unique_id": "model.p.child", "status": "skipped"},
+        ],
+    )
+    findings, notes = build_status_findings(tmp_path)
+    assert notes == []
+    by_identifier = {f.identifier: f for f in findings}
+    assert set(by_identifier) == {"grandparent", "parent", "child"}
+    failed = by_identifier["grandparent"]
+    assert failed.code == "node_failed"
+    assert failed.severity == "high"
+    assert failed.data == {"status": status}
+    for descendant in ("parent", "child"):
+        skipped = by_identifier[descendant]
+        assert skipped.code == "node_skipped"
+        assert skipped.severity == "medium"
+        assert skipped.data == {"caused_by": "grandparent"}
+        assert "'grandparent' failed to build" in skipped.detail
+
+
+def test_a_node_skipped_by_a_failed_parent_test_names_that_test(tmp_path: Path):
+    """In `dbt build`, a model whose parent succeeded can be skipped because a
+    data test on that parent failed."""
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.parent": {"name": "parent", "resource_type": "model"},
+            "test.p.unique_parent_id.abc": {
+                "name": "unique_parent_id",
+                "resource_type": "test",
+                "depends_on": {"nodes": ["model.p.parent"]},
+            },
+            "model.p.child": {
+                "name": "child",
+                "resource_type": "model",
+                "depends_on": {"nodes": ["model.p.parent"]},
+            },
+        },
+        results=[
+            {"unique_id": "model.p.parent", "status": "success"},
+            {
+                "unique_id": "test.p.unique_parent_id.abc",
+                "status": "runtime error",
+                "message": "timeout",
+            },
+            {"unique_id": "model.p.child", "status": "skipped"},
+        ],
+    )
+    findings, notes = build_status_findings(tmp_path)
+    assert notes == []
+    by_identifier = {f.identifier: f for f in findings}
+    assert by_identifier["unique_parent_id"].code == "node_failed"
+    assert by_identifier["child"].code == "node_skipped"
+    assert by_identifier["child"].severity == "medium"
+    assert by_identifier["child"].data == {"caused_by": "unique_parent_id"}
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "expected_status"),
+    [
+        ("partial success", "partial success"),
+        ("Partial Success", "Partial Success"),
+        ("no-op", "no-op"),
+        ("unknown", "unknown"),
+        ("", "unknown"),
+        (None, "unknown"),
+        ("halted", "halted"),
+    ],
+)
+def test_partial_success_and_unrecognized_statuses_report_incomplete_not_failed(
+    tmp_path: Path, raw_status: str | None, expected_status: str
+):
+    """Issue #1317: microbatch partial-success and unrecognized statuses are
+    neither silently treated as clean nor indiscriminately labeled failures."""
+
+    record: dict = {"unique_id": "model.p.events"}
+    if raw_status is not None:
+        record["status"] = raw_status
+    record["message"] = (
+        "batch 2026-01-02: Could not convert string 'secret-token' to INT32"
+    )
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.events": {"name": "events", "resource_type": "model"},
+            "model.p.downstream": {
+                "name": "downstream",
+                "resource_type": "model",
+                "depends_on": {"nodes": ["model.p.events"]},
+            },
+        },
+        results=[
+            record,
+            {"unique_id": "model.p.downstream", "status": "skipped"},
+        ],
+    )
+    findings, notes = build_status_findings(tmp_path)
+    assert notes == []
+    by_identifier = {f.identifier: f for f in findings}
+    incomplete = by_identifier["events"]
+    assert incomplete.axis == "build"
+    assert incomplete.code == "node_incomplete"
+    assert incomplete.severity == "medium"
+    assert incomplete.data == {
+        "status": expected_status,
+        "status_kind": "unrecognized",
+    }
+    assert expected_status in incomplete.detail
+    assert "incomplete" in incomplete.detail
+    assert "secret-token" not in incomplete.detail
+    # A skipped child of an unrecognized node is not told its parent failed.
+    skipped = by_identifier["downstream"]
+    assert skipped.code == "node_skipped"
+    assert skipped.severity == "low"
+    assert skipped.data == {}
+    assert "failed to build" not in skipped.detail
 
 
 # --- missing_relation_findings: pure ---------------------------------------------
@@ -1251,6 +1408,103 @@ def test_verify_reports_a_failed_node_end_to_end(
     assert findings[0]["code"] == "node_failed"
     assert findings[0]["identifier"] == "stg_orders"
     assert "build_status" not in payload["data"]["suppressed"]
+
+
+def test_verify_reports_runtime_error_partial_success_and_warn_end_to_end(
+    maintain_repo, _assume_the_project_compiles
+):
+    """Issue #1317: standalone `maintain verify` surfaces runtime-error, failed,
+    partial-success, no-op, skipped and warn statuses without suppressing
+    build_status or duplicating no_relation, while retaining warn semantics."""
+
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.stg_runtime": {
+                "name": "stg_runtime",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."stg_runtime"',
+            },
+            "model.maintain_test.fct_downstream": {
+                "name": "fct_downstream",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_downstream"',
+                "depends_on": {"nodes": ["model.maintain_test.stg_runtime"]},
+            },
+            "model.maintain_test.fct_microbatch": {
+                "name": "fct_microbatch",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_microbatch"',
+            },
+            "model.maintain_test.fct_noop": {
+                "name": "fct_noop",
+                "resource_type": "model",
+                "relation_name": '"warehouse"."main"."fct_noop"',
+            },
+            "test.maintain_test.rel_warn.123": {
+                "name": "rel_warn",
+                "resource_type": "test",
+            },
+        },
+        results=[
+            {
+                "unique_id": "model.maintain_test.stg_runtime",
+                "status": "runtime error",
+                "message": "syntax error",
+            },
+            {
+                "unique_id": "model.maintain_test.fct_downstream",
+                "status": "skipped",
+            },
+            {
+                "unique_id": "model.maintain_test.fct_microbatch",
+                "status": "partial success",
+                "message": "1 of 4 batches errored",
+            },
+            {
+                "unique_id": "model.maintain_test.fct_noop",
+                "status": "no-op",
+            },
+            {
+                "unique_id": "test.maintain_test.rel_warn.123",
+                "status": "warn",
+                "message": "got 3 results, configured to warn if != 0",
+            },
+        ],
+    )
+    rc, payload = maintain_repo.dex("maintain", "verify")
+    assert rc == 0 and payload["status"] == "ok", payload
+    assert "build_status" not in payload["data"]["suppressed"]
+    by_id = {(f["identifier"], f["code"]): f for f in payload["data"]["findings"]}
+    assert ("stg_runtime", "node_failed") in by_id
+    assert by_id[("stg_runtime", "node_failed")]["severity"] == "high"
+    assert ("fct_downstream", "node_skipped") in by_id
+    assert (
+        by_id[("fct_downstream", "node_skipped")]["data"]["caused_by"] == "stg_runtime"
+    )
+    assert ("fct_microbatch", "node_incomplete") in by_id
+    assert by_id[("fct_microbatch", "node_incomplete")]["severity"] == "medium"
+    assert by_id[("fct_microbatch", "node_incomplete")]["data"] == {
+        "status": "partial success",
+        "status_kind": "unrecognized",
+    }
+    assert ("fct_noop", "node_incomplete") in by_id
+    assert ("rel_warn", "node_warned") in by_id
+    assert by_id[("rel_warn", "node_warned")]["severity"] == "low"
+    # Models already explained by build-status findings are not repeated as no_relation.
+    assert not any(
+        f["code"] == "no_relation"
+        and f["identifier"]
+        in {"stg_runtime", "fct_downstream", "fct_microbatch", "fct_noop"}
+        for f in payload["data"]["findings"]
+    )
+
+    # Model-scoped standalone verify keeps the incomplete finding for that model.
+    rc_scoped, scoped = maintain_repo.dex("maintain", "verify", "fct_microbatch")
+    assert rc_scoped == 0 and scoped["status"] == "ok", scoped
+    assert [(f["identifier"], f["code"]) for f in scoped["data"]["findings"]] == [
+        ("fct_microbatch", "node_incomplete")
+    ]
 
 
 def test_verify_reports_a_model_with_no_relation_end_to_end(

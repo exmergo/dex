@@ -448,11 +448,28 @@ def test_snapshot_execution_is_reported_apart_from_the_history_claim(tmp_path):
     assert record["status"] == "contradicted"
 
 
-def test_a_failed_snapshot_is_unchecked_rather_than_measured_stale(tmp_path):
-    result = _run(tmp_path, FLIPPING, [(1, 3, D4, D2)], run_status="error")
+@pytest.mark.parametrize(
+    ("run_status", "expected_execution"),
+    [
+        ("error", "error"),
+        ("runtime error", "runtime error"),
+        ("fail", "fail"),
+        ("failed", "failed"),
+        ("skipped", "skipped"),
+        ("partial success", "partial success"),
+        ("no-op", "no-op"),
+        ("unknown", "unknown"),
+    ],
+)
+def test_a_failed_or_incomplete_snapshot_is_unchecked_rather_than_measured_stale(
+    tmp_path, run_status: str, expected_execution: str
+):
+    result = _run(tmp_path, FLIPPING, [(1, 3, D4, D2)], run_status=run_status)
     record = _record(result)
     assert record["status"] == "unchecked"
     assert record["reason_code"] == "snapshot_not_built"
+    assert record["snapshot_execution"]["status"] == expected_execution
+    assert expected_execution in record["reason"]
     assert "temporal" in result.suppressed
 
 

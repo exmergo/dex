@@ -1165,14 +1165,29 @@ def test_a_scoped_unique_test_proves_no_grain(tmp_path: Path, config: dict):
     assert passed_grain_tests(tmp_path) == {}
 
 
-def test_a_failing_unique_test_unproves_a_passing_one(tmp_path: Path):
+@pytest.mark.parametrize(
+    "bad_status",
+    [
+        "warn",
+        "WARN",
+        "fail",
+        "failed",
+        "error",
+        "runtime error",
+        "partial success",
+        "no-op",
+    ],
+)
+def test_a_failing_or_unrecognized_unique_test_unproves_a_passing_one(
+    tmp_path: Path, bad_status: str
+):
     from exmergo_dex_core.maintain.verify import passed_grain_tests
 
     _uniqueness_artifacts(
-        tmp_path, {"id": ("pass", {}), "line_id": ("warn", {"where": None})}
+        tmp_path, {"id": ("pass", {}), "line_id": (bad_status, {"where": None})}
     )
     assert passed_grain_tests(tmp_path) == {}
-    _uniqueness_artifacts(tmp_path, {"id": ("pass", {}), "line_id": ("skipped", {})})
+    _uniqueness_artifacts(tmp_path, {"id": ("PASS", {}), "line_id": ("skipped", {})})
     assert passed_grain_tests(tmp_path) == {
         "fct": {"columns": ["id"], "source": "unique_test"}
     }
@@ -1548,18 +1563,96 @@ def test_a_model_that_failed_is_left_out_and_named(tmp_path: Path):
     assert result.payload()["scope_not_built"] == ["subscriptions"]
 
 
-@pytest.mark.parametrize("status", ["error", "skipped", "unknown", "runtime error"])
-def test_scope_reports_only_successful_models(tmp_path: Path, status: str):
-    """Scope reports only successful models."""
+@pytest.mark.parametrize(
+    "status",
+    [
+        "error",
+        "skipped",
+        "unknown",
+        "runtime error",
+        "failed",
+        "partial success",
+        "no-op",
+    ],
+)
+@pytest.mark.parametrize("process_success", [False, True])
+def test_scope_reports_only_successful_models(
+    tmp_path: Path, status: str, process_success: bool
+):
+    """Scope and column_contract judge only models reporting `success`, even if
+    dbt exited zero on a partial-success or no-op node (#1317)."""
 
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.good": {
+                "name": "good",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."good"',
+                "columns": {"id": {"name": "id"}},
+            },
+            "model.p.other": {
+                "name": "other",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."other"',
+                "columns": {"id": {"name": "id"}},
+            },
+        },
+        results=[
+            {"unique_id": "model.p.good", "status": "success"},
+            {"unique_id": "model.p.other", "status": status},
+        ],
+    )
     summary = _summary(
         [_node("model.p.good"), _node("model.p.other", status=status)],
-        success=False,
+        success=process_success,
     )
     result = _sweep(tmp_path, summary)
     assert result.payload()["scope"] == ["good"]
     assert result.payload()["scope_not_built"] == ["other"]
+    assert result.column_contract is not None
+    assert {"model": "other", "reason_code": "not_built"} in result.column_contract[
+        "unchecked"
+    ]
     assert built_models(summary) == {"model.p.good": "good", "model.p.other": "other"}
+
+
+def test_only_partial_success_models_do_not_judge_incomplete_relations(tmp_path: Path):
+    """When dbt exits zero with only partial-success models, row-level checks are
+    suppressed rather than run over half-built relations, and `node_incomplete`
+    surfaces the status (#1317)."""
+
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.events": {
+                "name": "events",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."events"',
+                "columns": {"id": {"name": "id"}},
+            }
+        },
+        results=[
+            {
+                "unique_id": "model.p.events",
+                "status": "partial success",
+                "message": "1 batch failed",
+            }
+        ],
+    )
+    summary = _summary(
+        [_node("model.p.events", status="partial success")], success=True
+    )
+    result = _sweep(tmp_path, summary)
+    assert result.scope == []
+    assert result.scope_not_built == ["events"]
+    assert [f.code for f in result.findings] == ["node_incomplete"]
+    assert "did not complete" in result.suppressed["row_population"]
+    assert result.column_contract == {
+        "checked": [],
+        "no_declared_columns": [],
+        "unchecked": [{"model": "events", "reason_code": "not_built"}],
+    }
 
 
 def test_scope_is_empty_when_no_model_built(tmp_path: Path):
