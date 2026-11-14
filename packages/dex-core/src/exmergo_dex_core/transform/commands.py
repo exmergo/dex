@@ -4526,7 +4526,7 @@ def _population_gate(
     the plan recorded when it was made.
     """
 
-    from .change_scope import accepted_key, undeclared_population_changes
+    from .scope_gate import accepted_key, undeclared_population_changes
 
     if stored.edit_target == "semantic":
         return None

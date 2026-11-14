@@ -55,21 +55,17 @@ from .row_attribution import (
     render_model_sql,
 )
 
+# The kinds held to an assumption, and the stored-entry readers apply and a build
+# use, live in the parser-free scope_gate module (#1230); re-exported here.
+from .scope_gate import (  # noqa: F401
+    JUDGED,
+    accepted_key,
+    is_population_change,
+    undeclared_population_changes,
+)
+
 MAX_MODELS = 25
 MAX_CHANGES_PER_MODEL = 8
-
-#: Kinds held to an assumption. ``column_added`` and ``expression_changed`` are
-#: listed and never judged: adding a requested column and rewriting the formula
-#: a fix is about are what repairs do, and calling every one undeclared would
-#: bury the changes nobody asked for.
-JUDGED = frozenset(
-    {
-        "column_removed",
-        "type_changed",
-        "aggregate_changed",
-        "null_handling_changed",
-    }
-)
 
 _NULL_FUNCTIONS = ("coalesce", "ifnull", "nvl", "nullif", "nvl2", "zeroifnull")
 # Functions that turn one row into several when they sit in a select list
@@ -1278,59 +1274,3 @@ def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, An
     for model in (report or {}).get("beyond_cap") or []:
         out[model] = [{"kind": "elided", "status": "unchecked"}]
     return out
-
-
-#: Stored entries that record what could not be read rather than a change.
-_UNREAD = frozenset({"unread", "elided"})
-
-
-def is_population_change(entry: Mapping[str, Any]) -> bool:
-    """Whether one stored change-scope entry moves the model's rows.
-
-    A plan stored before the entry carried its ``axis`` is read by kind: every
-    judged kind but the output ones is a population change.
-    """
-
-    axis = entry.get("axis")
-    if axis is not None:
-        return axis == "population"
-    kind = str(entry.get("kind") or "")
-    return bool(kind) and kind not in JUDGED and kind not in _UNREAD
-
-
-def undeclared_population_changes(
-    stored: Mapping[str, list[Mapping[str, Any]]] | None,
-) -> list[dict[str, Any]]:
-    """Each undeclared population change a plan recorded, as ``{model, kind,
-    column, reason}``: the changes ``transform apply`` holds to an assumption or
-    an explicit acceptance (#1230)."""
-
-    out: list[dict[str, Any]] = []
-    for model, entries in sorted((stored or {}).items()):
-        for entry in entries or []:
-            if entry.get("status") != "undeclared" or not is_population_change(entry):
-                continue
-            out.append(
-                {
-                    k: v
-                    for k, v in (
-                        ("model", model),
-                        ("kind", entry.get("kind")),
-                        ("column", entry.get("column")),
-                        ("columns", entry.get("columns") or None),
-                        ("reason", entry.get("reason")),
-                    )
-                    if v is not None
-                }
-            )
-    return out
-
-
-def accepted_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:
-    """How an accepted population change is matched to a stored entry."""
-
-    return (
-        str(entry.get("model") or ""),
-        str(entry.get("kind") or ""),
-        str(entry.get("column") or ""),
-    )

@@ -833,7 +833,7 @@ def summarize_completion(
     under ``unverified`` stands; the evidence's own outcome is unchanged.
     """
 
-    from .change_scope import accepted_key
+    from .scope_gate import accepted_key
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
@@ -950,7 +950,7 @@ def _scope_obligations(
     decision, and still listed so the decision stays in view.
     """
 
-    from .change_scope import accepted_key, is_population_change
+    from .scope_gate import accepted_key, is_population_change
 
     if not recorded:
         return []
@@ -1123,7 +1123,7 @@ def _unverified(
     change to be unfinished.
     """
 
-    from .change_scope import is_population_change
+    from .scope_gate import is_population_change
 
     if completion.deliverables.coverage != "known":
         return []
