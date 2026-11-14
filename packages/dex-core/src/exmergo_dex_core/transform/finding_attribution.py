@@ -462,7 +462,9 @@ def classify(
 ) -> Attribution:
     """``introduced``, ``unattributed`` or ``existing``, with its ``basis``.
 
-    In order: a finding the baseline reported is ``existing`` (``baseline``); a
+    A downstream-impact finding (#1231) is ``introduced`` (``measured``): it
+    compares the tree after the plan with the tree before it. Otherwise, in
+    order: a finding the baseline reported is ``existing`` (``baseline``); a
     finding on a model the plan created is ``introduced`` (``new_model``); one
     on a node the plan's lineage cannot reach is ``existing`` (``lineage``);
     one on a model the baseline swept with that check running is
@@ -472,6 +474,10 @@ def classify(
     """
 
     identifier = str(_value(finding, "identifier") or "")
+    # Measured against the tree before the plan by construction (#1231): the
+    # plan's own doing, whatever an earlier sweep saw.
+    if _value(finding, "axis") == "downstream_impact":
+        return Attribution(INTRODUCED, "measured")
     if baseline is not None and fingerprint(finding) in baseline.fingerprints:
         return Attribution(EXISTING, "baseline")
     if reach is not None:

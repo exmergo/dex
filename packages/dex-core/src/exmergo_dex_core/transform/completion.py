@@ -237,9 +237,11 @@ class Unverified(BaseModel):
     its baseline was ready), ``comparison_contradicted`` (a recorded
     ``different`` or ``unexpected`` verdict), ``undeclared_population_change``
     (a population change no assumption records and apply did not accept),
-    ``introduced_high_finding`` (a high-severity finding this plan introduced)
-    or ``unattributed_high_finding`` (a high-severity finding on a model the
-    plan edited that no baseline places before the plan).
+    ``introduced_high_finding`` (a high-severity finding this plan introduced),
+    ``unattributed_high_finding`` (a high-severity finding on a model the
+    plan edited that no baseline places before the plan) or
+    ``downstream_population_changed`` (an unedited model below the plan's edits
+    whose rows or keys moved with nothing recording that population, #1231).
     """
 
     model: str
@@ -363,6 +365,36 @@ class ComparisonState(BaseModel):
     baseline_ready: bool | None = None
 
 
+class ImpactEntry(BaseModel):
+    """One model whose results the plan moved (#1231), in a few fields."""
+
+    model: str
+    role: str
+    #: ``"<before> -> <after>"`` rows.
+    rows: str | None = None
+    keys_removed: int | None = None
+    keys_added: int | None = None
+    #: How many columns changed on kept keys (marts only).
+    columns_changed: int | None = None
+    upstream: list[str] = Field(default_factory=list)
+    finding: str | None = None
+    settled: bool | None = None
+
+
+class ImpactSummary(BaseModel):
+    """What the plan did to the models it rewrote and the unedited models
+    below them (#1231): counts, then the largest changes first. The records
+    are under ``data.verification.impact``."""
+
+    ran: bool
+    measured: int = 0
+    changed: int = 0
+    unchecked: int = 0
+    top: list[ImpactEntry] = Field(default_factory=list)
+    unchecked_reasons: dict[str, int] = Field(default_factory=dict)
+    reason_code: str | None = None
+
+
 class BuildCompletion(BaseModel):
     """The bounded lead of a build payload. See the module docstring."""
 
@@ -376,6 +408,9 @@ class BuildCompletion(BaseModel):
     blockers: list[Blocker] = Field(default_factory=list)
     assurance: Assurance = Field(default_factory=Assurance)
     verification: VerificationSummary = Field(default_factory=VerificationSummary)
+    #: What the named plan did to the models below its edits (#1231); absent
+    #: when the build named no plan or did not verify.
+    impact: ImpactSummary | None = None
     obligations: Obligations = Field(default_factory=Obligations)
     refactor_comparison: list[ComparisonState] | None = None
     cold: ColdSummary | None = None
@@ -867,6 +902,7 @@ def summarize_completion(
         verification=_verification(
             verification, findings_dropped, verification_offered
         ),
+        impact=_impact_summary(verification),
         obligations=_obligations(verification),
         refactor_comparison=comparisons,
         cold=_cold_summary(cold),
@@ -1177,6 +1213,18 @@ def _unverified(
         for ref in verification.get("introduced") or []
         if ref.get("severity") == "high"
     )
+    # A model the plan never edited whose population moved, whatever the
+    # severity: the request did not ask for it (#1231).
+    impact = verification.get("impact") or {}
+    out.extend(
+        Unverified(
+            model=str(record.get("model") or ""),
+            reason="downstream_population_changed",
+            detail=_impact_rows(record),
+        )
+        for record in impact.get("models") or []
+        if isinstance(record, Mapping) and record.get("finding")
+    )
     # Without a baseline, a high finding on a model the plan edited cannot be
     # shown to predate it; the plan's own models are where that matters.
     required = _required(evidence) or set()
@@ -1392,6 +1440,8 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     cap_list(completion, "blockers", _NAMES, "blockers")
     if completion.unverified is not None:
         cap_list(completion, "unverified", _NAMES, "unverified")
+    if completion.impact is not None:
+        cap_list(completion.impact, "top", _NAMES, "impact.top")
     cap_list(completion.deliverables, "blocked", _NAMES, "deliverables.blocked")
     cap_list(completion.obligations, "contradicted", _NAMES, "obligations.contradicted")
     cap_list(completion.obligations, "unchecked", _NAMES, "obligations.unchecked")
@@ -1460,6 +1510,9 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             )
         if completion.unverified is not None:
             cap_list(completion, "unverified", max(keep, 1), "unverified")
+        # The largest move below the edits is the one a reader must see (#1231).
+        if completion.impact is not None:
+            cap_list(completion.impact, "top", max(keep, 1), "impact.top")
         cap_list(
             completion.assurance.failed_checks,
             "checks",
@@ -1516,11 +1569,68 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             return
     # Then the introduced findings and the unfinished reasons, last of all:
     # `outcome` still says `built_unverified`, and `elided` counts what went.
+    if completion.impact is not None:
+        cap_list(completion.impact, "top", 0, "impact.top")
+        completion.elided = dict(elided)
+        if completion.size() <= budget:
+            return
     if completion.verification.introduced is not None:
         cap_list(completion.verification, "introduced", 0, "verification.introduced")
     if completion.unverified is not None:
         cap_list(completion, "unverified", 0, "unverified")
     completion.elided = dict(elided)
+
+
+def _impact_rows(record: Mapping[str, Any]) -> str | None:
+    rows = record.get("rows")
+    if not isinstance(rows, Mapping):
+        return None
+    return f"{rows.get('baseline')} -> {rows.get('proposed')}"
+
+
+def _impact_summary(verification: Mapping[str, Any] | None) -> ImpactSummary | None:
+    """The impact records reduced to counts and the changed models, largest
+    first (the records arrive sorted)."""
+
+    impact = (verification or {}).get("impact")
+    if not isinstance(impact, Mapping):
+        return None
+    records = [r for r in impact.get("models") or [] if isinstance(r, Mapping)]
+    reasons = Counter(
+        str(r.get("reason_code") or "unknown")
+        for r in records
+        if r.get("status") != "measured"
+    )
+    top = []
+    for record in records:
+        if record.get("status") != "measured" or record.get("change") != "changed":
+            continue
+        keys = record.get("keys") if isinstance(record.get("keys"), Mapping) else {}
+        columns = (
+            record.get("columns") if isinstance(record.get("columns"), Mapping) else {}
+        )
+        top.append(
+            ImpactEntry(
+                model=str(record.get("model") or ""),
+                role=str(record.get("role") or ""),
+                rows=_impact_rows(record),
+                keys_removed=keys.get("removed") if keys else None,
+                keys_added=keys.get("added") if keys else None,
+                columns_changed=len(columns.get("changed") or []) if columns else None,
+                upstream=list(record.get("upstream") or []),
+                finding=record.get("finding"),
+                settled=True if record.get("settled_by") else None,
+            )
+        )
+    return ImpactSummary(
+        ran=bool(impact.get("ran")),
+        measured=int(impact.get("measured") or 0),
+        changed=int(impact.get("changed") or 0),
+        unchecked=int(impact.get("unchecked") or 0),
+        top=top,
+        unchecked_reasons=dict(sorted(reasons.items())),
+        reason_code=impact.get("reason_code"),
+    )
 
 
 def _unattributed_high(verification: Mapping[str, Any]) -> list[Mapping[str, Any]]:

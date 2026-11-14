@@ -140,6 +140,12 @@ class TransformPlan(BaseModel):
     # conversions and what they rest on, read by a `--for-plan` build to hold the
     # repair to its obligations. Bookkeeping outside the digest, like the two above.
     repair: dict[str, Any] | None = None
+    # Each model file this plan replaced or deleted, as it read just before
+    # `transform apply` wrote over it (#1231): the pre-plan SQL a `--for-plan`
+    # build re-executes to measure what the change did to the models below it.
+    # Bookkeeping outside the digest, like the fields above; None until applied
+    # and on plans applied before the field.
+    baseline_sources: dict[str, str] | None = None
     # The retirement contract (#858): which flag value's behavior survives and
     # what each output must hold. Intent rather than bookkeeping, so unlike the
     # two above it travels in the plan document and, where present, its digest.
@@ -704,6 +710,7 @@ def apply(
 
     stored = store.load_plan(plan_id)
     project = Path(repo_root) / stored.project_dir
+    preimages = _model_preimages(stored, project)
     if stored.edit_target == "semantic":
         if semantic_layer is None:
             raise PlanError(
@@ -741,8 +748,33 @@ def apply(
         )
     if result.written:
         stored.applied_at = datetime.now(UTC).isoformat()
+        if preimages:
+            stored.baseline_sources = preimages
         store.save_plan(stored)
     return result
+
+
+def _model_preimages(stored: TransformPlan, project: Path) -> dict[str, str]:
+    """The model files a plan is about to replace or delete, as they read now.
+
+    Read before the write, so a `--for-plan` build can compile the tree as it
+    stood before the plan (#1231). Best effort: a file that cannot be read is
+    left out, and the build then reports its models as having no baseline.
+    """
+
+    if stored.edit_target != "project":
+        return {}
+    found: dict[str, str] = {}
+    for edit in stored.edits:
+        if edit.kind is not EditKind.MODEL_SQL:
+            continue
+        path = project / edit.path
+        try:
+            if path.is_file():
+                found[edit.path] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+    return found
 
 
 #: Reference forms that stop the project compiling once their target is gone.

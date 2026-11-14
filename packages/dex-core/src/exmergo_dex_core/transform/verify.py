@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from ..engine import DexEngine
     from ..maintain.drift import DriftFinding
     from ..results import ConfirmationRequest
+    from .downstream_impact import ImpactInput
     from .finding_attribution import AttributionInput
 
 # What a build's findings are worth reading in one sitting. A build that trips
@@ -112,6 +113,9 @@ class BuildVerification:
     #: Every finding's fingerprint, the capped tail included, which is what the
     #: sweep history records as the next build's baseline.
     fingerprints: list[str] = field(default_factory=list)
+    #: What the named plan did to the models it rewrote and the unedited models
+    #: below them (#1231); ``None`` when no plan was named.
+    impact: dict[str, Any] | None = None
 
     def payload(self) -> dict[str, Any]:
         """Serialize the measured build checks and their explicit suppressions."""
@@ -131,6 +135,8 @@ class BuildVerification:
             # part of the sweep a reader must not miss (#1230).
             payload["introduced"] = self.introduced or []
             payload["attribution"] = self.attribution
+        if self.impact is not None:
+            payload["impact"] = self.impact
         if self.join_coverage is not None:
             payload["join_coverage"] = self.join_coverage
         if self.parent_population:
@@ -314,6 +320,7 @@ def verify_build(
     plan_edits: list[Any] | None = None,
     selection: str | None = None,
     attribution: AttributionInput | None = None,
+    impact: ImpactInput | None = None,
 ) -> BuildVerification:
     """Sweep the nodes this build ran, and report what it could not sweep.
 
@@ -333,6 +340,10 @@ def verify_build(
     ``attribution`` is the named plan's edits and the sweep recorded before it
     was applied: with it, each finding is classified ``introduced``,
     ``unattributed`` or ``existing`` before the list is capped (#1230).
+
+    ``impact`` is the named plan's edits and pre-plan sources: with it, the
+    models the plan rewrote and every unedited model below them are measured
+    against the tree before the plan (#1231).
 
     Never raises except on a cost-guard refusal, which is re-raised untouched:
     a build that has already run must report what it found, so every other
@@ -385,6 +396,13 @@ def verify_build(
         if not opened:
             opened.append(resolve_adapter())
         return opened[0]
+
+    # Compiled before anything opens the warehouse: on DuckDB dbt has to hold
+    # the file while it compiles, which a read-only handle of ours would block.
+    if impact is not None:
+        from .downstream_impact import ensure_prepared
+
+        ensure_prepared(engine, project_dir, impact, None)
 
     findings, notes = verify_mod.build_status_findings(project_dir)
     result.warnings.extend(notes)
@@ -446,6 +464,9 @@ def verify_build(
         proven = {**verify_mod.passed_grain_tests(project_dir), **proven}
     result.findings = verify_mod.damp_fanout(result.findings, proven)
 
+    if impact is not None:
+        _downstream_impact(engine, summary, impact, adapter_once, result)
+
     result.findings = drift_mod.rank_findings(findings + result.findings)
     _attribute(project_dir, attribution, result)
     if len(result.findings) > MAX_FINDINGS:
@@ -464,6 +485,139 @@ def verify_build(
             "model, so fix the ranked ones and re-run"
         )
     return result
+
+
+def _downstream_impact(
+    engine: DexEngine,
+    summary: dict[str, Any],
+    impact: ImpactInput,
+    resolve_adapter: Callable[[], Adapter],
+    result: BuildVerification,
+) -> None:
+    """Measure the plan's rewritten models and the unedited ones below them
+    against the tree before the plan (#1231), as a phase of the build."""
+
+    from .. import command_args
+    from ..errors import DexError
+    from ..guards.cost_guard import CostGuardError
+    from . import downstream_impact as impact_mod
+
+    prepared = impact.prepared
+    if prepared is None:
+        return
+    if not summary.get("success"):
+        reason = (
+            "the build did not complete, so the relations both sides read are a "
+            "mix of this run's output and the last one's"
+        )
+        result.suppressed["downstream_impact"] = reason
+        result.impact = {"ran": False, "reason_code": "build_failed", "reason": reason}
+        return
+    if prepared.reason_code is not None:
+        outcome = impact_mod.unmeasured(prepared)
+        result.suppressed["downstream_impact"] = prepared.reason or ""
+        result.impact = outcome.payload()
+        return
+    try:
+        adapter = resolve_adapter()
+    except CostGuardError:
+        raise
+    except DexError as exc:
+        reason = f"warehouse unreachable: {exc}"
+        result.suppressed["downstream_impact"] = reason
+        result.impact = {"ran": False, "reason_code": "unreachable", "reason": reason}
+        return
+    config = engine.config
+    ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
+    billed = command_args.cost_gate(adapter) is not None
+    try:
+        outcome = impact_mod.run(
+            prepared,
+            adapter,
+            timeout_seconds=config.query.timeout_seconds,
+            handshake=_impact_handshake(adapter),
+            ceiling=ceiling,
+            billed=billed,
+        )
+    except CostGuardError:
+        raise
+    except Exception as exc:
+        from ..envelope import failure_text, redact
+
+        reason = redact(f"the impact could not be measured ({failure_text(exc)})")
+        result.suppressed["downstream_impact"] = reason
+        result.impact = {"ran": False, "reason_code": "failed", "reason": reason}
+        return
+    result.findings.extend(outcome.findings)
+    result.notes.extend(outcome.notes)
+    result.impact = outcome.payload()
+    if outcome.offer is not None and result.offer is None:
+        result.offer = outcome.offer
+
+
+def _impact_handshake(adapter: Adapter):
+    """The impact statements as a phase of the build (#1231), gated like the
+    declared facts: extend the reservation, offer rather than refuse."""
+
+    from .. import command_args
+
+    def ask(estimate: float, model_count: int):
+        return command_args.phase_handshake(
+            "transform build",
+            adapter,
+            estimate,
+            phase="downstream_impact",
+            per_table_key="(downstream impact)",
+            extra={"model_count": model_count},
+            skip=model_count == 0,
+            notes=[
+                "the build is complete and its spend is settled; this estimate "
+                "buys only the comparison of the models below the plan's edits "
+                "with the tree before it"
+            ],
+            hint=lambda cost, unit, budget: (
+                f"{model_count} model(s) below the plan's edits are compared with "
+                f"the tree before it, estimated at {cost:.0f} {unit} beyond what "
+                "remains of the confirmed budget. The build itself is done and "
+                f"billed; re-run with --verify --confirm --budget {budget} to "
+                "build and judge in one pass"
+            ),
+        )
+
+    return ask
+
+
+def price_impact(
+    engine: DexEngine,
+    adapter: Adapter,
+    project_dir: Path,
+    impact: ImpactInput,
+    manifest_path: Path | None,
+) -> tuple[float, list[str]]:
+    """The impact statements priced before the build (#1231), folded into the
+    build's one estimate. Best-effort: the phase prices again after the build."""
+
+    from . import downstream_impact as impact_mod
+
+    try:
+        prepared = impact_mod.ensure_prepared(
+            engine, project_dir, impact, manifest_path
+        )
+        if prepared.reason_code is not None or not prepared.compiled:
+            return 0.0, []
+        config = engine.config
+        ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
+        return impact_mod.price(prepared, adapter, ceiling), []
+    except Exception as exc:
+        from ..envelope import failure_text, redact
+
+        return 0.0, [
+            redact(
+                "could not price the comparison of the models below the plan's "
+                f"edits upfront ({failure_text(exc)}); it is priced again after "
+                "the build and offered if it does not fit the confirmed budget"
+            )
+        ]
 
 
 def _attribute(

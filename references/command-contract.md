@@ -457,7 +457,13 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      data.evidence.outcome keeps validated. With --verify and a plan,
                                      findings carry attribution (introduced, unattributed, existing),
                                      introduced first, judged against the last --verify build before
-                                     the plan was applied (data.verification.introduced, .attribution)
+                                     the plan was applied (data.verification.introduced, .attribution).
+                                     With --verify and a plan, the models the plan rewrote and every
+                                     unedited model below them are re-executed against the tree before
+                                     the plan (rows, keys kept/removed/added, a mart's changed columns;
+                                     counts only) under data.verification.impact and
+                                     data.completion.impact, largest change first (#1231); an unedited
+                                     model whose rows or keys moved is downstream_population_changed
                                      data.evidence carries the invocation, typed per-node statuses,
                                      the selection asked for against what it got, the manifest and
                                      run-results digests, the relations this run's successful nodes
@@ -1432,7 +1438,9 @@ default, or a filter or operator after it is refused. A key naming a location
   `data.completion.unverified`: a rewrite applied uncompared while its baseline
   was ready, an undeclared population change apply did not accept, or a
   high-severity finding the plan introduced (or, with no baseline, one on a
-  model it edited). It is set on `data.outcome` and `data.completion.outcome`;
+  model it edited), or an unedited model below the plan's edits whose rows or
+  keys moved with nothing recording that population (#1231). It is set on
+  `data.outcome` and `data.completion.outcome`;
   `data.evidence.outcome` keeps `validated`, since a host recomputes that one
   from the evidence alone. `data.evidence` is where the
   reasoning lives: the dbt invocation, per-node status and materialization and
