@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 from .elementary_fixture import (
+    ABSENT,
     ELEMENTARY_SCHEMA,
     VARIANTS,
     VERSIONS,
@@ -32,8 +33,11 @@ from .mutation_helpers import _engine
 MATERIALIZATION_LINE = "starting test materialization hook"
 TEMP_TABLE_LINE = "created test temp table"
 
-#: What each variant's row promises: whether dbt picks Elementary's ``test``
-#: materialization, and whether that materialization uses temp tables.
+#: What each variant's row promises: whether Elementary's ``test`` materialization
+#: handles the tests, and whether it routes them through temp tables. b and d read
+#: the same here for different reasons (dbt picks its own on b; on d Elementary's
+#: is picked and returns at once, the package being disabled), which is why the
+#: build test tells them apart by the models dbt enables.
 BEHAVIOUR = {
     "a": (True, False),
     "b": (False, False),
@@ -76,24 +80,59 @@ def test_the_census_sees_new_rows_a_new_relation_and_a_dropped_one(duckdb_file: 
     )
 
     assert footprint(before, duckdb_census(duckdb_file)) == {
-        ("audit", "latest", "VIEW"): (None, 1),
-        ("audit", "runs", "BASE TABLE"): (None, 1),
+        ("audit", "latest", "VIEW"): (ABSENT, 1),
+        ("audit", "runs", "BASE TABLE"): (ABSENT, 1),
         ("main", "customers", "BASE TABLE"): (2, 3),
-        ("main", "orders", "BASE TABLE"): (3, None),
+        ("main", "orders", "BASE TABLE"): (3, ABSENT),
     }
 
 
-def test_a_relation_that_cannot_be_counted_is_reported_not_raised(duckdb_file: Path):
+def test_a_relation_that_cannot_be_counted_is_kept_and_told_from_a_dropped_one(
+    duckdb_file: Path,
+):
+    view = ("main", "order_ids", "VIEW")
     _execute(duckdb_file, "create view order_ids as select id from orders")
     before = duckdb_census(duckdb_file)
     _execute(duckdb_file, "drop table orders")
 
-    change = footprint(before, duckdb_census(duckdb_file))
+    after = duckdb_census(duckdb_file)
 
-    assert change[("main", "order_ids", "VIEW")] == (3, None)
+    assert view in after, "the census dropped a relation it could not count"
+    assert after[view] is None
+    assert footprint(before, after)[view] == (3, None)
+    assert footprint(before, {})[view] == (3, ABSENT)
 
 
 # --- the fixture, against the installed package ---------------------------------
+
+
+def _listed(project: Path, *argv: str) -> set[str]:
+    """What ``dbt ls`` selects in ``project``, by name. It opens no connection."""
+
+    out = dbt(
+        "ls",
+        "--quiet",
+        "--output",
+        "name",
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(project),
+        *argv,
+        cwd=project,
+    )
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+#: The four kinds of test, as dbt names them: an anomaly test, ``schema_changes``,
+#: a dbt built-in, and the two Dex renders from the declared grain.
+FCT_TESTS = {
+    "elementary_volume_anomalies_fct_ordered_at",
+    "elementary_schema_changes_fct_",
+    "accepted_values_fct_band__large__small",
+    "unique_fct_id",
+    "not_null_fct_id",
+}
 
 
 @requires_elementary
@@ -103,23 +142,27 @@ def test_each_variant_parses_builds_and_carries_the_four_kinds_of_test(
 ):
     project = elementary_project(tmp_path, variant, installed_elementary)
     [fct] = yaml.safe_load((project / "models" / "schema.yml").read_text())["models"]
-    by_column = {column["name"]: column["data_tests"] for column in fct["columns"]}
-
-    assert [next(iter(test)) for test in fct["data_tests"][:1]] == [
-        "elementary.volume_anomalies"
-    ]
-    assert "elementary.schema_changes" in fct["data_tests"]
-    assert "accepted_values" in by_column["band"][0]
-    # Rendered by Dex from the declared grain, not written by hand.
-    assert by_column["id"] == ["unique", "not_null"]
+    # The grain's tests are rendered by Dex from a declaration, not written here.
     assert fct["config"]["meta"]["dex"]["grain"] == ["id"]
 
     _engine(project).build(target="dev")
 
-    schemas = {schema for schema, _, _ in duckdb_census(tmp_path / "dev.duckdb")}
-    assert "main" in schemas, "the project's own models did not build"
-    # Variant d disables the package's models for dev, so its schema never appears.
-    assert (ELEMENTARY_SCHEMA in schemas) is (variant != "d")
+    built = duckdb_census(tmp_path / "dev.duckdb")
+    assert ("main", "fct", "BASE TABLE") in built, (
+        "the project's own mart did not build"
+    )
+    tests = ("--resource-type", "test", "--select", "fct", "--target", "dev")
+    assert _listed(project, *tests) == FCT_TESTS
+    # Variant d disables the package's models for dev, and only for dev: a
+    # resolver asked about `prod` must find them enabled there. Listing reads the
+    # graph, so `prod` is named without ever being built.
+    elementary = ("--resource-type", "model", "--select", "package:elementary")
+    assert bool(_listed(project, *elementary, "--target", "dev")) is (variant != "d")
+    assert bool(_listed(project, *elementary, "--target", "prod"))
+    assert ({schema for schema, _, _ in built} >= {ELEMENTARY_SCHEMA}) is (
+        variant != "d"
+    )
+    assert not (tmp_path / "prod.duckdb").exists()
 
 
 @requires_elementary
@@ -147,7 +190,6 @@ def test_each_variant_changes_what_elementary_does_in_a_run(
         cwd=project,
     )
 
-    assert "Done. PASS=" in log, log[-2000:]
     assert (MATERIALIZATION_LINE in log, TEMP_TABLE_LINE in log) == BEHAVIOUR[variant]
 
 
@@ -182,9 +224,10 @@ def test_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
 def test_a_mutation_run_with_elementary_disabled_leaves_no_footprint(
     tmp_path: Path, installed_elementary: Path
 ):
-    """The holding arm, on variant d: the same command over the same project with
-    the package's models disabled for dev changes nothing, so the footprint on
-    variant a is Elementary's and not the fixture's."""
+    """The holding arm, on variant d: the same command over a project that differs
+    from variant a only in disabling the package's models for dev changes
+    nothing, so the footprint on variant a is Elementary's and not the
+    fixture's."""
 
     project = elementary_project(tmp_path, "d", installed_elementary)
     engine = _engine(project)

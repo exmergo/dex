@@ -10,9 +10,18 @@ left behind in the dev warehouse.
 | a | ``require_explicit_package_overrides_for_builtin_materializations: false`` |
 | b | that flag true, no root shim |
 | c | that flag true, with a root ``test`` materialization shim |
-| d | Elementary's models disabled for the dev target, the flag left unset |
+| d | flag false, and Elementary's models disabled for the dev target |
 | e | flag false, and a root model that refers to an Elementary model |
 | f | flag false, and ``tests_use_temp_tables: true`` |
+
+Variant d sets the flag false, as Elementary's install instructions do, so it
+differs from variant a only in ``+enabled``: dbt still picks Elementary's
+materialization, which returns at once because the package is disabled.
+
+On DuckDB the census cannot see variant f's test-result temp tables: Elementary
+creates them as ``temporary`` tables, which DuckDB drops when dbt's connection
+closes, and Postgres does the same. Variant f is read from Elementary's debug
+log instead. BigQuery, where those tables outlive the run, is #1331's.
 
 The package comes from the dbt package hub, so installing it needs the network.
 The suite is otherwise offline, so everything here is opt-in: set
@@ -37,11 +46,11 @@ ENV = "DEX_TEST_ELEMENTARY"
 
 VARIANTS = ("a", "b", "c", "d", "e", "f")
 
-#: The release the compatibility work read (its source reading was nine commits
-#: past this tag) and the first release that carries DuckDB macros. Releases
-#: before 0.23.0 have no ``duckdb__`` macros and fail ``dbt build`` on DuckDB in
-#: the package's own models, so the 0.15 and 0.16 series most installs pin
-#: cannot run here.
+#: The release nearest the source the compatibility work read (e3ab23d8, nine
+#: commits past this tag) and the first release that carries DuckDB macros.
+#: Releases before 0.23.0 have no ``duckdb__`` macros (read from the tags; 0.16.4
+#: was run and fails ``dbt build`` on DuckDB in the package's own models), so the
+#: 0.15 and 0.16 series most installs pin cannot run here.
 CURRENT_VERSION = "0.26.1"
 OLDEST_DUCKDB_VERSION = "0.23.0"
 VERSIONS = (CURRENT_VERSION, OLDEST_DUCKDB_VERSION)
@@ -109,6 +118,8 @@ def dbt(*argv: str, cwd: Path) -> str:
 
     executable = shutil.which("dbt")
     if executable is None:
+        if os.environ.get(ENV):
+            pytest.fail(f"{ENV} is set but no dbt executable is on PATH")
         pytest.skip("needs the dbt executable on PATH")
     done = subprocess.run(  # noqa: S603
         [executable, *argv], cwd=cwd, capture_output=True, text=True, check=False
@@ -185,7 +196,7 @@ def _dbt_project(variant: str) -> dict:
         "macro-paths": ["macros"],
         "models": {"elementary": {"+schema": "elementary"}},
     }
-    if variant in {"a", "e", "f"}:
+    if variant in {"a", "d", "e", "f"}:
         project["flags"] = {FLAG: False}
     elif variant in {"b", "c"}:
         project["flags"] = {FLAG: True}
@@ -257,14 +268,21 @@ Query = Callable[[str], Iterable[tuple]]
 
 _SYSTEM_SCHEMAS = ("information_schema", "pg_catalog")
 
+#: What :func:`footprint` reports for the side a relation is missing from, so a
+#: dropped relation never reads like one that is still there but uncountable.
+ABSENT = "absent"
+
 
 def census(query: Query) -> dict[Relation, int | None]:
-    """Every relation in the warehouse with its row count.
+    """Every relation in the current database with its row count.
 
-    Reads ``information_schema.tables``, so it counts tables and views alike and
-    runs unchanged on any warehouse that has one. A relation that cannot be
-    counted (a view whose parent is gone) is kept with ``None``, because a census
-    that raises there hides exactly the damage it is for.
+    Reads an unqualified ``information_schema.tables`` and counts through
+    double-quoted identifiers, which DuckDB and Postgres accept as written. It
+    reads one catalog and keys relations by schema and name only. BigQuery, which
+    needs a qualified ``INFORMATION_SCHEMA`` and backtick quoting, would need its
+    own listing. A relation that cannot be counted (a view whose parent is gone)
+    is kept with ``None``, because a census that raises there hides exactly the
+    damage it is for.
     """
 
     counts: dict[Relation, int | None] = {}
@@ -294,23 +312,27 @@ def duckdb_census(warehouse: Path) -> dict[Relation, int | None]:
         con.close()
 
 
+#: One side of a footprint entry: a row count, ``None`` for a relation that is
+#: there and uncountable, or :data:`ABSENT`.
+Reading = int | str | None
+
+
 def footprint(
     before: dict[Relation, int | None], after: dict[Relation, int | None]
-) -> dict[Relation, tuple[int | None, int | None]]:
+) -> dict[Relation, tuple[Reading, Reading]]:
     """What changed between two censuses: ``{relation: (before, after)}``.
 
-    A relation only one side has is reported against ``None`` on the other, so a
-    created relation, a dropped one and a row-count change all read the same way.
-    An empty footprint means the command left the warehouse as it found it.
+    A relation only one side has is reported against :data:`ABSENT` on the other,
+    so a created relation reads ``(ABSENT, n)``, a dropped one ``(n, ABSENT)``,
+    and one that is still there but can no longer be counted ``(n, None)``. An
+    empty footprint means the command left the warehouse as it found it.
     """
 
-    missing = object()
-    changed: dict[Relation, tuple[int | None, int | None]] = {}
+    changed: dict[Relation, tuple[Reading, Reading]] = {}
     for relation in sorted(set(before) | set(after)):
-        was, now = before.get(relation, missing), after.get(relation, missing)
+        # `.get` keeps a present `None` (uncountable) apart from a missing key.
+        was = before.get(relation, ABSENT)
+        now = after.get(relation, ABSENT)
         if was != now:
-            changed[relation] = (
-                None if was is missing else was,  # type: ignore[assignment]
-                None if now is missing else now,  # type: ignore[assignment]
-            )
+            changed[relation] = (was, now)
     return changed

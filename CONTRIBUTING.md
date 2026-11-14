@@ -414,8 +414,8 @@ DEX_TEST_ELEMENTARY=1 uv run pytest tests/transform/test_elementary_fixture.py
 
 Without the variable they collect as skipped with it named in the skip reason.
 They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
-the first release with DuckDB macros. Older releases fail `dbt build` on
-DuckDB; running them on Postgres is
+the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
+run and fails `dbt build` on DuckDB); running them on Postgres is
 [#1331](https://github.com/exmergo/dex/issues/1331).
 
 ## Agent evals (`evals/`)
