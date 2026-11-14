@@ -18,6 +18,7 @@ import pytest
 import yaml
 
 from exmergo_dex_core.cli import main
+from exmergo_dex_core.storage import FilesystemStore
 
 
 def _field(name: str) -> dict:
@@ -165,3 +166,122 @@ def test_reconcile_proposes_no_edit_for_a_failed_declared_grain(tmp_path: Path, 
     assert len(proposals) == 1
     assert proposals[0]["kind"] == "advisory"
     assert payload["data"].get("plan_id") is None
+
+
+def _customers(
+    tmp_path: Path, rows: list[tuple], *, primary_key: list[str] | None = None
+) -> Path:
+    """A primary key and an alternate unique key, each on a physical column."""
+
+    duckdb = pytest.importorskip("duckdb")
+
+    root = tmp_path
+    db_path = root / "demo.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute(
+        "CREATE TABLE customers (customer_id INTEGER, email VARCHAR, region VARCHAR)"
+    )
+    conn.executemany("INSERT INTO customers VALUES (?, ?, ?)", rows)
+    conn.close()
+
+    handle = _field("handle")
+    handle["expression"]["dialects"][0]["expression"] = "lower(email)"
+    doc = {
+        "version": "0.2.0.dev0",
+        "name": "crm",
+        "datasets": [
+            {
+                "name": "customers",
+                "source": "demo.main.customers",
+                "fields": [
+                    _field("customer_id"),
+                    _field("email"),
+                    _field("region"),
+                    handle,
+                ],
+                "primary_key": primary_key or ["customer_id"],
+                "unique_keys": [["email"]],
+            }
+        ],
+    }
+    (root / "crm.ossie.yaml").write_text(
+        yaml.safe_dump(doc, sort_keys=False), encoding="utf-8"
+    )
+
+    (root / ".dex").mkdir()
+    (root / ".dex" / "config.yml").write_text(
+        "connector: duckdb\n"
+        f"duckdb:\n  path: {db_path}\n"
+        "semantic:\n"
+        "  vendor: ossie\n"
+        "  ossie:\n"
+        "    files: [crm.ossie.yaml]\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _by_column(payload: dict, code: str) -> dict[str, dict]:
+    return {f["column"]: f for f in payload["data"]["findings"] if f["code"] == code}
+
+
+def test_the_fingerprint_says_which_key_is_the_grain(tmp_path: Path, capsys):
+    repo = _customers(tmp_path, [(1, "a@x", "EU"), (2, "b@x", "US")])
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+
+    snap = FilesystemStore(str(repo)).load_snapshot()
+    (model,) = snap.semantic_layer.semantic_models
+    assert model.keys == [["customer_id"], ["email"]]
+    assert model.key_claims == ["primary", "unique"]
+
+
+def test_a_key_left_out_takes_its_claim_with_it(tmp_path: Path, capsys):
+    """A primary key on a computed field links no column, so it is not
+    fingerprinted; the unique key after it must not inherit its claim."""
+
+    repo = _customers(
+        tmp_path, [(1, "a@x", "EU"), (2, "b@x", "US")], primary_key=["handle"]
+    )
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+
+    snap = FilesystemStore(str(repo)).load_snapshot()
+    (model,) = snap.semantic_layer.semantic_models
+    assert model.keys == [["email"]]
+    assert model.key_claims == ["unique"]
+
+
+def test_a_violated_key_is_worded_as_the_claim_it_made(tmp_path: Path, capsys):
+    repo = _customers(tmp_path, [(1, "a@x", "EU"), (1, "b@x", "US"), (2, "b@x", "US")])
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+
+    payload = _cli(repo, "maintain", "grain", capsys=capsys)
+
+    assert payload["_exit"] == 0, payload
+    found = _by_column(payload, "declared_grain_not_unique")
+    assert found["customer_id"]["data"]["claim"] == "primary"
+    assert (
+        "declares (customer_id) as the primary key of" in found["customer_id"]["detail"]
+    )
+    assert found["email"]["data"]["claim"] == "unique"
+    assert "declares (email) unique on" in found["email"]["detail"]
+    assert "primary key" not in found["email"]["detail"]
+
+
+def test_a_lapsed_unique_key_names_the_claim_it_made(tmp_path: Path, capsys):
+    repo = _customers(tmp_path, [(1, "a@x", "EU"), (2, "b@x", "US"), (3, "c@x", "US")])
+    _cli(repo, "explore", "map", capsys=capsys)
+    _cli(repo, "maintain", "snapshot", capsys=capsys)
+
+    import duckdb
+
+    conn = duckdb.connect(str(repo / "demo.duckdb"))
+    conn.execute("INSERT INTO customers VALUES (4, 'a@x', 'EU')")
+    conn.close()
+
+    payload = _cli(repo, "maintain", "grain", capsys=capsys)
+
+    assert payload["_exit"] == 0, payload
+    lapsed = _by_column(payload, "key_lost_uniqueness")
+    assert lapsed["email"]["data"]["claim"] == "unique"
+    assert "declares (email) unique on" in lapsed["email"]["detail"]
+    assert "primary key" not in lapsed["email"]["detail"]
