@@ -53,17 +53,14 @@ from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
+from ..transform.evidence import (
+    PASSED_STATUS,
+    WARNED_STATUS,
+    normalize_node_status,
+    status_kind,
+)
 from ..value_mask import mask_values
 from .drift import DriftFinding, _grain_severity
-
-#: dbt's own run_results.json status strings that mean the node did not build.
-_FAILURE_STATUSES = frozenset({"error", "fail"})
-
-# A test dbt ran at `severity: warn` passed the run and failed the assertion.
-# Neither a failure nor a skip, so it fell through both branches and was
-# reported nowhere: a build whose seventeen warnings are normal and whose
-# eighteenth is a regression had no way to say which seventeen they were.
-_WARNING_STATUSES = frozenset({"warn"})
 
 # Deliberately the same numbers `volume_drift` uses, because it is the same
 # judgement asked of a different pair of counts: below the first, a row-count
@@ -189,15 +186,17 @@ def read_manifest_target(project_dir: Path) -> str | None:
 
 
 def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[str]]:
-    """Nodes that failed, were skipped because a parent failed, or warned, from
-    the last run's ``run_results.json`` joined to the compiled manifest for
-    names and the dependency graph. Free: reads artifacts already on disk,
-    opens no connection.
+    """Nodes that failed, were skipped, reported an incomplete or unrecognized
+    status, or warned, from the last run's ``run_results.json`` joined to the
+    compiled manifest for names and the dependency graph. Free: reads artifacts
+    already on disk, opens no connection.
 
-    A skip is walked back through however many transitively-skipped parents
-    it takes to name the node that actually failed, since a two-layer partial
-    build (a grandparent failure skipping both its child and grandchild)
-    would otherwise only ever name the immediate, also-skipped parent.
+    Reuses :func:`~..transform.evidence.status_kind` (#1105, #1317) rather than
+    a separate status deny-list: known failure statuses produce ``node_failed``,
+    ``skipped`` walks back through transitively-skipped parents (and failed data
+    tests attached to a parent) to name the node that actually failed, and
+    partial-success or unrecognized statuses produce ``node_incomplete`` so
+    indeterminate execution is neither silently passed nor mislabeled a failure.
 
     A warning ranks low on purpose. A project that runs relationship tests at
     ``severity: warn`` over documented gaps has warnings by design, so this is
@@ -218,37 +217,63 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
         )
 
     def name_of(uid: str) -> str:
-        return manifest_node_label(uid, nodes.get(uid))
+        node = nodes.get(uid)
+        return manifest_node_label(uid, node if isinstance(node, dict) else None)
 
     status_by_uid = {
-        r["unique_id"]: str(r.get("status", "unknown"))
+        str(r["unique_id"]): normalize_node_status(r.get("status"))
         for r in results
-        if r.get("unique_id")
+        if isinstance(r, dict) and r.get("unique_id")
     }
+    tests_on: dict[str, list[str]] = {}
+    for candidate_uid, candidate_node in nodes.items():
+        if not isinstance(candidate_node, dict):
+            continue
+        if candidate_node.get("resource_type") == "test" or str(
+            candidate_uid
+        ).startswith("test."):
+            for parent in (candidate_node.get("depends_on") or {}).get("nodes") or []:
+                tests_on.setdefault(str(parent), []).append(str(candidate_uid))
 
-    def failed_ancestor(uid: str, seen: set[str]) -> str | None:
-        if uid in seen:
-            return None
-        seen.add(uid)
-        node = nodes.get(uid) or {}
-        for dep in (node.get("depends_on") or {}).get("nodes", []):
-            status = status_by_uid.get(dep)
-            if status in _FAILURE_STATUSES:
-                return name_of(dep)
-            if status == "skipped":
-                found = failed_ancestor(dep, seen)
-                if found:
-                    return found
+    def failed_ancestor(uid: str) -> str | None:
+        seen: set[str] = set()
+        pending = [uid]
+        while pending:
+            current = pending.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            node = nodes.get(current)
+            raw_deps = (
+                (node.get("depends_on") or {}).get("nodes")
+                if isinstance(node, dict)
+                else None
+            )
+            for dep in raw_deps if isinstance(raw_deps, list) else ():
+                dep_id = str(dep)
+                dep_status = status_by_uid.get(dep_id)
+                if dep_status is not None and status_kind(dep_status) == "failed":
+                    return name_of(dep_id)
+                for test_id in tests_on.get(dep_id, ()):
+                    test_status = status_by_uid.get(test_id)
+                    if test_status is not None and status_kind(test_status) == "failed":
+                        return name_of(test_id)
+                if dep_status is not None and status_kind(dep_status) == "skipped":
+                    pending.append(dep_id)
         return None
 
     findings: list[DriftFinding] = []
     for result in results:
-        uid = result.get("unique_id")
-        status = str(result.get("status", "unknown"))
-        if not uid or status not in _FAILURE_STATUSES | _WARNING_STATUSES | {"skipped"}:
+        if not isinstance(result, dict) or not result.get("unique_id"):
+            continue
+        uid = str(result["unique_id"])
+        status = normalize_node_status(result.get("status"))
+        kind = status_kind(status)
+        lowered = status.lower()
+        if kind == "succeeded" and lowered != WARNED_STATUS:
             continue
         name = name_of(uid)
-        if status in _WARNING_STATUSES:
+        if lowered == WARNED_STATUS:
             message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
@@ -261,7 +286,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                 )
             )
             continue
-        if status in _FAILURE_STATUSES:
+        if kind == "failed":
             message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
@@ -274,22 +299,39 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                 )
             )
             continue
-        cause = failed_ancestor(uid, set())
+        if kind == "skipped":
+            cause = failed_ancestor(uid)
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="node_skipped",
+                    identifier=name,
+                    # A named cause is a definite causal chain; an unnamed one
+                    # (a selector exclusion, an upstream error dbt did not
+                    # attribute) is real but less actionable, so it ranks lower.
+                    severity="medium" if cause else "low",
+                    detail=(
+                        f"'{name}' was skipped because '{cause}' failed to build"
+                        if cause
+                        else f"'{name}' was skipped"
+                    ),
+                    data={"caused_by": cause} if cause else {},
+                )
+            )
+            continue
+        message = _dbt_message(result, status)
+        note = f" ({message})" if result.get("message") and message != status else ""
         findings.append(
             DriftFinding(
                 axis="build",
-                code="node_skipped",
+                code="node_incomplete",
                 identifier=name,
-                # A named cause is a definite causal chain; an unnamed one
-                # (a selector exclusion, an upstream error dbt did not
-                # attribute) is real but less actionable, so it ranks lower.
-                severity="medium" if cause else "low",
+                severity="medium",
                 detail=(
-                    f"'{name}' was skipped because '{cause}' failed to build"
-                    if cause
-                    else f"'{name}' was skipped"
+                    f"'{name}' reported '{status}'{note}; execution is incomplete "
+                    "and could not be verified as a clean build"
                 ),
-                data={"caused_by": cause} if cause else {},
+                data={"status": status, "status_kind": kind},
             )
         )
     return findings, []
@@ -2449,7 +2491,11 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
 
     nodes = _manifest_nodes(project_dir) or {}
     results = _run_results(project_dir) or []
-    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    status = {
+        str(r["unique_id"]): normalize_node_status(r.get("status"))
+        for r in results
+        if isinstance(r, dict) and r.get("unique_id")
+    }
     proven: dict[str, dict] = {}
     unproven: set[str] = set()
     for unique_id in sorted(status):
@@ -2480,9 +2526,12 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
         model = manifest_node_label(
             attached, parent if isinstance(parent, dict) else None
         )
-        if status[unique_id] in _FAILURE_STATUSES | _WARNING_STATUSES:
+        raw_status = status[unique_id]
+        lowered = raw_status.lower()
+        kind = status_kind(raw_status)
+        if kind in ("failed", "unrecognized") or lowered == WARNED_STATUS:
             unproven.add(model)
-        elif status[unique_id] == "pass":
+        elif lowered == PASSED_STATUS:
             proven.setdefault(model, {"columns": columns, "source": source})
     return {model: grain for model, grain in proven.items() if model not in unproven}
 

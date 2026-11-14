@@ -312,13 +312,14 @@ def verify_build(
 
     from ..maintain import drift as drift_mod
     from ..maintain import verify as verify_mod
+    from .evidence import BUILT_STATUS
 
     built = built_models(summary)
     scope = set(built)
     successful = {
         str(node.get("unique_id") or "")
         for node in summary.get("nodes") or []
-        if str(node.get("status") or "").lower() == "success"
+        if str(node.get("status") or "").lower() == BUILT_STATUS
     }
     result = BuildVerification(
         ran=True,
@@ -432,34 +433,48 @@ def _judgeable(
 ) -> tuple[dict[str, Any], set[str]]:
     """The summary and scope the row-level checks judge.
 
-    dbt's ``success`` is false when any node failed, a test included. A model
-    that dbt reports as built in this run has this run's relation whatever a
-    test said about it, and none of its parents was skipped (dbt would have
-    skipped it too), so it is judged. A model that failed or was skipped is
-    not, and is named; when no model built at all, the build is reported as not
-    complete, as before.
+    dbt's ``success`` is false when any node failed, a test included, and can be
+    true when a model reported ``partial success`` or ``no-op``. Only a model
+    that dbt reports as ``success`` in this run has this run's complete relation
+    (#857, #1105, #1317), so any other status is left out and named; when no
+    model built cleanly at all, the build is reported as not complete.
     """
 
-    if summary.get("success"):
+    from .evidence import BUILT_STATUS, status_kind
+
+    if not built:
         return summary, set(built)
     status = {
-        str(node.get("unique_id") or ""): str(node.get("status") or "").lower()
+        str(node.get("unique_id") or ""): str(node.get("status") or "unknown").lower()
         for node in summary.get("nodes") or []
     }
-    good = {uid for uid in built if status.get(uid) == "success"}
-    if not good:
+    good = {uid for uid in built if status.get(uid) == BUILT_STATUS}
+    if good == set(built) and summary.get("success"):
         return summary, set(built)
+    if not good:
+        return {**summary, "success": False}, set(built)
     left_out = sorted(label for uid, label in built.items() if uid not in good)
     if left_out:
+        unbuilt_uids = [uid for uid in built if uid not in good]
+        has_unrecognized = any(
+            status_kind(status.get(uid, "unknown")) == "unrecognized"
+            for uid in unbuilt_uids
+        )
+        why = (
+            "did not report a complete build"
+            if has_unrecognized
+            else "failed or were skipped"
+        )
         result.warnings.append(
             "the row-level checks judge only the models this build built: "
             + ", ".join(left_out)
-            + " failed or were skipped and were not judged"
+            + f" {why} and were not judged"
         )
-    result.notes.append(
-        "dbt reported the build as failed, but every judged model built in this "
-        "run; the failures are tests or other nodes, reported under build status"
-    )
+    if not summary.get("success"):
+        result.notes.append(
+            "dbt reported the build as failed, but every judged model built in this "
+            "run; the failures are tests or other nodes, reported under build status"
+        )
     return {**summary, "success": True}, good
 
 

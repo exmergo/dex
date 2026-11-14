@@ -202,8 +202,12 @@ definition changing.
 
 Needs no baseline. The classes of finding:
 
-- **Build status**: nodes that failed; nodes skipped because a parent failed
-  (naming the one that actually failed, through a chain of skipped parents);
+- **Build status**: nodes that failed (`node_failed`, across dbt's failure
+  statuses `error`, `runtime error`, `fail` and `failed`); nodes skipped because
+  a parent failed (`node_skipped`, naming the node that actually failed through
+  a chain of skipped parents or a parent's failed test); nodes reporting a
+  partial-success or unrecognized status (`node_incomplete`, ranked medium so
+  indeterminate execution is neither silently passed nor mislabeled a failure);
   nodes that warned rather than failed (`node_warned`, ranked low, because a
   project running relationship tests at `severity: warn` has warnings by design);
   and models the project declares that built no relation.

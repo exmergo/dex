@@ -53,6 +53,24 @@ SUCCEEDED_STATUSES = frozenset({"success", "pass", "warn"})
 #: The one status that means a node produced its relation in this run.
 BUILT_STATUS = "success"
 
+#: The one status that means a test ran and returned zero offending rows.
+PASSED_STATUS = "pass"
+
+#: Status reported when a test returned rows under `severity: warn`: dbt counts
+#: the build as passed, while individual assertion readers still surface the
+#: warning rather than treating the assertion as proven (#1317).
+WARNED_STATUS = "warn"
+
+
+def normalize_node_status(raw: object) -> str:
+    """Normalize a ``run_results.json`` status entry, defaulting missing or
+    blank values to ``unknown`` so they classify as ``unrecognized``."""
+
+    if raw is None:
+        return "unknown"
+    text = str(raw).strip()
+    return text or "unknown"
+
 
 def status_kind(status: str) -> str:
     """What one dbt node status means: ``succeeded``, ``failed``, ``skipped``
@@ -887,7 +905,7 @@ def build_evidence(
         node = manifest_nodes.get(unique_id) or {}
         config = node.get("config") if isinstance(node.get("config"), dict) else {}
         relation = node.get("relation_name")
-        status = str(result.get("status") or "unknown")
+        status = normalize_node_status(result.get("status"))
         built = BuildNode(
             unique_id=unique_id,
             name=manifest_node_label(unique_id, node or None),

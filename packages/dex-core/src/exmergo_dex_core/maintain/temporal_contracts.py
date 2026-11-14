@@ -49,6 +49,7 @@ from pydantic import ValidationError
 from ..cache import match_identifier
 from ..dbt_project import strip_relation_quoting
 from ..semantic_declarations import History
+from ..transform.evidence import BUILT_STATUS, normalize_node_status
 from .drift import DriftFinding
 
 if TYPE_CHECKING:
@@ -112,7 +113,11 @@ def snapshot_nodes(nodes: dict[str, Any], project_dir: Path) -> dict[str, Snapsh
     from .verify import _run_results
 
     results = _run_results(project_dir) or []
-    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    status = {
+        str(r["unique_id"]): normalize_node_status(r.get("status"))
+        for r in results
+        if isinstance(r, dict) and r.get("unique_id")
+    }
     out: dict[str, SnapshotNode] = {}
     for uid, node in nodes.items():
         if (
@@ -278,7 +283,7 @@ def write_probe(
             f"could not be read ({why})",
         )
         return
-    if node.execution in ("error", "fail", "skipped"):
+    if node.execution is not None and node.execution.lower() != BUILT_STATUS:
         _unwritten(
             prepared,
             model,
