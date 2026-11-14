@@ -33,6 +33,7 @@ redundant.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 
 class DexError(Exception):
@@ -64,6 +65,24 @@ class RequestError(DexError, ValueError):
     numeric. A host seeing this can usually surface the message to whoever made
     the request, because the message names what to pass instead.
     """
+
+
+class UndeclaredPopulationChangeError(RequestError):
+    """`transform apply` refused a plan whose population changes no assumption
+    records (#1230).
+
+    ``changes`` lists each one (``model``, ``kind``, ``columns``, ``reason``),
+    so a host can name what to record or undo; ``plan_id`` is the plan refused.
+    Settled by an assumption naming the column, or by applying with
+    ``accept_population_change``, which is recorded on the plan.
+    """
+
+    def __init__(
+        self, message: str, changes: list[dict[str, Any]], plan_id: str
+    ) -> None:
+        super().__init__(message)
+        self.changes = changes
+        self.plan_id = plan_id
 
 
 class PrerequisiteError(DexError):

@@ -104,7 +104,13 @@ the project edits, migrations and dev builds described below.
    change reached beyond its statement.
 4. **Apply.** `dex transform apply <plan-id>` writes the plan as a reviewable
    diff. A `needs_confirmation` here means a file changed since planning:
-   plan again against it. A commit carrying files Dex wrote ends with the
+   plan again against it. Apply refuses a plan whose `change_scope` holds an
+   `undeclared` population change, naming each under
+   `data.undeclared_population_changes`: record an assumption naming its
+   `column` (a re-driven model needs `request` or `contract` tier) and plan
+   again, or undo it. `--accept-population-change "<reason>"` applies it
+   anyway and records the reason on the plan; use it only where the request
+   settles the change. A commit carrying files Dex wrote ends with the
    `data.commit_trailer` line, after a blank line.
 5. **Build and verify on dev.**
    `dex transform build --target dev --verify --for-plan <plan-id>`. Read
@@ -112,6 +118,15 @@ the project edits, migrations and dev builds described below.
    a cut-off read, and `details` names where the rest is. A required deliverable
    that `failed`, was `skipped` or is `missing` is not done, whatever relation is
    left in dev from an earlier run; fix what `blockers` names and build again.
+   `outcome: built_unverified` means every deliverable built and part of the
+   change is still open: `data.completion.unverified` names each model and
+   reason (`comparison_not_run`, `comparison_contradicted`,
+   `undeclared_population_change`,
+   `introduced_high_finding`, `unattributed_high_finding`). It is not done.
+   `data.verification.introduced` lists the findings this plan introduced,
+   judged against the last `--verify` build before it was applied, and they
+   lead `findings`; an `existing` finding predates the plan, an `unattributed`
+   one could not be placed. Never dismiss an introduced finding as inherited.
    `build_only` means nothing checked those rows. Then read
    `data.verification.ran`, every finding and everything under
    `suppressed`. A green build says dbt ran, not that the rows are right: a

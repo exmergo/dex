@@ -215,13 +215,26 @@ def test_a_package_parent_is_planned_built_and_verified(project, capsys):
     planned = _plan(capsys, project, FROM_PARENT)
     assert planned["status"] == "ok", planned["errors"]
     assert _parent_rows(planned) == []
-    assert (
-        _dex(capsys, "transform", "apply", planned["data"]["plan_id"])["status"] == "ok"
+    # Re-driving from the parent is the fix this test is about (#1230).
+    applied = _dex(
+        capsys,
+        "transform",
+        "apply",
+        planned["data"]["plan_id"],
+        "--accept-population-change",
+        "re-driven from the parent under test",
     )
+    assert applied["status"] == "ok", applied["errors"]
     schema = (project / "models/marts/inbox__threads.yml").read_text()
     assert f"ref('{PARENT}')" in schema
     built = _build(capsys, planned["data"]["plan_id"])
-    assert built["data"]["outcome"] == "validated"
+    # Built and checked, but the rewrite was applied uncompared while its
+    # baseline was ready, so the change is not finished (#1230).
+    assert built["data"]["outcome"] == "built_unverified"
+    assert built["data"]["completion"]["unverified"] == [
+        {"model": "inbox__threads", "reason": "comparison_not_run"}
+    ]
+    assert built["data"]["evidence"]["outcome"] == "validated"
     [record] = built["data"]["verification"]["parent_population"]
     assert record["status"] == "satisfied"
     relationships = [

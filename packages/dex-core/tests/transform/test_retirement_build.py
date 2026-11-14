@@ -294,8 +294,13 @@ def test_the_benchmark_failure_is_caught_at_plan_compare_and_build(repo, capsys)
     assert ("rpt_empty", "retirement_output_present") in codes
     assert _rows(repo, "select count(*) from rpt_empty") == [(0,)]
     contradicted = built["data"]["completion"]["obligations"]["contradicted"]
+    # The bounded block may cut this busy plan's list to one entry, counted
+    # under `elided`; the uncut records are under data.verification.retirement.
+    assert {o["model"] for o in contradicted if o["kind"] == "retirement"}
     assert {"rpt_empty", "rpt_orders"} <= {
-        o["model"] for o in contradicted if o["kind"] == "retirement"
+        r["model"]
+        for r in built["data"]["verification"]["retirement"]
+        if r["status"] == "contradicted"
     }
 
 

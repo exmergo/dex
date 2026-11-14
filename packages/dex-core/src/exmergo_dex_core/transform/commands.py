@@ -25,6 +25,7 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -39,7 +40,7 @@ from ..dbt_tests import incremental_unit_tests as _incremental_unit_tests
 from ..dbt_tests import runs_full_build as _runs_full_build
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
-from ..errors import DexError, RequestError
+from ..errors import DexError, RequestError, UndeclaredPopulationChangeError
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
@@ -1160,6 +1161,9 @@ def _record_refactor_models(
         stored.refactor_models = {
             m["model"]: m["static_attribution"] for m in per_model
         }
+        stored.refactor_baseline_ready = {
+            m["model"]: not m.get("blocked_inputs") for m in per_model
+        }
         store.save_plan(stored)
 
 
@@ -1172,6 +1176,7 @@ def refactor_comparison_states(stored: Any) -> list[dict[str, Any]] | None:
 
     models = getattr(stored, "refactor_models", None) or {}
     recorded = getattr(stored, "comparisons", None) or {}
+    ready = getattr(stored, "refactor_baseline_ready", None) or {}
     if not models and not recorded:
         return None
     states = []
@@ -1182,6 +1187,8 @@ def refactor_comparison_states(stored: Any) -> list[dict[str, Any]] | None:
         state: dict[str, Any] = {"model": model}
         if model in models:
             state["static_attribution"] = models[model]
+            if model in ready:
+                state["baseline_ready"] = ready[model]
         if verdict:
             state.update(
                 status=verdict.get("status"),
@@ -4458,30 +4465,147 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return env.error_for(exc)
 
 
-def apply(engine: DexEngine, plan_id: str | None = None) -> ApplyResult:
+def apply(
+    engine: DexEngine,
+    plan_id: str | None = None,
+    *,
+    accept_population_change: str | None = None,
+) -> ApplyResult:
     """Write a stored plan's edits into the dbt project.
 
     A file that changed after the plan was made is a conflict, not an overwrite:
     human edits are authoritative, so the result comes back with conflicts and
     nothing written until the caller confirms deliberately.
+
+    A plan that changes a model's population with no assumption recording it
+    is refused (#1230): re-plan with an assumption naming the column it governs,
+    or pass ``accept_population_change`` with the reason, which is recorded on
+    the plan and reported by its ``--for-plan`` build.
     """
 
     # No id means the latest unapplied plan of any kind: apply does not dispatch
     # on kind, a plan is a plan (a semantic plan applies the same way a model plan
     # does). An empty id is refused rather than read as no id (#1103).
+    _reject_blank(
+        accept_population_change,
+        "--accept-population-change",
+        "state why the population change is intended, or record an assumption "
+        "naming the column it governs and plan again",
+    )
     store, plan_id, resolved = _resolve_plan_id(engine, plan_id, "applying a plan")
     with _naming_resolution(resolved):
-        return _apply_stored(engine, store, plan_id, resolved)
+        return _apply_stored(
+            engine,
+            store,
+            plan_id,
+            resolved,
+            accept_population_change=accept_population_change,
+        )
+
+
+def _population_gate(
+    store: Store, stored: Any, plan_id: str, accept: str | None
+) -> dict[str, Any] | None:
+    """Refuse an undeclared population change, or record its acceptance.
+
+    Returns the acceptance the plan carries, if any. Free: it reads only what
+    the plan recorded when it was made.
+    """
+
+    from .scope_gate import accepted_key, undeclared_population_changes
+
+    if stored.edit_target == "semantic":
+        return None
+    pending = undeclared_population_changes(stored.change_scope)
+    acceptance = stored.population_acceptance
+    taken = {
+        accepted_key(entry)
+        for entry in (acceptance or {}).get("changes") or []
+        if isinstance(entry, dict)
+    }
+    open_ = [entry for entry in pending if accepted_key(entry) not in taken]
+    if not open_:
+        return acceptance
+    if accept is None:
+        named = "; ".join(
+            f"{entry['model']} ({entry.get('kind', 'population')}"
+            + (
+                f" reading {', '.join(entry['columns'])}"
+                if entry.get("columns")
+                else ""
+            )
+            + (", re-driven" if entry.get("reason") == "redriven" else "")
+            + ")"
+            for entry in open_[:5]
+        )
+        more = f" and {len(open_) - 5} more" if len(open_) > 5 else ""
+        raise UndeclaredPopulationChangeError(
+            "this plan changes which rows a model holds and no assumption records "
+            f"it: {named}{more}. A general filter changes aggregates; whether a "
+            "roster or lookup also loses those rows is a decision to record, "
+            "never a side effect. If the request asks for it, add an assumption "
+            "naming the `column` it governs (a re-driven model needs one at "
+            "`request` or `contract` tier) and plan again; otherwise undo it. To "
+            'apply anyway, re-run with --accept-population-change "<reason>", '
+            "which is recorded on the plan (data.undeclared_population_changes)",
+            open_,
+            plan_id,
+        )
+    acceptance = {
+        "reason": accept.strip(),
+        "accepted_at": datetime.now(UTC).isoformat(),
+        "changes": [*((acceptance or {}).get("changes") or []), *open_],
+    }
+    stored.population_acceptance = acceptance
+    store.save_plan(stored)
+    return acceptance
+
+
+def _refresh_baseline_ready(engine: DexEngine, store: Store, stored: Any) -> None:
+    """Re-read, at apply, whether each rewritten model's baseline would build.
+
+    The offer recorded it when the plan was made; a repair built since then
+    makes it ready, and applying is the last moment the comparison could have
+    run (#1230). Free: the latest run results and the manifest beside them.
+    Best effort: a readiness that cannot be read keeps what the offer recorded.
+    """
+
+    models = getattr(stored, "refactor_models", None) or {}
+    if not models or stored.edit_target == "semantic":
+        return
+    with contextlib.suppress(Exception):
+        # Here, not at the top: it loads the SQL parser, which a semantic-layer
+        # apply in an install without the SQL extra does not have.
+        from .refactor_compare import _blocked_parents
+
+        project = engine.project_dir()
+        stored.refactor_baseline_ready = {
+            model: not _blocked_parents(project, model, set()) for model in models
+        }
+        store.save_plan(stored)
 
 
 def _apply_stored(
-    engine: DexEngine, store: Store, plan_id: str, resolved: dict[str, Any] | None
+    engine: DexEngine,
+    store: Store,
+    plan_id: str,
+    resolved: dict[str, Any] | None,
+    *,
+    accept_population_change: str | None = None,
 ) -> ApplyResult:
     """:func:`apply` once the plan id is settled."""
 
     resolution_warnings = _resolution_warnings(resolved)
     repo_root = engine.require_repo_root("applying a plan")
     stored = store.load_plan(plan_id)
+    acceptance = _population_gate(store, stored, plan_id, accept_population_change)
+    _refresh_baseline_ready(engine, store, stored)
+    if acceptance is None and accept_population_change is not None:
+        resolution_warnings = [
+            *resolution_warnings,
+            "--accept-population-change was given, but this plan records no "
+            "undeclared population change, so nothing was accepted",
+        ]
     semantic_layer = None
     if stored.edit_target == "semantic":
         candidate = engine.semantic_catalog_source()
@@ -4533,6 +4657,7 @@ def _apply_stored(
         conflicts_overridden=[c.path for c in outcome.conflicts],
         diffs=outcome.diffs,
         refactor_comparison=comparison,
+        population_acceptance=acceptance,
         notes=_comparison_notes(comparison),
         decisions=(
             None
@@ -4660,7 +4785,26 @@ def _built_decisions(engine: DexEngine, summary: dict) -> list[dict[str, Any]] |
 
 def cmd_apply(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
-        return to_envelope(apply(engine, getattr(args, "argument", None)))
+        return to_envelope(
+            apply(
+                engine,
+                getattr(args, "argument", None),
+                accept_population_change=getattr(
+                    args, "accept_population_change", None
+                ),
+            )
+        )
+    except UndeclaredPopulationChangeError as exc:
+        found = _resolution_error(exc)
+        return env.error_for(
+            exc,
+            data={
+                **found.get("data", {}),
+                "plan_id": exc.plan_id,
+                "undeclared_population_changes": exc.changes,
+            },
+            warnings=found.get("warnings", []),
+        )
     except (ValueError, PlanError) as exc:
         # `PlanError` is the apply-time containment refusal, which is a refusal
         # the caller can act on rather than a failure, so it gets the same named
@@ -4905,6 +5049,13 @@ def cmd_apply_document(args: argparse.Namespace, engine: DexEngine) -> env.Envel
             "pass the plan document's path (or `-` for stdin), or drop the flag "
             "and pass a stored plan id",
         )
+        if getattr(args, "accept_population_change", None) is not None:
+            # A document carries the edits and their digest, not the change
+            # scope the plan recorded, so there is nothing here to accept.
+            raise RequestError(
+                "--accept-population-change applies to a stored plan, whose "
+                "change scope the store recorded; a plan document carries none"
+            )
         raw = sys.stdin.read() if path == "-" else read_payload_file(path)
         return to_envelope(
             apply_document(
@@ -5417,6 +5568,11 @@ def _build_project(
             toggle=_plan_toggle(engine, for_plan, for_plan_document),
             plan_edits=_plan_edits(engine, for_plan, for_plan_document),
             select=select,
+            attribution=_attribution_input(
+                engine, for_plan, for_plan_document, seed_history_dir, target
+            ),
+            history=(seed_history_dir, target),
+            plan_id=for_plan,
         )
         return _shape_build_result(
             summary,
@@ -5577,6 +5733,11 @@ def _build_project(
         toggle=_plan_toggle(engine, for_plan, for_plan_document),
         plan_edits=_plan_edits(engine, for_plan, for_plan_document),
         select=select,
+        attribution=_attribution_input(
+            engine, for_plan, for_plan_document, seed_history_dir, target
+        ),
+        history=(seed_history_dir, target),
+        plan_id=for_plan,
     )
     decisions = _with_retirement(
         _built_decisions(engine, summary),
@@ -5684,8 +5845,12 @@ def _verify_build(
     toggle: dict[str, Any] | None = None,
     plan_edits: list[PlanEdit] | None = None,
     select: str | None = None,
+    attribution: Any = None,
+    history: tuple[Path, str] | None = None,
+    plan_id: str | None = None,
 ) -> BuildVerification:
-    """The sweep, or the statement that it did not run.
+    """The sweep, or the statement that it did not run, recorded as the next
+    build's baseline.
 
     Opt-in on every connector, free ones included. Verification on DuckDB costs
     nothing, so making it automatic there was tempting; one flag that means one
@@ -5704,6 +5869,10 @@ def _verify_build(
     hand it a different run's manifest or a different run's passing tests.
 
     ``select`` carries the build's selector expression, when supplied.
+
+    ``attribution`` is :func:`_attribution_input`'s answer for a ``--for-plan``
+    build, and ``history`` the directory and target the sweep is recorded
+    under once it ran, so the next plan's build has a baseline (#1230).
     """
 
     from .artifact_runtime import pinned_artifacts
@@ -5718,28 +5887,82 @@ def _verify_build(
         if adapter is not None
         else (lambda: engine._adapter("transform build", reads_dev_target=True))
     )
+    kwargs: dict[str, Any] = {
+        "resolve_adapter": opener,
+        "retirement": retirement,
+        "toggle": toggle,
+        "plan_edits": plan_edits,
+        "selection": select,
+        "attribution": attribution,
+    }
     if artifact_directory is None:
-        return verify_build(
-            engine,
-            Path(project),
-            summary,
-            resolve_adapter=opener,
-            retirement=retirement,
-            toggle=toggle,
-            plan_edits=plan_edits,
-            selection=select,
+        result = verify_build(engine, Path(project), summary, **kwargs)
+    else:
+        with pinned_artifacts(artifact_directory, invocation_id):
+            result = verify_build(engine, Path(project), summary, **kwargs)
+    if result.ran and history is not None:
+        from .finding_attribution import record_sweep, unchecked_keys
+
+        record_sweep(
+            history[0],
+            history[1],
+            scope=result.scope,
+            suppressed=result.suppressed,
+            fingerprints=result.fingerprints,
+            unchecked=unchecked_keys(result.payload()),
+            invocation_id=invocation_id,
+            plan_id=plan_id,
         )
-    with pinned_artifacts(artifact_directory, invocation_id):
-        return verify_build(
-            engine,
-            Path(project),
-            summary,
-            resolve_adapter=opener,
-            retirement=retirement,
-            toggle=toggle,
-            plan_edits=plan_edits,
-            selection=select,
+    return result
+
+
+def _attribution_input(
+    engine: DexEngine,
+    for_plan: str | None,
+    for_plan_document: Any,
+    history_directory: Path | None,
+    target: str,
+) -> Any:
+    """The plan's edits and the sweep recorded before it was applied (#1230).
+
+    ``None`` when no plan was named: with no change there is nothing a finding
+    could have been introduced by. A plan document carries no apply time, so a
+    sandbox build attributes by lineage and new models alone.
+    """
+
+    from .finding_attribution import AttributionInput, load_baseline
+
+    edits = _plan_edits(engine, for_plan, for_plan_document)
+    if edits is None:
+        return None
+    if not for_plan:
+        return AttributionInput(
+            edits=edits,
+            baseline_reason=(
+                "a plan document carries no apply time, so no earlier sweep can "
+                "be placed before it; attributed by lineage and new models only"
+            ),
         )
+    # The plan's apply time, or its creation while it is unapplied: never a
+    # sweep of the plan's own earlier build.
+    cutoff = None
+    with contextlib.suppress(Exception):
+        stored = engine.require_full_store("reading a plan").load_plan(for_plan)
+        cutoff = stored.applied_at or stored.created_at
+    baseline = load_baseline(history_directory, target, before=cutoff, plan_id=for_plan)
+    return AttributionInput(
+        edits=edits,
+        baseline=baseline,
+        baseline_reason=(
+            None
+            if baseline is not None
+            else (
+                f"no `transform build --verify` of target '{target}' was recorded "
+                "before this plan was applied; build with --verify before applying "
+                "the next plan to give its findings a baseline"
+            )
+        ),
+    )
 
 
 def _for_plan_document(args: argparse.Namespace) -> Any:
@@ -6916,6 +7139,7 @@ def _attach_completion(
             change_scope=inputs.get("change_scope"),
             incremental_replay=_incremental_replay_inputs(result, inputs),
             repair=inputs.get("repair"),
+            population_accepted=inputs.get("population_accepted"),
         )
     except Exception as exc:
         result.notes.append(
@@ -7003,6 +7227,9 @@ def _completion_inputs(
             )
             inputs["change_scope"] = getattr(stored, "change_scope", None) or {}
             inputs["repair"] = getattr(stored, "repair", None)
+            inputs["population_accepted"] = getattr(
+                stored, "population_acceptance", None
+            )
     elif for_plan_document is not None:
         inputs["source"] = "for_plan_file"
         with contextlib.suppress(Exception):

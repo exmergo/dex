@@ -390,6 +390,10 @@ class ApplyResult(Result):
     # behavior change needs no equivalence. Absent when the plan rewrote no
     # existing model.
     refactor_comparison: list[dict[str, Any]] | None = None
+    # What `--accept-population-change` accepted on this plan (#1230): the
+    # reason, when, and each undeclared population change it covers. Absent
+    # when the plan changed no population without an assumption.
+    population_acceptance: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         resolution = (
@@ -411,6 +415,8 @@ class ApplyResult(Result):
         }
         if self.refactor_comparison is not None:
             payload["refactor_comparison"] = self.refactor_comparison
+        if self.population_acceptance is not None:
+            payload["population_acceptance"] = self.population_acceptance
         if self.decisions is not None:
             payload["decisions"] = self.decisions
         if self.commit_trailer is not None:
@@ -761,7 +767,10 @@ class BuildResult(Result):
     ``summary`` keeps reading what it read.
 
     ``outcome`` is lifted to the top of the payload from inside ``evidence``
-    because it is the one field a reader must not have to go looking for.
+    because it is the one field a reader must not have to go looking for. Where
+    the completion block is present it is the block's outcome, which reads
+    ``built_unverified`` in place of ``validated`` when the change left work
+    unfinished (#1230).
     """
 
     success: bool = False
@@ -801,6 +810,12 @@ class BuildResult(Result):
                 if isinstance(evidence_data, dict)
                 else getattr(self.evidence, "outcome", None)
             )
+            # The completion block can say more than the evidence: a build
+            # that validated with part of the change unfinished is
+            # `built_unverified` (#1230). `data.evidence.outcome` keeps what
+            # the dbt evidence alone establishes, which a host recomputes.
+            if self.completion is not None:
+                outcome = self.completion.outcome
             payload = {
                 "outcome": outcome,
                 **payload,
