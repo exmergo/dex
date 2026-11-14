@@ -182,6 +182,52 @@ def analyze(
     }
 
 
+#: How many unedited descendants ``downstream`` names per rewritten model.
+MAX_DOWNSTREAM = 10
+
+
+def downstream(
+    report: Mapping[str, Any], view: Any, edits: Iterable[Any]
+) -> dict[str, Any] | None:
+    """The unedited models below each rewritten one (#1231), read from the
+    project's ``ref()`` graph: what this plan can move without touching.
+
+    Static and free, and only a pointer: ``transform build --verify
+    --for-plan`` measures each against the tree before the plan and reports
+    it under ``data.completion.impact``. ``None`` when nothing is below.
+    """
+
+    from ..references import ReferenceIndex
+
+    index = ReferenceIndex(view)
+    edited = {
+        PurePosixPath(str(getattr(edit, "path", ""))).stem.lower() for edit in edits
+    }
+    per_model: dict[str, Any] = {}
+    every: set[str] = set()
+    for entry in report.get("models") or []:
+        model = str(entry.get("model") or "")
+        below = sorted(
+            name
+            for name in index.descendants_of(model)
+            if name.lower() not in edited and name.lower() != model.lower()
+        )
+        if not below:
+            continue
+        every.update(below)
+        per_model[model] = {
+            "count": len(below),
+            "models": below[:MAX_DOWNSTREAM],
+        }
+    if not per_model:
+        return None
+    return {
+        "models": per_model,
+        "count": len(every),
+        "measured_by": "transform build --target dev --verify --for-plan <plan-id>",
+    }
+
+
 def scope_for(
     path: str,
     prior_sql: str,

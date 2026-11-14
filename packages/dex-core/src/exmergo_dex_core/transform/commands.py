@@ -1387,6 +1387,10 @@ def _report_change_scope(
         return
     if report is None:
         return
+    with contextlib.suppress(Exception):
+        downstream = change_scope.downstream(report, view, edits)
+        if downstream:
+            report["downstream"] = downstream
     result.change_scope = report
     result.warnings.extend(change_scope.warnings(report))
     per_model = change_scope.stored_form(report)
@@ -5573,6 +5577,13 @@ def _build_project(
             ),
             history=(seed_history_dir, target),
             plan_id=for_plan,
+            impact=(
+                _impact_input(
+                    engine, for_plan, for_plan_document, repo_root, target, connector
+                )
+                if verify
+                else None
+            ),
         )
         return _shape_build_result(
             summary,
@@ -5622,6 +5633,11 @@ def _build_project(
 
     from .verify import plan_models
 
+    impact = (
+        _impact_input(engine, for_plan, for_plan_document, repo_root, target, connector)
+        if verify
+        else None
+    )
     estimate, per_node, price_notes, upper_bounds, adapter = _price_build(
         engine,
         checkout,
@@ -5635,6 +5651,7 @@ def _build_project(
             if verify
             else None
         ),
+        impact=impact,
     )
     if estimate is not None:
         command_args.billed_handshake(
@@ -5738,6 +5755,7 @@ def _build_project(
         ),
         history=(seed_history_dir, target),
         plan_id=for_plan,
+        impact=impact,
     )
     decisions = _with_retirement(
         _built_decisions(engine, summary),
@@ -5802,6 +5820,48 @@ def _plan_edits(
     return None
 
 
+def _impact_input(
+    engine: DexEngine,
+    for_plan: str | None,
+    for_plan_document: Any,
+    repo_root: Any,
+    target: str,
+    connector: str | None,
+) -> Any:
+    """What the impact phase needs from the plan this build answers for
+    (#1231): its edits and the pre-plan sources ``transform apply`` recorded.
+    ``None`` when no plan was named. A plan document carries no recorded
+    sources, so its pre-plan SQL comes from git alone."""
+
+    from .downstream_impact import ImpactInput
+
+    if not connector:
+        return None
+    with contextlib.suppress(Exception):
+        recorded = None
+        if for_plan:
+            stored = engine.require_full_store("reading a plan").load_plan(for_plan)
+            edits, project_dir = list(stored.edits), stored.project_dir
+            recorded = stored.baseline_sources
+        elif for_plan_document is not None:
+            from .portable import verify_plan_document
+
+            document = verify_plan_document(for_plan_document)
+            edits, project_dir = list(document.edits), document.project_dir
+        else:
+            return None
+        return ImpactInput(
+            edits=edits,
+            recorded=recorded,
+            repo_root=Path(repo_root) if repo_root else None,
+            project_dir=project_dir,
+            target=target,
+            connector=connector,
+            marts_paths=list(engine.config.transform.marts_paths),
+        )
+    return None
+
+
 def _plan_retirement(
     engine: DexEngine, for_plan: str | None, for_plan_document: Any
 ) -> dict[str, Any] | None:
@@ -5848,6 +5908,7 @@ def _verify_build(
     attribution: Any = None,
     history: tuple[Path, str] | None = None,
     plan_id: str | None = None,
+    impact: Any = None,
 ) -> BuildVerification:
     """The sweep, or the statement that it did not run, recorded as the next
     build's baseline.
@@ -5894,6 +5955,7 @@ def _verify_build(
         "plan_edits": plan_edits,
         "selection": select,
         "attribution": attribution,
+        "impact": impact,
     }
     if artifact_directory is None:
         result = verify_build(engine, Path(project), summary, **kwargs)
@@ -6578,6 +6640,7 @@ def _price_build(
     artifact_directory: Path | None = None,
     full_refresh: bool = False,
     focus: set[str] | None = None,
+    impact: Any = None,
 ):
     """Price a billed build upfront with a free ``dbt compile`` dry-run.
 
@@ -6707,6 +6770,31 @@ def _price_build(
             if joins:
                 estimate += joins
                 per_node = {**per_node, "(join overlap probes)": joins}
+            if impact is not None:
+                from .artifact_runtime import artifact_paths
+                from .verify import price_impact
+
+                # The models below the plan's edits, against the tree before
+                # it (#1231): compiled here once and reused by the sweep. A
+                # fresh pin: the one above is spent once its block exits.
+                with (
+                    pinned_artifacts(artifact_directory)
+                    if artifact_directory is not None
+                    else contextlib.nullcontext()
+                ):
+                    moved, impact_notes = price_impact(
+                        engine,
+                        adapter,
+                        Path(project),
+                        impact,
+                        artifact_paths(artifact_directory).manifest
+                        if artifact_directory is not None
+                        else None,
+                    )
+                notes = [*notes, *impact_notes]
+                if moved:
+                    estimate += moved
+                    per_node = {**per_node, "(downstream impact)": moved}
         upper_bounds: dict[str, str] = {}
         # Under a full refresh the rebuilt nodes compile without their batch
         # filter, so only a model whose `full_refresh: false` keeps it is named.

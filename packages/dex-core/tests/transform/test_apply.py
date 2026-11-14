@@ -542,3 +542,28 @@ def test_guarded_delete_is_identical_across_connectors(
     )
     assert rc == 0, (connector, envelope)
     assert not (dbt_project_dir / "models/staging/stg_customers.sql").exists()
+
+
+def test_apply_keeps_the_first_preimage_as_the_plans_baseline(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """#1231: the pre-plan SQL is recorded once, at the first apply. A confirmed
+    re-apply over a human edit must not record that edit as the tree before
+    the plan."""
+
+    path = "models/staging/stg_customers.sql"
+    original = (dbt_project_dir / path).read_text(encoding="utf-8")
+    plan_id = _make_plan(tmp_path, capsys, path, "select 2 as id\n")
+    rc, _ = _run(["--repo-root", str(tmp_path), "transform", "apply", plan_id], capsys)
+    assert rc == 0
+    plan_file = tmp_path / ".dex" / "plans" / f"{plan_id}.json"
+    assert json.loads(plan_file.read_text())["baseline_sources"] == {path: original}
+
+    (dbt_project_dir / path).write_text("select 3 as id\n", encoding="utf-8")
+    _run(
+        ["--repo-root", str(tmp_path), "--confirm", "transform", "apply", plan_id],
+        capsys,
+    )
+    # The confirmed re-apply did write over the human edit.
+    assert (dbt_project_dir / path).read_text(encoding="utf-8") == "select 2 as id\n"
+    assert json.loads(plan_file.read_text())["baseline_sources"] == {path: original}
