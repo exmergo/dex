@@ -396,6 +396,28 @@ DEX_TEST_TRINO_URL=http://dex_ro@127.0.0.1:8085 \
     uv run pytest tests/integration -q -m trino_iceberg
 ```
 
+## Elementary fixture tests
+
+`tests/transform/elementary_fixture.py` builds a small dbt project with the
+`elementary-data/elementary` package installed, in six variants that each change
+what the package does in a run, and takes a census of the dev warehouse: every
+relation with its row count, before and after a command. The difference is the
+command's footprint. The Elementary compatibility work is proved on it.
+
+The census tests run with the rest of the suite. The fixture tests install the
+package from the dbt package hub, which needs the network, so they are opt-in
+and run on local DuckDB with no cloud account:
+
+```
+DEX_TEST_ELEMENTARY=1 uv run pytest tests/transform/test_elementary_fixture.py
+```
+
+Without the variable they collect as skipped with it named in the skip reason.
+They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
+the first release with DuckDB macros. Older releases fail `dbt build` on
+DuckDB; running them on Postgres is
+[#1331](https://github.com/exmergo/dex/issues/1331).
+
 ## Agent evals (`evals/`)
 
 The Tier-2 agent-eval harness lives at the repo root in `evals/`, separate from
