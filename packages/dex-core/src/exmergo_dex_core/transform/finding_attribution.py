@@ -148,6 +148,10 @@ class Baseline:
     scope: frozenset[str]
     suppressed: frozenset[str]
     fingerprints: frozenset[str]
+    #: ``axis|model|join`` keys of checks the baseline left ``unchecked`` on one
+    #: model (a join it could not probe, a column contract it could not read),
+    #: which a model-wide suppression does not name.
+    unchecked: frozenset[str] = frozenset()
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -174,6 +178,7 @@ def record_sweep(
     scope: Iterable[str],
     suppressed: Iterable[str],
     fingerprints: Iterable[str],
+    unchecked: Iterable[str] = (),
     invocation_id: str | None = None,
     now: datetime | None = None,
 ) -> None:
@@ -193,6 +198,7 @@ def record_sweep(
             "scope": sorted(set(scope)),
             "suppressed": sorted(set(suppressed)),
             "fingerprints": sorted(set(fingerprints)),
+            "unchecked": sorted(set(unchecked)),
         }
         sweeps = [*_read(directory), entry][-MAX_SWEEPS:]
         body = json.dumps({"schema_version": 1, "sweeps": sweeps}, indent=1)
@@ -205,13 +211,48 @@ def record_sweep(
         return
 
 
+#: The verification record lists whose ``unchecked`` records leave one model's
+#: check unrun, and the finding axis each stands for.
+_RECORD_AXES = (
+    ("join_coverage", "join_contract"),
+    ("parent_population", "declaration"),
+    ("temporal_contracts", "declaration"),
+    ("population_delta", "declaration"),
+)
+
+
+def unchecked_keys(verification: Mapping[str, Any]) -> list[str]:
+    """``axis|model|join`` for every per-model check a sweep left unchecked.
+
+    ``verification`` is a sweep's payload. A join record keys on its join, so
+    another join on the same model that was measured still counts as checked;
+    the other records key on the model.
+    """
+
+    keys: list[str] = []
+    for kind, axis in _RECORD_AXES:
+        for record in verification.get(kind) or []:
+            if not isinstance(record, Mapping) or record.get("status") != "unchecked":
+                continue
+            join = record.get("join") if kind == "join_coverage" else None
+            keys.append(f"{axis}|{record.get('model') or ''}|{join or ''}")
+    contract = verification.get("column_contract") or {}
+    keys.extend(
+        f"build|{item.get('model') or ''}|"
+        for item in contract.get("unchecked") or []
+        if isinstance(item, Mapping)
+    )
+    return keys
+
+
 def load_baseline(
     directory: Path | None, target: str, *, before: str | None
 ) -> Baseline | None:
     """The latest sweep of ``target`` recorded strictly before ``before``.
 
-    ``before`` is the plan's ``applied_at``; ``None`` takes the latest sweep,
-    which is what an unapplied plan's tree was last swept as.
+    ``before`` is the plan's ``applied_at``, or its ``created_at`` while it is
+    unapplied, so a build of the plan never takes its own earlier sweep as the
+    baseline. ``None`` takes the latest sweep.
     """
 
     if directory is None:
@@ -237,6 +278,7 @@ def load_baseline(
         scope=frozenset(str(s) for s in sweep.get("scope") or ()),
         suppressed=frozenset(str(s) for s in sweep.get("suppressed") or ()),
         fingerprints=frozenset(str(s) for s in sweep.get("fingerprints") or ()),
+        unchecked=frozenset(str(s) for s in sweep.get("unchecked") or ()),
     )
 
 
@@ -296,7 +338,14 @@ def plan_reach(edits: Iterable[Any], manifest: Mapping[str, Any] | None) -> Reac
     label_of: dict[str, str] = {}
     by_file: dict[str, list[str]] = {}
     by_patch: dict[str, list[str]] = {}
-    for unique_id, node in nodes.items():
+    # Sources too: a `schema.yml` that declares one is that source's file, and
+    # its consumers are what an edit to it reaches.
+    sources = (manifest or {}).get("sources") or {}
+    defined = [
+        *nodes.items(),
+        *(sources.items() if isinstance(sources, Mapping) else ()),
+    ]
+    for unique_id, node in defined:
         if not isinstance(node, Mapping):
             continue
         label = manifest_node_label(str(unique_id), dict(node))
@@ -326,10 +375,16 @@ def plan_reach(edits: Iterable[Any], manifest: Mapping[str, Any] | None) -> Reac
             if not matched and kind != "test_sql":
                 bounded = False
         elif kind == "schema_yml":
-            roots.update(by_patch.get(path, []))
-            # A YAML that documents a seed or source may have no patch_path in
-            # an older manifest; what it changes is then unknown.
-            if not by_patch.get(path):
+            documented = by_patch.get(path, [])
+            # A source is defined in the YAML itself, so its file is the path.
+            declared = [
+                uid for uid in by_file.get(path, []) if uid.startswith("source.")
+            ]
+            roots.update(documented)
+            roots.update(declared)
+            # A YAML that matches no node (an older manifest with no patch_path)
+            # changes something the lineage cannot name.
+            if not documented and not declared:
                 bounded = False
     reach.edited = {label_of[uid] for uid in roots if uid in label_of}
     if not bounded:
@@ -416,10 +471,33 @@ def classify(
         classes = _classes(
             str(_value(finding, "axis") or ""), str(_value(finding, "code") or "")
         )
-        if classes is not None and not classes & baseline.suppressed:
+        if (
+            classes is not None
+            and not classes & baseline.suppressed
+            and not _left_unchecked(finding, identifier, baseline)
+        ):
             return Attribution(INTRODUCED, "baseline")
         return Attribution(UNATTRIBUTED, "baseline_suppressed")
     return Attribution(UNATTRIBUTED, "no_baseline")
+
+
+def _left_unchecked(finding: Any, identifier: str, baseline: Baseline) -> bool:
+    """Whether the baseline swept the model and left this one check unrun.
+
+    A column-contract finding is a ``build`` finding with a ``column_`` code; a
+    join finding matches its own join, or a record that named none.
+    """
+
+    axis = str(_value(finding, "axis") or "")
+    code = str(_value(finding, "code") or "")
+    if axis == "build" and not code.startswith("column_"):
+        return False
+    data = _value(finding, "data") or {}
+    join = data.get("join") if isinstance(data, Mapping) else None
+    keys = {f"{axis}|{identifier}|"}
+    if isinstance(join, str):
+        keys.add(f"{axis}|{identifier}|{join}")
+    return bool(keys & baseline.unchecked)
 
 
 def attribute(
@@ -483,4 +561,25 @@ def introduced_refs(
         }
         for f, a in zip(findings, attributions, strict=True)
         if a.attribution == INTRODUCED
+    ][:MAX_INTRODUCED]
+
+
+def unattributed_high_refs(
+    findings: list[Any], attributions: list[Attribution]
+) -> list[dict[str, Any]]:
+    """The high-severity findings nothing could place, as ``{code, identifier,
+    column}``, taken before the findings cap so none is lost to it."""
+
+    return [
+        {
+            k: v
+            for k, v in (
+                ("code", _value(f, "code")),
+                ("identifier", _value(f, "identifier")),
+                ("column", _value(f, "column")),
+            )
+            if v is not None
+        }
+        for f, a in zip(findings, attributions, strict=True)
+        if a.attribution == UNATTRIBUTED and _value(f, "severity") == "high"
     ][:MAX_INTRODUCED]

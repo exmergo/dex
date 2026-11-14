@@ -426,3 +426,147 @@ def test_a_declared_fact_is_held_to_its_own_class_not_the_whole_axis():
         "baseline_suppressed",
     )
     assert judged("something_new") == ("unattributed", "baseline_suppressed")
+
+
+# --- review follow-ups ----------------------------------------------------------
+
+
+def test_a_check_the_baseline_left_unchecked_on_the_model_is_not_evidence():
+    """The baseline swept the model, but could not probe this join."""
+
+    payload = {
+        "join_coverage": [
+            {"model": "fct_orders", "status": "unchecked", "join": "o join u"},
+            {"model": "fct_orders", "status": "satisfied", "join": "o join p"},
+        ],
+        "column_contract": {"unchecked": [{"model": "dim_users"}]},
+    }
+    keys = attr.unchecked_keys(payload)
+    assert keys == ["join_contract|fct_orders|o join u", "build|dim_users|"]
+    baseline = _baseline(unchecked=frozenset(keys))
+    reach = None
+
+    def judged(finding):
+        result = attr.classify(finding, baseline, reach)
+        return result.attribution, result.basis
+
+    unprobed = _finding("fct_orders", data={"join": "o join u"})
+    probed = _finding("fct_orders", data={"join": "o join p"})
+    column = _finding("dim_users", code="column_missing", axis="build")
+    failed = _finding("dim_users", code="node_failed", axis="build")
+    assert judged(unprobed) == ("unattributed", "baseline_suppressed")
+    assert judged(probed) == ("introduced", "baseline")
+    assert judged(column) == ("unattributed", "baseline_suppressed")
+    assert judged(failed) == ("introduced", "baseline")
+
+
+def test_a_schema_yml_that_declares_a_source_reaches_its_consumers():
+    manifest = _manifest()
+    manifest["sources"] = {
+        "source.p.raw.orders": {
+            "name": "orders",
+            "resource_type": "source",
+            "original_file_path": "models/sources.yml",
+        }
+    }
+    manifest["nodes"]["model.p.stg_orders"]["depends_on"]["nodes"] = [
+        "source.p.raw.orders"
+    ]
+    reach = attr.plan_reach(
+        [_edit("models/sources.yml", EditKind.SCHEMA_YML, old_content_hash="h")],
+        manifest,
+    )
+    assert reach.reached is not None
+    assert {"stg_orders", "int_orders", "fct_orders"} <= reach.reached
+    assert "dim_users" not in reach.reached
+
+
+def test_an_unapplied_plan_is_judged_against_sweeps_before_it_was_made(
+    tmp_path: Path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.transform import commands
+
+    start = datetime(2026, 11, 1, tzinfo=UTC)
+    attr.record_sweep(
+        tmp_path, "dev", scope=[], suppressed=[], fingerprints=["before"], now=start
+    )
+    attr.record_sweep(
+        tmp_path,
+        "dev",
+        scope=[],
+        suppressed=[],
+        fingerprints=["the plan's own build"],
+        now=start + timedelta(hours=2),
+    )
+    plan = SimpleNamespace(
+        applied_at=None, created_at=(start + timedelta(hours=1)).isoformat()
+    )
+    engine = SimpleNamespace(
+        require_full_store=lambda what: SimpleNamespace(load_plan=lambda pid: plan)
+    )
+    monkeypatch.setattr(commands, "_plan_edits", lambda *a: [])
+    given = commands._attribution_input(engine, "p1", None, tmp_path, "dev")
+    assert given.baseline.fingerprints == {"before"}
+
+
+def test_apply_records_whether_the_baseline_is_ready_now(monkeypatch):
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.transform import commands, refactor_compare
+
+    saved = []
+    stored = SimpleNamespace(
+        refactor_models={"fct_orders": "unattributed", "dim_users": "none"},
+        refactor_baseline_ready={"fct_orders": False, "dim_users": False},
+        edit_target="project",
+    )
+    store = SimpleNamespace(save_plan=saved.append)
+    engine = SimpleNamespace(project_dir=lambda: Path())
+    # The repair since planning built fct_orders' parent; dim_users' still fails.
+    monkeypatch.setattr(
+        refactor_compare,
+        "_blocked_parents",
+        lambda project, model, exclude: [] if model == "fct_orders" else ["x"],
+    )
+    commands._refresh_baseline_ready(engine, store, stored)
+    assert stored.refactor_baseline_ready == {"fct_orders": True, "dim_users": False}
+    assert saved == [stored]
+
+
+def test_a_comparison_elsewhere_excuses_a_rewrite_only_when_it_held():
+    evidence = _evidence(_nodes("int_a", "fct_b"), required=["int_a", "fct_b"])
+
+    def reasons(other: str):
+        completion = summarize_completion(
+            evidence,
+            None,
+            comparisons=[
+                ComparisonState(
+                    model="int_a", status="not_compared", baseline_ready=True
+                ),
+                ComparisonState(model="fct_b", status=other, baseline_ready=True),
+            ],
+        )
+        return {(u.model, u.reason) for u in completion.unverified or []}
+
+    assert reasons("equivalent") == set()
+    assert ("int_a", "comparison_not_run") in reasons("not_checked")
+    assert reasons("different") == {
+        ("int_a", "comparison_not_run"),
+        ("fct_b", "comparison_contradicted"),
+    }
+
+
+def test_an_unattributed_high_finding_past_the_cap_still_counts():
+    verification = _verification([_f("other", "introduced", severity="low")], [])
+    verification["attribution"]["unattributed_high"] = [
+        {"code": "join_no_match", "identifier": "int_orders"}
+    ]
+    completion = summarize_completion(
+        _evidence(_nodes("int_orders"), required=["int_orders"]), verification
+    )
+    assert [(u.model, u.reason) for u in completion.unverified] == [
+        ("int_orders", "unattributed_high_finding")
+    ]

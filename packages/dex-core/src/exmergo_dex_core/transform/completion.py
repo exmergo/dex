@@ -234,8 +234,9 @@ class Unverified(BaseModel):
     """One reason a build that validated is still not a finished change (#1230).
 
     ``reason`` is ``comparison_not_run`` (a rewrite applied uncompared while
-    its baseline was ready), ``undeclared_population_change`` (a population
-    change no assumption records and apply did not accept),
+    its baseline was ready), ``comparison_contradicted`` (a recorded
+    ``different`` or ``unexpected`` verdict), ``undeclared_population_change``
+    (a population change no assumption records and apply did not accept),
     ``introduced_high_finding`` (a high-severity finding this plan introduced)
     or ``unattributed_high_finding`` (a high-severity finding on a model the
     plan edited that no baseline places before the plan).
@@ -1129,13 +1130,31 @@ def _unverified(
         return []
     ready = {state.model: state.baseline_ready for state in comparisons or []}
     # `compared_elsewhere` is a comparison of another rewrite in the plan,
-    # which may be what checks the results this one keeps (#1049), so only a
-    # plain `not_compared` counts, and only where the baseline was ready.
+    # which may be what checks the results this one keeps (#1049). It excuses
+    # this one only when that comparison held: a `not_checked` or `different`
+    # verdict elsewhere established nothing about these results.
+    held_elsewhere = any(
+        state.status in ("equivalent", "as_expected") for state in comparisons or []
+    )
+    comparisons_owed = completion.obligations.comparison or []
     out = [
         Unverified(model=item.model, reason="comparison_not_run")
-        for item in completion.obligations.comparison or []
-        if item.reason_code == "not_compared" and ready.get(item.model) is True
+        for item in comparisons_owed
+        if ready.get(item.model) is True
+        and (
+            item.reason_code == "not_compared"
+            or (item.reason_code == "compared_elsewhere" and not held_elsewhere)
+        )
     ]
+    # A recorded `different` or `unexpected` verdict is a defect until the SQL
+    # or an expectation says otherwise (#1157).
+    out.extend(
+        Unverified(
+            model=item.model, reason="comparison_contradicted", detail=item.finding
+        )
+        for item in comparisons_owed
+        if item.status == "contradicted"
+    )
     out.extend(
         Unverified(
             model=item.model,
@@ -1168,10 +1187,8 @@ def _unverified(
             detail=finding.get("code"),
             column=finding.get("column"),
         )
-        for finding in verification.get("findings") or []
-        if finding.get("attribution") == "unattributed"
-        and finding.get("severity") == "high"
-        and finding.get("identifier") in required
+        for finding in _unattributed_high(verification)
+        if finding.get("identifier") in required
     )
     # One entry per model and reason: the findings themselves are listed
     # under `verification`, and the block's bytes are better spent there.
@@ -1504,3 +1521,18 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
     if completion.unverified is not None:
         cap_list(completion, "unverified", 0, "unverified")
     completion.elided = dict(elided)
+
+
+def _unattributed_high(verification: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """The high-severity findings nothing placed, from the list the sweep took
+    before its findings cap (#1230), or from ``findings`` where a payload
+    predates that list."""
+
+    attribution = verification.get("attribution")
+    if isinstance(attribution, Mapping) and "unattributed_high" in attribution:
+        return [f for f in attribution["unattributed_high"] if isinstance(f, Mapping)]
+    return [
+        f
+        for f in verification.get("findings") or []
+        if f.get("attribution") == "unattributed" and f.get("severity") == "high"
+    ]

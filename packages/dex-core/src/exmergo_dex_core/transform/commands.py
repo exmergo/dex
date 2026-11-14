@@ -4561,6 +4561,28 @@ def _population_gate(
     return acceptance
 
 
+def _refresh_baseline_ready(engine: DexEngine, store: Store, stored: Any) -> None:
+    """Re-read, at apply, whether each rewritten model's baseline would build.
+
+    The offer recorded it when the plan was made; a repair built since then
+    makes it ready, and applying is the last moment the comparison could have
+    run (#1230). Free: the latest run results and the manifest beside them.
+    Best effort: a readiness that cannot be read keeps what the offer recorded.
+    """
+
+    from .refactor_compare import _blocked_parents
+
+    models = getattr(stored, "refactor_models", None) or {}
+    if not models or stored.edit_target == "semantic":
+        return
+    with contextlib.suppress(Exception):
+        project = engine.project_dir()
+        stored.refactor_baseline_ready = {
+            model: not _blocked_parents(project, model, set()) for model in models
+        }
+        store.save_plan(stored)
+
+
 def _apply_stored(
     engine: DexEngine,
     store: Store,
@@ -4575,6 +4597,7 @@ def _apply_stored(
     repo_root = engine.require_repo_root("applying a plan")
     stored = store.load_plan(plan_id)
     acceptance = _population_gate(store, stored, plan_id, accept_population_change)
+    _refresh_baseline_ready(engine, store, stored)
     if acceptance is None and accept_population_change is not None:
         resolution_warnings = [
             *resolution_warnings,
@@ -5873,7 +5896,7 @@ def _verify_build(
         with pinned_artifacts(artifact_directory, invocation_id):
             result = verify_build(engine, Path(project), summary, **kwargs)
     if result.ran and history is not None:
-        from .finding_attribution import record_sweep
+        from .finding_attribution import record_sweep, unchecked_keys
 
         record_sweep(
             history[0],
@@ -5881,6 +5904,7 @@ def _verify_build(
             scope=result.scope,
             suppressed=result.suppressed,
             fingerprints=result.fingerprints,
+            unchecked=unchecked_keys(result.payload()),
             invocation_id=invocation_id,
         )
     return result
@@ -5913,12 +5937,13 @@ def _attribution_input(
                 "be placed before it; attributed by lineage and new models only"
             ),
         )
-    applied_at = None
+    # The plan's apply time, or its creation while it is unapplied: never a
+    # sweep of the plan's own earlier build.
+    cutoff = None
     with contextlib.suppress(Exception):
-        applied_at = (
-            engine.require_full_store("reading a plan").load_plan(for_plan).applied_at
-        )
-    baseline = load_baseline(history_directory, target, before=applied_at)
+        stored = engine.require_full_store("reading a plan").load_plan(for_plan)
+        cutoff = stored.applied_at or stored.created_at
+    baseline = load_baseline(history_directory, target, before=cutoff)
     return AttributionInput(
         edits=edits,
         baseline=baseline,

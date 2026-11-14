@@ -499,6 +499,10 @@ def _attribute(
     result.finding_attribution = judged
     result.introduced = attr.introduced_refs(ordered, judged)
     result.attribution = attr.summary(ordered, judged, given, reach)
+    # Read before the findings cap, which can cut them from `findings`.
+    result.attribution["unattributed_high"] = attr.unattributed_high_refs(
+        ordered, judged
+    )
 
 
 def _judgeable(

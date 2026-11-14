@@ -588,7 +588,7 @@ failed-build envelope carries it too, and Python callers get the same typed
 | Field | What it says |
 |---|---|
 | `outcome` | `data.outcome`, repeated so the block stands alone |
-| `unverified` | why a build that validated is `built_unverified` (#1230): per model, `comparison_not_run` (a rewrite applied with no `transform compare` verdict while the plan's offer said `baseline_ready: true`), `undeclared_population_change` (with its `detail`, the change-scope kind, unless apply accepted it), `introduced_high_finding` (with the finding code) or `unattributed_high_finding` (a high finding on a model the plan edited that no baseline places before the plan). Absent when nothing is open. It is not done: settle each one and build again |
+| `unverified` | why a build that validated is `built_unverified` (#1230): per model, `comparison_not_run` (a rewrite applied with no `transform compare` verdict while its baseline was ready, as apply read it; a comparison of another rewrite excuses it only when that one held), `comparison_contradicted` (a recorded `different` or `unexpected` verdict), `undeclared_population_change` (with its `detail`, the change-scope kind, unless apply accepted it), `introduced_high_finding` (with the finding code) or `unattributed_high_finding` (a high finding on a model the plan edited that no baseline places before the plan). Absent when nothing is open. It is not done: settle each one and build again |
 | `process` | dbt's own `success`, `returncode` and `node_counts` by status. A process result, not a check |
 | `change` | the `plan_id` and `source` (`for_plan`, `for_plan_file`) the build was asked to validate, and the `selector` (cut at 200 characters; the whole one is in `data.evidence.selection`) |
 | `deliverables` | `coverage`: `known`, `unknown` (no plan named, so nothing says what the build was for) or `undetermined` (the plan's edits name no buildable node). Then `required`, and `built`, `failed`, `skipped`, `missing` and `stale` as `{count, names, elided}`. `blocked` names each required deliverable that did not build and the node that `cause`d it, walked back through skipped parents, a failing data test on a parent included. A skipped or failed deliverable is never counted as built: whatever relation it has in dev predates this run, and `note` says so |
@@ -749,9 +749,9 @@ test over the smaller result.
   | `no_baseline` (`unattributed`) | no baseline swept the model |
 
   The baseline is the latest `--verify` build of the same target recorded
-  before the plan's `applied_at`, kept as one fingerprint per finding (axis,
+  before the plan's `applied_at` (its `created_at` while unapplied), kept as one fingerprint per finding (axis,
   code, model, column, join; never a count or a value) in
-  `dex_verify_history.json` beside the build artifacts, ten builds deep. A
+  `dex_verify_history.json` beside the build artifacts, ten builds deep. A check the baseline left `unchecked` on one model (a join it could not probe, a column contract it could not read) is recorded too, so a finding from it on that model is `baseline_suppressed`, not `introduced`. A
   `--for-plan-file` build has no apply time, so it attributes by lineage and new
   models only. `attribution.baseline_reason` says why there was no baseline;
   build with `--verify` before applying the next plan to give it one.

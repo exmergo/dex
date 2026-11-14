@@ -105,7 +105,8 @@ the project edits, migrations and dev builds described below.
    left in dev from an earlier run; fix what `blockers` names and build again.
    `outcome: built_unverified` means every deliverable built and part of the
    change is still open: `data.completion.unverified` names each model and
-   reason (`comparison_not_run`, `undeclared_population_change`,
+   reason (`comparison_not_run`, `comparison_contradicted`,
+   `undeclared_population_change`,
    `introduced_high_finding`, `unattributed_high_finding`). It is not done.
    `data.verification.introduced` lists the findings this plan introduced,
    judged against the last `--verify` build before it was applied, and they
