@@ -747,3 +747,18 @@ def test_a_failed_column_statement_keeps_the_rows_and_keys():
     assert record["columns"]["compared"] is False
     assert "TimeoutError" in record["columns"]["reason"]
     assert record["finding"] == "downstream_population_changed"
+
+
+def test_a_blocked_node_further_up_a_second_path_still_cuts_the_model():
+    manifest = _manifest(
+        _node("a", "models/a.sql"),
+        _node("p", "models/p.py", ["a"], language="python"),
+        _node("q", "models/q.sql", ["p"]),
+        _node("d", "models/d.sql", ["a", "q"]),
+        _node("unrelated_py", "models/u.py", language="python"),
+        _node("e", "models/e.sql", ["a", "unrelated_py"]),
+    )
+    found = impact.select_targets([_edit("models/a.sql")], manifest)
+    assert [t.label for t in found.targets] == ["a", "e"]
+    cut = {c["model"]: c["reason_code"] for c in found.cut}
+    assert cut["d"] == "not_inlinable"

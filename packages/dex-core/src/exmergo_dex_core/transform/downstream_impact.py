@@ -261,20 +261,31 @@ def select_targets(
     # snapshot below the edits) would read that node's post-plan relation on
     # both sides, so its baseline would hide what came through it.
     parents = _parents(nodes)
+    # Everything below the edits, through nodes the walk above stopped at, so
+    # A -> P (Python) -> Q -> D is seen as reaching D through P.
+    below: set[str] = set()
+    pending = list(roots)
+    while pending:
+        current = pending.pop()
+        for child in children.get(current, ()):
+            if child not in below and str(child).startswith(("model.", "snapshot.")):
+                below.add(child)
+                pending.append(child)
     through_blocked: dict[str, str] = {}
     for uid in distance:
         seen: set[str] = set()
         pending = list(parents.get(uid, ()))
         while pending:
             current = pending.pop()
-            if current in seen:
+            if current in seen or current not in below:
                 continue
             seen.add(current)
-            if current in blocked:
+            if current in blocked or _not_routable(
+                dict(nodes.get(current) or {}), project
+            ):
                 through_blocked[uid] = label.get(current, current)
                 break
-            if current in distance:
-                pending.extend(parents.get(current, ()))
+            pending.extend(parents.get(current, ()))
 
     ordered = sorted(
         distance,
