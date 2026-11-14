@@ -161,7 +161,13 @@ def select_targets(
     project = (manifest.get("metadata") or {}).get("project_name")
     by_file: dict[str, str] = {}
     for uid, node in nodes.items():
-        if str(uid).startswith("model.") and isinstance(node, Mapping):
+        # A package's model can sit at the same relative path as one of the
+        # project's: only the project's own files are what a plan edits.
+        if (
+            str(uid).startswith("model.")
+            and isinstance(node, Mapping)
+            and (project is None or node.get("package_name") == project)
+        ):
             path = node.get("original_file_path")
             if isinstance(path, str):
                 by_file[PurePosixPath(path).as_posix()] = str(uid)
@@ -251,6 +257,25 @@ def select_targets(
                     pending.append(child)
                     upstream.setdefault(child, set()).add(roots[root])
 
+    # A model that also reads a node no copy can inline (a Python model or a
+    # snapshot below the edits) would read that node's post-plan relation on
+    # both sides, so its baseline would hide what came through it.
+    parents = _parents(nodes)
+    through_blocked: dict[str, str] = {}
+    for uid in distance:
+        seen: set[str] = set()
+        pending = list(parents.get(uid, ()))
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if current in blocked:
+                through_blocked[uid] = label.get(current, current)
+                break
+            if current in distance:
+                pending.extend(parents.get(current, ()))
+
     ordered = sorted(
         distance,
         key=lambda uid: (distance[uid], label.get(uid, uid), uid),
@@ -258,6 +283,19 @@ def select_targets(
     for uid in ordered:
         if uid in created_or_edited and uid not in roots:
             # Another file of this plan: measured as edited if it existed.
+            continue
+        if uid in through_blocked and uid not in roots:
+            selection.cut.append(
+                _unchecked_record(
+                    label.get(uid, uid),
+                    "descendant",
+                    sorted(upstream.get(uid, set()) - {label.get(uid, uid)}),
+                    "not_inlinable",
+                    f"it also reads {through_blocked[uid]}, below the plan's edits, "
+                    "which cannot be inlined, so both sides would read its "
+                    "post-plan relation",
+                )
+            )
             continue
         node = nodes.get(uid) or {}
         role = "edited" if uid in roots else "descendant"
@@ -288,7 +326,6 @@ def select_targets(
     # then compiles it into the measured model's SQL on both sides, so its dev
     # relation (which this build may have rewritten) is never what either reads.
     measured = {t.unique_id for t in selection.targets}
-    parents = _parents(nodes)
     ancestors: set[str] = set()
     pending = list(measured)
     while pending:
@@ -734,18 +771,30 @@ def _sql_grain(sql: str, dialect: str) -> list[str]:
     if group is None:
         return []
     keys: list[str] = []
-    by_source: dict[str, str] = {}
+    # Keyed by the qualified column, so `a.id` and `b.id` stay two columns; an
+    # unqualified group-by column that matches more than one is ambiguous.
+    by_source: dict[tuple[str, str], str] = {}
     for projection in tree.expressions:
         inner = projection.this if isinstance(projection, exp.Alias) else projection
         if isinstance(inner, exp.Column):
-            by_source[inner.name.lower()] = projection.alias_or_name
+            by_source[(inner.table.lower(), inner.name.lower())] = (
+                projection.alias_or_name
+            )
     for expression in group.expressions:
         if not isinstance(expression, exp.Column):
             return []
-        name = by_source.get(expression.name.lower())
-        if name is None:
+        table, name = expression.table.lower(), expression.name.lower()
+        matches = [
+            output
+            for (source_table, source_name), output in by_source.items()
+            if source_name == name
+            and (not table or not source_table or source_table == table)
+        ]
+        if len(matches) != 1:
             return []
-        keys.append(name)
+        keys.append(matches[0])
+    if len(set(keys)) != len(keys):
+        return []
     return keys
 
 
@@ -757,15 +806,15 @@ def _settlement(node: Mapping[str, Any], key: Sequence[str]) -> dict[str, Any] |
     dex = meta.get("dex") if isinstance(meta, Mapping) else None
     assumptions = dex.get("assumptions") if isinstance(dex, Mapping) else None
     wanted = {k.lower() for k in key}
+    # With no key there is nothing an assumption could name that settles
+    # which rows the model holds.
+    if not wanted:
+        return None
     for item in assumptions or ():
         if not isinstance(item, Mapping):
             continue
         column = str(item.get("column") or "").lower()
-        if (
-            item.get("evidence") in SETTLING_TIERS
-            and column
-            and (not wanted or column in wanted)
-        ):
+        if item.get("evidence") in SETTLING_TIERS and column in wanted:
             return {"column": item.get("column"), "evidence": item.get("evidence")}
     return None
 
@@ -1096,6 +1145,7 @@ def _measure(
     timeout_seconds: float,
     assert_sql: Callable[[str], Any],
 ) -> dict[str, Any]:
+    from ..guards.cost_guard import CostGuardError
     from .multiset_compare import _as_described, _base_type, _normal_type, _read_counts
 
     base_cols = prop_cols = None
@@ -1225,16 +1275,28 @@ def _measure(
                 sql = columns_sql(
                     item.baseline_sql, item.proposed_sql, key_pairs, pairs, dialect
                 )
-                assert_sql(sql)
-                values = _read_counts(
-                    adapter.run_query(sql, max_rows=1, timeout_seconds=timeout_seconds),
-                    len(pairs) + 1,
-                )
-                for (name, _), count in zip(pairs, values[1:], strict=True):
-                    if count:
-                        changed_columns.append({"column": name, "keys": count})
-                changed_columns.sort(key=lambda c: (-c["keys"], c["column"]))
-                columns_info["changed"] = changed_columns
+                try:
+                    assert_sql(sql)
+                    values = _read_counts(
+                        adapter.run_query(
+                            sql, max_rows=1, timeout_seconds=timeout_seconds
+                        ),
+                        len(pairs) + 1,
+                    )
+                except CostGuardError:
+                    raise
+                except Exception as exc:
+                    # The rows and keys above stand; only the columns are unread.
+                    columns_info["compared"] = False
+                    columns_info["reason"] = (
+                        f"the column statement failed ({type(exc).__name__})"
+                    )
+                else:
+                    for (name, _), count in zip(pairs, values[1:], strict=True):
+                        if count:
+                            changed_columns.append({"column": name, "keys": count})
+                    changed_columns.sort(key=lambda c: (-c["keys"], c["column"]))
+                    columns_info["changed"] = changed_columns
             record["columns"] = columns_info
     any_column = bool(changed_columns) or bool(
         (record.get("columns") or {}).get("added")

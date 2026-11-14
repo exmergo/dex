@@ -505,7 +505,16 @@ def _downstream_impact(
     prepared = impact.prepared
     if prepared is None:
         return
-    if not summary.get("success"):
+    # Read off the nodes, not `success`: the sweep marks a build whose only
+    # failures are tests as judgeable, while a model that failed or was skipped
+    # leaves a relation both sides could read as stale input.
+    unbuilt = [
+        str(node.get("unique_id"))
+        for node in summary.get("nodes") or []
+        if str(node.get("unique_id") or "").startswith("model.")
+        and str(node.get("status") or "").lower() != "success"
+    ]
+    if unbuilt or not summary.get("success"):
         reason = (
             "the build did not complete, so the relations both sides read are a "
             "mix of this run's output and the last one's"

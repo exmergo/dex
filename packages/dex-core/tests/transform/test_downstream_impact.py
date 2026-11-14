@@ -662,3 +662,88 @@ def test_a_billed_build_folds_the_impact_into_its_one_estimate(monkeypatch, tmp_
     assert estimate == 142.0
     assert per_node["(downstream impact)"] == 42.0
     assert seen == [tmp_path / "manifest.json"]
+
+
+# --- review follow-ups -------------------------------------------------------------
+
+
+def test_a_package_model_at_the_same_path_is_not_the_edited_one():
+    package = _node("stg_products", "models/stg_products.sql")
+    package["package_name"] = "pkg"
+    manifest = _manifest(
+        _node("stg_products", "models/stg_products.sql"),
+        _node("dim_products", "models/marts/dim_products.sql", ["stg_products"]),
+    )
+    manifest["nodes"]["model.pkg.stg_products"] = package
+    found = impact.select_targets([_edit("models/stg_products.sql")], manifest)
+    assert [t.unique_id for t in found.targets] == [
+        "model.p.stg_products",
+        "model.p.dim_products",
+    ]
+
+
+def test_a_model_that_also_reads_a_blocked_node_below_the_edit_is_cut():
+    manifest = _manifest(
+        _node("stg", "models/stg.sql"),
+        _node("py", "models/py.py", ["stg"], language="python"),
+        _node("dim", "models/dim.sql", ["stg", "py"]),
+    )
+    found = impact.select_targets([_edit("models/stg.sql")], manifest)
+    assert [t.label for t in found.targets] == ["stg"]
+    cut = {c["model"]: c for c in found.cut}
+    assert cut["dim"]["reason_code"] == "not_inlinable"
+    assert "py" in cut["dim"]["reason"]
+
+
+def test_a_group_by_two_columns_of_one_name_keeps_both_or_none():
+    sql = (
+        "select a.id as aid, b.id as bid, count(*) as n from a join b on a.k = b.k "
+        "group by a.id, b.id"
+    )
+    assert impact._sql_grain(sql, "duckdb") == ["aid", "bid"]
+    ambiguous = "select a.id as aid, b.id as bid, count(*) as n from a, b group by id"
+    assert impact._sql_grain(ambiguous, "duckdb") == []
+
+
+def test_no_key_means_nothing_settles():
+    node = {
+        "config": {
+            "meta": {"dex": {"assumptions": [{"evidence": "request", "column": "x"}]}}
+        }
+    }
+    assert impact._settlement(node, []) is None
+
+
+class _Failing:
+    """Counts answer; the column statement fails."""
+
+    dialect = "duckdb"
+    describe_query_free = True
+
+    def describe_query(self, sql):
+        return duckdb.sql(sql).description and [
+            SimpleNamespace(name=d[0], data_type=str(d[1]), groupable=True)
+            for d in duckdb.sql(sql).description
+        ]
+
+    def run_query(self, sql, *, max_rows, timeout_seconds):
+        if "dex_kept, " in sql and "having" in sql:
+            raise TimeoutError("slow")
+        rows = duckdb.sql(sql).fetchall()
+        return SimpleNamespace(cells=[list(rows[0])], truncated=False)
+
+
+def test_a_failed_column_statement_keeps_the_rows_and_keys():
+    item = _compiled()
+    item.baseline_sql = "select * from (values (1, 'a'), (2, 'b')) t(product_id, n)"
+    item.proposed_sql = "select * from (values (1, 'z')) t(product_id, n)"
+    prepared = impact.Prepared(
+        selection=impact.Selection(), compiled=[item], marts=["models/marts/"]
+    )
+    result = impact.run(prepared, _Failing(), timeout_seconds=5, handshake=None)
+    (record,) = result.records
+    assert record["status"] == "measured"
+    assert record["keys"]["removed"] == 1
+    assert record["columns"]["compared"] is False
+    assert "TimeoutError" in record["columns"]["reason"]
+    assert record["finding"] == "downstream_population_changed"

@@ -747,8 +747,11 @@ def apply(
             list(stored.edits), project, confirmed=confirmed
         )
     if result.written:
+        # The first apply's preimages only: a confirmed re-apply over a human
+        # edit would otherwise record that edit as the tree before the plan.
+        first_apply = stored.applied_at is None
         stored.applied_at = datetime.now(UTC).isoformat()
-        if preimages:
+        if preimages and first_apply:
             stored.baseline_sources = preimages
         store.save_plan(stored)
     return result
