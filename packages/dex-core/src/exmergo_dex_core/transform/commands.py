@@ -5572,6 +5572,7 @@ def _build_project(
                 engine, for_plan, for_plan_document, seed_history_dir, target
             ),
             history=(seed_history_dir, target),
+            plan_id=for_plan,
         )
         return _shape_build_result(
             summary,
@@ -5736,6 +5737,7 @@ def _build_project(
             engine, for_plan, for_plan_document, seed_history_dir, target
         ),
         history=(seed_history_dir, target),
+        plan_id=for_plan,
     )
     decisions = _with_retirement(
         _built_decisions(engine, summary),
@@ -5845,6 +5847,7 @@ def _verify_build(
     select: str | None = None,
     attribution: Any = None,
     history: tuple[Path, str] | None = None,
+    plan_id: str | None = None,
 ) -> BuildVerification:
     """The sweep, or the statement that it did not run, recorded as the next
     build's baseline.
@@ -5908,6 +5911,7 @@ def _verify_build(
             fingerprints=result.fingerprints,
             unchecked=unchecked_keys(result.payload()),
             invocation_id=invocation_id,
+            plan_id=plan_id,
         )
     return result
 
@@ -5945,7 +5949,7 @@ def _attribution_input(
     with contextlib.suppress(Exception):
         stored = engine.require_full_store("reading a plan").load_plan(for_plan)
         cutoff = stored.applied_at or stored.created_at
-    baseline = load_baseline(history_directory, target, before=cutoff)
+    baseline = load_baseline(history_directory, target, before=cutoff, plan_id=for_plan)
     return AttributionInput(
         edits=edits,
         baseline=baseline,

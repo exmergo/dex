@@ -570,3 +570,73 @@ def test_an_unattributed_high_finding_past_the_cap_still_counts():
     assert [(u.model, u.reason) for u in completion.unverified] == [
         ("int_orders", "unattributed_high_finding")
     ]
+
+
+def test_a_plan_never_takes_its_own_sweep_as_its_baseline(tmp_path: Path):
+    """A pre-apply build of a checkout already holding the edits records a sweep
+    tagged with the plan; after apply it must not become the baseline."""
+
+    start = datetime(2026, 11, 1, tzinfo=UTC)
+    attr.record_sweep(
+        tmp_path, "dev", scope=[], suppressed=[], fingerprints=["clean"], now=start
+    )
+    attr.record_sweep(
+        tmp_path,
+        "dev",
+        scope=[],
+        suppressed=[],
+        fingerprints=["the plan's"],
+        plan_id="p1",
+        now=start + timedelta(hours=1),
+    )
+    applied = (start + timedelta(hours=2)).isoformat()
+    assert attr.load_baseline(
+        tmp_path, "dev", before=applied, plan_id="p1"
+    ).fingerprints == {"clean"}
+    # Another plan may use it: that sweep is the tree it was applied onto.
+    assert attr.load_baseline(
+        tmp_path, "dev", before=applied, plan_id="p2"
+    ).fingerprints == {"the plan's"}
+
+
+def test_a_sweep_recorded_without_per_model_coverage_introduces_nothing(
+    tmp_path: Path,
+):
+    history = {
+        "schema_version": 1,
+        "sweeps": [
+            {
+                "target": "dev",
+                "recorded_at": "2026-11-01T00:00:00+00:00",
+                "scope": ["dim_users"],
+                "suppressed": [],
+                "fingerprints": [],
+            }
+        ],
+    }
+    (tmp_path / attr.HISTORY).write_text(json.dumps(history))
+    baseline = attr.load_baseline(tmp_path, "dev", before=None)
+    assert baseline is not None and baseline.coverage_known is False
+    column = _finding("dim_users", code="column_missing", axis="build")
+    result = attr.classify(column, baseline, None)
+    assert (result.attribution, result.basis) == (
+        "unattributed",
+        "baseline_suppressed",
+    )
+
+
+def test_every_unattributed_high_finding_reaches_completion():
+    """More than fifty of them on other models must not hide one on the plan's."""
+
+    findings = [_finding(f"other_{i}") for i in range(60)] + [_finding("int_orders")]
+    judged = [attr.Attribution("unattributed", "no_baseline")] * len(findings)
+    refs = attr.unattributed_high_refs(findings, judged)
+    assert len(refs) == 61
+    verification = _verification([], [])
+    verification["attribution"]["unattributed_high"] = refs
+    completion = summarize_completion(
+        _evidence(_nodes("int_orders"), required=["int_orders"]), verification
+    )
+    assert [(u.model, u.reason) for u in completion.unverified] == [
+        ("int_orders", "unattributed_high_finding")
+    ]

@@ -152,6 +152,9 @@ class Baseline:
     #: model (a join it could not probe, a column contract it could not read),
     #: which a model-wide suppression does not name.
     unchecked: frozenset[str] = frozenset()
+    #: False for a sweep recorded before per-model coverage was: its silence
+    #: on a model then proves nothing, so nothing is `introduced` by it.
+    coverage_known: bool = True
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -180,6 +183,7 @@ def record_sweep(
     fingerprints: Iterable[str],
     unchecked: Iterable[str] = (),
     invocation_id: str | None = None,
+    plan_id: str | None = None,
     now: datetime | None = None,
 ) -> None:
     """Append one sweep to the history, keeping the latest :data:`MAX_SWEEPS`.
@@ -195,6 +199,9 @@ def record_sweep(
             "target": target,
             "recorded_at": (now or datetime.now(UTC)).isoformat(),
             "invocation_id": invocation_id,
+            # The plan a `--for-plan` build answered for: that plan never takes
+            # its own sweep as its baseline, applied or not.
+            "plan_id": plan_id,
             "scope": sorted(set(scope)),
             "suppressed": sorted(set(suppressed)),
             "fingerprints": sorted(set(fingerprints)),
@@ -246,13 +253,19 @@ def unchecked_keys(verification: Mapping[str, Any]) -> list[str]:
 
 
 def load_baseline(
-    directory: Path | None, target: str, *, before: str | None
+    directory: Path | None,
+    target: str,
+    *,
+    before: str | None,
+    plan_id: str | None = None,
 ) -> Baseline | None:
     """The latest sweep of ``target`` recorded strictly before ``before``.
 
     ``before`` is the plan's ``applied_at``, or its ``created_at`` while it is
     unapplied, so a build of the plan never takes its own earlier sweep as the
-    baseline. ``None`` takes the latest sweep.
+    baseline. ``None`` takes the latest sweep. ``plan_id`` skips every sweep a build
+    of that plan recorded, applied or not: a checkout that already held the
+    plan's edits before apply was the plan, not its baseline.
     """
 
     if directory is None:
@@ -263,6 +276,8 @@ def load_baseline(
     best: tuple[datetime, dict[str, Any]] | None = None
     for sweep in _read(directory):
         if sweep.get("target") != target:
+            continue
+        if plan_id is not None and sweep.get("plan_id") == plan_id:
             continue
         when = _instant(sweep.get("recorded_at"))
         if when is None or (cutoff is not None and when >= cutoff):
@@ -279,6 +294,7 @@ def load_baseline(
         suppressed=frozenset(str(s) for s in sweep.get("suppressed") or ()),
         fingerprints=frozenset(str(s) for s in sweep.get("fingerprints") or ()),
         unchecked=frozenset(str(s) for s in sweep.get("unchecked") or ()),
+        coverage_known="unchecked" in sweep,
     )
 
 
@@ -474,6 +490,7 @@ def classify(
         if (
             classes is not None
             and not classes & baseline.suppressed
+            and baseline.coverage_known
             and not _left_unchecked(finding, identifier, baseline)
         ):
             return Attribution(INTRODUCED, "baseline")
@@ -582,4 +599,4 @@ def unattributed_high_refs(
         }
         for f, a in zip(findings, attributions, strict=True)
         if a.attribution == UNATTRIBUTED and _value(f, "severity") == "high"
-    ][:MAX_INTRODUCED]
+    ]
