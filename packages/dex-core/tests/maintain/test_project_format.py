@@ -139,7 +139,13 @@ def test_verify_runs_portable_checks_through_the_project_format(
     assert [finding["identifier"] for finding in missing] == ["ghost"]
     assert "no_relation" not in payload["data"]["suppressed"]
     assert "grain" not in payload["data"]["suppressed"]
-    assert set(payload["data"]["suppressed"]) == {
+    suppressed = dict(payload["data"]["suppressed"])
+    # The format's declared foreign keys are judged without dbt (#1197); this
+    # format declares none, which is a different reason from a missing target/.
+    assert suppressed.pop("foreign_key_contract") == (
+        "the project format declares no foreign key"
+    )
+    assert set(suppressed) == {
         "compile",
         "build_status",
         "row_population",
@@ -153,7 +159,7 @@ def test_verify_runs_portable_checks_through_the_project_format(
     }
     assert all(
         "'graph' project format does not provide dbt target/ artifacts" in reason
-        for reason in payload["data"]["suppressed"].values()
+        for reason in suppressed.values()
     )
     assert _NOTE in payload["warnings"]
 
