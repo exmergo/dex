@@ -4570,12 +4570,14 @@ def _refresh_baseline_ready(engine: DexEngine, store: Store, stored: Any) -> Non
     Best effort: a readiness that cannot be read keeps what the offer recorded.
     """
 
-    from .refactor_compare import _blocked_parents
-
     models = getattr(stored, "refactor_models", None) or {}
     if not models or stored.edit_target == "semantic":
         return
     with contextlib.suppress(Exception):
+        # Here, not at the top: it loads the SQL parser, which a semantic-layer
+        # apply in an install without the SQL extra does not have.
+        from .refactor_compare import _blocked_parents
+
         project = engine.project_dir()
         stored.refactor_baseline_ready = {
             model: not _blocked_parents(project, model, set()) for model in models
