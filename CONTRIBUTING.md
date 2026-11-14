@@ -256,7 +256,8 @@ undeclared foreign key, a firewalled query, and a dbt build into the
 dedicated dev schema. Unlike the cloud suites it bills nothing and needs no
 cloud account: the target is a local Docker container seeded from
 `scripts/postgres_seed.sql`, with a read-only `dex_ro` role for the engine
-and a `dbt_dev` role that can write only the dev schema.
+and a `dbt_dev` role that can write only the dev schema and the
+`dbt_dev_elementary` schema beside it.
 
 Stand the container up and run the suite locally:
 
@@ -415,8 +416,21 @@ DEX_TEST_ELEMENTARY=1 uv run pytest tests/transform/test_elementary_fixture.py
 Without the variable they collect as skipped with it named in the skip reason.
 They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
 the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
-run and fails `dbt build` on DuckDB); running them on Postgres is
-[#1331](https://github.com/exmergo/dex/issues/1331).
+run and fails `dbt build` on DuckDB), and most installs pin 0.15 or 0.16, so
+those run on Postgres instead. `tests/integration/test_postgres_elementary.py`
+builds the same variants at 0.16.4 and 0.15.2 against the seeded container
+`scripts/setup_postgres_dev.sh` starts, and needs both opt-ins:
+
+```
+DEX_TEST_ELEMENTARY=1 \
+    DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:5433/dex_dogfood \
+    DEX_TEST_PG_DEV_PASSWORD=dbt_dev \
+    uv run pytest tests/integration/test_postgres_elementary.py
+```
+
+The seed gives the `dbt_dev` role a second schema, `dbt_dev_elementary`, for the
+package's models, so re-run the setup script on a container seeded before it
+existed. No CI job sets `DEX_TEST_ELEMENTARY`, so neither file runs there.
 
 ## Agent evals (`evals/`)
 

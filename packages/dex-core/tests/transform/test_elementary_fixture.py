@@ -15,7 +15,10 @@ import yaml
 
 from .elementary_fixture import (
     ABSENT,
+    BEHAVIOUR,
     ELEMENTARY_SCHEMA,
+    MATERIALIZATION_LINE,
+    TEMP_TABLE_LINE,
     VARIANTS,
     VERSIONS,
     dbt,
@@ -27,26 +30,6 @@ from .elementary_fixture import (
 from .elementary_fixture import elementary_installs as elementary_installs
 from .elementary_fixture import installed_elementary as installed_elementary
 from .mutation_helpers import _engine
-
-#: Printed by Elementary's ``test`` materialization, with its debug logs on, once
-#: per test it handles and once more per test it routes through a temp table.
-MATERIALIZATION_LINE = "starting test materialization hook"
-TEMP_TABLE_LINE = "created test temp table"
-
-#: What each variant's row promises: whether Elementary's ``test`` materialization
-#: handles the tests, and whether it routes them through temp tables. b and d read
-#: the same here for different reasons (dbt picks its own on b; on d Elementary's
-#: is picked and returns at once, the package being disabled), which is why the
-#: build test tells them apart by the models dbt enables.
-BEHAVIOUR = {
-    "a": (True, False),
-    "b": (False, False),
-    "c": (True, False),
-    "d": (False, False),
-    "e": (True, False),
-    "f": (True, True),
-}
-
 
 # --- the census, offline --------------------------------------------------------
 
