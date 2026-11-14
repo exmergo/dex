@@ -292,8 +292,12 @@ def census(query: Query) -> dict[Relation, int | None]:
     for schema, name, kind in rows:
         if schema.lower() in _SYSTEM_SCHEMAS:
             continue
+        # A name may hold a double quote itself, written doubled inside the quotes.
+        relation = ".".join(
+            '"' + part.replace('"', '""') + '"' for part in (schema, name)
+        )
         try:
-            [(count,)] = query(f'select count(*) from "{schema}"."{name}"')  # noqa: S608
+            [(count,)] = query(f"select count(*) from {relation}")  # noqa: S608
         except Exception:
             # Whatever the driver raised, the relation is there and uncountable.
             count = None

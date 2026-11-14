@@ -103,6 +103,18 @@ def test_a_relation_that_cannot_be_counted_is_kept_and_told_from_a_dropped_one(
     assert footprint(before, {})[view] == (3, ABSENT)
 
 
+def test_a_relation_whose_name_holds_a_double_quote_is_still_counted(
+    duckdb_file: Path,
+):
+    table = ("main", 'order"items', "BASE TABLE")
+    _execute(duckdb_file, 'create table "order""items" as select 1 as id')
+    before = duckdb_census(duckdb_file)
+    _execute(duckdb_file, 'insert into "order""items" values (2)')
+
+    assert before[table] == 1, "the census could not count a validly named relation"
+    assert footprint(before, duckdb_census(duckdb_file)) == {table: (1, 2)}
+
+
 # --- the fixture, against the installed package ---------------------------------
 
 
@@ -237,5 +249,10 @@ def test_a_mutation_run_with_elementary_disabled_leaves_no_footprint(
     before = duckdb_census(warehouse)
     result = engine.test_mutations("fct")
 
-    assert result.counts["generated"] >= 1, "no mutant ran, so nothing was measured"
+    # `generated` is the batch size, set whether or not a mutant was ever tested.
+    executed = sum(
+        result.counts[outcome]
+        for outcome in ("killed", "caught_downstream", "survived", "rejected")
+    )
+    assert executed >= 1, "no mutant ran, so nothing was measured"
     assert footprint(before, duckdb_census(warehouse)) == {}
