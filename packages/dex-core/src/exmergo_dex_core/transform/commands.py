@@ -40,7 +40,7 @@ from ..dbt_tests import incremental_unit_tests as _incremental_unit_tests
 from ..dbt_tests import runs_full_build as _runs_full_build
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
-from ..errors import DexError, RequestError
+from ..errors import DexError, RequestError, UndeclaredPopulationChangeError
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
@@ -4463,20 +4463,6 @@ def cmd_test(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         return env.error_for(exc, warnings=exc.warnings)
     except (ValueError, TestScaffoldError, MutationError) as exc:
         return env.error_for(exc)
-
-
-class UndeclaredPopulationChangeError(RequestError):
-    """``transform apply`` refused a plan whose population changes no assumption
-    records (#1230).
-
-    ``changes`` lists each one (``model``, ``kind``, ``column``, ``reason``), so
-    the refusal names what to record or undo.
-    """
-
-    def __init__(self, message: str, changes: list[dict[str, Any]], plan_id: str):
-        super().__init__(message)
-        self.changes = changes
-        self.plan_id = plan_id
 
 
 def apply(
