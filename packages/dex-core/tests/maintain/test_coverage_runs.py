@@ -499,3 +499,62 @@ def test_freshness_leaks_nothing_from_result_rows_and_never_says_current(
     ):
         assert leaked not in rendered
     assert "recent" not in rendered and "current" not in rendered
+
+
+def test_parsed_timestamps_order_fractional_seconds_and_missing_stamps(
+    project: Path,
+) -> None:
+    # Lexicographically "11:15:00Z" > "11:15:00.500000Z" ('Z' > '.'), whereas
+    # chronologically .500000Z is half a second newer.
+    _write_sources(
+        project / "target",
+        {SRC_ORDERS: "pass"},
+        invocation=INV_A,
+        generated_at="2026-11-15T11:15:00Z",
+    )
+    _write_sources(
+        _dex_dir(project),
+        {SRC_ORDERS: "error"},
+        invocation=INV_B,
+        generated_at="2026-11-15T11:15:00.500000Z",
+    )
+    _write_results(
+        project / "target",
+        {NOT_NULL: "pass"},
+        invocation=INV_A,
+        generated_at="2026-11-15T11:15:00Z",
+    )
+    _write_results(
+        _dex_dir(project),
+        {NOT_NULL: "fail"},
+        invocation=INV_B,
+        generated_at="2026-11-15T11:15:00.500000Z",
+    )
+    _write_log(project, INV_A, INV_B)
+
+    fresh = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+    assert fresh.statuses == {SRC_ORDERS: "error"}
+    assert fresh.run is not None and fresh.run["invocation_id"] == INV_B
+
+    last = coverage_runs.last_run(project, _manifest(), now=NOW)
+    assert last.statuses == {NOT_NULL: "fail"}
+    assert last.run is not None and last.run["invocation_id"] == INV_B
+
+    # A missing timestamp sorts before any parsed timestamp, and breaks ties by mtime.
+    _write_sources(
+        project / "target",
+        {SRC_ORDERS: "pass"},
+        invocation=INV_A,
+        generated_at="",
+    )
+    _write_sources(
+        _dex_dir(project),
+        {SRC_ORDERS: "warn"},
+        invocation=INV_B,
+        generated_at="",
+    )
+    os.utime(project / "target" / "sources.json", (100.0, 100.0))
+    os.utime(_dex_dir(project) / "sources.json", (200.0, 200.0))
+    untimed = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+    assert untimed.statuses == {SRC_ORDERS: "warn"}
+    assert untimed.run is not None and untimed.run["invocation_id"] == INV_B

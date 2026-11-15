@@ -467,9 +467,9 @@ one coverage number.
   same directories, and `data.freshness_run` names that `dbt source freshness`
   invocation with its own `generated_at` and `age_seconds`, apart from
   `data.last_run`. Quote the age with the status: a status describes that run,
-  not the project now. With no run results or no `sources.json` every entry is
-  `not_run` and a note says so; results from an invocation no dbt log names are
-  not attributed.
+  not the project now. With no run results, every test is `not_run`; with no
+  `sources.json`, every source freshness check is `not_run`. Each case adds a
+  note, and results from an invocation no dbt log names are not attributed.
 - **Strength.** A model carries `strength`, the score its last
   `transform test --mutate` recorded. `fresh` means the model's SQL as written and its own tests
   are what the run measured, and every downstream test it ran still reads the

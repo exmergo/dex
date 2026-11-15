@@ -191,6 +191,9 @@ def _logged_invocations(path: Path) -> set[str]:
     return found
 
 
+_EPOCH = datetime.min.replace(tzinfo=UTC)
+
+
 def _parse_time(stamp: str) -> datetime | None:
     if not stamp:
         return None
@@ -199,6 +202,13 @@ def _parse_time(stamp: str) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _candidate_sort_key(run: _Candidate) -> tuple[bool, datetime, float]:
+    """Order parsed timestamps chronologically; missing timestamps sort first."""
+
+    parsed = _parse_time(run.generated_at)
+    return (parsed is not None, parsed or _EPOCH, run.mtime)
 
 
 def _current_tests(manifest: dict[str, Any]) -> set[str]:
@@ -251,8 +261,8 @@ def last_run(
                 "test is not_run: nothing records that it ever ran"
             ]
         )
-    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
-    newest = max(found, key=lambda run: (run.generated_at, run.mtime))
+    # Compare parsed timestamps chronologically; missing ones sort first, then by mtime.
+    newest = max(found, key=_candidate_sort_key)
     meta = newest.document.get("metadata") or {}
     invocation = str(meta["invocation_id"]) if meta.get("invocation_id") else None
     run: dict[str, Any] = {
@@ -352,8 +362,8 @@ def freshness_run(
                 "that it ever ran"
             ]
         )
-    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
-    newest = max(found, key=lambda run: (run.generated_at, run.mtime))
+    # Compare parsed timestamps chronologically; missing ones sort first, then by mtime.
+    newest = max(found, key=_candidate_sort_key)
     meta = newest.document.get("metadata") or {}
     invocation = str(meta["invocation_id"]) if meta.get("invocation_id") else None
     run: dict[str, Any] = {
