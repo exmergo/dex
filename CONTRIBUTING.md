@@ -55,8 +55,9 @@ supported range (`>=3.11,<3.15`) rather than one version, so `uv sync` there kee
 a `.venv` already on a supported Python and otherwise creates one on the newest
 supported Python, downloading it if needed, even when your newest is 3.15;
 `--python 3.12` or any other supported version overrides it. pyenv and mise read
-the same file and expect a single version, so with them set one yourself
-(`pyenv local 3.14`) or let uv choose. The skill
+the same file and expect a single version, so with them choose one for the
+shell (`pyenv shell 3.14`, or `PYENV_VERSION=3.14`) rather than `pyenv local`,
+which would overwrite the tracked range; or let uv choose. The skill
 wrappers carry the same range twice, in their `requires-python` (the wrapper's own
 interpreter) and in `SUPPORTED_PYTHON` (passed to the `uv run` that builds the
 engine's environment, which would otherwise pick the newest Python installed), so
@@ -65,8 +66,9 @@ a user whose newest Python is 3.15 gets a supported one picked for them. The eng
 `packages/dex-core/pyproject.toml` says why), and
 `packages/dex-core/tests/test_python_support.py` holds every other statement of
 the range to one list. When the weekly `python-next` job in
-`.github/workflows/upstream-deps-canaries.yml` turns green, the next Python's
-wheels exist and the range can be widened.
+`.github/workflows/upstream-deps-canaries.yml` is green on all three of its legs
+(Linux, macOS and Windows), the next Python installs everywhere and the range can
+be widened.
 
 The engine lives in `packages/dex-core/` and is managed with
 [uv](https://docs.astral.sh/uv/). From that directory, sync the runtime plus the

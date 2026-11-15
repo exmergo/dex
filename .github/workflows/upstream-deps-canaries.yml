@@ -40,10 +40,10 @@ name: Upstream canaries (sqlglot, DuckDB, next Python)
 # compiled dependencies, and building them from source fails. It installs the
 # engine with every extra into a fresh 3.15 environment, resolved from the ranges
 # pyproject.toml declares rather than from the lock (a newer release inside a
-# range is often the one that ships the wheel), and runs the suite there. Green
-# means the range can be widened: add the version to the wrappers, the
-# classifiers and every matrix (test_python_support.py lists them), and refresh
-# the lock. Before the install it prints which resolved packages still have no
+# range is often the one that ships the wheel), on Linux, macOS and Windows, and
+# runs the suite on Linux. Green on every leg means the range can be widened: add
+# the version to the wrappers, the classifiers and every matrix
+# (test_python_support.py lists them), and refresh the lock. Before the install it prints which resolved packages still have no
 # wheel for the version, which names the blocker whether or not a source build
 # would rescue it.
 
@@ -143,13 +143,24 @@ jobs:
           uv run --no-sync python -c "import sys, duckdb; print('python', sys.version); print('testing duckdb', duckdb.__version__)"
           uv run --no-sync pytest -q -m "not packaging"
 
+  # One leg per runner OS: a wheel missing on macOS or Windows blocks the users
+  # there as surely as one missing on Linux, so the range is widened only when
+  # every leg is green. Each leg installs every extra; the suite runs on Linux,
+  # where the other canaries run it (os-canaries.yml covers the other systems on
+  # the supported range).
   python-next:
-    runs-on: ubuntu-latest
+    name: python-next (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     env:
       # The one Python above the supported range. Moves up when the range does.
       NEXT_PYTHON: "3.15"
     defaults:
       run:
+        shell: bash
         working-directory: packages/dex-core
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,14 +170,20 @@ jobs:
           python-version: ${{ env.NEXT_PYTHON }}
       # Informational: the resolved packages with no wheel for the next Python on
       # Linux, macOS and Windows. A pure-Python package that publishes only an
-      # sdist is listed too and installs fine, so this never fails the job; the
-      # install below is the verdict.
+      # sdist is listed too and installs fine, so this never fails the job, and a
+      # platform whose resolution fails is reported and skipped rather than
+      # ending the report; the install legs are the verdict. Once, on Linux,
+      # since it reads the index rather than the runner.
       - name: Packages with no wheel for the next Python
+        if: runner.os == 'Linux'
         run: |
           for platform in x86_64-manylinux_2_28 aarch64-apple-darwin x86_64-pc-windows-msvc; do
-            uv pip compile pyproject.toml --extra all --extra dev \
-              --python-version "$NEXT_PYTHON" --python-platform "$platform" \
-              --no-header --no-annotate -q -o "$RUNNER_TEMP/next-$platform.txt"
+            if ! uv pip compile pyproject.toml --extra all --extra dev \
+                --python-version "$NEXT_PYTHON" --python-platform "$platform" \
+                --no-header --no-annotate -q -o "$RUNNER_TEMP/next-$platform.txt"; then
+              echo "$platform: the extras do not resolve for $NEXT_PYTHON"
+              continue
+            fi
             missing=()
             while read -r requirement; do
               case "$requirement" in ""|"#"*) continue ;; esac
@@ -179,13 +196,17 @@ jobs:
             echo "$platform: ${#missing[@]} without a wheel: ${missing[*]:-none}"
           done
       # A fresh resolution from the declared ranges, never --locked, and every
-      # extra, so a green run means a user's `pip install "exmergo-dex-core[all]"`
-      # works on this Python today.
+      # extra, so a green leg means a user's `pip install "exmergo-dex-core[all]"`
+      # works on this Python and this system today.
       - name: Install every extra on the next Python
         run: |
           uv venv --python "$NEXT_PYTHON" "$RUNNER_TEMP/next-venv"
           uv pip install --python "$RUNNER_TEMP/next-venv" ".[all,dev]"
-      - name: Suite on the next Python
+      - name: Import the stack
         run: |
-          "$RUNNER_TEMP/next-venv/bin/python" -c "import sys, dbt.version, duckdb, sqlglot; print(sys.version); print('dbt-core', dbt.version.__version__, 'duckdb', duckdb.__version__, 'sqlglot', sqlglot.__version__)"
-          "$RUNNER_TEMP/next-venv/bin/python" -m pytest -q -m "not packaging"
+          python="$RUNNER_TEMP/next-venv/bin/python"
+          [ -x "$python" ] || python="$RUNNER_TEMP/next-venv/Scripts/python.exe"
+          "$python" -c "import sys, dbt.version, duckdb, sqlglot, exmergo_dex_core; print(sys.version); print('dbt-core', dbt.version.__version__, 'duckdb', duckdb.__version__, 'sqlglot', sqlglot.__version__)"
+      - name: Suite on the next Python
+        if: runner.os == 'Linux'
+        run: '"$RUNNER_TEMP/next-venv/bin/python" -m pytest -q -m "not packaging"'
