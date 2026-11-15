@@ -47,6 +47,7 @@ from .sqlglot_keywords import slayer_keywords
 # isort: split
 
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from slayer.core.enums import DataType
@@ -130,6 +131,7 @@ def declared_schema_drift(
         names = {entry.model.name for entry in entries}
         diffs: dict[str, tuple[Any, set[str]]] = {}
         located: dict[str, tuple[str, dict[str, str] | None]] = {}
+        models_by_name = {entry.model.name: entry.model for entry in loaded.models}
         for entry in entries:
             model = entry.model
             if not model.sql_table:
@@ -182,7 +184,14 @@ def declared_schema_drift(
                 retypes = retype_findings(model=model, live_table=live)
             located[model.name] = (dataset.identifier, spelled)
             findings.extend(
-                _retype_finding(entry, retype, dataset.identifier, spelled)
+                _retype_finding(
+                    entry,
+                    retype,
+                    dataset.identifier,
+                    spelled,
+                    all_entries=loaded.models,
+                    models_by_name=models_by_name,
+                )
                 for retype in retypes
             )
 
@@ -320,6 +329,9 @@ def _retype_finding(
     retype: Any,
     identifier: str,
     spelled: dict[str, str],
+    *,
+    all_entries: Sequence[LoadedModel] | None = None,
+    models_by_name: Mapping[str, Any] | None = None,
 ) -> DriftFinding:
     """A declared column whose warehouse type is in another of SLayer's buckets.
 
@@ -342,21 +354,48 @@ def _retype_finding(
     physical = physical_column_sql(sql=col.sql, name=col.name) if col else retype.column
     declared = str(getattr(retype.stored_type, "value", retype.stored_type))
     live_type = spelled.get(physical, str(retype.live_type.value))
+
+    check_entries = list(all_entries) if all_entries is not None else [entry]
+    broken: list[dict[str, str]] | None = []
+    unreadable = False
+
     with slayer_keywords():
-        before = unaggregatable_measures(entry)
-        after = unaggregatable_measures(
-            entry, retyped={retype.column: retype.live_type}
-        )
-    broken: list[dict[str, str]] | None
-    if after is None or before is None:
+        for candidate in check_entries:
+            before = unaggregatable_measures(candidate, models_by_name=models_by_name)
+            after = unaggregatable_measures(
+                candidate,
+                retyped={retype.column: retype.live_type},
+                retyped_model=model.name,
+                models_by_name=models_by_name,
+            )
+            if after is None or before is None:
+                unreadable = True
+                break
+            already = {
+                (p.measure, p.resolved_column or p.column, p.model) for p in before
+            }
+            for p in after:
+                if (p.measure, p.resolved_column or p.column, p.model) in already:
+                    continue
+                target_col = p.resolved_column or p.column
+                column_matches = target_col == retype.column or target_col.endswith(
+                    f".{retype.column}"
+                )
+                model_matches = (
+                    p.model == model.name
+                    if p.model is not None
+                    else candidate.model.name == model.name
+                )
+                if column_matches and model_matches:
+                    meas_name = (
+                        p.measure
+                        if candidate.model.name == model.name
+                        else f"{candidate.model.name}.{p.measure}"
+                    )
+                    broken.append({"measure": meas_name, "aggregation": p.aggregation})
+
+    if unreadable:
         broken = None
-    else:
-        already = {(p.measure, p.column) for p in before}
-        broken = [
-            {"measure": p.measure, "aggregation": p.aggregation}
-            for p in after
-            if p.column == retype.column and (p.measure, p.column) not in already
-        ]
     remedy = retype.remedy
     if broken:
         named = ", ".join(f"{b['measure']} ({b['aggregation']})" for b in broken)
