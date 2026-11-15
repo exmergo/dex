@@ -5,7 +5,9 @@ warehouse. `explore relationships|map --use-project` carry each relationship and
 key at confidence 1.0 on a real DuckDB warehouse. `maintain snapshot`
 fingerprints the layer, `maintain semantic` reports a changed definition, and
 `maintain grain` measures a declared key and a relationship's arity. A query and
-a values read are refused by name, the values read after the PII gate.
+a values read on any other connector than Snowflake are refused by name, the
+values read after the PII gate (#1290 runs them on Snowflake: see
+`test_query.py`).
 """
 
 from __future__ import annotations
@@ -98,14 +100,18 @@ def test_the_narrowing_flags_answer(layer, capsys, no_network):
     assert "shop.orders.revenue" in {m["name"] for m in searched["data"]["metrics"]}
 
 
-def test_a_query_is_refused_by_name(layer, capsys, no_network):
-    """Naming #1290."""
+def test_a_query_on_another_connector_is_refused_naming_snowflake(
+    tmp_path, capsys, no_network
+):
+    """A Semantic View is a Snowflake object (#1290): on DuckDB the query is
+    refused by name, before any connection opens."""
+    root = repo(tmp_path, SHOP, connector="duckdb")
     rc, envelope = _run(
-        capsys, layer, "explore", "semantic", "query", "shop.orders.revenue"
+        capsys, root, "explore", "semantic", "query", "shop.orders.revenue"
     )
 
     assert rc != 0
-    assert "#1290" in " ".join(envelope["errors"])
+    assert "runs on the Snowflake connector" in " ".join(envelope["errors"])
 
 
 def test_values_of_a_personal_dimension_are_refused_as_pii_first(
@@ -121,16 +127,17 @@ def test_values_of_a_personal_dimension_are_refused_as_pii_first(
     assert "#1290" not in " ".join(envelope["errors"])
 
 
-def test_values_of_any_other_dimension_are_refused_for_want_of_a_runtime(
-    layer, capsys, no_network
+def test_values_on_another_connector_are_refused_after_the_pii_gate(
+    tmp_path, capsys, no_network
 ):
-    """Naming #1290."""
+    """A cleared dimension is refused for the connector, by name."""
+    root = repo(tmp_path, SHOP, connector="duckdb")
     rc, envelope = _run(
-        capsys, layer, "explore", "semantic", "values", "shop.customers.region"
+        capsys, root, "explore", "semantic", "values", "shop.customers.region"
     )
 
     assert rc != 0
-    assert "#1290" in " ".join(envelope["errors"])
+    assert "runs on the Snowflake connector" in " ".join(envelope["errors"])
 
 
 def test_an_unreadable_layer_says_which_file(tmp_path, capsys, no_network):

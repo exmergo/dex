@@ -1314,6 +1314,7 @@ class DexEngine:
         full: bool = False,
         api: bool = False,
         local: bool = False,
+        deployed: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> SemanticListResult:
         from .explore.semantic import commands as semantic_cmds
@@ -1329,6 +1330,7 @@ class DexEngine:
             full=full,
             api=api,
             local=local,
+            deployed=deployed,
         )
         result.result_mode = mode
         return result

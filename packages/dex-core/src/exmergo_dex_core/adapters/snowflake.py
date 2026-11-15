@@ -1454,6 +1454,71 @@ class SnowflakeAdapter:
         names.update(str(row["name"]) for row in rows)
         return sorted(names)
 
+    def list_semantic_views(self) -> list[str]:
+        """Every semantic view the source allowlist's scopes hold, as
+        ``DB.SCHEMA.NAME``. Free: ``SHOW SEMANTIC VIEWS``, no warehouse.
+
+        Kept apart from :meth:`list_objects`, which leaves semantic views out
+        because none of them is a relation to profile. A scope whose listing is
+        refused contributes nothing rather than failing the whole read: the
+        caller reports a view it cannot find by name."""
+
+        found: list[str] = []
+        for scope in self._scopes():
+            try:
+                rows = self._show(f"SHOW SEMANTIC VIEWS {self._scope_clause(scope)}")
+            except self._sf_errors.ProgrammingError:
+                continue
+            found.extend(
+                f"{row['database_name']}.{row['schema_name']}.{row['name']}"
+                for row in rows
+            )
+        return sorted(set(found))
+
+    def read_semantic_view_yaml(self, identifier: str) -> str:
+        """One deployed semantic view's definition, as
+        ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`` returns it.
+
+        The one statement besides SHOW that goes through the free door: it is
+        dex-built (the identifier comes from SHOW output and is passed as a
+        string literal, escaped), it reads no table, and Snowflake answers it
+        from the cloud-services layer without resuming a warehouse (checked on
+        a suspended warehouse: it stayed suspended). So no cost gate prices it,
+        and a stale-definition refusal happens before any spend.
+        """
+
+        parts = identifier.split(".")
+        if len(parts) != 3 or not all(parts):
+            raise ValueError(f"not a DB.SCHEMA.NAME semantic view: {identifier!r}")
+        quoted = ".".join(_quote_ident(part) for part in parts)
+        cursor = self._conn.cursor()
+        cursor.execute(
+            f"SELECT SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW('{_escape_literal(quoted)}')"
+        )
+        rows = cursor.fetchall()
+        if not rows or rows[0][0] is None:
+            raise ValueError(f"no definition came back for {identifier}")
+        return str(rows[0][0])
+
+    def relations_estimate(self, identifiers: Sequence[str]) -> float:
+        """The heuristic estimate for a statement over these base tables: their
+        summed bytes over the scan rate, the same as :meth:`query_estimate`
+        prices a statement that names them. For a statement over a semantic
+        view, which Snowflake keeps no bytes for: the layer names the tables the
+        rendered members reach (#1294)."""
+
+        self._load_inventory()
+        total_bytes = 0
+        known = 0
+        for identifier in dict.fromkeys(i.upper() for i in identifiers):
+            entry = self._objects.get(identifier)
+            if entry and entry["byte_size"] is not None:
+                total_bytes += entry["byte_size"]
+                known += 1
+        if known == 0:
+            return _MIN_STATEMENT_SECONDS
+        return self._scan_seconds(total_bytes)
+
     def _scope_clause(self, scope: str) -> str:
         if "." in scope:
             db, schema = scope.split(".", 1)

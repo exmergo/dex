@@ -37,6 +37,7 @@ def semantic_list(
     full: bool = False,
     api: bool = False,
     local: bool = False,
+    deployed: bool = False,
 ):
     """The semantic layer's objects: semantic models, metrics, dimensions,
     entities, measures.
@@ -64,7 +65,22 @@ def semantic_list(
     from . import SemanticBackendError, SemanticQuery, resolve_backend
 
     backend = resolve_backend(engine, api=api, local=local)
-    catalog = backend.list_definitions()
+    if deployed:
+        # Read off a capability rather than a vendor name: a layer with a
+        # deployment it can read says so.
+        if not getattr(backend, "reads_deployed", False):
+            from .backend import descriptor_from_backend
+
+            described = descriptor_from_backend(backend)
+            raise SemanticBackendError(
+                f"--deployed reads the definitions deployed from the repository's "
+                f"files, and the '{described.name}' backend "
+                f"({described.vendor}) has no deployment dex reads. List "
+                "without --deployed"
+            )
+        catalog = backend.list_definitions(deployed=True)
+    else:
+        catalog = backend.list_definitions()
     # Normalized through the query object so `--metric a,b` and the repeated flag
     # mean the same thing here as they do on a metric query. The same normalization
     # for `--for-dimension`, whose values are identifiers too.
@@ -245,12 +261,19 @@ def semantic_query(
         grain=grain,
         limit=limit,
     )
-    if not query.metrics:
-        raise SemanticBackendError(
-            "a metric query needs at least one metric (discover them with "
-            "`explore semantic list`)"
-        )
-    result = resolve_backend(engine, api=api, local=local).query(query)
+    refusal = SemanticBackendError(
+        "a metric query needs at least one metric (discover them with "
+        "`explore semantic list`)"
+    )
+    # Refused before any backend is resolved, so the refusal never depends on
+    # which one would have answered. A query of facts alone names none and
+    # groups by the facts, which only a layer that says so answers.
+    if not query.metrics and not query.group_by:
+        raise refusal
+    backend = resolve_backend(engine, api=api, local=local)
+    if not query.metrics and not getattr(backend, "metricless_queries", False):
+        raise refusal
+    result = backend.query(query)
     from ...config import QueryLimits
 
     limits = getattr(engine.config, "query", None) or QueryLimits()
@@ -288,10 +311,12 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         for_dimensions = list(getattr(args, "for_dimension", None) or [])
         search = list(getattr(args, "search", None) or [])
         full = bool(getattr(args, "full", False))
+        deployed = bool(getattr(args, "deployed", False))
         catalog_only = {
             "--for-dimension": bool(for_dimensions),
             "--search": bool(search),
             "--full": full,
+            "--deployed": deployed,
         }
         misplaced = [flag for flag, given in catalog_only.items() if given]
         if misplaced and mode != "list":
@@ -313,6 +338,7 @@ def cmd_semantic(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     full=full,
                     api=api,
                     local=local,
+                    deployed=deployed,
                 )
             )
         if mode == "values":
