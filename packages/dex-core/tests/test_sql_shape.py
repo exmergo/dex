@@ -255,6 +255,43 @@ def test_bigquery_group_by_outer_projection_alias_keeps_its_expression():
     assert alias_key != source_key
 
 
+def test_group_by_key_preserves_string_literal_case():
+    upper = _parse(
+        "select count(*) from t group by case when status = 'US' then 1 else 0 end"
+    )
+    lower = _parse(
+        "select count(*) from t group by case when status = 'us' then 1 else 0 end"
+    )
+    assert sql_shape.group_by_key(upper) != sql_shape.group_by_key(lower)
+
+
+def test_group_by_key_preserves_postgres_quoted_identifier_case():
+    upper = _parse('select count(*) from t group by "Status"')
+    lower = _parse('select count(*) from t group by "status"')
+    assert sql_shape.group_by_key(upper, "postgres") != sql_shape.group_by_key(
+        lower, "postgres"
+    )
+
+
+def test_group_by_key_folds_duckdb_quoted_identifier_case():
+    upper = _parse('select count(*) from t group by "Status"')
+    lower = _parse('select count(*) from t group by "status"')
+    assert sql_shape.group_by_key(upper, "duckdb") == sql_shape.group_by_key(
+        lower, "duckdb"
+    )
+
+
+def test_group_by_key_folds_unquoted_identifier_case():
+    upper = _parse("select count(*) from t group by STATUS")
+    lower = _parse("select count(*) from t group by status")
+    assert sql_shape.group_by_key(upper) == sql_shape.group_by_key(lower)
+
+
+def test_group_by_keys_compatibility_alias():
+    tree = _parse("select s.a, count(*) from t as s group by s.a")
+    assert sql_shape.group_by_keys(tree) == sql_shape.group_by_key(tree)
+
+
 def test_scopes_includes_set_operation_ctes():
     sql = (
         "with named as (select 1 as a), "
