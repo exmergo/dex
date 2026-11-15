@@ -563,8 +563,10 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "Count each model's, source's, snapshot's and seed's own tests by kind, "
         "its downstream tests, incremental branch tests and asserted columns, "
         "each against a stated denominator; each test's last run status, each "
-        "model's recorded mutation score (fresh or stale), and what checks each "
-        "declared fact. Free; reads the manifest, run results and .dex/ only.",
+        "model's recorded mutation score (fresh or stale), the columns singular "
+        "tests read, and what checks each declared fact. Free; reads the "
+        "manifest, run results and .dex/ only. --mutate refreshes stale and "
+        "missing scores in one batch, behind one cost handshake.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -1690,6 +1692,31 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="lift the caps on every listed section and name",
                     )
+                    sp.add_argument(
+                        "--mutate",
+                        action="store_true",
+                        default=False,
+                        help=(
+                            "refresh the stale and missing mutation scores by "
+                            "running transform test --mutate for each, behind "
+                            "one cost handshake (opens a connection)"
+                        ),
+                    )
+                    sp.add_argument(
+                        "--max-models",
+                        type=int,
+                        default=None,
+                        metavar="N",
+                        help="refresh at most N models (25, never more)",
+                    )
+                    sp.add_argument(
+                        "--target",
+                        default=None,
+                        help=(
+                            "dbt dev target --mutate runs against; "
+                            "prod-looking targets are refused"
+                        ),
+                    )
                 if group == "maintain" and name == "reconcile":
                     sp.add_argument(
                         "drift_class",
@@ -1825,9 +1852,10 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # requiring a warehouse dialect here would make a zero-connection path
         # depend on the very connector it deliberately does not touch.
         # `coverage` reads a parsed manifest and nothing else (#1280).
-        connectionless = args.subcommand == "coverage" or (
-            args.subcommand == "snapshot" and getattr(args, "project_only", False)
-        )
+        # `--mutate` is the one part of it that runs dbt against the warehouse.
+        connectionless = (
+            args.subcommand == "coverage" and not getattr(args, "mutate", False)
+        ) or (args.subcommand == "snapshot" and getattr(args, "project_only", False))
         if not connectionless:
             ensure_dialect_available()
         from .maintain import commands as maintain_cmds

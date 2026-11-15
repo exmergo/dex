@@ -245,11 +245,20 @@ class CoverageResult(Result):
     #: What checks each declared fact (#1283): a summary and one record per
     #: fact, ``checked_by`` a dbt test, ``maintain verify``, both or nothing.
     declarations: dict[str, Any] | None = None
+    #: What ``--mutate`` refreshed (#1284): the models attempted, refreshed,
+    #: refused, skipped, not run and left for the next run. ``None`` without
+    #: ``--mutate``, so the key is absent rather than empty.
+    refresh: dict[str, Any] | None = None
+    #: What singular tests read (#1282): how many were read, from where, and
+    #: each one that could not be, with a reason code.
+    singular_tests: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if self.summary is not None:
             payload["summary"] = self.summary
+        if self.refresh is not None:
+            payload["refresh"] = self.refresh
         payload["suppressed"] = self.suppressed
         if self.findings:
             payload["findings"] = [f.model_dump(mode="json") for f in self.findings]
@@ -262,6 +271,8 @@ class CoverageResult(Result):
         payload.update(self.sections)
         if self.declarations is not None:
             payload["declarations"] = self.declarations
+        if self.singular_tests is not None:
+            payload["singular_tests"] = self.singular_tests
         if self.excluded is not None:
             payload["excluded"] = self.excluded
         if self.elided is not None:

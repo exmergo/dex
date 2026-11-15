@@ -51,7 +51,9 @@ reviewed what it returns:
   can carry its arguments, and a parse error's message withheld; its last-run,
   strength and declarations sections carry statuses, scores, digests' verdicts,
   fact kinds and finding codes, never a population filter's values or a rule's
-  prose)
+  prose; the columns singular tests read are named with their roles and test
+  names, never an expression or a literal). `maintain coverage --mutate`
+  refuses in the mode, since it runs `transform test --mutate`
 
 Everything else refuses before it opens a connection, with `reason: guard` and
 `data.code: command_not_values_free`. That includes `explore cluster` (a small

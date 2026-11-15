@@ -1,0 +1,372 @@
+"""`maintain coverage --mutate`: refreshing stale and missing strength (#1284).
+
+The batch rules (order, cap, free skips, one handshake, the budget stop) are
+checked against a stubbed `transform test --mutate`; the round trip at the
+bottom runs the real thing on dbt and DuckDB.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from exmergo_dex_core.config import DexConfig
+from exmergo_dex_core.envelope import Cost
+from exmergo_dex_core.guards.cost_guard import ConfirmationRequiredError
+from exmergo_dex_core.maintain import coverage_refresh as refresh_mod
+from exmergo_dex_core.maintain.coverage_refresh import Candidate
+from exmergo_dex_core.transform import commands as transform_commands
+from exmergo_dex_core.transform.mutation import MutationError
+
+from .test_coverage_strength import FCT, MART, _manifest, _record, _strength
+
+
+def _candidates(*specs: tuple[str, str]) -> list[Candidate]:
+    return [
+        Candidate(unique_id=f"model.shop.{name}", label=name, name=name, status=status)
+        for name, status in specs
+    ]
+
+
+def _chain_manifest(*names: str) -> dict:
+    """Models named in order, each reading the one before it."""
+
+    nodes = {}
+    previous = None
+    for name in names:
+        nodes[f"model.shop.{name}"] = {
+            "resource_type": "model",
+            "name": name,
+            "language": "sql",
+            "config": {},
+            "depends_on": {"nodes": [previous] if previous else []},
+        }
+        previous = f"model.shop.{name}"
+    return {"metadata": {"project_name": "shop"}, "nodes": nodes}
+
+
+# --- order and free skips ---------------------------------------------------
+
+
+def test_missing_comes_before_stale_then_upstream_before_downstream():
+    manifest = _chain_manifest("a", "b", "c", "d")
+    ordered = refresh_mod.order(
+        _candidates(("d", "missing"), ("c", "stale"), ("a", "stale"), ("b", "missing")),
+        manifest,
+        None,
+    )
+    assert [c.label for c in ordered] == ["b", "d", "a", "c"]
+
+
+def test_a_selector_keeps_the_order_it_was_written_in():
+    manifest = _chain_manifest("a", "b", "c")
+    ordered = refresh_mod.order(
+        _candidates(("a", "missing"), ("b", "stale"), ("c", "missing")),
+        manifest,
+        ["c", "a", "b"],
+    )
+    assert [c.label for c in ordered] == ["c", "a", "b"]
+
+
+@pytest.mark.parametrize(
+    ("node", "reason"),
+    [
+        ({"language": "python"}, "python_model"),
+        ({"config": {"sql_header": "set x = 1"}}, "sql_header"),
+        ({"version": 2}, "versioned_model"),
+        ({"language": "sql", "config": {}}, None),
+    ],
+)
+def test_models_a_run_would_refuse_are_skipped_off_the_manifest(node, reason):
+    assert refresh_mod.skip_reason(node) == reason
+
+
+# --- the batch, with transform test --mutate stubbed --------------------------
+
+
+class _Engine:
+    """Just what the batch reads off an engine."""
+
+    def __init__(self, connector: str = "duckdb", *, budget: float | None = None):
+        self.config = DexConfig(connector=connector, dbt_target="dev")
+        self.connector = connector
+        self.budget = budget
+        self.confirmed = budget is not None
+        self.store = None
+        self._last_spend = None
+        self.adapters: list[str] = []
+
+    def _adapter(self, command: str):
+        self.adapters.append(command)
+        return SimpleNamespace(cost_gate=None)
+
+
+def _result(*, score=0.5, not_run=0):
+    return SimpleNamespace(
+        score=score,
+        score_with_downstream=None,
+        incremental=None,
+        counts={"survived": 1, "not_run": not_run},
+        record="/somewhere",
+        warnings=[],
+    )
+
+
+@pytest.fixture
+def calls(monkeypatch):
+    seen: dict[str, list] = {"runs": [], "prices": [], "handshakes": []}
+    plan: dict[str, object] = {"refuse": {}, "short": set(), "price": 10.0}
+
+    def fake(engine, model, *, target=None, refresh_batch=None, **_):
+        refused = plan["refuse"].get(model)
+        if refused:
+            raise MutationError(refused)
+        if refresh_batch is not None and refresh_batch.pricing:
+            seen["prices"].append(model)
+            refresh_batch.add_price({"name": model}, plan["price"], {}, [])
+            return None
+        seen["runs"].append(model)
+        if refresh_batch is not None:
+            refresh_batch.record_spend(plan["price"], None)
+        return _result(not_run=2 if model in plan["short"] else 0)
+
+    def handshake(command, adapter, estimate, *, per_table=None, notes=None, **_):
+        seen["handshakes"].append((command, estimate, dict(per_table or {})))
+        seen.setdefault("notes", []).append(list(notes or []))
+        if not plan.get("confirmed"):
+            raise ConfirmationRequiredError(Cost())
+
+    monkeypatch.setattr(transform_commands, "test_mutations", fake)
+    monkeypatch.setattr(
+        "exmergo_dex_core.command_args.billed_handshake", handshake, raising=True
+    )
+    seen["plan"] = plan
+    return seen
+
+
+def test_a_free_connector_runs_each_model_in_order_with_no_handshake(calls):
+    engine = _Engine()
+    manifest = _chain_manifest("a", "b", "c")
+    block, _warnings, _spend, _cost = refresh_mod.refresh(
+        engine, manifest, _candidates(("c", "stale"), ("b", "missing"), ("a", "stale"))
+    )
+    assert calls["runs"] == ["b", "a", "c"]
+    assert calls["prices"] == [] and calls["handshakes"] == []
+    assert engine.adapters == []
+    assert block["refreshed_count"] == 3
+    assert [entry["model"] for entry in block["refreshed"]] == ["b", "a", "c"]
+    assert block["refreshed"][0]["was"] == "missing"
+
+
+def test_the_cap_narrows_and_names_the_rest_for_the_next_run(calls):
+    manifest = _chain_manifest("a", "b", "c", "d")
+    block, *_ = refresh_mod.refresh(
+        _Engine(),
+        manifest,
+        _candidates(
+            ("a", "missing"), ("b", "missing"), ("c", "missing"), ("d", "missing")
+        ),
+        limit=2,
+    )
+    assert calls["runs"] == ["a", "b"]
+    assert block["attempted"] == 2 and block["limit"] == 2
+    assert block["elided"] == {"count": 2, "models": ["c", "d"]}
+
+
+def test_the_cap_cannot_be_widened():
+    with pytest.raises(ValueError, match="above the ceiling of 25"):
+        refresh_mod.refresh(_Engine(), {}, [], limit=26)
+
+
+def test_a_skipped_model_is_free_and_does_not_count_against_the_cap(calls):
+    manifest = _chain_manifest("a", "b")
+    manifest["nodes"]["model.shop.a"]["language"] = "python"
+    block, *_ = refresh_mod.refresh(
+        _Engine(), manifest, _candidates(("a", "missing"), ("b", "missing")), limit=1
+    )
+    assert calls["runs"] == ["b"]
+    assert block["skipped"] == [{"model": "a", "reason_code": "python_model"}]
+    assert block["elided"]["count"] == 0
+
+
+def test_a_refusal_is_reported_with_a_code_and_the_batch_goes_on(calls):
+    calls["plan"]["refuse"] = {
+        "a": "'a' has no SQL dex knows how to plant a defect in (...)"
+    }
+    block, *_ = refresh_mod.refresh(
+        _Engine(),
+        _chain_manifest("a", "b"),
+        _candidates(("a", "missing"), ("b", "stale")),
+    )
+    assert calls["runs"] == ["b"]
+    assert block["refused"][0]["model"] == "a"
+    assert block["refused"][0]["reason_code"] == "no_mutable_sql"
+
+
+def test_nothing_to_refresh_runs_nothing():
+    block, _warnings, spend, cost = refresh_mod.refresh(_Engine(), {}, [])
+    assert block["ran"] is False and block["attempted"] == 0
+    assert spend is None and cost is None
+
+
+def test_a_metered_batch_is_priced_and_confirmed_once(calls):
+    engine = _Engine("bigquery")
+    with pytest.raises(ConfirmationRequiredError):
+        refresh_mod.refresh(
+            engine,
+            _chain_manifest("a", "b", "c"),
+            _candidates(("a", "missing"), ("b", "missing"), ("c", "stale")),
+        )
+    assert calls["prices"] == ["a", "b", "c"]
+    assert calls["runs"] == [], "nothing runs before the one handshake"
+    assert len(calls["handshakes"]) == 1
+    command, estimate, lines = calls["handshakes"][0]
+    assert command == "maintain coverage"
+    assert estimate == 30.0
+    assert lines == {"a": 10.0, "b": 10.0, "c": 10.0}
+
+
+def test_the_ask_names_the_models_refused_while_pricing(calls):
+    calls["plan"]["refuse"] = {"b": "'b' has no SQL dex knows how to plant (...)"}
+    with pytest.raises(ConfirmationRequiredError):
+        refresh_mod.refresh(
+            _Engine("bigquery"),
+            _chain_manifest("a", "b"),
+            _candidates(("a", "missing"), ("b", "missing")),
+        )
+    assert calls["handshakes"][0][2] == {"a": 10.0}
+    assert any("b (no_mutable_sql)" in note for note in calls["notes"][0])
+
+
+def test_a_budget_that_runs_out_leaves_the_rest_not_run(calls):
+    calls["plan"]["confirmed"] = True
+    calls["plan"]["short"] = {"b"}
+    engine = _Engine("bigquery", budget=100.0)
+    block, warnings, _spend, cost = refresh_mod.refresh(
+        engine,
+        _chain_manifest("a", "b", "c", "d"),
+        _candidates(
+            ("a", "missing"), ("b", "missing"), ("c", "missing"), ("d", "missing")
+        ),
+    )
+    assert calls["runs"] == ["a", "b"]
+    assert [e["complete"] for e in block["refreshed"]] == [True, False]
+    assert block["refreshed"][1]["not_run"] == 2
+    assert block["not_run"] == [
+        {"model": "c", "reason_code": "budget"},
+        {"model": "d", "reason_code": "budget"},
+    ]
+    assert any("ran out part way" in w for w in warnings)
+    assert cost.estimate == 40.0 and cost.ceiling == 100.0
+
+
+def test_each_run_draws_on_what_the_batch_has_left(calls, monkeypatch):
+    calls["plan"]["confirmed"] = True
+    seen: list[float | None] = []
+    original = transform_commands.test_mutations
+
+    def watching(engine, model, *, refresh_batch=None, **kwargs):
+        if refresh_batch is not None and not refresh_batch.pricing:
+            seen.append(refresh_batch.remaining())
+        return original(engine, model, refresh_batch=refresh_batch, **kwargs)
+
+    monkeypatch.setattr(transform_commands, "test_mutations", watching)
+    refresh_mod.refresh(
+        _Engine("bigquery", budget=25.0),
+        _chain_manifest("a", "b"),
+        _candidates(("a", "missing"), ("b", "missing")),
+    )
+    assert seen == [25.0, 15.0]
+
+
+# --- the refusal record -------------------------------------------------------
+
+
+def test_a_structural_refusal_reads_untestable_until_the_model_changes():
+    manifest = _manifest()
+    records = {FCT: _record(manifest, refused="no_mutable_sql", score=None)}
+    strength = _strength(manifest, records)
+    assert strength["fct"]["status"] == "untestable"
+    assert strength["fct"]["reason"] == "no_mutable_sql"
+
+    manifest["nodes"][FCT]["raw_code"] = "select id from raw where id > 0"
+    strength = _strength(manifest, records)
+    assert strength["fct"] == {"status": "missing", "changed": ["model_sql"]}
+
+
+def test_a_refusal_record_is_left_out_of_the_score_bands():
+    from exmergo_dex_core.maintain import coverage as coverage_mod
+
+    manifest = _manifest()
+    records = {
+        FCT: _record(manifest, refused="no_mutable_sql", score=None),
+        MART: _record(manifest, MART, score=0.9),
+    }
+    found = coverage_mod.inventory(manifest, records=records)
+    summary = found.summary["models"]["strength"]
+    assert summary["by_status"]["untestable"] >= 1
+    assert sum(summary["fresh_score_bands"].values()) == 1
+
+
+# --- the command ----------------------------------------------------------------
+
+
+def test_values_free_mode_refuses_mutate_before_anything_opens(tmp_path: Path):
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import MemoryStore
+    from exmergo_dex_core.values_free import ValuesFreeCode, ValuesFreeError
+
+    engine = DexEngine(
+        connector="duckdb",
+        repo_root=str(tmp_path),
+        store=MemoryStore(),
+        config=DexConfig(connector="duckdb"),
+        result_mode="values_free",
+    )
+    with pytest.raises(ValuesFreeError) as caught:
+        engine.coverage(mutate=True)
+    assert caught.value.code is ValuesFreeCode.COMMAND_NOT_VALUES_FREE
+
+
+def test_mutate_refreshes_in_one_command_and_a_second_run_moves_on(
+    tmp_path: Path, duckdb_file: Path
+):
+    pytest.importorskip("dbt.adapters.duckdb")
+    from tests.transform.mutation_helpers import _engine, _schema_yml
+    from tests.transform.mutation_helpers import (
+        measurable_project as _fixture,
+    )
+
+    project = _fixture.__wrapped__(tmp_path, duckdb_file)
+    (project / "models" / "schema.yml").write_text(_schema_yml(True), "utf-8")
+    engine = _engine(project)
+    engine.build(target="dev")
+
+    first = engine.coverage(["fct"], mutate=True)
+    assert first.refresh["attempted"] == 1
+    assert [e["model"] for e in first.refresh["refreshed"]] == ["fct"]
+    assert first.sections["models"][0]["strength"]["status"] == "fresh"
+    assert first.refresh["refreshed"][0]["recorded"] is True
+
+    again = engine.coverage(["fct"], mutate=True)
+    assert again.refresh["ran"] is False
+    assert again.refresh["candidates"] == 0
+
+    # The staging models are passthroughs: refused once, recorded, and left
+    # alone afterwards rather than retried on every run.
+    whole = engine.coverage(mutate=True)
+    refused = {e["model"]: e["reason_code"] for e in whole.refresh["refused"]}
+    assert refused == {
+        "stg_customers": "no_mutable_sql",
+        "stg_orders": "no_mutable_sql",
+    }
+    after = engine.coverage(mutate=True)
+    assert after.refresh["candidates"] == 0
+    statuses = {r["name"]: r["strength"]["status"] for r in after.sections["models"]}
+    assert statuses == {
+        "fct": "fresh",
+        "stg_customers": "untestable",
+        "stg_orders": "untestable",
+    }
