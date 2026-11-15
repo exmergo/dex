@@ -2640,6 +2640,10 @@ def test_mutations(
                     "which the semantic layer cannot anchor"
                 )
             node, model_path = _mutable_model(engine, shadow, model, mutation_mod)
+            # Taken before anything in the copy is rewritten, from the fields a
+            # plain parse carries too, so `maintain coverage` can tell later
+            # whether this run still describes the model (#1281).
+            fingerprint = _mutation_fingerprint(shadow.manifest(), node)
             below = _DownstreamTests.prepare(
                 shadow,
                 node,
@@ -2813,7 +2817,30 @@ def test_mutations(
             )
         )
 
+    cap_block = {
+        "limit": batch.cap,
+        "generated": len(batch.mutants)
+        + (len(branch.mutants) if branch is not None else 0),
+        "considered": batch.considered
+        + (branch.considered if branch is not None else 0),
+        "elided": elided,
+    }
+    record_at, record_warning = _record_mutation_run(
+        store,
+        node,
+        fingerprint,
+        result,
+        cap=cap_block,
+        unsupported=len(batch.unsupported),
+        downstream=below,
+        connector=connector,
+        full_tests=full_tests,
+    )
+    if record_warning:
+        warnings.append(record_warning)
+
     return MutationCoverageResult(
+        record=record_at,
         model=node["name"],
         target=target,
         baseline=result["baseline"],
@@ -2823,14 +2850,7 @@ def test_mutations(
         score_with_downstream=result["score_with_downstream"],
         # The whole run's cap: it binds the full build and the incremental
         # branch together, and data.incremental.cap holds the branch's share.
-        cap={
-            "limit": batch.cap,
-            "generated": len(batch.mutants)
-            + (len(branch.mutants) if branch is not None else 0),
-            "considered": batch.considered
-            + (branch.considered if branch is not None else 0),
-            "elided": elided,
-        },
+        cap=cap_block,
         unsupported_sites=batch.unsupported,
         runs=runs,
         equivalence=result["equivalence"],
@@ -2840,6 +2860,122 @@ def test_mutations(
         cost=_mutation_cost(paradigm, estimate, ceiling, adapter),
         warnings=warnings,
     )
+
+
+def _mutation_fingerprint(manifest: dict, node: dict) -> dict[str, Any]:
+    """What a recorded run is measured against, from parse-time fields (#1281)."""
+
+    from .. import dbt_tests
+    from . import mutation as mutation_mod
+
+    return {
+        # The copy's model file ends with the ephemeral header `--mutate`
+        # appended; the project's does not.
+        "sql_digest": dbt_tests.model_sql_digest(
+            node, appended=mutation_mod.EPHEMERAL_HEADER
+        ),
+        "tests_digest": dbt_tests.own_tests_digest(manifest, node),
+        "manifest": manifest,
+    }
+
+
+def _record_mutation_run(
+    store,
+    node: dict,
+    fingerprint: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    cap: dict[str, Any],
+    unsupported: int,
+    downstream,
+    connector: str,
+    full_tests: bool = True,
+) -> tuple[str | None, str | None]:
+    """Keep this run as the model's current mutation record, where it measured
+    anything (#1281).
+
+    A run that decided no mutant (every one ``not_run`` or ``rejected``) records
+    nothing and leaves the previous record in place. A run the budget stopped
+    part way is recorded with its ``not_run`` count and ``complete: false``,
+    never as a full score. The record holds counts, scores, digests and
+    timestamps: no SQL, no row and no warehouse value.
+    """
+
+    from .. import __version__, dbt_tests
+    from ..dbt_project import manifest_node_label
+
+    counts = dict(result["counts"])
+    incremental = result.get("incremental") or None
+    branch_counts = dict((incremental or {}).get("counts") or {})
+    # Only mutants a test actually ran count. With no test running the full
+    # build (``full_tests`` false), or no unit test taking the is_incremental()
+    # branch, that side's mutants are survivors by construction, not by a run,
+    # and must not replace an earlier record on their own.
+    executed = 0
+    if full_tests:
+        executed += sum(
+            counts.get(key, 0) for key in ("killed", "caught_downstream", "survived")
+        )
+    if (incremental or {}).get("tests"):
+        executed += sum(branch_counts.get(key, 0) for key in ("killed", "survived"))
+    if not executed:
+        return None, None
+    saver = getattr(store, "save_mutation_record", None)
+    if saver is None:
+        return None, (
+            "this run was not recorded: the configured store keeps no mutation "
+            "records, so `maintain coverage` will report this model's strength "
+            "as missing"
+        )
+
+    manifest = fingerprint["manifest"]
+    nodes = manifest.get("nodes") or {}
+    by_label = {
+        manifest_node_label(uid, test): uid
+        for uid, test in nodes.items()
+        if test.get("resource_type") == "test"
+    }
+    routed = bool(getattr(downstream, "enabled", False))
+    downstream_tests: dict[str, str] = {}
+    if routed:
+        for label in downstream.tests:
+            uid = by_label.get(label)
+            if uid is not None:
+                downstream_tests[uid] = dbt_tests.test_digest(nodes[uid])
+    not_run = counts.get("not_run", 0) + branch_counts.get("not_run", 0)
+    record = {
+        "model_id": node.get("unique_id"),
+        "model": manifest_node_label(str(node.get("unique_id")), node),
+        "score": result.get("score"),
+        "score_with_downstream": result.get("score_with_downstream"),
+        "incremental_score": (incremental or {}).get("score"),
+        "counts": counts,
+        "incremental_counts": branch_counts or None,
+        "survivors": counts.get("survived", 0) + branch_counts.get("survived", 0),
+        "not_run": not_run,
+        "complete": not_run == 0,
+        "cap": {
+            "limit": cap["limit"],
+            "generated": cap["generated"],
+            "elided": sum((cap.get("elided") or {}).values()),
+        },
+        "unsupported_sites": unsupported,
+        "equivalence_checked": bool((result.get("equivalence") or {}).get("checked")),
+        "downstream": routed,
+        "connector": connector,
+        "engine_version": __version__,
+        "recorded_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "sql_digest": fingerprint["sql_digest"],
+        "tests_digest": fingerprint["tests_digest"],
+        "downstream_tests": downstream_tests,
+    }
+    try:
+        return saver(record), None
+    except Exception as exc:  # a scratch-state write never fails the measurement
+        return None, (
+            f"this run was not recorded ({type(exc).__name__}), so `maintain "
+            "coverage` will not see it"
+        )
 
 
 def _unsupported_frames_warning(unsupported: list[dict[str, str]]) -> str:

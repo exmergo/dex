@@ -108,6 +108,7 @@ class Document(str, Enum):
     DRIFT = "drift"
     QUERY_LOG = "queries"
     SPEND_LOG = "spend"
+    MUTATIONS = "mutations"
 
 
 @runtime_checkable
@@ -494,6 +495,53 @@ class SpendHistory(Protocol):
         midnight UTC.
         """
         ...
+
+
+@runtime_checkable
+class MutationRecords(Protocol):
+    """Optional: keep the latest ``transform test --mutate`` result per model (#1281).
+
+    Two methods, on top of any tier. ``transform test --mutate`` measures one
+    model's tests and returns the score in its envelope; this is what lets
+    ``maintain coverage`` read that measurement back later, with no mutant
+    re-run, and call it fresh or stale against the project as it stands.
+
+    **One current record per model.** ``save_mutation_record`` replaces any
+    earlier record for the same ``record["model_id"]`` (the model's manifest
+    ``unique_id``) and leaves every other model's record alone, so two models
+    measured one after the other both survive. **A backend stores records; it
+    does not interpret them**: hand each back as it was saved, every key
+    included, from ``load_mutation_records`` keyed by ``model_id``.
+
+    A record carries counts, scores, digests and timestamps only: no SQL, no
+    row and no warehouse value ever reaches it, so a backend needs no special
+    handling for it.
+
+    Absence is handled gently, as :class:`SpendHistory`'s is: a store without
+    these methods records nothing, ``--mutate`` says so, and coverage reports
+    every model's strength as ``missing`` with a note naming why.
+    """
+
+    def save_mutation_record(self, record: dict) -> str:
+        """Replace ``record["model_id"]``'s record; return where it was written."""
+        ...
+
+    def load_mutation_records(self) -> dict[str, dict]:
+        """Every current record, keyed by ``model_id``; empty when none."""
+        ...
+
+
+def mutation_record_key(model_id: str) -> str:
+    """A filesystem- and key-safe name for one model's mutation record.
+
+    A manifest ``unique_id`` carries dots and, on a versioned model, a version
+    suffix; hashing it gives every backend the same short, collision-free key
+    without escaping rules of its own.
+    """
+
+    import hashlib
+
+    return hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
 
 
 @dataclass(frozen=True)

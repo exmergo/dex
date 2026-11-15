@@ -35,6 +35,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -58,6 +59,21 @@ COLUMN_CAP = 12
 EXCLUDED_CAP = 25
 #: Downstream resources named per resource.
 DOWNSTREAM_CAP = 10
+
+#: A test's status in the latest run results (#1285); ``not_run`` where the
+#: run did not include it.
+RUN_STATUSES = ("pass", "fail", "warn", "error", "skipped", "not_run")
+
+#: What a recorded mutation score is called against the project (#1284).
+STRENGTH_STATUSES = ("fresh", "stale", "missing", "untestable")
+
+#: Score bands for the distribution: the summary never averages scores.
+_SCORE_BANDS = (
+    ("below_0.25", 0.25),
+    ("0.25_to_0.5", 0.5),
+    ("0.5_to_0.75", 0.75),
+    ("0.75_and_above", None),
+)
 
 _NOUN = {
     "models": "models",
@@ -93,6 +109,8 @@ class Inventory:
     scope: dict[str, Any]
     notes: list[str]
     warnings: list[str]
+    #: The unique ids in scope, every section and type, before any cut.
+    selected: frozenset[str] = frozenset()
 
 
 def _label(unique_id: str, node: dict[str, Any]) -> str:
@@ -153,8 +171,17 @@ def inventory(
     *,
     selector: Iterable[str] | None = None,
     full: bool = False,
+    statuses: dict[str, str] | None = None,
+    records: dict[str, dict[str, Any]] | None = None,
+    now: datetime | None = None,
 ) -> Inventory:
-    """Inventory the tests ``manifest`` declares for the root project."""
+    """Inventory the tests ``manifest`` declares for the root project.
+
+    ``statuses`` is each test's status in the latest run results (#1285), by
+    unique id; ``None`` means no run was read, and no test carries a status.
+    ``records`` is the recorded mutation results by model unique id (#1284);
+    ``None`` means the store keeps none, so no model carries a strength.
+    """
 
     project = (manifest.get("metadata") or {}).get("project_name")
     nodes: dict[str, dict] = manifest.get("nodes") or {}
@@ -244,6 +271,9 @@ def inventory(
                     stack.append(child)
         return seen
 
+    # Each test's status once, by unique id: a singular test reading two
+    # selected resources is listed on both and counted once, as by_kind is.
+    summary_statuses: dict[str, str] = {}
     totals = dict.fromkeys(dbt_tests.TEST_KINDS, 0)
     severities = {"error": 0, "warn": 0}
     package_tests = 0
@@ -279,6 +309,9 @@ def inventory(
             resource = resources[owner]
             resource.test_ids.add(unique_id)
             record: dict[str, Any] = {"kind": kind, "severity": severity}
+            if statuses is not None:
+                record["last_run"] = statuses.get(unique_id, "not_run")
+                summary_statuses[unique_id] = record["last_run"]
             if kind == "generic":
                 record["test"] = dbt_tests.generic_test_name(test)
                 column = test.get("column_name")
@@ -314,6 +347,9 @@ def inventory(
             resource = resources[owner]
             resource.test_ids.add(unique_id)
             record = {"kind": "unit", "name": unit.get("name")}
+            if statuses is not None:
+                record["last_run"] = statuses.get(unique_id, "not_run")
+                summary_statuses[unique_id] = record["last_run"]
             if _materialized(resource.node) == "incremental":
                 value = ((unit.get("overrides") or {}).get("macros") or {}).get(
                     "is_incremental"
@@ -359,19 +395,39 @@ def inventory(
         "excluded": 0,
     }
     sections: dict[str, list[dict[str, Any]]] = {name: [] for name in _NOUN}
+    strength: dict[str, dict[str, Any]] = {}
+    if records is not None:
+        for unique_id in selected:
+            resource = resources[unique_id]
+            if resource.resource_type == "model":
+                strength[unique_id] = _strength(
+                    manifest, resource, records.get(unique_id), now=now
+                )
     for unique_id in selected:
         resource = resources[unique_id]
-        sections[SECTIONS[resource.resource_type]].append(_record(resource))
-    for name, records in sections.items():
-        records.sort(key=lambda r: (r["tested"], r["name"]))
-        if not full and len(records) > RESOURCE_CAP:
-            elided[name] = len(records) - RESOURCE_CAP
-            del records[RESOURCE_CAP:]
+        record = _record(resource, last_run=statuses is not None)
+        if unique_id in strength:
+            record["strength"] = strength[unique_id]
+        sections[SECTIONS[resource.resource_type]].append(record)
+    for name, listed in sections.items():
+        listed.sort(key=lambda r: (r["tested"], r["name"]))
+        if not full and len(listed) > RESOURCE_CAP:
+            elided[name] = len(listed) - RESOURCE_CAP
+            del listed[RESOURCE_CAP:]
         if not full:
-            for record in records:
+            for record in listed:
                 _cap(record, elided)
 
     summary = _summary(resources, selected, totals, severities, scoped=bool(wanted))
+    if statuses is not None:
+        by_status = dict.fromkeys(RUN_STATUSES, 0)
+        for status in summary_statuses.values():
+            by_status[status] += 1
+        summary["tests"]["by_last_run"] = by_status
+    if records is not None:
+        summary["models"]["strength"] = _strength_summary(
+            list(strength.values()), scoped=bool(wanted)
+        )
 
     excluded.sort(key=lambda e: (e["reason"], str(e["resource_type"]), e["name"]))
     excluded_block: dict[str, Any] = {
@@ -405,7 +461,14 @@ def inventory(
         scope=scope,
         notes=notes,
         warnings=warnings,
+        selected=frozenset(selected),
     )
+
+
+def selected_ids(inventory: Inventory) -> frozenset[str]:
+    """The unique ids the inventory covers, for the sections built beside it."""
+
+    return inventory.selected
 
 
 def _cap(record: dict[str, Any], elided: dict[str, int]) -> None:
@@ -430,7 +493,7 @@ def _cap(record: dict[str, Any], elided: dict[str, int]) -> None:
         record["downstream_tests"]["on"] = via[:DOWNSTREAM_CAP]
 
 
-def _record(resource: _Resource) -> dict:
+def _record(resource: _Resource, *, last_run: bool = False) -> dict:
     node = resource.node
     own = dict.fromkeys(dbt_tests.TEST_KINDS, 0)
     severity = {"error": 0, "warn": 0}
@@ -487,6 +550,11 @@ def _record(resource: _Resource) -> dict:
         ),
     )
     record["tests"] = tests
+    if last_run:
+        counted = [t["last_run"] for t in resource.tests if "last_run" in t]
+        record["last_run"] = dict.fromkeys(RUN_STATUSES, 0)
+        for status in counted:
+            record["last_run"][status] += 1
     record["downstream_tests"] = {
         "count": len(resource.downstream),
         "on": sorted(resource.downstream_via),
@@ -604,3 +672,98 @@ def _elision_notes(elided: dict[str, int]) -> list[str]:
             "Pass --full to name them"
         )
     return notes
+
+
+# --- strength: recorded mutation results (#1284) -----------------------------
+
+
+def _age_seconds(stamp: Any, now: datetime | None) -> int | None:
+    try:
+        recorded = datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+    if recorded.tzinfo is None:
+        recorded = recorded.replace(tzinfo=UTC)
+    return max(0, int(((now or datetime.now(UTC)) - recorded).total_seconds()))
+
+
+def _strength(
+    manifest: dict[str, Any],
+    resource: _Resource,
+    record: dict[str, Any] | None,
+    *,
+    now: datetime | None,
+) -> dict[str, Any]:
+    """One model's recorded mutation score, called against the project.
+
+    ``fresh`` only when the model's SQL as written and its own tests match what
+    the run measured, and every downstream test it ran still reads the same;
+    ``stale`` names which changed; ``missing`` where nothing was recorded, and
+    ``untestable`` where the model has no test, own or downstream, so a run
+    would refuse it.
+    """
+
+    if record is None:
+        status = "missing" if (resource.tests or resource.downstream) else "untestable"
+        return {"status": status}
+    changed: list[str] = []
+    if record.get("sql_digest") != dbt_tests.model_sql_digest(resource.node):
+        changed.append("model_sql")
+    if record.get("tests_digest") != dbt_tests.own_tests_digest(
+        manifest, resource.node
+    ):
+        changed.append("own_tests")
+    for unique_id, digest in (record.get("downstream_tests") or {}).items():
+        test = dbt_tests.test_node(manifest, unique_id)
+        if (
+            test is None
+            or not dbt_tests.test_enabled(test)
+            or dbt_tests.test_digest(test) != digest
+        ):
+            changed.append("downstream_tests")
+            break
+    entry: dict[str, Any] = {
+        "status": "stale" if changed else "fresh",
+        "score": record.get("score"),
+        "score_with_downstream": record.get("score_with_downstream"),
+        "incremental_score": record.get("incremental_score"),
+        "survivors": record.get("survivors"),
+        "complete": record.get("complete", True),
+        "downstream": bool(record.get("downstream")),
+        "recorded_at": record.get("recorded_at"),
+        "age_seconds": _age_seconds(record.get("recorded_at"), now),
+    }
+    if not entry["complete"]:
+        entry["not_run"] = record.get("not_run")
+    if changed:
+        entry["changed"] = changed
+    return entry
+
+
+def _strength_summary(entries: list[dict[str, Any]], *, scoped: bool) -> dict:
+    """Counts per status and a distribution of fresh scores, never an average.
+
+    A project-wide mutation score would blend models whose suites were measured
+    against different planted defects, at different times; the bands say where
+    the measured suites sit without pretending to be one number.
+    """
+
+    prefix = "selected " if scoped else ""
+    by_status = dict.fromkeys(STRENGTH_STATUSES, 0)
+    bands = {name: 0 for name, _ in _SCORE_BANDS}
+    for entry in entries:
+        by_status[entry["status"]] += 1
+        score = entry.get("score")
+        if entry["status"] != "fresh" or score is None:
+            continue
+        for name, upper in _SCORE_BANDS:
+            if upper is None or score < upper:
+                bands[name] += 1
+                break
+    return {
+        "by_status": by_status,
+        "fresh": _ratio(
+            by_status["fresh"], len(entries), f"{prefix}enabled project models"
+        ),
+        "fresh_score_bands": bands,
+    }

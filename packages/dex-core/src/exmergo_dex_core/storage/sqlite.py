@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING
 
 from ..cache import DexCache
 from ..errors import ConfigurationError
-from .base import Document, StoreContext, spend_total
+from .base import Document, StoreContext, mutation_record_key, spend_total
 from .filesystem import CACHE_LOCK_FILE, hold_file_lock
 
 if TYPE_CHECKING:
@@ -478,6 +478,44 @@ class SqliteStore:
             if kind is None or all(edit.kind is kind for edit in plan.edits):
                 return plan
         return None
+
+    # --- mutation records (#1281) ----------------------------------------------
+
+    # Kept in the ``documents`` table under one kind per model rather than a
+    # table of their own, so the file needs no schema migration to hold them.
+    _MUTATION_PREFIX = "mutation:"
+
+    def save_mutation_record(self, record: dict) -> str:
+        kind = self._MUTATION_PREFIX + mutation_record_key(str(record["model_id"]))
+        with self._conn_lock:
+            conn = self._connection()
+            conn.execute(
+                "INSERT INTO documents(kind, body) VALUES (?, ?) "
+                "ON CONFLICT(kind) DO UPDATE SET body = excluded.body",
+                (kind, json.dumps(record, sort_keys=True)),
+            )
+            conn.commit()
+        return f"{self.path}#{kind}"
+
+    def load_mutation_records(self) -> dict[str, dict]:
+        with self._conn_lock:
+            rows = (
+                self._connection()
+                .execute(
+                    "SELECT body FROM documents WHERE kind LIKE ?",
+                    (self._MUTATION_PREFIX + "%",),
+                )
+                .fetchall()
+            )
+        records: dict[str, dict] = {}
+        for (body,) in rows:
+            try:
+                record = json.loads(body)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("model_id"):
+                records[str(record["model_id"])] = record
+        return records
 
     # --- locators -------------------------------------------------------------
 

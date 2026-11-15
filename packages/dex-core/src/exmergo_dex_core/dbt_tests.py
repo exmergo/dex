@@ -197,3 +197,92 @@ def freshness_policy(source: dict[str, Any]) -> str | None:
         if ((policy.get("warn_after") or {}).get("count")) is not None:
             return "warn"
     return None
+
+
+# --- freshness fingerprints for recorded mutation results (#1281) -----------
+#
+# `transform test --mutate` compiles the project; `maintain coverage` only
+# parses it, and must stay connectionless. So the fingerprint is taken from
+# what both manifests carry identically: a model's SQL as written (``raw_code``)
+# and each test's definition, never compiled SQL. A change in a macro the model
+# calls, or in a parent's SQL, does not change it.
+
+#: The test config keys that change which rows a data test fails on.
+_TEST_CONFIG_KEYS = ("severity", "where", "limit", "warn_if", "error_if", "fail_calc")
+
+
+def _digest(payload: Any) -> str:
+    import hashlib
+    import json
+
+    text = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def model_sql_digest(node: dict[str, Any], *, appended: str | None = None) -> str:
+    """The model's SQL as written, and its language.
+
+    ``appended`` is a line the caller added to the file and wants left out:
+    ``--mutate`` appends an ephemeral ``config()`` to the model in its copy, so
+    the materialization it compiles is never the project's and is not read.
+    A ``config()`` the model's own file writes is part of its SQL and counts.
+    """
+
+    raw = str(node.get("raw_code") or "").strip()
+    if appended and raw.endswith(appended):
+        raw = raw[: -len(appended)].strip()
+    return _digest({"raw_code": raw, "language": node.get("language")})
+
+
+def test_digest(test: dict[str, Any]) -> str:
+    """One test's definition: what it asserts, not what it is called."""
+
+    if test.get("resource_type") == "unit_test":
+        return _digest(
+            {
+                "model": test.get("model"),
+                "version": test.get("version"),
+                "given": test.get("given"),
+                "expect": test.get("expect"),
+                "overrides": test.get("overrides"),
+            }
+        )
+    config = test.get("config") or {}
+    metadata = test.get("test_metadata") or {}
+    return _digest(
+        {
+            "test": [metadata.get("namespace"), metadata.get("name")],
+            "kwargs": metadata.get("kwargs"),
+            "column": test.get("column_name"),
+            "raw_code": None if metadata else str(test.get("raw_code") or "").strip(),
+            "config": {key: config.get(key) for key in _TEST_CONFIG_KEYS},
+        }
+    )
+
+
+def test_node(manifest: dict, unique_id: str) -> dict[str, Any] | None:
+    """A test or unit test node by unique id, from either manifest table."""
+
+    node = (manifest.get("nodes") or {}).get(unique_id)
+    if node is None:
+        node = (manifest.get("unit_tests") or {}).get(unique_id)
+    return node
+
+
+def own_tests_digest(manifest: dict, node: dict[str, Any]) -> str:
+    """The set of tests attached to the model, each with its definition.
+
+    Enabled tests only, keyed by unique id: a test added, removed, disabled or
+    rewritten changes it.
+    """
+
+    entries = {}
+    for unique_id in attached_tests(manifest, node):
+        test = test_node(manifest, unique_id)
+        if test is None or not test_enabled(test):
+            continue
+        units = manifest.get("unit_tests") or {}
+        if unique_id in units and not covers(units[unique_id], node):
+            continue
+        entries[unique_id] = test_digest(test)
+    return _digest(entries)

@@ -238,6 +238,13 @@ class CoverageResult(Result):
     #: tree as it stands) or ``artifact`` (the newest one on disk, which a
     #: warning dates), with ``generated_at`` where dbt recorded it.
     manifest: dict[str, Any] | None = None
+    #: The latest run results each test status was read from (#1285): its
+    #: invocation, when dbt wrote it and how old it is. ``None`` where no run
+    #: was found, which a note says; every test then reads ``not_run``.
+    last_run: dict[str, Any] | None = None
+    #: What checks each declared fact (#1283): a summary and one record per
+    #: fact, ``checked_by`` a dbt test, ``maintain verify``, both or nothing.
+    declarations: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {}
@@ -250,7 +257,11 @@ class CoverageResult(Result):
             payload["scope"] = self.scope
         if self.manifest is not None:
             payload["manifest"] = self.manifest
+        if self.summary is not None:
+            payload["last_run"] = self.last_run
         payload.update(self.sections)
+        if self.declarations is not None:
+            payload["declarations"] = self.declarations
         if self.excluded is not None:
             payload["excluded"] = self.excluded
         if self.elided is not None:

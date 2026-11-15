@@ -17,6 +17,7 @@ Two properties are load-bearing:
 
 from __future__ import annotations
 
+import copy
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -49,6 +50,8 @@ class MemoryStore:
         self._plans: dict[str, TransformPlan] = {}
         self._queries: list[dict] = []
         self._spend: list[dict] = []
+        self._mutations: dict[str, dict] = {}
+        self._mutations_lock = threading.Lock()
         self._spend_lock = threading.RLock()
         self._cache_lock = threading.RLock()
 
@@ -196,6 +199,21 @@ class MemoryStore:
         ]
         latest = max(candidates, key=lambda p: p.created_at, default=None)
         return latest.model_copy(deep=True) if latest is not None else None
+
+    # --- mutation records (#1281) ----------------------------------------------
+
+    def save_mutation_record(self, record: dict) -> str:
+        model_id = str(record["model_id"])
+        saved = copy.deepcopy(record)
+        with self._mutations_lock:
+            self._mutations[model_id] = saved
+        return f"memory:mutations/{model_id}"
+
+    def load_mutation_records(self) -> dict[str, dict]:
+        # Copied under the lock: a save from another thread mid-copy would
+        # otherwise change the dict while it is iterated.
+        with self._mutations_lock:
+            return copy.deepcopy(self._mutations)
 
     # --- locators -------------------------------------------------------------
 

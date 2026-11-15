@@ -61,11 +61,16 @@ at runtime. Passing an explore-only store to a transform command refuses with a
 message naming the tier and the missing members, rather than failing on a missing
 attribute several frames down.
 
-Four capabilities sit alongside the tiers rather than inside them, and all are
+Five capabilities sit alongside the tiers rather than inside them, and all are
 optional: `SpendLock`, so the cumulative spend ceiling binds when two commands
 overlap; `CacheLock`, so one command's cache write never reverts another's;
 `SpendHistory`, so an over-ceiling refusal can say how far this connector's past
-estimates ran from what they actually billed; and the construction contract, so
+estimates ran from what they actually billed; `MutationRecords`
+(`save_mutation_record`, `load_mutation_records`), so the latest `transform test
+--mutate` result per model survives for `maintain coverage` to read back, one
+current record per model keyed by its manifest `unique_id`, handed back as saved
+(without it, `--mutate` records nothing and coverage says every model's strength
+is missing); and the construction contract, so
 your backend can be named in configuration. A backend is a complete backend
 without any of them, and the two locks are ones every concurrent host wants.
 
@@ -523,6 +528,11 @@ same way. It checks the three properties from
 [Reading the ledger back](#reading-the-ledger-back): entries come back
 uninterpreted, oldest first, and `limit` caps the most recent entries *after* the
 connector filter rather than before it.
+
+**If your backend implements `save_mutation_record`**, mix in
+`MutationRecordsContract`. It checks that a record round-trips with every key,
+that a second save replaces only that model's record, that two versions of a
+model are two records, and that two keys share nothing.
 
 ## Which calls need nothing on the filesystem
 

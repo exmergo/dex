@@ -52,6 +52,11 @@ skipping it costs a sentence on an over-ceiling refusal (how far this
 connector's past estimates ran from what they actually billed) and nothing else,
 so a backend that omits it is complete rather than narrow.
 
+**If your backend can keep the latest mutation score per model**, mix
+:class:`MutationRecordsContract` in. Also optional: without it ``transform test
+--mutate`` records nothing and ``maintain coverage`` reports every model's
+strength as ``missing``, saying why.
+
 This module imports pytest, so it is deliberately not imported by
 ``exmergo_dex_core.storage``: a bare ``import exmergo_dex_core`` must not require
 a test framework. Install the ``[storage-conformance]`` extra to get what running
@@ -1022,6 +1027,90 @@ class SpendHistoryContract(_KeyedContract):
         assert two.spend_entries() == [], (
             "two keys share the spend ledger, so one tenant's settled history "
             f"would calibrate another tenant's refusal. Got {two.spend_entries()!r}"
+        )
+
+
+class MutationRecordsContract(_KeyedContract):
+    """The optional capability that keeps one mutation score per model (#1281).
+
+    Mix it in alongside the contract for your tier::
+
+        class TestMyStore(MutationRecordsContract, ExploreStoreContract):
+            def make_store(self, key):
+                return MyStore(tenant=key)
+
+    ``transform test --mutate`` saves one record per model after a run that
+    executed mutants, and ``maintain coverage`` reads them all back to say
+    which scores still describe the project. Three properties: a record comes
+    back **as saved**, every key included; a second save for the same
+    ``model_id`` **replaces** the first and leaves other models alone; and two
+    keys do not share records.
+    """
+
+    @staticmethod
+    def _record(model_id: str, score: float) -> dict:
+        return {
+            "model_id": model_id,
+            "model": model_id.rsplit(".", 1)[-1],
+            "score": score,
+            "counts": {"killed": 3, "survived": 1, "not_run": 0},
+            "sql_digest": "a" * 16,
+            "tests_digest": "b" * 16,
+            "recorded_at": "2026-11-15T10:00:00+00:00",
+            "nested": {"incremental": {"score": None}},
+        }
+
+    def test_mutation_record_round_trips_every_key(self):
+        store = self.store_for("mutations")
+        record = self._record("model.shop.fct_orders", 0.75)
+        locator = store.save_mutation_record(dict(record))
+        assert isinstance(locator, str) and locator, (
+            "save_mutation_record must return where the record was written, as "
+            f"a non-empty string. Got {locator!r}"
+        )
+        got = store.load_mutation_records()
+        assert got == {"model.shop.fct_orders": record}, (
+            "load_mutation_records must hand each record back as saved, keyed "
+            f"by its model_id. Got {got!r}"
+        )
+
+    def test_mutation_record_replaces_the_same_model_only(self):
+        store = self.store_for("mutations")
+        store.save_mutation_record(self._record("model.shop.fct_orders", 0.5))
+        store.save_mutation_record(self._record("model.shop.dim_customers", 1.0))
+        store.save_mutation_record(self._record("model.shop.fct_orders", 0.9))
+        got = store.load_mutation_records()
+        assert sorted(got) == ["model.shop.dim_customers", "model.shop.fct_orders"]
+        assert got["model.shop.fct_orders"]["score"] == 0.9, (
+            "a second save for one model must replace its record: coverage "
+            f"reads the current one. Got {got!r}"
+        )
+        assert got["model.shop.dim_customers"]["score"] == 1.0, (
+            "saving one model's record must leave every other model's alone. "
+            f"Got {got!r}"
+        )
+
+    def test_mutation_record_keys_a_versioned_model_apart(self):
+        store = self.store_for("mutations")
+        store.save_mutation_record(self._record("model.shop.dim_teams.v1", 0.1))
+        store.save_mutation_record(self._record("model.shop.dim_teams.v2", 0.2))
+        assert len(store.load_mutation_records()) == 2, (
+            "two versions of one model are two models: each keeps its own record"
+        )
+
+    def test_mutation_records_are_empty_before_any_save(self):
+        store = self.store_for("mutations")
+        assert store.load_mutation_records() == {}, (
+            "load_mutation_records must return an empty dict when nothing was "
+            "saved, not None and not an error"
+        )
+
+    def test_two_keys_do_not_share_mutation_records(self):
+        one, two = self.store_for("tenant-one"), self.store_for("tenant-two")
+        one.save_mutation_record(self._record("model.shop.fct_orders", 0.5))
+        assert two.load_mutation_records() == {}, (
+            "two keys share mutation records, so one project's scores would "
+            "read as another's"
         )
 
 

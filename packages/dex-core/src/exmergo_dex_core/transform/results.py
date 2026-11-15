@@ -733,6 +733,10 @@ class MutationCoverageResult(Result):
     unsupported_sites: list[dict[str, Any]] = Field(default_factory=list)
     incremental: dict[str, Any] | None = None
 
+    #: Where this run was recorded for `maintain coverage` (#1281), or None
+    #: where nothing was (no mutant decided, or a store that keeps none).
+    record: str | None = None
+
     def data(self) -> dict[str, Any]:
         return {
             "model": self.model,
@@ -748,6 +752,7 @@ class MutationCoverageResult(Result):
             "equivalence": self.equivalence,
             "downstream": self.downstream,
             "incremental": self.incremental,
+            **({"record": self.record} if self.record else {}),
         }
 
 
