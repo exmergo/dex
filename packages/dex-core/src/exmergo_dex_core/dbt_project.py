@@ -1037,6 +1037,31 @@ def jinja_calls(content: str) -> list[JinjaCall]:
     return [call for region in regions for call in region.calls]
 
 
+def mask_yaml_comments(content: str) -> str:
+    """Mask YAML comments with spaces, preserving character positions and lines.
+
+    Jinja expressions inside YAML comments must not become referenced sites,
+    while expressions in YAML scalar values (quoted, unquoted, or multi-line block
+    scalars) keep their original line and column positions.
+    """
+
+    try:
+        ranges = [(t.start_mark.index, t.end_mark.index) for t in yaml.scan(content)]
+    except yaml.YAMLError:
+        return re.sub(r"(?m)^[ \t]*#.*$", lambda m: " " * len(m.group()), content)
+
+    chars = list(content)
+    for m in re.finditer(r"#.*", content):
+        start, end = m.span()
+        inside = any(
+            tok_start <= start and end <= tok_end for tok_start, tok_end in ranges
+        )
+        if not inside:
+            for i in range(start, end):
+                chars[i] = " "
+    return "".join(chars)
+
+
 #: One argument as read: its literal value (``None`` when dex did not resolve it)
 #: and the absolute half-open span of that literal's contents (``None`` likewise).
 _Argument = tuple[str | None, tuple[int, int] | None]

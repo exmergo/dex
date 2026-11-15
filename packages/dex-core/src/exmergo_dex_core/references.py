@@ -44,6 +44,7 @@ from .dbt_project import (
     _project_vars,
     jinja_calls,
     jinja_regions,
+    mask_yaml_comments,
     metric_inputs,
     node_files,
     node_name,
@@ -1756,9 +1757,11 @@ class ReferenceIndex:
         A static var() call in supported YAML scalar expressions is indexed with
         its exact file and line under form "var_call"; an unreadable or dynamic
         call is recorded as indeterminate so completeness claims stay honest.
+        YAML comments are excluded from discovery.
         """
 
-        for call in jinja_calls(content):
+        masked = mask_yaml_comments(content)
+        for call in jinja_calls(masked):
             if call.callee == "var":
                 target = call.args[0] if call.args else None
                 self._record(

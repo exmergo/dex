@@ -1104,3 +1104,37 @@ def test_dynamic_and_nested_var_calls_in_yaml_are_reported_as_indeterminate(tmp_
     report = find_references(view, ["feature_fee"], kind="var", index=index)
     assert report.completeness == "incomplete"
     assert any("indeterminate" in lim for lim in report.limits)
+
+
+def test_yaml_comments_are_excluded_from_var_reference_discovery(tmp_path):
+    """YAML comments containing var() calls are excluded from discovery (#1318)."""
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: demo\n"
+        'version: "1.0"\n'
+        "profile: demo\n"
+        "# {{ var('commented_flag') }}\n"
+        "# {{ var(dynamic_flag) }}\n"
+        "models:\n"
+        "  demo:\n"
+        "    +enabled: \"{{ var('feature_fee') }}\" # {{ var('inline_flag') }}\n"
+        "vars:\n"
+        "  feature_fee: false\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/schema.yml").write_text(
+        "version: 2\n# {{ var(another_dynamic) }}\nmodels:\n  - name: my_model\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/my_model.sql").write_text("select 1 as id\n", encoding="utf-8")
+
+    view = load(tmp_path)
+    index = ReferenceIndex(view, scan_packages=False)
+
+    assert index.references_to("commented_flag", "var")[0] == []
+    assert index.references_to("inline_flag", "var")[0] == []
+    assert index.indeterminate_for("var") == []
+
+    report = find_references(view, ["feature_fee"], kind="var", index=index)
+    assert report.completeness == "complete"
+    assert not report.limits
