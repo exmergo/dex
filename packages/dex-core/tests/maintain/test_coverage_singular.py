@@ -230,3 +230,29 @@ def test_the_reader_off_by_default_records_no_references():
         "select a from {{ ref('x') }} where b > 0", None, dialect="duckdb", vars=None
     )
     assert reading.referenced == {}
+
+
+def test_using_keys_are_join_reads_on_both_sides():
+    sql = (
+        "select o.amount from {{ ref('orders') }} o join {{ ref('customers') }} c "
+        "using (id) where o.amount < 0"
+    )
+    reads, _ = singular_reads(
+        _manifest(using=_test("using", sql, ORDERS, CUSTOMERS)), dialect="duckdb"
+    )
+    assert _roles(reads, ORDERS)["id"] == ["join"]
+    assert _roles(reads, CUSTOMERS) == {"id": ["join"]}
+
+
+def test_an_alias_read_in_having_is_the_expression_behind_it():
+    sql = (
+        "select status, sum(amount) as total from {{ ref('orders') }} "
+        "group by status having total < 0"
+    )
+    reads, block = singular_reads(
+        _manifest(alias=_test("alias", sql, ORDERS)), dialect="duckdb"
+    )
+    roles = _roles(reads, ORDERS)
+    assert "total" not in roles
+    assert roles["amount"] == ["aggregation", "predicate"]
+    assert block["read"]["resolved"] == 1

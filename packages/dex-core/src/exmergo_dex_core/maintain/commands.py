@@ -1929,6 +1929,8 @@ def coverage(
                 label=inventory.models[uid][0],
                 name=inventory.models[uid][1],
                 status=entry["status"],
+                own_tests=inventory.models[uid][2],
+                retry=bool(entry.get("last_refusal")),
             )
             for uid, entry in inventory.strength.items()
             if entry["status"] in {"stale", "missing"}

@@ -23,9 +23,15 @@ from exmergo_dex_core.transform.mutation import MutationError
 from .test_coverage_strength import FCT, MART, _manifest, _record, _strength
 
 
-def _candidates(*specs: tuple[str, str]) -> list[Candidate]:
+def _candidates(*specs: tuple[str, str], **flags) -> list[Candidate]:
     return [
-        Candidate(unique_id=f"model.shop.{name}", label=name, name=name, status=status)
+        Candidate(
+            unique_id=f"model.shop.{name}",
+            label=name,
+            name=name,
+            status=status,
+            **flags.get(name, {}),
+        )
         for name, status in specs
     ]
 
@@ -103,21 +109,31 @@ class _Engine:
         return SimpleNamespace(cost_gate=None)
 
 
-def _result(*, score=0.5, not_run=0):
+def _result(*, score=0.5, not_run=0, budget=True):
     return SimpleNamespace(
         score=score,
         score_with_downstream=None,
         incremental=None,
         counts={"survived": 1, "not_run": not_run},
         record="/somewhere",
-        warnings=[],
+        warnings=(
+            ["the confirmed budget covered 1 of 3 mutants; the rest are not_run"]
+            if not_run and budget
+            else []
+        ),
     )
 
 
 @pytest.fixture
 def calls(monkeypatch):
     seen: dict[str, list] = {"runs": [], "prices": [], "handshakes": []}
-    plan: dict[str, object] = {"refuse": {}, "short": set(), "price": 10.0}
+    plan: dict[str, object] = {
+        "refuse": {},
+        "short": set(),
+        "branch_only": set(),
+        "price": 10.0,
+        "baseline": 0.0,
+    }
 
     def fake(engine, model, *, target=None, refresh_batch=None, **_):
         refused = plan["refuse"].get(model)
@@ -125,11 +141,18 @@ def calls(monkeypatch):
             raise MutationError(refused)
         if refresh_batch is not None and refresh_batch.pricing:
             seen["prices"].append(model)
-            refresh_batch.add_price({"name": model}, plan["price"], {}, [])
+            refresh_batch.add_price(
+                {"name": model},
+                plan["price"],
+                {"(baseline)": plan["baseline"]},
+                [],
+            )
             return None
         seen["runs"].append(model)
         if refresh_batch is not None:
             refresh_batch.record_spend(plan["price"], None)
+        if model in plan["branch_only"]:
+            return _result(not_run=2, budget=False)
         return _result(not_run=2 if model in plan["short"] else 0)
 
     def handshake(command, adapter, estimate, *, per_table=None, notes=None, **_):
@@ -344,6 +367,12 @@ def test_mutate_refreshes_in_one_command_and_a_second_run_moves_on(
     engine = _engine(project)
     engine.build(target="dev")
 
+    # A cap of zero plants nothing, which says nothing about the SQL: no
+    # refusal is recorded for it.
+    with pytest.raises(MutationError):
+        engine.test_mutations("fct", max_mutants=0)
+    assert engine.store.load_mutation_records() == {}
+
     first = engine.coverage(["fct"], mutate=True)
     assert first.refresh["attempted"] == 1
     assert [e["model"] for e in first.refresh["refreshed"]] == ["fct"]
@@ -370,3 +399,123 @@ def test_mutate_refreshes_in_one_command_and_a_second_run_moves_on(
         "stg_customers": "untestable",
         "stg_orders": "untestable",
     }
+
+
+# --- review fixes -------------------------------------------------------------
+
+
+def test_a_downstream_only_model_is_skipped_where_routing_bills(calls):
+    calls["plan"]["confirmed"] = True
+    block, *_ = refresh_mod.refresh(
+        _Engine("bigquery", budget=100.0),
+        _chain_manifest("a", "b"),
+        _candidates(("a", "missing"), ("b", "missing"), a={"own_tests": False}),
+        limit=1,
+    )
+    assert block["skipped"] == [{"model": "a", "reason_code": "downstream_only"}]
+    assert calls["runs"] == ["b"]
+
+
+def test_a_downstream_only_model_still_runs_on_duckdb(calls):
+    refresh_mod.refresh(
+        _Engine(),
+        _chain_manifest("a"),
+        _candidates(("a", "missing"), a={"own_tests": False}),
+    )
+    assert calls["runs"] == ["a"]
+
+
+def test_a_model_the_data_refused_is_retried_after_the_untried_ones():
+    manifest = _chain_manifest("a", "b", "c")
+    ordered = refresh_mod.order(
+        _candidates(
+            ("a", "missing"), ("b", "missing"), ("c", "stale"), a={"retry": True}
+        ),
+        manifest,
+        None,
+    )
+    assert [c.label for c in ordered] == ["b", "c", "a"]
+
+
+def test_a_model_starts_only_if_its_baseline_fits_what_is_left(calls):
+    calls["plan"]["confirmed"] = True
+    calls["plan"]["baseline"] = 6.0
+    block, *_ = refresh_mod.refresh(
+        _Engine("bigquery", budget=15.0),
+        _chain_manifest("a", "b"),
+        _candidates(("a", "missing"), ("b", "missing")),
+    )
+    # a spends 10, leaving 5: b's baseline of 6 would overrun it.
+    assert calls["runs"] == ["a"]
+    assert block["not_run"] == [{"model": "b", "reason_code": "budget"}]
+
+
+def test_mutants_left_not_run_for_another_reason_do_not_stop_the_batch(calls):
+    calls["plan"]["confirmed"] = True
+    calls["plan"]["branch_only"] = {"a"}
+    block, warnings, *_ = refresh_mod.refresh(
+        _Engine("bigquery", budget=100.0),
+        _chain_manifest("a", "b"),
+        _candidates(("a", "missing"), ("b", "missing")),
+    )
+    assert calls["runs"] == ["a", "b"]
+    assert block["not_run"] == []
+    assert not any("ran out" in w for w in warnings)
+
+
+def test_a_refresh_that_runs_nothing_reports_no_earlier_spend():
+    engine = _Engine()
+    engine._last_spend = {"bytes_billed": 1.0}
+    refresh_mod.refresh(engine, {}, [])
+    assert engine._last_spend is None
+
+
+def test_a_baseline_refusal_reads_missing_and_marks_a_retry():
+    manifest = _manifest()
+    records = {FCT: _record(manifest, refused="baseline_not_passing", score=None)}
+    strength = _strength(manifest, records)["fct"]
+    assert strength["status"] == "missing"
+    assert strength["last_refusal"] == "baseline_not_passing"
+
+
+def test_a_failed_baseline_hands_its_meter_back_so_the_spend_is_booked(tmp_path):
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.storage import FilesystemStore
+    from exmergo_dex_core.transform import mutation
+
+    class _Shadow:
+        def write(self, *args, **kwargs):
+            pass
+
+        def test(self, model, **kwargs):
+            return {
+                "success": False,
+                "nodes": [
+                    {
+                        "unique_id": "test.p.not_null.abc",
+                        "name": "not_null",
+                        "status": "fail",
+                        "execution_time": 4.0,
+                    }
+                ],
+            }
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    )
+    meters = []
+    with pytest.raises(MutationError, match="passes against the unmutated model"):
+        transform_commands._run_mutants(
+            _Shadow(),
+            "models/fct.sql",
+            batch,
+            model="fct",
+            paradigm=Paradigm.COMPUTE_TIME,
+            connector="snowflake",
+            store=FilesystemStore(tmp_path),
+            ceiling=100.0,
+            estimate=10.0,
+            mutation_mod=mutation,
+            on_meter=meters.append,
+        )
+    assert meters and meters[0].spent > 0

@@ -46,6 +46,11 @@ class Candidate:
     label: str
     name: str
     status: str  # stale or missing
+    #: Whether the model has tests of its own, not only downstream ones.
+    own_tests: bool = True
+    #: Whether its last run was refused for a reason the data decided, so it
+    #: is retried after the models a refresh has not tried yet.
+    retry: bool = False
 
 
 @dataclass
@@ -61,6 +66,9 @@ class RefreshBatch:
     ceiling: float | None = None
     pricing: bool = False
     prices: dict[str, float] = field(default_factory=dict)
+    #: Each model's baseline run price: the statement that runs before any
+    #: affordability check inside the model, so the batch checks it first.
+    baselines: dict[str, float] = field(default_factory=dict)
     price_notes: list[str] = field(default_factory=list)
     unpriced: list[str] = field(default_factory=list)
     spent: float = 0.0
@@ -78,6 +86,7 @@ class RefreshBatch:
         self.prices[label] = max(
             0.0, float(estimate) - float((per_table or {}).get(UPTIME_LINE, 0.0))
         )
+        self.baselines[label] = float((per_table or {}).get("(baseline)", 0.0))
         self.price_notes.extend(n for n in notes or [] if n not in self.price_notes)
 
     def remaining(self) -> float | None:
@@ -146,7 +155,12 @@ def order(
 
     return sorted(
         candidates,
-        key=lambda c: (c.status != "missing", level(c.unique_id), c.label),
+        key=lambda c: (
+            c.retry,
+            c.status != "missing",
+            level(c.unique_id),
+            c.label,
+        ),
     )
 
 
@@ -186,12 +200,29 @@ def refresh(
             "again for the next batch"
         )
     cap = REFRESH_CAP if limit is None else max(0, limit)
+    # This command's spend, and only this command's: a refresh that runs
+    # nothing must not report the last one's.
+    engine._last_spend = None
+
+    config = engine.config
+    connector = engine.connector or config.connector
+    effective = config.model_copy(update={"connector": connector})
+    paradigm = paradigm_for(connector, effective)
 
     nodes = manifest.get("nodes") or {}
     skipped: list[dict[str, Any]] = []
     eligible: list[Candidate] = []
     for candidate in order(candidates, manifest, selector):
         reason = skip_reason(nodes.get(candidate.unique_id) or {})
+        if (
+            reason is None
+            and not candidate.own_tests
+            and paradigm is not Paradigm.FREE_LOCAL
+        ):
+            # Only downstream tests read it, and routing a mutant through them
+            # is opt-in where it bills, so the run would refuse it as having no
+            # tests and hold a slot on every refresh.
+            reason = "downstream_only"
         if reason is not None:
             skipped.append({"model": candidate.label, "reason_code": reason})
         else:
@@ -199,7 +230,6 @@ def refresh(
     attempted = eligible[:cap]
     elided = eligible[cap:]
 
-    config = engine.config
     target = target or config.dbt_target or "dev"
     block: dict[str, Any] = {
         "ran": True,
@@ -222,9 +252,6 @@ def refresh(
         return block, warnings, None, None
 
     assert_dev_target(target, config.dbt_target)
-    connector = engine.connector or config.connector
-    effective = config.model_copy(update={"connector": connector})
-    paradigm = paradigm_for(connector, effective)
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
 
     batch = RefreshBatch(ceiling=None if paradigm is Paradigm.FREE_LOCAL else ceiling)
@@ -301,7 +328,11 @@ def refresh(
                 )
                 continue
             left = batch.remaining()
-            if left is not None and left <= 0:
+            # The baseline runs before any check inside the model, so it has
+            # to fit in what is left before the model starts.
+            if left is not None and (
+                left <= 0 or left < batch.baselines.get(candidate.name, 0.0)
+            ):
                 exhausted = True
                 block["not_run"].append(
                     {"model": candidate.label, "reason_code": "budget"}
@@ -335,7 +366,11 @@ def refresh(
             }
             if not_run:
                 entry["not_run"] = not_run
-                exhausted = batch.ceiling is not None
+                # Only the budget stops the batch: a branch whose own baseline
+                # passes no test leaves its mutants not_run with money to spare.
+                exhausted = batch.ceiling is not None and any(
+                    "the confirmed budget" in w for w in result.warnings
+                )
             block["refreshed"].append(entry)
             warnings.extend(
                 w
@@ -348,8 +383,9 @@ def refresh(
                 "models it did not reach are under refresh.not_run. Re-run with a "
                 "larger --budget, or narrow the batch with --max-models"
             )
-        uptime = getattr(batch.adapter, "warehouse_uptime", None)
-        if uptime is not None:
+        if batch.adapter is not None:
+            # The uptime overhead and the compute-unit translation, once for
+            # the batch: the per-model runs left both unsettled.
             from ..transform.commands import _BatchSpend
 
             meter = _BatchSpend(

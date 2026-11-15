@@ -1473,6 +1473,11 @@ class _Lineage:
 
         for select in self.tree.find_all(exp.Select):
             nested_in_predicate = self._under_predicate(select)
+            aliases = {
+                e.alias.lower(): e.this
+                for e in select.expressions
+                if isinstance(e, exp.Alias) and e.alias
+            }
             for column in select.find_all(exp.Column):
                 if column.find_ancestor(exp.Select) is not select:
                     continue
@@ -1481,12 +1486,67 @@ class _Lineage:
                 roles = self._roles(select, column)
                 if nested_in_predicate:
                     roles.add("predicate")
-                origins = self._trace(select, column, 0)
+                origins = self._read_alias(select, column, aliases)
+                if origins is None:
+                    origins = self._trace(select, column, 0)
                 if origins is None:
                     self.reading.unreferenced.add(column.name.lower())
                 for origin in origins or []:
                     key = (origin.relation, origin.column, origin.is_ref)
                     self.reading.referenced.setdefault(key, set()).update(roles)
+            self._using_keys(select)
+
+    def _read_alias(
+        self, select: Any, column: Any, aliases: dict[str, Any]
+    ) -> list[_Origin] | None:
+        """A SELECT alias read back in the same SELECT (``having total < 0``).
+
+        Outside the select list an unqualified name matching an alias is the
+        alias, so it resolves to the columns its expression reads rather than
+        to a column of that name on the source. ``None`` when it is not one.
+        """
+
+        from sqlglot import expressions as exp
+
+        if column.table or column.name.lower() not in aliases:
+            return None
+        node = column
+        while node.parent is not None and node.parent is not select:
+            node = node.parent
+        if node.arg_key not in {"having", "qualify", "order", "group"}:
+            return None
+        traced: list[_Origin] = []
+        for read in aliases[column.name.lower()].find_all(exp.Column):
+            found = self._trace(select, read, 1)
+            if found is None:
+                return None
+            traced.extend(found)
+        return traced
+
+    def _using_keys(self, select: Any) -> None:
+        """Join keys a ``USING`` names: identifiers sqlglot does not parse as
+        columns, read on the joined relation and on each one before it."""
+
+        from sqlglot import expressions as exp
+
+        sources = self.sources(select)
+        for join in select.args.get("joins") or []:
+            names = [
+                getattr(item, "name", None) or str(item)
+                for item in join.args.get("using") or []
+            ]
+            if not names:
+                continue
+            joined = join.this.alias_or_name.lower()
+            position = next(
+                (i for i, s in enumerate(sources) if s[0] == joined), len(sources)
+            )
+            for name in names:
+                for alias, _relation, _join in sources[: position + 1]:
+                    origin = self.origin(select, exp.column(name, table=alias))
+                    if origin is not None:
+                        key = (origin.relation, origin.column, origin.is_ref)
+                        self.reading.referenced.setdefault(key, set()).add("join")
 
     @staticmethod
     def _under_predicate(select: Any) -> bool:

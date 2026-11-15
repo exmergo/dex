@@ -66,6 +66,8 @@ RUN_STATUSES = ("pass", "fail", "warn", "error", "skipped", "not_run")
 
 #: What a recorded mutation score is called against the project (#1284).
 STRENGTH_STATUSES = ("fresh", "stale", "missing", "untestable")
+#: Refusals the project alone decides, which hold until the model changes.
+STRUCTURAL_REFUSALS = frozenset({"no_mutable_sql"})
 
 #: Score bands for the distribution: the summary never averages scores.
 _SCORE_BANDS = (
@@ -116,8 +118,9 @@ class Inventory:
     #: Each selected model's strength entry by unique id, before any cut, for
     #: the refresh that picks the stale and missing ones (#1284).
     strength: dict[str, dict[str, Any]] = field(default_factory=dict)
-    #: Each selected model's label and name by unique id.
-    models: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: Each selected model's label, name and whether it has tests of its own,
+    #: by unique id.
+    models: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
 
 
 def _label(unique_id: str, node: dict[str, Any]) -> str:
@@ -490,7 +493,11 @@ def inventory(
         selected=frozenset(selected),
         strength=strength,
         models={
-            uid: (resources[uid].label, str(resources[uid].node.get("name") or ""))
+            uid: (
+                resources[uid].label,
+                str(resources[uid].node.get("name") or ""),
+                bool(resources[uid].tests),
+            )
             for uid in selected
             if resources[uid].resource_type == "model"
         },
@@ -783,10 +790,17 @@ def _strength(
     ):
         changed.append("own_tests")
     if record.get("refused"):
-        # A structural refusal (#1284): it holds while the model reads as it
-        # did, and a changed model is worth asking again.
+        # A refusal (#1284). A structural one holds while the model reads as
+        # it did; a changed model, or a refusal the data decided (no test
+        # passes the baseline), is worth asking again.
         if changed:
             return {"status": "missing", "changed": changed}
+        if record["refused"] not in STRUCTURAL_REFUSALS:
+            return {
+                "status": "missing",
+                "last_refusal": str(record["refused"]),
+                "recorded_at": record.get("recorded_at"),
+            }
         return {
             "status": "untestable",
             "reason": str(record["refused"]),

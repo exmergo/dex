@@ -2696,8 +2696,14 @@ def test_mutations(
             if not batch.mutants and not (branch is not None and branch.mutants):
                 # Recorded, so `maintain coverage` reads the model as
                 # untestable until its SQL or tests change, rather than
-                # retrying it on every refresh (#1284).
-                _record_mutation_refusal(store, node, fingerprint, "no_mutable_sql")
+                # retrying it on every refresh (#1284). Only when the planner
+                # found nothing to plant: a cap of zero considers nothing and
+                # says nothing about the SQL.
+                considered = batch.considered + (
+                    branch.considered if branch is not None else 0
+                )
+                if not considered and cap > 0:
+                    _record_mutation_refusal(store, node, fingerprint, "no_mutable_sql")
                 raise mutation_mod.MutationError(
                     f"'{model}' has no SQL dex knows how to plant a defect in "
                     "(no comparison, filter, join, CASE, division, window frame "
@@ -2784,28 +2790,49 @@ def test_mutations(
             elif refresh_batch is not None and refresh_batch.pricing:
                 return None
 
-            result = _run_mutants(
-                shadow,
-                model_path,
-                batch,
-                model=node["name"],
-                paradigm=paradigm,
-                connector=connector,
-                store=store,
-                ceiling=(
-                    refresh_batch.remaining() if refresh_batch is not None else ceiling
-                ),
-                estimate=estimate,
-                mutation_mod=mutation_mod,
-                prices=prices,
-                equivalence=equivalence,
-                uptime=getattr(adapter, "warehouse_uptime", None),
-                adapter=adapter,
-                downstream=below,
-                incremental_tests=incremental_tests,
-                full_tests=full_tests,
-                settle_uptime=refresh_batch is None,
-            )
+            meters: list[_BatchSpend] = []
+            try:
+                result = _run_mutants(
+                    shadow,
+                    model_path,
+                    batch,
+                    model=node["name"],
+                    paradigm=paradigm,
+                    connector=connector,
+                    store=store,
+                    ceiling=(
+                        refresh_batch.remaining()
+                        if refresh_batch is not None
+                        else ceiling
+                    ),
+                    estimate=estimate,
+                    mutation_mod=mutation_mod,
+                    prices=prices,
+                    equivalence=equivalence,
+                    uptime=getattr(adapter, "warehouse_uptime", None),
+                    adapter=adapter,
+                    downstream=below,
+                    incremental_tests=incremental_tests,
+                    full_tests=full_tests,
+                    settle_uptime=refresh_batch is None,
+                    on_meter=meters.append,
+                )
+            except mutation_mod.MutationError as exc:
+                # A baseline that billed and then passed no test still spent:
+                # the batch books it before the next model draws on the rest.
+                if refresh_batch is not None and meters:
+                    refresh_batch.record_spend(meters[0].spent, meters[0].spend)
+                if "passes against the unmutated model" in str(exc):
+                    # Kept, so a refresh retries it after the models it has not
+                    # tried yet rather than first on every run (#1284).
+                    _record_mutation_refusal(
+                        store,
+                        node,
+                        fingerprint,
+                        "baseline_not_passing",
+                        keep_fresh_score=True,
+                    )
+                raise
             runs, spend, run_warnings, spent = result.pop("_meta")
             warnings.extend(run_warnings)
             if refresh_batch is not None:
@@ -3006,7 +3033,12 @@ def _record_mutation_run(
 
 
 def _record_mutation_refusal(
-    store, node: dict, fingerprint: dict[str, Any], reason_code: str
+    store,
+    node: dict,
+    fingerprint: dict[str, Any],
+    reason_code: str,
+    *,
+    keep_fresh_score: bool = False,
 ) -> None:
     """Keep a structural refusal as the model's record, with no score (#1284).
 
@@ -3014,8 +3046,10 @@ def _record_mutation_refusal(
     in): it holds until the model's SQL or tests change, which the digests
     show, so `maintain coverage` reads the model as untestable rather than
     retrying it on every refresh. A refusal that depends on the data (no test
-    passes the baseline) records nothing. Best effort: a store without the
-    capability, or a failed write, changes nothing.
+    passes the baseline) is recorded too, read as ``missing`` and retried after
+    the models a refresh has not tried, and with ``keep_fresh_score`` it never
+    replaces a score that still describes the model. Best effort: a store
+    without the capability, or a failed write, changes nothing.
     """
 
     from .. import __version__
@@ -3024,6 +3058,18 @@ def _record_mutation_refusal(
     saver = getattr(store, "save_mutation_record", None)
     if saver is None:
         return
+    if keep_fresh_score:
+        loader = getattr(store, "load_mutation_records", None)
+        prior = None
+        with contextlib.suppress(Exception):
+            prior = (loader() if loader is not None else {}).get(node.get("unique_id"))
+        if (
+            prior
+            and not prior.get("refused")
+            and prior.get("sql_digest") == fingerprint["sql_digest"]
+            and prior.get("tests_digest") == fingerprint["tests_digest"]
+        ):
+            return
     record = {
         "model_id": node.get("unique_id"),
         "model": manifest_node_label(str(node.get("unique_id")), node),
@@ -3522,6 +3568,7 @@ def _run_mutants(
     incremental_tests: Sequence[IncrementalUnitTest] = (),
     full_tests: bool = True,
     settle_uptime: bool = True,
+    on_meter=None,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
 
@@ -3563,6 +3610,8 @@ def _run_mutants(
         ),
         adapter=adapter,
     )
+    if on_meter is not None:
+        on_meter(meter)
 
     mutants: list[dict] = []
     counts = {

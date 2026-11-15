@@ -521,8 +521,14 @@ one coverage number.
     target only (`--target`).
   - `refresh.skipped` lists models a run would refuse, read off the manifest at
     no cost and not counted toward the cap: Python models, models with a
-    `sql_header`, and versioned models, whose versions share the name
-    `transform test --mutate` takes.
+    `sql_header`, versioned models, whose versions share the name
+    `transform test --mutate` takes, and, on a metered connector, a model only
+    downstream tests read (`downstream_only`), since routing a mutant through
+    them is opt-in there (`transform test --mutate <model> --downstream`).
+  - A model whose tests pass no baseline is recorded too: it reads `missing`
+    with `last_refusal`, and a refresh retries it after the models it has not
+    tried yet, so it never holds the first slots. It never replaces a score
+    that still describes the model.
   - `refresh.refused` lists the runs that refused, with a `reason_code` and the
     reason.
   - `refresh.refreshed` lists the models measured, with what each `was`, its
