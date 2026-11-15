@@ -500,6 +500,11 @@ is not described here.
   baseline lists is named in `warnings`, not reported dropped: it is usually a
   derived cube still pointing at a dev schema. An expression Dex could not read
   is named there as unchecked.
+- On a Databricks Metric View or Snowflake Semantic View layer the same four
+  `declared_*` codes are Dex's own rules on its metadata too, with no workspace
+  or account object created, each naming the view, the element and the column.
+  Dex never deploys: once a reconcile plan is applied, the user redeploys the
+  view (after `verify_only` on Snowflake).
 - `compiled_only_changed` means a Cube JS model, templated file or `extends`
   changed, and Dex cannot say how. The warning that compiled-only definitions
   were compared by content alone rides every run while the layer holds one, so

@@ -161,6 +161,10 @@ jobs:
       DEX_TEST_SNOWFLAKE_DATABASE: DEX_CI
       DEX_TEST_SNOWFLAKE_WAREHOUSE: DEX_CI_WH
       DEX_TEST_SNOWFLAKE_MAX_SECONDS: "60"
+      # The role test_snowflake_semantic_views.py deploys its fixture views
+      # with (scripts/setup_snowflake_ci.sh), apart from DEX_CI_ROLE, which
+      # dex runs as. A role name, not a credential.
+      DEX_TEST_SNOWFLAKE_SV_DEPLOYER_ROLE: DEX_CI_SV_DEPLOYER
       SNOWFLAKE_ACCOUNT: ${{ vars.DEX_TEST_SNOWFLAKE_ACCOUNT }}
       SNOWFLAKE_USER: ${{ vars.DEX_TEST_SNOWFLAKE_USER }}
       SNOWFLAKE_AUTHENTICATOR: WORKLOAD_IDENTITY
@@ -172,9 +176,10 @@ jobs:
           enable-cache: true
           python-version: "3.14"
       # [slayer] runs the governed SLayer query smoke (test_slayer_query.py),
-      # which skips itself without it.
-      - name: Sync (snowflake + duckdb + slayer + dev extras)
-        run: uv sync --extra snowflake --extra duckdb --extra slayer --extra dev
+      # and [semantic-views] the Semantic View suite
+      # (test_snowflake_semantic_views.py); each skips itself without its extra.
+      - name: Sync (snowflake + duckdb + slayer + semantic-views + dev extras)
+        run: uv sync --extra snowflake --extra duckdb --extra slayer --extra semantic-views --extra dev
       # Mint the GitHub OIDC token Snowflake validates (audience pinned to
       # what the service user's OIDC_AUDIENCE_LIST expects) and hand it to the
       # connector through the same SNOWFLAKE_* discovery path the engine uses

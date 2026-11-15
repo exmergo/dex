@@ -44,6 +44,12 @@ def _run(argv: list[str], capsys) -> dict:
         # Exact person tokens, any type, unchanged behavior.
         ("first_name", "VARCHAR", PIICategory.NAME),
         ("surname", "VARCHAR", PIICategory.NAME),
+        # The generic `*_name` match keeps flagging what a geography qualifier
+        # does not cover: a bare TPC-H `n_name` is ambiguous.
+        ("customer_name", "VARCHAR", PIICategory.NAME),
+        ("n_name", "VARCHAR", PIICategory.NAME),
+        # A city is address data, which no geography qualifier clears.
+        ("city_name", "VARCHAR", PIICategory.ADDRESS),
         ("dob", "DATE", PIICategory.DOB),
         ("email", "VARCHAR", PIICategory.EMAIL),
         # camelCase matches the same patterns as snake_case.
@@ -86,6 +92,11 @@ def test_detect_pii_flags(column: str, data_type: str, category: PIICategory):
         ("file_name", "VARCHAR"),
         ("product_name", "VARCHAR"),
         ("model_name", "VARCHAR"),
+        # Geography qualifiers name a place, not a person.
+        ("nation_name", "VARCHAR"),
+        ("country_name", "VARCHAR"),
+        ("region_name", "VARCHAR"),
+        ("continent_name", "VARCHAR"),
         # The weak patterns are string-only: a numeric `comments` is a count.
         ("comments", "INTEGER"),
         ("name", "INTEGER"),

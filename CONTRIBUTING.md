@@ -178,7 +178,8 @@ maintainer with an ACCOUNTADMIN `snow` connection): the `DEX_CI_WH` X-Small
 warehouse (60s auto-suspend, statement timeout, resource monitor), the
 transient zero-retention `DEX_CI` database, the least-privilege `DEX_CI_ROLE`
 (read samples, write scratch only: the grant-level enforcement of "dex never
-writes outside the dev target"), a workload-identity CI user, a key-pair dev
+writes outside the dev target"), the `DEX_CI_SV_DEPLOYER` role the Semantic
+View suite deploys its fixtures with, a workload-identity CI user, a key-pair dev
 user with a local `dex-ci` connection, and the GitHub environment with its
 variables.
 
@@ -187,6 +188,22 @@ Run the suite locally against the `dex-ci` connection:
 ```
 DEX_TEST_SNOWFLAKE_CONNECTION=dex-ci DEX_TEST_SNOWFLAKE_DATABASE=DEX_CI \
     uv run pytest tests/integration -q -m snowflake
+```
+
+The Semantic View suite (`test_snowflake_semantic_views.py`) also needs the
+`[semantic-views]` extra and `DEX_TEST_SNOWFLAKE_SV_DEPLOYER_ROLE`, and skips
+without either. dex never deploys a semantic view, so the suite deploys its
+corpus fixtures itself, under `DEX_CI_SV_DEPLOYER`: a role the setup script
+grants to the CI and dev users, kept apart from `DEX_CI_ROLE` (which dex runs
+as and which reads what the deployer creates through future grants). It makes
+one schema in `DEX_CI`, deploys two views over `SNOWFLAKE_SAMPLE_DATA.TPCH_SF1`
+and one empty table there, and drops the schema afterwards:
+
+```
+DEX_TEST_SNOWFLAKE_CONNECTION=dex-ci DEX_TEST_SNOWFLAKE_DATABASE=DEX_CI \
+    DEX_TEST_SNOWFLAKE_SV_DEPLOYER_ROLE=DEX_CI_SV_DEPLOYER \
+    uv run --extra semantic-views pytest \
+    tests/integration/test_snowflake_semantic_views.py -q -m snowflake
 ```
 
 In CI the same suite runs from `.github/workflows/integration.yml`,

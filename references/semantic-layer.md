@@ -1548,8 +1548,9 @@ semantic:
   `sales.revenue_per_customer`), and every token of one query names one view.
   The order is the safety contract:
   1. translation, with every refusal a request earns on its own: facts beside
-     metrics, facts beside dimensions (Snowflake's 2026_07 behaviour change), a
-     private member, a window, level-of-detail or `using_relationships` member,
+     metrics, facts beside dimensions (Snowflake's 2026_07 behaviour change, in
+     force on the dogfood account: "Querying FACTS with DIMENSIONS in a semantic
+     view is not supported"), a private member, a window, level-of-detail or `using_relationships` member,
      a view declaring `variables`, a dimension the metric's table does not reach
      many-to-one (Snowflake's own `Invalid dimension specified`), a grain on a
      dimension that is not temporal, a bare `--grain` (there is no
@@ -1623,6 +1624,18 @@ semantic:
   metric classified, never deployed. A declared dbt mart derives a logical table,
   spliced into the file whose tables its foreign keys reference, and a
   `declarations` payload annotates a table in place.
+- **What this release does not do.** It reads and authors the Semantic View YAML
+  specification only: a `CREATE SEMANTIC VIEW` DDL file and a
+  `dbt_semantic_view` model are refused by name (#1298), and there is no bridge
+  to or from Ossie (#1297). It never deploys, replaces or drops a view; applying
+  a plan writes the file and stops, so a maintainer deploys it (after
+  `verify_only`). It runs no Cortex Analyst or natural-language request. A
+  governed query renders the `SEMANTIC_VIEW` clause only, not the standard-SQL
+  form, over one view, and refuses window metrics, `variables`, level-of-detail
+  and `using_relationships` members by name. Window metrics, `NON ADDITIVE BY`,
+  ASOF and range relationships, filters, `variables` and the Cortex Analyst keys
+  are carried in the catalog and named rather than modelled, and
+  `sample_values` is counted, never surfaced.
 
 What Dex accepts, checks, maps and declines to claim, rule by rule, is in
 [Snowflake Semantic View compatibility](snowflake-semantic-views-compatibility.md).

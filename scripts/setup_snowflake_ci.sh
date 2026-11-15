@@ -15,6 +15,15 @@
 #   - DEX_CI_ROLE: read on SNOWFLAKE_SAMPLE_DATA plus write on the scratch
 #     database only (the grant-level enforcement of "dex never writes outside
 #     the dev target")
+#   - DEX_CI_SV_DEPLOYER: the role the Semantic View integration test
+#     (tests/integration/test_snowflake_semantic_views.py) deploys its fixture
+#     views with, kept apart from DEX_CI_ROLE, the identity dex runs as. dex
+#     never deploys a semantic view, so the test does it on a connection of its
+#     own: CREATE SCHEMA in the scratch database (it owns, and drops, the
+#     schema it makes), read on the sample data the fixtures sit on, and the
+#     warehouse. DEX_CI_ROLE reads what it creates through database-level
+#     future grants: SELECT and REFERENCES on semantic views, SELECT on tables.
+#     Granted to the DEX_CI and DEX_DEV users, never to a role.
 #   - DEX_CI user: a SERVICE user authenticated by Workload Identity
 #     Federation (GitHub OIDC), pinned to this repository and to the
 #     snowflake-integration environment; no key or password is ever created
@@ -69,6 +78,7 @@ WAREHOUSE="DEX_CI_WH"
 MONITOR="DEX_CI_MONITOR"
 DATABASE="DEX_CI"
 ROLE="DEX_CI_ROLE"
+SV_DEPLOYER="DEX_CI_SV_DEPLOYER"
 CI_USER="DEX_CI"
 CI_DBT_USER="DEX_CI_DBT"
 DEV_USER="DEX_DEV"
@@ -90,6 +100,7 @@ echo "   warehouse:   ${WAREHOUSE} (X-Small, auto-suspend 60s, timeout ${STATEME
 echo "   monitor:     ${MONITOR} (${CREDIT_QUOTA} credits/month if created, suspends; an existing monitor keeps its quota)"
 echo "   database:    ${DATABASE} (transient, retention 0)"
 echo "   role:        ${ROLE}"
+echo "   sv deployer: ${SV_DEPLOYER} (deploys the Semantic View test fixtures)"
 echo "   ci user:     ${CI_USER} (WIF: GitHub OIDC, env ${GH_ENV})"
 echo "   ci dbt user: ${CI_DBT_USER} (key pair, rotated into ${GH_ENV} on every run)"
 echo "   dev user:    ${DEV_USER} (key pair, connection '${DEV_CONN_NAME}')"
@@ -131,6 +142,17 @@ sql "CREATE ROLE IF NOT EXISTS ${ROLE};
      GRANT ALL PRIVILEGES ON ALL SCHEMAS IN DATABASE ${DATABASE} TO ROLE ${ROLE};
      GRANT ALL PRIVILEGES ON FUTURE SCHEMAS IN DATABASE ${DATABASE} TO ROLE ${ROLE};"
 
+echo "-- Semantic View fixture deployer (the test's own role; dex never deploys)"
+# Database-level future grants hand DEX_CI_ROLE what the deployer creates in a
+# schema of its own. A schema-level future grant would take precedence over
+# these, so none is made on a deployer's schema.
+sql "CREATE ROLE IF NOT EXISTS ${SV_DEPLOYER};
+     GRANT USAGE ON WAREHOUSE ${WAREHOUSE} TO ROLE ${SV_DEPLOYER};
+     GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE_SAMPLE_DATA TO ROLE ${SV_DEPLOYER};
+     GRANT USAGE, CREATE SCHEMA ON DATABASE ${DATABASE} TO ROLE ${SV_DEPLOYER};
+     GRANT SELECT, REFERENCES ON FUTURE SEMANTIC VIEWS IN DATABASE ${DATABASE} TO ROLE ${ROLE};
+     GRANT SELECT ON FUTURE TABLES IN DATABASE ${DATABASE} TO ROLE ${ROLE};"
+
 echo "-- CI service user (Workload Identity Federation, pinned to ${REPO} + ${GH_ENV})"
 # CREATE IF NOT EXISTS then ALTER keeps re-runs idempotent while refreshing
 # the pinning if the repository or environment name ever changes. The subject
@@ -148,7 +170,8 @@ sql "CREATE USER IF NOT EXISTS ${CI_USER}
        SUBJECT = 'repo:${REPO}:environment:${GH_ENV}'
        OIDC_AUDIENCE_LIST = ('snowflakecomputing.com')
      );
-     GRANT ROLE ${ROLE} TO USER ${CI_USER};"
+     GRANT ROLE ${ROLE} TO USER ${CI_USER};
+     GRANT ROLE ${SV_DEPLOYER} TO USER ${CI_USER};"
 
 echo "-- CI dbt service user (key pair; dbt-snowflake cannot use workload identity)"
 # Same role, so the same blast radius as the WIF user: read the samples, write
@@ -169,7 +192,8 @@ sql "CREATE USER IF NOT EXISTS ${DEV_USER}
        DEFAULT_WAREHOUSE = ${WAREHOUSE}
        DEFAULT_NAMESPACE = ${DATABASE}
        COMMENT = 'dex local development (key-pair auth)';
-     GRANT ROLE ${ROLE} TO USER ${DEV_USER};"
+     GRANT ROLE ${ROLE} TO USER ${DEV_USER};
+     GRANT ROLE ${SV_DEPLOYER} TO USER ${DEV_USER};"
 
 if [[ -f "$KEY_FILE" ]]; then
   echo "   key ${KEY_FILE} already exists; reusing it"

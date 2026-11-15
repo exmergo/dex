@@ -245,6 +245,13 @@ _NONPERSON_NAME_QUALIFIERS = frozenset(
         "company",
         "app",
         "service",
+        # Geography: a nation, country, region or continent is named, but it is
+        # not a person. City, street and state stay flagged, since those sit
+        # beside address data.
+        "nation",
+        "country",
+        "region",
+        "continent",
     }
 )
 
