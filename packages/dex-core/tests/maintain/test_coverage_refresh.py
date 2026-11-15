@@ -519,3 +519,52 @@ def test_a_failed_baseline_hands_its_meter_back_so_the_spend_is_booked(tmp_path)
             on_meter=meters.append,
         )
     assert meters and meters[0].spent > 0
+
+
+def test_a_selector_still_puts_a_refused_model_after_the_rest():
+    manifest = _chain_manifest("a", "b")
+    ordered = refresh_mod.order(
+        _candidates(("a", "missing"), ("b", "missing"), a={"retry": True}),
+        manifest,
+        ["a", "b"],
+    )
+    assert [c.label for c in ordered] == ["b", "a"]
+
+
+def test_an_unpriced_model_never_starts_where_the_batch_bills(calls):
+    calls["plan"]["confirmed"] = True
+    calls["plan"]["price"] = None
+    block, warnings, *_ = refresh_mod.refresh(
+        _Engine("bigquery", budget=100.0),
+        _chain_manifest("a"),
+        _candidates(("a", "missing")),
+    )
+    assert calls["runs"] == []
+    assert block["not_run"] == [{"model": "a", "reason_code": "unpriced"}]
+    assert any("could not be priced" in w for w in warnings)
+
+
+def test_a_kept_score_is_marked_so_a_stale_one_is_retried_last():
+    from exmergo_dex_core.storage import MemoryStore
+
+    manifest = _manifest()
+    prior = _record(manifest)
+    store = MemoryStore()
+    store.save_mutation_record(prior)
+    fingerprint = {
+        "sql_digest": prior["sql_digest"],
+        "tests_digest": prior["tests_digest"],
+    }
+    transform_commands._record_mutation_refusal(
+        store,
+        {**manifest["nodes"][FCT], "unique_id": FCT},
+        fingerprint,
+        "baseline_not_passing",
+        keep_fresh_score=True,
+    )
+    kept = store.load_mutation_records()[FCT]
+    assert kept["score"] == prior["score"] and not kept.get("refused")
+    assert kept["last_refusal"] == "baseline_not_passing"
+    assert _strength(manifest, {FCT: kept})["fct"]["last_refusal"] == (
+        "baseline_not_passing"
+    )

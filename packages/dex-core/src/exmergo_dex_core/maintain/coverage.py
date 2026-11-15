@@ -826,6 +826,8 @@ def _strength(
         "recorded_at": record.get("recorded_at"),
         "age_seconds": _age_seconds(record.get("recorded_at"), now),
     }
+    if record.get("last_refusal"):
+        entry["last_refusal"] = str(record["last_refusal"])
     if not entry["complete"]:
         entry["not_run"] = record.get("not_run")
     if changed:

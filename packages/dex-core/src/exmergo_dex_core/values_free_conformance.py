@@ -428,8 +428,9 @@ _COVERAGE_RESOURCE = (
             "age_seconds",
             "changed",
             "changed[]",
-            # A structural refusal's reason code (#1284).
+            # A refusal's reason code (#1284).
             "reason",
+            "last_refusal",
         )
     ),
     # Columns singular tests read (#1282): names, roles and test names only.

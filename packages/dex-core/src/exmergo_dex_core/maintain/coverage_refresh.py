@@ -131,7 +131,9 @@ def order(
                 (position[n] for n in names if n in position), default=len(wanted)
             )
 
-        return sorted(candidates, key=lambda c: (rank(c), c.label))
+        # The selector's order, with a model a run already refused after the
+        # rest, so it never holds the first slots run after run.
+        return sorted(candidates, key=lambda c: (c.retry, rank(c), c.label))
 
     nodes = manifest.get("nodes") or {}
     depth: dict[str, int] = {}
@@ -285,8 +287,9 @@ def refresh(
             if batch.unpriced:
                 warnings.append(
                     f"{len(batch.unpriced)} model(s) could not be priced upfront "
-                    f"({', '.join(batch.unpriced[:NAME_CAP])}); their runs still "
-                    "draw on the confirmed budget and stop where it ends"
+                    f"({', '.join(batch.unpriced[:NAME_CAP])}); with no price "
+                    "for their baselines nothing says they fit the budget, so "
+                    "they are not run (refresh.not_run, reason_code unpriced)"
                 )
             if len(refused) < len(attempted):
                 # Asked even at zero: a run nothing could price still bills, so
@@ -325,6 +328,13 @@ def refresh(
             if exhausted:
                 block["not_run"].append(
                     {"model": candidate.label, "reason_code": "budget"}
+                )
+                continue
+            if batch.ceiling is not None and candidate.name in batch.unpriced:
+                # Its baseline has no price, so nothing says it fits: a model
+                # never starts on a guess where the batch bills.
+                block["not_run"].append(
+                    {"model": candidate.label, "reason_code": "unpriced"}
                 )
                 continue
             left = batch.remaining()

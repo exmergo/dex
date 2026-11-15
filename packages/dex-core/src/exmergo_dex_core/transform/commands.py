@@ -3069,6 +3069,10 @@ def _record_mutation_refusal(
             and prior.get("sql_digest") == fingerprint["sql_digest"]
             and prior.get("tests_digest") == fingerprint["tests_digest"]
         ):
+            # The score stays, marked, so a refresh that finds it stale (a
+            # downstream test changed) retries it after the untried models.
+            with contextlib.suppress(Exception):
+                saver({**prior, "last_refusal": reason_code})
             return
     record = {
         "model_id": node.get("unique_id"),
