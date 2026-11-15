@@ -2545,7 +2545,8 @@ def test_mutations(
     target: str | None = None,
     check_equivalence: bool | None = None,
     downstream: bool | None = None,
-) -> MutationCoverageResult:
+    refresh_batch=None,
+) -> MutationCoverageResult | None:
     """Plant standard analytics defects in a model and report which tests miss them.
 
     The question this answers is the one a passing suite cannot: whether the
@@ -2570,6 +2571,13 @@ def test_mutations(
     ``downstream`` is tri-state the same way and for the same reason. Routing
     each mutant through the models that read it, so their tests answer for it
     too, is free on DuckDB and recomputes the chain on every test elsewhere.
+
+    ``refresh_batch`` is how ``maintain coverage --mutate`` runs this for many models
+    behind one handshake (#1284). In its pricing phase the model is planned and
+    priced, the price handed to the batch, and ``None`` returned before any
+    handshake. In its run phase the batch has already admitted the whole
+    estimate on one gate, so this run asks nothing, holds no gate of its own,
+    and stops at what the batch has left rather than at the command budget.
     """
 
     from ..adapters import get_dialect
@@ -2686,6 +2694,16 @@ def test_mutations(
                 )
             branch = batch.incremental
             if not batch.mutants and not (branch is not None and branch.mutants):
+                # Recorded, so `maintain coverage` reads the model as
+                # untestable until its SQL or tests change, rather than
+                # retrying it on every refresh (#1284). Only when the planner
+                # found nothing to plant: a cap of zero considers nothing and
+                # says nothing about the SQL.
+                considered = batch.considered + (
+                    branch.considered if branch is not None else 0
+                )
+                if not considered and cap > 0:
+                    _record_mutation_refusal(store, node, fingerprint, "no_mutable_sql")
                 raise mutation_mod.MutationError(
                     f"'{model}' has no SQL dex knows how to plant a defect in "
                     "(no comparison, filter, join, CASE, division, window frame "
@@ -2738,7 +2756,11 @@ def test_mutations(
             estimate = None
             prices: dict[str, float] = {}
             if paradigm is not Paradigm.FREE_LOCAL:
-                adapter = engine._adapter("transform test")
+                adapter = (
+                    refresh_batch.adapter
+                    if refresh_batch is not None
+                    else engine._adapter("transform test")
+                )
                 estimate, per_table, prices, price_notes = _price_mutations(
                     adapter,
                     shadow,
@@ -2752,37 +2774,69 @@ def test_mutations(
                     incremental_tests=incremental_tests,
                 )
                 warnings.extend(price_notes)
-                if estimate is not None:
-                    command_args.billed_handshake(
-                        "transform test",
-                        adapter,
-                        estimate,
-                        per_table=per_table or None,
-                        notes=price_notes or None,
-                    )
-                gate = command_args.cost_gate(adapter)
+                if refresh_batch is not None and refresh_batch.pricing:
+                    refresh_batch.add_price(node, estimate, per_table, price_notes)
+                    return None
+                if refresh_batch is None:
+                    if estimate is not None:
+                        command_args.billed_handshake(
+                            "transform test",
+                            adapter,
+                            estimate,
+                            per_table=per_table or None,
+                            notes=price_notes or None,
+                        )
+                    gate = command_args.cost_gate(adapter)
+            elif refresh_batch is not None and refresh_batch.pricing:
+                return None
 
-            result = _run_mutants(
-                shadow,
-                model_path,
-                batch,
-                model=node["name"],
-                paradigm=paradigm,
-                connector=connector,
-                store=store,
-                ceiling=ceiling,
-                estimate=estimate,
-                mutation_mod=mutation_mod,
-                prices=prices,
-                equivalence=equivalence,
-                uptime=getattr(adapter, "warehouse_uptime", None),
-                adapter=adapter,
-                downstream=below,
-                incremental_tests=incremental_tests,
-                full_tests=full_tests,
-            )
-            runs, spend, run_warnings = result.pop("_meta")
+            meters: list[_BatchSpend] = []
+            try:
+                result = _run_mutants(
+                    shadow,
+                    model_path,
+                    batch,
+                    model=node["name"],
+                    paradigm=paradigm,
+                    connector=connector,
+                    store=store,
+                    ceiling=(
+                        refresh_batch.remaining()
+                        if refresh_batch is not None
+                        else ceiling
+                    ),
+                    estimate=estimate,
+                    mutation_mod=mutation_mod,
+                    prices=prices,
+                    equivalence=equivalence,
+                    uptime=getattr(adapter, "warehouse_uptime", None),
+                    adapter=adapter,
+                    downstream=below,
+                    incremental_tests=incremental_tests,
+                    full_tests=full_tests,
+                    settle_uptime=refresh_batch is None,
+                    on_meter=meters.append,
+                )
+            except mutation_mod.MutationError as exc:
+                # A baseline that billed and then passed no test still spent:
+                # the batch books it before the next model draws on the rest.
+                if refresh_batch is not None and meters:
+                    refresh_batch.record_spend(meters[0].spent, meters[0].spend)
+                if "passes against the unmutated model" in str(exc):
+                    # Kept, so a refresh retries it after the models it has not
+                    # tried yet rather than first on every run (#1284).
+                    _record_mutation_refusal(
+                        store,
+                        node,
+                        fingerprint,
+                        "baseline_not_passing",
+                        keep_fresh_score=True,
+                    )
+                raise
+            runs, spend, run_warnings, spent = result.pop("_meta")
             warnings.extend(run_warnings)
+            if refresh_batch is not None:
+                refresh_batch.record_spend(spent, spend)
             # Released before the day's total is read back, exactly as
             # `_shape_build_result` releases before reading. Every run settles
             # while this command still holds its whole-batch reservation, so a
@@ -2976,6 +3030,71 @@ def _record_mutation_run(
             f"this run was not recorded ({type(exc).__name__}), so `maintain "
             "coverage` will not see it"
         )
+
+
+def _record_mutation_refusal(
+    store,
+    node: dict,
+    fingerprint: dict[str, Any],
+    reason_code: str,
+    *,
+    keep_fresh_score: bool = False,
+) -> None:
+    """Keep a structural refusal as the model's record, with no score (#1284).
+
+    Only for a refusal the project alone decides (no SQL dex can plant a defect
+    in): it holds until the model's SQL or tests change, which the digests
+    show, so `maintain coverage` reads the model as untestable rather than
+    retrying it on every refresh. A refusal that depends on the data (no test
+    passes the baseline) is recorded too, read as ``missing`` and retried after
+    the models a refresh has not tried, and with ``keep_fresh_score`` it never
+    replaces a score that still describes the model. Best effort: a store
+    without the capability, or a failed write, changes nothing.
+    """
+
+    from .. import __version__
+    from ..dbt_project import manifest_node_label
+
+    saver = getattr(store, "save_mutation_record", None)
+    if saver is None:
+        return
+    if keep_fresh_score:
+        loader = getattr(store, "load_mutation_records", None)
+        prior = None
+        with contextlib.suppress(Exception):
+            prior = (loader() if loader is not None else {}).get(node.get("unique_id"))
+        if (
+            prior
+            and not prior.get("refused")
+            and prior.get("sql_digest") == fingerprint["sql_digest"]
+            and prior.get("tests_digest") == fingerprint["tests_digest"]
+        ):
+            # The score stays, marked, so a refresh that finds it stale (a
+            # downstream test changed) retries it after the untried models.
+            with contextlib.suppress(Exception):
+                saver(
+                    {
+                        **prior,
+                        "last_refusal": reason_code,
+                        "last_refusal_at": datetime.now(UTC).isoformat(
+                            timespec="seconds"
+                        ),
+                    }
+                )
+            return
+    record = {
+        "model_id": node.get("unique_id"),
+        "model": manifest_node_label(str(node.get("unique_id")), node),
+        "refused": reason_code,
+        "score": None,
+        "engine_version": __version__,
+        "recorded_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "sql_digest": fingerprint["sql_digest"],
+        "tests_digest": fingerprint["tests_digest"],
+        "downstream_tests": {},
+    }
+    with contextlib.suppress(Exception):
+        saver(record)
 
 
 def _unsupported_frames_warning(unsupported: list[dict[str, str]]) -> str:
@@ -3460,6 +3579,8 @@ def _run_mutants(
     downstream: _DownstreamTests | None = None,
     incremental_tests: Sequence[IncrementalUnitTest] = (),
     full_tests: bool = True,
+    settle_uptime: bool = True,
+    on_meter=None,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
 
@@ -3476,6 +3597,10 @@ def _run_mutants(
     build's runs leave them out and they run only against ``batch.incremental``
     afterwards (#1132). ``full_tests`` false means no other test runs the full
     build: its mutants then survive by construction, without a run.
+
+    ``settle_uptime`` false leaves the warehouse's uptime overhead unsettled,
+    for a caller that runs several of these behind one command and settles it
+    once at the end (``maintain coverage --mutate``, #1284).
     """
 
     select = downstream.select if downstream is not None else model
@@ -3497,6 +3622,8 @@ def _run_mutants(
         ),
         adapter=adapter,
     )
+    if on_meter is not None:
+        on_meter(meter)
 
     mutants: list[dict] = []
     counts = {
@@ -3525,7 +3652,11 @@ def _run_mutants(
             "--budget, or narrow the run with --max-mutants"
         )
 
-    if batch.mutants and full_tests:
+    if batch.mutants and full_tests and not meter.affords("(baseline)"):
+        # Checked before the baseline, at the price this run computed: a
+        # batch of models can reach one with too little left to start it.
+        stop(batch.mutants)
+    elif batch.mutants and full_tests:
         shadow.write(model_path, batch.identity)
         baseline_summary = shadow.test(select, exclude=exclude)
         meter.settle(baseline_summary, "(baseline)")
@@ -3624,7 +3755,8 @@ def _run_mutants(
     # are what they would be without them.
     decided = counts["killed"] + counts["caught_downstream"] + counts["survived"]
     routed = downstream is not None and downstream.enabled
-    warnings.extend(meter.settle_uptime())
+    if settle_uptime:
+        warnings.extend(meter.settle_uptime())
     return {
         "baseline": {
             "tests": [
@@ -3643,7 +3775,7 @@ def _run_mutants(
         ),
         "equivalence": equivalence.summary() if equivalence is not None else None,
         "incremental": incremental,
-        "_meta": (meter.runs, meter.spend, warnings),
+        "_meta": (meter.runs, meter.spend, warnings, meter.spent),
     }
 
 
@@ -3924,6 +4056,12 @@ class _BatchSpend:
                 translate(self.spend.get(spend_field(self._paradigm)) or 0.0)
             )
         return notes
+
+    @property
+    def spent(self) -> float:
+        """What the batch's runs have billed so far, in the paradigm's unit."""
+
+        return self._spent
 
     def _price(self, key: str) -> float:
         return self._prices.get(key, self._fallback)

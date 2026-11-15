@@ -757,7 +757,7 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      data.suppressed names each finding class that did not run and why,
                                      declared-fact classes (unit, additivity, population,
                                      parent_population, temporal) included
-dex maintain coverage [<names>] [--full]
+dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t>]]
                                   -> which project resources the dbt tests reach (#1280). Free and
                                      connectionless on every connector: the manifest comes from a dbt
                                      parse of a throwaway copy of the project, no baseline required.
@@ -788,9 +788,26 @@ dex maintain coverage [<names>] [--full]
                                      called fresh, stale (with what changed), missing or untestable,
                                      summarized as counts and score bands (#1284); and declarations,
                                      one record per declared fact with checked_by dbt_test,
-                                     dex_verify, both, none or prose (#1283). All free; refreshing a
-                                     score is transform test --mutate. Report only: status ok
-                                     whatever the coverage. Reviewed for values-free mode
+                                     dex_verify, both, none or prose (#1283). Columns a singular test
+                                     reads are columns.referenced_columns (roles: predicate, join,
+                                     aggregation, grouping, projection; the tests that read them),
+                                     counted as referenced and referenced_only and summarized as
+                                     columns_referenced_only, never added to asserted (#1282); a test
+                                     is rendered statically, or read from a compiled manifest on disk
+                                     holding it with the same checksum, and data.singular_tests names
+                                     each test read in part or not at all with a reason_code. All
+                                     free. --mutate refreshes every stale and missing score (#1284):
+                                     transform test --mutate per model, in selector order (else
+                                     missing first, upstream first), at most 25 per run (--max-models
+                                     narrows, never widens; the rest named under refresh.elided),
+                                     priced and confirmed once for the batch on a metered connector,
+                                     a budget that runs out leaving the rest under refresh.not_run
+                                     (reason_code budget); Python, sql_header and versioned models
+                                     are refresh.skipped for free; a model with no SQL to plant a
+                                     defect in is recorded and reads untestable (reason
+                                     no_mutable_sql) until it changes. Dev target only; refused in
+                                     values-free mode. Report only: status ok whatever the coverage.
+                                     Reviewed for values-free mode without --mutate
 ```
 
 ### How authored content reaches the engine

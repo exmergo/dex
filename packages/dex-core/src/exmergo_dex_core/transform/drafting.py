@@ -150,6 +150,13 @@ class _Reading:
     #: Output columns carried from the outer side of a join, which read NULL
     #: where the join found no match (#1228).
     outer_joined: list[str] = field(default_factory=list)
+    #: Every column the statement reads, resolved to its upstream origin, with
+    #: the roles it is read in (``predicate``, ``join``, ``aggregation``,
+    #: ``grouping``, ``projection``). Filled only when :func:`read` is asked for
+    #: references (#1282).
+    referenced: dict[tuple[str, str, bool], set[str]] = field(default_factory=dict)
+    #: Column names read that could not be traced to a relation, when asked.
+    unreferenced: set[str] = field(default_factory=set)
 
 
 def draft(
@@ -623,6 +630,7 @@ def read(
     model_paths: list[str] | None = None,
     manifest: Mapping[str, Any] | None = None,
     known_keys: Mapping[str, Any] | None = None,
+    references: bool = False,
 ) -> _Reading:
     """Read one model's SQL statically.
 
@@ -631,7 +639,9 @@ def read(
     needs no alias. ``manifest`` is the compiled dbt manifest, used to resolve
     ambiguous ``ref()`` inputs (#989). ``known_keys`` maps a lowered relation
     name to keys the project tests or declares unique on it, which stand in
-    where the cache has no profile (#1228, #1252).
+    where the cache has no profile (#1228, #1252). ``references`` also records
+    every column the statement reads and the role it is read in, under
+    ``referenced`` (#1282).
     """
     reading = _Reading()
     try:
@@ -675,7 +685,7 @@ def read(
         )
         return reading
 
-    _Lineage(
+    lineage = _Lineage(
         tree,
         relations,
         cache,
@@ -684,7 +694,10 @@ def read(
         model_paths=model_paths,
         manifest=manifest,
         known_keys=known_keys,
-    ).run()
+    )
+    lineage.run()
+    if references:
+        lineage.collect_references()
     return reading
 
 
@@ -1443,6 +1456,224 @@ class _Lineage:
         if kind in {"physical", "ref"}:
             return target
         return relation.alias_or_name or "a subquery"
+
+    # -- every column read, for the referenced tier (#1282) ----------------------
+
+    def collect_references(self) -> None:
+        """Record every column each SELECT in the statement reads, and its role.
+
+        Walks every SELECT, set-operation branches and subqueries included, so
+        a ``UNION ALL`` of checks (the usual shape of a singular test) is read
+        branch by branch. A column carried through a CTE or subquery resolves
+        to the relation it comes from; one a scope computes (``amount * 2 as
+        a2``) passes its role on to the columns its expression reads.
+        """
+
+        from sqlglot import expressions as exp
+
+        for select in self.tree.find_all(exp.Select):
+            nested_in_predicate = self._under_predicate(select)
+            aliases = {
+                e.alias.lower(): e.this
+                for e in select.expressions
+                if isinstance(e, exp.Alias) and e.alias
+            }
+            for column in select.find_all(exp.Column):
+                if column.find_ancestor(exp.Select) is not select:
+                    continue
+                if isinstance(column.this, exp.Star):
+                    continue
+                roles = self._roles(select, column)
+                if nested_in_predicate:
+                    roles.add("predicate")
+                origins = self._read_alias(select, column, aliases)
+                if origins is None:
+                    origins = self._trace(select, column, 0)
+                if origins is None:
+                    self.reading.unreferenced.add(column.name.lower())
+                for origin in origins or []:
+                    key = (origin.relation, origin.column, origin.is_ref)
+                    self.reading.referenced.setdefault(key, set()).update(roles)
+            self._using_keys(select)
+
+    def _read_alias(
+        self, select: Any, column: Any, aliases: dict[str, Any]
+    ) -> list[_Origin] | None:
+        """A SELECT alias read back in the same SELECT (``having total < 0``).
+
+        Outside the select list an unqualified name matching an alias is the
+        alias, so it resolves to the columns its expression reads rather than
+        to a column of that name on the source. ``None`` when it is not one.
+        """
+
+        from sqlglot import expressions as exp
+
+        if column.table or column.name.lower() not in aliases:
+            return None
+        node = column
+        while node.parent is not None and node.parent is not select:
+            node = node.parent
+        if node.arg_key not in {"having", "qualify", "order", "group"}:
+            return None
+        traced: list[_Origin] = []
+        for read in aliases[column.name.lower()].find_all(exp.Column):
+            found = self._trace(select, read, 1)
+            if found is None:
+                return None
+            traced.extend(found)
+        return traced
+
+    def _using_keys(self, select: Any) -> None:
+        """Join keys a ``USING`` names: identifiers sqlglot does not parse as
+        columns, read on the joined relation and on the left side's relation
+        that carries the key.
+
+        The left side is the one relation before the join, or among several
+        the one whose columns are known to hold the key; a key the left side
+        cannot place is untraced, never credited to every relation there.
+        Each side is traced, so a key a CTE computes reaches its columns.
+        """
+
+        from sqlglot import expressions as exp
+
+        sources = self.sources(select)
+        for join in select.args.get("joins") or []:
+            names = [
+                getattr(item, "name", None) or str(item)
+                for item in join.args.get("using") or []
+            ]
+            if not names:
+                continue
+            # As sources() names it: an unaliased ref() goes by its dbt name.
+            joined = self.alias(join.this).lower()
+            position = next(
+                (i for i, s in enumerate(sources) if s[0] == joined), len(sources)
+            )
+            left = sources[:position]
+            for name in names:
+                sides = [sources[position]] if position < len(sources) else []
+                if len(left) == 1:
+                    sides.append(left[0])
+                else:
+                    holding = [
+                        s
+                        for s in left
+                        if name.lower()
+                        in [c.lower() for c in self.columns_of(s[1]) or []]
+                    ]
+                    if len(holding) == 1:
+                        sides.append(holding[0])
+                    else:
+                        self.reading.unreferenced.add(name.lower())
+                for alias, _relation, _join in sides:
+                    traced = self._trace(select, exp.column(name, table=alias), 0)
+                    if traced is None:
+                        self.reading.unreferenced.add(name.lower())
+                        continue
+                    for origin in traced:
+                        key = (origin.relation, origin.column, origin.is_ref)
+                        self.reading.referenced.setdefault(key, set()).add("join")
+
+    @staticmethod
+    def _under_predicate(select: Any) -> bool:
+        """Whether this SELECT sits in another's WHERE, HAVING or QUALIFY."""
+
+        node = select
+        while node.parent is not None:
+            if node.arg_key in {"where", "having", "qualify"}:
+                return True
+            node = node.parent
+        return False
+
+    @staticmethod
+    def _roles(select: Any, column: Any) -> set[str]:
+        from sqlglot import expressions as exp
+
+        roles: set[str] = set()
+        node = column
+        clause = None
+        while node is not None and node is not select:
+            parent = node.parent
+            if isinstance(node, exp.AggFunc):
+                roles.add("aggregation")
+            if (
+                isinstance(parent, exp.If)
+                and node.arg_key == "this"
+                and isinstance(parent.parent, exp.Case)
+            ):
+                roles.add("predicate")
+            if parent is select:
+                clause = node.arg_key
+            node = parent
+        if clause in {"where", "having", "qualify"}:
+            roles.add("predicate")
+        elif clause == "joins":
+            roles.add("join")
+        elif clause in {"group", "order"}:
+            roles.add("grouping")
+        elif (clause == "expressions" and not roles) or not roles:
+            roles.add("projection")
+        return roles
+
+    def _trace(self, select: Any, column: Any, depth: int) -> list[_Origin] | None:
+        """Where a read column comes from, through computed scope outputs too.
+
+        ``None`` when it could not be traced; an empty list when it was, and
+        the scope computes it from no column at all (``count(*) as c``).
+        """
+
+        from sqlglot import expressions as exp
+
+        if depth > 16:
+            return None
+        origin = self.origin(select, column)
+        if origin is not None:
+            return [origin]
+        found = self.source_of(select, column)
+        if found is None:
+            return None
+        kind, target = self.target(found[1])
+        if kind != "scope":
+            return None
+        outputs = self.outputs(target)
+        if outputs is None:
+            return self._through_star(target, column, depth)
+        inner = outputs.get(column.name.lower())
+        if inner is None:
+            return self._through_star(target, column, depth)
+        traced: list[_Origin] = []
+        for read in inner.find_all(exp.Column):
+            if read.find_ancestor(exp.Select) is not target:
+                continue
+            found_origins = self._trace(target, read, depth + 1)
+            if found_origins is None:
+                return None
+            traced.extend(found_origins)
+        return traced
+
+    def _through_star(
+        self, scope: Any, column: Any, depth: int
+    ) -> list[_Origin] | None:
+        """A column read through ``select *`` over exactly one relation.
+
+        With no catalog the star cannot be expanded, but over a single source a
+        column of that name can only come from it.
+        """
+
+        from sqlglot import expressions as exp
+
+        if not isinstance(scope, exp.Select):
+            return None
+        stars = [
+            e
+            for e in scope.expressions
+            if isinstance(e, exp.Star)
+            or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+        ]
+        sources = self.sources(scope)
+        if not stars or len(sources) != 1:
+            return None
+        return self._trace(scope, exp.column(column.name), depth + 1)
 
     # -- what the SQL filters and branches on -------------------------------------
 

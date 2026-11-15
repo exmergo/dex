@@ -428,6 +428,28 @@ _COVERAGE_RESOURCE = (
             "age_seconds",
             "changed",
             "changed[]",
+            # A refusal's reason code (#1284).
+            "reason",
+            "last_refusal",
+            "last_refusal_at",
+        )
+    ),
+    # Columns singular tests read (#1282): names, roles and test names only.
+    "[].columns.referenced",
+    "[].columns.referenced_only",
+    "[].columns.referenced_columns",
+    "[].columns.referenced_columns[]",
+    *(
+        f"[].columns.referenced_columns[].{key}"
+        for key in (
+            "column",
+            "documented",
+            "asserted",
+            "roles",
+            "roles[]",
+            "tests",
+            "tests[]",
+            "test_count",
         )
     ),
 )
@@ -458,10 +480,16 @@ def _coverage_fields() -> frozenset[str]:
             "downstream_only",
             "incremental_branch_tested",
             "columns_asserted",
+            "columns_referenced_only",
         ),
-        "sources": ("with_own_tests", "with_freshness", "columns_asserted"),
-        "snapshots": ("with_own_tests", "columns_asserted"),
-        "seeds": ("with_own_tests", "columns_asserted"),
+        "sources": (
+            "with_own_tests",
+            "with_freshness",
+            "columns_asserted",
+            "columns_referenced_only",
+        ),
+        "snapshots": ("with_own_tests", "columns_asserted", "columns_referenced_only"),
+        "seeds": ("with_own_tests", "columns_asserted", "columns_referenced_only"),
     }
     for section, names in ratios.items():
         paths |= {f"summary.{section}", f"summary.{section}.count"}
@@ -475,6 +503,28 @@ def _coverage_fields() -> frozenset[str]:
     paths |= {"summary.tests.by_severity.error", "summary.tests.by_severity.warn"}
     paths |= {"scope", "scope.selected", "scope.selected[]"}
     paths |= {"manifest", "manifest.source", "manifest.generated_at"}
+    paths |= _under(
+        "singular_tests",
+        ".count",
+        ".read",
+        ".read.resolved",
+        ".read.partial",
+        ".read.unresolved",
+        ".read_from",
+        ".read_from.raw_code",
+        ".read_from.compiled_artifact",
+        ".unresolved",
+        ".unresolved[]",
+        ".unresolved[].test",
+        ".unresolved[].reason_code",
+        ".partial",
+        ".partial[]",
+        ".partial[].test",
+        ".partial[].reason_code",
+        ".elided",
+        ".elided.unresolved",
+        ".elided.partial",
+    )
     paths |= {
         "findings",
         "findings[]",
@@ -1310,11 +1360,29 @@ class ValuesFreeContract:
             "complete": False,
             "not_run": 1,
         }
+        from .maintain.coverage_singular import singular_reads
+
+        # A singular test that filters on the sentinel: its column is named,
+        # its literal never is (#1282).
+        manifest["nodes"]["test.shop.assert_status_read"] = {
+            "resource_type": "test",
+            "name": "assert_status_read",
+            "package_name": "shop",
+            # A fixture string, never executed.
+            "raw_code": (
+                f"select * from {{{{ ref('orders') }}}} where status = '{value}'"  # noqa: S608
+            ),
+            "config": {"severity": "warn", "enabled": True},
+            "depends_on": {"nodes": [model]},
+        }
+        reads, singular_block = singular_reads(manifest, dialect="duckdb", full=True)
+        assert reads[model]["status"]["roles"] == {"predicate"}
         found = inventory(
             manifest,
             full=True,
             statuses={"test.shop.accepted": "fail"},
             records={model: record},
+            referenced=reads,
         )
         declared = declarations(manifest, selected={model}, values_free=True)
         result = CoverageResult(
@@ -1336,6 +1404,7 @@ class ValuesFreeContract:
             excluded=found.excluded,
             elided={**found.elided, "declared_facts": declared["elided"]},
             manifest={"source": "parsed"},
+            singular_tests=singular_block,
             notes=[*found.notes, *declared["notes"]],
             warnings=found.warnings,
             result_mode=ResultMode.VALUES_FREE,

@@ -737,7 +737,7 @@ def test_the_budget_can_stop_the_batch_before_a_survivors_comparison(project):
         prices=prices,
         equivalence=_EquivalenceCheck(shadow),
     )
-    _runs, _spend, warnings = result.pop("_meta")
+    _runs, _spend, warnings, _spent = result.pop("_meta")
 
     assert shadow.invoked == ["test", "show", "test"]
     first = next(m for m in result["mutants"] if m["id"] == "m01")
@@ -810,7 +810,7 @@ def test_the_stop_rule_leaves_room_for_what_the_warehouse_bills_beyond_the_runs(
         prices=prices,
         uptime=uptime,
     )
-    _runs, spend, warnings = result.pop("_meta")
+    _runs, spend, warnings, _spent = result.pop("_meta")
 
     # The baseline, then one mutant: 10 + 75 + 10 fits, 20 + 75 + 10 does not.
     assert shadow.invoked == ["test", "test"]
@@ -1076,7 +1076,7 @@ def test_the_run_stops_when_the_confirmed_budget_runs_out(
         estimate=90.0,
         mutation_mod=mutation,
     )
-    _runs, _spend, warnings = result.pop("_meta")
+    _runs, _spend, warnings, _spent = result.pop("_meta")
 
     assert result["counts"]["not_run"] > 0
     assert shadow.runs < len(batch.mutants) + 1, "the run kept going past the budget"
@@ -1649,7 +1649,7 @@ def test_each_program_runs_against_its_own_tests_and_is_scored_apart(project):
     batch = _incremental_batch()
     shadow = _ProgramCopy(batch)
 
-    result, (runs, _spend, _warnings) = _run(shadow, batch, project)
+    result, (runs, _spend, _warnings, _spent) = _run(shadow, batch, project)
 
     full_runs = [call for call in shadow.calls if call[0] == "fct"]
     branch_runs = [call for call in shadow.calls if call[0] != "fct"]
@@ -1675,7 +1675,7 @@ def test_a_model_tested_only_through_its_branch_runs_no_full_build_mutant(projec
     batch = _incremental_batch()
     shadow = _ProgramCopy(batch)
 
-    result, (_runs, _spend, warnings) = _run(
+    result, (_runs, _spend, warnings, _spent) = _run(
         shadow,
         batch,
         project,
@@ -1701,7 +1701,7 @@ def test_a_budget_spent_on_the_full_build_leaves_the_branch_not_run(project):
     prices = {"(baseline)": 10.0, **{m.id: 10.0 for m in batch.mutants}}
     prices.update({m.id: 0.0 for m in batch.incremental.mutants})
 
-    result, (_runs, _spend, warnings) = _run(
+    result, (_runs, _spend, warnings, _spent) = _run(
         shadow,
         batch,
         project,

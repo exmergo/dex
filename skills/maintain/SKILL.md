@@ -441,8 +441,14 @@ It is free and needs no baseline. Report its answers apart, each with the
 denominator it states: which resources and columns have tests, each test's
 status in the last run (with that run's age), each model's recorded mutation
 score (`fresh` or `stale`, never quoted as current when stale), and what checks
-each declared fact. Never combine them into one coverage number. A model with no
-score is measured with `transform test --mutate <model>`.
+each declared fact. Never combine them into one coverage number. A column only
+a singular test reads is `referenced`, with the role it is read in, and never
+counts as asserted: a `join` read asserts nothing about the key. A model with
+no score is measured with `transform test --mutate <model>`; to refresh every
+stale and missing score at once, run `maintain coverage --mutate`. It takes 25
+models at most per run, and runs again on the rest. It is priced and confirmed
+once for the whole batch on a metered connector, under the same spending rules
+as any confirmation.
 
 Per-axis fields and finding codes are in
 `${CLAUDE_SKILL_DIR}/references/axes.md`. Read it when a finding's code or field

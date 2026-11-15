@@ -1424,12 +1424,26 @@ class DexEngine:
         objects: list[str] | None = None,
         *,
         full: bool = False,
+        mutate: bool = False,
+        max_models: int | None = None,
+        target: str | None = None,
     ) -> CoverageResult:
-        """Which project resources the dbt tests reach, from the manifest (#1280)."""
+        """Which project resources the dbt tests reach, from the manifest (#1280).
+
+        ``mutate`` also refreshes the stale and missing mutation scores (#1284),
+        the one part of the command that opens a connection.
+        """
 
         from .maintain import commands as maintain
 
-        result = maintain.coverage(self, objects, full=full)
+        result = maintain.coverage(
+            self,
+            objects,
+            full=full,
+            mutate=mutate,
+            max_models=max_models,
+            target=target,
+        )
         # The CLI stamps its envelope; a library caller reads the result, so
         # the mode the engine is pinned to is stamped here too.
         result.result_mode = self.resolve_result_mode(None)

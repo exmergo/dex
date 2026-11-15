@@ -66,6 +66,8 @@ RUN_STATUSES = ("pass", "fail", "warn", "error", "skipped", "not_run")
 
 #: What a recorded mutation score is called against the project (#1284).
 STRENGTH_STATUSES = ("fresh", "stale", "missing", "untestable")
+#: Refusals the project alone decides, which hold until the model changes.
+STRUCTURAL_REFUSALS = frozenset({"no_mutable_sql"})
 
 #: Score bands for the distribution: the summary never averages scores.
 _SCORE_BANDS = (
@@ -96,6 +98,8 @@ class _Resource:
     downstream: set[str] = field(default_factory=set)
     downstream_via: set[str] = field(default_factory=set)
     incremental_branch_tests: list[str] = field(default_factory=list)
+    #: What singular tests read of this resource (#1282), by lowercased column.
+    referenced: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -111,6 +115,12 @@ class Inventory:
     warnings: list[str]
     #: The unique ids in scope, every section and type, before any cut.
     selected: frozenset[str] = frozenset()
+    #: Each selected model's strength entry by unique id, before any cut, for
+    #: the refresh that picks the stale and missing ones (#1284).
+    strength: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Each selected model's label, name and whether it has tests of its own,
+    #: by unique id.
+    models: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
 
 
 def _label(unique_id: str, node: dict[str, Any]) -> str:
@@ -174,6 +184,7 @@ def inventory(
     statuses: dict[str, str] | None = None,
     records: dict[str, dict[str, Any]] | None = None,
     now: datetime | None = None,
+    referenced: dict[str, dict[str, dict[str, Any]]] | None = None,
 ) -> Inventory:
     """Inventory the tests ``manifest`` declares for the root project.
 
@@ -181,6 +192,8 @@ def inventory(
     unique id; ``None`` means no run was read, and no test carries a status.
     ``records`` is the recorded mutation results by model unique id (#1284);
     ``None`` means the store keeps none, so no model carries a strength.
+    ``referenced`` is what singular tests read, by resource unique id (#1282);
+    ``None`` means nothing was read, and no record lists referenced columns.
     """
 
     project = (manifest.get("metadata") or {}).get("project_name")
@@ -394,6 +407,10 @@ def inventory(
         "downstream_resources": 0,
         "excluded": 0,
     }
+    if referenced is not None:
+        for owner_id, column_reads in referenced.items():
+            if owner_id in resources:
+                resources[owner_id].referenced = column_reads
     sections: dict[str, list[dict[str, Any]]] = {name: [] for name in _NOUN}
     strength: dict[str, dict[str, Any]] = {}
     if records is not None:
@@ -405,7 +422,12 @@ def inventory(
                 )
     for unique_id in selected:
         resource = resources[unique_id]
-        record = _record(resource, last_run=statuses is not None)
+        record = _record(
+            resource,
+            last_run=statuses is not None,
+            referenced=referenced is not None,
+            full=full,
+        )
         if unique_id in strength:
             record["strength"] = strength[unique_id]
         sections[SECTIONS[resource.resource_type]].append(record)
@@ -418,7 +440,14 @@ def inventory(
             for record in listed:
                 _cap(record, elided)
 
-    summary = _summary(resources, selected, totals, severities, scoped=bool(wanted))
+    summary = _summary(
+        resources,
+        selected,
+        totals,
+        severities,
+        scoped=bool(wanted),
+        referenced=referenced is not None,
+    )
     if statuses is not None:
         by_status = dict.fromkeys(RUN_STATUSES, 0)
         for status in summary_statuses.values():
@@ -462,6 +491,16 @@ def inventory(
         notes=notes,
         warnings=warnings,
         selected=frozenset(selected),
+        strength=strength,
+        models={
+            uid: (
+                resources[uid].label,
+                str(resources[uid].node.get("name") or ""),
+                bool(resources[uid].tests),
+            )
+            for uid in selected
+            if resources[uid].resource_type == "model"
+        },
     )
 
 
@@ -475,8 +514,8 @@ def _cap(record: dict[str, Any], elided: dict[str, int]) -> None:
     """Cut one listed record's lists to their caps, counting every cut."""
 
     columns = record["columns"]
-    for key in ("unasserted", "undocumented_tested"):
-        if len(columns[key]) > COLUMN_CAP:
+    for key in ("unasserted", "undocumented_tested", "referenced_columns"):
+        if key in columns and len(columns[key]) > COLUMN_CAP:
             elided["columns"] += len(columns[key]) - COLUMN_CAP
             columns[key] = columns[key][:COLUMN_CAP]
     incremental = record.get("incremental")
@@ -493,7 +532,13 @@ def _cap(record: dict[str, Any], elided: dict[str, int]) -> None:
         record["downstream_tests"]["on"] = via[:DOWNSTREAM_CAP]
 
 
-def _record(resource: _Resource, *, last_run: bool = False) -> dict:
+def _record(
+    resource: _Resource,
+    *,
+    last_run: bool = False,
+    referenced: bool = False,
+    full: bool = False,
+) -> dict:
     node = resource.node
     own = dict.fromkeys(dbt_tests.TEST_KINDS, 0)
     severity = {"error": 0, "warn": 0}
@@ -539,6 +584,19 @@ def _record(resource: _Resource, *, last_run: bool = False) -> dict:
         "unasserted": unasserted,
         "undocumented_tested": undocumented,
     }
+    if referenced:
+        from .coverage_singular import referenced_entries
+
+        # Read by a singular test, never asserted by one (#1282): counted
+        # apart, so the asserted figure keeps meaning a column-scoped test.
+        entries = referenced_entries(
+            resource.referenced, documented, resource.asserted, full=full
+        )
+        columns["referenced"] = sum(1 for e in entries if e["documented"])
+        columns["referenced_only"] = sum(
+            1 for e in entries if e["documented"] and not e["asserted"]
+        )
+        columns["referenced_columns"] = entries
     record["columns"] = columns
 
     tests = sorted(
@@ -569,6 +627,7 @@ def _summary(
     severities: dict[str, int],
     *,
     scoped: bool,
+    referenced: bool = False,
 ) -> dict[str, Any]:
     prefix = "selected " if scoped else ""
     by_type: dict[str, list[_Resource]] = defaultdict(list)
@@ -585,6 +644,19 @@ def _summary(
             asserted,
             documented,
             f"documented columns of {prefix}enabled project {noun}",
+        )
+
+    def referenced_only(group: list[_Resource], noun: str) -> dict[str, Any]:
+        documented = sum(len(_documented(r.node)) for r in group)
+        only = sum(
+            len((set(r.referenced) & set(_documented(r.node))) - r.asserted)
+            for r in group
+        )
+        return _ratio(
+            only,
+            documented,
+            f"documented columns of {prefix}enabled project {noun}, read by a "
+            "singular test and asserted by no generic test",
         )
 
     models = by_type["model"]
@@ -616,6 +688,8 @@ def _summary(
             "columns_asserted": columns(models, "models"),
         }
     }
+    if referenced:
+        summary["models"]["columns_referenced_only"] = referenced_only(models, "models")
     for resource_type in ("source", "snapshot", "seed"):
         group = by_type[resource_type]
         noun = SECTIONS[resource_type]
@@ -628,6 +702,8 @@ def _summary(
             ),
             "columns_asserted": columns(group, noun),
         }
+        if referenced:
+            entry["columns_referenced_only"] = referenced_only(group, noun)
         if resource_type == "source":
             entry["with_freshness"] = _ratio(
                 sum(1 for r in group if any(t["kind"] == "freshness" for t in r.tests)),
@@ -713,6 +789,23 @@ def _strength(
         manifest, resource.node
     ):
         changed.append("own_tests")
+    if record.get("refused"):
+        # A refusal (#1284). A structural one holds while the model reads as
+        # it did; a changed model, or a refusal the data decided (no test
+        # passes the baseline), is worth asking again.
+        if changed:
+            return {"status": "missing", "changed": changed}
+        if record["refused"] not in STRUCTURAL_REFUSALS:
+            return {
+                "status": "missing",
+                "last_refusal": str(record["refused"]),
+                "recorded_at": record.get("recorded_at"),
+            }
+        return {
+            "status": "untestable",
+            "reason": str(record["refused"]),
+            "recorded_at": record.get("recorded_at"),
+        }
     for unique_id, digest in (record.get("downstream_tests") or {}).items():
         test = dbt_tests.test_node(manifest, unique_id)
         if (
@@ -733,6 +826,9 @@ def _strength(
         "recorded_at": record.get("recorded_at"),
         "age_seconds": _age_seconds(record.get("recorded_at"), now),
     }
+    if record.get("last_refusal"):
+        entry["last_refusal"] = str(record["last_refusal"])
+        entry["last_refusal_at"] = record.get("last_refusal_at")
     if not entry["complete"]:
         entry["not_run"] = record.get("not_run")
     if changed:

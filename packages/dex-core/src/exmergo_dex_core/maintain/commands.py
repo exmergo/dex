@@ -1724,6 +1724,9 @@ def coverage(
     objects: list[str] | None = None,
     *,
     full: bool = False,
+    mutate: bool = False,
+    max_models: int | None = None,
+    target: str | None = None,
 ) -> CoverageResult:
     """Which project resources the dbt tests reach, from the manifest alone (#1280).
 
@@ -1741,6 +1744,11 @@ def coverage(
     comma- or space-separated, matching models (and their versions), sources
     (``source.table``), snapshots and seeds. ``full`` lifts every list cap.
     Reports, never gates: low coverage is not an error in this release.
+
+    ``mutate`` refreshes the strength of the stale and missing models (#1284):
+    ``transform test --mutate`` for each, at most ``max_models`` (25, never more)
+    per run, on the dev ``target``, behind one cost handshake. It is the one
+    path here that opens a connection; without it nothing does.
     """
 
     import json
@@ -1755,6 +1763,25 @@ def coverage(
             f"the '{project.name}' project format declares no dbt tests to inventory"
         )
         project = None
+    if mutate and _values_free(engine):
+        from ..values_free import ValuesFreeCode, ValuesFreeError
+
+        # `--mutate` runs `transform test --mutate`, which was never reviewed
+        # for the mode; plain coverage was, and stays allowed.
+        raise ValuesFreeError(
+            ValuesFreeCode.COMMAND_NOT_VALUES_FREE,
+            command="maintain coverage --mutate",
+        )
+    if mutate and max_models is not None:
+        from .coverage_refresh import REFRESH_CAP
+
+        if max_models > REFRESH_CAP:
+            raise ValueError(
+                f"--max-models {max_models} is above the ceiling of {REFRESH_CAP}; "
+                "every model is a mutation run of its own, so the ceiling is what "
+                "keeps one refresh's cost and time predictable. Lower it, and run "
+                "the command again for the next batch"
+            )
     if project is None:
         reason = project_reason or "no readable project format found"
         return CoverageResult(
@@ -1867,6 +1894,10 @@ def coverage(
                 f"({type(exc).__name__}), so no model carries a strength"
             )
 
+    # What singular tests read (#1282): their Jinja rendered statically, and a
+    # test only a compile can render read from the newest compiled manifest on
+    # disk where it holds that test unchanged. Files only, no connection.
+    referenced, singular_block = _singular_reads(engine, project_dir, manifest, full)
     selector = model_scope.model_names(objects) if objects else None
     inventory = coverage_mod.inventory(
         manifest,
@@ -1874,7 +1905,52 @@ def coverage(
         full=full,
         statuses=run.statuses,
         records=records,
+        referenced=referenced,
     )
+    refresh: dict[str, Any] | None = None
+    spend = None
+    cost = None
+    if mutate:
+        from . import coverage_refresh
+
+        if records is None or loader is None:
+            raise ValueError(
+                "maintain coverage --mutate has nowhere to keep what it measures: "
+                "the configured store keeps no mutation records"
+            )
+        if origin is not None and origin.get("source") == "artifact":
+            raise ValueError(
+                "maintain coverage --mutate needs a fresh parse of the project, "
+                f"and dex could not parse it ({parse_skipped}); fix that first"
+            )
+        candidates = coverage_refresh.candidates(inventory)
+        refresh, refresh_warnings, spend, cost = coverage_refresh.refresh(
+            engine,
+            manifest,
+            candidates,
+            selector=selector,
+            limit=max_models,
+            target=target,
+        )
+        warnings.extend(refresh_warnings)
+        if refresh["ran"]:
+            # Read again, so each section shows what this run measured.
+            try:
+                records = loader()
+            except Exception as exc:  # scratch state, as above
+                warnings.append(
+                    f"recorded mutation results could not be read back "
+                    f"({type(exc).__name__}) after the refresh"
+                )
+            else:
+                inventory = coverage_mod.inventory(
+                    manifest,
+                    selector=selector,
+                    full=full,
+                    statuses=run.statuses,
+                    records=records,
+                    referenced=referenced,
+                )
     if records is not None:
         notes.append(
             "strength is the recorded `transform test --mutate` score: it counts "
@@ -1905,9 +1981,41 @@ def coverage(
         excluded=inventory.excluded,
         elided=elided,
         manifest=origin,
+        refresh=refresh,
+        singular_tests=singular_block,
+        spend=spend,
+        **({"cost": cost} if cost is not None else {}),
         notes=[*inventory.notes, *notes, *declared["notes"]],
         warnings=[*warnings, *inventory.warnings],
     )
+
+
+def _singular_reads(
+    engine: DexEngine, project_dir: Path, manifest: dict[str, Any], full: bool
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The ``referenced`` tier's reads, or ``(None, None)`` where none ran."""
+
+    import json
+
+    from ..transform.artifact_runtime import readable_artifact_dir
+    from .coverage_singular import singular_reads
+
+    dialect = None
+    with contextlib.suppress(Exception):
+        from ..adapters import get_dialect
+
+        dialect = get_dialect(engine.connector or engine.config.connector)
+    artifact = None
+    path = readable_artifact_dir(project_dir) / "manifest.json"
+    if path.is_file():
+        with contextlib.suppress(OSError, ValueError):
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and loaded is not manifest:
+                artifact = loaded
+    try:
+        return singular_reads(manifest, artifact=artifact, dialect=dialect, full=full)
+    except Exception:  # a reader failure costs this tier, never the inventory
+        return None, None
 
 
 def _values_free(engine: DexEngine) -> bool:
@@ -1917,13 +2025,18 @@ def _values_free(engine: DexEngine) -> bool:
 
 
 def cmd_coverage(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
-    return to_envelope(
-        coverage(
+    try:
+        result = coverage(
             engine,
             getattr(args, "objects", None),
             full=bool(getattr(args, "full", False)),
+            mutate=bool(getattr(args, "mutate", False)),
+            max_models=getattr(args, "max_models", None),
+            target=getattr(args, "target", None),
         )
-    )
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result)
 
 
 def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
