@@ -1,0 +1,1 @@
+**`explore inventory` now refuses `--limit` values below 1.** Passing a zero or negative `--limit` previously accepted the value silently and returned an empty list or elided the tail of the ranked objects. It now reports a usage error with reason `request`, requiring a limit of at least 1.

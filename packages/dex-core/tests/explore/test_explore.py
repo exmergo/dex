@@ -107,6 +107,67 @@ def test_inventory_rank_limit_caps_the_ranked_list(duckdb_file: Path, capsys):
     assert any("capped at 1" in n for n in payload["data"]["notes"])
 
 
+@pytest.mark.parametrize("limit_val", ["0", "-5"])
+def test_inventory_rank_limit_below_one_is_refused(
+    duckdb_file: Path, capsys, limit_val: str
+):
+    rc = main(
+        [
+            "explore",
+            "inventory",
+            "--rank",
+            "--limit",
+            limit_val,
+            "--path",
+            str(duckdb_file),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, "exactly one envelope line"
+    payload = json.loads(out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["reason"] == "request"
+    expected = f"--limit {limit_val} is below 1; --limit must be at least 1"
+    assert expected in payload["errors"]
+
+
+def test_inventory_limit_below_one_without_rank_is_refused(duckdb_file: Path, capsys):
+    rc = main(
+        [
+            "explore",
+            "inventory",
+            "--limit",
+            "0",
+            "--path",
+            str(duckdb_file),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, "exactly one envelope line"
+    payload = json.loads(out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["reason"] == "request"
+    assert "--limit 0 is below 1; --limit must be at least 1" in payload["errors"]
+
+
+def test_inventory_programmatic_limit_below_one_raises(duckdb_file: Path):
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.errors import RequestError
+    from exmergo_dex_core.explore import commands
+
+    engine = DexEngine.from_repo(
+        duckdb_file.parent, connector="duckdb", path=str(duckdb_file)
+    )
+    msg_zero = r"--limit 0 is below 1; --limit must be at least 1"
+    with pytest.raises(RequestError, match=msg_zero):
+        commands.inventory(engine, limit=0)
+    msg_neg = r"--limit -3 is below 1; --limit must be at least 1"
+    with pytest.raises(RequestError, match=msg_neg):
+        commands.inventory(engine, limit=-3)
+
+
 def test_inventory_rank_all_lifts_the_cap_even_with_a_limit(duckdb_file: Path, capsys):
     # --all wins over --limit: today's full-unbounded behavior, explicitly asked
     # for, is not something a smaller --limit passed alongside it can narrow.

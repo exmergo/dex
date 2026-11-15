@@ -350,8 +350,11 @@ def inventory(
 
     ``limit``/``show_all`` only act on a ranked call: an unranked list carries
     no order to cut a shortlist from, so it is returned whole either way, the
-    same as it always has been.
+    same as it always has been. When provided, ``limit`` must be at least 1.
     """
+
+    if limit is not None and limit < 1:
+        raise RequestError(f"--limit {limit} is below 1; --limit must be at least 1")
 
     mode = engine.resolve_result_mode(result_mode)
     adapter = engine._adapter("explore inventory")
