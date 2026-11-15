@@ -285,3 +285,18 @@ def test_a_using_key_the_left_side_cannot_place_is_untraced_not_spread():
     assert "c.k" in keys
     assert "a.k" not in keys and "b.k" not in keys
     assert "k" in reading.unreferenced
+
+
+def test_a_using_key_between_unaliased_refs_reaches_both_sides():
+    reading = read(
+        "select orders.amount from {{ ref('orders') }} "
+        "join {{ ref('customers') }} using (id) where orders.amount < 0",
+        None,
+        dialect="duckdb",
+        vars=None,
+        references=True,
+    )
+    keys = {f"{r}.{c}": sorted(v) for (r, c, _), v in reading.referenced.items()}
+    assert keys["orders.id"] == ["join"]
+    assert keys["customers.id"] == ["join"]
+    assert "id" not in reading.unreferenced

@@ -1544,7 +1544,8 @@ class _Lineage:
             ]
             if not names:
                 continue
-            joined = join.this.alias_or_name.lower()
+            # As sources() names it: an unaliased ref() goes by its dbt name.
+            joined = self.alias(join.this).lower()
             position = next(
                 (i for i, s in enumerate(sources) if s[0] == joined), len(sources)
             )
