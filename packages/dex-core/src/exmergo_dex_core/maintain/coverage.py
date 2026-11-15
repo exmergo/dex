@@ -271,6 +271,9 @@ def inventory(
                     stack.append(child)
         return seen
 
+    # Each test's status once, by unique id: a singular test reading two
+    # selected resources is listed on both and counted once, as by_kind is.
+    summary_statuses: dict[str, str] = {}
     totals = dict.fromkeys(dbt_tests.TEST_KINDS, 0)
     severities = {"error": 0, "warn": 0}
     package_tests = 0
@@ -308,6 +311,7 @@ def inventory(
             record: dict[str, Any] = {"kind": kind, "severity": severity}
             if statuses is not None:
                 record["last_run"] = statuses.get(unique_id, "not_run")
+                summary_statuses[unique_id] = record["last_run"]
             if kind == "generic":
                 record["test"] = dbt_tests.generic_test_name(test)
                 column = test.get("column_name")
@@ -345,6 +349,7 @@ def inventory(
             record = {"kind": "unit", "name": unit.get("name")}
             if statuses is not None:
                 record["last_run"] = statuses.get(unique_id, "not_run")
+                summary_statuses[unique_id] = record["last_run"]
             if _materialized(resource.node) == "incremental":
                 value = ((unit.get("overrides") or {}).get("macros") or {}).get(
                     "is_incremental"
@@ -416,10 +421,8 @@ def inventory(
     summary = _summary(resources, selected, totals, severities, scoped=bool(wanted))
     if statuses is not None:
         by_status = dict.fromkeys(RUN_STATUSES, 0)
-        for unique_id in selected:
-            for test in resources[unique_id].tests:
-                if "last_run" in test:
-                    by_status[test["last_run"]] += 1
+        for status in summary_statuses.values():
+            by_status[status] += 1
         summary["tests"]["by_last_run"] = by_status
     if records is not None:
         summary["models"]["strength"] = _strength_summary(

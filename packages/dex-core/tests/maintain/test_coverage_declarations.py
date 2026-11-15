@@ -301,3 +301,57 @@ def test_cap_lists_unchecked_first_and_counts_the_cut() -> None:
     full = _run(manifest, full=True)
     assert len(full["facts"]) == FACT_CAP + 6
     assert full["elided"] == 0
+
+
+def test_a_relationships_test_on_another_field_does_not_check_the_reference() -> None:
+    """Review fix: membership in ``customers.legacy_id`` says nothing about the
+    declared ``customers.customer_id``."""
+
+    manifest = _manifest(
+        [
+            _model("customers"),
+            _model(
+                "orders",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+            ),
+        ],
+        [
+            _test(
+                "relationships",
+                "orders",
+                "customer_id",
+                reads=["orders", "customers"],
+                kwargs={"to": "ref('customers')", "field": "legacy_id"},
+            )
+        ],
+    )
+    assert _fact(_run(manifest), "references", "customer_id")["checked_by"] == "none"
+    manifest["nodes"][next(k for k in manifest["nodes"] if k.startswith("test."))][
+        "test_metadata"
+    ]["kwargs"]["field"] = "customer_id"
+    assert _fact(_run(manifest), "references", "customer_id")["checked_by"] == (
+        "dbt_test"
+    )
+
+
+def test_a_self_reference_counts_its_relationships_test() -> None:
+    manifest = _manifest(
+        [
+            _model(
+                "employees",
+                columns={"manager_id": {"references": "employees.employee_id"}},
+            ),
+        ],
+        [
+            _test(
+                "relationships",
+                "employees",
+                "manager_id",
+                reads=["employees"],
+                kwargs={"to": "ref('employees')", "field": "employee_id"},
+            )
+        ],
+    )
+    fact = _fact(_run(manifest), "references", "manager_id")
+    assert fact["checked_by"] in {"dbt_test", "both"}
+    assert fact["tests"] == ["relationships"]

@@ -273,3 +273,78 @@ def test_a_refused_mutation_run_records_nothing(tmp_path: Path, duckdb_file: Pat
     with pytest.raises(Exception, match="no tests"):
         engine.test_mutations("fct")
     assert engine.store.load_mutation_records() == {}
+
+
+def test_a_singular_test_on_two_models_counts_once_in_the_status_summary():
+    manifest = _manifest()
+    manifest["nodes"]["test.shop.both"] = {
+        "resource_type": "test",
+        "name": "both",
+        "package_name": PROJECT,
+        "attached_node": None,
+        "config": {"severity": "ERROR", "enabled": True},
+        "depends_on": {"nodes": [FCT, MART]},
+    }
+    found = coverage_mod.inventory(manifest, statuses={"test.shop.both": "fail"})
+    assert found.summary["tests"]["by_last_run"]["fail"] == 1
+    listed = {r["name"]: r["last_run"]["fail"] for r in found.sections["models"]}
+    assert listed["fct"] == 1 and listed["mart"] == 1
+
+
+def _run_result(*, full: dict, branch: dict | None, branch_tests: list[str]):
+    return {
+        "counts": {"killed": 0, "caught_downstream": 0, "survived": 0, "not_run": 0}
+        | full,
+        "incremental": None
+        if branch is None
+        else {
+            "counts": {"killed": 0, "survived": 0, "not_run": 0} | branch,
+            "tests": branch_tests,
+            "score": 0.0,
+        },
+        "score": None,
+        "score_with_downstream": None,
+        "equivalence": None,
+    }
+
+
+def test_inferred_branch_survivors_alone_record_nothing():
+    """Review fix: with the budget spent before any full-build mutant ran and
+    no unit test taking the is_incremental() branch, the branch's survivors are
+    by construction, so the previous record stays."""
+
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.transform.commands import _record_mutation_run
+
+    store = MemoryStore()
+    manifest = _manifest()
+    node = {**manifest["nodes"][FCT], "unique_id": FCT}
+    fingerprint = {"sql_digest": "a", "tests_digest": "b", "manifest": manifest}
+    cap = {"limit": 20, "generated": 4, "elided": {}}
+    below = SimpleNamespace(enabled=False, tests=[])
+
+    at, _ = _record_mutation_run(
+        store,
+        node,
+        fingerprint,
+        _run_result(full={"not_run": 2}, branch={"survived": 2}, branch_tests=[]),
+        cap=cap,
+        unsupported=0,
+        downstream=below,
+        connector="duckdb",
+    )
+    assert at is None and store.load_mutation_records() == {}
+
+    at, _ = _record_mutation_run(
+        store,
+        node,
+        fingerprint,
+        _run_result(full={"not_run": 2}, branch={"killed": 1}, branch_tests=["ut"]),
+        cap=cap,
+        unsupported=0,
+        downstream=below,
+        connector="duckdb",
+    )
+    assert at is not None
+    assert store.load_mutation_records()[FCT]["complete"] is False

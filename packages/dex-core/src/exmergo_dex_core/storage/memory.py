@@ -51,6 +51,7 @@ class MemoryStore:
         self._queries: list[dict] = []
         self._spend: list[dict] = []
         self._mutations: dict[str, dict] = {}
+        self._mutations_lock = threading.Lock()
         self._spend_lock = threading.RLock()
         self._cache_lock = threading.RLock()
 
@@ -203,11 +204,16 @@ class MemoryStore:
 
     def save_mutation_record(self, record: dict) -> str:
         model_id = str(record["model_id"])
-        self._mutations[model_id] = copy.deepcopy(record)
+        saved = copy.deepcopy(record)
+        with self._mutations_lock:
+            self._mutations[model_id] = saved
         return f"memory:mutations/{model_id}"
 
     def load_mutation_records(self) -> dict[str, dict]:
-        return copy.deepcopy(self._mutations)
+        # Copied under the lock: a save from another thread mid-copy would
+        # otherwise change the dict while it is iterated.
+        with self._mutations_lock:
+            return copy.deepcopy(self._mutations)
 
     # --- locators -------------------------------------------------------------
 

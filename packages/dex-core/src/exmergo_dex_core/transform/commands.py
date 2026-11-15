@@ -2905,10 +2905,15 @@ def _record_mutation_run(
     counts = dict(result["counts"])
     incremental = result.get("incremental") or None
     branch_counts = dict((incremental or {}).get("counts") or {})
-    decided = sum(
+    # Only mutants a test actually ran count. With no unit test taking the
+    # is_incremental() branch, its mutants are survivors by construction, not
+    # by a run, and must not replace an earlier record on their own.
+    executed = sum(
         counts.get(key, 0) for key in ("killed", "caught_downstream", "survived")
-    ) + sum(branch_counts.get(key, 0) for key in ("killed", "survived"))
-    if not decided:
+    )
+    if (incremental or {}).get("tests"):
+        executed += sum(branch_counts.get(key, 0) for key in ("killed", "survived"))
+    if not executed:
         return None, None
     saver = getattr(store, "save_mutation_record", None)
     if saver is None:

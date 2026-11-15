@@ -147,18 +147,38 @@ class _Tests:
                 return name
         return None
 
-    def relationship(self, model: str, column: str, parent: str | None) -> bool:
+    def relationship(
+        self,
+        model: str,
+        column: str,
+        parent: str | None,
+        field: str | None = None,
+    ) -> bool:
+        """Whether a ``relationships`` test on ``model.column`` checks the
+        declared reference: to ``parent`` (by the relation it reads, the model
+        itself included for a self-reference) and, where both name one, on
+        the declared ``field``."""
+
         key = _bare(column)
-        for name, col, _kwargs, reads in self.by_model.get(model, []):
+        for name, col, kwargs, reads in self.by_model.get(model, []):
             if _base(name) != "relationships" or col != key:
+                continue
+            tested_field = kwargs.get("field")
+            if (
+                field is not None
+                and tested_field is not None
+                and _bare(str(tested_field)) != _bare(field)
+            ):
                 continue
             if parent is None:
                 return True
+            wanted = parent.lower()
+            # The test reads the child and the parent; the child's own label
+            # matches only when the reference is to the model itself.
             if any(
-                self.labels.get(uid, "").lower() == parent.lower()
-                or self.labels.get(uid, "").split(".", 1)[0].lower() == parent.lower()
+                self.labels.get(uid, "").lower() == wanted
+                or self.labels.get(uid, "").split(".", 1)[0].lower() == wanted
                 for uid in reads
-                if uid != model
             ):
                 return True
         return False
@@ -343,8 +363,12 @@ def _model_facts(
         role = dex.get("role")
         references = dex.get("references")
         if isinstance(references, str) and "." in references:
-            parent = references.rpartition(".")[0]
-            found = ["relationships"] if tests.relationship(uid, name, parent) else []
+            parent, _, field = references.rpartition(".")
+            found = (
+                ["relationships"]
+                if tests.relationship(uid, name, parent, field or None)
+                else []
+            )
             joins = parent.lower() in reads or parent.split(".", 1)[0].lower() in reads
             add(
                 "references",
