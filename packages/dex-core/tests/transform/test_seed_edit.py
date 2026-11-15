@@ -168,13 +168,11 @@ def test_a_sub_threshold_cache_flag_warns_rather_than_refuses():
 
 
 def test_the_provisional_generic_name_match_warns_rather_than_refuses():
-    # `country_name` matches the generic `*_name` pattern, which the detector
+    # `owner_name` matches the generic `*_name` pattern, which the detector
     # itself calls provisional: on a warehouse column `explore` refines it
     # against value shape, and dex never reads a seed's values, so blocking on
     # it would claim a certainty the detector disclaims.
-    warnings = validate_seed(
-        "seeds/countries.csv", "country_code,country_name\nIT,Italy\n"
-    )
+    warnings = validate_seed("seeds/owners.csv", "owner_code,owner_name\nIT,Italy\n")
     assert warnings and "cannot refine on a seed" in warnings[0]
 
 
