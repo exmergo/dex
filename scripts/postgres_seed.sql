@@ -14,21 +14,27 @@
 --   - v_order_totals: a view (no stored rows)
 --   - events: ~100k rows via generate_series (sampling / statement_timeout target)
 --   - dbt_dev: the empty dev schema dbt builds into (never a source)
+--   - dbt_dev_elementary: empty, where the Elementary fixture's package models
+--     build (tests/integration/test_postgres_elementary.py); dbt names it from
+--     the dev schema and the package's custom one, and dbt_dev cannot create it
 --   - slayer.orders: six fixed rows a SLayer metric query is answered over
 --     (tests/integration/test_slayer_query.py), apart from app so the counts
 --     every other suite reads there stay put
 -- Roles:
 --   - dex_ro: the read-only role dex connects as (USAGE + SELECT on app only)
---   - dbt_dev: reads app, writes only schema dbt_dev, statement_timeout pinned
+--   - dbt_dev: reads app, writes only schemas dbt_dev and dbt_dev_elementary,
+--     statement_timeout pinned
 
 BEGIN;
 
 DROP SCHEMA IF EXISTS app CASCADE;
 DROP SCHEMA IF EXISTS dbt_dev CASCADE;
+DROP SCHEMA IF EXISTS dbt_dev_elementary CASCADE;
 DROP SCHEMA IF EXISTS slayer CASCADE;
 
 CREATE SCHEMA app;
 CREATE SCHEMA dbt_dev;
+CREATE SCHEMA dbt_dev_elementary;
 CREATE SCHEMA slayer;
 
 CREATE TYPE app.product_category AS ENUM ('electronics', 'grocery', 'apparel', 'home');
@@ -195,12 +201,13 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO dex_ro;
 GRANT USAGE ON SCHEMA slayer TO dex_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA slayer TO dex_ro;
 
--- dbt_dev: read sources, write only the dev schema; server-side time cap.
+-- dbt_dev: read sources, write only the dev schemas; server-side time cap.
 GRANT USAGE ON SCHEMA app TO dbt_dev;
 GRANT SELECT ON ALL TABLES IN SCHEMA app TO dbt_dev;
 GRANT USAGE ON TYPE app.uncomparable TO dbt_dev;
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO dbt_dev;
 GRANT USAGE, CREATE ON SCHEMA dbt_dev TO dbt_dev;
+GRANT USAGE, CREATE ON SCHEMA dbt_dev_elementary TO dbt_dev;
 ALTER ROLE dbt_dev SET statement_timeout = '600s';
 
 ANALYZE;

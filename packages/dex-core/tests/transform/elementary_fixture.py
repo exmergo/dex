@@ -23,6 +23,10 @@ creates them as ``temporary`` tables, which DuckDB drops when dbt's connection
 closes, and Postgres does the same. Variant f is read from Elementary's debug
 log instead. BigQuery, where those tables outlive the run, is #1331's.
 
+DuckDB can build only package 0.23.0 and later, and most installs pin 0.15 or
+0.16. Those releases run on Postgres (#1331): :func:`elementary_project` takes a
+:class:`PostgresTarget`, and :func:`postgres_census` reads the same census there.
+
 The package comes from the dbt package hub, so installing it needs the network.
 The suite is otherwise offline, so everything here is opt-in: set
 ``DEX_TEST_ELEMENTARY=1`` and the tests that use ``requires_elementary`` run;
@@ -35,6 +39,7 @@ import os
 import shutil
 import subprocess
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -55,11 +60,65 @@ CURRENT_VERSION = "0.26.1"
 OLDEST_DUCKDB_VERSION = "0.23.0"
 VERSIONS = (CURRENT_VERSION, OLDEST_DUCKDB_VERSION)
 
+#: The last release of each series most public installs pin (the count on
+#: #1312). Neither carries DuckDB macros and both carry Postgres ones, so these
+#: run on Postgres only.
+LEGACY_VERSIONS = ("0.16.4", "0.15.2")
+
 #: What Elementary's own models build into: dbt's default schema naming joins the
 #: target schema and the custom one.
 ELEMENTARY_SCHEMA = "main_elementary"
 
+
+@dataclass(frozen=True)
+class PostgresTarget:
+    """Where a variant builds on Postgres: the server and the role's dev schema.
+
+    The password is never held here. The profile reads it from ``PGPASSWORD``,
+    as the profile ``transform init`` renders does. ``schema`` and the
+    Elementary schema dbt derives from it must both exist and be writable by
+    ``user``, since a dev role cannot usually create a schema
+    (``scripts/postgres_seed.sql`` creates both).
+    """
+
+    host: str
+    port: int
+    dbname: str
+    user: str = "dbt_dev"
+    schema: str = "dbt_dev"
+
+    @property
+    def elementary_schema(self) -> str:
+        return f"{self.schema}_elementary"
+
+    @property
+    def schemas(self) -> tuple[str, str]:
+        """The two schemas a variant writes: its own and Elementary's."""
+
+        return (self.schema, self.elementary_schema)
+
+
 FLAG = "require_explicit_package_overrides_for_builtin_materializations"
+
+#: Printed by Elementary's ``test`` materialization, with its debug logs on, once
+#: per test it handles and once more per test it routes through a temp table.
+#: Releases 0.15.2 to 0.26.1 all print both.
+MATERIALIZATION_LINE = "starting test materialization hook"
+TEMP_TABLE_LINE = "created test temp table"
+
+#: What each variant's row promises: whether Elementary's ``test`` materialization
+#: handles the tests, and whether it routes them through temp tables. b and d read
+#: the same here for different reasons (dbt picks its own on b; on d Elementary's
+#: is picked and returns at once, the package being disabled), which is why the
+#: build tests tell them apart by what the package builds.
+BEHAVIOUR = {
+    "a": (True, False),
+    "b": (False, False),
+    "c": (True, False),
+    "d": (False, False),
+    "e": (True, False),
+    "f": (True, True),
+}
 
 requires_elementary = pytest.mark.skipif(
     not os.environ.get(ENV),
@@ -113,8 +172,54 @@ def _schema_yml() -> str:
     return render(SCHEMA_YML, declaration)
 
 
-def dbt(*argv: str, cwd: Path) -> str:
-    """Run dbt itself, outside Dex, and return what it printed."""
+#: The rows the DuckDB variants read from ``main.raw_orders``, generated in the
+#: staging model instead: a dev role on Postgres can write only its dev schemas,
+#: so there is nowhere to load a raw table.
+POSTGRES_STG_ORDERS_SQL = """select
+    i as id,
+    (i % 5) + 1 as cid,
+    (i % 90)::double precision + 1 as amount,
+    case when i % 11 = 0 then 'cancelled' else 'placed' end as status,
+    (current_date - (i % 20))::timestamp as ordered_at
+from generate_series(0, 399) as t(i)
+"""
+
+#: Two tests that fail on ``stg_orders`` (a cancelled status is not an accepted
+#: value), alike but for the per-test switch that turns Elementary's sampling of
+#: failing rows off. Written by :func:`add_failing_tests`, never by
+#: :func:`elementary_project`, so the variants themselves stay green.
+FAILING_TESTS_YML = """version: 2
+models:
+  - name: stg_orders
+    columns:
+      - name: status
+        data_tests:
+          - accepted_values:
+              name: sampled_status
+              values: ['placed']
+          - accepted_values:
+              name: unsampled_status
+              values: ['placed']
+              config:
+                meta:
+                  disable_test_samples: true
+"""
+
+
+def add_failing_tests(project: Path) -> None:
+    """Add :data:`FAILING_TESTS_YML` to a project :func:`elementary_project` wrote."""
+
+    (project / "models" / "failing_tests.yml").write_text(
+        FAILING_TESTS_YML, encoding="utf-8"
+    )
+
+
+def dbt(*argv: str, cwd: Path, check: bool = True) -> str:
+    """Run dbt itself, outside Dex, and return what it printed.
+
+    ``check=False`` also returns the output of a run that exited nonzero, for a
+    command that is meant to fail (``dbt test`` over a failing test).
+    """
 
     executable = shutil.which("dbt")
     if executable is None:
@@ -124,7 +229,7 @@ def dbt(*argv: str, cwd: Path) -> str:
     done = subprocess.run(  # noqa: S603
         [executable, *argv], cwd=cwd, capture_output=True, text=True, check=False
     )
-    if done.returncode:
+    if check and done.returncode:
         raise RuntimeError(f"dbt {' '.join(argv)} failed:\n{done.stdout}{done.stderr}")
     return done.stdout + done.stderr
 
@@ -186,6 +291,27 @@ def _profiles_yml(warehouse: Path) -> str:
     )
 
 
+def _postgres_profiles_yml(target: PostgresTarget) -> str:
+    # The same two targets as on DuckDB. `prod` names a schema nothing creates,
+    # and listing it opens no connection.
+    def output(schema: str) -> dict:
+        return {
+            "type": "postgres",
+            "host": target.host,
+            "port": target.port,
+            "user": target.user,
+            "password": "{{ env_var('PGPASSWORD', '') }}",
+            "dbname": target.dbname,
+            "schema": schema,
+            "threads": 1,
+        }
+
+    outputs = {"dev": output(target.schema), "prod": output("prod")}
+    return yaml.safe_dump(
+        {"shop": {"target": "dev", "outputs": outputs}}, sort_keys=False
+    )
+
+
 def _dbt_project(variant: str) -> dict:
     project: dict = {
         "name": "shop",
@@ -207,16 +333,9 @@ def _dbt_project(variant: str) -> dict:
     return project
 
 
-def elementary_project(tmp_path: Path, variant: str, installed: Path) -> Path:
-    """Write variant ``variant`` under ``tmp_path`` and return the project directory.
+def _raw_orders(tmp_path: Path) -> Path:
+    """Create the DuckDB warehouse with its one raw table and return its path."""
 
-    The warehouse is ``tmp_path / "dev.duckdb"`` and holds only the raw table; the
-    project is parsed and built by whoever asks. ``installed`` is what
-    :func:`install_elementary` returned.
-    """
-
-    if variant not in VARIANTS:
-        raise ValueError(f"no variant {variant!r}; choose from {VARIANTS}")
     duckdb = pytest.importorskip("duckdb")
     warehouse = tmp_path / "dev.duckdb"
     con = duckdb.connect(str(warehouse))
@@ -230,6 +349,33 @@ def elementary_project(tmp_path: Path, variant: str, installed: Path) -> Path:
         "from range(400) t(i)"
     )
     con.close()
+    return warehouse
+
+
+def elementary_project(
+    tmp_path: Path,
+    variant: str,
+    installed: Path,
+    postgres: PostgresTarget | None = None,
+) -> Path:
+    """Write variant ``variant`` under ``tmp_path`` and return the project directory.
+
+    The warehouse is ``tmp_path / "dev.duckdb"`` and holds only the raw table; the
+    project is parsed and built by whoever asks. ``installed`` is what
+    :func:`install_elementary` returned. With ``postgres`` the same variant is
+    written against that server instead: nothing is loaded, the staging model
+    generates the rows the raw table would hold, and the models build into
+    ``postgres.schema``.
+    """
+
+    if variant not in VARIANTS:
+        raise ValueError(f"no variant {variant!r}; choose from {VARIANTS}")
+    if postgres is None:
+        profiles = _profiles_yml(_raw_orders(tmp_path))
+        stg_orders = "select id, cid, amount, status, ordered_at from main.raw_orders\n"
+    else:
+        profiles = _postgres_profiles_yml(postgres)
+        stg_orders = POSTGRES_STG_ORDERS_SQL
 
     project = tmp_path / "analytics"
     (project / "models").mkdir(parents=True)
@@ -237,11 +383,8 @@ def elementary_project(tmp_path: Path, variant: str, installed: Path) -> Path:
     (project / "dbt_project.yml").write_text(
         yaml.safe_dump(_dbt_project(variant), sort_keys=False), encoding="utf-8"
     )
-    (project / "profiles.yml").write_text(_profiles_yml(warehouse), encoding="utf-8")
-    (project / "models" / "stg_orders.sql").write_text(
-        "select id, cid, amount, status, ordered_at from main.raw_orders\n",
-        encoding="utf-8",
-    )
+    (project / "profiles.yml").write_text(profiles, encoding="utf-8")
+    (project / "models" / "stg_orders.sql").write_text(stg_orders, encoding="utf-8")
     (project / "models" / "fct.sql").write_text(MODEL_SQL, encoding="utf-8")
     (project / "models" / "schema.yml").write_text(_schema_yml(), encoding="utf-8")
     if variant == "c":
@@ -314,6 +457,20 @@ def duckdb_census(warehouse: Path) -> dict[Relation, int | None]:
         return census(lambda sql: con.execute(sql).fetchall())
     finally:
         con.close()
+
+
+def postgres_census(dsn: str) -> dict[Relation, int | None]:
+    """:func:`census` over a Postgres database, as the role ``dsn`` names.
+
+    It lists what that role may see, so connect as the role that builds: a
+    read-only role granted nothing in the dev schemas finds them empty. Each
+    statement is its own transaction, because one failed count would otherwise
+    abort the rest and read every later relation as uncountable.
+    """
+
+    psycopg = pytest.importorskip("psycopg")
+    with psycopg.connect(dsn, autocommit=True) as con:
+        return census(lambda sql: con.execute(sql).fetchall())
 
 
 #: One side of a footprint entry: a row count, ``None`` for a relation that is
