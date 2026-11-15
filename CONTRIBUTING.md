@@ -47,6 +47,27 @@ nobody present, put the draft in your report.
 
 ## Development setup
 
+Dex supports **Python 3.11 to 3.14**, and CI tests each of them. Python 3.15 is
+not supported yet: several compiled dependencies (PyYAML, DuckDB, and the
+pydantic-core the dbt adapters pin) ship no 3.15 wheels, so an install there
+builds them from source and fails. `packages/dex-core/.python-version` holds the
+supported range (`>=3.11,<3.15`) rather than one version, so `uv sync` there keeps
+a `.venv` already on a supported Python and otherwise creates one on the newest
+supported Python, downloading it if needed, even when your newest is 3.15;
+`--python 3.12` or any other supported version overrides it. pyenv and mise read
+the same file and expect a single version, so with them set one yourself
+(`pyenv local 3.14`) or let uv choose. The skill
+wrappers carry the same range twice, in their `requires-python` (the wrapper's own
+interpreter) and in `SUPPORTED_PYTHON` (passed to the `uv run` that builds the
+engine's environment, which would otherwise pick the newest Python installed), so
+a user whose newest Python is 3.15 gets a supported one picked for them. The engine's own
+`requires-python` has no ceiling on purpose (a comment in
+`packages/dex-core/pyproject.toml` says why), and
+`packages/dex-core/tests/test_python_support.py` holds every other statement of
+the range to one list. When the weekly `python-next` job in
+`.github/workflows/upstream-deps-canaries.yml` turns green, the next Python's
+wheels exist and the range can be widened.
+
 The engine lives in `packages/dex-core/` and is managed with
 [uv](https://docs.astral.sh/uv/). From that directory, sync the runtime plus the
 DuckDB on-ramp, the BigQuery client (its unit tests run offline against a fake
@@ -666,12 +687,13 @@ for the Snowflake Semantic View source.
 
 We use [Ruff](https://docs.astral.sh/ruff/) as both the linter and the
 formatter. A single `ruff.toml` at the repo root governs the whole tree
-(`packages/`, `skills/`, and `scripts/`), so run Ruff from the repo root:
+(`packages/`, `skills/`, and `scripts/`), so run Ruff from the repo root, at the
+version the lockfile pins (the one CI runs):
 
 ```
-uvx ruff check .          # lint
-uvx ruff check --fix .    # lint and auto-fix
-uvx ruff format .         # format in place
+python3 scripts/uvx_locked.py ruff check .          # lint
+python3 scripts/uvx_locked.py ruff check --fix .    # lint and auto-fix
+python3 scripts/uvx_locked.py ruff format .         # format in place
 ```
 
 ### Set up the pre-commit hook
@@ -820,28 +842,21 @@ replaces the folder.
 - No connector or semantic-layer promises with dates.
 - Demo numbers come from the pinned demo output only.
 
-## Keeping the Ruff version in sync
+## Keeping tool versions in sync
 
-The pinned Ruff version appears in four places that must move together when you
-bump it:
+Ruff and towncrier are pinned in one place: the exact `ruff==<version>` and
+`towncrier==<version>` pins in the `dev` extra of
+`packages/dex-core/pyproject.toml`, and the matching entries in
+`packages/dex-core/uv.lock`. Everything else runs the locked version through
+`scripts/uvx_locked.py`, which reads the lock and calls `uvx <tool>@<version>`:
+the Lint and Changelog workflows, the pre-commit hooks, `scripts/prepare_release.sh`
+and the commands in this guide. `python3 scripts/uvx_locked.py --version ruff`
+prints the version in use.
 
-- `.github/workflows/lint.yml` (the `uvx ruff@<version>` calls)
-- `.pre-commit-config.yaml` (the Ruff hook's `rev:` tag, without its leading `v`)
-- `packages/dex-core/pyproject.toml` (the exact `ruff==<version>` pin in the `dev` extra)
-- `packages/dex-core/uv.lock` (the locked Ruff package version)
-
-The dev extra's exact pin is the source of truth. The consistency test at
-`packages/dex-core/tests/test_ruff_version_pins.py` reads all four surfaces
-without fetching packages or resolving dependencies. Its in-memory fixture
-checks drift reporting without modifying the checkout.
-
-## Keeping the towncrier version in sync
-
-The pinned towncrier version appears in `scripts/prepare_release.sh`,
-`.github/workflows/changelog.yml`, the `towncrier==<version>` pin in the `dev`
-extra of `packages/dex-core/pyproject.toml`, and the commands in this guide and
-in `changelog.d/README.md`. Bump them together; `tests/test_changelog.py` fails
-when any two disagree.
+So a bump is the pin plus `uv lock`, which is exactly the pull request Dependabot's
+`dev-tools` group opens, and nothing else has to move.
+`packages/dex-core/tests/test_tool_version_pins.py` fails if the pin and the lock
+disagree, or if a workflow, hook, script or guide restates a version by hand.
 
 ## Changelog fragments
 
@@ -894,15 +909,15 @@ Create the file in your editor, or with towncrier from the repository root. The
 second command names the file `+<random hex>.fixed.md`:
 
 ```
-uvx towncrier@26.9.0 create --content "**Headline.** What changed." 613.fixed.md
-uvx towncrier@26.9.0 create --content "**Headline.** What changed." +.fixed.md
+python3 scripts/uvx_locked.py towncrier create --content "**Headline.** What changed." 613.fixed.md
+python3 scripts/uvx_locked.py towncrier create --content "**Headline.** What changed." +.fixed.md
 ```
 
 Preview the release notes that the pending fragments produce, and check every
 fragment's name the way CI does:
 
 ```
-uvx towncrier@26.9.0 build --draft --version preview
+python3 scripts/uvx_locked.py towncrier build --draft --version preview
 python3 scripts/check_changelog_fragments.py
 ```
 
@@ -979,7 +994,7 @@ commit:
    badly while it is still a fragment:
 
    ```
-   uvx towncrier@26.9.0 build --draft --version <engine-version>
+   python3 scripts/uvx_locked.py towncrier build --draft --version <engine-version>
    ```
 
 2. Run the release script with the engine version (PEP 440) and the plugin

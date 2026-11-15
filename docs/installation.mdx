@@ -71,6 +71,11 @@ For another warehouse, install its connector extra instead. For example:
 uv tool install "exmergo-dex-core[snowflake]"
 ```
 
+Dex supports Python 3.11 to 3.14, and `uv tool install` uses your newest
+Python. If that is 3.15, which Dex does not support yet, name a supported one:
+`uv tool install --python 3.14 "exmergo-dex-core[duckdb]"`. The agent skills
+pick a supported Python on their own.
+
 If Dex is already installed with a different set of extras, use
 `uv tool install --force` with the complete set you need, such as
 `"exmergo-dex-core[duckdb,snowflake]"`.

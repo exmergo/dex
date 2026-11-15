@@ -7,6 +7,22 @@ name = "exmergo-dex-core"
 dynamic = ["version"]
 description = "Analytics engineering for Claude Code and any agent: data warehouse exploration, dbt transformation and semantic modeling, and schema-drift maintenance on dbt."
 readme = "README.md"
+# Supported and tested: Python 3.11 to 3.14, the classifiers below and the CI
+# matrix. 3.15 is not yet: the stack dex installs ships no 3.15 wheels for
+# several of its compiled dependencies (pyyaml, duckdb and the pydantic-core the
+# dbt adapters pin, as of November 2026), so an install there builds them from
+# source and fails (#1134).
+#
+# The ceiling is deliberately not written here. Under a `<3.15` in published
+# metadata, pip on 3.15 does not refuse: it falls back to the newest older dex
+# release without one and fails on the same builds, now with a stale engine.
+# The bound lives where an interpreter is chosen instead: each skill wrapper's
+# `requires-python` (uv picks or downloads a supported Python there) and the
+# `.python-version` beside this file (what `uv sync` uses for contributors; uv
+# reads it only inside the project, never from the repository root). A test
+# holds the wrappers, the classifiers and the CI matrices to one range, and the
+# `python-next` job in upstream-deps-canaries.yml reports when the next
+# Python's wheels exist.
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]

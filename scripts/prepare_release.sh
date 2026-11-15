@@ -44,7 +44,9 @@
 # plugin version is semver, distinct from the engine's PEP 440 string, so it is set
 # explicitly rather than copied (0.1.0a1 is valid PEP 440 but not valid semver).
 #
-# Towncrier renders the notes, fetched by uvx at the version pinned below. Setting
+# Towncrier renders the notes, fetched by uvx at the version packages/dex-core/uv.lock
+# pins (scripts/uvx_locked.py reads it, so the release runs the towncrier CI and
+# the tests run, and a Dependabot bump of it needs no edit here). Setting
 # TOWNCRIER replaces that command, for example with an installed
 # `python -m towncrier`; the test suite does this so it needs no network.
 set -euo pipefail
@@ -55,7 +57,11 @@ ENGINE_VERSION="${ENGINE_VERSION#v}"
 PLUGIN_VERSION="${2:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RELEASE_DATE="$(date -u +%Y-%m-%d)"
-read -r -a TOWNCRIER_CMD <<<"${TOWNCRIER:-uvx towncrier@26.9.0}"
+if [[ -n "${TOWNCRIER:-}" ]]; then
+  read -r -a TOWNCRIER_CMD <<<"${TOWNCRIER}"
+else
+  TOWNCRIER_CMD=(python3 "${ROOT}/scripts/uvx_locked.py" towncrier)
+fi
 
 CHANGELOG="${ROOT}/CHANGELOG.md"
 FRAGMENTS="${ROOT}/changelog.d"
