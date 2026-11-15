@@ -2590,6 +2590,10 @@ class JoinCandidate:
     #: ``left join orders_by_customer o``), so its outputs can be traced to the
     #: final output columns through :attr:`ModelJoinContext.projected`.
     to_alias: str = field(default="", compare=False)
+    #: The query scope the join is written in, by ``id()`` of its SELECT node
+    #: in the parsed tree (#1324). An alias alone is not an identity: an inner
+    #: CTE and the final query can both call a relation ``g``.
+    scope_id: int = field(default=0, compare=False, repr=False)
 
     def scope_filters(self) -> tuple[str | None, str | None] | None:
         """Each side's filters joined into one predicate, or None where neither
@@ -3577,6 +3581,7 @@ def _model_joins(
                         to_grouped=to_grouped,
                         to_grouped_outputs=to_grouped_outputs if to_grouped else (),
                         to_alias=join_alias,
+                        scope_id=id(current),
                     )
                 )
 
@@ -3650,11 +3655,13 @@ class ModelJoinContext:
     parents: dict[str, str] = field(default_factory=dict)
     assumptions: list[dict] = field(default_factory=list)
     population_filters: tuple[str, ...] = ()
-    #: Per ``(join alias, grouped output column)``, the final output names the
-    #: model projects it as (#1324). An aggregate inside a grouped CTE has no
-    #: physical column, so this is how its provenance reaches the model's own
-    #: columns, where a declaration can name it.
-    projected: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+    #: Per ``(query scope, join alias, grouped output column)``, the final
+    #: output names the model projects it as (#1324). An aggregate inside a
+    #: grouped CTE has no physical column, so this is how its provenance
+    #: reaches the model's own columns, where a declaration can name it. The
+    #: scope identity keeps an alias in an inner CTE apart from the same alias
+    #: reused by the final query.
+    projected: dict[tuple[int, str, str], tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -3835,18 +3842,22 @@ def _output_lineage(tree, sql_shape, depth: int = 0) -> dict[str, tuple[str, str
     return _select_lineage(tree, cte_scopes, sql_shape, depth, root)
 
 
-def _final_output_map(tree, depth: int = 0) -> dict[tuple[str, str], tuple[str, ...]]:
-    """Each ``(join alias, column)`` the model's final SELECT names, mapped to
-    the output column(s) it is projected as (#1324).
+def _final_output_map(
+    tree, depth: int = 0
+) -> dict[tuple[int, str, str], tuple[str, ...]]:
+    """Each ``(query scope, join alias, column)`` the model's final SELECT
+    names, mapped to the output column(s) it is projected as (#1324).
 
     A grouped CTE's aggregate output (``sum(amount) as total``) has no
     physical column, so its provenance is known only here: the model may
-    project it as ``spend``, or not at all. Only a bare column (optionally
-    aliased) is mapped: a computed output such as ``coalesce(o.total, 0) as
-    spend`` is not NULL when the group is missing, so it must not make the
-    join required. A star over one CTE follows that CTE's own projections;
-    a star over a join, a set operation or a projection mixing aliases
-    contributes nothing.
+    project it as ``spend``, or not at all. The scope is the ``id()`` of the
+    SELECT that writes the projection, so an inner join's ``g`` cannot be
+    mistaken for another relation the final query also calls ``g``. Only a
+    bare column (optionally aliased) is mapped: a computed output such as
+    ``coalesce(o.total, 0) as spend`` is not NULL when the group is missing,
+    so it must not make the join required. A star over one CTE follows that
+    CTE's own projections; a star over a join, a set operation or a
+    projection mixing aliases contributes nothing.
     """
 
     from sqlglot import expressions as exp
@@ -3859,7 +3870,7 @@ def _final_output_map(tree, depth: int = 0) -> dict[tuple[str, str], tuple[str, 
         if with_clause is not None
         else {}
     )
-    names: dict[tuple[str, str], list[str]] = {}
+    names: dict[tuple[int, str, str], list[str]] = {}
     for projection in tree.expressions:
         if isinstance(projection, exp.Star):
             if tree.args.get("joins"):
@@ -3892,7 +3903,7 @@ def _final_output_map(tree, depth: int = 0) -> dict[tuple[str, str], tuple[str, 
         table = (column.table or "").replace('"', "").replace("`", "").lower()
         if not table:
             continue
-        key = (table, column.name.lower())
+        key = (id(tree), table, column.name.lower())
         outputs = names.setdefault(key, [])
         if output not in outputs:
             outputs.append(output)
@@ -4012,7 +4023,9 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
         # model reads them through, projected to the model's own output names
         # (#1324). An aggregate the model does not project contributes nothing.
         for column in candidate.to_grouped_outputs:
-            supplied.update(ctx.projected.get((candidate.to_alias, column), ()))
+            supplied.update(
+                ctx.projected.get((candidate.scope_id, candidate.to_alias, column), ())
+            )
     derived = tuple(sorted(supplied))
     driving = tuple(
         sorted(

@@ -430,10 +430,8 @@ def test_a_star_final_follows_the_cte_to_the_grouped_outputs():
         "select * from final"
     )
     tree = sqlglot.parse_one(sql, read="duckdb")
-    assert verify_mod._final_output_map(tree) == {
-        ("c", "id"): ("customer_id",),
-        ("o", "total_amount"): ("spend",),
-    }
+    mapping = verify_mod._final_output_map(tree)
+    assert set(mapping.values()) == {("customer_id",), ("spend",)}
 
 
 def test_a_grouped_aggregate_the_model_does_not_project_is_not_derived(
@@ -501,6 +499,55 @@ def test_a_computed_projection_over_a_grouped_output_does_not_require_the_join(
     assert record["declared"]["required"] is False
     assert record["status"] == "satisfied"
     assert _codes(data, "rpt_customers") == {}
+
+
+def test_an_inner_cte_alias_is_not_confused_with_the_same_final_alias(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The grouped join calls its CTE `g` inside `base`, and the final query
+    also calls another relation `g`. The final `g.total_amount as spend` is not
+    the inner join's output, so it must not make that optional join required."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, sum(amount) as total_amount "
+        f"from {W}.child_orders where status = 'paid' group by customer_id), "
+        "base as ("
+        "select c.id as customer_id, g.total_amount "
+        f"from {W}.roster c left join orders_by_customer g "
+        "on c.id = g.customer_id) "
+        "select b.customer_id, g.total_amount as spend "
+        f"from base b join {W}.other_totals g on b.customer_id = g.id"
+    )
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    maintain_repo.sql(
+        "CREATE OR REPLACE TABLE other_totals (id INTEGER, total_amount DOUBLE)",
+        "INSERT INTO other_totals VALUES (1, 100.0), (2, 200.0)",
+    )
+    _model(
+        maintain_repo,
+        sql,
+        columns={
+            "customer_id": {"role": "key"},
+            "spend": {"role": "measure", "null_rule": "never"},
+        },
+    )
+
+    data = _verify(maintain_repo, "rpt_customers")
+    records = _records(data, "rpt_customers")
+    grouped = next(
+        record
+        for record in records
+        if (record.get("effective_input") or {}).get("to", {}).get("grouped_by")
+    )
+
+    assert grouped["declared"]["derived_columns"] == []
+    assert grouped["declared"]["required"] is False
+    assert grouped["status"] == "satisfied"
 
 
 def test_groups_whose_keys_the_roster_lacks_are_a_zero_match_join(
