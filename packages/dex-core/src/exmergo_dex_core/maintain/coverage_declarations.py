@@ -154,6 +154,27 @@ class _Tests:
                 return name
         return None
 
+    def _resolve(self, package: str | None, name: str, *, near: str) -> str | None:
+        """The model unique id ``ref(package, name)`` resolves to, read from
+        ``near``'s side: an unqualified name is the model's own package first,
+        then the only model of that name anywhere."""
+
+        key = name.lower()
+        found = [
+            uid
+            for uid, label in self.labels.items()
+            if label.lower() == key or label.split(".", 1)[0].lower() == key
+        ]
+        if package is not None:
+            found = [uid for uid in found if self.packages.get(uid) == package]
+            return found[0] if len(found) == 1 else None
+        own = [
+            uid for uid in found if self.packages.get(uid) == self.packages.get(near)
+        ]
+        if len(own) == 1:
+            return own[0]
+        return found[0] if len(found) == 1 else None
+
     def relationship(
         self,
         model: str,
@@ -179,31 +200,38 @@ class _Tests:
                 continue
             if parent is None:
                 return True
-            wanted = parent.lower()
+            wanted = self._resolve(None, parent, near=model)
             target = _ref_target(kwargs.get("to"))
             if target is not None:
-                package, target_name = target
-                # A declaration names a model of this project: `ref('pkg',
-                # 'nodes')` is another model when `pkg` is not this project.
-                if (
-                    package is None or package == self.packages.get(model)
-                ) and target_name.lower() == wanted.split(".", 1)[0]:
+                # Compared as manifest identities: a package-qualified ref
+                # matches a package-only parent and never a same-named model
+                # of another package.
+                if wanted is not None and self._resolve(*target, near=model) == wanted:
+                    return True
+                if wanted is None and target[1].lower() == parent.lower():
                     return True
                 continue
             # No readable `to`: the target is what the test reads besides the
             # child, and the child itself only when it reads nothing else.
             targets = [uid for uid in reads if uid != model] or [model]
+            if wanted is not None:
+                if wanted in targets:
+                    return True
+                continue
             if any(
-                self.labels.get(uid, "").lower() == wanted
-                or self.labels.get(uid, "").split(".", 1)[0].lower() == wanted
+                self.labels.get(uid, "").lower() == parent.lower()
+                or self.labels.get(uid, "").split(".", 1)[0].lower() == parent.lower()
                 for uid in targets
             ):
                 return True
         return False
 
 
+#: The whole ``to`` is one ``ref()``, optionally inside ``{{ }}``: anything
+#: else (a conditional, a filter, a concatenation) is not read as a target.
 _REF = re.compile(
     r"""^\s*(?:\{\{\s*)?ref\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]+)['"]\s*)?\)"""
+    r"""\s*(?:\}\}\s*)?$"""
 )
 
 

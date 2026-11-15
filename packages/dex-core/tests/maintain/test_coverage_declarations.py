@@ -406,3 +406,50 @@ def test_a_package_qualified_ref_to_a_same_named_model_does_not_check() -> None:
         "dbt_test",
         "both",
     }
+
+
+def test_a_package_only_parent_matches_its_package_qualified_ref() -> None:
+    manifest = _manifest(
+        [_model("orders", columns={"customer_id": {"references": "customers.id"}})],
+        [
+            _test(
+                "relationships",
+                "orders",
+                "customer_id",
+                reads=["orders"],
+                kwargs={"to": "ref('crm', 'customers')", "field": "id"},
+            )
+        ],
+    )
+    # The parent lives only in the installed package `crm`.
+    package_model = _model("customers")
+    package_model["package_name"] = "crm"
+    manifest["nodes"]["model.crm.customers"] = package_model
+    fact = _fact(_run(manifest), "references", "customer_id")
+    assert fact["tests"] == ["relationships"]
+
+
+def test_a_conditional_to_expression_is_not_read_as_its_first_ref() -> None:
+    manifest = _manifest(
+        [
+            _model("customers"),
+            _model("vendors"),
+            _model(
+                "orders",
+                columns={"customer_id": {"references": "customers.id"}},
+            ),
+        ],
+        [
+            _test(
+                "relationships",
+                "orders",
+                "customer_id",
+                reads=["orders", "vendors"],
+                kwargs={
+                    "to": "{{ ref('customers') if false else ref('vendors') }}",
+                    "field": "id",
+                },
+            )
+        ],
+    )
+    assert _fact(_run(manifest), "references", "customer_id")["checked_by"] == "none"
