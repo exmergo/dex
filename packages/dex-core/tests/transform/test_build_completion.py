@@ -794,3 +794,105 @@ def test_an_unrecognized_deliverable_survives_the_4_kib_cut():
     completion = summarize_completion(evidence, None)
     assert completion.size() <= COMPLETION_BUDGET_BYTES
     assert completion.deliverables.unrecognized.names == [REPORT]
+
+
+def test_a_plan_that_only_adds_tests_establishes_coverage_when_tests_pass():
+    nodes = [
+        BuildNode(
+            unique_id="test.dex_test.assert_orders_have_ids",
+            name="assert_orders_have_ids",
+            resource_type="test",
+            status="pass",
+        )
+    ]
+    evidence = _evidence(nodes, required=["assert_orders_have_ids"])
+    completion = summarize_completion(evidence, None)
+    assert completion.outcome == "validated"
+    assert completion.deliverables.coverage == "known"
+    assert completion.deliverables.required == 1
+    assert completion.deliverables.built.names == ["assert_orders_have_ids"]
+    assert completion.deliverables.failed.count == 0
+    assert completion.deliverables.missing.count == 0
+    # Model execution and assertion evidence remain separate
+    assert completion.assurance.asserted.count == 0
+    assert completion.assurance.build_only.count == 0
+
+
+def test_an_unrelated_model_build_does_not_satisfy_a_test_only_plan():
+    nodes = [
+        BuildNode(
+            unique_id=_uid(REPORT),
+            name=REPORT,
+            resource_type="model",
+            status="success",
+        )
+    ]
+    evidence = _evidence(nodes, required=["assert_orders_have_ids"])
+    completion = summarize_completion(evidence, None)
+    assert completion.outcome == "unrelated"
+    assert completion.deliverables.coverage == "known"
+    assert completion.deliverables.required == 1
+    assert completion.deliverables.built.count == 0
+    assert completion.deliverables.missing.names == ["assert_orders_have_ids"]
+
+
+def test_a_failed_test_in_a_test_only_plan_is_reported_explicitly():
+    nodes = [
+        BuildNode(
+            unique_id="test.dex_test.assert_orders_have_ids",
+            name="assert_orders_have_ids",
+            resource_type="test",
+            status="fail",
+        )
+    ]
+    evidence = _evidence(nodes, required=["assert_orders_have_ids"])
+    completion = summarize_completion(evidence, None)
+    assert completion.outcome == "failed"
+    assert completion.deliverables.failed.names == ["assert_orders_have_ids"]
+    assert [(b.deliverable, b.status) for b in completion.deliverables.blocked] == [
+        ("assert_orders_have_ids", "fail")
+    ]
+    assert completion.blockers[0].node == "assert_orders_have_ids"
+    assert completion.blockers[0].status == "fail"
+
+
+def test_a_skipped_test_in_a_test_only_plan_names_the_failed_ancestor():
+    nodes = [
+        BuildNode(
+            unique_id=_uid(REPORT),
+            name=REPORT,
+            resource_type="model",
+            status="error",
+        ),
+        BuildNode(
+            unique_id="test.dex_test.assert_orders_have_ids",
+            name="assert_orders_have_ids",
+            resource_type="test",
+            status="skipped",
+        ),
+    ]
+    evidence = _evidence(nodes, required=["assert_orders_have_ids"])
+    graph = {"test.dex_test.assert_orders_have_ids": [_uid(REPORT)]}
+    completion = summarize_completion(evidence, None, graph=graph)
+    assert completion.outcome == "failed"
+    assert completion.deliverables.skipped.names == ["assert_orders_have_ids"]
+    assert [
+        (b.deliverable, b.status, b.cause) for b in completion.deliverables.blocked
+    ] == [("assert_orders_have_ids", "skipped", REPORT)]
+
+
+def test_native_unit_test_deliverable_passes_without_rebuilding_model():
+    nodes = [
+        BuildNode(
+            unique_id="unit_test.dex_test.stg_orders.test_orders_atomic",
+            name="test_orders_atomic",
+            resource_type="unit_test",
+            status="pass",
+        )
+    ]
+    evidence = _evidence(nodes, required=["test_orders_atomic"])
+    completion = summarize_completion(evidence, None)
+    assert completion.outcome == "validated"
+    assert completion.deliverables.built.names == ["test_orders_atomic"]
+    assert "stg_orders" not in completion.deliverables.built.names
+    assert "stg_orders" not in completion.assurance.build_only.names

@@ -825,3 +825,300 @@ def test_one_disabled_version_does_not_excuse_the_enabled_one():
         },
     }
     assert _disabled_models(manifest) == {"dim_teams.v2"}
+
+
+def test_required_nodes_resolves_singular_test_edits(project):
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content=(
+                "select order_id from {{ ref('stg_orders') }} where order_id is null"
+            ),
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    required, basis, undetermined = required_nodes(edits, project)
+    assert required == ["assert_orders_have_ids"]
+    assert undetermined is False
+    assert any("runs test 'assert_orders_have_ids'" in line for line in basis)
+
+
+def test_required_nodes_resolves_singular_test_in_configured_test_paths(tmp_path):
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: p\nversion: "1.0.0"\ntest-paths: ["assertions"]\n',
+        encoding="utf-8",
+    )
+    edits = [
+        PlanEdit(
+            path="assertions/assert_totals_reconcile.sql",
+            new_content="select 1 where false",
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    required, basis, undetermined = required_nodes(edits, tmp_path)
+    assert required == ["assert_totals_reconcile"]
+    assert undetermined is False
+    assert any("runs test 'assert_totals_reconcile'" in line for line in basis)
+
+
+def test_required_nodes_treats_generic_test_macro_as_undetermined(project):
+    edits = [
+        PlanEdit(
+            path="tests/generic/not_negative.sql",
+            new_content=(
+                "{% test not_negative(model, column_name) %}"
+                "select * from {{ model }} where {{ column_name }} < 0"
+                "{% endtest %}"
+            ),
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    required, basis, undetermined = required_nodes(edits, project)
+    assert required == []
+    assert undetermined is True
+    assert any(
+        "a generic test definition can affect any node" in line for line in basis
+    )
+
+
+def test_required_nodes_resolves_native_unit_tests(project):
+    yaml_content = (
+        "version: 2\n"
+        "unit_tests:\n"
+        "  - name: test_orders_atomic\n"
+        "    model: stg_orders\n"
+        "    given: []\n"
+        "    expect:\n"
+        "      rows: []\n"
+    )
+    edits = [
+        PlanEdit(
+            path="models/staging/test_stg_orders.yml",
+            new_content=yaml_content,
+            op=EditOp.UPSERT,
+            kind=EditKind.SCHEMA_YML,
+        )
+    ]
+    required, basis, undetermined = required_nodes(edits, project)
+    assert required == ["test_orders_atomic"]
+    assert undetermined is False
+    assert any("documents test_orders_atomic" in line for line in basis)
+
+
+def test_required_nodes_resolves_mixed_models_and_unit_tests(project):
+    yaml_content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_orders\n"
+        "unit_tests:\n"
+        "  - name: test_orders_atomic\n"
+        "    model: stg_orders\n"
+    )
+    edits = [
+        PlanEdit(
+            path="models/staging/schema.yml",
+            new_content=yaml_content,
+            op=EditOp.UPSERT,
+            kind=EditKind.SCHEMA_YML,
+        )
+    ]
+    required, _basis, undetermined = required_nodes(edits, project)
+    assert required == ["stg_orders", "test_orders_atomic"]
+    assert undetermined is False
+
+
+def test_build_evidence_validates_when_all_required_tests_pass(project):
+    content = "select 1"
+    test_path = project / "tests" / "assert_orders_have_ids.sql"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text(content, encoding="utf-8")
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content=content,
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    test_uid = "test.shop.assert_orders_have_ids"
+    write_manifest_nodes(
+        project,
+        {
+            test_uid: {
+                "name": "assert_orders_have_ids",
+                "resource_type": "test",
+            }
+        },
+    )
+    write_run_results(project, [{"unique_id": test_uid, "status": "pass"}])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.VALIDATED
+    assert evidence.coverage.required == ["assert_orders_have_ids"]
+    assert evidence.coverage.built == ["assert_orders_have_ids"]
+    assert evidence.coverage.not_built == []
+    assert evidence.coverage.missing == []
+    # Test execution produces no relation
+    assert evidence.generated == []
+
+
+def test_build_evidence_treats_warning_test_as_passed(project):
+    content = "select 1"
+    test_path = project / "tests" / "assert_orders_have_ids.sql"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text(content, encoding="utf-8")
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content=content,
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    test_uid = "test.shop.assert_orders_have_ids"
+    write_manifest_nodes(
+        project,
+        {
+            test_uid: {
+                "name": "assert_orders_have_ids",
+                "resource_type": "test",
+            }
+        },
+    )
+    write_run_results(project, [{"unique_id": test_uid, "status": "warn"}])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.VALIDATED
+    assert evidence.coverage.built == ["assert_orders_have_ids"]
+
+
+def test_build_evidence_fails_when_required_test_fails(project):
+    content = "select 1"
+    test_path = project / "tests" / "assert_orders_have_ids.sql"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text(content, encoding="utf-8")
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content=content,
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    test_uid = "test.shop.assert_orders_have_ids"
+    write_manifest_nodes(
+        project,
+        {
+            test_uid: {
+                "name": "assert_orders_have_ids",
+                "resource_type": "test",
+            }
+        },
+    )
+    write_run_results(project, [{"unique_id": test_uid, "status": "fail"}])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.FAILED
+    assert evidence.coverage.required == ["assert_orders_have_ids"]
+    assert evidence.coverage.built == []
+    assert evidence.coverage.not_built == ["assert_orders_have_ids"]
+    assert len(evidence.errors) == 1
+    assert evidence.errors[0]["node"] == "assert_orders_have_ids"
+
+
+def test_build_evidence_reports_unrelated_when_only_models_built_for_test_plan(project):
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content="select 1",
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    write_manifest_nodes(
+        project,
+        {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+            }
+        },
+    )
+    write_run_results(project, [node("stg_orders", status="success")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.UNRELATED
+    assert evidence.coverage.required == ["assert_orders_have_ids"]
+    assert evidence.coverage.covered == []
+    assert evidence.coverage.missing == ["assert_orders_have_ids"]
+
+
+def test_build_evidence_reports_partial_when_required_test_skipped(project):
+    content = "select 1"
+    test_path = project / "tests" / "assert_orders_have_ids.sql"
+    test_path.parent.mkdir(parents=True, exist_ok=True)
+    test_path.write_text(content, encoding="utf-8")
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content=content,
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    test_uid = "test.shop.assert_orders_have_ids"
+    model_uid = "model.shop.stg_orders"
+    write_manifest_nodes(
+        project,
+        {
+            test_uid: {
+                "name": "assert_orders_have_ids",
+                "resource_type": "test",
+            },
+            model_uid: {
+                "name": "stg_orders",
+                "resource_type": "model",
+            },
+        },
+    )
+    write_run_results(
+        project,
+        [
+            node("stg_orders", status="success"),
+            {"unique_id": test_uid, "status": "skipped"},
+        ],
+    )
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.PARTIAL
+    assert evidence.coverage.required == ["assert_orders_have_ids"]
+    assert evidence.coverage.built == []
+    assert evidence.coverage.not_built == ["assert_orders_have_ids"]
+
+
+def test_build_evidence_reports_disabled_test_as_missing(project):
+    edits = [
+        PlanEdit(
+            path="tests/assert_orders_have_ids.sql",
+            new_content="select 1",
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    # Test is disabled in manifest, not executed, so not in run results
+    manifest = {
+        "nodes": {
+            "model.shop.stg_orders": {
+                "name": "stg_orders",
+                "resource_type": "model",
+            }
+        },
+        "disabled": {
+            "test.shop.assert_orders_have_ids": [{"name": "assert_orders_have_ids"}],
+        },
+    }
+    manifest_path = project / "target" / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    write_run_results(project, [node("stg_orders", status="success")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.UNRELATED
+    assert evidence.coverage.required == ["assert_orders_have_ids"]
+    assert evidence.coverage.missing == ["assert_orders_have_ids"]

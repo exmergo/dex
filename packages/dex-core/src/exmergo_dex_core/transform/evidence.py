@@ -374,6 +374,21 @@ def required_nodes(
             required.add(name)
             basis.append(f"{edit.path}: builds '{name}'")
             continue
+        if edit.kind is EditKind.TEST_SQL:
+            from .validate import _TEST_CLOSE, _TEST_OPEN
+
+            content = edit.new_content or ""
+            if _TEST_OPEN.search(content) or _TEST_CLOSE.search(content):
+                undetermined_edits = True
+                basis.append(
+                    f"{edit.path}: a generic test definition can affect any node, "
+                    "so it requires none in particular"
+                )
+                continue
+            name = node_name(edit.path)
+            required.add(name)
+            basis.append(f"{edit.path}: runs test '{name}'")
+            continue
         if edit.kind in {EditKind.SCHEMA_YML, EditKind.SEMANTIC_YML}:
             named, detail, unresolved = _requirements_from_yaml(
                 edit.new_content or "",
@@ -552,47 +567,52 @@ def _requirements_from_yaml(
     from ..dbt_project import REF_PATTERN
 
     try:
-        document = yaml.safe_load(content)
+        documents = [d for d in yaml.safe_load_all(content) if isinstance(d, dict)]
     except yaml.YAMLError:
         return set(), "names no buildable node", True
-    if not isinstance(document, dict):
+    if not documents:
         return set(), "names no buildable node", True
 
     names: set[str] = set()
-    for key in ("models", "seeds", "snapshots"):
-        for entry in document.get(key) or []:
+    for document in documents:
+        for key in ("models", "seeds", "snapshots"):
+            for entry in document.get(key) or []:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    names.add(entry["name"])
+        for entry in document.get("semantic_models") or []:
+            if not isinstance(entry, dict):
+                continue
+            model = entry.get("model")
+            if isinstance(model, str):
+                match = REF_PATTERN.search(model)
+                if match:
+                    names.add(match.group(1))
+        for entry in document.get("unit_tests") or []:
             if isinstance(entry, dict) and isinstance(entry.get("name"), str):
                 names.add(entry["name"])
-    for entry in document.get("semantic_models") or []:
-        if not isinstance(entry, dict):
-            continue
-        model = entry.get("model")
-        if isinstance(model, str):
-            match = REF_PATTERN.search(model)
-            if match:
-                names.add(match.group(1))
 
     unresolved_metrics: list[str] = []
     metric_models: set[str] = set()
-    for entry in document.get("metrics") or []:
-        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-            continue
-        metric_name = entry["name"]
-        # Prefer the edit's own body for this metric's inputs.
-        local_defs = dict(metric_defs)
-        local_defs[metric_name] = entry
-        grounded = _grounded_measures(metric_name, local_defs)
-        if not grounded:
-            unresolved_metrics.append(metric_name)
-            continue
-        found_any = False
-        for measure in grounded:
-            owner = measure_owners.get(measure)
-            if owner:
-                metric_models.add(owner)
-                found_any = True
-        if not found_any:
-            unresolved_metrics.append(metric_name)
+    for document in documents:
+        for entry in document.get("metrics") or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                continue
+            metric_name = entry["name"]
+            # Prefer the edit's own body for this metric's inputs.
+            local_defs = dict(metric_defs)
+            local_defs[metric_name] = entry
+            grounded = _grounded_measures(metric_name, local_defs)
+            if not grounded:
+                unresolved_metrics.append(metric_name)
+                continue
+            found_any = False
+            for measure in grounded:
+                owner = measure_owners.get(measure)
+                if owner:
+                    metric_models.add(owner)
+                    found_any = True
+            if not found_any:
+                unresolved_metrics.append(metric_name)
 
     names.update(metric_models)
     if names and not unresolved_metrics:
@@ -871,7 +891,10 @@ def build_evidence(
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             manifest = {}
-    manifest_nodes = manifest.get("nodes") or {}
+    manifest_nodes = {
+        **(manifest.get("nodes") or {}),
+        **(manifest.get("unit_tests") or {}),
+    }
 
     nodes: list[BuildNode] = []
     # Every name a built node answers to, not only its label: a selector or an
@@ -888,10 +911,14 @@ def build_evidence(
         config = node.get("config") if isinstance(node.get("config"), dict) else {}
         relation = node.get("relation_name")
         status = str(result.get("status") or "unknown")
+        is_test = node.get("resource_type") in {
+            "test",
+            "unit_test",
+        } or unique_id.startswith(("test.", "unit_test."))
         built = BuildNode(
             unique_id=unique_id,
             name=manifest_node_label(unique_id, node or None),
-            resource_type=node.get("resource_type"),
+            resource_type=node.get("resource_type") or ("test" if is_test else None),
             status=status,
             execution_time=result.get("execution_time"),
             materialization=(config or {}).get("materialized"),
@@ -912,7 +939,12 @@ def build_evidence(
         ):
             node_answers.add(node_name(node["original_file_path"]))
         answers.update(node_answers)
-        if status.lower() != BUILT_STATUS:
+        is_successful = (
+            status_kind(status) == "succeeded"
+            if is_test
+            else (status.lower() == BUILT_STATUS)
+        )
+        if not is_successful:
             unsuccessful_answers.update(node_answers)
         if status.lower() in FAILED_STATUSES:
             errors.append({"node": built.name, "message": built.message or status})
