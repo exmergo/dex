@@ -2470,56 +2470,83 @@ def _link_covered_advisories(
                 tbl = (m.get("table") or model_name).lower()
                 mem_name = (m.get("name") or "").lower()
                 if mem_name:
-                    removed_members.add((tbl, mem_name))
-                    removed_members.add(("", mem_name))
+                    if tbl:
+                        removed_members.add((tbl, mem_name))
+                        if model_file:
+                            file_for_member[(tbl, mem_name)] = model_file
                     if model_name:
                         removed_members.add((model_name, mem_name))
-                    if model_file:
-                        file_for_member[(tbl, mem_name)] = model_file
-                        file_for_member[("", mem_name)] = model_file
-                        if model_name:
+                        if model_file:
                             file_for_member[(model_name, mem_name)] = model_file
+                    if model_name and tbl and model_name != tbl:
+                        qualified = f"{model_name}.{tbl}"
+                        removed_members.add((qualified, mem_name))
+                        if model_file:
+                            file_for_member[(qualified, mem_name)] = model_file
+                    if not tbl and not model_name:
+                        removed_members.add(("", mem_name))
+                        if model_file:
+                            file_for_member[("", mem_name)] = model_file
 
         for rel in removal.get("relationships") or []:
             if isinstance(rel, str):
                 rel_lower = rel.lower()
-                removed_relationships.add(rel_lower)
-                if model_file:
-                    file_for_rel[rel_lower] = model_file
+                if model_name:
+                    removed_relationships.add((model_name, rel_lower))
+                    if model_file:
+                        file_for_rel[(model_name, rel_lower)] = model_file
+                else:
+                    removed_relationships.add(("", rel_lower))
+                    if model_file:
+                        file_for_rel[("", rel_lower)] = model_file
 
         for field in removal.get("fields") or []:
             if isinstance(field, str):
                 f_lower = field.lower()
-                removed_members.add((model_name, f_lower))
-                removed_members.add(("", f_lower))
-                if model_file:
-                    file_for_member[(model_name, f_lower)] = model_file
-                    file_for_member[("", f_lower)] = model_file
+                if model_name:
+                    removed_members.add((model_name, f_lower))
+                    if model_file:
+                        file_for_member[(model_name, f_lower)] = model_file
+                else:
+                    removed_members.add(("", f_lower))
+                    if model_file:
+                        file_for_member[("", f_lower)] = model_file
 
         for meas in removal.get("measures") or []:
             if isinstance(meas, str):
                 m_lower = meas.lower()
-                removed_members.add((model_name, m_lower))
-                removed_members.add(("", m_lower))
-                if model_file:
-                    file_for_member[(model_name, m_lower)] = model_file
-                    file_for_member[("", m_lower)] = model_file
+                if model_name:
+                    removed_members.add((model_name, m_lower))
+                    if model_file:
+                        file_for_member[(model_name, m_lower)] = model_file
+                else:
+                    removed_members.add(("", m_lower))
+                    if model_file:
+                        file_for_member[("", m_lower)] = model_file
 
         for dim in removal.get("dimensions") or []:
             if isinstance(dim, str):
                 d_lower = dim.lower()
-                removed_members.add((model_name, d_lower))
-                removed_members.add(("", d_lower))
-                if model_file:
-                    file_for_member[(model_name, d_lower)] = model_file
-                    file_for_member[("", d_lower)] = model_file
+                if model_name:
+                    removed_members.add((model_name, d_lower))
+                    if model_file:
+                        file_for_member[(model_name, d_lower)] = model_file
+                else:
+                    removed_members.add(("", d_lower))
+                    if model_file:
+                        file_for_member[("", d_lower)] = model_file
 
         for join in removal.get("joins") or []:
             if isinstance(join, str):
                 j_lower = join.lower()
-                removed_relationships.add(j_lower)
-                if model_file:
-                    file_for_rel[j_lower] = model_file
+                if model_name:
+                    removed_relationships.add((model_name, j_lower))
+                    if model_file:
+                        file_for_rel[(model_name, j_lower)] = model_file
+                else:
+                    removed_relationships.add(("", j_lower))
+                    if model_file:
+                        file_for_rel[("", j_lower)] = model_file
 
     for proposal in advisory_proposals:
         if proposal.kind != "advisory" or proposal.axis != "semantic":
@@ -2535,27 +2562,35 @@ def _link_covered_advisories(
             sm = (f.data.get("semantic_model") or "").lower()
             name = (f.data.get("name") or "").lower()
             metric = (f.data.get("metric") or "").lower()
+            sm_cands = [sm, sm.rsplit(".", 1)[-1]] if sm else [""]
             candidates = [name, name.rsplit(".", 1)[-1]] if name else []
-            for cand in candidates:
-                if (sm, cand) in removed_members or ("", cand) in removed_members:
-                    matched_file = file_for_member.get(
-                        (sm, cand)
-                    ) or file_for_member.get(("", cand))
+            for s in sm_cands:
+                for cand in candidates:
+                    if (s, cand) in removed_members:
+                        matched_file = file_for_member.get((s, cand))
+                        break
+                if matched_file is not None:
                     break
             if matched_file is None and metric:
                 metric_cands = [metric, metric.rsplit(".", 1)[-1]]
-                for cand in metric_cands:
-                    if (sm, cand) in removed_members or ("", cand) in removed_members:
-                        matched_file = file_for_member.get(
-                            (sm, cand)
-                        ) or file_for_member.get(("", cand))
+                for s in sm_cands:
+                    for cand in metric_cands:
+                        if (s, cand) in removed_members:
+                            matched_file = file_for_member.get((s, cand))
+                            break
+                    if matched_file is not None:
                         break
         elif f.code == "broken_relationship":
+            sm = (f.data.get("semantic_model") or "").lower()
             rel = (f.data.get("relationship") or "").lower()
+            sm_cands = [sm, sm.rsplit(".", 1)[-1]] if sm else [""]
             rel_cands = [rel, rel.rsplit(".", 1)[-1]] if rel else []
-            for cand in rel_cands:
-                if cand in removed_relationships:
-                    matched_file = file_for_rel.get(cand)
+            for s in sm_cands:
+                for cand in rel_cands:
+                    if (s, cand) in removed_relationships:
+                        matched_file = file_for_rel.get((s, cand))
+                        break
+                if matched_file is not None:
                     break
 
         if matched_file is not None:

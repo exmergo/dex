@@ -989,3 +989,59 @@ def test_reconcile_refused_repair_leaves_advisories_uncovered(warehouse, capsys)
     assert all("covered by" not in p["action"] for p in proposals)
     assert data.get("mechanical_count", 0) == 0
     assert data["advisory_count"] == len(proposals)
+
+
+def test_reconcile_does_not_claim_coverage_for_same_named_member_in_other_view(
+    warehouse, capsys
+):
+    """Removing a member in one view does not claim coverage for another."""
+
+    _sql(
+        warehouse,
+        "CREATE TABLE refunds (refund_id INTEGER, refund_amount DOUBLE)",
+        "INSERT INTO refunds VALUES (1, 5.0)",
+    )
+    refunds_yaml = """\
+name: refunds
+description: Customer refunds.
+tables:
+  - name: refunds
+    base_table:
+      database: demo
+      schema: main
+      table: refunds
+    primary_key:
+      columns: [refund_id]
+    facts:
+      - name: amount
+        expr: missing_amount
+    metrics:
+      - name: revenue
+        expr: SUM(refunds.amount)
+"""
+    (warehouse / "views" / "refunds.yaml").write_text(refunds_yaml, encoding="utf-8")
+    assert _run_ok(
+        warehouse,
+        "config",
+        "set",
+        "semantic.snowflake.files",
+        '["views/sales.yaml", "views/refunds.yaml"]',
+    )
+    _sql(warehouse, "ALTER TABLE orders DROP COLUMN amount")
+    assert _run_ok(warehouse, "explore", "map", "--refresh")
+    rc, checked = _run(capsys, warehouse, "maintain", "check")
+    assert rc == 0, checked["errors"]
+
+    rc, envelope = _run(capsys, warehouse, "maintain", "reconcile")
+    assert rc == 0, envelope["errors"]
+    data = envelope["data"]
+
+    refunds_proposals = [
+        p
+        for p in data["proposals"]
+        if "views/refunds.yaml" in p.get("paths", [])
+        or (p.get("detail") and "refunds" in p["detail"])
+    ]
+    for p in refunds_proposals:
+        assert p["plan_id"] is None
+        assert "covered by" not in p["action"]

@@ -133,6 +133,7 @@ def test_a_relationship_naming_a_vanished_model_is_broken():
     assert broken[0].data == {
         "relationship": "orders_to_customers",
         "missing_model": "shop.customers",
+        "semantic_model": "shop.orders",
     }
 
 
