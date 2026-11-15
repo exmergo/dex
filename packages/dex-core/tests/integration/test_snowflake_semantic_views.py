@@ -36,6 +36,11 @@ from .conftest import SF_MAX_SECONDS, assert_ok, integration_budget
 from .test_snowflake_connect import SAMPLE_SCOPE, run_cli
 
 pytest.importorskip("sqlglot", reason="the [semantic-views] extra is not installed")
+# Module level, because the module-scoped `deployment` fixture runs before the
+# function-scoped skip in conftest and would otherwise fail on the import.
+pytest.importorskip(
+    "snowflake.connector", reason="the [snowflake] extra is not installed"
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.snowflake]
 

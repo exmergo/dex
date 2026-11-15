@@ -586,12 +586,14 @@ is not described here.
   spellings, and the edit is the user's. On ClickHouse nullability is part of the
   type, so a column that starts accepting nulls is reported as a retype.
 - With no editable dbt project, every proposal is advisory and no plan is stored.
-  Authoring into a native semantic layer is `semantic ossie`, `semantic slayer`
-  or `semantic cube` in the transform skill, never this command. The exception
-  is a SLayer or Cube layer's own schema findings (`declared_*`): reconcile
-  stores their removals as a second plan, `data.semantic_plan_id`, through the
-  `semantic slayer update` or `semantic cube update` route, even in a repository
-  with no dbt project. Relay both plan ids; each applies with `transform apply`.
+  Authoring into a native semantic layer is `semantic ossie`, `semantic slayer`,
+  `semantic cube`, `semantic databricks` or `semantic snowflake` in the
+  transform skill, never this command. The exception is a SLayer, Cube,
+  Databricks Metric View or Snowflake Semantic View layer's own schema findings
+  (`declared_*`): reconcile stores their removals as a second plan,
+  `data.semantic_plan_id`, through the `semantic slayer update`, `semantic cube
+  update`, `semantic databricks update` or `semantic snowflake update` route,
+  even in a repository with no dbt project. Relay both plan ids; each applies with `transform apply`.
   On Cube, a view source whose join path walks a removed join stays advisory,
   with that join: re-routing a view is the user's decision.
 

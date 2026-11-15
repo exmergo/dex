@@ -50,6 +50,10 @@ def _run(argv: list[str], capsys) -> dict:
         ("n_name", "VARCHAR", PIICategory.NAME),
         # A city is address data, which no geography qualifier clears.
         ("city_name", "VARCHAR", PIICategory.ADDRESS),
+        # A later `name` token still counts when an earlier one is cleared:
+        # a qualified `region.customer_name` is a person's name.
+        ("region__customer_name", "VARCHAR", PIICategory.NAME),
+        ("region_name_customer_name", "VARCHAR", PIICategory.NAME),
         ("dob", "DATE", PIICategory.DOB),
         ("email", "VARCHAR", PIICategory.EMAIL),
         # camelCase matches the same patterns as snake_case.
