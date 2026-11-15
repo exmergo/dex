@@ -146,6 +146,24 @@ def test_a_cte_grouped_by_the_join_key_is_carried_as_a_grouped_side():
             "where status = 'paid' group by abs(customer_id)",
             "grouping expression",
         ),
+        (
+            "select customer_id, count(*) as order_count, "
+            f"sum(amount) as total_amount from {W}.child_orders "
+            "group by customer_id, rollup(region)",
+            "rollup",
+        ),
+        (
+            "select customer_id, count(*) as order_count, "
+            f"sum(amount) as total_amount from {W}.child_orders "
+            "group by cube(customer_id, region)",
+            "cube",
+        ),
+        (
+            "select customer_id, count(*) as order_count, "
+            f"sum(amount) as total_amount from {W}.child_orders "
+            "group by grouping sets ((customer_id), (region))",
+            "grouping sets",
+        ),
     ],
 )
 def test_an_unsupported_grouped_shape_stays_unchecked(body: str, said: str):
@@ -315,6 +333,33 @@ def test_a_required_reference_counts_unmatched_parents_as_orphans(
     assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
 
 
+def test_a_grouped_joins_aggregate_output_can_make_it_required(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`count(*)`/`sum(...)` have no single physical column, but they are still
+    columns the grouped join supplies, so `null_rule: never` on one makes the
+    join required (#1324)."""
+
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    _model(
+        maintain_repo,
+        _GROUPED,
+        columns={"total_amount": {"role": "measure", "null_rule": "never"}},
+    )
+
+    data = _verify(maintain_repo, "rpt_customers")
+    (record,) = _records(data, "rpt_customers")
+
+    assert "total_amount" in record["declared"]["derived_columns"]
+    assert record["declared"]["required"] is True
+    assert record["status"] == "contradicted"
+    assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
+
+
 def test_groups_whose_keys_the_roster_lacks_are_a_zero_match_join(
     maintain_repo, _assume_the_project_compiles
 ):
@@ -407,6 +452,27 @@ def test_the_probe_measures_the_grouped_inputs_groups_and_matches():
     assert row["dex_cov_rows_0"] == 3
     assert row["dex_cov_matched_0"] == 1
     assert row["dex_cov_to_groups_0"] == 2
+
+
+def test_a_composite_key_split_across_relation_pairs_is_unchecked():
+    """The grouped input is keyed by both columns, but the ON clause pairs one
+    of them with each of two relations. Probing each pair on its own would
+    group by a subset, so the whole join stays unchecked."""
+
+    sql = (
+        "with grouped as ("
+        "select customer_id, region, count(*) as n "
+        f"from {W}.child_orders group by customer_id, region) "
+        "select c.id as customer_id, r.code as region, g.n "
+        f"from {W}.roster c join {W}.regions r on c.region = r.code "
+        "left join grouped g "
+        "on c.id = g.customer_id and r.code = g.region"
+    )
+    candidates, skipped = _joins(sql)
+    assert not [candidate for candidate in candidates if candidate.to_grouped]
+    assert any(
+        skip.code == "filtered_cte" and "key columns" in skip.reason for skip in skipped
+    )
 
 
 def test_a_grouping_on_only_one_key_column_of_a_composite_join_is_unchecked():

@@ -2582,6 +2582,10 @@ class JoinCandidate:
     #: per child key is a different population from the child's own rows.
     from_grouped: bool = False
     to_grouped: bool = False
+    #: Aliases of the aggregate projections a grouped ``to`` side computes
+    #: (#1324). They are columns the join supplies that no single physical
+    #: column holds, kept so a declaration can still make the join required.
+    to_grouped_outputs: tuple[str, ...] = ()
 
     def scope_filters(self) -> tuple[str | None, str | None] | None:
         """Each side's filters joined into one predicate, or None where neither
@@ -2657,9 +2661,13 @@ class _FilterWalk:
     code: str | None = None
     reason: str | None = None
     #: The physical columns a carried GROUP BY groups by, one entry per key
-    #: column, and whether this walk crossed such a scope (#1324).
+    #: column, whether this walk crossed such a scope, and the aliases of the
+    #: aggregate projections it computed there (#1324). The outputs are the
+    #: columns a grouped join supplies but cannot attribute to one physical
+    #: column, so the join's declaration can still make it required.
     group_columns: list[tuple[str, str]] = field(default_factory=list)
     grouped: bool = False
+    group_outputs: list[str] = field(default_factory=list)
 
     def fail(self, code: str, reason: str) -> None:
         if self.code is None:
@@ -2722,6 +2730,15 @@ class _FilterWalk:
                 return self._refuse(name, keys)
             self.grouped = True
             self.group_columns.extend(keys)
+            self.group_outputs.extend(
+                projection.alias.lower()
+                for projection in select.expressions
+                if isinstance(projection, exp.Alias)
+                and projection.alias
+                and not isinstance(
+                    projection.this, (exp.Column, exp.Star, exp.Subquery, exp.Select)
+                )
+            )
         if name not in self.scopes:
             self.scopes.append(name)
         return True
@@ -2797,8 +2814,29 @@ def _group_key_columns(select, source, cte_scopes, sql_shape, dialect):
     group = select.args.get("group")
     if group is None:
         return "a grouping dex did not recognize"
+    modifiers = [
+        label
+        for name, label in (
+            ("rollup", "ROLLUP"),
+            ("cube", "CUBE"),
+            ("grouping_sets", "GROUPING SETS"),
+            ("totals", "TOTALS"),
+        )
+        if group.args.get(name)
+    ]
+    if group.args.get("all"):
+        modifiers.append("GROUP BY ALL")
+    if modifiers:
+        return "a grouping modifier (" + ", ".join(modifiers) + ")"
     keys: list[tuple[str, str]] = []
     for expression in group.expressions:
+        for node, label in (
+            (exp.Rollup, "ROLLUP"),
+            (exp.Cube, "CUBE"),
+            (exp.GroupingSets, "GROUPING SETS"),
+        ):
+            if isinstance(expression, node):
+                return f"a grouping modifier ({label})"
         column = expression
         if isinstance(expression, exp.Literal) and expression.is_int:
             index = int(expression.this) - 1
@@ -3319,7 +3357,19 @@ def _model_joins(
             # between the same two relations is one composite key, not one
             # candidate per pair (see JoinCandidate's own docstring).
             grouped: dict[
-                tuple[str, str, tuple, tuple, tuple, tuple, bool, bool],
+                tuple[
+                    str,
+                    str,
+                    tuple,
+                    tuple,
+                    tuple,
+                    tuple,
+                    bool,
+                    bool,
+                    tuple,
+                    tuple,
+                    tuple,
+                ],
                 list[tuple[str, str, str | None, str | None]],
             ] = {}
             unresolved = False
@@ -3408,6 +3458,9 @@ def _model_joins(
                     tuple(to_walk.scopes),
                     from_walk.grouped,
                     to_walk.grouped,
+                    _distinct(from_walk.group_columns),
+                    _distinct(to_walk.group_columns),
+                    _distinct(to_walk.group_outputs),
                 )
                 grouped.setdefault(group_key, []).append(
                     (from_col, to_col, from_tpl, to_tpl)
@@ -3433,28 +3486,30 @@ def _model_joins(
                 continue
             from_grouped = bool(from_walks) and all(w.grouped for w in from_walks)
             to_grouped = bool(to_walks) and all(w.grouped for w in to_walks)
-            grouped_from_columns = {
-                column for walk in from_walks for _table, column in walk.group_columns
-            }
-            grouped_to_columns = {
-                column for walk in to_walks for _table, column in walk.group_columns
-            }
-            resolved_from_columns = {
-                column
-                for column_pairs in grouped.values()
-                for (column, _t, _f, _g) in column_pairs
-            }
-            resolved_to_columns = {
-                column
-                for column_pairs in grouped.values()
-                for (_c, column, _f, _g) in column_pairs
-            }
-            if (
-                (any(w.grouped for w in from_walks) and not from_grouped)
-                or (any(w.grouped for w in to_walks) and not to_grouped)
-                or (from_grouped and grouped_from_columns != resolved_from_columns)
-                or (to_grouped and grouped_to_columns != resolved_to_columns)
-            ):
+            # Each entry becomes one candidate, so its grouped side must group
+            # by exactly that candidate's key columns. A union across entries is
+            # not enough: a composite key split across relation pairs passes it
+            # and is then probed one column at a time, which can read a join that
+            # matches nothing as satisfied.
+            bad_grouping = (
+                any(w.grouped for w in from_walks) and not from_grouped
+            ) or (any(w.grouped for w in to_walks) and not to_grouped)
+            for group_key, column_pairs in grouped.items():
+                from_cols = tuple(c for c, _t, _f, _g in column_pairs)
+                to_cols = tuple(c for _c, c, _f, _g in column_pairs)
+                if from_grouped and (
+                    {table for table, _c in group_key[8]} != {group_key[0]}
+                    or {c for _t, c in group_key[8]} != set(from_cols)
+                ):
+                    bad_grouping = True
+                    break
+                if to_grouped and (
+                    {table for table, _c in group_key[9]} != {group_key[1]}
+                    or {c for _t, c in group_key[9]} != set(to_cols)
+                ):
+                    bad_grouping = True
+                    break
+            if bad_grouping:
                 scopes: list[str] = []
                 for walk in [*from_walks, *to_walks]:
                     for scope in walk.scopes:
@@ -3467,16 +3522,18 @@ def _model_joins(
                         f"a join column is read through "
                         f"{', '.join(scopes) or 'a grouping'}, which groups by "
                         "something other than exactly the join's key columns (an "
-                        "extra grouping column, a subset of a composite key, or a "
-                        "grouping on only one side of the join), so probing it "
-                        "would measure rows the model never joins",
+                        "extra grouping column, a subset of a composite key, a "
+                        "composite key split across relation pairs, or a grouping "
+                        "on only one side of the join), so probing it would "
+                        "measure rows the model never joins",
                     )
                 )
                 continue
             for group_key, column_pairs in grouped.items():
                 from_name, to_name, from_filters, to_filters = group_key[:4]
                 from_scopes, to_scopes = group_key[4:6]
-                from_grouped, to_grouped = group_key[6:]
+                from_grouped, to_grouped = group_key[6:8]
+                to_grouped_outputs = group_key[10]
                 from_cols = tuple(c for c, _t, _f, _g in column_pairs)
                 to_cols = tuple(c for _c, c, _f, _g in column_pairs)
                 from_keys = tuple(f for _c, _t, f, _g in column_pairs)
@@ -3512,6 +3569,7 @@ def _model_joins(
                         to_scopes=to_scopes,
                         from_grouped=from_grouped,
                         to_grouped=to_grouped,
+                        to_grouped_outputs=to_grouped_outputs if to_grouped else (),
                     )
                 )
 
@@ -3866,13 +3924,17 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
     if ctx is None:
         return JoinPolicy((), (), None, False, None)
     from_columns = {c.lower() for c in candidate.from_columns}
-    derived = tuple(
-        sorted(
-            col
-            for col, (relation, _c) in ctx.lineage.items()
-            if _same_relation(relation, candidate.to_relation)
-        )
-    )
+    supplied = {
+        col
+        for col, (relation, _c) in ctx.lineage.items()
+        if _same_relation(relation, candidate.to_relation)
+    }
+    if candidate.to_grouped:
+        # The grouped side's aggregate outputs have no single physical column,
+        # so lineage cannot attribute them; they are still columns the join
+        # supplies, and a declaration can make it required (#1324).
+        supplied.update(candidate.to_grouped_outputs)
+    derived = tuple(sorted(supplied))
     driving = tuple(
         sorted(
             col

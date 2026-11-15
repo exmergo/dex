@@ -284,8 +284,9 @@ Needs no baseline. The classes of finding:
     logic, `coalesce`, casts and `lower`/`upper`/`trim`, as in
     `where coalesce(_fivetran_active, true)`) that traces to the key's own
     physical relation. A side grouped by *exactly* the join's key columns
-    (a direct `GROUP BY` over one input, with no `HAVING`, window, `LIMIT` or
-    set operation, and optionally the supported `WHERE`) also carries
+    (a direct `GROUP BY` over one input, with no `HAVING`, window, `LIMIT`,
+    set operation or grouping modifier (`ROLLUP`, `CUBE`, `GROUPING SETS`,
+    `GROUP BY ALL`), and optionally the supported `WHERE`) also carries
     `grouped_by`, the key columns it groups by. That side is probed over its
     groups, never the ungrouped relation underneath, and its own denominator
     is `measured.group_rows`. A grouping by anything else (an extra column, a
