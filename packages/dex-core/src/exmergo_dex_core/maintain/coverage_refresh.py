@@ -375,6 +375,11 @@ def refresh(
                 )
                 continue
             left = batch.remaining()
+            uptime = getattr(batch.adapter, "warehouse_uptime", None)
+            if left is not None and uptime is not None:
+                # What the warehouse is owed beyond its statements so far, as
+                # each run's own affordability check counts it.
+                left -= uptime.pending()
             # The baseline runs before any check inside the model, so it has
             # to fit in what is left before the model starts.
             if left is not None and (

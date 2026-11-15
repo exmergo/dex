@@ -686,3 +686,67 @@ def test_a_kept_score_stale_downstream_is_retried_after_the_untried(monkeypatch)
     assert kept["score"] == 0.8 and kept["last_refusal_at"]
     # mart has never been measured; fct is stale and marked, so mart goes first.
     assert _next_up(store, manifest) == ["mart", "fct"]
+
+
+def test_pending_uptime_counts_against_the_next_baseline(calls):
+    calls["plan"]["confirmed"] = True
+    calls["plan"]["baseline"] = 6.0
+
+    class _Uptime:
+        def pending(self):
+            return 2.0
+
+        def settle(self):
+            return 0.0, []
+
+    engine = _Engine("bigquery", budget=17.0)
+    engine._adapter = lambda command: SimpleNamespace(
+        cost_gate=None, warehouse_uptime=_Uptime()
+    )
+    # Pricing quotes through the stub; settling at the end reads the meter.
+    block, *_ = refresh_mod.refresh(
+        engine,
+        _chain_manifest("a", "b"),
+        _candidates(("a", "missing"), ("b", "missing")),
+    )
+    # a spends 10, leaving 7, less 2 owed: b's baseline of 6 does not fit.
+    assert calls["runs"] == ["a"]
+    assert block["not_run"] == [{"model": "b", "reason_code": "budget"}]
+
+
+def test_a_run_checks_its_own_baseline_price_before_running_it(tmp_path):
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.storage import FilesystemStore
+    from exmergo_dex_core.transform import mutation
+
+    class _Shadow:
+        tests = 0
+
+        def write(self, *args, **kwargs):
+            pass
+
+        def test(self, model, **kwargs):
+            self.tests += 1
+            return {"success": True, "nodes": []}
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    )
+    shadow = _Shadow()
+    result = transform_commands._run_mutants(
+        shadow,
+        "models/fct.sql",
+        batch,
+        model="fct",
+        paradigm=Paradigm.BYTES_SCANNED,
+        connector="bigquery",
+        store=FilesystemStore(tmp_path),
+        ceiling=5.0,
+        estimate=100.0,
+        mutation_mod=mutation,
+        prices={"(baseline)": 20.0},
+    )
+    _runs, _spend, warnings, _spent = result.pop("_meta")
+    assert shadow.tests == 0
+    assert result["counts"]["not_run"] == len(batch.mutants)
+    assert any("the confirmed budget" in w for w in warnings)

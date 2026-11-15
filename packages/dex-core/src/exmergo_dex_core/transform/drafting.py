@@ -1525,7 +1525,14 @@ class _Lineage:
 
     def _using_keys(self, select: Any) -> None:
         """Join keys a ``USING`` names: identifiers sqlglot does not parse as
-        columns, read on the joined relation and on each one before it."""
+        columns, read on the joined relation and on the left side's relation
+        that carries the key.
+
+        The left side is the one relation before the join, or among several
+        the one whose columns are known to hold the key; a key the left side
+        cannot place is untraced, never credited to every relation there.
+        Each side is traced, so a key a CTE computes reaches its columns.
+        """
 
         from sqlglot import expressions as exp
 
@@ -1541,10 +1548,28 @@ class _Lineage:
             position = next(
                 (i for i, s in enumerate(sources) if s[0] == joined), len(sources)
             )
+            left = sources[:position]
             for name in names:
-                for alias, _relation, _join in sources[: position + 1]:
-                    origin = self.origin(select, exp.column(name, table=alias))
-                    if origin is not None:
+                sides = [sources[position]] if position < len(sources) else []
+                if len(left) == 1:
+                    sides.append(left[0])
+                else:
+                    holding = [
+                        s
+                        for s in left
+                        if name.lower()
+                        in [c.lower() for c in self.columns_of(s[1]) or []]
+                    ]
+                    if len(holding) == 1:
+                        sides.append(holding[0])
+                    else:
+                        self.reading.unreferenced.add(name.lower())
+                for alias, _relation, _join in sides:
+                    traced = self._trace(select, exp.column(name, table=alias), 0)
+                    if traced is None:
+                        self.reading.unreferenced.add(name.lower())
+                        continue
+                    for origin in traced:
                         key = (origin.relation, origin.column, origin.is_ref)
                         self.reading.referenced.setdefault(key, set()).add("join")
 

@@ -3652,7 +3652,11 @@ def _run_mutants(
             "--budget, or narrow the run with --max-mutants"
         )
 
-    if batch.mutants and full_tests:
+    if batch.mutants and full_tests and not meter.affords("(baseline)"):
+        # Checked before the baseline, at the price this run computed: a
+        # batch of models can reach one with too little left to start it.
+        stop(batch.mutants)
+    elif batch.mutants and full_tests:
         shadow.write(model_path, batch.identity)
         baseline_summary = shadow.test(select, exclude=exclude)
         meter.settle(baseline_summary, "(baseline)")

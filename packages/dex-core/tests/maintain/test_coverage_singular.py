@@ -256,3 +256,32 @@ def test_an_alias_read_in_having_is_the_expression_behind_it():
     assert "total" not in roles
     assert roles["amount"] == ["aggregation", "predicate"]
     assert block["read"]["resolved"] == 1
+
+
+def test_a_using_key_a_cte_computes_traces_to_its_column():
+    reading = read(
+        "with o as (select lower(code) as k, amount from {{ ref('orders') }}) "
+        "select o.amount from o join {{ ref('customers') }} c using (k)",
+        None,
+        dialect="duckdb",
+        vars=None,
+        references=True,
+    )
+    keys = {f"{r}.{c}": sorted(v) for (r, c, _), v in reading.referenced.items()}
+    assert "join" in keys["orders.code"]
+    assert keys["customers.k"] == ["join"]
+
+
+def test_a_using_key_the_left_side_cannot_place_is_untraced_not_spread():
+    reading = read(
+        "select a.x from {{ ref('a') }} a join {{ ref('b') }} b on a.id = b.id "
+        "join {{ ref('c') }} c using (k)",
+        None,
+        dialect="duckdb",
+        vars=None,
+        references=True,
+    )
+    keys = {f"{r}.{c}" for (r, c, _), _v in reading.referenced.items()}
+    assert "c.k" in keys
+    assert "a.k" not in keys and "b.k" not in keys
+    assert "k" in reading.unreferenced
