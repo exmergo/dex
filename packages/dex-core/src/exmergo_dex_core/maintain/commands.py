@@ -1843,11 +1843,15 @@ def coverage(
     from . import coverage_declarations, coverage_runs
 
     notes: list[str] = []
-    # Last run status (#1285): files only. A manifest read from disk is the
-    # one the run wrote, so its tests are attributed against it all the same.
+    # Last run status (#1285) and source freshness status (#1347): files only.
+    # A manifest read from disk is the one the run wrote, so its tests and
+    # sources are attributed against it all the same.
     run = coverage_runs.last_run(project_dir, manifest)
     notes.extend(run.notes)
     warnings.extend(run.warnings)
+    freshness = coverage_runs.freshness_run(project_dir, manifest)
+    notes.extend(freshness.notes)
+    warnings.extend(freshness.warnings)
     # Recorded mutation results (#1284), from the store: no connection.
     loader = getattr(engine.store, "load_mutation_records", None)
     records: dict[str, dict[str, Any]] | None = None
@@ -1873,6 +1877,7 @@ def coverage(
         selector=selector,
         full=full,
         statuses=run.statuses,
+        freshness_statuses=freshness.statuses,
         records=records,
     )
     if records is not None:
@@ -1902,6 +1907,7 @@ def coverage(
             "facts": declared["facts"],
         },
         last_run=run.run,
+        freshness_run=freshness.run,
         excluded=inventory.excluded,
         elided=elided,
         manifest=origin,

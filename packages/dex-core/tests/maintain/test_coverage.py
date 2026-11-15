@@ -497,3 +497,249 @@ def test_the_incremental_branch_test_names_are_capped_and_counted():
         len(_record(full, "models", "fct")["incremental"]["incremental_branch_tests"])
         == coverage_mod.TEST_CAP + extra
     )
+
+
+def test_source_freshness_carries_last_run_status_and_not_run_when_unreached():
+    warn_only = {
+        "warn_after": {"count": 12, "period": "hour"},
+        "error_after": {"count": None, "period": None},
+    }
+    err_policy = {
+        "warn_after": {"count": 12, "period": "hour"},
+        "error_after": {"count": 24, "period": "hour"},
+    }
+    manifest = _manifest(
+        nodes={
+            "test.s": _generic(
+                "not_null", None, "id", reads=[f"source.{PROJECT}.raw.orders"]
+            )
+        },
+        sources={
+            f"source.{PROJECT}.raw.orders": _source(
+                "orders", columns=["id"], freshness=err_policy
+            ),
+            f"source.{PROJECT}.raw.customers": _source(
+                "customers", freshness=warn_only
+            ),
+            f"source.{PROJECT}.raw.payments": _source("payments", freshness=err_policy),
+            f"source.{PROJECT}.raw.unreached": _source(
+                "unreached", freshness=warn_only
+            ),
+            f"source.{PROJECT}.raw.unchecked": _source("unchecked", freshness=None),
+        },
+    )
+    inv = coverage_mod.inventory(
+        manifest,
+        statuses={"test.s": "pass"},
+        freshness_statuses={
+            f"source.{PROJECT}.raw.orders": "pass",
+            f"source.{PROJECT}.raw.customers": "warn",
+            f"source.{PROJECT}.raw.payments": "error",
+            # An old sources.json row for a source that no longer declares freshness.
+            f"source.{PROJECT}.raw.unchecked": "error",
+        },
+    )
+
+    orders = _record(inv, "sources", "raw.orders")
+    assert {
+        "kind": "freshness",
+        "severity": "error",
+        "last_run": "pass",
+    } in orders["tests"]
+    assert orders["last_run"] == {
+        "pass": 2,
+        "fail": 0,
+        "warn": 0,
+        "error": 0,
+        "skipped": 0,
+        "not_run": 0,
+    }
+
+    assert _record(inv, "sources", "raw.customers")["tests"] == [
+        {"kind": "freshness", "severity": "warn", "last_run": "warn"}
+    ]
+    assert _record(inv, "sources", "raw.payments")["tests"] == [
+        {"kind": "freshness", "severity": "error", "last_run": "error"}
+    ]
+    assert _record(inv, "sources", "raw.unreached")["tests"] == [
+        {"kind": "freshness", "severity": "warn", "last_run": "not_run"}
+    ]
+    assert _record(inv, "sources", "raw.unchecked")["tests"] == []
+    assert inv.summary["tests"]["by_last_run"] == {
+        "pass": 2,
+        "fail": 0,
+        "warn": 1,
+        "error": 1,
+        "skipped": 0,
+        "not_run": 1,
+    }
+
+
+def test_coverage_keeps_last_run_and_freshness_run_apart_and_opens_no_connection(
+    tmp_path, monkeypatch
+):
+    from exmergo_dex_core import connect
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.results import to_envelope
+
+    for name in ("DBT_ENGINE_TARGET_PATH", "DBT_TARGET_PATH", "DBT_LOG_PATH"):
+        monkeypatch.delenv(name, raising=False)
+
+    project = tmp_path / "analytics"
+    target = project / "target"
+    logs = project / "logs"
+    target.mkdir(parents=True)
+    logs.mkdir(parents=True)
+    (project / "dbt_project.yml").write_text("name: shop\n", encoding="utf-8")
+
+    err_policy = {
+        "warn_after": {"count": 12, "period": "hour"},
+        "error_after": {"count": 24, "period": "hour"},
+    }
+    manifest = _manifest(
+        nodes={
+            f"{M}.orders": _model("orders", columns=["id"]),
+            "test.shop.not_null_orders_id": _generic("not_null", f"{M}.orders", "id"),
+        },
+        sources={
+            f"source.{PROJECT}.raw.orders": _source("orders", freshness=err_policy),
+            f"source.{PROJECT}.raw.events": _source("events", freshness=err_policy),
+            f"source.{PROJECT}.raw.disabled": {
+                **_source("disabled", freshness=err_policy),
+                "config": {"enabled": False, "freshness": err_policy},
+            },
+        },
+    )
+    manifest["metadata"]["generated_at"] = "2026-11-15T10:00:00Z"
+    (target / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    test_inv = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    fresh_inv = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    (target / "run_results.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "generated_at": "2026-11-15T10:10:00Z",
+                    "invocation_id": test_inv,
+                },
+                "results": [
+                    {
+                        "unique_id": "test.shop.not_null_orders_id",
+                        "status": "fail",
+                        "message": "secret_test_failure",
+                    }
+                ],
+                "args": {"which": "test"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target / "sources.json").write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "generated_at": "2026-11-15T10:20:00Z",
+                    "invocation_id": fresh_inv,
+                },
+                "results": [
+                    {
+                        "unique_id": f"source.{PROJECT}.raw.orders",
+                        "status": "runtime error",
+                        "max_loaded_at": "2026-11-14T01:02:03Z",
+                        "message": "Database Error: secret_freshness_message",
+                    },
+                    {
+                        "unique_id": f"source.{PROJECT}.raw.gone",
+                        "status": "pass",
+                        "max_loaded_at": "2026-11-15T09:59:59Z",
+                    },
+                    {
+                        "unique_id": f"source.{PROJECT}.raw.disabled",
+                        "status": "pass",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (logs / "dbt.log").write_text(
+        "\n".join(
+            json.dumps({"info": {"invocation_id": inv}})
+            for inv in (test_inv, fresh_inv)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    import importlib
+
+    build_mod = importlib.import_module("exmergo_dex_core.transform.build")
+    monkeypatch.setattr(
+        build_mod,
+        "shadow_parse",
+        lambda *a, **k: {
+            "available": False,
+            "reason": "dbt is not installed",
+            "success": None,
+            "messages": [],
+        },
+    )
+
+    def _forbid_connection(*args, **kwargs):
+        raise AssertionError("maintain coverage opened a connection")
+
+    monkeypatch.setattr(connect, "open_adapter", _forbid_connection)
+
+    with DexEngine(
+        config=DexConfig(dbt_project_dir="analytics"), repo_root=tmp_path
+    ) as engine:
+        envelope = to_envelope(engine.coverage()).model_dump(mode="json")
+        assert engine._adapter_instance is None
+        data = envelope["data"]
+
+        assert data["last_run"]["invocation_id"] == test_inv
+        assert data["last_run"]["generated_at"] == "2026-11-15T10:10:00Z"
+        assert data["last_run"]["command"] == "test"
+        assert isinstance(data["last_run"]["age_seconds"], int)
+
+        assert data["freshness_run"]["invocation_id"] == fresh_inv
+        assert data["freshness_run"]["generated_at"] == "2026-11-15T10:20:00Z"
+        assert data["freshness_run"]["artifact"] == "project"
+        assert data["freshness_run"]["cold"] is False
+        assert isinstance(data["freshness_run"]["age_seconds"], int)
+
+        by_source = {s["name"]: s["tests"] for s in data["sources"]}
+        assert by_source["raw.orders"] == [
+            {"kind": "freshness", "severity": "error", "last_run": "error"}
+        ]
+        assert by_source["raw.events"] == [
+            {"kind": "freshness", "severity": "error", "last_run": "not_run"}
+        ]
+        assert "raw.gone" not in by_source
+        assert "raw.disabled" not in by_source
+
+        rendered = json.dumps(envelope)
+        for forbidden in (
+            "max_loaded_at",
+            "2026-11-14T01:02:03Z",
+            "2026-11-15T09:59:59Z",
+            "secret_freshness_message",
+            "secret_test_failure",
+            "current",
+            "recent",
+        ):
+            assert forbidden not in rendered
+
+        # Removing sources.json is a note, not an error, and leaves last_run intact.
+        (target / "sources.json").unlink()
+        without_sources = to_envelope(engine.coverage()).model_dump(mode="json")
+        assert engine._adapter_instance is None
+        assert without_sources["status"] == "ok"
+        assert without_sources["data"]["last_run"]["invocation_id"] == test_inv
+        assert without_sources["data"]["freshness_run"] is None
+        assert any("sources.json" in note for note in without_sources["data"]["notes"])
+        assert {
+            s["name"]: s["tests"][0]["last_run"]
+            for s in without_sources["data"]["sources"]
+        } == {"raw.events": "not_run", "raw.orders": "not_run"}

@@ -172,6 +172,7 @@ def inventory(
     selector: Iterable[str] | None = None,
     full: bool = False,
     statuses: dict[str, str] | None = None,
+    freshness_statuses: dict[str, str] | None = None,
     records: dict[str, dict[str, Any]] | None = None,
     now: datetime | None = None,
 ) -> Inventory:
@@ -179,6 +180,9 @@ def inventory(
 
     ``statuses`` is each test's status in the latest run results (#1285), by
     unique id; ``None`` means no run was read, and no test carries a status.
+    ``freshness_statuses`` is each source's freshness status in the latest
+    ``sources.json`` (#1347), by source unique id; ``None`` means none was read,
+    and no freshness entry carries a status.
     ``records`` is the recorded mutation results by model unique id (#1284);
     ``None`` means the store keeps none, so no model carries a strength.
     """
@@ -367,7 +371,13 @@ def inventory(
         policy = dbt_tests.freshness_policy(resource.node)
         if policy is not None:
             totals["freshness"] += 1
-            resource.tests.append({"kind": "freshness", "severity": policy})
+            freshness_entry: dict[str, Any] = {"kind": "freshness", "severity": policy}
+            if freshness_statuses is not None:
+                freshness_entry["last_run"] = freshness_statuses.get(
+                    unique_id, "not_run"
+                )
+                summary_statuses[f"freshness:{unique_id}"] = freshness_entry["last_run"]
+            resource.tests.append(freshness_entry)
 
     # Downstream: data tests on the resources that read this one, and tests
     # that read it without being attached to it (a relationships test points
@@ -403,9 +413,10 @@ def inventory(
                 strength[unique_id] = _strength(
                     manifest, resource, records.get(unique_id), now=now
                 )
+    has_last_run = statuses is not None or freshness_statuses is not None
     for unique_id in selected:
         resource = resources[unique_id]
-        record = _record(resource, last_run=statuses is not None)
+        record = _record(resource, last_run=has_last_run)
         if unique_id in strength:
             record["strength"] = strength[unique_id]
         sections[SECTIONS[resource.resource_type]].append(record)
@@ -419,7 +430,7 @@ def inventory(
                 _cap(record, elided)
 
     summary = _summary(resources, selected, totals, severities, scoped=bool(wanted))
-    if statuses is not None:
+    if has_last_run:
         by_status = dict.fromkeys(RUN_STATUSES, 0)
         for status in summary_statuses.values():
             by_status[status] += 1

@@ -1,4 +1,5 @@
-"""``maintain coverage``'s last-run statuses, read from ``run_results.json`` (#1285)."""
+"""``maintain coverage``'s last-run statuses, read from ``run_results.json`` (#1285)
+and ``sources.json`` (#1347)."""
 
 from __future__ import annotations
 
@@ -20,15 +21,33 @@ NOT_NULL = "test.shop.not_null_orders_order_id.abc123"
 UNIQUE = "test.shop.unique_orders_order_id.def456"
 SINGULAR = "test.shop.assert_positive_amount"
 UNIT = "unit_test.shop.orders.test_orders_full"
+SRC_ORDERS = "source.shop.raw.orders"
+SRC_CUSTOMERS = "source.shop.raw.customers"
+SRC_EVENTS = "source.shop.raw.events"
+SRC_PAYMENTS = "source.shop.raw.payments"
 
 
-def _manifest(*extra_tests: str) -> dict:
+def _manifest(*extra_tests: str, extra_sources: tuple[str, ...] = ()) -> dict:
     nodes = {
         uid: {"resource_type": "test", "config": {"enabled": True}}
         for uid in (NOT_NULL, UNIQUE, SINGULAR, *extra_tests)
     }
     nodes["model.shop.orders"] = {"resource_type": "model", "config": {}}
-    return {"nodes": nodes, "unit_tests": {UNIT: {"config": {"enabled": True}}}}
+    sources = {
+        uid: {"resource_type": "source", "config": {"enabled": True}}
+        for uid in (
+            SRC_ORDERS,
+            SRC_CUSTOMERS,
+            SRC_EVENTS,
+            SRC_PAYMENTS,
+            *extra_sources,
+        )
+    }
+    return {
+        "nodes": nodes,
+        "sources": sources,
+        "unit_tests": {UNIT: {"config": {"enabled": True}}},
+    }
 
 
 def _write_results(
@@ -299,3 +318,184 @@ def test_target_path_from_environment(
 
     assert found.statuses == {NOT_NULL: "pass"}
     assert os.fspath(elsewhere) not in json.dumps(found.run)
+
+
+def _write_sources(
+    directory: Path,
+    rows: dict[str, str],
+    *,
+    invocation: str = INV_A,
+    generated_at: str = "2026-11-15T11:15:00.000000Z",
+) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    document = {
+        "metadata": {
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/sources/v3.json",
+            "dbt_version": "1.12.0",
+            "generated_at": generated_at,
+            "invocation_id": invocation,
+        },
+        "results": [
+            {
+                "unique_id": uid,
+                "status": status,
+                "max_loaded_at": "2026-11-15T08:42:19.000000Z",
+                "snapshotted_at": "2026-11-15T11:15:00.000000Z",
+                "max_loaded_at_time_ago_in_s": 9161.0,
+                "criteria": {
+                    "warn_after": {"count": 12, "period": "hour"},
+                    "error_after": {"count": 24, "period": "hour"},
+                    "filter": "secret_tenant = 'vip'",
+                },
+                "message": "Database Error in source: secret_warehouse_detail",
+                "error": "Runtime Error: secret_warehouse_detail",
+            }
+            for uid, status in rows.items()
+        ],
+        "elapsed_time": 0.8,
+    }
+    (directory / "sources.json").write_text(json.dumps(document))
+
+
+def test_freshness_reads_dex_isolated_sources_json(project: Path) -> None:
+    _write_sources(
+        _dex_dir(project),
+        {
+            SRC_ORDERS: "pass",
+            SRC_CUSTOMERS: "warn",
+            SRC_EVENTS: "error",
+            SRC_PAYMENTS: "runtime error",
+        },
+    )
+    _write_log(project, INV_A)
+    found = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+
+    assert found.statuses == {
+        SRC_ORDERS: "pass",
+        SRC_CUSTOMERS: "warn",
+        SRC_EVENTS: "error",
+        SRC_PAYMENTS: "error",
+    }
+    assert found.run == {
+        "invocation_id": INV_A,
+        "generated_at": "2026-11-15T11:15:00.000000Z",
+        "artifact": "dex",
+        "cold": False,
+        "age_seconds": 2700,
+    }
+    assert found.warnings == []
+
+
+def test_freshness_reads_project_target_and_picks_newer(project: Path) -> None:
+    _write_sources(
+        _dex_dir(project),
+        {SRC_ORDERS: "error"},
+        invocation=INV_A,
+        generated_at="2026-11-15T09:00:00Z",
+    )
+    _write_sources(
+        project / "target",
+        {SRC_ORDERS: "pass"},
+        invocation=INV_B,
+        generated_at="2026-11-15T10:30:00Z",
+    )
+    _write_log(project, INV_A, INV_B)
+    found = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "pass"}
+    assert found.run == {
+        "invocation_id": INV_B,
+        "generated_at": "2026-11-15T10:30:00Z",
+        "artifact": "project",
+        "cold": False,
+        "age_seconds": 5400,
+    }
+
+
+def test_freshness_reads_cold_deps_and_target_env(
+    project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    monkeypatch.setenv("DBT_TARGET_PATH", str(elsewhere))
+    _write_sources(
+        elsewhere / "cold",
+        {SRC_ORDERS: "warn"},
+        generated_at="2026-11-15T11:40:00Z",
+    )
+    _write_log(project, INV_A)
+    found = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "warn"}
+    assert found.run is not None
+    assert found.run["artifact"] == "project"
+    assert found.run["cold"] is True
+    assert os.fspath(elsewhere) not in json.dumps(found.run)
+
+
+def test_freshness_drops_removed_and_disabled_sources_and_unknown_status(
+    project: Path,
+) -> None:
+    gone = "source.shop.raw.legacy"
+    disabled = "source.shop.raw.archived"
+    manifest = _manifest(extra_sources=(disabled,))
+    manifest["sources"][disabled]["config"]["enabled"] = False
+    _write_sources(
+        _dex_dir(project),
+        {
+            gone: "error",
+            disabled: "error",
+            SRC_ORDERS: "pass",
+            SRC_CUSTOMERS: "no-op",
+        },
+    )
+    _write_log(project, INV_A)
+    found = coverage_runs.freshness_run(project, manifest, now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "pass"}
+    assert SRC_EVENTS not in found.statuses
+    assert any("2 freshness result(s)" in note for note in found.notes)
+    assert any("does not recognize" in note for note in found.notes)
+
+
+def test_freshness_mismatched_invocation_warns_and_attributes_nothing(
+    project: Path,
+) -> None:
+    _write_sources(_dex_dir(project), {SRC_ORDERS: "pass"}, invocation=INV_A)
+    _write_log(project, INV_B)
+    found = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+
+    assert found.statuses == {}
+    assert found.run is not None and found.run["invocation_id"] == INV_A
+    assert any(INV_A in warning for warning in found.warnings)
+
+
+def test_no_sources_json_is_a_note_and_not_an_error(project: Path) -> None:
+    found = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+
+    assert found.statuses == {}
+    assert found.run is None
+    assert found.warnings == []
+    assert found.notes
+    assert "sources.json" in found.notes[0] and "not_run" in found.notes[0]
+
+
+def test_freshness_leaks_nothing_from_result_rows_and_never_says_current(
+    project: Path,
+) -> None:
+    _write_sources(_dex_dir(project), {SRC_ORDERS: "runtime error"})
+    _write_log(project, INV_A)
+    found = coverage_runs.freshness_run(project, _manifest(), now=NOW)
+
+    rendered = json.dumps(
+        {"s": found.statuses, "r": found.run, "n": found.notes, "w": found.warnings}
+    )
+    for leaked in (
+        "max_loaded_at",
+        "2026-11-15T08:42:19",
+        "snapshotted_at",
+        "9161",
+        "secret_tenant",
+        "secret_warehouse_detail",
+    ):
+        assert leaked not in rendered
+    assert "recent" not in rendered and "current" not in rendered
