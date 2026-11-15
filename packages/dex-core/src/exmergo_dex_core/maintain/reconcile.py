@@ -60,6 +60,8 @@ class Proposal(BaseModel):
     column: str | None = None
     action: str
     paths: list[str] = Field(default_factory=list)
+    plan_id: str | None = None
+    finding: Any | None = Field(default=None, exclude=True)
 
 
 # Schema findings reconcile reads off the schema axis.
@@ -579,6 +581,7 @@ def _advisory(
         action=actions.get(
             finding.code, "review the finding; no automatic fix applies"
         ),
+        finding=finding,
     )
 
 
@@ -592,6 +595,7 @@ def _schema_advisory(identifier: str, finding: DriftFinding, reason: str) -> Pro
         action=(
             f"{reason}; adjust the referencing models by hand or with `transform plan`"
         ),
+        finding=finding,
     )
 
 
@@ -625,6 +629,7 @@ def _retype_advisory(
             "the connector's spelling rather than a canonical one. Update the "
             "declared type and the models reading this column by hand"
         ),
+        finding=finding,
     )
 
 

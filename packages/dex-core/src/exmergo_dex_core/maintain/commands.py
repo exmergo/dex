@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     from ..adapters.project import ExploreProject, MaintainProject
     from ..dbt_project import ProjectDefinitions
     from ..engine import DexEngine
+    from .reconcile import Proposal
     from .snapshot import SemanticLayer, TransformLayer
 
 
@@ -2343,6 +2344,9 @@ def reconcile(engine: DexEngine, drift_class: str | None = None) -> ReconcileRes
         result.diffs = diffs
         result.warnings.extend(plan_warnings)
         result.plan_id = plan.plan_id
+        for p in result.proposals:
+            if p.kind == "mechanical":
+                p.plan_id = plan.plan_id
     if semantic_findings:
         _reconcile_semantic(
             engine, semantic_source, semantic_findings, drift_class, result
@@ -2404,7 +2408,164 @@ def _reconcile_semantic(
                 if w not in result.warnings
             )
             result.semantic_plan_id = planned.plan_id
+            for proposal in proposals:
+                if proposal.kind == "mechanical":
+                    proposal.plan_id = planned.plan_id
+            _link_covered_advisories(
+                result.proposals, proposals, planned.plan_id, vendor
+            )
     result.proposals = _mechanical_first([*result.proposals, *proposals])
+
+
+def _link_covered_advisories(
+    advisory_proposals: list[Proposal],
+    semantic_proposals: list[Proposal],
+    plan_id: str,
+    vendor: str,
+) -> None:
+    """Link semantic-axis advisories covered by a validated native semantic plan.
+
+    When the layer's authoring route accepts and validates edits that remove a
+    broken element or relationship, any advisory proposal describing that same
+    dependency is linked to the plan rather than left reading as an independent
+    manual action. Uncovered advisories, including those held back by guards or
+    refused plans, keep their original advice.
+    """
+
+    mechanical_proposals = [p for p in semantic_proposals if p.kind == "mechanical"]
+    if not mechanical_proposals:
+        return
+
+    removed_members: set[tuple[str, str]] = set()
+    removed_relationships: set[str] = set()
+    file_for_member: dict[tuple[str, str], str] = {}
+    file_for_rel: dict[str, str] = {}
+
+    for p in mechanical_proposals:
+        f = getattr(p, "finding", None)
+        model_file = (
+            p.paths[0]
+            if p.paths
+            else (
+                f.data.get("model_file")
+                if f is not None and isinstance(f.data, dict)
+                else None
+            )
+        )
+        model_name = (
+            (f.data.get("semantic_model") or "").lower()
+            if f is not None and isinstance(f.data, dict)
+            else ""
+        )
+        removal = (
+            f.data.get("removal")
+            if f is not None and isinstance(f.data, dict)
+            else None
+        )
+        if not isinstance(removal, dict):
+            continue
+
+        for m in removal.get("members") or []:
+            if isinstance(m, dict):
+                tbl = (m.get("table") or model_name).lower()
+                mem_name = (m.get("name") or "").lower()
+                if mem_name:
+                    removed_members.add((tbl, mem_name))
+                    removed_members.add(("", mem_name))
+                    if model_name:
+                        removed_members.add((model_name, mem_name))
+                    if model_file:
+                        file_for_member[(tbl, mem_name)] = model_file
+                        file_for_member[("", mem_name)] = model_file
+                        if model_name:
+                            file_for_member[(model_name, mem_name)] = model_file
+
+        for rel in removal.get("relationships") or []:
+            if isinstance(rel, str):
+                rel_lower = rel.lower()
+                removed_relationships.add(rel_lower)
+                if model_file:
+                    file_for_rel[rel_lower] = model_file
+
+        for field in removal.get("fields") or []:
+            if isinstance(field, str):
+                f_lower = field.lower()
+                removed_members.add((model_name, f_lower))
+                removed_members.add(("", f_lower))
+                if model_file:
+                    file_for_member[(model_name, f_lower)] = model_file
+                    file_for_member[("", f_lower)] = model_file
+
+        for meas in removal.get("measures") or []:
+            if isinstance(meas, str):
+                m_lower = meas.lower()
+                removed_members.add((model_name, m_lower))
+                removed_members.add(("", m_lower))
+                if model_file:
+                    file_for_member[(model_name, m_lower)] = model_file
+                    file_for_member[("", m_lower)] = model_file
+
+        for dim in removal.get("dimensions") or []:
+            if isinstance(dim, str):
+                d_lower = dim.lower()
+                removed_members.add((model_name, d_lower))
+                removed_members.add(("", d_lower))
+                if model_file:
+                    file_for_member[(model_name, d_lower)] = model_file
+                    file_for_member[("", d_lower)] = model_file
+
+        for join in removal.get("joins") or []:
+            if isinstance(join, str):
+                j_lower = join.lower()
+                removed_relationships.add(j_lower)
+                if model_file:
+                    file_for_rel[j_lower] = model_file
+
+    for proposal in advisory_proposals:
+        if proposal.kind != "advisory" or proposal.axis != "semantic":
+            continue
+        f = getattr(proposal, "finding", None)
+        if f is None or not isinstance(f.data, dict):
+            continue
+
+        matched_file: str | None = None
+        if f.code == "dangling_reference":
+            if f.data.get("role") == "key":
+                continue
+            sm = (f.data.get("semantic_model") or "").lower()
+            name = (f.data.get("name") or "").lower()
+            metric = (f.data.get("metric") or "").lower()
+            candidates = [name, name.rsplit(".", 1)[-1]] if name else []
+            for cand in candidates:
+                if (sm, cand) in removed_members or ("", cand) in removed_members:
+                    matched_file = file_for_member.get(
+                        (sm, cand)
+                    ) or file_for_member.get(("", cand))
+                    break
+            if matched_file is None and metric:
+                metric_cands = [metric, metric.rsplit(".", 1)[-1]]
+                for cand in metric_cands:
+                    if (sm, cand) in removed_members or ("", cand) in removed_members:
+                        matched_file = file_for_member.get(
+                            (sm, cand)
+                        ) or file_for_member.get(("", cand))
+                        break
+        elif f.code == "broken_relationship":
+            rel = (f.data.get("relationship") or "").lower()
+            rel_cands = [rel, rel.rsplit(".", 1)[-1]] if rel else []
+            for cand in rel_cands:
+                if cand in removed_relationships:
+                    matched_file = file_for_rel.get(cand)
+                    break
+
+        if matched_file is not None:
+            proposal.plan_id = plan_id
+            if matched_file not in proposal.paths:
+                proposal.paths.append(matched_file)
+            proposal.action = (
+                f"covered by the {vendor} semantic plan ({plan_id}); "
+                f"apply with `transform apply {plan_id}`"
+            )
 
 
 def _mechanical_first(proposals):

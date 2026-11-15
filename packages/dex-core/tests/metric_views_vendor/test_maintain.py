@@ -803,3 +803,70 @@ def test_a_having_name_both_alias_and_column_is_unchecked_not_dropped(tmp_path, 
         "so what reads it was not compared to the warehouse"
         in json.dumps(envelope["warnings"])
     )
+
+
+def test_reconcile_links_covered_advisories_and_keeps_unrelated(warehouse, capsys):
+    """Covered advisories link to the validated semantic plan while unrelated
+    advisories remain independent manual actions, preserving counts."""
+
+    _sql(
+        warehouse,
+        "ALTER TABLE orders DROP COLUMN amount",
+    )
+    assert _run_ok(warehouse, "explore", "map", "--refresh")
+    rc, checked = _run(capsys, warehouse, "maintain", "check")
+    assert rc == 0, checked["errors"]
+
+    rc, envelope = _run(capsys, warehouse, "maintain", "reconcile")
+    assert rc == 0, envelope["errors"]
+    data = envelope["data"]
+    plan_id = data.get("semantic_plan_id")
+    assert plan_id is not None
+
+    covered = [
+        p
+        for p in data["proposals"]
+        if p["axis"] == "semantic" and p["finding_code"] == "dangling_reference"
+    ]
+    assert covered, "expected dangling_reference advisory for dropped amount"
+    for p in covered:
+        assert p["kind"] == "advisory"
+        assert p["plan_id"] == plan_id
+        assert p["paths"] == ["views/orders.yaml"]
+        assert f"covered by the databricks semantic plan ({plan_id})" in p["action"]
+        assert f"`transform apply {plan_id}`" in p["action"]
+
+    assert data["mechanical_count"] == sum(
+        1 for p in data["proposals"] if p["kind"] == "mechanical"
+    )
+    assert data["advisory_count"] == sum(
+        1 for p in data["proposals"] if p["kind"] == "advisory"
+    )
+    assert data["proposal_count"] == data["mechanical_count"] + data["advisory_count"]
+
+
+def test_reconcile_refused_repair_leaves_advisories_uncovered(warehouse, capsys):
+    """When a semantic plan is refused, no plan is stored and advisories remain."""
+
+    path = warehouse / "views" / "orders.yaml"
+    path.write_text(
+        path.read_text() + "\nunknown_key: true\n",
+        encoding="utf-8",
+    )
+    _sql(warehouse, "ALTER TABLE orders DROP COLUMN amount")
+    assert _run_ok(warehouse, "explore", "map", "--refresh")
+    rc, checked = _run(capsys, warehouse, "maintain", "check")
+    assert rc == 0, checked["errors"]
+
+    rc, reconciled = _run(capsys, warehouse, "maintain", "reconcile")
+    assert rc == 0, reconciled["errors"]
+    data = reconciled["data"]
+    assert data.get("semantic_plan_id") is None
+
+    proposals = data["proposals"]
+    assert proposals
+    assert all(p["kind"] == "advisory" for p in proposals)
+    assert all(p["plan_id"] is None for p in proposals)
+    assert all("covered by" not in p["action"] for p in proposals)
+    assert data.get("mechanical_count", 0) == 0
+    assert data["advisory_count"] == len(proposals)
