@@ -130,6 +130,12 @@ class _Tests:
             for owner in dbt_tests.generic_test_targets(test):
                 self.by_model[owner].append((name, column_key, kwargs, reads))
         self.labels = labels
+        #: Each model's package, so a package-qualified `ref` resolves.
+        self.packages: dict[str, str | None] = {
+            uid: node.get("package_name")
+            for uid, node in (manifest.get("nodes") or {}).items()
+            if isinstance(node, dict) and node.get("resource_type") == "model"
+        }
 
     def on_column(self, model: str, column: str, test: str) -> bool:
         key = _bare(column)
@@ -176,7 +182,12 @@ class _Tests:
             wanted = parent.lower()
             target = _ref_target(kwargs.get("to"))
             if target is not None:
-                if target.lower() == wanted.split(".", 1)[0]:
+                package, target_name = target
+                # A declaration names a model of this project: `ref('pkg',
+                # 'nodes')` is another model when `pkg` is not this project.
+                if (
+                    package is None or package == self.packages.get(model)
+                ) and target_name.lower() == wanted.split(".", 1)[0]:
                     return True
                 continue
             # No readable `to`: the target is what the test reads besides the
@@ -196,14 +207,17 @@ _REF = re.compile(
 )
 
 
-def _ref_target(to: Any) -> str | None:
-    """The model a ``relationships`` test's ``to`` names, from ``ref('x')`` or
-    ``ref('package', 'x')``; ``None`` for a source or anything else."""
+def _ref_target(to: Any) -> tuple[str | None, str] | None:
+    """``(package, model)`` a ``relationships`` test's ``to`` names, from
+    ``ref('x')`` (no package) or ``ref('package', 'x')``; ``None`` for a source
+    or anything else."""
 
     match = _REF.match(str(to)) if isinstance(to, str) else None
     if match is None:
         return None
-    return match.group(2) or match.group(1)
+    if match.group(2):
+        return match.group(1), match.group(2)
+    return None, match.group(1)
 
 
 def _bare(name: str) -> str:

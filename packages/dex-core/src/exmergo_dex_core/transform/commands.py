@@ -2834,6 +2834,7 @@ def test_mutations(
         unsupported=len(batch.unsupported),
         downstream=below,
         connector=connector,
+        full_tests=full_tests,
     )
     if record_warning:
         warnings.append(record_warning)
@@ -2888,6 +2889,7 @@ def _record_mutation_run(
     unsupported: int,
     downstream,
     connector: str,
+    full_tests: bool = True,
 ) -> tuple[str | None, str | None]:
     """Keep this run as the model's current mutation record, where it measured
     anything (#1281).
@@ -2905,12 +2907,15 @@ def _record_mutation_run(
     counts = dict(result["counts"])
     incremental = result.get("incremental") or None
     branch_counts = dict((incremental or {}).get("counts") or {})
-    # Only mutants a test actually ran count. With no unit test taking the
-    # is_incremental() branch, its mutants are survivors by construction, not
-    # by a run, and must not replace an earlier record on their own.
-    executed = sum(
-        counts.get(key, 0) for key in ("killed", "caught_downstream", "survived")
-    )
+    # Only mutants a test actually ran count. With no test running the full
+    # build (``full_tests`` false), or no unit test taking the is_incremental()
+    # branch, that side's mutants are survivors by construction, not by a run,
+    # and must not replace an earlier record on their own.
+    executed = 0
+    if full_tests:
+        executed += sum(
+            counts.get(key, 0) for key in ("killed", "caught_downstream", "survived")
+        )
     if (incremental or {}).get("tests"):
         executed += sum(branch_counts.get(key, 0) for key in ("killed", "survived"))
     if not executed:

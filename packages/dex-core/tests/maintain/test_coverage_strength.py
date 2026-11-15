@@ -333,6 +333,7 @@ def test_inferred_branch_survivors_alone_record_nothing():
         unsupported=0,
         downstream=below,
         connector="duckdb",
+        full_tests=True,
     )
     assert at is None and store.load_mutation_records() == {}
 
@@ -345,6 +346,32 @@ def test_inferred_branch_survivors_alone_record_nothing():
         unsupported=0,
         downstream=below,
         connector="duckdb",
+        full_tests=True,
     )
     assert at is not None
     assert store.load_mutation_records()[FCT]["complete"] is False
+
+
+def test_full_build_survivors_with_no_full_build_test_record_nothing():
+    """Review fix: with no test running the full build, its mutants survive by
+    construction; with no branch test either, nothing ran."""
+
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.transform.commands import _record_mutation_run
+
+    store = MemoryStore()
+    manifest = _manifest()
+    node = {**manifest["nodes"][FCT], "unique_id": FCT}
+    at, _ = _record_mutation_run(
+        store,
+        node,
+        {"sql_digest": "a", "tests_digest": "b", "manifest": manifest},
+        _run_result(full={"survived": 3}, branch={"survived": 2}, branch_tests=[]),
+        cap={"limit": 20, "generated": 5, "elided": {}},
+        unsupported=0,
+        downstream=SimpleNamespace(enabled=False, tests=[]),
+        connector="duckdb",
+        full_tests=False,
+    )
+    assert at is None and store.load_mutation_records() == {}

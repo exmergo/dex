@@ -381,3 +381,28 @@ def test_a_self_reference_is_not_checked_by_a_test_on_another_model() -> None:
     test_id = next(k for k in manifest["nodes"] if k.startswith("test."))
     del manifest["nodes"][test_id]["test_metadata"]["kwargs"]["to"]
     assert _fact(_run(manifest), "references", "parent_id")["checked_by"] == "none"
+
+
+def test_a_package_qualified_ref_to_a_same_named_model_does_not_check() -> None:
+    manifest = _manifest(
+        [_model("nodes", columns={"parent_id": {"references": "nodes.id"}})],
+        [
+            _test(
+                "relationships",
+                "nodes",
+                "parent_id",
+                reads=["nodes"],
+                kwargs={"to": "ref('other_pkg', 'nodes')", "field": "id"},
+            )
+        ],
+    )
+    assert _fact(_run(manifest), "references", "parent_id")["checked_by"] == "none"
+    test_id = next(k for k in manifest["nodes"] if k.startswith("test."))
+    project = manifest["nodes"][_uid("nodes")]["package_name"]
+    manifest["nodes"][test_id]["test_metadata"]["kwargs"]["to"] = (
+        f"ref('{project}', 'nodes')"
+    )
+    assert _fact(_run(manifest), "references", "parent_id")["checked_by"] in {
+        "dbt_test",
+        "both",
+    }
