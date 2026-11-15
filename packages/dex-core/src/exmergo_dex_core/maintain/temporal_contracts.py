@@ -49,6 +49,7 @@ from pydantic import ValidationError
 from ..cache import match_identifier
 from ..dbt_project import strip_relation_quoting
 from ..semantic_declarations import History
+from ..transform.evidence import status_kind
 from .drift import DriftFinding
 
 if TYPE_CHECKING:
@@ -278,7 +279,10 @@ def write_probe(
             f"could not be read ({why})",
         )
         return
-    if node.execution in ("error", "fail", "skipped"):
+    if node.execution and (
+        status_kind(node.execution) in ("failed", "skipped", "unrecognized")
+        or node.execution in ("error", "fail", "skipped")
+    ):
         _unwritten(
             prepared,
             model,
