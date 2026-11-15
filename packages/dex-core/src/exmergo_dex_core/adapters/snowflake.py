@@ -1456,7 +1456,8 @@ class SnowflakeAdapter:
 
     def list_semantic_views(self) -> list[str]:
         """Every semantic view the source allowlist's scopes hold, as
-        ``DB.SCHEMA.NAME``. Free: ``SHOW SEMANTIC VIEWS``, no warehouse.
+        ``DB.SCHEMA.NAME``. Warehouse-free: ``SHOW SEMANTIC VIEWS``, served by
+        cloud services.
 
         Kept apart from :meth:`list_objects`, which leaves semantic views out
         because none of them is a relation to profile. A scope whose listing is
@@ -1479,7 +1480,7 @@ class SnowflakeAdapter:
         """One deployed semantic view's definition, as
         ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`` returns it.
 
-        The one statement besides SHOW that goes through the free door: it is
+        The one statement besides SHOW that goes through the warehouse-free door: it is
         dex-built (the identifier comes from SHOW output and is passed as a
         string literal, escaped), it reads no table, and Snowflake answers it
         from the cloud-services layer without resuming a warehouse (checked on

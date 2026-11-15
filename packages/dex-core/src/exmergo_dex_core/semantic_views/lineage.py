@@ -365,12 +365,17 @@ VALUE_FUNCTIONS: frozenset[str] = frozenset(
         "arrayagg",
         "array_unique_agg",
         "arrayuniqueagg",
+        "array_union_agg",
+        "arrayunionagg",
         "object_agg",
         "objectagg",
         "max_by",
         "argmax",
+        "arg_max",
         "min_by",
         "argmin",
+        "arg_min",
+        "group_concat",
         "percentile_cont",
         "percentilecont",
         "percentile_disc",
@@ -398,6 +403,9 @@ def value_reads(sql: str) -> list[Read] | None:
         if not isinstance(node, exp.Func):
             continue
         names = {(node.sql_name() or "").lower(), type(node).__name__.lower()}
+        if isinstance(node, exp.Anonymous):
+            # A function sqlglot has no node for keeps its own name.
+            names.add(str(node.name or "").lower())
         if not names & VALUE_FUNCTIONS:
             continue
         for column in node.find_all(exp.Column):

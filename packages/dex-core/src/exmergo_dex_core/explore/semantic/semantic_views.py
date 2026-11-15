@@ -27,7 +27,7 @@ the order:
    member, every member ``--where`` names, the time dimension a grain buckets,
    and every input of a metric that returns one of its values (``MAX``,
    ``MIN``, ``ANY_VALUE``, ``LISTAGG``, ...);
-4. the deployed view, located with a free ``SHOW SEMANTIC VIEWS`` over the
+4. the deployed view, located with a warehouse-free ``SHOW SEMANTIC VIEWS`` over the
    source allowlist and read back with ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``,
    which Snowflake answers without a warehouse; every member the query relies
    on is held to the repository's definition, and a difference refuses;
@@ -124,6 +124,9 @@ class LocalSemanticViewLayer:
         self._dex = engine
         self._view: Any = None
         self._governed: GovernedSql | None = None
+        #: Base columns a value-returning aggregate reads directly, registered by
+        #: the PII gate's screening for this command (see :meth:`_screened`).
+        self._base_columns: dict[str, tuple[str, str]] = {}
 
     @classmethod
     def from_engine(cls, engine: Any) -> LocalSemanticViewLayer:
@@ -186,6 +189,18 @@ class LocalSemanticViewLayer:
         lines up with the repository's.
         """
 
+        self._supported_connector(
+            "`explore semantic list --deployed`",
+            advice="List the repository's files without --deployed, which needs no "
+            "connection",
+        )
+        governed = self._governed_sql()
+        try:
+            return self._read_deployed_catalog(governed)
+        finally:
+            governed.release()
+
+    def _read_deployed_catalog(self, governed: GovernedSql) -> SemanticCatalog:
         from ...semantic_views import catalog as catalog_mod
         from ...semantic_views.deployed import (
             REFUSED,
@@ -197,12 +212,6 @@ class LocalSemanticViewLayer:
         )
         from ...semantic_views.loader import LoadResult
 
-        self._supported_connector(
-            "`explore semantic list --deployed`",
-            advice="List the repository's files without --deployed, which needs no "
-            "connection",
-        )
-        governed = self._governed_sql()
         adapter = governed.adapter("explore semantic list")
         listed = adapter.list_semantic_views()
         loaded = self._loaded()
@@ -284,6 +293,14 @@ class LocalSemanticViewLayer:
                 grain=q.grain,
             )
         )
+        try:
+            return self._run_query(q, plan, governed)
+        finally:
+            governed.release()
+
+    def _run_query(
+        self, q: SemanticQuery, plan: Any, governed: GovernedSql
+    ) -> SemanticQueryResult:
         cache = governed.load_cache()
         refs, aliases = self._screened(plan)
         lookup = governed.pii_lookup(cache)
@@ -325,7 +342,6 @@ class LocalSemanticViewLayer:
         from ...semantic_views.query import (
             QueryRefused,
             resolve_token,
-            translate_values,
         )
 
         # The token is resolved and screened before the connector is asked for:
@@ -334,16 +350,36 @@ class LocalSemanticViewLayer:
             token = resolve_token(self._loaded(), dimension)
         except QueryRefused as exc:
             raise SemanticBackendError(str(exc)) from exc
+        from ...semantic_views.query import token_of
+
         governed = self._governed_sql() if self._dex is not None else None
         cache = governed.load_cache() if governed is not None else None
         lookup = governed.pii_lookup(cache) if governed is not None else None
+        # Screened as the catalog spells it: a token written in another case
+        # resolves to the same member and must meet the same evidence.
         notes = screen_values_request(
             token.token,
             meta_lookup=lookup,
-            aliases={token.token: [token.base]} if token.grain else None,
+            aliases={token.token: [token_of(token.view, token.member)]},
         )
         self._supported_connector("reading a Semantic View dimension's values")
         governed = self._governed_sql()
+        try:
+            return self._run_values(dimension, metrics, token, cache, notes, governed)
+        finally:
+            governed.release()
+
+    def _run_values(
+        self,
+        dimension: str,
+        metrics: list[str],
+        token: Any,
+        cache: Any,
+        notes: list[str],
+        governed: GovernedSql,
+    ) -> SemanticValuesResult:
+        from ...semantic_views.query import translate_values
+
         plan = self._translate(
             lambda loaded, resolved, catalog: translate_values(
                 loaded, resolved, catalog, dimension, metrics
@@ -383,16 +419,24 @@ class LocalSemanticViewLayer:
             raise SemanticBackendError(str(exc)) from exc
 
     def _screened(self, plan: Any) -> tuple[list[str], dict[str, list[str]]]:
-        """Every token the PII gate screens, and the tokens each stands for."""
+        """Every token the PII gate screens, and the tokens each stands for.
 
-        from ...semantic_views.query import token_of, value_inputs
+        Each is screened as the catalog spells it (``token_of``), since a token
+        written in another case resolves to the same member and must meet the
+        same evidence; the refusal still names the caller's spelling. A base
+        column a value-returning aggregate reads directly (``MAX(raw0)``) has
+        no catalog token, so it is screened through its physical column,
+        registered for this command in :meth:`_physical_columns`.
+        """
 
+        from ...semantic_views.query import BASE_COLUMN, token_of, value_inputs
+
+        resolved = self._source.resolution()
         refs: list[str] = []
         aliases: dict[str, list[str]] = {}
         for item in [*plan.dimensions, *plan.facts, *plan.filters]:
             refs.append(item.token)
-            if item.grain is not None:
-                aliases[item.token] = [item.base]
+            aliases[item.token] = [token_of(plan.view, item.member)]
         for metric in plan.metrics:
             inputs = value_inputs(plan.view, metric.member)
             if inputs is None:
@@ -401,7 +445,14 @@ class LocalSemanticViewLayer:
                     f"{metric.token} returns the values of, so the PII gate cannot "
                     "screen them"
                 )
-            refs.extend(token_of(plan.view, member) for member in inputs)
+            for member in inputs:
+                ref = token_of(plan.view, member)
+                column = member.raw.get(BASE_COLUMN)
+                if column is not None and member.table is not None:
+                    gate = resolved.gate(plan.view, member.table)
+                    if gate is not None:
+                        self._base_columns[ref] = (gate, resolved.fold(column))
+                refs.append(ref)
         return list(dict.fromkeys(refs)), aliases
 
     def _deployed(self, plan: Any, command: str) -> tuple[str, list[str]]:
@@ -416,7 +467,7 @@ class LocalSemanticViewLayer:
             locate,
             read_deployed,
         )
-        from ...semantic_views.query import metric_inputs
+        from ...semantic_views.query import row_inputs
 
         adapter = self._governed_sql().adapter(command)
         view = plan.view
@@ -431,9 +482,12 @@ class LocalSemanticViewLayer:
                 "dex cannot hold it to the repository's definition: "
                 + "; ".join(read.coverage.reasons)
             )
+        # Each member, and everything it reads at any depth: the metrics a
+        # derived metric is built from, and the facts and dimensions those
+        # aggregate (`SUM(orders.net_amount)` relies on the fact's expression).
         members = [item.member for item in plan.members]
-        for item in plan.metrics:
-            members.extend(metric_inputs(view, item.member))
+        for item in plan.members:
+            members.extend(row_inputs(view, item.member))
         unique = list({(m.table or "", m.name.lower()): m for m in members}.values())
         differences = compare(
             view, read.view, unique, plan.tables(self._source.resolution())
@@ -538,9 +592,10 @@ class LocalSemanticViewLayer:
 
     def _physical_columns(self) -> dict[str, tuple[str, str]]:
         try:
-            return dict(self._catalog_view().physical_columns)
+            columns = dict(self._catalog_view().physical_columns)
         except SemanticBackendError:
-            return {}
+            columns = {}
+        return {**columns, **self._base_columns}
 
     def _computed_columns(self) -> dict[str, tuple[str, str]]:
         try:

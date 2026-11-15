@@ -77,16 +77,28 @@ SALES = sv(
         dimensions=[
             {"name": "segment", "expr": "c_mktsegment"},
             {"name": "email", "expr": "c_email"},
+            {"name": "contact", "expr": "c_ref"},
         ],
+        facts=[{"name": "total_price", "expr": "c_acctbal"}],
         metrics=[
             {"name": "customer_count", "expr": "COUNT(c_custkey)"},
             {"name": "last_email", "expr": "MAX(customers.email)"},
+            {"name": "top_ref", "expr": "MAX(c_ref)"},
         ],
+    ),
+    table(
+        "nations",
+        "SHOP.PUBLIC.NATIONS",
+        ["n_nationkey"],
+        dimensions=[{"name": "country", "expr": "n_name"}],
     ),
     relationships=[
         relationship(
             "orders_customers", "orders", "customers", ("o_custkey", "c_custkey")
-        )
+        ),
+        relationship(
+            "customers_nations", "customers", "nations", ("c_nationkey", "n_nationkey")
+        ),
     ],
     metrics=[
         {
@@ -142,6 +154,14 @@ class Account:
                 [("C_CUSTKEY", "FIXED", False)],
                 rows=100,
                 bytes=2 * GB,
+            ),
+            FakeSnowflakeTable(
+                "SHOP",
+                "PUBLIC",
+                "NATIONS",
+                [("N_NATIONKEY", "FIXED", False)],
+                rows=25,
+                bytes=1_000,
             ),
         ]
         if deployed is not None:
@@ -221,15 +241,18 @@ def account(monkeypatch):
     holder: dict[str, Account] = {"account": Account()}
 
     def opener(**opened):
-        root = Path(opened["repo_root"]) if opened.get("repo_root") else Path.cwd()
+        # The engine's own store and repository, never the working directory:
+        # the spend ledger belongs to the test's repository.
+        root = Path(opened["repo_root"])
         config = opened.get("config") or load_config(root)
+        store = opened.get("store") or FilesystemStore(root)
         fake = holder["account"]
         return SnowflakeAdapter(
             connection=fake.connection,
             cost_gate=connect_mod.new_cost_gate(
                 "snowflake",
                 config,
-                FilesystemStore(root),
+                store,
                 budget=opened.get("budget"),
                 confirmed=opened.get("confirmed", False),
                 command=opened.get("command"),
@@ -282,7 +305,7 @@ def test_a_metric_by_dimension_runs_through_dex_s_connector(tmp_path, capsys, ac
 
 
 def test_the_statement_order_is_the_safety_contract(tmp_path, capsys, account):
-    """SHOW (free), the read-back (free, no warehouse), then the one billed
+    """SHOW and the read-back (no warehouse), then the one billed
     statement: the definition check precedes any spend."""
 
     root = _repo(tmp_path, SALES)
@@ -735,3 +758,145 @@ def test_deployed_is_a_list_flag(tmp_path, capsys, account):
     envelope = _query(capsys, root, "sales.orders.revenue", "--deployed")
 
     assert "`list`" in " ".join(envelope["errors"])
+
+
+# --- review round 1 ----------------------------------------------------------------
+
+
+def _flag(root: Path, column: str) -> None:
+    """Profile CUSTOMERS with ``column`` flagged as email, as `explore profile`
+    would have cached it."""
+
+    from exmergo_dex_core.cache import (
+        ColumnProfile,
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+    from exmergo_dex_core.storage import FilesystemStore
+
+    FilesystemStore(root).save_cache(
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier="SHOP.PUBLIC.CUSTOMERS",
+                    columns=[
+                        ColumnProfile(
+                            name=column,
+                            data_type="TEXT",
+                            pii=PIIFlag(category=PIICategory.EMAIL, confidence=0.95),
+                        ),
+                        ColumnProfile(name="C_MKTSEGMENT", data_type="TEXT"),
+                    ],
+                )
+            ]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sales.orders.order_count", "--group-by", "SALES.CUSTOMERS.CONTACT"],
+        ["sales.orders.order_count", "--where", "CUSTOMERS.CONTACT = 'x'"],
+        ["sales.customers.top_ref"],
+    ],
+    ids=["another-case", "filter-another-case", "max-of-a-base-column"],
+)
+def test_a_profiled_flag_binds_whatever_the_spelling(tmp_path, capsys, account, argv):
+    """A neutral name over a flagged column: the case a name heuristic misses,
+    so the cached flag has to be found however the token is spelled, and a
+    bare base column inside MAX() is screened as that column."""
+
+    root = _repo(tmp_path, SALES)
+    _flag(root, "C_REF")
+    envelope = _query(capsys, root, *argv)
+
+    assert "would surface PII" in " ".join(envelope["errors"]), envelope
+    assert account["account"].sent == []
+
+
+def test_values_in_another_case_meet_the_same_flag(tmp_path, capsys, account):
+    root = _repo(tmp_path, SALES)
+    _flag(root, "C_REF")
+    envelope = _run(
+        capsys, root, "explore", "semantic", "values", "Sales.Customers.Contact"
+    )
+
+    assert envelope["reason"] == "guard", envelope
+    assert account["account"].sent == []
+
+
+def test_a_changed_fact_a_metric_sums_is_stale(tmp_path, capsys, account):
+    deployed = json.loads(json.dumps(SALES))
+    deployed["tables"][0]["facts"][0]["expr"] = "o_totalprice * 2"
+    account["account"] = Account(deployed=deployed)
+    root = _repo(tmp_path, SALES)
+    envelope = _query(capsys, root, "sales.orders.revenue")
+
+    assert "orders.total_price has a different expr" in envelope["errors"][0]
+    assert account["account"].queries == []
+
+
+def test_the_table_a_dimension_is_joined_through_is_held_too(tmp_path, capsys, account):
+    """`orders` reaches `nations` through `customers`: a changed key on the
+    intermediate table changes the join, so it is compared and priced."""
+
+    deployed = json.loads(json.dumps(SALES))
+    deployed["tables"][1]["primary_key"] = {"columns": ["c_ref"]}
+    account["account"] = Account(deployed=deployed)
+    root = _repo(tmp_path, SALES)
+    envelope = _query(
+        capsys,
+        root,
+        "sales.orders.order_count",
+        "--group-by",
+        "sales.nations.country",
+    )
+
+    assert "table customers has a different primary_key" in envelope["errors"][0]
+
+
+def test_facts_sharing_a_name_are_refused(tmp_path, capsys, account):
+    root = _repo(tmp_path, SALES)
+    envelope = _query(
+        capsys,
+        root,
+        "--group-by",
+        "sales.orders.total_price,sales.customers.total_price",
+    )
+
+    assert "share the name" in " ".join(envelope["errors"]), envelope
+    assert account["account"].queries == []
+
+
+def test_each_operation_opens_its_own_adapter(tmp_path):
+    """A gate must not carry one operation's confirmation or charges into the
+    next: the adapter is released when the operation ends, on a refusal too."""
+
+    from exmergo_dex_core.config import QueryLimits
+    from exmergo_dex_core.explore.semantic.governed import GovernedSql
+
+    opened: list[str] = []
+
+    class Engine:
+        def _adapter(self, command):
+            opened.append(command)
+            return object()
+
+    governed = GovernedSql(
+        Engine(), "snowflake", QueryLimits(), dict, recompile_hint="x"
+    )
+    first = governed.adapter("explore semantic query")
+    assert governed.adapter("explore semantic query") is first
+    governed.release()
+    assert governed.adapter("explore semantic query") is not first
+    assert opened == ["explore semantic query", "explore semantic query"]
+
+
+def test_array_union_agg_returns_its_inputs():
+    from exmergo_dex_core.semantic_views.lineage import value_reads
+
+    reads = value_reads("ARRAY_UNION_AGG(customers.tags)")
+    assert [(r.qualifier, r.name) for r in reads or []] == [("customers", "tags")]

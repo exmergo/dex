@@ -3,13 +3,13 @@
 A governed query reads the deployed view and answers with the reviewed
 repository definition or not at all, so before anything is priced dex:
 
-1. **locates** the view: a free ``SHOW SEMANTIC VIEWS`` over the source
+1. **locates** the view: a warehouse-free ``SHOW SEMANTIC VIEWS`` over the source
    allowlist, matched by name. A view the account does not have is refused as
    defined only in the repository (dex never deploys one); one name in two
    allowlisted schemas is refused as ambiguous, and ``--scope`` narrows it;
 2. **reads it back** with ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``, which
    Snowflake serves from its cloud-services layer without resuming a warehouse
-   (checked on the dogfood account), so the read costs nothing and the refusal
+   (checked on the dogfood account), so the read bills no warehouse time and the refusal
    below comes before any spend;
 3. **compares** every member the query names, the metrics they read, the
    relationships between the tables they reach, and those tables' keys and base
@@ -33,6 +33,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+from ..errors import DexError
 from .model import LogicalTable, Member, SemanticView
 
 __all__ = [
@@ -51,7 +52,7 @@ LIMITED = "limited"
 REFUSED = "refused"
 
 
-class LocateRefused(Exception):  # noqa: N818  (a refusal, not an error)
+class LocateRefused(DexError):  # noqa: N818  (a refusal, not an error)
     """The view cannot be located on the account, said by name."""
 
 

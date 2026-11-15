@@ -40,6 +40,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ..errors import DexError
 from .model import (
     DERIVED,
     DIMENSION,
@@ -80,11 +81,14 @@ GRAINS: tuple[str, ...] = (
 
 _TEMPORAL = ("DATE", "TIME", "TIMESTAMP", "DATETIME")
 
+#: The ``raw`` key :func:`value_inputs` marks a base column read directly with.
+BASE_COLUMN = "base_column"
+
 #: The member keys that make a metric a level-of-detail expression.
 _LOD_KEYS = ("lod_dimension_type", "lod_dimensions")
 
 
-class QueryRefused(Exception):  # noqa: N818  (a refusal, not an error)
+class QueryRefused(DexError, ValueError):  # noqa: N818  (a refusal, not an error)
     """A request understood and deliberately not sent. ``guard`` marks one refused
     for safety (a private member, a filter that cannot be screened) rather than
     for shape, which the layer reports as a refusal rather than a bad request."""
@@ -245,6 +249,32 @@ def _inputs(view: SemanticView, member: Member) -> list[Member]:
             seen.add(identity)
             found.append(target)
             pending.append(target)
+    return found
+
+
+def row_inputs(view: SemanticView, member: Member) -> list[Member]:
+    """Every member ``member``'s expression reads, at any depth, metrics and
+    row-level members alike: what a definition check has to hold beside the
+    member itself (``SUM(orders.net_amount)`` relies on the fact)."""
+
+    from .lineage import reads
+    from .loader import resolve_read
+
+    found: list[Member] = []
+    pending, seen = [member], {(member.table or "", member.name.lower())}
+    while pending:
+        current = pending.pop(0)
+        for read in reads(current.expr) or []:
+            target = resolve_read(view, current, read.qualifier, read.name)
+            inner = target.member
+            if inner is None:
+                continue
+            identity = (inner.table or "", inner.name.lower())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            found.append(inner)
+            pending.append(inner)
     return found
 
 
@@ -483,16 +513,33 @@ class Translated:
 
     def tables(self, resolution: Resolution) -> set[str]:
         """The logical tables the statement reaches (lowered): each member's,
-        each metric input's, and the coarser tables a dimension is joined in from."""
+        each table a metric or member reads through, and every table on the
+        relationship paths that join them (an intermediate table a dimension
+        is joined in through, such as `customers` between `orders` and
+        `nations`)."""
+
+        from .loader import relationship_graph
 
         found: set[str] = set()
         for item in self.members:
             if item.table:
                 found.add(item.table.lower())
+            for inner in row_inputs(self.view, item.member):
+                if inner.table:
+                    found.add(inner.table.lower())
             if item.kind in (METRIC, DERIVED):
                 found.update(
                     m.table.lower() for m in _inputs(self.view, item.member) if m.table
                 )
+        graph = relationship_graph(self.view)
+        names = {rel.name.lower(): rel for rel in self.view.relationships}
+        reached = sorted(found)
+        for index, a in enumerate(reached):
+            for b in reached[index + 1 :]:
+                for name in graph.paths(a, b)[2]:
+                    rel = names.get(name)
+                    if rel is not None:
+                        found.update({rel.left_table.lower(), rel.right_table.lower()})
         return found
 
     def render(
@@ -522,7 +569,18 @@ class Translated:
             names[alias] = item.token
             aliases[item.token.lower()] = _quote(alias)
         facts: list[str] = []
+        headers: dict[str, str] = {}
         for item in self.facts:
+            # A fact takes no alias, so Snowflake heads it with its own name:
+            # two tables' `amount` would come back as one header.
+            other = headers.setdefault(item.member.name.lower(), item.token)
+            if other != item.token:
+                raise QueryRefused(
+                    f"{other} and {item.token} share the name "
+                    f"`{item.member.name}`, and Snowflake heads a fact by its name "
+                    "alone, so their columns cannot be told apart: query them one "
+                    "at a time"
+                )
             facts.append(item.reference)
             names[item.member.name.lower()] = item.token
             aliases[item.token.lower()] = item.member.name
@@ -748,14 +806,15 @@ def value_inputs(view: SemanticView, metric: Member) -> list[Member] | None:
             elif target.member is not None:
                 continue  # a metric inside MAX(): its own inputs are walked too
             elif target.column is not None:
-                # A base column read directly: screened by its own name on the
-                # metric's table, through a member standing for it.
+                # A base column read directly (`MAX(raw0)`): a member standing
+                # for it, marked so the gate screens the physical column itself.
                 found.append(
                     Member(
                         kind=FACT,
                         name=target.column,
                         expr=target.column,
                         table=target.table,
+                        raw={BASE_COLUMN: target.column},
                     )
                 )
             else:
