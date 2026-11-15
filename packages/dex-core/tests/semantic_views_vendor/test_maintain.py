@@ -911,3 +911,137 @@ def test_a_quoted_read_keeps_its_spelling_on_snowflake(tmp_path):
         if f.code == "declared_column_missing"
     }
     assert missing == {"tables['orders'].dimensions['note']": "NOTE"}
+
+
+def test_reconcile_links_covered_advisories_and_keeps_unrelated(warehouse, capsys):
+    """Covered advisories link to the validated semantic plan while unrelated
+    advisories remain independent manual actions, preserving counts."""
+
+    _sql(
+        warehouse,
+        "ALTER TABLE orders DROP COLUMN amount",
+        "ALTER TABLE orders ALTER placed_at TYPE VARCHAR",
+    )
+    assert _run_ok(warehouse, "explore", "map", "--refresh")
+    rc, checked = _run(capsys, warehouse, "maintain", "check")
+    assert rc == 0, checked["errors"]
+
+    rc, envelope = _run(capsys, warehouse, "maintain", "reconcile")
+    assert rc == 0, envelope["errors"]
+    data = envelope["data"]
+    plan_id = data.get("semantic_plan_id")
+    assert plan_id is not None
+
+    covered = [
+        p
+        for p in data["proposals"]
+        if p["axis"] == "semantic" and p["finding_code"] == "dangling_reference"
+    ]
+    assert covered, "expected dangling_reference advisory for dropped amount"
+    for p in covered:
+        assert p["kind"] == "advisory"
+        assert p["plan_id"] == plan_id
+        assert p["paths"] == ["views/sales.yaml"]
+        assert f"covered by the snowflake semantic plan ({plan_id})" in p["action"]
+        assert f"`transform apply {plan_id}`" in p["action"]
+
+    unrelated = [
+        p for p in data["proposals"] if p["finding_code"] == "declared_type_conflict"
+    ]
+    assert unrelated, "expected advisory for text time dimension"
+    for p in unrelated:
+        assert p["kind"] == "advisory"
+        assert p["plan_id"] is None
+        assert "covered by" not in p["action"]
+
+    assert data["mechanical_count"] == sum(
+        1 for p in data["proposals"] if p["kind"] == "mechanical"
+    )
+    assert data["advisory_count"] == sum(
+        1 for p in data["proposals"] if p["kind"] == "advisory"
+    )
+    assert data["proposal_count"] == data["mechanical_count"] + data["advisory_count"]
+
+
+def test_reconcile_refused_repair_leaves_advisories_uncovered(warehouse, capsys):
+    """When a semantic plan is refused, no plan is stored and advisories remain."""
+
+    # Add an unknown key so authoring strict rules refuse any edit to sales.yaml
+    path = warehouse / "views" / "sales.yaml"
+    path.write_text(
+        path.read_text() + "\nunknown_top_level_key: true\n",
+        encoding="utf-8",
+    )
+    _sql(warehouse, "ALTER TABLE orders DROP COLUMN amount")
+    assert _run_ok(warehouse, "explore", "map", "--refresh")
+    rc, checked = _run(capsys, warehouse, "maintain", "check")
+    assert rc == 0, checked["errors"]
+
+    rc, reconciled = _run(capsys, warehouse, "maintain", "reconcile")
+    assert rc == 0, reconciled["errors"]
+    data = reconciled["data"]
+    assert data.get("semantic_plan_id") is None
+
+    proposals = data["proposals"]
+    assert proposals
+    assert all(p["kind"] == "advisory" for p in proposals)
+    assert all(p["plan_id"] is None for p in proposals)
+    assert all("covered by" not in p["action"] for p in proposals)
+    assert data.get("mechanical_count", 0) == 0
+    assert data["advisory_count"] == len(proposals)
+
+
+def test_reconcile_does_not_claim_coverage_for_same_named_member_in_other_view(
+    warehouse, capsys
+):
+    """Removing a member in one view does not claim coverage for another."""
+
+    _sql(
+        warehouse,
+        "CREATE TABLE refunds (refund_id INTEGER, refund_amount DOUBLE)",
+        "INSERT INTO refunds VALUES (1, 5.0)",
+    )
+    refunds_yaml = """\
+name: refunds
+description: Customer refunds.
+tables:
+  - name: refunds
+    base_table:
+      database: demo
+      schema: main
+      table: refunds
+    primary_key:
+      columns: [refund_id]
+    facts:
+      - name: amount
+        expr: missing_amount
+    metrics:
+      - name: revenue
+        expr: SUM(refunds.amount)
+"""
+    (warehouse / "views" / "refunds.yaml").write_text(refunds_yaml, encoding="utf-8")
+    assert _run_ok(
+        warehouse,
+        "config",
+        "set",
+        "semantic.snowflake.files",
+        '["views/sales.yaml", "views/refunds.yaml"]',
+    )
+    _sql(warehouse, "ALTER TABLE orders DROP COLUMN amount")
+    assert _run_ok(warehouse, "explore", "map", "--refresh")
+    rc, checked = _run(capsys, warehouse, "maintain", "check")
+    assert rc == 0, checked["errors"]
+
+    rc, envelope = _run(capsys, warehouse, "maintain", "reconcile")
+    assert rc == 0, envelope["errors"]
+    data = envelope["data"]
+
+    refunds_proposals = [
+        p
+        for p in data["proposals"]
+        if "views/refunds.yaml" in p.get("paths", [])
+        or (p.get("detail") and "refunds" in p["detail"])
+    ]
+    for p in refunds_proposals:
+        assert p["plan_id"] is None
+        assert "covered by" not in p["action"]

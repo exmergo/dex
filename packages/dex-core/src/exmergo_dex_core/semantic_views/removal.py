@@ -530,4 +530,5 @@ def _proposal(
         column=finding.column,
         action=action,
         paths=paths or [],
+        finding=finding,
     )

@@ -3131,7 +3131,11 @@ def semantic_free_drift(
                             f"relationship '{rel.name}' names '{missing_side}', "
                             "which is no longer a semantic model"
                         ),
-                        data={"relationship": rel.name, "missing_model": missing_side},
+                        data={
+                            "relationship": rel.name,
+                            "missing_model": missing_side,
+                            "semantic_model": rel.model,
+                        },
                     )
                 )
                 continue
@@ -3158,7 +3162,12 @@ def semantic_free_drift(
                             f"'{rel.to_model}' names column pair(s) that no "
                             f"longer resolve: {broken}"
                         ),
-                        data={"relationship": rel.name, "missing_pairs": broken},
+                        data={
+                            "relationship": rel.name,
+                            "missing_pairs": broken,
+                            "semantic_model": rel.model,
+                            "to_model": rel.to_model,
+                        },
                     )
                 )
 
