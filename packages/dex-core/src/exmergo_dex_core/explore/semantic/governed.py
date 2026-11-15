@@ -24,7 +24,7 @@ A layer that executes against an object deployed in the warehouse (a Snowflake
 Semantic View) has to read that object before it can render: where it is, and
 whether it still matches the reviewed repository definition. It does so on the
 command's one connection, :meth:`GovernedSql.adapter`, with warehouse-free metadata
-reads only, so a stale deployment is refused before the handshake prices anything.
+reads only, so a stale deployment is refused before the governed query runs.
 
 What comes before rendering belongs to the layer, because only the layer can read
 its own request: the PII request-gate on the grouped and filtered dimensions, and

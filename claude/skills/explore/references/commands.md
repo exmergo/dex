@@ -586,7 +586,7 @@ it as `execution` (`dex` or `vendor`).
   private, window, LOD or `using_relationships` members, `variables`, an
   unreachable dimension and a grain on a categorical one, after the PII gate,
   and after holding the deployed view (read back with no warehouse) to
-  the repository's file, a difference refusing before spend. Tokens are the
+  the repository's file, a difference refusing before the query runs. Tokens are the
   catalog's, one view per query; a grain is `view.table.dim__month`, `--where`
   a Snowflake predicate over dimensions and facts (`orders.status = 'F'`), and
   a query of facts alone takes `--group-by <fact>` and no metric.

@@ -10,7 +10,7 @@ repository definition or not at all, so before anything is priced dex:
 2. **reads it back** with ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``, which
    Snowflake serves from its cloud-services layer without resuming a warehouse
    (checked on the dogfood account), so the read bills no warehouse time and the refusal
-   below comes before any spend;
+   below comes before the governed query runs;
 3. **compares** every member the query names, the metrics they read, the
    relationships between the tables they reach, and those tables' keys and base
    tables, refusing on the first difference and naming the member and the field.

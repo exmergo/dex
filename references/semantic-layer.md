@@ -1567,7 +1567,7 @@ semantic:
      names, every metric they read, and the base tables, keys and relationships
      of the tables they reach are held to the repository's file: kind,
      expression, access modifier, `non_additive_dimensions` and
-     `using_relationships`. A difference refuses the query before any spend,
+     `using_relationships`. A difference refuses the query before it runs,
      naming the member and the field. What Snowflake does on the way back
      (upper-cased names, `access_modifier` written out, a re-inferred
      `data_type`, empty `synonyms` and `description`) is not a difference;

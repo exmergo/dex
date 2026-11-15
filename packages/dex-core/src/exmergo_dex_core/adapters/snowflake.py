@@ -1485,7 +1485,8 @@ class SnowflakeAdapter:
         string literal, escaped), it reads no table, and Snowflake answers it
         from the cloud-services layer without resuming a warehouse (checked on
         a suspended warehouse: it stayed suspended). So no cost gate prices it,
-        and a stale-definition refusal happens before any spend.
+        and a stale-definition refusal happens before the governed query runs
+        and before any warehouse time is spent.
         """
 
         parts = identifier.split(".")
