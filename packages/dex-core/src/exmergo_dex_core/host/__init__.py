@@ -81,6 +81,7 @@ _EXPORTS = {
     "build_evidence": "transform.evidence",
     "plan_drift": "transform.evidence",
     "recompute_outcome": "transform.evidence",
+    "RequiredNodes": "transform.evidence",
     "required_nodes": "transform.evidence",
     "verify_build_evidence": "transform.evidence",
     # What a build established, bounded to lead its payload (#855).
@@ -175,6 +176,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
         BuildOutcome,
         BuildSelection,
         PlanDrift,
+        RequiredNodes,
         build_evidence,
         plan_drift,
         recompute_outcome,
@@ -260,6 +262,7 @@ __all__ = [
     "Reason",
     "RefusalReason",
     "RepairRefusedError",
+    "RequiredNodes",
     "StatementVerdict",
     "TransformPlan",
     "UnresolvedReference",

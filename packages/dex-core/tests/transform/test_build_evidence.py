@@ -1122,3 +1122,133 @@ def test_build_evidence_reports_disabled_test_as_missing(project):
     assert evidence.outcome == BuildOutcome.UNRELATED
     assert evidence.coverage.required == ["assert_orders_have_ids"]
     assert evidence.coverage.missing == ["assert_orders_have_ids"]
+
+
+def test_plan_requiring_test_sql_not_satisfied_by_same_named_model(project):
+    """Same-named model cannot satisfy a singular test requirement (#1316)."""
+    edits = [
+        PlanEdit(
+            path="tests/orders.sql",
+            new_content="select 1 from {{ ref('orders') }} where false",
+            op=EditOp.UPSERT,
+            kind=EditKind.TEST_SQL,
+        )
+    ]
+    manifest = {
+        "nodes": {
+            "model.shop.orders": {
+                "name": "orders",
+                "resource_type": "model",
+            },
+            "test.shop.orders": {
+                "name": "orders",
+                "resource_type": "test",
+            },
+        },
+    }
+    manifest_path = project / "target" / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    write_run_results(project, [node("orders", status="success")])
+    evidence = build_evidence(project, target="dev", edits=edits)
+    assert evidence.outcome == BuildOutcome.UNRELATED
+    assert evidence.coverage.required == ["orders"]
+    assert evidence.coverage.missing == ["orders"]
+    assert evidence.coverage.built == []
+    assert evidence.coverage.not_built == ["orders"]
+
+
+def test_unit_test_and_versioned_model_sharing_name_not_expanded(project):
+    """Unit test name is not expanded when a versioned model shares its name (#1316)."""
+    (project / "models" / "orders_atomic_v1.sql").write_text(
+        "select 1 as id", encoding="utf-8"
+    )
+    (project / "models" / "orders_atomic_v2.sql").write_text(
+        "select 1 as id", encoding="utf-8"
+    )
+    versioned_yaml = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders_atomic\n"
+        "    versions:\n"
+        "      - v: 1\n"
+        "      - v: 2\n"
+    )
+    (project / "models" / "schema_versions.yml").write_text(
+        versioned_yaml, encoding="utf-8"
+    )
+    unit_test_yaml = (
+        "version: 2\nunit_tests:\n  - name: orders_atomic\n    model: customers\n"
+    )
+    edits = [
+        PlanEdit(
+            path="models/schema_test.yml",
+            new_content=unit_test_yaml,
+            op=EditOp.UPSERT,
+            kind=EditKind.SCHEMA_YML,
+        )
+    ]
+    required, _basis, undetermined = required_nodes(edits, project)
+    assert required == ["orders_atomic"]
+    assert "orders_atomic.v1" not in required
+    assert "orders_atomic.v2" not in required
+    assert undetermined is False
+
+
+def test_unit_tests_with_same_name_on_different_models_preserve_identity(project):
+    """Multiple unit tests with the same name preserve model identity (#1316)."""
+    unit_test_yaml = (
+        "version: 2\n"
+        "unit_tests:\n"
+        "  - name: atomic\n"
+        "    model: orders\n"
+        "  - name: atomic\n"
+        "    model: customers\n"
+    )
+    edits = [
+        PlanEdit(
+            path="models/schema_tests.yml",
+            new_content=unit_test_yaml,
+            op=EditOp.UPSERT,
+            kind=EditKind.SCHEMA_YML,
+        )
+    ]
+    required, _basis, undetermined = required_nodes(edits, project)
+    assert "orders.atomic" in required
+    assert "customers.atomic" in required
+    assert len(required) == 2
+    assert undetermined is False
+
+
+def test_unit_test_on_versioned_model_creates_version_scoped_requirements(project):
+    """Unit test on versioned model generates requirements for each version (#1316)."""
+    (project / "models" / "orders_v1.sql").write_text(
+        "select 1 as id", encoding="utf-8"
+    )
+    (project / "models" / "orders_v2.sql").write_text(
+        "select 1 as id", encoding="utf-8"
+    )
+    versioned_yaml = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: orders\n"
+        "    versions:\n"
+        "      - v: 1\n"
+        "      - v: 2\n"
+    )
+    (project / "models" / "schema_versions.yml").write_text(
+        versioned_yaml, encoding="utf-8"
+    )
+    unit_test_yaml = "version: 2\nunit_tests:\n  - name: atomic\n    model: orders\n"
+    edits = [
+        PlanEdit(
+            path="models/schema_tests.yml",
+            new_content=unit_test_yaml,
+            op=EditOp.UPSERT,
+            kind=EditKind.SCHEMA_YML,
+        )
+    ]
+    required, _basis, undetermined = required_nodes(edits, project)
+    assert "orders.v1.atomic" in required
+    assert "orders.v2.atomic" in required
+    assert len(required) == 2
+    assert undetermined is False

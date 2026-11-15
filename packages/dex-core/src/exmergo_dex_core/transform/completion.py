@@ -442,6 +442,21 @@ def node_answers(node: BuildNode) -> set[str]:
         "test",
         "unit_test",
     }:
+        if len(parts) >= 3:
+            answers.add(f"test.{parts[-1]}")
+            answers.add(f"test:{parts[-1]}")
+        if parts[0] == "unit_test" and len(parts) >= 4:
+            model = parts[2]
+            test_name = parts[3]
+            answers.add(f"{model}.{test_name}")
+            if "_" in test_name:
+                base_test, _, ver = test_name.rpartition("_")
+                if ver.startswith("v") and ver[1:].isdigit():
+                    answers.add(f"{model}.{base_test}")
+                    answers.add(f"{model}.{ver}.{base_test}")
+                    answers.add(f"{model}.{test_name}")
+                    answers.add(base_test)
+                    answers.add(f"{test_name}")
         return answers
     if parts[0] not in _BUILDABLE:
         return set()
@@ -598,8 +613,39 @@ def _deliverables(
     blocked: list[Blocked] = []
     causes: list[str] = []
     missing: list[str] = []
+    kinds_map = getattr(coverage, "kinds", {}) or {}
     for name in coverage.required:
-        matches = [n for n in evidence.nodes if name in node_answers(n)]
+        req_kind = kinds_map.get(name)
+        if not req_kind and coverage.basis:
+            if any(
+                f"runs test '{name}'" in b or f"runs unit test '{name}'" in b
+                for b in coverage.basis
+            ):
+                req_kind = "test"
+            elif any(f"builds '{name}'" in b for b in coverage.basis):
+                req_kind = "model"
+
+        candidate_nodes = evidence.nodes
+        if req_kind in {"test", "unit_test"}:
+            candidate_nodes = [
+                n
+                for n in evidence.nodes
+                if (
+                    n.resource_type in {"test", "unit_test"}
+                    or n.unique_id.startswith(("test.", "unit_test."))
+                )
+            ]
+        elif req_kind in {"model", "seed", "snapshot"}:
+            candidate_nodes = [
+                n
+                for n in evidence.nodes
+                if not (
+                    n.resource_type in {"test", "unit_test"}
+                    or n.unique_id.startswith(("test.", "unit_test."))
+                )
+            ]
+
+        matches = [n for n in candidate_nodes if name in node_answers(n)]
         if not matches:
             missing.append(name)
             continue

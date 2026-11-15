@@ -34,6 +34,7 @@ from exmergo_dex_core.transform.evidence import (
     BuildCoverage,
     BuildEvidence,
     BuildNode,
+    BuildOutcome,
     BuildSelection,
     PlanDrift,
     recompute_outcome,
@@ -896,3 +897,61 @@ def test_native_unit_test_deliverable_passes_without_rebuilding_model():
     assert completion.deliverables.built.names == ["test_orders_atomic"]
     assert "stg_orders" not in completion.deliverables.built.names
     assert "stg_orders" not in completion.assurance.build_only.names
+
+
+def test_same_named_model_cannot_satisfy_required_test_deliverable():
+    """Model node execution cannot satisfy a required test deliverable (#1316)."""
+    coverage = BuildCoverage(
+        required=["orders"],
+        covered=[],
+        missing=["orders"],
+        built=[],
+        not_built=["orders"],
+        kinds={"orders": "test"},
+    )
+    nodes = [
+        BuildNode(
+            unique_id="model.dex_test.orders",
+            name="orders",
+            resource_type="model",
+            status="success",
+        )
+    ]
+    evidence = BuildEvidence(
+        outcome=BuildOutcome.UNRELATED,
+        nodes=nodes,
+        coverage=coverage,
+    )
+    completion = summarize_completion(evidence, None)
+    assert completion.deliverables.missing.names == ["orders"]
+    assert "orders" not in completion.deliverables.built.names
+    assert completion.outcome == "unrelated"
+
+
+def test_model_scoped_unit_test_completion_requires_all_scoped_tests():
+    """Running only one model-scoped unit test leaves the other missing (#1316)."""
+    coverage = BuildCoverage(
+        required=["customers.atomic", "orders.atomic"],
+        covered=["orders.atomic"],
+        missing=["customers.atomic"],
+        built=["orders.atomic"],
+        not_built=["customers.atomic"],
+        kinds={"orders.atomic": "unit_test", "customers.atomic": "unit_test"},
+    )
+    nodes = [
+        BuildNode(
+            unique_id="unit_test.dex_test.orders.atomic",
+            name="atomic",
+            resource_type="unit_test",
+            status="pass",
+        )
+    ]
+    evidence = BuildEvidence(
+        outcome=BuildOutcome.PARTIAL,
+        nodes=nodes,
+        coverage=coverage,
+    )
+    completion = summarize_completion(evidence, None)
+    assert "orders.atomic" in completion.deliverables.built.names
+    assert "customers.atomic" in completion.deliverables.missing.names
+    assert completion.outcome == "partial"
