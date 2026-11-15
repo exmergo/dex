@@ -360,6 +360,71 @@ def test_a_grouped_joins_aggregate_output_can_make_it_required(
     assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
 
 
+def test_a_grouped_aggregate_renamed_in_the_model_keeps_its_provenance(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The CTE computes `total_amount`, but the model projects it as `spend`.
+    A declaration on `spend` must reach the join, and the CTE's unprojected
+    `order_count` must not be checked against the built relation."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, count(*) as order_count, sum(amount) as total_amount "
+        f"from {W}.child_orders where status = 'paid' group by customer_id) "
+        "select c.id as customer_id, c.name, o.total_amount as spend "
+        f"from {W}.roster c left join orders_by_customer o "
+        "on c.id = o.customer_id"
+    )
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    _model(
+        maintain_repo,
+        sql,
+        columns={"spend": {"role": "measure", "null_rule": "never"}},
+    )
+
+    data = _verify(maintain_repo, "rpt_customers")
+    (record,) = _records(data, "rpt_customers")
+
+    assert record["declared"]["derived_columns"] == ["spend"]
+    assert record["declared"]["required"] is True
+    assert record["status"] == "contradicted"
+    assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
+
+
+def test_a_grouped_aggregate_the_model_does_not_project_is_not_derived(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The CTE computes aggregates, but the model only selects the key and a
+    parent column: the aggregates are not columns the join supplies to the
+    model, so no NULL check may be generated for them."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, count(*) as order_count, sum(amount) as total_amount "
+        f"from {W}.child_orders where status = 'paid' group by customer_id) "
+        "select c.id as customer_id, c.name "
+        f"from {W}.roster c left join orders_by_customer o "
+        "on c.id = o.customer_id"
+    )
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    _model(maintain_repo, sql)
+
+    data = _verify(maintain_repo, "rpt_customers")
+    (record,) = _records(data, "rpt_customers")
+
+    assert record["declared"]["derived_columns"] == []
+    assert record["status"] == "satisfied"
+    assert _codes(data, "rpt_customers") == {}
+
+
 def test_groups_whose_keys_the_roster_lacks_are_a_zero_match_join(
     maintain_repo, _assume_the_project_compiles
 ):

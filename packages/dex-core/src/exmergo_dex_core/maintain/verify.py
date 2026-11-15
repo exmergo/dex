@@ -2586,6 +2586,10 @@ class JoinCandidate:
     #: (#1324). They are columns the join supplies that no single physical
     #: column holds, kept so a declaration can still make the join required.
     to_grouped_outputs: tuple[str, ...] = ()
+    #: The alias the model reads the grouped ``to`` side as (``o`` in
+    #: ``left join orders_by_customer o``), so its outputs can be traced to the
+    #: final output columns through :attr:`ModelJoinContext.projected`.
+    to_alias: str = field(default="", compare=False)
 
     def scope_filters(self) -> tuple[str | None, str | None] | None:
         """Each side's filters joined into one predicate, or None where neither
@@ -3570,6 +3574,7 @@ def _model_joins(
                         from_grouped=from_grouped,
                         to_grouped=to_grouped,
                         to_grouped_outputs=to_grouped_outputs if to_grouped else (),
+                        to_alias=join_alias,
                     )
                 )
 
@@ -3643,6 +3648,11 @@ class ModelJoinContext:
     parents: dict[str, str] = field(default_factory=dict)
     assumptions: list[dict] = field(default_factory=list)
     population_filters: tuple[str, ...] = ()
+    #: Per ``(join alias, grouped output column)``, the final output names the
+    #: model projects it as (#1324). An aggregate inside a grouped CTE has no
+    #: physical column, so this is how its provenance reaches the model's own
+    #: columns, where a declaration can name it.
+    projected: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -3753,6 +3763,7 @@ def plan_join_contract(
                 parents=parents,
                 assumptions=assumptions,
                 population_filters=population_filters,
+                projected=_final_output_map(tree),
             )
     return plan
 
@@ -3820,6 +3831,56 @@ def _output_lineage(tree, sql_shape, depth: int = 0) -> dict[str, tuple[str, str
         else {}
     )
     return _select_lineage(tree, cte_scopes, sql_shape, depth, root)
+
+
+def _final_output_map(tree) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Each ``(join alias, column)`` the model's final SELECT names, mapped to
+    the output column(s) it is projected as (#1324).
+
+    A grouped CTE's aggregate output (``sum(amount) as total``) has no
+    physical column, so its provenance is known only here: the model may
+    project it as ``spend``, or not at all. Only a projection whose column
+    references all name one alias is mapped; a star, a set operation or a
+    projection mixing aliases contributes nothing. Every reference of a
+    computed output (``coalesce(o.total, 0) as spend``) maps to that output.
+    """
+
+    from sqlglot import expressions as exp
+
+    if not isinstance(tree, exp.Select):
+        return {}
+    names: dict[tuple[str, str], list[str]] = {}
+    for projection in tree.expressions:
+        if isinstance(projection, exp.Alias) and projection.alias:
+            output = projection.alias.lower()
+            inner = projection.this
+        elif isinstance(projection, exp.Column):
+            output = projection.name.lower()
+            inner = projection
+        else:
+            continue
+        columns = (
+            [inner]
+            if isinstance(inner, exp.Column)
+            else list(inner.find_all(exp.Column))
+        )
+        if not columns:
+            continue
+        tables = {
+            (column.table or "").replace('"', "").replace("`", "").lower()
+            for column in columns
+        }
+        if len(tables) != 1:
+            continue
+        table = tables.pop()
+        if not table:
+            continue
+        for column in columns:
+            key = (table, column.name.lower())
+            outputs = names.setdefault(key, [])
+            if output not in outputs:
+                outputs.append(output)
+    return {key: tuple(outputs) for key, outputs in names.items()}
 
 
 def _select_lineage(select, cte_scopes, sql_shape, depth, root) -> dict:
@@ -3931,9 +3992,11 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
     }
     if candidate.to_grouped:
         # The grouped side's aggregate outputs have no single physical column,
-        # so lineage cannot attribute them; they are still columns the join
-        # supplies, and a declaration can make it required (#1324).
-        supplied.update(candidate.to_grouped_outputs)
+        # so lineage cannot attribute them; their provenance is the alias the
+        # model reads them through, projected to the model's own output names
+        # (#1324). An aggregate the model does not project contributes nothing.
+        for column in candidate.to_grouped_outputs:
+            supplied.update(ctx.projected.get((candidate.to_alias, column), ()))
     derived = tuple(sorted(supplied))
     driving = tuple(
         sorted(

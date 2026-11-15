@@ -289,7 +289,10 @@ Needs no baseline. The classes of finding:
     `GROUP BY ALL`), and optionally the supported `WHERE`) also carries
     `grouped_by`, the key columns it groups by. That side is probed over its
     groups, never the ungrouped relation underneath, and its own denominator
-    is `measured.group_rows`. A grouping by anything else (an extra column, a
+    is `measured.group_rows`. Its aggregate outputs are attributed through the
+    model's final projections, so `null_rule: never` on a renamed output
+    (`o.total_amount as spend`) still makes the join required, and an
+    aggregate the model does not project is not treated as supplied. A grouping by anything else (an extra column, a
     subset of a composite key, an expression, or a grouping inside another
     grouping) stays `filtered_cte`.
   - `status`: `satisfied`, `contradicted` (with the finding), `not_applicable`
