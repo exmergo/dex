@@ -355,3 +355,29 @@ def test_a_self_reference_counts_its_relationships_test() -> None:
     fact = _fact(_run(manifest), "references", "manager_id")
     assert fact["checked_by"] in {"dbt_test", "both"}
     assert fact["tests"] == ["relationships"]
+
+
+def test_a_self_reference_is_not_checked_by_a_test_on_another_model() -> None:
+    manifest = _manifest(
+        [
+            _model("categories"),
+            _model(
+                "nodes",
+                columns={"parent_id": {"references": "nodes.id"}},
+            ),
+        ],
+        [
+            _test(
+                "relationships",
+                "nodes",
+                "parent_id",
+                reads=["nodes", "categories"],
+                kwargs={"to": "ref('categories')", "field": "id"},
+            )
+        ],
+    )
+    assert _fact(_run(manifest), "references", "parent_id")["checked_by"] == "none"
+    # Without a readable `to`, the other relation it reads is still the target.
+    test_id = next(k for k in manifest["nodes"] if k.startswith("test."))
+    del manifest["nodes"][test_id]["test_metadata"]["kwargs"]["to"]
+    assert _fact(_run(manifest), "references", "parent_id")["checked_by"] == "none"

@@ -48,6 +48,7 @@ How each fact kind is judged (dbt test; maintain verify codes):
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -173,15 +174,36 @@ class _Tests:
             if parent is None:
                 return True
             wanted = parent.lower()
-            # The test reads the child and the parent; the child's own label
-            # matches only when the reference is to the model itself.
+            target = _ref_target(kwargs.get("to"))
+            if target is not None:
+                if target.lower() == wanted.split(".", 1)[0]:
+                    return True
+                continue
+            # No readable `to`: the target is what the test reads besides the
+            # child, and the child itself only when it reads nothing else.
+            targets = [uid for uid in reads if uid != model] or [model]
             if any(
                 self.labels.get(uid, "").lower() == wanted
                 or self.labels.get(uid, "").split(".", 1)[0].lower() == wanted
-                for uid in reads
+                for uid in targets
             ):
                 return True
         return False
+
+
+_REF = re.compile(
+    r"""^\s*(?:\{\{\s*)?ref\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]+)['"]\s*)?\)"""
+)
+
+
+def _ref_target(to: Any) -> str | None:
+    """The model a ``relationships`` test's ``to`` names, from ``ref('x')`` or
+    ``ref('package', 'x')``; ``None`` for a source or anything else."""
+
+    match = _REF.match(str(to)) if isinstance(to, str) else None
+    if match is None:
+        return None
+    return match.group(2) or match.group(1)
 
 
 def _bare(name: str) -> str:
