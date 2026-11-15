@@ -11,11 +11,20 @@ to be written this way, and this is the one place it is stated:
    the ``.dex/`` cache and then the connection's own inventory, so a namespace
    mismatch is refused by name rather than billed as a failed job.
 3. **Cost handshake.** The adapter prices the statement and a billed connector
-   stops for ``--confirm --budget`` before any spend.
+   stops for ``--confirm --budget`` before any spend. A statement over a
+   semantic object the warehouse keeps no bytes for is priced by the base
+   relations the layer says it reaches (``priced_relations``), where the
+   adapter can price relations, rather than at the per-statement floor.
 4. **Run**, through dex's own connector, under the query limits.
 5. **Cap** the columnar result, disclosing every cut and any relation the PII
    gate could only screen by name.
 6. **Stamp spend** onto the record that comes back.
+
+A layer that executes against an object deployed in the warehouse (a Snowflake
+Semantic View) has to read that object before it can render: where it is, and
+whether it still matches the reviewed repository definition. It does so on the
+command's one connection, :meth:`GovernedSql.adapter`, with warehouse-free metadata
+reads only, so a stale deployment is refused before the governed query runs.
 
 What comes before rendering belongs to the layer, because only the layer can read
 its own request: the PII request-gate on the grouped and filtered dimensions, and
@@ -84,6 +93,7 @@ class GovernedSql:
         self._physical_columns = physical_columns
         self._computed_columns = computed_columns or dict
         self._recompile_hint = recompile_hint
+        self._opened: tuple[str, Any] | None = None
 
     def run(
         self,
@@ -96,6 +106,8 @@ class GovernedSql:
         extra_notes: list[str] | None = None,
         column_names: Mapping[str, str] | None = None,
         utc_session: bool = False,
+        priced_relations: list[str] | None = None,
+        live_relations: list[str] | None = None,
         **fields,
     ):
         """Take rendered SQL to a stamped result, in the order the module states.
@@ -109,56 +121,97 @@ class GovernedSql:
         rendered SQL assumes its own driver's (Cube's): an adapter whose
         sessions carry no time zone (BigQuery, whose ``TIMESTAMP`` is UTC) has
         nothing to pin.
+
+        ``live_relations`` names relations the statement may read that the
+        adapter's inventory leaves out (a semantic view is no relation to
+        profile, so it is never listed), which the layer has already found on
+        this connection. ``priced_relations`` is what the statement is priced
+        by, where the adapter prices relations.
         """
 
-        from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
-
-        dialect = get_dialect(self._connector)
         try:
-            assert_select_only(sql, dialect=dialect)
-        except NotSelectOnlyError as exc:
-            raise SemanticQueryRefusedError(
-                f"rendered metric SQL was not read-only: {exc}"
-            ) from exc
+            from ...guards.sql_guard import NotSelectOnlyError, assert_select_only
 
-        # One adapter for the whole command: the pre-check may introspect the
-        # connection, and `_adapter` rebuilds the cost gate on every call, so
-        # asking twice would settle and rebuild a gate for nothing.
-        adapter = self._dex._adapter(command)
-        if utc_session and (pin := getattr(adapter, "pin_utc_session", None)):
-            pin()
-        refusal, unprofiled = self.relation_precheck(
-            sql,
-            cache,
-            dialect,
-            lambda: [meta.identifier for meta in adapter.list_objects()],
-        )
-        if refusal is not None:
-            raise SemanticBackendError(refusal)
+            dialect = get_dialect(self._connector)
+            try:
+                assert_select_only(sql, dialect=dialect)
+            except NotSelectOnlyError as exc:
+                raise SemanticQueryRefusedError(
+                    f"rendered metric SQL was not read-only: {exc}"
+                ) from exc
 
-        estimate_fn = getattr(adapter, "query_estimate", None)
-        estimate = estimate_fn(sql) if estimate_fn else 0.0
-        command_args.billed_handshake(command, adapter, estimate)
-        result = adapter.run_query(
-            sql,
-            max_rows=self._limits.max_rows,
-            timeout_seconds=self._limits.timeout_seconds,
-        )
-        columns = list(result.columns)
-        if column_names:
-            columns = [column_names.get(name, name) for name in columns]
-        capped = cap_columnar(
-            columns,
-            result.types,
-            result.cells,
-            max_rows=self._limits.max_rows,
-            max_cell_chars=self._limits.max_cell_chars,
-            max_payload_bytes=self._limits.max_payload_bytes,
-            truncated_by_source=result.truncated,
-            extra_notes=[*(extra_notes or []), *unprofiled_note(unprofiled)],
-        )
-        record = result_type.from_capped(capped, backend=backend, **fields)
-        return command_args.stamp_spend(record, adapter)
+            adapter = self.adapter(command)
+            if utc_session and (pin := getattr(adapter, "pin_utc_session", None)):
+                pin()
+
+            def live() -> list[str]:
+                listed = [meta.identifier for meta in adapter.list_objects()]
+                return [*listed, *(live_relations or [])]
+
+            refusal, unprofiled = self.relation_precheck(sql, cache, dialect, live)
+            if refusal is not None:
+                raise SemanticBackendError(refusal)
+            if live_relations:
+                # A semantic object is never profiled; the PII gate screened the
+                # base relations behind it, so those are what the disclosure names.
+                unprofiled = [
+                    *(r for r in unprofiled if not match_identifier(r, live_relations)),
+                    *unprofiled_in(priced_relations or [], cache),
+                ]
+
+            by_relations = getattr(adapter, "relations_estimate", None)
+            estimate_fn = getattr(adapter, "query_estimate", None)
+            if priced_relations and by_relations is not None:
+                estimate = by_relations(priced_relations)
+            else:
+                estimate = estimate_fn(sql) if estimate_fn else 0.0
+            command_args.billed_handshake(command, adapter, estimate)
+            result = adapter.run_query(
+                sql,
+                max_rows=self._limits.max_rows,
+                timeout_seconds=self._limits.timeout_seconds,
+            )
+            columns = list(result.columns)
+            if column_names:
+                columns = [column_names.get(name, name) for name in columns]
+            capped = cap_columnar(
+                columns,
+                result.types,
+                result.cells,
+                max_rows=self._limits.max_rows,
+                max_cell_chars=self._limits.max_cell_chars,
+                max_payload_bytes=self._limits.max_payload_bytes,
+                truncated_by_source=result.truncated,
+                extra_notes=[
+                    *(extra_notes or []),
+                    *unprofiled_note(unprofiled),
+                ],
+            )
+            record = result_type.from_capped(capped, backend=backend, **fields)
+            return command_args.stamp_spend(record, adapter)
+        finally:
+            self.release()
+
+    def adapter(self, command: str):
+        """The command's one adapter, opened once.
+
+        One for the whole operation, released by :meth:`run` when it ends
+        (and by the layer, on a refusal before ``run``). A layer may read the
+        warehouse's metadata before it renders, the pre-check may introspect
+        the connection, and `_adapter` rebuilds the cost gate on every call, so
+        asking twice would settle and rebuild a gate for nothing.
+        """
+
+        if self._opened is None or self._opened[0] != command:
+            self._opened = (command, self._dex._adapter(command))
+        return self._opened[1]
+
+    def release(self) -> None:
+        """End the operation: the next one opens its own adapter, and so its
+        own cost gate, rather than inheriting this one's confirmation or the
+        estimates it has already charged."""
+
+        self._opened = None
 
     def load_cache(self):
         """The exploration cache with config PII overrides applied in memory, or None.
@@ -424,6 +477,14 @@ def expression_columns(expression: str, dialect: str) -> list[str] | None:
     if tree is None or tree.find(exp.Select, exp.Subquery) is not None:
         return None
     return list(dict.fromkeys(column.name for column in tree.find_all(exp.Column)))
+
+
+def unprofiled_in(relations: list[str], cache) -> list[str]:
+    """Those of ``relations`` the cache holds no column profile for."""
+
+    datasets = list(cache.datasets) if cache is not None else []
+    profiled = [dataset.identifier for dataset in datasets if dataset.columns]
+    return [name for name in relations if not match_identifier(name, profiled)]
 
 
 def unprofiled_note(relations: list[str]) -> list[str]:

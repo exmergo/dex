@@ -643,7 +643,9 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     "databricks": ("local",),
     # Snowflake Semantic Views: the Semantic View YAML documents committed here,
     # read statically. The views deployed on an account are a second copy dex
-    # neither reads nor writes in this release (#1290 reads them, explicitly).
+    # never writes; it reads them only explicitly (#1290): a governed query reads
+    # back the view it runs on, and `explore semantic list --deployed` reads them
+    # all. Neither is a deployment setting, so `local` stays the only one.
     "snowflake": ("local",),
 }
 

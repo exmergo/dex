@@ -92,6 +92,11 @@ INTERNAL_REFUSALS = {
     "CubeRefusalError",
     "CubeTransportError",
     "StaleRendererError",
+    # Wrapped before a caller sees it: the Snowflake Semantic View layer turns
+    # each into SemanticBackendError, or SemanticQueryRefusedError for a guard
+    # (#1290).
+    "LocateRefused",
+    "QueryRefused",
     # Never leaves the Metric View validator: it stops reading one element, and
     # the finding it carries is what a caller sees (#1257).
     "_RefusedError",

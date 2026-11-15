@@ -293,9 +293,10 @@ metric-views = ["exmergo-dex-core[sql]"]
 # Snowflake Semantic View YAML files (`semantic.vendor: snowflake`). Read
 # statically, validated by dex's own port of Snowflake's specification and
 # validation rules, so there is no Snowflake package to install and no account to
-# reach: the connector is the separate [snowflake] extra, which only a query
-# (#1290) needs. The reader needs the dialect engine, to trace each member's
-# `expr` to what it reads, which [sql] carries. Nothing outside
+# reach: the connector is the separate [snowflake] extra, which only a governed
+# query, a values read and `list --deployed` (#1290) need. The reader needs the
+# dialect engine, to trace each member's `expr` to what it reads, which [sql]
+# carries. Nothing outside
 # `exmergo_dex_core.semantic_views.lineage` imports sqlglot for Semantic Views,
 # and a base install refuses `vendor: snowflake` by name; a packaging test holds
 # both.

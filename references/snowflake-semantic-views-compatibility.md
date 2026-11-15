@@ -36,10 +36,11 @@ rather than as every definition changing.
 |---|---|---|
 | `config validate` and `config get` on a `semantic.snowflake` block | none | always available |
 | reading the layer: `explore semantic list`, `--use-project`, `maintain` | `[semantic-views]`, the dialect engine (every connector extra already carries it) | refused by name, `reason: prerequisite` |
+| a governed `explore semantic query` or `values`, and `list --deployed` | `[semantic-views]` and `[snowflake]`, the warehouse connector | refused by name |
 
 Reading the layer installs no Snowflake package and opens no Snowflake
 connection. The `[snowflake]` extra is the warehouse connector, which only a
-governed query (#1290) will need.
+governed query, a values read and `list --deployed` need.
 
 ## The YAML document is read; the DDL is not
 
@@ -201,14 +202,76 @@ The catalog's declared gaps:
 - `model_ref` and `agg_time_dimension`
 - an entity's label and description
 
-## `query` and `values` are not available yet
+## `query` and `values`: Dex renders, Snowflake executes (#1290)
 
-A governed Semantic View query is a `SEMANTIC_VIEW(...)` clause rendered by Dex
-and executed through the Snowflake connector under the cost guard (#1290). Until
-then `explore semantic query` refuses by name. `explore semantic values` resolves
-the token and runs the values PII gate first, so a personal dimension is refused
-as PII before it is refused for want of a runtime. Profile the relations the
-catalog names with `explore profile` instead.
+A governed query is a `SEMANTIC_VIEW(...)` clause Dex renders from the catalog
+and executes through its own Snowflake connector, under the cost guard
+(`execution: dex`). Every other connector is refused by name.
+
+| Request | What Dex does |
+|---|---|
+| `query sales.orders.revenue --group-by sales.customers.segment` | `SELECT * FROM SEMANTIC_VIEW("DB"."SCH"."SALES" DIMENSIONS customers.segment AS "c0" METRICS orders.revenue AS "c1") LIMIT 51`, result columns named by the tokens |
+| a view-level metric (`sales.revenue_per_customer`) | `METRICS revenue_per_customer`, groupable by what all its inputs share |
+| `--group-by sales.orders.order_date__month` | `DATE_TRUNC('month', orders.order_date)` in `DIMENSIONS`, on a time dimension or one with a temporal `data_type`, at `second` through `year` |
+| `--where "orders.status = 'F'"` | a Snowflake predicate over `table.member` or `view.table.member` dimensions and facts, re-rendered by sqlglot and placed inside the clause |
+| `--group-by sales.orders.total_price` and no metric | `FACTS orders.total_price`: a query of facts alone |
+| `--order-by=-sales.orders.revenue`, `--limit 10` | `ORDER BY` and `LIMIT` outside the clause, over the query's own tokens |
+| `values sales.customers.segment [--metric m]` | a `DIMENSIONS`-only clause, or one with `METRICS m` projecting the dimension alone; `scoped_to` names the metric |
+
+Refused before anything is sent, each by name:
+- facts with metrics (Snowflake refuses the combination), and facts with
+  dimensions (refused from Snowflake's 2026_07 behaviour change on);
+- a private member as a query member or in `--where`;
+- a window metric, a level-of-detail member, a member naming
+  `using_relationships`, or a metric reading one of them; a view declaring
+  `variables`;
+- a dimension (grouped or filtered) whose table the metric's table does not
+  reach many-to-one through one unambiguous path, which Snowflake refuses as
+  `Invalid dimension specified`; the check reads the catalog's groupable list;
+- a grain on a dimension that is not temporal, and a bare `--grain`;
+- a `--where` naming a metric, or one Dex cannot read (a subquery, an
+  aggregate, a window, a placeholder, an unqualified name);
+- tokens from two views, and a query spanning views;
+- a PII dimension, filter or value-returning metric input, through the
+  catalog's lineage.
+
+**The deployed view must match the repository.** Before the cost handshake:
+1. `SHOW SEMANTIC VIEWS` over the source allowlist finds the view by name
+   (no warehouse). None found is refused as defined only in the repository, since Dex
+   never deploys; two found are refused as ambiguous, and `--scope` narrows.
+2. `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` reads it back. Checked on a suspended
+   warehouse: it stayed suspended, so the read bills no warehouse time
+   (it uses cloud services, which Snowflake bills only past the daily
+   allowance).
+3. Each member the query names, every metric those read, and the base table,
+   keys and relationships of each table reached, are compared: kind,
+   expression (parsed, identifiers folded), access modifier,
+   `non_additive_dimensions` and `using_relationships`. Any difference refuses
+   the query, naming the member and the field. A member the query does not rely
+   on may differ.
+
+What Snowflake changes on read-back is normalization, never a difference, and
+the 15 read-backs in the corpus compare clean against the files they came from:
+upper-cased names, `access_modifier` written out, a re-inferred `data_type`, and
+an empty `synonyms` and `description` on a view-level metric.
+
+**Pricing.** Snowflake keeps no bytes for a semantic view, so a statement over
+one would be quoted at the per-statement floor. Dex prices it from the base
+tables of every logical table the rendered members reach. A base table outside
+the source allowlist (or the `--scope` it was narrowed to) has no size dex may
+read, so a query reaching one is refused by name rather than quoted as nothing.
+
+**`list --deployed`** reads the views deployed from the configured files, with
+`source: deployed` and per-view `coverage`: `full`, `limited` (a private member
+the role could not read back, which then refuses any query relying on it) or
+`refused` (not deployed, ambiguous, or unreadable). A plain `list` never contacts
+Snowflake. On the dogfood account a role holding only SELECT on the view, with
+secondary roles off, read every private member back, so `limited` guards a
+behaviour Snowflake does not show today.
+
+**Not in this release:** the standard-SQL form (`SELECT AGG(metric) FROM sv`),
+window metrics, `variables`, LOD and `using_relationships` selections, a query
+spanning views, Cortex Analyst, and deploying a view.
 
 ## Deployed semantic views and the warehouse
 

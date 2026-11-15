@@ -23,6 +23,7 @@ expression cannot be parsed. The caller decides what that means.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import sqlglot
@@ -36,12 +37,15 @@ __all__ = [
     "Read",
     "aggregate",
     "aggregates",
+    "canonical",
     "definition_reads",
     "definition_table",
+    "filter_predicate",
     "over_columns",
     "plain",
     "ratio_sides",
     "reads",
+    "value_reads",
     "window",
 ]
 
@@ -341,3 +345,134 @@ def definition_reads(sql: str) -> tuple[str, list[str]] | None:
         if node.name.lower() not in {f.lower() for f in found}:
             found.append(node.name)
     return ".".join(part.name for part in table.parts), found
+
+
+# --- governed queries (#1290) ---------------------------------------------------
+
+#: Function names (lowered) whose result is one of the values they read, so a
+#: metric built on one returns a column's values as surely as grouping by it.
+VALUE_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "min",
+        "max",
+        "median",
+        "any_value",
+        "anyvalue",
+        "mode",
+        "listagg",
+        "groupconcat",
+        "array_agg",
+        "arrayagg",
+        "array_unique_agg",
+        "arrayuniqueagg",
+        "array_union_agg",
+        "arrayunionagg",
+        "object_agg",
+        "objectagg",
+        "max_by",
+        "argmax",
+        "arg_max",
+        "min_by",
+        "argmin",
+        "arg_min",
+        "group_concat",
+        "percentile_cont",
+        "percentilecont",
+        "percentile_disc",
+        "percentiledisc",
+        "approx_top_k",
+        "approxtopk",
+        "first_value",
+        "firstvalue",
+        "last_value",
+        "lastvalue",
+    }
+)
+
+
+def value_reads(sql: str) -> list[Read] | None:
+    """The names ``sql`` reads inside a function that returns one of its input
+    values (``MAX``, ``ANY_VALUE``, ``LISTAGG``, ...), or ``None`` where it does
+    not parse."""
+
+    tree = _parse(sql)
+    if tree is None:
+        return None
+    found: list[Read] = []
+    for node in tree.walk():
+        if not isinstance(node, exp.Func):
+            continue
+        names = {(node.sql_name() or "").lower(), type(node).__name__.lower()}
+        if isinstance(node, exp.Anonymous):
+            # A function sqlglot has no node for keeps its own name.
+            names.add(str(node.name or "").lower())
+        if not names & VALUE_FUNCTIONS:
+            continue
+        for column in node.find_all(exp.Column):
+            if isinstance(column.this, exp.Star):
+                continue
+            read = _read(column)
+            if read is None:
+                return None
+            found.append(read)
+    return found
+
+
+#: What a ``--where`` predicate may not hold: a query, an aggregate (a metric's
+#: work), a window, a placeholder bound after the gate, or a star.
+_FILTER_FORBIDDEN = (
+    exp.Select,
+    exp.Subquery,
+    exp.AggFunc,
+    exp.Window,
+    exp.Placeholder,
+    exp.Parameter,
+    exp.Star,
+)
+
+
+def filter_predicate(
+    clause: str, resolve: Callable[[list[str]], tuple[str, str]]
+) -> str | None:
+    """A ``--where`` clause re-rendered over ``table.member`` names, or ``None``
+    where it cannot be read: it does not parse, is not a predicate, reads no
+    member, names something that is not a column reference, or holds what
+    :data:`_FILTER_FORBIDDEN` lists.
+
+    ``resolve`` takes each column's parts as written (``["orders", "status"]``,
+    or with the view in front) and returns ``(table, member)``; it raises to
+    refuse a name a filter may not read.
+    """
+
+    if not clause or "{" in clause or "}" in clause or ";" in clause:
+        return None
+    tree = _parse(clause)
+    if tree is None or isinstance(tree, exp.Query | exp.Command):
+        return None
+    if tree.find(*_FILTER_FORBIDDEN) is not None:
+        return None
+    columns = list(tree.find_all(exp.Column))
+    if not columns:
+        return None
+    for column in columns:
+        parts = [p for p in (column.catalog, column.db, column.table) if p]
+        if len(parts) not in (1, 2):
+            return None
+        table, member = resolve([*parts, column.name])
+        column.replace(exp.column(member, table=table))
+    return tree.sql(dialect=DIALECT)
+
+
+def canonical(sql: str | None) -> str | None:
+    """An expression as parsed SQL with unquoted identifiers folded, or its
+    whitespace-collapsed, upper-cased text where it does not parse: the form two
+    spellings of one expression share."""
+
+    if sql is None:
+        return None
+    from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+
+    tree = _parse(sql)
+    if tree is None:
+        return " ".join(sql.split()).upper()
+    return normalize_identifiers(tree, dialect=DIALECT).sql(dialect=DIALECT)

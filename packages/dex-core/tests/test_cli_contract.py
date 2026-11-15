@@ -677,6 +677,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
                 "for_dimension",
                 "search",
                 "full",
+                "deployed",
                 "group_by",
                 "where",
                 "order_by",

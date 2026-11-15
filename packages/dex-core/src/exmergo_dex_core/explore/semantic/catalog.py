@@ -132,6 +132,14 @@ class SemanticCatalog:
     for_dimensions: list[str] = field(default_factory=list)
     searched_for: list[str] = field(default_factory=list)
     elided: dict[str, int] = field(default_factory=dict)
+    #: Where the definitions came from, for a layer that can read both the
+    #: repository and a deployment of it: ``repository`` or ``deployed``. None
+    #: (and absent from the payload) for a layer with one source.
+    source: str | None = None
+    #: Per deployed definition, how much of it this role could read back
+    #: (``full``, ``limited`` or ``refused``, with reasons). Only on a deployed
+    #: read, so a permission-limited catalog is never presented as complete.
+    coverage: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def backend(self) -> str:
@@ -265,6 +273,10 @@ class SemanticCatalog:
                 "notes": self.notes,
             }
         )
+        if self.source is not None:
+            payload["source"] = self.source
+        if self.coverage:
+            payload["coverage"] = [dict(entry) for entry in self.coverage]
         if self.view.compiled_only:
             payload["compiled_only"] = [
                 _element_data(item) for item in self.view.compiled_only

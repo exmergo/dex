@@ -2114,8 +2114,14 @@ table's dimensions and those its relationships reach many-to-one, so
 relationship referencing it a foreign declaration; every primary and unique key
 and every key-equality relationship, with its arity, reach `explore` through the
 declaration channel at confidence 1.0. `sample_values` are counted and never
-surfaced. `query` and `values` refuse by name until #1290, `values` after the PII
-gate. `maintain snapshot` records `vendor: snowflake` and dex's own rule-set
+surfaced. `query` and `values` are governed (#1290): Dex renders `SELECT * FROM
+SEMANTIC_VIEW(<deployed view> DIMENSIONS ... METRICS ... [WHERE ...])` from the
+catalog and runs it through the Snowflake connector under the cost guard, after
+translation refusals, the PII gate, and a warehouse-free deployed-definition check that
+locates the view with `SHOW SEMANTIC VIEWS` and refuses one whose read-back
+(`SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`) differs from the repository on what the
+query relies on; `list --deployed` reads the deployed views instead, with
+per-view `coverage`. `maintain snapshot` records `vendor: snowflake` and dex's own rule-set
 revision as `format_version` (the format has no `version` key), over a canonical
 form, so a view read back from Snowflake fingerprints as its file; the
 layer-neutral axes read it: definition drift on the semantic axis, each key and

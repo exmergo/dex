@@ -978,6 +978,16 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=False,
                         help="list mode: lift the catalog's payload caps",
                     )
+                    # Reads the definitions deployed from the repository's files
+                    # rather than the files, on a layer that has a deployment to
+                    # read (Snowflake Semantic Views). Explicit, never ambient:
+                    # a plain `list` contacts no warehouse.
+                    sp.add_argument(
+                        "--deployed",
+                        action="store_true",
+                        default=False,
+                        help="list mode: read the deployed definitions instead",
+                    )
                     sp.add_argument(
                         "--group-by",
                         action="append",
