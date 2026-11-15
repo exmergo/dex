@@ -2437,9 +2437,9 @@ def _link_covered_advisories(
         return
 
     removed_members: set[tuple[str, str]] = set()
-    removed_relationships: set[str] = set()
+    removed_relationships: set[tuple[str, str]] = set()
     file_for_member: dict[tuple[str, str], str] = {}
-    file_for_rel: dict[str, str] = {}
+    file_for_rel: dict[tuple[str, str], str] = {}
 
     for p in mechanical_proposals:
         f = getattr(p, "finding", None)
