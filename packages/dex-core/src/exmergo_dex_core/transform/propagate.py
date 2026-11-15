@@ -721,6 +721,14 @@ class _Builder:
             span = self._replacement_span(name, content)
             if span is not None:
                 self._spans[path].append(span)
+        if self.kind == "var":
+            for name in jinja_names(content):
+                if not self._matches(name.name, name.kind):
+                    continue
+                self.sites[name.form] += 1
+                span = self._replacement_span(name)
+                if span is not None:
+                    self._spans[path].append(span)
 
     def _yaml_removal(self, path: str, content: str) -> None:
         for block in yaml_blocks(content, versions=True):

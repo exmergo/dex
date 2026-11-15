@@ -1014,3 +1014,93 @@ def test_a_file_the_column_scan_cannot_parse_is_named_apart(tmp_path):
     assert index.column_unread == ["models/rpt.sql"]
     assert column_parse_limit("models/rpt.sql") in index.limits
     assert index.references_to("wide", "var")[0]
+
+
+def test_var_calls_in_dbt_project_yml_and_model_properties_yaml_are_indexed(tmp_path):
+    """Static var() calls in YAML configuration are indexed (#1318)."""
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: demo\n"
+        'version: "1.0"\n'
+        "profile: demo\n"
+        "models:\n"
+        "  demo:\n"
+        "    +enabled: \"{{ var('feature_fee') }}\"\n"
+        "vars:\n"
+        "  feature_fee: false\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: my_model\n"
+        "    config:\n"
+        "      enabled: \"{{ var('feature_fee') }}\"\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/my_model.sql").write_text("select 1 as id\n", encoding="utf-8")
+
+    view = load(tmp_path)
+    index = ReferenceIndex(view, scan_packages=False)
+    hits, limits = index.references_to("feature_fee", "var")
+    assert not limits
+    assert {(hit.path, hit.line, hit.form, hit.kind) for hit in hits} == {
+        ("dbt_project.yml", 6, "var_call", "var"),
+        ("models/schema.yml", 5, "var_call", "var"),
+        ("dbt_project.yml", 8, "project_yml_var", "var"),
+    }
+    defs = index.definitions_of("feature_fee", "var")
+    assert len(defs) == 1
+    assert defs[0].form == "project_yml_var"
+
+    report = find_references(view, ["feature_fee"], kind="var", index=index)
+    assert report.completeness == "complete"
+    assert not report.limits
+    target = report.targets[0]
+    assert target["found"] is True
+    assert target["occurrence_count"] == 3
+
+
+def test_dynamic_and_nested_var_calls_in_yaml_are_reported_as_indeterminate(tmp_path):
+    """Unresolvable var() calls in YAML are indeterminate (#1318)."""
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: demo\n"
+        'version: "1.0"\n'
+        "profile: demo\n"
+        "models:\n"
+        "  demo:\n"
+        '    +enabled: "{{ var(dynamic_flag) }}"\n'
+        "vars:\n"
+        "  feature_fee: false\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: my_model\n"
+        "    config:\n"
+        "      enabled: \"{{ var(var('nested_flag')) }}\"\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/my_model.sql").write_text("select 1 as id\n", encoding="utf-8")
+
+    view = load(tmp_path)
+    index = ReferenceIndex(view, scan_packages=False)
+
+    nested_hits, _ = index.references_to("nested_flag", "var")
+    assert len(nested_hits) == 1
+    assert nested_hits[0].path == "models/schema.yml"
+    assert nested_hits[0].line == 5
+    assert nested_hits[0].form == "var_call"
+    assert nested_hits[0].name == "nested_flag"
+
+    unresolved = index.indeterminate_for("var")
+    assert {(u.path, u.line, u.form, u.kind, u.resolution) for u in unresolved} == {
+        ("dbt_project.yml", 6, "var_call", "var", "indeterminate"),
+        ("models/schema.yml", 5, "var_call", "var", "indeterminate"),
+    }
+
+    report = find_references(view, ["feature_fee"], kind="var", index=index)
+    assert report.completeness == "incomplete"
+    assert any("indeterminate" in lim for lim in report.limits)
