@@ -3503,13 +3503,15 @@ def _model_joins(
                 to_cols = tuple(c for _c, c, _f, _g in column_pairs)
                 if from_grouped and (
                     {table for table, _c in group_key[8]} != {group_key[0]}
-                    or {c for _t, c in group_key[8]} != set(from_cols)
+                    or {c.lower() for _t, c in group_key[8]}
+                    != {c.lower() for c in from_cols}
                 ):
                     bad_grouping = True
                     break
                 if to_grouped and (
                     {table for table, _c in group_key[9]} != {group_key[1]}
-                    or {c for _t, c in group_key[9]} != set(to_cols)
+                    or {c.lower() for _t, c in group_key[9]}
+                    != {c.lower() for c in to_cols}
                 ):
                     bad_grouping = True
                     break
@@ -3833,53 +3835,67 @@ def _output_lineage(tree, sql_shape, depth: int = 0) -> dict[str, tuple[str, str
     return _select_lineage(tree, cte_scopes, sql_shape, depth, root)
 
 
-def _final_output_map(tree) -> dict[tuple[str, str], tuple[str, ...]]:
+def _final_output_map(tree, depth: int = 0) -> dict[tuple[str, str], tuple[str, ...]]:
     """Each ``(join alias, column)`` the model's final SELECT names, mapped to
     the output column(s) it is projected as (#1324).
 
     A grouped CTE's aggregate output (``sum(amount) as total``) has no
     physical column, so its provenance is known only here: the model may
-    project it as ``spend``, or not at all. Only a projection whose column
-    references all name one alias is mapped; a star, a set operation or a
-    projection mixing aliases contributes nothing. Every reference of a
-    computed output (``coalesce(o.total, 0) as spend``) maps to that output.
+    project it as ``spend``, or not at all. Only a bare column (optionally
+    aliased) is mapped: a computed output such as ``coalesce(o.total, 0) as
+    spend`` is not NULL when the group is missing, so it must not make the
+    join required. A star over one CTE follows that CTE's own projections;
+    a star over a join, a set operation or a projection mixing aliases
+    contributes nothing.
     """
 
     from sqlglot import expressions as exp
 
-    if not isinstance(tree, exp.Select):
+    if depth > 8 or not isinstance(tree, exp.Select):
         return {}
+    with_clause = tree.args.get("with_") or tree.args.get("with")
+    cte_scopes = (
+        {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        if with_clause is not None
+        else {}
+    )
     names: dict[tuple[str, str], list[str]] = {}
     for projection in tree.expressions:
+        if isinstance(projection, exp.Star):
+            if tree.args.get("joins"):
+                continue
+            from_ = tree.args.get("from_") or tree.args.get("from")
+            relation = from_.this if from_ is not None else None
+            body = None
+            if isinstance(relation, exp.Subquery) and isinstance(
+                relation.this, exp.Select
+            ):
+                body = relation.this
+            elif isinstance(relation, exp.Table):
+                cte = _cte_name(relation, cte_scopes)
+                if cte is not None and isinstance(cte_scopes[cte], exp.Select):
+                    body = cte_scopes[cte]
+            if body is not None:
+                for key, outputs in _final_output_map(body, depth + 1).items():
+                    names.setdefault(key, list(outputs))
+            continue
         if isinstance(projection, exp.Alias) and projection.alias:
             output = projection.alias.lower()
-            inner = projection.this
+            if not isinstance(projection.this, exp.Column):
+                continue
+            column = projection.this
         elif isinstance(projection, exp.Column):
             output = projection.name.lower()
-            inner = projection
+            column = projection
         else:
             continue
-        columns = (
-            [inner]
-            if isinstance(inner, exp.Column)
-            else list(inner.find_all(exp.Column))
-        )
-        if not columns:
-            continue
-        tables = {
-            (column.table or "").replace('"', "").replace("`", "").lower()
-            for column in columns
-        }
-        if len(tables) != 1:
-            continue
-        table = tables.pop()
+        table = (column.table or "").replace('"', "").replace("`", "").lower()
         if not table:
             continue
-        for column in columns:
-            key = (table, column.name.lower())
-            outputs = names.setdefault(key, [])
-            if output not in outputs:
-                outputs.append(output)
+        key = (table, column.name.lower())
+        outputs = names.setdefault(key, [])
+        if output not in outputs:
+            outputs.append(output)
     return {key: tuple(outputs) for key, outputs in names.items()}
 
 

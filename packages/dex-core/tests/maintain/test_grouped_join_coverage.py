@@ -164,6 +164,11 @@ def test_a_cte_grouped_by_the_join_key_is_carried_as_a_grouped_side():
             "group by grouping sets ((customer_id), (region))",
             "grouping sets",
         ),
+        (
+            "select customer_id, count(*) as order_count "
+            f"from {W}.child_orders group by all",
+            "ALL",
+        ),
     ],
 )
 def test_an_unsupported_grouped_shape_stays_unchecked(body: str, said: str):
@@ -191,6 +196,18 @@ def test_a_group_by_ordinal_and_a_projection_alias_resolve_to_the_key_column():
     assert skipped == []
     assert candidate.to_grouped is True
     assert candidate.to_columns == ("customer_id",)
+
+
+def test_a_group_key_resolves_case_insensitively():
+    sql = (
+        "with grouped as (select CUSTOMER_ID, count(*) as n "
+        f"from {W}.child_orders group by CUSTOMER_ID) "
+        "select c.id as customer_id, g.n "
+        f"from {W}.roster c left join grouped g on c.id = g.customer_id"
+    )
+    (candidate,), skipped = _joins(sql)
+    assert skipped == []
+    assert candidate.to_grouped is True
 
 
 def test_a_grouping_over_a_filtered_input_carries_both_shapes():
@@ -383,7 +400,10 @@ def test_a_grouped_aggregate_renamed_in_the_model_keeps_its_provenance(
     _model(
         maintain_repo,
         sql,
-        columns={"spend": {"role": "measure", "null_rule": "never"}},
+        columns={
+            "customer_id": {"role": "key"},
+            "spend": {"role": "measure", "null_rule": "never"},
+        },
     )
 
     data = _verify(maintain_repo, "rpt_customers")
@@ -393,6 +413,27 @@ def test_a_grouped_aggregate_renamed_in_the_model_keeps_its_provenance(
     assert record["declared"]["required"] is True
     assert record["status"] == "contradicted"
     assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
+
+
+def test_a_star_final_follows_the_cte_to_the_grouped_outputs():
+    """A `select * from final` closing still maps the grouped output through
+    final's own projection, so a rename inside final keeps its provenance."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, sum(amount) as total_amount "
+        f"from {W}.child_orders group by customer_id), "
+        "final as ("
+        "select c.id as customer_id, o.total_amount as spend "
+        f"from {W}.roster c left join orders_by_customer o "
+        "on c.id = o.customer_id) "
+        "select * from final"
+    )
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    assert verify_mod._final_output_map(tree) == {
+        ("c", "id"): ("customer_id",),
+        ("o", "total_amount"): ("spend",),
+    }
 
 
 def test_a_grouped_aggregate_the_model_does_not_project_is_not_derived(
@@ -421,6 +462,43 @@ def test_a_grouped_aggregate_the_model_does_not_project_is_not_derived(
     (record,) = _records(data, "rpt_customers")
 
     assert record["declared"]["derived_columns"] == []
+    assert record["status"] == "satisfied"
+    assert _codes(data, "rpt_customers") == {}
+
+
+def test_a_computed_projection_over_a_grouped_output_does_not_require_the_join(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`coalesce(o.total_amount, 0) as spend` is never NULL, so it must not
+    make the LEFT join required even when declared `null_rule: never`."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, count(*) as order_count, sum(amount) as total_amount "
+        f"from {W}.child_orders where status = 'paid' group by customer_id) "
+        "select c.id as customer_id, coalesce(o.total_amount, 0) as spend "
+        f"from {W}.roster c left join orders_by_customer o "
+        "on c.id = o.customer_id"
+    )
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    _model(
+        maintain_repo,
+        sql,
+        columns={
+            "customer_id": {"role": "key"},
+            "spend": {"role": "measure", "null_rule": "never"},
+        },
+    )
+
+    data = _verify(maintain_repo, "rpt_customers")
+    (record,) = _records(data, "rpt_customers")
+
+    assert record["declared"]["derived_columns"] == []
+    assert record["declared"]["required"] is False
     assert record["status"] == "satisfied"
     assert _codes(data, "rpt_customers") == {}
 
