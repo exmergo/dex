@@ -104,6 +104,37 @@ class RefreshBatch:
         self.spend = _merge_spend(self.spend, spend)
 
 
+def candidates(inventory) -> list[Candidate]:
+    """The models an inventory calls ``stale`` or ``missing``, as candidates.
+
+    A model a run refused before carries the retry marker and when it was
+    last refused, which :func:`order` reads to rotate retries.
+    """
+
+    found: list[Candidate] = []
+    for unique_id, entry in inventory.strength.items():
+        if entry["status"] not in {"stale", "missing"}:
+            continue
+        label, name, own_tests = inventory.models[unique_id]
+        refused = bool(entry.get("last_refusal"))
+        found.append(
+            Candidate(
+                unique_id=unique_id,
+                label=label,
+                name=name,
+                status=entry["status"],
+                own_tests=own_tests,
+                retry=refused,
+                retried_at=str(
+                    entry.get("last_refusal_at") or entry.get("recorded_at") or ""
+                )
+                if refused
+                else "",
+            )
+        )
+    return found
+
+
 def skip_reason(node: dict[str, Any]) -> str | None:
     """Why a model is never attempted, read off the manifest for free."""
 

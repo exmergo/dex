@@ -609,3 +609,80 @@ def test_a_kept_score_gone_stale_downstream_is_a_retry_candidate():
     assert strength["status"] == "stale"
     assert strength["changed"] == ["downstream_tests"]
     assert strength["last_refusal_at"] == "2026-11-15T11:30:00+00:00"
+
+
+def _clock(monkeypatch, *stamps: str):
+    """Make each refusal record carry the next of ``stamps`` as its time."""
+
+    from datetime import datetime as real
+
+    times = iter(real.fromisoformat(stamp) for stamp in stamps)
+
+    class _Now(real):
+        @classmethod
+        def now(cls, tz=None):
+            return next(times)
+
+    monkeypatch.setattr(transform_commands, "datetime", _Now)
+
+
+def _refuse(store, manifest, model_id: str, reason: str = "baseline_not_passing"):
+    from exmergo_dex_core import dbt_tests
+
+    node = {**manifest["nodes"][model_id], "unique_id": model_id}
+    transform_commands._record_mutation_refusal(
+        store,
+        node,
+        {
+            "sql_digest": dbt_tests.model_sql_digest(node),
+            "tests_digest": dbt_tests.own_tests_digest(manifest, node),
+        },
+        reason,
+        keep_fresh_score=True,
+    )
+
+
+def _next_up(store, manifest, selector=None) -> list[str]:
+    from exmergo_dex_core.maintain import coverage as coverage_mod
+
+    found = coverage_mod.inventory(manifest, records=store.load_mutation_records())
+    ordered = refresh_mod.order(refresh_mod.candidates(found), manifest, selector)
+    return [c.label for c in ordered]
+
+
+def test_successive_refusals_persist_and_rotate_the_retries(monkeypatch):
+    from exmergo_dex_core.storage import MemoryStore
+
+    manifest = _manifest()
+    store = MemoryStore()
+    _clock(
+        monkeypatch,
+        "2026-11-15T10:00:00+00:00",
+        "2026-11-15T11:00:00+00:00",
+        "2026-11-15T12:00:00+00:00",
+    )
+    _refuse(store, manifest, FCT)
+    _refuse(store, manifest, MART)
+    # Both refused once: the one refused longest ago goes first.
+    assert _next_up(store, manifest, ["fct", "mart"]) == ["fct", "mart"]
+    # The next run retries fct, which fails again and is recorded anew.
+    _refuse(store, manifest, FCT)
+    assert _next_up(store, manifest, ["fct", "mart"]) == ["mart", "fct"]
+
+
+def test_a_kept_score_stale_downstream_is_retried_after_the_untried(monkeypatch):
+    from exmergo_dex_core.storage import MemoryStore
+
+    manifest = _manifest()
+    store = MemoryStore()
+    # A score whose own digests match, so a baseline refusal keeps it, but
+    # whose downstream test has changed since: coverage reads it stale.
+    store.save_mutation_record(
+        _record(manifest, downstream_tests={"test.shop.unique_mart_id": "old"})
+    )
+    _clock(monkeypatch, "2026-11-15T10:00:00+00:00")
+    _refuse(store, manifest, FCT)
+    kept = store.load_mutation_records()[FCT]
+    assert kept["score"] == 0.8 and kept["last_refusal_at"]
+    # mart has never been measured; fct is stale and marked, so mart goes first.
+    assert _next_up(store, manifest) == ["mart", "fct"]
