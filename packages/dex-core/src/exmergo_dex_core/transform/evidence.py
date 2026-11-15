@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable, Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -208,6 +209,7 @@ class BuildCoverage(BaseModel):
     #: ``required`` is therefore empty. Hosts must not read an empty required list
     #: as "nothing to check" / validated.
     undetermined: bool = False
+    kinds: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_partition(self) -> BuildCoverage:
@@ -337,9 +339,21 @@ def _file_digest(path: Path) -> str | None:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class RequiredNodes(list[str]):
+    """Required node names, preserving each requirement's resource kind."""
+
+    def __init__(
+        self,
+        iterable: Iterable[str] = (),
+        kinds: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(iterable)
+        self.kinds: dict[str, str] = dict(kinds or {})
+
+
 def required_nodes(
     edits: list[PlanEdit], project: Path
-) -> tuple[list[str], list[str], bool]:
+) -> tuple[RequiredNodes, list[str], bool]:
     """The nodes a plan's edits require a build to exercise, and how each was derived.
 
     Read from the edits themselves rather than from a compiled artifact, so this
@@ -354,6 +368,7 @@ def required_nodes(
     from ..dbt_project import node_name
 
     required: set[str] = set()
+    kinds: dict[str, str] = {}
     basis: list[str] = []
     undetermined_edits = False
     # Measure -> transformation model, union of plan edits and on-disk YAML.
@@ -372,17 +387,53 @@ def required_nodes(
         if edit.kind in _NODE_KINDS:
             name = label_for_file(edit.path, versions) or node_name(edit.path)
             required.add(name)
+            kinds[name] = "model"
             basis.append(f"{edit.path}: builds '{name}'")
             continue
+        if edit.kind is EditKind.TEST_SQL:
+            from .validate import _TEST_CLOSE, _TEST_OPEN
+
+            content = edit.new_content or ""
+            if _TEST_OPEN.search(content) or _TEST_CLOSE.search(content):
+                undetermined_edits = True
+                basis.append(
+                    f"{edit.path}: a generic test definition can affect any node, "
+                    "so it requires none in particular"
+                )
+                continue
+            name = node_name(edit.path)
+            req_name = (
+                f"test.{name}"
+                if (name in required and kinds.get(name) != "test")
+                else name
+            )
+            required.add(req_name)
+            kinds[req_name] = "test"
+            basis.append(f"{edit.path}: runs test '{req_name}'")
+            continue
         if edit.kind in {EditKind.SCHEMA_YML, EditKind.SEMANTIC_YML}:
-            named, detail, unresolved = _requirements_from_yaml(
+            (
+                model_names,
+                unit_test_reqs,
+                detail,
+                unresolved,
+            ) = _requirements_from_yaml(
                 edit.new_content or "",
                 measure_owners=measure_owners,
                 metric_defs=metric_defs,
+                versions=versions,
             )
-            named = expand(named, versions)
-            if named:
-                required.update(named)
+            # Model requirements are expanded before unit-test requirements are added;
+            # unit-test names must not be passed to expand(named, versions).
+            expanded_models = expand(model_names, versions)
+            for m in expanded_models:
+                required.add(m)
+                kinds[m] = "model"
+            for u in unit_test_reqs:
+                required.add(u)
+                kinds[u] = "unit_test"
+
+            if expanded_models or unit_test_reqs:
                 basis.append(f"{edit.path}: {detail}")
             elif unresolved:
                 undetermined_edits = True
@@ -397,7 +448,7 @@ def required_nodes(
             "requires none in particular"
         )
     undetermined = undetermined_edits and not required
-    return sorted(required), basis, undetermined
+    return RequiredNodes(sorted(required), kinds=kinds), basis, undetermined
 
 
 def _version_map(edits: list[PlanEdit], project: Path) -> dict[str, Any]:
@@ -541,75 +592,128 @@ def _requirements_from_yaml(
     *,
     measure_owners: dict[str, str],
     metric_defs: dict[str, dict[str, Any]],
-) -> tuple[set[str], str, bool]:
+    versions: Mapping[str, Any] | None = None,
+) -> tuple[set[str], set[str], str, bool]:
     """Buildable node names a schema or semantic YAML requires.
 
-    Returns ``(names, detail, unresolved)``. ``unresolved`` is true when the
-    document named metrics (or similar) whose measures could not be located, so
-    the caller can mark coverage undetermined rather than silently empty.
+    Returns ``(model_names, unit_test_names, detail, unresolved)``. ``unresolved``
+    is true when the document named metrics (or similar) whose measures could not
+    be located, so the caller can mark coverage undetermined rather than silently empty.
     """
 
     from ..dbt_project import REF_PATTERN
 
     try:
-        document = yaml.safe_load(content)
+        documents = [d for d in yaml.safe_load_all(content) if isinstance(d, dict)]
     except yaml.YAMLError:
-        return set(), "names no buildable node", True
-    if not isinstance(document, dict):
-        return set(), "names no buildable node", True
+        return set(), set(), "names no buildable node", True
+    if not documents:
+        return set(), set(), "names no buildable node", True
 
-    names: set[str] = set()
-    for key in ("models", "seeds", "snapshots"):
-        for entry in document.get(key) or []:
-            if isinstance(entry, dict) and isinstance(entry.get("name"), str):
-                names.add(entry["name"])
-    for entry in document.get("semantic_models") or []:
-        if not isinstance(entry, dict):
-            continue
-        model = entry.get("model")
-        if isinstance(model, str):
-            match = REF_PATTERN.search(model)
-            if match:
-                names.add(match.group(1))
+    model_names: set[str] = set()
+    raw_unit_tests: list[dict[str, Any]] = []
+    for document in documents:
+        for key in ("models", "seeds", "snapshots"):
+            for entry in document.get(key) or []:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+                    model_names.add(entry["name"])
+        for entry in document.get("semantic_models") or []:
+            if not isinstance(entry, dict):
+                continue
+            model = entry.get("model")
+            if isinstance(model, str):
+                match = REF_PATTERN.search(model)
+                if match:
+                    model_names.add(match.group(1))
+        raw_unit_tests.extend(
+            entry
+            for entry in document.get("unit_tests") or []
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        )
 
     unresolved_metrics: list[str] = []
     metric_models: set[str] = set()
-    for entry in document.get("metrics") or []:
-        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-            continue
-        metric_name = entry["name"]
-        # Prefer the edit's own body for this metric's inputs.
-        local_defs = dict(metric_defs)
-        local_defs[metric_name] = entry
-        grounded = _grounded_measures(metric_name, local_defs)
-        if not grounded:
-            unresolved_metrics.append(metric_name)
-            continue
-        found_any = False
-        for measure in grounded:
-            owner = measure_owners.get(measure)
-            if owner:
-                metric_models.add(owner)
-                found_any = True
-        if not found_any:
-            unresolved_metrics.append(metric_name)
+    for document in documents:
+        for entry in document.get("metrics") or []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                continue
+            metric_name = entry["name"]
+            # Prefer the edit's own body for this metric's inputs.
+            local_defs = dict(metric_defs)
+            local_defs[metric_name] = entry
+            grounded = _grounded_measures(metric_name, local_defs)
+            if not grounded:
+                unresolved_metrics.append(metric_name)
+                continue
+            found_any = False
+            for measure in grounded:
+                owner = measure_owners.get(measure)
+                if owner:
+                    metric_models.add(owner)
+                    found_any = True
+            if not found_any:
+                unresolved_metrics.append(metric_name)
 
-    names.update(metric_models)
-    if names and not unresolved_metrics:
-        detail = f"documents {', '.join(sorted(names))}"
-        return names, detail, False
-    if names and unresolved_metrics:
-        detail = (
-            f"documents {', '.join(sorted(names))}; unresolved metrics: "
-            + ", ".join(unresolved_metrics)
+    model_names.update(metric_models)
+
+    # Process unit tests while preserving model and version identity
+    unit_test_reqs: set[str] = set()
+    name_counts: dict[str, int] = {}
+    for entry in raw_unit_tests:
+        t_name = entry["name"]
+        name_counts[t_name] = name_counts.get(t_name, 0) + 1
+
+    for entry in raw_unit_tests:
+        test_name = entry["name"]
+        model = entry.get("model")
+        version = entry.get("version")
+        versions_cfg = entry.get("versions")
+
+        vmodel = (
+            versions.get(model)
+            if (versions is not None and isinstance(model, str))
+            else None
         )
-        return names, detail, False
+        if vmodel is not None and getattr(vmodel, "versions", None):
+            target_v = str(version).lstrip("v") if version is not None else None
+            applicable = []
+            if target_v is not None:
+                applicable = [v for v in vmodel.versions if str(v.v) == target_v]
+            elif isinstance(versions_cfg, dict):
+                inc = [str(x).lstrip("v") for x in (versions_cfg.get("include") or [])]
+                exc = [str(x).lstrip("v") for x in (versions_cfg.get("exclude") or [])]
+                if inc:
+                    applicable = [v for v in vmodel.versions if str(v.v) in inc]
+                elif exc:
+                    applicable = [v for v in vmodel.versions if str(v.v) not in exc]
+                else:
+                    applicable = list(vmodel.versions)
+            else:
+                applicable = list(vmodel.versions)
+
+            for v in applicable:
+                unit_test_reqs.add(f"{model}.v{v.v}.{test_name}")
+        else:
+            if name_counts.get(test_name, 0) > 1 and isinstance(model, str):
+                unit_test_reqs.add(f"{model}.{test_name}")
+            else:
+                unit_test_reqs.add(test_name)
+
+    all_names = sorted(model_names | unit_test_reqs)
+    if all_names and not unresolved_metrics:
+        detail = f"documents {', '.join(all_names)}"
+        return model_names, unit_test_reqs, detail, False
+    if all_names and unresolved_metrics:
+        detail = f"documents {', '.join(all_names)}; unresolved metrics: " + ", ".join(
+            unresolved_metrics
+        )
+        return model_names, unit_test_reqs, detail, False
     if unresolved_metrics:
         detail = "names metrics whose measures could not be located: " + ", ".join(
             unresolved_metrics
         )
-        return set(), detail, True
-    return set(), "names no buildable node", True
+        return set(), set(), detail, True
+    return set(), set(), "names no buildable node", True
 
 
 def plan_drift(edits: list[PlanEdit], project: Path) -> list[PlanDrift]:
@@ -871,7 +975,10 @@ def build_evidence(
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             manifest = {}
-    manifest_nodes = manifest.get("nodes") or {}
+    manifest_nodes = {
+        **(manifest.get("nodes") or {}),
+        **(manifest.get("unit_tests") or {}),
+    }
 
     nodes: list[BuildNode] = []
     # Every name a built node answers to, not only its label: a selector or an
@@ -880,6 +987,10 @@ def build_evidence(
     # and each of those did build this node.
     answers: set[str] = set()
     unsuccessful_answers: set[str] = set()
+    buildable_answers: set[str] = set()
+    unsuccessful_buildable_answers: set[str] = set()
+    test_answers: set[str] = set()
+    unsuccessful_test_answers: set[str] = set()
     generated: list[str] = []
     errors: list[dict[str, str]] = []
     for result in results:
@@ -888,10 +999,14 @@ def build_evidence(
         config = node.get("config") if isinstance(node.get("config"), dict) else {}
         relation = node.get("relation_name")
         status = str(result.get("status") or "unknown")
+        is_test = node.get("resource_type") in {
+            "test",
+            "unit_test",
+        } or unique_id.startswith(("test.", "unit_test."))
         built = BuildNode(
             unique_id=unique_id,
             name=manifest_node_label(unique_id, node or None),
-            resource_type=node.get("resource_type"),
+            resource_type=node.get("resource_type") or ("test" if is_test else None),
             status=status,
             execution_time=result.get("execution_time"),
             materialization=(config or {}).get("materialized"),
@@ -907,12 +1022,42 @@ def build_evidence(
         node_answers = {built.name}
         if isinstance(node.get("name"), str):
             node_answers.add(node["name"])
-        if node.get("resource_type") == "model" and isinstance(
-            node.get("original_file_path"), str
-        ):
-            node_answers.add(node_name(node["original_file_path"]))
+        is_successful = (
+            status_kind(status) == "succeeded"
+            if is_test
+            else (status.lower() == BUILT_STATUS)
+        )
+        if is_test:
+            parts = unique_id.split(".")
+            if len(parts) >= 3:
+                node_answers.add(f"test.{parts[-1]}")
+                node_answers.add(f"test:{parts[-1]}")
+            if parts[0] == "unit_test" and len(parts) >= 4:
+                model = parts[2]
+                test_name = parts[3]
+                node_answers.add(f"{model}.{test_name}")
+                if "_" in test_name:
+                    base_test, _, ver = test_name.rpartition("_")
+                    if ver.startswith("v") and ver[1:].isdigit():
+                        node_answers.add(f"{model}.{base_test}")
+                        node_answers.add(f"{model}.{ver}.{base_test}")
+                        node_answers.add(f"{model}.{test_name}")
+                        node_answers.add(base_test)
+                        node_answers.add(f"{test_name}")
+            test_answers.update(node_answers)
+            if not is_successful:
+                unsuccessful_test_answers.update(node_answers)
+        else:
+            if node.get("resource_type") == "model" and isinstance(
+                node.get("original_file_path"), str
+            ):
+                node_answers.add(node_name(node["original_file_path"]))
+            buildable_answers.update(node_answers)
+            if not is_successful:
+                unsuccessful_buildable_answers.update(node_answers)
+
         answers.update(node_answers)
-        if status.lower() != BUILT_STATUS:
+        if not is_successful:
             unsuccessful_answers.update(node_answers)
         if status.lower() in FAILED_STATUSES:
             errors.append({"node": built.name, "message": built.message or status})
@@ -949,16 +1094,44 @@ def build_evidence(
                 *basis,
                 *(f"'{name}' is disabled, so no build runs it" for name in idle),
             ]
-        covered = [name for name in required if name in answers]
-        successful = [name for name in covered if name not in unsuccessful_answers]
+        kinds = getattr(required, "kinds", {})
+        covered: list[str] = []
+        successful: list[str] = []
+        for name in required:
+            req_kind = kinds.get(name)
+            if not req_kind:
+                if any(
+                    f"runs test '{name}'" in b or f"runs unit test '{name}'" in b
+                    for b in basis
+                ):
+                    req_kind = "test"
+                elif any(f"builds '{name}'" in b for b in basis):
+                    req_kind = "model"
+
+            if req_kind in {"test", "unit_test"}:
+                in_answers = name in test_answers
+                is_unsuccessful = name in unsuccessful_test_answers
+            elif req_kind in {"model", "seed", "snapshot"}:
+                in_answers = name in buildable_answers
+                is_unsuccessful = name in unsuccessful_buildable_answers
+            else:
+                in_answers = name in answers
+                is_unsuccessful = name in unsuccessful_answers
+
+            if in_answers:
+                covered.append(name)
+                if not is_unsuccessful:
+                    successful.append(name)
+
         coverage = BuildCoverage(
             required=required,
             covered=covered,
-            missing=[name for name in required if name not in answers],
+            missing=[name for name in required if name not in covered],
             built=successful,
             not_built=[name for name in required if name not in successful],
             basis=basis,
             undetermined=undetermined,
+            kinds=kinds,
         )
 
     stale: bool | None = None

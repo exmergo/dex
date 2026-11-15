@@ -653,3 +653,48 @@ def test_build_result_docstring_documents_typed_evidence():
     assert ":class:`~exmergo_dex_core.transform.evidence.BuildEvidence`" in (
         BuildResult.__doc__ or ""
     )
+
+
+def test_host_boundary_evaluates_test_only_plans(tmp_path):
+    """Issue #1316: Test requirements resolved and outcomes verified."""
+    (tmp_path / "dbt_project.yml").write_text(
+        'name: p\nversion: "1.0.0"\n',
+        encoding="utf-8",
+    )
+    edits = [
+        host.PlanEdit(
+            path="tests/assert_positive.sql",
+            new_content="select * from {{ ref('stg_orders') }} where total <= 0",
+            kind=host.EditKind.TEST_SQL,
+        )
+    ]
+    required, basis, undetermined = host.required_nodes(edits, tmp_path)
+    assert required == ["assert_positive"]
+    assert undetermined is False
+
+    coverage = host.BuildCoverage(
+        required=["assert_positive"],
+        covered=["assert_positive"],
+        built=["assert_positive"],
+        not_built=[],
+        missing=[],
+        basis=basis,
+    )
+    node = host.BuildNode(
+        unique_id="test.p.assert_positive",
+        name="assert_positive",
+        resource_type="test",
+        status="pass",
+    )
+    evidence = host.BuildEvidence(
+        outcome=host.BuildOutcome.VALIDATED,
+        nodes=[node],
+        coverage=coverage,
+    )
+    verified = host.verify_build_evidence(evidence)
+    assert verified.outcome is host.BuildOutcome.VALIDATED
+    assert host.recompute_outcome(evidence) is host.BuildOutcome.VALIDATED
+
+    completion = host.summarize_completion(evidence, None)
+    assert completion.outcome == "validated"
+    assert completion.deliverables.built.names == ["assert_positive"]

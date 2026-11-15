@@ -437,6 +437,27 @@ def node_answers(node: BuildNode) -> set[str]:
     parts = node.unique_id.split(".")
     # Only a node that builds a relation can stand for a deliverable: a unit
     # test's id carries its model's name too, and running it builds nothing.
+    # Tests answer only for their own test deliverable (#1316).
+    if parts[0] in {"test", "unit_test"} or node.resource_type in {
+        "test",
+        "unit_test",
+    }:
+        if len(parts) >= 3:
+            answers.add(f"test.{parts[-1]}")
+            answers.add(f"test:{parts[-1]}")
+        if parts[0] == "unit_test" and len(parts) >= 4:
+            model = parts[2]
+            test_name = parts[3]
+            answers.add(f"{model}.{test_name}")
+            if "_" in test_name:
+                base_test, _, ver = test_name.rpartition("_")
+                if ver.startswith("v") and ver[1:].isdigit():
+                    answers.add(f"{model}.{base_test}")
+                    answers.add(f"{model}.{ver}.{base_test}")
+                    answers.add(f"{model}.{test_name}")
+                    answers.add(base_test)
+                    answers.add(f"{test_name}")
+        return answers
     if parts[0] not in _BUILDABLE:
         return set()
     if len(parts) >= 3:
@@ -460,13 +481,31 @@ def _status_kind(status: str) -> str:
     """``built``, ``failed``, ``skipped`` or ``unrecognized`` for one node.
 
     Built is the one status the coverage partition counts, so a deliverable
-    and ``coverage.built`` can never disagree (#1105). A passing test is
-    ``succeeded`` in the evidence, and never stands for a deliverable here.
+    and ``coverage.built`` can never disagree (#1105).
     """
 
     kind = status_kind(status)
     if kind == "succeeded":
         return "built" if status.lower() == BUILT_STATUS else "succeeded"
+    return kind
+
+
+def _node_status_kind(node: BuildNode) -> str:
+    """``built``, ``failed``, ``skipped`` or ``unrecognized`` for one node.
+
+    For models, seeds and snapshots, only ``success`` counts as ``built``.
+    For singular and unit tests that are required deliverables, a passing
+    or warning status (``pass``, ``warn``) also counts as ``built`` (#1316).
+    """
+
+    kind = status_kind(node.status)
+    if kind == "succeeded":
+        is_test = node.resource_type in {
+            "test",
+            "unit_test",
+        } or node.unique_id.startswith(("test.", "unit_test."))
+        if is_test or node.status.lower() == BUILT_STATUS:
+            return "built"
     return kind
 
 
@@ -574,16 +613,47 @@ def _deliverables(
     blocked: list[Blocked] = []
     causes: list[str] = []
     missing: list[str] = []
+    kinds_map = getattr(coverage, "kinds", {}) or {}
     for name in coverage.required:
-        matches = [n for n in evidence.nodes if name in node_answers(n)]
+        req_kind = kinds_map.get(name)
+        if not req_kind and coverage.basis:
+            if any(
+                f"runs test '{name}'" in b or f"runs unit test '{name}'" in b
+                for b in coverage.basis
+            ):
+                req_kind = "test"
+            elif any(f"builds '{name}'" in b for b in coverage.basis):
+                req_kind = "model"
+
+        candidate_nodes = evidence.nodes
+        if req_kind in {"test", "unit_test"}:
+            candidate_nodes = [
+                n
+                for n in evidence.nodes
+                if (
+                    n.resource_type in {"test", "unit_test"}
+                    or n.unique_id.startswith(("test.", "unit_test."))
+                )
+            ]
+        elif req_kind in {"model", "seed", "snapshot"}:
+            candidate_nodes = [
+                n
+                for n in evidence.nodes
+                if not (
+                    n.resource_type in {"test", "unit_test"}
+                    or n.unique_id.startswith(("test.", "unit_test."))
+                )
+            ]
+
+        matches = [n for n in candidate_nodes if name in node_answers(n)]
         if not matches:
             missing.append(name)
             continue
-        kinds = {_status_kind(n.status) for n in matches}
+        kinds = {_node_status_kind(n) for n in matches}
         node = matches[0]
         if "failed" in kinds:
             failed.append(name)
-            failing = next(n for n in matches if _status_kind(n.status) == "failed")
+            failing = next(n for n in matches if _node_status_kind(n) == "failed")
             blocked.append(Blocked(deliverable=name, status=failing.status))
             causes.append(failing.name)
         elif "skipped" in kinds:
@@ -598,7 +668,7 @@ def _deliverables(
             # Every match has to have built: a versioned requirement with one
             # version on an unrecognized status did not build as a whole.
             unrecognized.append(name)
-            odd = next(n for n in matches if _status_kind(n.status) != "built")
+            odd = next(n for n in matches if _node_status_kind(n) != "built")
             blocked.append(Blocked(deliverable=name, status=odd.status))
         else:
             built.append(name)
@@ -607,6 +677,13 @@ def _deliverables(
         notes.append(_UNRECOGNIZED_NOTE)
     if notes:
         note = "; ".join(notes)
+    model_answers = {
+        ans
+        for n in evidence.nodes
+        if (n.unique_id.startswith("model.") or n.resource_type == "model")
+        for ans in node_answers(n)
+    }
+    deliverable_models = [name for name in built if name in model_answers]
     return (
         Deliverables(
             coverage="known",
@@ -620,7 +697,7 @@ def _deliverables(
             blocked=blocked,
             note=note,
         ),
-        built if coverage.required else built_models,
+        deliverable_models if coverage.required else built_models,
         causes,
     )
 
@@ -649,7 +726,7 @@ def _blockers(
 
     diagnosed = {entry.get("unique_id"): entry for entry in prerequisites}
 
-    failed = [n for n in evidence.nodes if _status_kind(n.status) == "failed"]
+    failed = [n for n in evidence.nodes if _node_status_kind(n) == "failed"]
     rank = {name: index for index, name in enumerate(causes)}
     failed.sort(key=lambda n: (rank.get(n.name, len(rank)), n.name))
     return [
