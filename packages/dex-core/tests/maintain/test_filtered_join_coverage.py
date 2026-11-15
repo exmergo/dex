@@ -150,7 +150,10 @@ def test_an_inline_subquery_filter_is_carried_too():
 @pytest.mark.parametrize(
     ("body", "said"),
     [
-        (f"select id, count(*) as n from {W}.t where x = 1 group by id", "GROUP BY"),
+        (
+            f"select id, count(*) as n from {W}.t where x = 1 group by id, x",
+            "grouping",
+        ),
         (f"select distinct id from {W}.t where x = 1", "DISTINCT"),
         (f"select id from {W}.t where x = 1 limit 5", "LIMIT"),
         (f"select id from {W}.t where ts > current_date", "CurrentDate"),

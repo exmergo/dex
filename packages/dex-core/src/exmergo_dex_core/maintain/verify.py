@@ -2546,6 +2546,11 @@ class JoinCandidate:
     ones -- probing them separately would measure the overlap of each column
     alone, a different and generally wrong question from whether the
     combination matches.
+
+    A side may also be read through a scope grouped by exactly the key columns
+    (#1324): ``from_grouped``/``to_grouped`` say so, and the probe measures the
+    grouped input's groups rather than the relation's rows. A grouping by
+    anything else is not a candidate at all.
     """
 
     from_relation: str
@@ -2571,6 +2576,12 @@ class JoinCandidate:
     #: The filtering scopes behind each side, as the model writes them.
     from_scopes: tuple[str, ...] = field(default=(), compare=False)
     to_scopes: tuple[str, ...] = field(default=(), compare=False)
+    #: Whether each side is read through a scope grouped by exactly the join's
+    #: key columns (#1324). The probe then measures the grouped input's groups,
+    #: never the ungrouped relation underneath: a parent left-joined to one row
+    #: per child key is a different population from the child's own rows.
+    from_grouped: bool = False
+    to_grouped: bool = False
 
     def scope_filters(self) -> tuple[str | None, str | None] | None:
         """Each side's filters joined into one predicate, or None where neither
@@ -2583,6 +2594,14 @@ class JoinCandidate:
             return " AND ".join(f"({f})" for f in filters) if filters else None
 
         return joined(self.from_filters), joined(self.to_filters)
+
+    def grouped_sides(self) -> tuple[bool, bool] | None:
+        """Whether each side is read through a grouped scope, or None where
+        neither side is grouped (#1324)."""
+
+        if not self.from_grouped and not self.to_grouped:
+            return None
+        return self.from_grouped, self.to_grouped
 
     def key_exprs(self) -> tuple[tuple[str | None, ...], tuple[str | None, ...]] | None:
         """The conversion templates applied to each side's keys, or None where the join
@@ -2619,7 +2638,10 @@ class _FilterWalk:
     predicate in DuckDB SQL over the physical column names, unqualified and
     quoted, the form the coverage probe is authored in before it is transpiled
     to the connector's dialect. ``scopes`` names each filtering scope as the
-    model writes it, for the record. ``code``/``reason`` is the first failure.
+    model writes it, for the record. ``group_columns`` holds the physical
+    columns a scope grouped by exactly the join's key columns reads, and
+    ``grouped`` says one was crossed (#1324). ``code``/``reason`` is the first
+    failure.
 
     ``keep_rows`` is set by the join contract, which measures the rows a model
     joins: a scope whose own join can drop rows of the relation a column reads
@@ -2634,6 +2656,10 @@ class _FilterWalk:
     scopes: list[str] = field(default_factory=list)
     code: str | None = None
     reason: str | None = None
+    #: The physical columns a carried GROUP BY groups by, one entry per key
+    #: column, and whether this walk crossed such a scope (#1324).
+    group_columns: list[tuple[str, str]] = field(default_factory=list)
+    grouped: bool = False
 
     def fail(self, code: str, reason: str) -> None:
         if self.code is None:
@@ -2645,33 +2671,57 @@ class _FilterWalk:
 
         name = _scope_label(select)
         reducing = sql_shape.reducing_clauses(select)
-        if reducing != ["a WHERE filter"]:
-            others = [r for r in reducing if r != "a WHERE filter"]
+        if reducing not in (
+            ["a WHERE filter"],
+            ["a GROUP BY"],
+            ["a WHERE filter", "a GROUP BY"],
+        ):
+            supported = {"a WHERE filter", "a GROUP BY"}
+            others = [r for r in reducing if r not in supported]
             return self._refuse(name, ", ".join(others) or "its shape")
         if sql_shape.joins(select):
-            return self._refuse(name, "a join beside its filter")
+            return self._refuse(name, "a join beside its filter or grouping")
         source = sql_shape.from_relation(select)
         if source is None:
             return self._refuse(name, "no relation to filter")
-        for predicate in sql_shape.predicates(select, "where"):
-            why = sql_shape.simple_row_predicate(predicate, self.dialect)
-            if why is not None:
-                return self._refuse(name, why)
-            lowered = _lower_predicate(predicate, source, cte_scopes, sql_shape, seen)
-            if lowered is None:
-                return self._refuse(
-                    name,
-                    "the filter reads a column the CTE chain computes, aggregates "
-                    "or cannot trace to one relation",
+        if "a WHERE filter" in reducing:
+            for predicate in sql_shape.predicates(select, "where"):
+                why = sql_shape.simple_row_predicate(predicate, self.dialect)
+                if why is not None:
+                    return self._refuse(name, why)
+                lowered = _lower_predicate(
+                    predicate, source, cte_scopes, sql_shape, seen
                 )
-            table, condition = lowered
-            if sql_shape.simple_row_predicate(condition, self.dialect) is not None:
-                return self._refuse(
-                    name,
-                    "the filter reads a column the CTE chain computes with an "
-                    "expression dex does not carry",
+                if lowered is None:
+                    return self._refuse(
+                        name,
+                        "the filter reads a column the CTE chain computes, aggregates "
+                        "or cannot trace to one relation",
+                    )
+                table, condition = lowered
+                if sql_shape.simple_row_predicate(condition, self.dialect) is not None:
+                    return self._refuse(
+                        name,
+                        "the filter reads a column the CTE chain computes with an "
+                        "expression dex does not carry",
+                    )
+                self.filters.append(
+                    (_table_name(table), condition.sql(dialect="duckdb"))
                 )
-            self.filters.append((_table_name(table), condition.sql(dialect="duckdb")))
+        if "a GROUP BY" in reducing:
+            if self.grouped:
+                return self._refuse(name, "a grouping inside another grouping")
+            from sqlglot import expressions as exp
+
+            if next(select.find_all(exp.Window), None) is not None:
+                return self._refuse(name, "a window function beside its grouping")
+            keys = _group_key_columns(
+                select, source, cte_scopes, sql_shape, self.dialect
+            )
+            if isinstance(keys, str):
+                return self._refuse(name, keys)
+            self.grouped = True
+            self.group_columns.extend(keys)
         if name not in self.scopes:
             self.scopes.append(name)
         return True
@@ -2728,6 +2778,65 @@ def _scope_label(select) -> str:
     if isinstance(parent, exp.CTE):
         return f"CTE `{parent.alias_or_name}`"
     return "a subquery"
+
+
+def _group_key_columns(select, source, cte_scopes, sql_shape, dialect):
+    """The physical columns a supported GROUP BY groups by, or why the scope is
+    not the grouped-key shape (#1324).
+
+    The supported shape is the common mart rollup: one input relation, grouped
+    by exactly the bare key columns the join reads (a projection alias or a
+    ``GROUP BY`` ordinal naming one is accepted). Every grouping expression
+    (a function, a cast, a ``CASE``) and a grouping nested under another
+    grouping stay outside it, so the probe never measures a population the
+    model's own grouping did not produce.
+    """
+
+    from sqlglot import expressions as exp
+
+    group = select.args.get("group")
+    if group is None:
+        return "a grouping dex did not recognize"
+    keys: list[tuple[str, str]] = []
+    for expression in group.expressions:
+        column = expression
+        if isinstance(expression, exp.Literal) and expression.is_int:
+            index = int(expression.this) - 1
+            if index < 0 or index >= len(select.expressions):
+                return "a GROUP BY ordinal outside the select list"
+            column = select.expressions[index]
+        if isinstance(column, exp.Alias):
+            column = column.this
+        if not isinstance(column, exp.Column):
+            return "a grouping expression (only a bare key column is carried)"
+        # ``group by cid`` where ``cid`` is a projection alias: group by the
+        # column the projection reads, not the output name.
+        aliased = next(
+            (
+                projection.this
+                for projection in select.expressions
+                if isinstance(projection, exp.Alias)
+                and projection.alias.lower() == column.name.lower()
+            ),
+            None,
+        )
+        if aliased is not None:
+            if not isinstance(aliased, exp.Column):
+                return "a grouping over a computed projection"
+            column = aliased
+        walk = _FilterWalk(dialect=dialect, keep_rows=True)
+        resolved = _resolve_join_column(
+            source, column.name, cte_scopes, sql_shape, walk=walk
+        )
+        if resolved is None:
+            return walk.reason or (
+                "a grouping column that does not resolve to a physical column"
+            )
+        if walk.grouped:
+            return "a grouping over another grouping"
+        table, name = resolved
+        keys.append((_table_name(table), name))
+    return keys
 
 
 def _lower_predicate(predicate, relation, cte_scopes: dict, sql_shape, seen):
@@ -2852,12 +2961,15 @@ def _resolve_within_scope(
     have.
 
     With a ``walk`` (:class:`_FilterWalk`, the join contract's own resolution,
-    #1085), one reducing shape is resolved through instead: a scope reading one
-    relation whose only reducing clause is a WHERE of simple row predicates
-    (:func:`~..sql_shape.simple_row_predicate`). Each predicate is carried down
-    to the physical relation and collected on the walk, so the probe can
-    measure the rows the model actually joins rather than the whole table.
-    Every other shape is recorded on the walk as the reason it stays unchecked.
+    #1085), two reducing shapes are resolved through instead: a scope reading
+    one relation whose only reducing clause is a WHERE of simple row predicates
+    (:func:`~..sql_shape.simple_row_predicate`), and one grouped by exactly the
+    join's key columns, which may also carry that WHERE (#1324). Each predicate
+    is carried down to the physical relation and collected on the walk, and a
+    supported grouping records the physical key columns it groups by, so the
+    probe can measure the rows (or groups) the model actually joins rather than
+    the whole table. Every other shape is recorded on the walk as the reason it
+    stays unchecked.
     """
 
     from sqlglot import expressions as exp
@@ -3207,12 +3319,14 @@ def _model_joins(
             # between the same two relations is one composite key, not one
             # candidate per pair (see JoinCandidate's own docstring).
             grouped: dict[
-                tuple[str, str, tuple, tuple, tuple, tuple],
+                tuple[str, str, tuple, tuple, tuple, tuple, bool, bool],
                 list[tuple[str, str, str | None, str | None]],
             ] = {}
             unresolved = False
             unresolved_code = "unresolved_column"
             unresolved_reason: str | None = None
+            from_walks: list[_FilterWalk] = []
+            to_walks: list[_FilterWalk] = []
             for left, right, left_tpl, right_tpl in pairs:
                 left_relation = alias_map.get((left.table or "").lower())
                 right_relation = alias_map.get((right.table or "").lower())
@@ -3282,6 +3396,8 @@ def _model_joins(
                     break
                 from_walk, from_table, from_col, from_tpl = from_side
                 to_walk, to_table, to_col, to_tpl = to_side
+                from_walks.append(from_walk)
+                to_walks.append(to_walk)
                 from_name, to_name = _table_name(from_table), _table_name(to_table)
                 group_key = (
                     from_name,
@@ -3290,6 +3406,8 @@ def _model_joins(
                     _distinct(f for _n, f in to_walk.filters),
                     tuple(from_walk.scopes),
                     tuple(to_walk.scopes),
+                    from_walk.grouped,
+                    to_walk.grouped,
                 )
                 grouped.setdefault(group_key, []).append(
                     (from_col, to_col, from_tpl, to_tpl)
@@ -3313,9 +3431,52 @@ def _model_joins(
                     )
                 )
                 continue
+            from_grouped = bool(from_walks) and all(w.grouped for w in from_walks)
+            to_grouped = bool(to_walks) and all(w.grouped for w in to_walks)
+            grouped_from_columns = {
+                column for walk in from_walks for _table, column in walk.group_columns
+            }
+            grouped_to_columns = {
+                column for walk in to_walks for _table, column in walk.group_columns
+            }
+            resolved_from_columns = {
+                column
+                for column_pairs in grouped.values()
+                for (column, _t, _f, _g) in column_pairs
+            }
+            resolved_to_columns = {
+                column
+                for column_pairs in grouped.values()
+                for (_c, column, _f, _g) in column_pairs
+            }
+            if (
+                (any(w.grouped for w in from_walks) and not from_grouped)
+                or (any(w.grouped for w in to_walks) and not to_grouped)
+                or (from_grouped and grouped_from_columns != resolved_from_columns)
+                or (to_grouped and grouped_to_columns != resolved_to_columns)
+            ):
+                scopes: list[str] = []
+                for walk in [*from_walks, *to_walks]:
+                    for scope in walk.scopes:
+                        if scope not in scopes:
+                            scopes.append(scope)
+                skipped.append(
+                    JoinSkip(
+                        join.label,
+                        "filtered_cte",
+                        f"a join column is read through "
+                        f"{', '.join(scopes) or 'a grouping'}, which groups by "
+                        "something other than exactly the join's key columns (an "
+                        "extra grouping column, a subset of a composite key, or a "
+                        "grouping on only one side of the join), so probing it "
+                        "would measure rows the model never joins",
+                    )
+                )
+                continue
             for group_key, column_pairs in grouped.items():
                 from_name, to_name, from_filters, to_filters = group_key[:4]
-                from_scopes, to_scopes = group_key[4:]
+                from_scopes, to_scopes = group_key[4:6]
+                from_grouped, to_grouped = group_key[6:]
                 from_cols = tuple(c for c, _t, _f, _g in column_pairs)
                 to_cols = tuple(c for _c, c, _f, _g in column_pairs)
                 from_keys = tuple(f for _c, _t, f, _g in column_pairs)
@@ -3326,6 +3487,7 @@ def _model_joins(
                     and from_cols == to_cols
                     and not converts
                     and from_filters == to_filters
+                    and from_grouped == to_grouped
                 ):
                     # The literal same key read twice off the same relation
                     # (t.col = t.col): every row matches itself, always --
@@ -3348,6 +3510,8 @@ def _model_joins(
                         to_filters=to_filters,
                         from_scopes=from_scopes,
                         to_scopes=to_scopes,
+                        from_grouped=from_grouped,
+                        to_grouped=to_grouped,
                     )
                 )
 
@@ -3960,11 +4124,23 @@ def _scope_filters(pairs) -> dict[int, tuple]:
     }
 
 
+def _grouped_sides(pairs) -> dict[int, tuple[bool, bool]]:
+    """The grouped sides of each probed relationship (#1324), by identity, the
+    twin of :func:`_scope_filters`."""
+
+    return {
+        id(rel): grouped
+        for _m, candidate, rel in pairs
+        if (grouped := candidate.grouped_sides()) is not None
+    }
+
+
 def join_probe_cost(
     adapter,
     relationships: list,
     key_exprs: dict | None = None,
     scope_filters: dict | None = None,
+    grouped_sides: dict | None = None,
 ) -> tuple[float, int]:
     """``(estimate, probe_count)`` for measuring every relationship's coverage,
     without running it. Pure pricing, split out so a caller combining this axis
@@ -3980,7 +4156,11 @@ def join_probe_cost(
     if estimator is None:
         return 0.0, len(to_probe)
     statements = rel_mod.coverage_statements(
-        relationships, adapter.dialect, key_exprs=key_exprs, scope_filters=scope_filters
+        relationships,
+        adapter.dialect,
+        key_exprs=key_exprs,
+        scope_filters=scope_filters,
+        grouped_sides=grouped_sides,
     )
     return sum(estimator(stmt) for stmt in statements), len(to_probe)
 
@@ -4018,12 +4198,15 @@ def join_contract_cost(
     relationships = [rel for _m, _c, rel in pairs]
     exprs = _key_exprs(pairs)
     filters = _scope_filters(pairs)
-    estimate, _joins = join_probe_cost(adapter, relationships, exprs, filters)
+    grouped = _grouped_sides(pairs)
+    estimate, _joins = join_probe_cost(adapter, relationships, exprs, filters, grouped)
     checks, _notes = (
         _null_checks(adapter, plan, live_identifiers) if pairs else ([], [])
     )
     estimate += _statements_cost(adapter, [c.sql for c in checks])
-    return estimate, _statement_count(adapter, relationships, checks, exprs, filters)
+    return estimate, _statement_count(
+        adapter, relationships, checks, exprs, filters, grouped
+    )
 
 
 def _statement_count(
@@ -4032,6 +4215,7 @@ def _statement_count(
     checks: list,
     key_exprs: dict | None = None,
     scope_filters: dict | None = None,
+    grouped_sides: dict | None = None,
 ) -> int:
     """How many statements the axis would issue: the batched coverage probes
     and one NULL count per model, which is what a handshake states it buys."""
@@ -4039,7 +4223,11 @@ def _statement_count(
     from ..explore import relationships as rel_mod
 
     probes = rel_mod.coverage_statements(
-        relationships, adapter.dialect, key_exprs=key_exprs, scope_filters=scope_filters
+        relationships,
+        adapter.dialect,
+        key_exprs=key_exprs,
+        scope_filters=scope_filters,
+        grouped_sides=grouped_sides,
     )
     return len(probes) + len(checks) if probes else 0
 
@@ -4119,39 +4307,64 @@ def _candidate_record(model: str, candidate: JoinCandidate, policy: JoinPolicy) 
         **(
             {"effective_input": _effective_input(candidate)}
             if candidate.scope_filters() is not None
+            or candidate.grouped_sides() is not None
             else {}
         ),
     }
 
 
 def _effective_input(candidate: JoinCandidate) -> dict:
-    """Per filtered side, the scopes the join reads it through and the filters
-    the probe applied to the physical relation, as the probe ran them (#1085).
-    The measured counts are over these rows, not the whole relation."""
+    """Per filtered or grouped side, the scopes the join reads it through, the
+    filters the probe applied to the physical relation, and the key columns a
+    grouped side is grouped by (#1085, #1324). The measured counts are over
+    these rows (or groups), not the whole relation."""
 
     out: dict[str, dict] = {}
-    for side, relation, scopes, filters in (
+    for side, relation, scopes, filters, columns, grouped in (
         (
             "from",
             candidate.from_relation,
             candidate.from_scopes,
             candidate.from_filters,
+            candidate.from_columns,
+            candidate.from_grouped,
         ),
-        ("to", candidate.to_relation, candidate.to_scopes, candidate.to_filters),
+        (
+            "to",
+            candidate.to_relation,
+            candidate.to_scopes,
+            candidate.to_filters,
+            candidate.to_columns,
+            candidate.to_grouped,
+        ),
     ):
-        if filters:
-            out[side] = {
-                "relation": relation,
-                "through": list(scopes),
-                "filters": list(filters),
-            }
+        if not filters and not grouped:
+            continue
+        entry: dict = {
+            "relation": relation,
+            "through": list(scopes),
+            "filters": list(filters),
+        }
+        if grouped:
+            entry["grouped_by"] = list(columns)
+        out[side] = entry
     return out
 
 
-def _side_label(dataset: str, filters: tuple[str, ...]) -> str:
-    """A relation as a finding names it: with the filter the probe read it
-    through, so a count is never mistaken for the whole table's (#1085)."""
+def _side_label(dataset: str, filters: tuple[str, ...], grouped_by=()) -> str:
+    """A relation as a finding names it: with the filter and grouping the probe
+    read it through, so a count is never mistaken for the whole table's or the
+    ungrouped relation's (#1085, #1324)."""
 
+    if grouped_by:
+        keys = ", ".join(grouped_by)
+        base = f"{dataset} (grouped by {keys})"
+        if not filters:
+            return base
+        joined = (
+            filters[0] if len(filters) == 1 else " AND ".join(f"({f})" for f in filters)
+        )
+        return f"{base} (rows where {joined})"
     if not filters:
         return dataset
     # Parenthesized when there are several, as the probe joins them: a filter
@@ -4266,11 +4479,16 @@ def join_coverage(
     relationships = [rel for _m, _c, rel in pairs]
     exprs = _key_exprs(pairs)
     filters = _scope_filters(pairs)
+    grouped = _grouped_sides(pairs)
     checks, check_notes = _null_checks(adapter, plan, live_identifiers)
     result.notes.extend(check_notes)
-    estimate, probe_count = join_probe_cost(adapter, relationships, exprs, filters)
+    estimate, probe_count = join_probe_cost(
+        adapter, relationships, exprs, filters, grouped
+    )
     estimate += _statements_cost(adapter, [c.sql for c in checks])
-    statement_count = _statement_count(adapter, relationships, checks, exprs, filters)
+    statement_count = _statement_count(
+        adapter, relationships, checks, exprs, filters, grouped
+    )
     if statement_count == 0:
         return result
 
@@ -4303,6 +4521,7 @@ def join_coverage(
         timeout_seconds=timeout_seconds,
         **({"key_exprs": exprs} if exprs else {}),
         **({"scope_filters": filters} if filters else {}),
+        **({"grouped_sides": grouped} if grouped else {}),
     )
     counts_of = {id(rel): counts for rel, counts in measured}
     refused_of = {id(rel): text for rel, text in refused}
@@ -4401,6 +4620,15 @@ def _judge_coverage(
         # can tell a failed cast from a missing parent (#861).
         record["measured"]["conversion_failed_rows"] = counts.conversion_failed_rows
         record["measured"]["conversion_failed_keys"] = counts.conversion_failed_keys
+    if getattr(counts, "to_group_rows", None) is not None:
+        # The grouped input's own denominator (#1324): groups, not the child
+        # relation's rows, which is what the model actually joins.
+        record["measured"]["group_rows"] = counts.to_group_rows
+    if candidate.from_grouped:
+        # The driving side is the grouped one, so its row count *is* the number
+        # of groups. Named too, so a reader never compares it with a child
+        # relation's rows.
+        record["measured"].setdefault("group_rows", counts.rows)
     record["coverage"] = {"rows": coverage_rows, "keys": coverage_keys}
     record["threshold_source"] = threshold_source
     record["thresholds"] = (
@@ -4411,15 +4639,42 @@ def _judge_coverage(
             "join_orphans": _JOIN_ORPHANS_THRESHOLD,
         }
     )
-    child = _side_label(rel.from_dataset, candidate.from_filters)
-    parent = _side_label(rel.to_dataset, candidate.to_filters)
+    child = _side_label(
+        rel.from_dataset,
+        candidate.from_filters,
+        candidate.from_columns if candidate.from_grouped else (),
+    )
+    parent = _side_label(
+        rel.to_dataset,
+        candidate.to_filters,
+        candidate.to_columns if candidate.to_grouped else (),
+    )
+    if candidate.to_grouped and counts.to_group_rows == 0:
+        # The grouped side holds no groups at all: nothing was eligible on that
+        # side, so the join has no coverage to judge. Kept apart from "some
+        # parents have no children" (a LEFT join's optional relationship) and
+        # from an empty driving input (#1324).
+        record.update(
+            status="not_applicable",
+            reason_code="empty_input",
+            reason=(
+                f"{parent} has no groups (its effective input is empty), so the "
+                "join has no coverage to judge (undefined, not complete)"
+            ),
+        )
+        return None
     if eligible_rows == 0:
         record.update(
             status="not_applicable",
             reason_code="empty_input" if counts.rows == 0 else "all_keys_null",
             reason=(
-                f"{child} has no rows, so the join has no coverage to "
-                "judge (undefined, not complete)"
+                (
+                    f"{child} has no groups, so the join has no coverage to "
+                    "judge (undefined, not complete)"
+                    if candidate.from_grouped
+                    else f"{child} has no rows, so the join has no coverage to "
+                    "judge (undefined, not complete)"
+                )
                 if counts.rows == 0
                 else f"every {child} row has a NULL key, and the "
                 "declaration does not count NULL keys, so nothing is eligible"
@@ -4462,6 +4717,7 @@ def _judge_coverage(
     scoped = (
         f" (counted over {child} against {parent})"
         if candidate.scope_filters() is not None
+        or candidate.grouped_sides() is not None
         else ""
     )
 

@@ -738,7 +738,10 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      contradicted, not_applicable for an empty input, unchecked with a
                                      reason_code), a side read through a simple WHERE-only CTE measured
                                      over its filtered rows with effective_input on the record (#1085),
-                                     any other filtering CTE unchecked as filtered_cte; join_no_match for a nonempty population matching
+                                     and a side grouped by exactly the join's key columns measured over
+                                     its groups, with effective_input.grouped_by and
+                                     measured.group_rows (#1324); any other filtering or grouped CTE
+                                     unchecked as filtered_cte; join_no_match for a nonempty population matching
                                      nothing, join_orphans and join_zero_overlap against the contract or
                                      the stated defaults (an INNER join whose unmatched rows an
                                      assumptions entry or population.filters entry on the driving key
