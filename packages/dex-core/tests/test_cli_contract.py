@@ -912,7 +912,13 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     },
     ("maintain", "coverage"): {
         "method": "coverage",
-        "args": {"objects": "objects", "full": "full"},
+        "args": {
+            "objects": "objects",
+            "full": "full",
+            "mutate": "mutate",
+            "max_models": "max_models",
+            "target": "target",
+        },
     },
     ("maintain", "reconcile"): {
         "method": "reconcile",

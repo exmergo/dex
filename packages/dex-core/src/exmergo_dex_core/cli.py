@@ -1696,11 +1696,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         "--mutate",
                         action="store_true",
                         default=False,
-                        help=(
-                            "refresh the stale and missing mutation scores by "
-                            "running transform test --mutate for each, behind "
-                            "one cost handshake (opens a connection)"
-                        ),
+                        help="refresh stale and missing mutation scores",
                     )
                     sp.add_argument(
                         "--max-models",
