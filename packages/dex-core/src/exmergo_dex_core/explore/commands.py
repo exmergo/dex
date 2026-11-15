@@ -34,7 +34,7 @@ from sqlglot import expressions as exp
 from .. import command_args, dbt_project
 from .. import envelope as env
 from ..adapters import get_dialect
-from ..adapters.base import Adapter, ObjectMeta, name_list
+from ..adapters.base import Adapter, ObjectMeta, clip_cell_value, name_list
 
 # Aliased: `QueryResult` here is the explore record, and the adapter's
 # same-named row carrier is only a type hint on one shaping helper.
@@ -3850,18 +3850,17 @@ def _shape_query_payload(
     for row in result.cells:
         shaped: list = []
         for value in row:
-            if isinstance(value, str) and len(value) > limits.max_cell_chars:
-                shaped.append(value[: limits.max_cell_chars] + "...")
+            capped_val, was_clipped = clip_cell_value(value, limits.max_cell_chars)
+            shaped.append(capped_val)
+            if was_clipped:
                 clipped += 1
-            else:
-                shaped.append(value)
         cells.append(shaped)
     if clipped:
         notes.append(f"{clipped} cell(s) truncated to {limits.max_cell_chars} chars")
 
     budget = limits.max_payload_bytes if budget_bytes is None else max(budget_bytes, 0)
     dropped = 0
-    while cells and len(json.dumps(cells)) > budget:
+    while cells and len(json.dumps(cells, default=str)) > budget:
         cells.pop()
         dropped += 1
     if dropped and budget_bytes is None:

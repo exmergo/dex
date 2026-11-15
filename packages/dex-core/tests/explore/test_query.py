@@ -668,6 +668,57 @@ def test_cell_and_payload_caps_apply_with_notes(
     assert len(json.dumps(data["cells"])) <= 40
 
 
+def test_query_results_serialize_array_cells_as_json_lists(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    payload = _query(
+        "SELECT ['alpha', 'beta', 'gamma'] AS tags FROM RAW_LISTINGS LIMIT 1",
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+    data = payload["data"]
+    assert "VARCHAR[]" in data["types"][0]
+    cell = data["cells"][0][0]
+    assert isinstance(cell, list)
+    assert cell == ["alpha", "beta", "gamma"]
+
+    # Also test integer array aggregates
+    agg_payload = _query(
+        "SELECT list(distinct HOST_ID) AS host_ids FROM RAW_LISTINGS",
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+    agg_data = agg_payload["data"]
+    assert "INTEGER[]" in agg_data["types"][0]
+    agg_cell = agg_data["cells"][0][0]
+    assert isinstance(agg_cell, list)
+    assert sorted(agg_cell) == [1, 2]
+
+
+def test_query_results_array_cells_truncate_long_elements_without_malforming(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    repo = _mapped_repo(airbnb_duckdb, tmp_path, capsys)
+    save_config(
+        DexConfig(query=QueryLimits(max_cell_chars=4, max_payload_bytes=2000)),
+        repo,
+    )
+    payload = _query(
+        "SELECT ['superlongtag', 'short'] AS tags FROM RAW_LISTINGS LIMIT 1",
+        airbnb_duckdb,
+        repo,
+        capsys,
+    )
+    data = payload["data"]
+    cell = data["cells"][0][0]
+    assert isinstance(cell, list)
+    assert cell == ["supe...", "shor..."]
+    assert any("1 cell(s) truncated to 4 chars" in n for n in data["notes"])
+
+
 # --- the audit log -------------------------------------------------------------------
 
 

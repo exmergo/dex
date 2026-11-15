@@ -325,6 +325,21 @@ def test_cap_columnar_cell_truncation():
     assert data["cells"][0][0] == "abc..."
 
 
+def test_cap_columnar_array_cell_truncation():
+    data = cap_columnar(
+        ["a"],
+        ["VARCHAR[]"],
+        [[["abcdefghij", "xy"]]],
+        max_rows=50,
+        max_cell_chars=3,
+        max_payload_bytes=100_000,
+    )
+    cell = data["cells"][0][0]
+    assert isinstance(cell, list)
+    assert cell == ["abc...", "xy"]
+    assert any("1 cell(s) truncated to 3 chars" in n for n in data["notes"])
+
+
 def test_cap_columnar_notes_when_truncated_by_source():
     # Adapter already returned exactly max_rows with truncated=True; the engine-cap
     # hint must still land in notes (plain explore query already says this).

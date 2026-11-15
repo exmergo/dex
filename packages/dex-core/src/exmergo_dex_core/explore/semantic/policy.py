@@ -12,6 +12,7 @@ import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from ...adapters.base import clip_cell_value
 from ...guards import PII_BLOCK_CONFIDENCE
 from ...guards.pii_meta import PII_CATEGORY, says_pii
 from ...semantic_catalog import SemanticCatalogView
@@ -398,11 +399,10 @@ def cap_columnar(
     for row in cells:
         shaped: list[Any] = []
         for value in row:
-            if isinstance(value, str) and len(value) > max_cell_chars:
-                shaped.append(value[:max_cell_chars] + "...")
+            capped_val, was_clipped = clip_cell_value(value, max_cell_chars)
+            shaped.append(capped_val)
+            if was_clipped:
                 clipped += 1
-            else:
-                shaped.append(value)
         shaped_cells.append(shaped)
     if clipped:
         notes.append(f"{clipped} cell(s) truncated to {max_cell_chars} chars")

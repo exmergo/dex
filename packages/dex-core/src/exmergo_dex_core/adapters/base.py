@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from math import ceil
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from ..envelope import Paradigm
 from ..errors import StatementStage, WarehouseQueryError
@@ -374,7 +374,9 @@ def warehouse_refusal(
 
 
 def json_safe(value: object | None) -> object | None:
-    """Coerce a connector scalar to a JSON-serializable primitive for the envelope."""
+    """Coerce a connector scalar or collection to a JSON-serializable primitive
+    for the envelope.
+    """
 
     if value is None or isinstance(value, (int, float, bool, str)):
         return value
@@ -382,7 +384,41 @@ def json_safe(value: object | None) -> object | None:
         return float(value)
     if isinstance(value, (date, datetime, time)):
         return value.isoformat()
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if hasattr(value, "tolist") and callable(value.tolist):
+        return [json_safe(v) for v in value.tolist()]
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
     return str(value)
+
+
+def clip_cell_value(value: Any, max_chars: int) -> tuple[Any, bool]:
+    """Truncate strings in scalar or nested collection cells to max_chars."""
+
+    if isinstance(value, str):
+        if len(value) > max_chars:
+            return value[:max_chars] + "...", True
+        return value, False
+    if isinstance(value, list):
+        clipped = False
+        new_list = []
+        for item in value:
+            new_item, item_clipped = clip_cell_value(item, max_chars)
+            new_list.append(new_item)
+            if item_clipped:
+                clipped = True
+        return new_list, clipped
+    if isinstance(value, dict):
+        clipped = False
+        new_dict = {}
+        for k, v in value.items():
+            new_v, item_clipped = clip_cell_value(v, max_chars)
+            new_dict[k] = new_v
+            if item_clipped:
+                clipped = True
+        return new_dict, clipped
+    return value, False
 
 
 # Substring hints for arbitrary binary-blob column types across dialects

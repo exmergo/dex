@@ -1,0 +1,1 @@
+**Query results now serialize list and array cells as JSON arrays instead of Python repr strings.** Cells with array types previously fell back to string coercion in `json_safe`, emitting Python repr strings like `"[1, 2]"`. Array cells now serialize as JSON arrays, with nested cell-width truncation applied to long string elements and payload-byte caps preserved.

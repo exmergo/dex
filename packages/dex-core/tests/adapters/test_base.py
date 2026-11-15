@@ -156,3 +156,46 @@ def test_double_literals_reach_every_fraction():
     assert doubled.count("THEN 1e0 ") == fractions
     assert doubled.count("THEN 0e0 END") == default.count("THEN 0.0 END")
     assert "THEN 1.0 " not in doubled and "THEN 0.0 END" not in doubled
+
+
+def test_json_safe_coerces_scalars_and_collections():
+    from datetime import date, time
+    from decimal import Decimal
+
+    from exmergo_dex_core.adapters.base import json_safe
+
+    assert json_safe(None) is None
+    assert json_safe("text") == "text"
+    assert json_safe(42) == 42
+    assert json_safe(3.14) == 3.14
+    assert json_safe(True) is True
+    assert json_safe(Decimal("12.34")) == 12.34
+    assert json_safe(date(2026, 11, 15)) == "2026-11-15"
+    assert json_safe(time(12, 30)) == "12:30:00"
+
+    # Collections serialize as JSON-safe arrays/dicts
+    assert json_safe([1, 2, "a"]) == [1, 2, "a"]
+    assert json_safe((1, Decimal("2.5"))) == [1, 2.5]
+    assert json_safe([date(2026, 1, 1), [Decimal("3.0")]]) == ["2026-01-01", [3.0]]
+    assert json_safe({"k": Decimal("1.5")}) == {"k": 1.5}
+
+
+def test_clip_cell_value_bounds_scalar_and_nested_strings():
+    from exmergo_dex_core.adapters.base import clip_cell_value
+
+    assert clip_cell_value("abcdefgh", 4) == ("abcd...", True)
+    assert clip_cell_value("abc", 4) == ("abc", False)
+    assert clip_cell_value(123, 4) == (123, False)
+
+    # Nested list string truncation
+    res_list, clipped = clip_cell_value(["abcdefgh", "abc"], 4)
+    assert res_list == ["abcd...", "abc"]
+    assert clipped is True
+
+    # Nested list without truncation
+    assert clip_cell_value(["ab", "cd"], 4) == (["ab", "cd"], False)
+
+    # Deeper nested list
+    res_deep, deep_clipped = clip_cell_value([["abcdefgh"]], 4)
+    assert res_deep == [["abcd..."]]
+    assert deep_clipped is True
