@@ -526,13 +526,22 @@ def _coverage_fields() -> frozenset[str]:
             )
         ),
     )
-    # Last run (#1285): the run's identity and age, never a result message.
+    # Last run (#1285) and source freshness run (#1347): each run's identity
+    # and age, never a result message or max_loaded_at.
     paths |= _under(
         "last_run",
         ".invocation_id",
         ".generated_at",
         ".age_seconds",
         ".command",
+        ".artifact",
+        ".cold",
+    )
+    paths |= _under(
+        "freshness_run",
+        ".invocation_id",
+        ".generated_at",
+        ".age_seconds",
         ".artifact",
         ".cold",
     )
@@ -1272,7 +1281,28 @@ class ValuesFreeContract:
                     "depends_on": {"nodes": [model]},
                 },
             },
-            "sources": {},
+            "sources": {
+                "source.shop.raw.orders": {
+                    "resource_type": "source",
+                    "name": "orders",
+                    "source_name": "raw",
+                    "identifier": "orders",
+                    "package_name": "shop",
+                    "description": f"loaded with {value}",
+                    "config": {
+                        "enabled": True,
+                        "freshness": {
+                            "warn_after": {"count": 12, "period": "hour"},
+                            "error_after": {"count": 24, "period": "hour"},
+                        },
+                    },
+                    "freshness": {
+                        "warn_after": {"count": 12, "period": "hour"},
+                        "error_after": {"count": 24, "period": "hour"},
+                    },
+                    "columns": {"id": {"name": "id"}},
+                }
+            },
             "unit_tests": {
                 "unit_test.shop.orders.ut": {
                     "name": "ut_orders",
@@ -1314,6 +1344,7 @@ class ValuesFreeContract:
             manifest,
             full=True,
             statuses={"test.shop.accepted": "fail"},
+            freshness_statuses={"source.shop.raw.orders": "error"},
             records={model: record},
         )
         declared = declarations(manifest, selected={model}, values_free=True)
@@ -1331,6 +1362,13 @@ class ValuesFreeContract:
                 "age_seconds": 60,
                 "command": "build",
                 "artifact": "dex",
+                "cold": False,
+            },
+            freshness_run={
+                "invocation_id": "11111111-1111-1111-1111-111111111111",
+                "generated_at": "2026-11-15T10:05:00Z",
+                "age_seconds": 30,
+                "artifact": "project",
                 "cold": False,
             },
             excluded=found.excluded,

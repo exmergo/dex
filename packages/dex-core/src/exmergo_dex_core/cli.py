@@ -562,9 +562,10 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "inventory the tests the dbt project declares",
         "Count each model's, source's, snapshot's and seed's own tests by kind, "
         "its downstream tests, incremental branch tests and asserted columns, "
-        "each against a stated denominator; each test's last run status, each "
-        "model's recorded mutation score (fresh or stale), and what checks each "
-        "declared fact. Free; reads the manifest, run results and .dex/ only.",
+        "each against a stated denominator; each test's and source freshness "
+        "check's last run status, each model's recorded mutation score (fresh or "
+        "stale), and what checks each declared fact. Free; reads the manifest, "
+        "run results, sources.json and .dex/ only.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
