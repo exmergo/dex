@@ -314,6 +314,7 @@ class LocalSemanticViewLayer:
             )
         command = "explore semantic query"
         where, notes = self._deployed(plan, command)
+        self._in_scope(plan, command)
         rendered = self._render(
             plan, where, order_by=q.order_by, limit=q.limit, governed=governed
         )
@@ -387,6 +388,7 @@ class LocalSemanticViewLayer:
         )
         command = "explore semantic values"
         where, deployed_notes = self._deployed(plan, command)
+        self._in_scope(plan, command)
         rendered = self._render(plan, where, governed=governed)
         return governed.run(
             rendered.sql,
@@ -527,6 +529,39 @@ class LocalSemanticViewLayer:
             )
         except QueryRefused as exc:
             raise SemanticBackendError(str(exc)) from exc
+
+    def _in_scope(self, plan: Any, command: str) -> None:
+        """Refuse a statement whose base tables are not all in the scoped
+        inventory.
+
+        The statement is priced from those tables' sizes, and the inventory is
+        the source allowlist, narrowed by ``--scope``: a table outside it has no
+        size to read and would be quoted as nothing, while Snowflake still scans
+        it. The allowlist is a cost boundary a command may narrow and never
+        widen, so such a query is refused by name rather than under-priced.
+        """
+
+        from ...cache import match_identifier
+
+        relations = self._base_relations(plan)
+        if not relations:
+            return
+        adapter = self._governed_sql().adapter(command)
+        listed = [meta.identifier for meta in adapter.list_objects()]
+        outside = [
+            name
+            for name in relations
+            if not match_identifier(name, listed)
+            and not any(match_identifier(item, [name]) for item in listed)
+        ]
+        if outside:
+            raise SemanticQueryRefusedError(
+                f"refused: this query reads {', '.join(outside)} through the "
+                f"semantic view, outside the source allowlist (or the --scope it "
+                "was narrowed to), so dex cannot price what it would scan. Add "
+                "the schema to snowflake.databases in .dex/config.yml, or widen "
+                "--scope to it"
+            )
 
     def _base_relations(self, plan: Any) -> list[str]:
         """The base tables of every logical table the statement reaches."""

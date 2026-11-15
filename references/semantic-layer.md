@@ -1576,7 +1576,9 @@ semantic:
   5. the governed spine: SELECT-only, the relation pre-check, the cost
      handshake, Dex's connector, the columnar cap. Snowflake keeps no bytes for
      a semantic view, so the statement is priced from the base tables the
-     rendered members reach.
+     rendered members reach, and a query reaching a base table outside the
+     source allowlist (or a narrowed `--scope`) is refused by name rather than
+     quoted as nothing.
 
   A grain-suffixed token (`sales.orders.order_date__month`) renders as
   `DATE_TRUNC('month', orders.order_date)`, at `second` through `year`.

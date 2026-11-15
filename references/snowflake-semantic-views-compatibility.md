@@ -257,7 +257,9 @@ an empty `synonyms` and `description` on a view-level metric.
 
 **Pricing.** Snowflake keeps no bytes for a semantic view, so a statement over
 one would be quoted at the per-statement floor. Dex prices it from the base
-tables of every logical table the rendered members reach.
+tables of every logical table the rendered members reach. A base table outside
+the source allowlist (or the `--scope` it was narrowed to) has no size dex may
+read, so a query reaching one is refused by name rather than quoted as nothing.
 
 **`list --deployed`** reads the views deployed from the configured files, with
 `source: deployed` and per-view `coverage`: `full`, `limited` (a private member

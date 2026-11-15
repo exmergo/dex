@@ -900,3 +900,28 @@ def test_array_union_agg_returns_its_inputs():
 
     reads = value_reads("ARRAY_UNION_AGG(customers.tags)")
     assert [(r.qualifier, r.name) for r in reads or []] == [("customers", "tags")]
+
+
+def test_a_base_table_outside_the_allowlist_is_refused_not_priced_as_nothing(
+    tmp_path, capsys, account
+):
+    """The statement is priced from its base tables' sizes, which only the
+    allowlisted inventory carries: a table outside it would be quoted as
+    nothing while Snowflake scans it."""
+
+    view = json.loads(json.dumps(SALES))
+    view["tables"][2]["base_table"]["schema"] = "ELSEWHERE"
+    deployed = json.loads(json.dumps(view))
+    account["account"] = Account(deployed=deployed)
+    root = _repo(tmp_path, view)
+    envelope = _query(
+        capsys,
+        root,
+        "sales.orders.order_count",
+        "--group-by",
+        "sales.nations.country",
+    )
+
+    assert "outside the source allowlist" in " ".join(envelope["errors"]), envelope
+    assert "SHOP.ELSEWHERE.NATIONS" in envelope["errors"][0]
+    assert account["account"].queries == []
