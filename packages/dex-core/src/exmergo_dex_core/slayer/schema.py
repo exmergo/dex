@@ -371,11 +371,14 @@ def _retype_finding(
             if after is None or before is None:
                 unreadable = True
                 break
-            already = {(p.measure, p.column) for p in before}
+            already = {
+                (p.measure, p.resolved_column or p.column, p.model) for p in before
+            }
             for p in after:
-                if (p.measure, p.column) in already:
+                if (p.measure, p.resolved_column or p.column, p.model) in already:
                     continue
-                column_matches = p.column == retype.column or p.column.endswith(
+                target_col = p.resolved_column or p.column
+                column_matches = target_col == retype.column or target_col.endswith(
                     f".{retype.column}"
                 )
                 model_matches = (

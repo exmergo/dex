@@ -790,6 +790,7 @@ class UnaggregatableMeasure:
     aggregation: str
     reason: str
     model: str | None = None
+    resolved_column: str | None = None
 
 
 def unaggregatable_measures(
@@ -955,6 +956,7 @@ def unaggregatable_measures(
                         aggregation=agg,
                         reason=reason,
                         model=owner_model.name,
+                        resolved_column=col.name,
                     )
                 )
     return found

@@ -491,6 +491,43 @@ def test_retyping_joined_column_to_list_breaks_dependent_distinct_count(
     assert "orders.customer_tag_count (count_distinct)" in conflict["data"]["remedy"]
 
 
+def test_retyping_joined_column_breaks_expanded_named_measure(repo: Path, capsys):
+    """When a joined column changes type, expanded named measures are listed."""
+
+    _sql(
+        repo,
+        "ALTER TABLE customers ADD COLUMN score DOUBLE",
+        "UPDATE customers SET score = 10.0",
+    )
+    cust = _customers()
+    cust["columns"].append({"name": "score", "type": "DOUBLE"})
+    cust.setdefault("measures", []).append(
+        {"name": "cust_score", "formula": "score:sum"}
+    )
+    _write_model(repo, CUSTOMERS, cust)
+
+    ord_entry = _orders()
+    ord_entry["measures"].append(
+        {"name": "expanded_score", "formula": "sum(customers.cust_score)"}
+    )
+    _write_model(repo, ORDERS, ord_entry)
+
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE customers ALTER score TYPE VARCHAR")
+
+    payload = _cli(repo, capsys, "maintain", "schema")
+
+    assert payload["_exit"] == 0, payload
+    conflict = _finding(payload, "declared_type_conflict", column="score")
+    assert conflict["data"]["semantic_model"] == "customers"
+    assert conflict["data"]["breaks_measures"] == [
+        {"measure": "orders.expanded_score", "aggregation": "sum"},
+        {"measure": "cust_score", "aggregation": "sum"},
+    ]
+    assert "cust_score (sum)" in conflict["data"]["remedy"]
+    assert "orders.expanded_score (sum)" in conflict["data"]["remedy"]
+
+
 def test_a_dropped_source_column_still_declared_is_caught(repo: Path, capsys):
     _cli(repo, capsys, "maintain", "snapshot")
     _sql(repo, "ALTER TABLE orders DROP COLUMN status")
