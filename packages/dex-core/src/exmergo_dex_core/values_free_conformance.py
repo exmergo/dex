@@ -404,8 +404,49 @@ _COVERAGE_RESOURCE = (
     "[].downstream_tests.count",
     "[].downstream_tests.on",
     "[].downstream_tests.on[]",
+    # Last run status (#1285): a status per test and counts per resource.
+    "[].tests[].last_run",
+    "[].last_run",
+    *(
+        f"[].last_run.{status}"
+        for status in ("pass", "fail", "warn", "error", "skipped", "not_run")
+    ),
+    # Recorded mutation strength (#1284): scores, counts and timestamps.
+    "[].strength",
+    *(
+        f"[].strength.{key}"
+        for key in (
+            "status",
+            "score",
+            "score_with_downstream",
+            "incremental_score",
+            "survivors",
+            "complete",
+            "not_run",
+            "downstream",
+            "recorded_at",
+            "age_seconds",
+            "changed",
+            "changed[]",
+        )
+    ),
 )
 _RATIO = ("", ".numerator", ".denominator", ".of")
+_RUN_STATUSES = ("pass", "fail", "warn", "error", "skipped", "not_run")
+_FACT_KINDS = (
+    "grain",
+    "key",
+    "foreign_key",
+    "references",
+    "null_rule",
+    "population_filter",
+    "population_parent",
+    "population_rule",
+    "unit",
+    "additivity",
+    "history",
+)
+_CHECKERS = ("dbt_test", "dex_verify", "both", "none", "prose")
 
 
 def _coverage_fields() -> frozenset[str]:
@@ -481,8 +522,62 @@ def _coverage_fields() -> frozenset[str]:
                 "columns",
                 "downstream_resources",
                 "excluded",
+                "declared_facts",
             )
         ),
+    )
+    # Last run (#1285): the run's identity and age, never a result message.
+    paths |= _under(
+        "last_run",
+        ".invocation_id",
+        ".generated_at",
+        ".age_seconds",
+        ".command",
+        ".artifact",
+        ".cold",
+    )
+    paths.add("summary.tests.by_last_run")
+    paths |= {f"summary.tests.by_last_run.{status}" for status in _RUN_STATUSES}
+    # Strength (#1284): counts per status and score bands, never an average.
+    paths |= {"summary.models.strength", "summary.models.strength.by_status"}
+    paths |= {
+        f"summary.models.strength.by_status.{status}"
+        for status in ("fresh", "stale", "missing", "untestable")
+    }
+    paths |= _under("summary.models.strength.fresh", *_RATIO[1:])
+    paths.add("summary.models.strength.fresh_score_bands")
+    paths |= {
+        f"summary.models.strength.fresh_score_bands.{band}"
+        for band in ("below_0.25", "0.25_to_0.5", "0.5_to_0.75", "0.75_and_above")
+    }
+    # Declared facts (#1283): kinds, checkers, test names and verify codes.
+    paths |= {"declarations", "declarations.summary", "declarations.summary.facts"}
+    paths |= _under("declarations.summary.models_declared", *_RATIO[1:])
+    paths.add("declarations.summary.models_undeclared")
+    paths.add("declarations.summary.facts.count")
+    paths |= _under("declarations.summary.facts.checked", *_RATIO[1:])
+    paths |= {
+        "declarations.summary.facts.by_kind",
+        "declarations.summary.facts.by_checker",
+    }
+    paths |= {f"declarations.summary.facts.by_checker.{c}" for c in _CHECKERS}
+    for kind in _FACT_KINDS:
+        paths |= _under(
+            f"declarations.summary.facts.by_kind.{kind}",
+            ".count",
+            *(f".{c}" for c in _CHECKERS),
+        )
+    paths |= _under(
+        "declarations.facts",
+        "[]",
+        "[].model",
+        "[].fact",
+        "[].column",
+        "[].checked_by",
+        "[].tests",
+        "[].tests[]",
+        "[].verify",
+        "[].verify[]",
     )
     return _COMMON | frozenset(paths)
 
@@ -1190,15 +1285,58 @@ class ValuesFreeContract:
             },
             "disabled": {},
         }
-        found = inventory(manifest, full=True)
+        # A declaration whose population filter, rule and description carry
+        # the sentinel: the declarations section names facts, never values.
+        manifest["nodes"][model]["config"]["meta"]["dex"] = {
+            "grain": ["status"],
+            "population": {
+                "rule": f"only {value}",
+                "filters": [{"column": "status", "includes": [value]}],
+            },
+        }
+        manifest["nodes"][model]["columns"]["status"]["meta"] = {
+            "dex": {"role": "dimension", "null_rule": "never"}
+        }
+        from . import dbt_tests
+        from .maintain.coverage_declarations import declarations
+
+        record = {
+            "model_id": model,
+            "score": 0.5,
+            "sql_digest": dbt_tests.model_sql_digest(manifest["nodes"][model]),
+            "tests_digest": "stale",
+            "downstream_tests": {},
+            "recorded_at": "2026-11-15T10:00:00+00:00",
+            "complete": False,
+            "not_run": 1,
+        }
+        found = inventory(
+            manifest,
+            full=True,
+            statuses={"test.shop.accepted": "fail"},
+            records={model: record},
+        )
+        declared = declarations(manifest, selected={model}, values_free=True)
         result = CoverageResult(
             summary=found.summary,
             scope=found.scope,
             sections=found.sections,
+            declarations={
+                "summary": declared["summary"],
+                "facts": declared["facts"],
+            },
+            last_run={
+                "invocation_id": "00000000-0000-0000-0000-000000000000",
+                "generated_at": "2026-11-15T10:00:00Z",
+                "age_seconds": 60,
+                "command": "build",
+                "artifact": "dex",
+                "cold": False,
+            },
             excluded=found.excluded,
-            elided=found.elided,
+            elided={**found.elided, "declared_facts": declared["elided"]},
             manifest={"source": "parsed"},
-            notes=found.notes,
+            notes=[*found.notes, *declared["notes"]],
             warnings=found.warnings,
             result_mode=ResultMode.VALUES_FREE,
         )

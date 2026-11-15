@@ -1840,16 +1840,72 @@ def coverage(
             "not reflected"
         )
 
+    from . import coverage_declarations, coverage_runs
+
+    notes: list[str] = []
+    # Last run status (#1285): files only. A manifest read from disk is the
+    # one the run wrote, so its tests are attributed against it all the same.
+    run = coverage_runs.last_run(project_dir, manifest)
+    notes.extend(run.notes)
+    warnings.extend(run.warnings)
+    # Recorded mutation results (#1284), from the store: no connection.
+    loader = getattr(engine.store, "load_mutation_records", None)
+    records: dict[str, dict[str, Any]] | None = None
+    if loader is None:
+        notes.append(
+            "no model carries a strength: the configured store keeps no "
+            "mutation records, so `transform test --mutate` results are not "
+            "kept between commands"
+        )
+    else:
+        try:
+            records = loader()
+        except Exception as exc:  # scratch state: a bad read costs the section
+            records = None
+            warnings.append(
+                f"recorded mutation results could not be read "
+                f"({type(exc).__name__}), so no model carries a strength"
+            )
+
     selector = model_scope.model_names(objects) if objects else None
-    inventory = coverage_mod.inventory(manifest, selector=selector, full=full)
+    inventory = coverage_mod.inventory(
+        manifest,
+        selector=selector,
+        full=full,
+        statuses=run.statuses,
+        records=records,
+    )
+    if records is not None:
+        notes.append(
+            "strength is the recorded `transform test --mutate` score: it counts "
+            "only the defects Dex plants, describes the run at recorded_at, and "
+            "a stale one no longer describes the model's SQL or its tests. "
+            "Re-run `transform test --mutate <model>` to refresh one"
+        )
+    selected_models = {
+        uid for uid in coverage_mod.selected_ids(inventory) if uid.startswith("model.")
+    }
+    declared = coverage_declarations.declarations(
+        manifest,
+        selected=selected_models,
+        values_free=_values_free(engine),
+        full=full,
+    )
+    elided = dict(inventory.elided)
+    elided["declared_facts"] = declared["elided"]
     return CoverageResult(
         summary=inventory.summary,
         scope=inventory.scope,
         sections=inventory.sections,
+        declarations={
+            "summary": declared["summary"],
+            "facts": declared["facts"],
+        },
+        last_run=run.run,
         excluded=inventory.excluded,
-        elided=inventory.elided,
+        elided=elided,
         manifest=origin,
-        notes=inventory.notes,
+        notes=[*inventory.notes, *notes, *declared["notes"]],
         warnings=[*warnings, *inventory.warnings],
     )
 

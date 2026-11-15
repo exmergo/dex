@@ -18,13 +18,16 @@ import pytest
 
 from exmergo_dex_core.storage import FilesystemStore, MemoryStore, SqliteStore
 from exmergo_dex_core.storage.conformance import (
+    MutationRecordsContract,
     SpendHistoryContract,
     SpendLockContract,
     StoreContract,
 )
 
 
-class TestFilesystemStore(SpendHistoryContract, SpendLockContract, StoreContract):
+class TestFilesystemStore(
+    MutationRecordsContract, SpendHistoryContract, SpendLockContract, StoreContract
+):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
         # One root per test, with the key as a subdirectory: two keys are two
@@ -35,14 +38,18 @@ class TestFilesystemStore(SpendHistoryContract, SpendLockContract, StoreContract
         return FilesystemStore(self.root / key)
 
 
-class TestMemoryStore(SpendHistoryContract, SpendLockContract, StoreContract):
+class TestMemoryStore(
+    MutationRecordsContract, SpendHistoryContract, SpendLockContract, StoreContract
+):
     def make_store(self, key: str) -> MemoryStore:
         # Nothing to key on: a MemoryStore's state is the instance, so a distinct
         # instance is a distinct key by construction.
         return MemoryStore()
 
 
-class TestSqliteStore(SpendHistoryContract, SpendLockContract, StoreContract):
+class TestSqliteStore(
+    MutationRecordsContract, SpendHistoryContract, SpendLockContract, StoreContract
+):
     @pytest.fixture(autouse=True)
     def _root(self, tmp_path: Path):
         # Same convention as TestFilesystemStore: one root per test, the key as a

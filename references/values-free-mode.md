@@ -48,7 +48,10 @@ reviewed what it returns:
 - `explore semantic list` (it reads repository metadata, not the warehouse)
 - `maintain coverage` (it reads a parsed dbt manifest: names and counts, a
   generic test named by the test it applies rather than by its node name, which
-  can carry its arguments, and a parse error's message withheld)
+  can carry its arguments, and a parse error's message withheld; its last-run,
+  strength and declarations sections carry statuses, scores, digests' verdicts,
+  fact kinds and finding codes, never a population filter's values or a rule's
+  prose)
 
 Everything else refuses before it opens a connection, with `reason: guard` and
 `data.code: command_not_values_free`. That includes `explore cluster` (a small

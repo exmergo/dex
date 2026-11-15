@@ -780,8 +780,17 @@ dex maintain coverage [<names>] [--full]
                                      excluded), every cut in data.elided and notes; --full lifts them.
                                      A project that does not parse is reported first and suppresses the
                                      inventory; with no parse possible the newest manifest on disk is
-                                     read and dated (data.manifest.source: artifact). Report only:
-                                     status ok whatever the coverage. Reviewed for values-free mode
+                                     read and dated (data.manifest.source: artifact). Separate
+                                     sections, never blended: each test's last_run status from the
+                                     newest building run_results.json (not_run where it did not run;
+                                     data.last_run names the invocation and its age) (#1285); each
+                                     model's strength, its recorded transform test --mutate score
+                                     called fresh, stale (with what changed), missing or untestable,
+                                     summarized as counts and score bands (#1284); and declarations,
+                                     one record per declared fact with checked_by dbt_test,
+                                     dex_verify, both, none or prose (#1283). All free; refreshing a
+                                     score is transform test --mutate. Report only: status ok
+                                     whatever the coverage. Reviewed for values-free mode
 ```
 
 ### How authored content reaches the engine

@@ -11,6 +11,7 @@ Layout (all non-secret, committed to the user's repo):
     .dex/spend.lock     an empty file; the spend-admission lock is held on it
     .dex/cache.lock     an empty file; a cache read-merge-write holds it
     .dex/plans/*.json   the stored transform plans
+    .dex/mutations/*.json  the latest `transform test --mutate` record per model
 
 State on disk is what lets the CLI subcommands stay stateless: the agent
 orchestrates multi-step flows by re-reading the cache and the dbt project between
@@ -35,7 +36,7 @@ from typing import TYPE_CHECKING
 
 from ..cache import DexCache
 from ..errors import ConfigurationError
-from .base import Document, StoreContext, spend_total
+from .base import Document, StoreContext, mutation_record_key, spend_total
 
 if TYPE_CHECKING:
     from ..maintain.drift import DriftReport
@@ -51,6 +52,7 @@ SPEND_FILE = "spend.jsonl"
 SPEND_LOCK_FILE = "spend.lock"
 CACHE_LOCK_FILE = "cache.lock"
 PLANS_DIR = "plans"
+MUTATIONS_DIR = "mutations"
 
 # One re-entrant lock per resolved `.dex/` path, shared by every store instance
 # addressing it. The OS lock below is what serializes separate processes; this is
@@ -168,6 +170,7 @@ _DOCUMENT_FILES = {
     Document.DRIFT: DRIFT_FILE,
     Document.QUERY_LOG: QUERIES_FILE,
     Document.SPEND_LOG: SPEND_FILE,
+    Document.MUTATIONS: MUTATIONS_DIR,
 }
 
 
@@ -384,6 +387,45 @@ class FilesystemStore:
             TransformPlan.model_validate_json(path.read_text(encoding="utf-8"))
             for path in self.plans_dir.glob("*.json")
         ]
+
+    # --- mutation records (#1281) ----------------------------------------------
+
+    def save_mutation_record(self, record: dict) -> str:
+        """One file per model, so two models measured at once never race on a
+        shared document; each is replaced atomically."""
+
+        directory = self.dex_dir / MUTATIONS_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{mutation_record_key(str(record['model_id']))}.json"
+        fd, temp_path = tempfile.mkstemp(
+            dir=directory, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temp_file = Path(temp_path)
+        try:
+            with open(fd, "w", encoding="utf-8") as handle:  # noqa: PTH123
+                handle.write(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            temp_file.replace(path)
+        except BaseException:
+            with suppress(OSError):
+                temp_file.unlink()
+            raise
+        return str(path)
+
+    def load_mutation_records(self) -> dict[str, dict]:
+        directory = self.dex_dir / MUTATIONS_DIR
+        records: dict[str, dict] = {}
+        if not directory.is_dir():
+            return records
+        for path in sorted(directory.glob("*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # A torn or hand-edited file is one model's missing record, not
+                # a reason to lose every other model's.
+                continue
+            if isinstance(record, dict) and record.get("model_id"):
+                records[str(record["model_id"])] = record
+        return records
 
     # --- locators -------------------------------------------------------------
 
