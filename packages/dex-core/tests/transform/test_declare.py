@@ -611,7 +611,10 @@ def test_apply_then_declare_again_is_a_clean_no_op(shop: Path, capsys):
         m for m in yaml.safe_load(written)["models"] if m["name"] == "stg_customers"
     )
     assert entry["description"] == "One row per customer."
-    assert entry["columns"][0]["tests"] == ["unique", "not_null"]
+    assert entry["columns"][0]["tests"] == [
+        "unique",
+        {"not_null": {"config": {"meta": {"disable_test_samples": True}}}},
+    ]
 
     again = _dex(shop, ["transform", "declare", "stg_orders,stg_customers"], capsys)
     assert again["status"] == "ok", again

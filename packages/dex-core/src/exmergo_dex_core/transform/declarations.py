@@ -73,6 +73,7 @@ from .rewrite import (
     _scalar_value,
     _sequence,
     _span,
+    _unsampled,
     before_trailing_blanks,
     column_anchor,
     prevailing_test_key,
@@ -1231,7 +1232,7 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
             if value is not None
         }
         if column.null_rule is not None and column.null_rule.strip().lower() == "never":
-            entry["tests"].append("not_null")
+            entry["tests"].append(_unsampled("not_null"))
         if column.references is not None:
             parent, _, parent_column = column.references.rpartition(".")
             parent_base, parent_version = mv.split_label(parent)
@@ -1241,15 +1242,17 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
                 else f"ref('{parent}')"
             )
             entry["tests"].append(
-                {"relationships": {"arguments": {"to": to, "field": parent_column}}}
+                _unsampled(
+                    "relationships", arguments={"to": to, "field": parent_column}
+                )
             )
 
     grain = declaration.grain or []
     if len(grain) == 1:
         tests = slot(grain[0])["tests"]
         for name in ("unique", "not_null"):
-            if name not in tests:
-                tests.insert(0 if name == "unique" else 1, name)
+            if name not in {_spec_name(spec) for spec in tests}:
+                tests.insert(0 if name == "unique" else 1, _unsampled(name))
     return out
 
 

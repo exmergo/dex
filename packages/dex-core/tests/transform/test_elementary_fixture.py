@@ -239,3 +239,51 @@ def test_a_mutation_run_with_elementary_disabled_leaves_no_footprint(
     )
     assert executed >= 1, "no mutant ran, so nothing was measured"
     assert footprint(before, duckdb_census(warehouse)) == {}
+
+
+def _strip_sampling_switch(project: Path) -> None:
+    """Strip the sampling switch from the grain's rendered ``unique`` test."""
+
+    path = project / "models" / "schema.yml"
+    schema = yaml.safe_load(path.read_text(encoding="utf-8"))
+    [column] = [c for c in schema["models"][0]["columns"] if c["name"] == "id"]
+    column["data_tests"] = [
+        "unique" if isinstance(t, dict) and "unique" in t else t
+        for t in column["data_tests"]
+    ]
+    path.write_text(yaml.safe_dump(schema, sort_keys=False), encoding="utf-8")
+
+
+@requires_elementary
+def test_a_failing_rendered_test_leaves_no_sample_of_its_rows(
+    tmp_path: Path, installed_elementary: Path
+):
+    """#1306, on variant a, where Elementary's materialization handles the tests.
+    A failing ``unique`` test returns the duplicated key, and Elementary copies
+    failing rows into ``test_result_rows``. The test Dex renders carries
+    ``disable_test_samples``, so it adds no row there; the same test with the
+    switch removed adds one, so the census can see a sample when there is one."""
+
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    warehouse = tmp_path / "dev.duckdb"
+    # One duplicated key, so the grain's `unique` test fails on exactly one value.
+    _execute(
+        warehouse,
+        "insert into main.raw_orders select * from main.raw_orders where id = 1",
+    )
+    project_args = ("--project-dir", str(project), "--profiles-dir", str(project))
+    dbt("run", *project_args, cwd=project)
+    rows = (ELEMENTARY_SCHEMA, "test_result_rows", "BASE TABLE")
+
+    def sampled() -> int:
+        before = duckdb_census(warehouse)
+        log = dbt(
+            "test", *project_args, "--select", "unique_fct_id", cwd=project, check=False
+        )
+        assert "ERROR=1" in log, f"the rendered unique test is meant to fail:\n{log}"
+        was, now = footprint(before, duckdb_census(warehouse)).get(rows, (0, 0))
+        return now - was
+
+    assert sampled() == 0
+    _strip_sampling_switch(project)
+    assert sampled() == 1

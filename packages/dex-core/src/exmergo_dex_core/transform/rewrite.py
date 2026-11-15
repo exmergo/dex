@@ -1569,10 +1569,11 @@ def column_anchor(content: str, model: str) -> tuple[int, str] | None:
 class ColumnTests:
     """One column's declared tests, and the spans needed to change the list.
 
-    ``spans`` carries only the *scalar* items. A test written as a mapping
+    ``spans`` carries the *scalar* items and a mapping that is exactly the
+    unsampled test dex renders. Any other test written as a mapping
     (``- accepted_values: {...}``) is counted in ``values`` under its single key
     and carries no span, so it is never rewritten and never removed: dex changes
-    the tests it can name and leaves configured ones alone.
+    the tests it wrote and leaves configured ones alone.
     """
 
     key: str | None
@@ -1633,6 +1634,10 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
                 named = [name for name, _body in _mapping(item)]
                 values.append(named[0] if named else "")
                 items.append((item.start_mark.index, item.end_mark.index))
+                # The unsampled test dex rendered is dex's to move; any other
+                # mapping is someone's configuration and stays hands-off.
+                if named and _construct(item) == _unsampled(named[0]):
+                    spans[named[0]] = items[-1]
         return ColumnTests(
             key=key,
             values=values,
@@ -1655,6 +1660,21 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
         bullet_indent=bullet_indent,
         flow=False,
     )
+
+
+def _unsampled(name: str, **body: Any) -> dict[str, Any]:
+    """A rendered test that tells Elementary to keep no sample of its failing rows.
+
+    A failing ``not_null``, ``unique`` or ``relationships`` test returns key
+    values, and Elementary's test materialization copies up to
+    ``test_sample_row_count`` of them into ``test_result_rows``. Its
+    ``disable_test_samples`` meta flag turns that off for this test (from package
+    0.20.0) and does nothing where Elementary is not installed. It sits under
+    ``config``: Elementary reads either spelling, and dbt 1.12 warns on a test's
+    top-level ``meta`` (``PropertyMovedToConfigDeprecation``).
+    """
+
+    return {name: {**body, "config": {"meta": {"disable_test_samples": True}}}}
 
 
 def prevailing_test_key(content: str) -> str:
@@ -1714,10 +1734,12 @@ def column_tests_span(
         return (start, before_trailing_blanks(content, end), "")
 
     name = added[0]
+    # Every test dex adds carries the unsampled flag a declaration renders.
+    flow = yaml.safe_dump(_unsampled(name), default_flow_style=True).strip()
     if current.key is None:
         field_indent = current.bullet_indent + "  "
         at = before_trailing_blanks(content, current.entry_span[1])
-        return (at, at, f"{field_indent}{key}: [{name}]\n")
+        return (at, at, f"{field_indent}{key}: [{flow}]\n")
     if current.value_span is None:
         return None
     if current.flow:
@@ -1727,12 +1749,12 @@ def column_tests_span(
                 f"the test list for a column is not closed at {end}; dex would "
                 "have produced a file it could not predict, so nothing was changed"
             )
-        return (end - 1, end - 1, f", {name}" if current.values else name)
+        return (end - 1, end - 1, f", {flow}" if current.values else flow)
     last = max(current.items, key=lambda span: span[1])
     start = content.rfind("\n", 0, last[0]) + 1
-    item_indent = content[start : start + indent_of(content, start)]
-    at = block_end(content, start, indent_of(content, start))
-    return (at, at, f"{item_indent}- {name}\n")
+    indent = indent_of(content, start)
+    at = block_end(content, start, indent)
+    return (at, at, dump_items([_unsampled(name)], indent))
 
 
 def _column_node(root: Any, model: str, column: str) -> Any:

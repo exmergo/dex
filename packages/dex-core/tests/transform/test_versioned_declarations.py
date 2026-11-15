@@ -232,7 +232,8 @@ def test_a_reference_to_a_version_writes_a_versioned_ref():
     test = (column.get("data_tests") or column["tests"])[0]
     assert test == {
         "relationships": {
-            "arguments": {"to": "ref('dim_teams', v=2)", "field": "team_id"}
+            "arguments": {"to": "ref('dim_teams', v=2)", "field": "team_id"},
+            "config": {"meta": {"disable_test_samples": True}},
         }
     }
 
