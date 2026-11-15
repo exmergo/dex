@@ -685,3 +685,36 @@ def test_wrapper_envelope_matches_engine(wrapper, status):
     actual = json.loads(wrapper._envelope(status, **fields))
     expected = Envelope(status=status, **fields).model_dump(mode="json")
     assert actual == expected
+
+
+def test_the_engine_runs_on_a_supported_python(monkeypatch):
+    """The PEP 723 header picks the interpreter for the wrapper alone; the engine
+    runs in a second uv environment, which picks its own. Without the range there,
+    a machine whose newest Python is 3.15 builds the engine on 3.15 and fails on
+    dependencies that ship no wheels for it (#1134)."""
+
+    module = _wrapper()
+    header = WRAPPERS[0].read_text(encoding="utf-8").splitlines()[1]
+    assert header == f'# requires-python = "{module.SUPPORTED_PYTHON}"'
+
+    monkeypatch.delenv("UV_PYTHON", raising=False)
+    cmd = module._uv_run(["--with", "engine"], ["python", "-V"])
+    assert cmd == [
+        "uv",
+        "run",
+        "--no-project",
+        "--python",
+        module.SUPPORTED_PYTHON,
+        "--with",
+        "engine",
+        "python",
+        "-V",
+    ]
+
+
+def test_an_explicit_uv_python_is_left_to_stand(monkeypatch):
+    module = _wrapper()
+    monkeypatch.setenv("UV_PYTHON", "3.12")
+    cmd = module._uv_run(["--with", "engine"], ["python", "-V"])
+    assert "--python" not in cmd
+    assert module._child_env()["UV_PYTHON"] == "3.12"

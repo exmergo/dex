@@ -36,7 +36,7 @@ The release appends the link to the pull request, so leave it out of the text.
 Preview the release notes from the repository root:
 
 ```
-uvx towncrier@26.9.0 build --draft --version preview
+python3 scripts/uvx_locked.py towncrier build --draft --version preview
 ```
 
 The full instructions, including how to write a useful entry and when a pull

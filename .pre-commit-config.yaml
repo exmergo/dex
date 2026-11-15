@@ -3,13 +3,24 @@
 # repo root, so the same rules apply everywhere.
 #
 # Install once with: pre-commit install
-# When bumping Ruff, keep `rev` here, the workflow versions, the `ruff==` dev pin
-# in packages/dex-core/pyproject.toml, and the lockfile entry in
-# packages/dex-core/uv.lock in lockstep. test_ruff_version_pins.py checks them.
+#
+# Local hooks rather than Ruff's own pre-commit repository, so the version is not
+# restated here: scripts/uvx_locked.py runs the Ruff that packages/dex-core/uv.lock
+# pins, the same one the Lint workflow runs. A Ruff bump is the `ruff==` pin in
+# the [dev] extra plus `uv lock`, which is what Dependabot proposes, and nothing
+# else has to move (#1137). test_tool_version_pins.py holds that true.
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.2
+  - repo: local
     hooks:
       - id: ruff-check
-        args: [--fix]
+        name: ruff check
+        entry: python scripts/uvx_locked.py ruff check --force-exclude --fix
+        language: python
+        types_or: [python, pyi]
+        require_serial: true
       - id: ruff-format
+        name: ruff format
+        entry: python scripts/uvx_locked.py ruff format --force-exclude
+        language: python
+        types_or: [python, pyi]
+        require_serial: true

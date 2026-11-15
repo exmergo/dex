@@ -22,8 +22,10 @@ Python API. The agent skills call this same engine; the rules live in code.
 
 ## Try it in three commands
 
-Requires Python 3.11 or later; Python 3.11–3.14 are supported. Use pip 26.2.2+
-or uv 0.13.4+ to install.
+Supports Python 3.11 to 3.14. Python 3.15 is not supported yet, because several
+compiled dependencies ship no wheels for it; where your newest Python is 3.15,
+install into a 3.14 or older one (for example `uv tool install --python 3.14`).
+Use pip 26.2.2+ or uv 0.13.4+ to install.
 
 ```bash
 pip install "exmergo-dex-core[duckdb]"

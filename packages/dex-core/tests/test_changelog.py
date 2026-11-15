@@ -15,8 +15,8 @@ broke. So it is held here:
   is malformed or the version was already prepared.
 - The fragment check runs against fixture trees, the way CI hands it a pull
   request's changes and labels.
-- Every pinned towncrier version in the repository is the same one, so the
-  version these tests exercise is the version a release runs.
+- towncrier is pinned in one place, the dev extra, so the version these tests
+  exercise is the version a release runs (it reads the lock, which matches).
 """
 
 from __future__ import annotations
@@ -524,10 +524,9 @@ def test_every_towncrier_pin_is_the_same_version():
         if found:
             pins[name] = found
 
-    # The places a release, CI and the tests take the version from.
-    assert {
-        "scripts/prepare_release.sh",
-        ".github/workflows/changelog.yml",
-        "packages/dex-core/pyproject.toml",
-    } <= pins.keys()
+    # The one place the version is written: the release, CI and the guides run
+    # the version the lock pins for it (scripts/uvx_locked.py), and the tests run
+    # the dev extra's install. test_tool_version_pins.py holds the lock to it and
+    # refuses a restated copy, so a second pin found here means one crept back.
+    assert pins.keys() == {"packages/dex-core/pyproject.toml"}, pins
     assert len(set().union(*pins.values())) == 1, pins

@@ -45,5 +45,6 @@ jobs:
         run: python3 scripts/check_changelog_fragments.py
       # towncrier builds strictly (towncrier.toml sets `ignore`), so this also
       # fails on any file it would not collect. The rendered notes are in the log.
+      # At the version packages/dex-core/uv.lock pins, the one the release runs.
       - name: Preview the release notes
-        run: uvx towncrier@26.9.0 build --draft --version preview
+        run: python3 scripts/uvx_locked.py towncrier build --draft --version preview
