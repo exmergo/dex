@@ -298,8 +298,9 @@ def _across_set(
     # its path, so a join to it is reported as unreadable rather than unknown.
     configured = {PurePosixPath(name).stem for name in models}
     result.models = _across_models(parsed, configured, result.diagnostics)
+    models_by_name = {m.model.name: m.model for m in result.models}
     for loaded in result.models:
-        result.diagnostics.extend(_warnings(loaded))
+        result.diagnostics.extend(_warnings(loaded, models_by_name=models_by_name))
     return result
 
 
@@ -737,7 +738,9 @@ def _join_problems(
     return found
 
 
-def _warnings(loaded: LoadedModel) -> list[Diagnostic]:
+def _warnings(
+    loaded: LoadedModel, models_by_name: Mapping[str, SlayerModel] | None = None
+) -> list[Diagnostic]:
     """What dex reads past and says so."""
 
     model = loaded.model
@@ -772,7 +775,8 @@ def _warnings(loaded: LoadedModel) -> list[Diagnostic]:
                 "rewrite the measure"
             ),
         )
-        for problem in unaggregatable_measures(loaded) or []
+        for problem in unaggregatable_measures(loaded, models_by_name=models_by_name)
+        or []
     )
     return found
 
@@ -785,10 +789,15 @@ class UnaggregatableMeasure:
     column: str
     aggregation: str
     reason: str
+    model: str | None = None
 
 
 def unaggregatable_measures(
-    loaded: LoadedModel, retyped: Mapping[str, Any] | None = None
+    loaded: LoadedModel,
+    retyped: Mapping[str, Any] | None = None,
+    *,
+    models_by_name: Mapping[str, SlayerModel] | None = None,
+    retyped_model: str | None = None,
 ) -> list[UnaggregatableMeasure] | None:
     """Every saved measure whose aggregation SLayer refuses on its column.
 
@@ -803,9 +812,9 @@ def unaggregatable_measures(
 
     ``retyped`` overrides a column's declared type (``{column: DataType}``), which
     is how a retype asks what a proposed type would break. ``None`` means the
-    formulas were not read (no ``[sql]`` extra): unchecked, not clean. A
-    reference through a join, ``*``, and a formula SLayer's parser refuses are
-    left to their own checks.
+    formulas were not read (no ``[sql]`` extra): unchecked, not clean. Joined
+    references resolve through declared joins in ``models_by_name``. An unresolvable
+    join, ``*``, and a formula SLayer's parser refuses are left to their own checks.
     """
 
     if find_spec("sqlglot") is None:
@@ -817,12 +826,74 @@ def unaggregatable_measures(
     )
     from slayer.core.formula import parse_formula
     from slayer.core.models import is_identifier
+    from slayer.sql.column_expansion import resolve_ref_target
 
     model = loaded.model
+    models_dict = (
+        dict(models_by_name) if models_by_name is not None else {model.name: model}
+    )
+    if model.name not in models_dict:
+        models_dict[model.name] = model
+
     custom = frozenset(a.name for a in model.aggregations)
     named = {m.name: m.formula for m in model.measures if m.name}
-    columns = {c.name: c for c in model.columns}
     found: list[UnaggregatableMeasure] = []
+
+    def _resolve_leaf(
+        source: SlayerModel,
+        measure_name: str,
+        agg_name: str,
+        expanding: frozenset[tuple[str, str]] = frozenset(),
+    ) -> list[tuple[SlayerModel, Any, str]]:
+        if "." in measure_name:
+            *qualifiers, leaf = measure_name.split(".")
+            target = resolve_ref_target(
+                qualifiers=tuple(qualifiers),
+                source_model=source,
+                models_by_name=models_dict,
+            )
+        else:
+            target = source
+            leaf = measure_name
+        if target is None:
+            return []
+        col = target.get_column(leaf)
+        if col is not None:
+            return [(target, col, agg_name)]
+        meas = next((m for m in target.measures if m.name == leaf), None)
+        if meas is not None:
+            step = (target.name, leaf)
+            if step in expanding:
+                return []
+            target_custom = frozenset(a.name for a in target.aggregations)
+            target_named = {
+                m.name: m.formula
+                for m in target.measures
+                if m.name and m.name != meas.name
+            }
+            try:
+                sub_spec = parse_formula(
+                    meas.formula,
+                    extra_agg_names=target_custom,
+                    named_measures=target_named,
+                )
+            except (ValueError, RecursionError):
+                return []
+            results: list[tuple[SlayerModel, Any, str]] = []
+            for sub_ref in _aggregated_refs(sub_spec) or []:
+                if sub_ref.measure_name == "*":
+                    continue
+                results.extend(
+                    _resolve_leaf(
+                        target,
+                        sub_ref.measure_name,
+                        sub_ref.aggregation_name,
+                        expanding=expanding | {step},
+                    )
+                )
+            return results
+        return []
+
     for measure in model.measures:
         others = {k: v for k, v in named.items() if k != measure.name}
         try:
@@ -832,46 +903,60 @@ def unaggregatable_measures(
         except (ValueError, RecursionError):
             continue
         for ref in _aggregated_refs(spec) or []:
-            col = columns.get(ref.measure_name)
-            if col is None:
+            if ref.measure_name == "*":
                 continue
-            written = ref.aggregation_name
-            agg = written if written in custom else normalize_aggregation_name(written)
-            col_type = (retyped or {}).get(col.name, col.type)
-            if is_identifier(column=col, columns=model.columns):
-                if agg in PRIMARY_KEY_AGGREGATIONS:
-                    continue
-                reason = (
-                    f"'{col.name}' is the model's primary key, which aggregates "
-                    f"only with {', '.join(sorted(PRIMARY_KEY_AGGREGATIONS))}."
+            resolved = _resolve_leaf(model, ref.measure_name, ref.aggregation_name)
+            for owner_model, col, written in resolved:
+                owner_custom = frozenset(a.name for a in owner_model.aggregations)
+                agg = (
+                    written
+                    if written in custom or written in owner_custom
+                    else normalize_aggregation_name(written)
                 )
-            elif col.allowed_aggregations is not None:
-                if agg in col.allowed_aggregations:
-                    continue
-                reason = (
-                    f"'{col.name}' restricts allowed_aggregations to "
-                    f"{', '.join(sorted(col.allowed_aggregations))}."
+                if retyped is not None:
+                    if (owner_model.name, col.name) in retyped:
+                        col_type = retyped[(owner_model.name, col.name)]
+                    elif (
+                        retyped_model is None or retyped_model == owner_model.name
+                    ) and col.name in retyped:
+                        col_type = retyped[col.name]
+                    else:
+                        col_type = col.type
+                else:
+                    col_type = col.type
+
+                if is_identifier(column=col, columns=owner_model.columns):
+                    if agg in PRIMARY_KEY_AGGREGATIONS:
+                        continue
+                    reason = (
+                        f"'{col.name}' is the model's primary key, which aggregates "
+                        f"only with {', '.join(sorted(PRIMARY_KEY_AGGREGATIONS))}."
+                    )
+                elif col.allowed_aggregations is not None:
+                    if agg in col.allowed_aggregations:
+                        continue
+                    reason = (
+                        f"'{col.name}' restricts allowed_aggregations to "
+                        f"{', '.join(sorted(col.allowed_aggregations))}."
+                    )
+                else:
+                    allowed = DEFAULT_AGGREGATIONS_BY_TYPE.get(col_type, frozenset())
+                    if agg in custom or agg in owner_custom or agg in allowed:
+                        continue
+                    spelled = getattr(col_type, "value", col_type)
+                    reason = (
+                        f"'{agg}' is not applicable to a {spelled} column, which "
+                        f"aggregates only with {', '.join(sorted(allowed))}."
+                    )
+                found.append(
+                    UnaggregatableMeasure(
+                        measure=measure.name or "",
+                        column=ref.measure_name,
+                        aggregation=agg,
+                        reason=reason,
+                        model=owner_model.name,
+                    )
                 )
-            else:
-                allowed = DEFAULT_AGGREGATIONS_BY_TYPE.get(col_type, frozenset())
-                # A model's custom aggregation is exempt from the type defaults
-                # only: SLayer still holds it to a primary key's and a column's
-                # `allowed_aggregations` (`binding._column_agg_refusal`).
-                if agg in custom or agg in allowed:
-                    continue
-                spelled = getattr(col_type, "value", col_type)
-                reason = (
-                    f"'{agg}' is not applicable to a {spelled} column, which "
-                    f"aggregates only with {', '.join(sorted(allowed))}."
-                )
-            found.append(
-                UnaggregatableMeasure(
-                    measure=measure.name or "",
-                    column=col.name,
-                    aggregation=agg,
-                    reason=reason,
-                )
-            )
     return found
 
 

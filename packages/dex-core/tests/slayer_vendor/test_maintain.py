@@ -422,6 +422,75 @@ def test_a_column_that_became_a_list_is_a_reingest_conflict(repo: Path, capsys):
     assert (repo / BASE / ORDERS).read_text() == before
 
 
+def test_retyping_joined_column_lists_dependent_measures_in_breaks_measures(
+    repo: Path, capsys
+):
+    """When a joined model column is retyped, dependent measures are listed."""
+
+    _sql(
+        repo,
+        "ALTER TABLE customers ADD COLUMN score DOUBLE",
+        "UPDATE customers SET score = 10.0",
+    )
+    cust = _customers()
+    cust["columns"].append({"name": "score", "type": "DOUBLE"})
+    _write_model(repo, CUSTOMERS, cust)
+
+    ord_entry = _orders()
+    ord_entry["measures"].append(
+        {"name": "customer_score_sum", "formula": "customers.score:sum"}
+    )
+    _write_model(repo, ORDERS, ord_entry)
+
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE customers ALTER score TYPE VARCHAR")
+
+    payload = _cli(repo, capsys, "maintain", "schema")
+
+    assert payload["_exit"] == 0, payload
+    conflict = _finding(payload, "declared_type_conflict", column="score")
+    assert conflict["data"]["semantic_model"] == "customers"
+    assert conflict["data"]["breaks_measures"] == [
+        {"measure": "orders.customer_score_sum", "aggregation": "sum"}
+    ]
+    assert "orders.customer_score_sum (sum)" in conflict["data"]["remedy"]
+
+
+def test_retyping_joined_column_to_list_breaks_dependent_distinct_count(
+    repo: Path, capsys
+):
+    """When a joined column becomes a list, dependent measures are listed."""
+
+    _sql(
+        repo,
+        "ALTER TABLE customers ADD COLUMN tag VARCHAR",
+        "UPDATE customers SET tag = 'vip'",
+    )
+    cust = _customers()
+    cust["columns"].append({"name": "tag", "type": "TEXT"})
+    _write_model(repo, CUSTOMERS, cust)
+
+    ord_entry = _orders()
+    ord_entry["measures"].append(
+        {"name": "customer_tag_count", "formula": "customers.tag:count_distinct"}
+    )
+    _write_model(repo, ORDERS, ord_entry)
+
+    _cli(repo, capsys, "maintain", "snapshot")
+    _sql(repo, "ALTER TABLE customers ALTER tag TYPE VARCHAR[] USING [tag]")
+
+    payload = _cli(repo, capsys, "maintain", "schema")
+
+    assert payload["_exit"] == 0, payload
+    conflict = _finding(payload, "declared_type_conflict", column="tag")
+    assert conflict["data"]["semantic_model"] == "customers"
+    assert conflict["data"]["slayer_type"] == "ARRAY"
+    assert conflict["data"]["breaks_measures"] == [
+        {"measure": "orders.customer_tag_count", "aggregation": "count_distinct"}
+    ]
+    assert "orders.customer_tag_count (count_distinct)" in conflict["data"]["remedy"]
+
+
 def test_a_dropped_source_column_still_declared_is_caught(repo: Path, capsys):
     _cli(repo, capsys, "maintain", "snapshot")
     _sql(repo, "ALTER TABLE orders DROP COLUMN status")

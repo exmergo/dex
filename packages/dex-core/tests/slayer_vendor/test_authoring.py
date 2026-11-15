@@ -872,3 +872,201 @@ def test_formulas_are_skipped_by_name_without_the_sql_extra(
         "formulas were not parsed" in note and "[sql]" in note
         for note in planned["data"]["notes"]
     )
+
+
+def test_authoring_refuses_invalid_aggregation_on_joined_text_column(tmp_path, capsys):
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS],
+        **{ORDERS: dump(orders()), CUSTOMERS: dump(customers())},
+    )
+    authored = orders()
+    authored["measures"].append(
+        {"name": "customer_regions", "formula": "customers.region:sum"}
+    )
+
+    rc, refused = plan(capsys, root, "update", {ORDERS: dump(authored)})
+
+    assert rc != 0
+    message = errors(refused)
+    assert "no plan was stored" in message
+    assert (
+        f"{ORDERS}: measures['customer_regions'].formula: [aggregation_not_applicable]"
+        in message
+    ), message
+    assert "'sum' is not applicable to a TEXT column" in message
+
+
+def test_authoring_refuses_invalid_aggregation_on_joined_array_column(tmp_path, capsys):
+    cust = customers(
+        columns=[
+            {"name": "id", "type": "INT", "primary_key": True},
+            {"name": "tags", "type": "ARRAY", "element_type": "TEXT"},
+        ]
+    )
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS],
+        **{ORDERS: dump(orders()), CUSTOMERS: dump(cust)},
+    )
+    authored = orders()
+    authored["measures"].append(
+        {"name": "tag_dist", "formula": "customers.tags:count_distinct"}
+    )
+
+    rc, refused = plan(capsys, root, "update", {ORDERS: dump(authored)})
+
+    assert rc != 0
+    message = errors(refused)
+    assert "no plan was stored" in message
+    assert (
+        f"{ORDERS}: measures['tag_dist'].formula: [aggregation_not_applicable]"
+        in message
+    ), message
+    assert "'count_distinct' is not applicable to a ARRAY column" in message
+
+
+def test_authoring_refuses_invalid_aggregation_on_joined_primary_key(tmp_path, capsys):
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS],
+        **{ORDERS: dump(orders()), CUSTOMERS: dump(customers())},
+    )
+    authored = orders()
+    authored["measures"].append(
+        {"name": "customer_id_sum", "formula": "customers.id:sum"}
+    )
+
+    rc, refused = plan(capsys, root, "update", {ORDERS: dump(authored)})
+
+    assert rc != 0
+    message = errors(refused)
+    assert "no plan was stored" in message
+    assert (
+        f"{ORDERS}: measures['customer_id_sum'].formula: [aggregation_not_applicable]"
+        in message
+    ), message
+    assert "'id' is the model's primary key" in message
+
+
+def test_authoring_accepts_valid_aggregation_on_joined_column(tmp_path, capsys):
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS],
+        **{ORDERS: dump(orders()), CUSTOMERS: dump(customers())},
+    )
+    authored = orders()
+    authored["measures"].append(
+        {"name": "customer_count", "formula": "customers.region:count"}
+    )
+
+    rc, planned = plan(capsys, root, "update", {ORDERS: dump(authored)})
+
+    assert rc == 0, planned["errors"]
+    assert "plan_id" in planned["data"]
+
+
+def test_authoring_resolves_multi_hop_joined_columns(tmp_path, capsys):
+    regions_file = "models/wh/regions.yaml"
+    reg = model(
+        "regions",
+        columns=[
+            {"name": "id", "type": "INT", "primary_key": True},
+            {"name": "name", "type": "TEXT"},
+        ],
+    )
+    cust = customers(
+        columns=[
+            {"name": "id", "type": "INT", "primary_key": True},
+            {"name": "region_id", "type": "INT"},
+        ],
+        joins=[
+            {
+                "target_model": "regions",
+                "join_pairs": [["region_id", "id"]],
+                "cardinality": "many_to_one",
+            }
+        ],
+    )
+    root = repo(
+        tmp_path,
+        [ORDERS, CUSTOMERS, regions_file],
+        **{
+            ORDERS: dump(orders()),
+            CUSTOMERS: dump(cust),
+            regions_file: dump(reg),
+        },
+    )
+    authored = orders()
+    authored["measures"].append(
+        {"name": "region_sum", "formula": "customers.regions.name:sum"}
+    )
+
+    rc, refused = plan(capsys, root, "update", {ORDERS: dump(authored)})
+
+    assert rc != 0
+    message = errors(refused)
+    assert "no plan was stored" in message
+    assert (
+        f"{ORDERS}: measures['region_sum'].formula: [aggregation_not_applicable]"
+        in message
+    ), message
+    assert "'sum' is not applicable to a TEXT column" in message
+
+
+def test_authoring_leaves_unresolvable_joins_unchecked_by_aggregation_gate(
+    tmp_path, capsys
+):
+    authored = orders()
+    authored["measures"].append(
+        {"name": "unknown_meas", "formula": "unresolvable_model.col:sum"}
+    )
+    from exmergo_dex_core.slayer.loader import validate_model_contents
+
+    contents = {
+        ORDERS: dump(authored),
+        CUSTOMERS: dump(customers()),
+    }
+    result = validate_model_contents(contents)
+    rules = [d.rule for d in result.diagnostics]
+    assert "aggregation_not_applicable" not in rules
+
+
+def test_unaggregatable_measures_expands_joined_named_measures():
+    from slayer.core.models import SlayerModel
+
+    from exmergo_dex_core.slayer.loader import (
+        LoadedModel,
+        unaggregatable_measures,
+    )
+
+    cust_model = SlayerModel(
+        **customers(
+            columns=[
+                {"name": "id", "type": "INT", "primary_key": True},
+                {"name": "score", "type": "TEXT"},
+            ],
+            measures=[{"name": "cust_score", "formula": "score:sum"}],
+        )
+    )
+    orders_model = SlayerModel(
+        **orders(
+            measures=[
+                {
+                    "name": "expanded_score",
+                    "formula": "sum(customers.cust_score)",
+                }
+            ]
+        )
+    )
+    models_by_name = {"customers": cust_model, "orders": orders_model}
+    problems = unaggregatable_measures(
+        LoadedModel(file=ORDERS, model=orders_model),
+        models_by_name=models_by_name,
+    )
+    assert problems is not None
+    assert len(problems) == 1
+    assert problems[0].measure == "expanded_score"
+    assert problems[0].column == "customers.cust_score"
+    assert problems[0].aggregation == "sum"
+    assert "not applicable to a TEXT column" in problems[0].reason
