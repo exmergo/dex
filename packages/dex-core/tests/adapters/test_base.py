@@ -179,6 +179,30 @@ def test_json_safe_coerces_scalars_and_collections():
     assert json_safe([date(2026, 1, 1), [Decimal("3.0")]]) == ["2026-01-01", [3.0]]
     assert json_safe({"k": Decimal("1.5")}) == {"k": 1.5}
 
+    # Objects providing .tolist() returning collections or 0-D scalars
+    class MockArray:
+        def __init__(self, val):
+            self._val = val
+
+        def tolist(self):
+            return self._val
+
+    assert json_safe(MockArray([1, 2, "a"])) == [1, 2, "a"]
+    assert json_safe(MockArray(7)) == 7
+    assert json_safe(MockArray("abc")) == "abc"
+    assert json_safe(MockArray(Decimal("3.5"))) == 3.5
+    assert json_safe(MockArray([MockArray(1), MockArray("b")])) == [1, "b"]
+
+    try:
+        import numpy as np
+
+        assert json_safe(np.array(7)) == 7
+        assert json_safe(np.array("abc")) == "abc"
+        assert json_safe(np.array([1, 2, 3])) == [1, 2, 3]
+        assert json_safe(np.int64(42)) == 42
+    except ImportError:
+        pass
+
 
 def test_clip_cell_value_bounds_scalar_and_nested_strings():
     from exmergo_dex_core.adapters.base import clip_cell_value

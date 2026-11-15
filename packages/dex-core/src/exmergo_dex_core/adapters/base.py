@@ -387,7 +387,7 @@ def json_safe(value: object | None) -> object | None:
     if isinstance(value, (list, tuple)):
         return [json_safe(v) for v in value]
     if hasattr(value, "tolist") and callable(value.tolist):
-        return [json_safe(v) for v in value.tolist()]
+        return json_safe(value.tolist())
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
     return str(value)
