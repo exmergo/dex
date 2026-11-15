@@ -2117,7 +2117,7 @@ declaration channel at confidence 1.0. `sample_values` are counted and never
 surfaced. `query` and `values` are governed (#1290): Dex renders `SELECT * FROM
 SEMANTIC_VIEW(<deployed view> DIMENSIONS ... METRICS ... [WHERE ...])` from the
 catalog and runs it through the Snowflake connector under the cost guard, after
-translation refusals, the PII gate, and a free deployed-definition check that
+translation refusals, the PII gate, and a warehouse-free deployed-definition check that
 locates the view with `SHOW SEMANTIC VIEWS` and refuses one whose read-back
 (`SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW`) differs from the repository on what the
 query relies on; `list --deployed` reads the deployed views instead, with

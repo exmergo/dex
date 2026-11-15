@@ -237,10 +237,12 @@ Refused before anything is sent, each by name:
 
 **The deployed view must match the repository.** Before the cost handshake:
 1. `SHOW SEMANTIC VIEWS` over the source allowlist finds the view by name
-   (free). None found is refused as defined only in the repository, since Dex
+   (no warehouse). None found is refused as defined only in the repository, since Dex
    never deploys; two found are refused as ambiguous, and `--scope` narrows.
 2. `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` reads it back. Checked on a suspended
-   warehouse: it stayed suspended, so the read is free.
+   warehouse: it stayed suspended, so the read bills no warehouse time
+   (it uses cloud services, which Snowflake bills only past the daily
+   allowance).
 3. Each member the query names, every metric those read, and the base table,
    keys and relationships of each table reached, are compared: kind,
    expression (parsed, identifiers folded), access modifier,
