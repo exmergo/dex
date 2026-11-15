@@ -3072,7 +3072,15 @@ def _record_mutation_refusal(
             # The score stays, marked, so a refresh that finds it stale (a
             # downstream test changed) retries it after the untried models.
             with contextlib.suppress(Exception):
-                saver({**prior, "last_refusal": reason_code})
+                saver(
+                    {
+                        **prior,
+                        "last_refusal": reason_code,
+                        "last_refusal_at": datetime.now(UTC).isoformat(
+                            timespec="seconds"
+                        ),
+                    }
+                )
             return
     record = {
         "model_id": node.get("unique_id"),

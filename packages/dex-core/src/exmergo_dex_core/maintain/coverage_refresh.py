@@ -51,6 +51,9 @@ class Candidate:
     #: Whether its last run was refused for a reason the data decided, so it
     #: is retried after the models a refresh has not tried yet.
     retry: bool = False
+    #: When it was last refused, so retries rotate: the one refused longest
+    #: ago goes first, and one that fails again moves to the back.
+    retried_at: str = ""
 
 
 @dataclass
@@ -133,7 +136,9 @@ def order(
 
         # The selector's order, with a model a run already refused after the
         # rest, so it never holds the first slots run after run.
-        return sorted(candidates, key=lambda c: (c.retry, rank(c), c.label))
+        return sorted(
+            candidates, key=lambda c: (c.retry, c.retried_at, rank(c), c.label)
+        )
 
     nodes = manifest.get("nodes") or {}
     depth: dict[str, int] = {}
@@ -159,6 +164,7 @@ def order(
         candidates,
         key=lambda c: (
             c.retry,
+            c.retried_at,
             c.status != "missing",
             level(c.unique_id),
             c.label,

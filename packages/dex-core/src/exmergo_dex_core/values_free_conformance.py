@@ -431,6 +431,7 @@ _COVERAGE_RESOURCE = (
             # A refusal's reason code (#1284).
             "reason",
             "last_refusal",
+            "last_refusal_at",
         )
     ),
     # Columns singular tests read (#1282): names, roles and test names only.

@@ -568,3 +568,44 @@ def test_a_kept_score_is_marked_so_a_stale_one_is_retried_last():
     assert _strength(manifest, {FCT: kept})["fct"]["last_refusal"] == (
         "baseline_not_passing"
     )
+
+
+def test_retries_rotate_so_one_failing_model_cannot_starve_the_others():
+    manifest = _chain_manifest("a", "b")
+    first = refresh_mod.order(
+        _candidates(
+            ("a", "missing"),
+            ("b", "missing"),
+            a={"retry": True, "retried_at": "2026-11-15T10:00:00+00:00"},
+            b={"retry": True, "retried_at": "2026-11-15T11:00:00+00:00"},
+        ),
+        manifest,
+        ["a", "b"],
+    )
+    assert [c.label for c in first] == ["a", "b"]
+    # a was retried and refused again, so its marker is now the newest.
+    second = refresh_mod.order(
+        _candidates(
+            ("a", "missing"),
+            ("b", "missing"),
+            a={"retry": True, "retried_at": "2026-11-15T12:00:00+00:00"},
+            b={"retry": True, "retried_at": "2026-11-15T11:00:00+00:00"},
+        ),
+        manifest,
+        ["a", "b"],
+    )
+    assert [c.label for c in second] == ["b", "a"]
+
+
+def test_a_kept_score_gone_stale_downstream_is_a_retry_candidate():
+    manifest = _manifest()
+    record = _record(
+        manifest,
+        downstream_tests={"test.shop.unique_mart_id": "old-digest"},
+        last_refusal="baseline_not_passing",
+        last_refusal_at="2026-11-15T11:30:00+00:00",
+    )
+    strength = _strength(manifest, {FCT: record})["fct"]
+    assert strength["status"] == "stale"
+    assert strength["changed"] == ["downstream_tests"]
+    assert strength["last_refusal_at"] == "2026-11-15T11:30:00+00:00"
