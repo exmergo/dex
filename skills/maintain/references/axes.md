@@ -467,8 +467,8 @@ one coverage number.
   so; results from an invocation no dbt log names are not attributed. A source's
   freshness check reports no `last_run`: `dbt source freshness` writes its own
   artifact.
-- **Strength.** A model carries `strength`, the score its last `transform test
-  --mutate` recorded. `fresh` means the model's SQL as written and its own tests
+- **Strength.** A model carries `strength`, the score its last
+  `transform test --mutate` recorded. `fresh` means the model's SQL as written and its own tests
   are what the run measured, and every downstream test it ran still reads the
   same. `stale` lists what `changed` (`model_sql`, `own_tests`,
   `downstream_tests`); its score is shown with its age and is not current.
@@ -479,15 +479,15 @@ one coverage number.
   fresh scores; there is no project mutation score. A score counts only the
   defects Dex plants. The digest reads the SQL as written: a change in a macro
   the model calls, a parent's SQL, or a materialization set in
-  `dbt_project.yml` does not stale it. Refresh one with `dex transform test
-  --mutate <model>`.
+  `dbt_project.yml` does not stale it. Refresh one with
+  `dex transform test --mutate <model>`.
 - **Declarations.** `data.declarations.facts` holds one record per declared fact
   on the selected models: `fact` (`grain`, `key`, `foreign_key`, `references`,
   `null_rule`, `population_filter`, `population_parent`, `population_rule`,
   `unit`, `additivity`, `history`), `column`, and `checked_by`: `dbt_test` (the
   generic `tests` that assert it run on every `dbt build`), `dex_verify` (the
-  `verify` finding codes that can judge it on `maintain verify` or `transform
-  build --verify`; that verify *can* judge it, not that it ran), `both`, `none`,
+  `verify` finding codes that can judge it on `maintain verify` or
+  `transform build --verify`; that verify *can* judge it, not that it ran), `both`, `none`,
   or `prose` for a population stated only as a rule, which nothing can run.
   Unchecked facts come first. `summary.facts.checked` leaves prose out of its
   denominator, and `models_undeclared` counts models with no declaration apart
