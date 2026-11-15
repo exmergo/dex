@@ -48,7 +48,6 @@ How each fact kind is judged (dbt test; maintain verify codes):
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from typing import Any
 
@@ -131,10 +130,14 @@ class _Tests:
                 self.by_model[owner].append((name, column_key, kwargs, reads))
         self.labels = labels
         #: Each model's package, so a package-qualified `ref` resolves.
-        self.packages: dict[str, str | None] = {
-            uid: node.get("package_name")
+        self.parents: dict[str, dict] = {
+            uid: node
             for uid, node in (manifest.get("nodes") or {}).items()
-            if isinstance(node, dict) and node.get("resource_type") == "model"
+            if isinstance(node, dict)
+            and node.get("resource_type") in {"model", "seed", "snapshot"}
+        }
+        self.packages: dict[str, str | None] = {
+            uid: node.get("package_name") for uid, node in self.parents.items()
         }
 
     def on_column(self, model: str, column: str, test: str) -> bool:
@@ -154,20 +157,22 @@ class _Tests:
                 return name
         return None
 
-    def _resolve(self, package: str | None, name: str, *, near: str) -> str | None:
-        """The model unique id ``ref(package, name)`` resolves to, read from
-        ``near``'s side: an unqualified name is the model's own package first,
-        then the only model of that name anywhere."""
+    def _resolve(self, name: str, *, near: str) -> str | None:
+        """The manifest unique id a declared ``references`` parent names: a
+        model, seed or snapshot, of ``near``'s own package first, then the only
+        one of that name anywhere; an unversioned name of a versioned model is
+        its latest version, as dbt resolves an unversioned ``ref``."""
 
         key = name.lower()
-        found = [
-            uid
-            for uid, label in self.labels.items()
-            if label.lower() == key or label.split(".", 1)[0].lower() == key
-        ]
-        if package is not None:
-            found = [uid for uid in found if self.packages.get(uid) == package]
-            return found[0] if len(found) == 1 else None
+        found = []
+        for uid, node in self.parents.items():
+            label = (self.labels.get(uid) or str(node.get("name") or "")).lower()
+            if label == key:
+                found.append(uid)
+            elif str(node.get("name") or "").lower() == key:
+                version, latest = node.get("version"), node.get("latest_version")
+                if version is None or latest is None or str(version) == str(latest):
+                    found.append(uid)
         own = [
             uid for uid in found if self.packages.get(uid) == self.packages.get(near)
         ]
@@ -200,52 +205,16 @@ class _Tests:
                 continue
             if parent is None:
                 return True
-            wanted = self._resolve(None, parent, near=model)
-            target = _ref_target(kwargs.get("to"))
-            if target is not None:
-                # Compared as manifest identities: a package-qualified ref
-                # matches a package-only parent and never a same-named model
-                # of another package.
-                if wanted is not None and self._resolve(*target, near=model) == wanted:
-                    return True
-                if wanted is None and target[1].lower() == parent.lower():
-                    return True
-                continue
-            # No readable `to`: the target is what the test reads besides the
-            # child, and the child itself only when it reads nothing else.
+            # dbt resolved the test's `to` into its dependencies: the target is
+            # what the test reads besides the child, and the child itself only
+            # when it reads nothing else (a self-reference).
             targets = [uid for uid in reads if uid != model] or [model]
+            wanted = self._resolve(parent, near=model)
             if wanted is not None:
                 if wanted in targets:
                     return True
                 continue
-            if any(
-                self.labels.get(uid, "").lower() == parent.lower()
-                or self.labels.get(uid, "").split(".", 1)[0].lower() == parent.lower()
-                for uid in targets
-            ):
-                return True
         return False
-
-
-#: The whole ``to`` is one ``ref()``, optionally inside ``{{ }}``: anything
-#: else (a conditional, a filter, a concatenation) is not read as a target.
-_REF = re.compile(
-    r"""^\s*(?:\{\{\s*)?ref\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]+)['"]\s*)?\)"""
-    r"""\s*(?:\}\}\s*)?$"""
-)
-
-
-def _ref_target(to: Any) -> tuple[str | None, str] | None:
-    """``(package, model)`` a ``relationships`` test's ``to`` names, from
-    ``ref('x')`` (no package) or ``ref('package', 'x')``; ``None`` for a source
-    or anything else."""
-
-    match = _REF.match(str(to)) if isinstance(to, str) else None
-    if match is None:
-        return None
-    if match.group(2):
-        return match.group(1), match.group(2)
-    return None, match.group(1)
 
 
 def _bare(name: str) -> str:

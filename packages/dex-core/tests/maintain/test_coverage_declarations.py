@@ -57,7 +57,11 @@ def _test(
             "kwargs": kwargs or {},
         },
         "config": {"severity": "ERROR", "enabled": enabled},
-        "depends_on": {"nodes": [_uid(r) for r in (reads or [on])]},
+        # A name, or a full unique id (a package's or a seed's), as dbt
+        # resolves the test's `to` into its dependencies.
+        "depends_on": {
+            "nodes": [r if r.count(".") >= 2 else _uid(r) for r in (reads or [on])]
+        },
     }
 
 
@@ -391,21 +395,21 @@ def test_a_package_qualified_ref_to_a_same_named_model_does_not_check() -> None:
                 "relationships",
                 "nodes",
                 "parent_id",
-                reads=["nodes"],
+                reads=["nodes", "model.other_pkg.nodes"],
                 kwargs={"to": "ref('other_pkg', 'nodes')", "field": "id"},
             )
         ],
     )
+    other = _model("nodes")
+    other["package_name"] = "other_pkg"
+    manifest["nodes"]["model.other_pkg.nodes"] = other
     assert _fact(_run(manifest), "references", "parent_id")["checked_by"] == "none"
+    # The same test pointed at the model itself reads only the model.
     test_id = next(k for k in manifest["nodes"] if k.startswith("test."))
-    project = manifest["nodes"][_uid("nodes")]["package_name"]
-    manifest["nodes"][test_id]["test_metadata"]["kwargs"]["to"] = (
-        f"ref('{project}', 'nodes')"
-    )
-    assert _fact(_run(manifest), "references", "parent_id")["checked_by"] in {
-        "dbt_test",
-        "both",
-    }
+    manifest["nodes"][test_id]["depends_on"]["nodes"] = [_uid("nodes")]
+    assert _fact(_run(manifest), "references", "parent_id")["tests"] == [
+        "relationships"
+    ]
 
 
 def test_a_package_only_parent_matches_its_package_qualified_ref() -> None:
@@ -416,7 +420,7 @@ def test_a_package_only_parent_matches_its_package_qualified_ref() -> None:
                 "relationships",
                 "orders",
                 "customer_id",
-                reads=["orders"],
+                reads=["orders", "model.crm.customers"],
                 kwargs={"to": "ref('crm', 'customers')", "field": "id"},
             )
         ],
@@ -427,6 +431,66 @@ def test_a_package_only_parent_matches_its_package_qualified_ref() -> None:
     manifest["nodes"]["model.crm.customers"] = package_model
     fact = _fact(_run(manifest), "references", "customer_id")
     assert fact["tests"] == ["relationships"]
+
+
+def test_a_same_named_package_seed_is_not_the_project_seed() -> None:
+    manifest = _manifest(
+        [_model("orders", columns={"country": {"references": "countries.code"}})],
+        [
+            _test(
+                "relationships",
+                "orders",
+                "country",
+                reads=["orders", "seed.crm.countries"],
+                kwargs={"to": "ref('crm', 'countries')", "field": "code"},
+            )
+        ],
+    )
+    for uid, package in (
+        ("seed.shop.countries", PROJECT),
+        ("seed.crm.countries", "crm"),
+    ):
+        manifest["nodes"][uid] = {
+            "resource_type": "seed",
+            "name": "countries",
+            "package_name": package,
+        }
+    assert _fact(_run(manifest), "references", "country")["checked_by"] == "none"
+    test_id = next(k for k in manifest["nodes"] if k.startswith("test."))
+    manifest["nodes"][test_id]["depends_on"]["nodes"] = [
+        _uid("orders"),
+        "seed.shop.countries",
+    ]
+    assert _fact(_run(manifest), "references", "country")["tests"] == ["relationships"]
+
+
+def test_an_unversioned_reference_is_the_latest_version() -> None:
+    manifest = _manifest(
+        [_model("orders", columns={"customer_id": {"references": "customers.id"}})],
+        [
+            _test(
+                "relationships",
+                "orders",
+                "customer_id",
+                reads=["orders", "model.shop.customers.v2"],
+                kwargs={"to": "ref('customers')", "field": "id"},
+            )
+        ],
+    )
+    for version in (1, 2):
+        node = _model("customers")
+        node.update({"version": version, "latest_version": 2})
+        manifest["nodes"][f"model.shop.customers.v{version}"] = node
+    assert _fact(_run(manifest), "references", "customer_id")["tests"] == [
+        "relationships"
+    ]
+    # A test on the older version does not check a reference to the latest.
+    test_id = next(k for k in manifest["nodes"] if k.startswith("test."))
+    manifest["nodes"][test_id]["depends_on"]["nodes"] = [
+        _uid("orders"),
+        "model.shop.customers.v1",
+    ]
+    assert _fact(_run(manifest), "references", "customer_id")["checked_by"] == "none"
 
 
 def test_a_conditional_to_expression_is_not_read_as_its_first_ref() -> None:
