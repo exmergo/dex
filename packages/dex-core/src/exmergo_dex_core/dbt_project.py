@@ -922,6 +922,7 @@ _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _JINJA_REGION = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
 _CALL_START = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
 _QUOTED_ARG = re.compile(r"^(['\"])([^'\"]*)\1$")
+_QUOTED_DOUBLED_ARG = re.compile(r"^''([^']*)''$")
 # `==` is a comparison, not a keyword argument.
 _KEYWORD_ARG = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)")
 
@@ -1164,9 +1165,9 @@ def _literal(text: str, base: int) -> _Argument | None:
     if _KEYWORD_ARG.match(stripped):
         return None
     offset = base + len(text) - len(text.lstrip())
-    if stripped.startswith("''") and stripped.endswith("''") and len(stripped) >= 4:
-        content = stripped[2:-2]
-        return content.replace("''", "'"), (offset + 2, offset + len(stripped) - 2)
+    doubled = _QUOTED_DOUBLED_ARG.match(stripped)
+    if doubled is not None:
+        return doubled.group(1), (offset + doubled.start(1), offset + doubled.end(1))
     quoted = _QUOTED_ARG.match(stripped)
     if quoted is None:
         return None, None

@@ -960,6 +960,11 @@ def test_jinja_calls_resolves_doubled_single_quoted_literals():
     assert call.args == ("feature_fee",)
     assert call.arg_spans == (((9, 20)),)
 
+    (dyn_call,) = jinja_calls("{{ var(''pre_'' ~ suffix ~ ''_post'') }}")
+    assert dyn_call.callee == "var"
+    assert dyn_call.args == (None,)
+    assert dyn_call.arg_spans == (None,)
+
 
 def test_mask_yaml_comments_preserves_hashes_in_scalars():
     source = (

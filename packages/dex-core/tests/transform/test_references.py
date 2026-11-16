@@ -1197,6 +1197,7 @@ def test_single_quoted_yaml_scalar_with_doubled_quotes_resolves_var(tmp_path):
         "models:\n"
         "  demo:\n"
         "    +schema: '{{ var(''schema_suffix'') }}'\n"
+        "    +alias: '{{ var(''pre_'' ~ suffix ~ ''_post'') }}'\n"
         "vars:\n"
         "  schema_suffix: test\n",
         encoding="utf-8",
@@ -1225,4 +1226,11 @@ def test_single_quoted_yaml_scalar_with_doubled_quotes_resolves_var(tmp_path):
     assert calls_fee[0].path == "models/schema.yml"
     assert calls_fee[0].line == 4
 
-    assert index.indeterminate_for("var") == []
+    unresolved = index.indeterminate_for("var")
+    assert len(unresolved) == 1
+    assert unresolved[0].path == "dbt_project.yml"
+    assert unresolved[0].line == 7
+    assert unresolved[0].name is None
+
+    report = find_references(view, ["schema_suffix"], kind="var", index=index)
+    assert report.completeness == "incomplete"
