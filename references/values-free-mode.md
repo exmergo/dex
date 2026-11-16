@@ -46,7 +46,7 @@ reviewed what it returns:
   `explore diagram`
 - `explore query`, including several statements, `--sql-file` and `--across`
 - `explore semantic list` (it reads repository metadata, not the warehouse)
-- `maintain coverage` (it reads a parsed dbt manifest: names and counts, a
+- `maintain coverage` (it reads a parsed dbt manifest and the configured native semantic layer's files: names and counts, a
   generic test named by the test it applies rather than by its node name, which
   can carry its arguments, and a parse error's message withheld; its last-run,
   strength and declarations sections carry statuses, scores, digests' verdicts,

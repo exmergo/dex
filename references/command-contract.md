@@ -788,7 +788,11 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      called fresh, stale (with what changed), missing or untestable,
                                      summarized as counts and score bands (#1284); and declarations,
                                      one record per declared fact with checked_by dbt_test,
-                                     dex_verify, both, none or prose (#1283). Columns a singular test
+                                     dex_verify, both, none or prose (#1283), each naming its
+                                     source: dbt, or a native semantic layer's vendor, whose keys
+                                     and joins maintain grain judges and whose dex metadata nothing
+                                     checks; a fact both declare on one relation is counted once
+                                     (#1346). Columns a singular test
                                      reads are columns.referenced_columns (roles: predicate, join,
                                      aggregation, grouping, projection; the tests that read them),
                                      counted as referenced and referenced_only and summarized as
