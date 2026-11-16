@@ -62,7 +62,8 @@ VERSIONS = (CURRENT_VERSION, OLDEST_DUCKDB_VERSION)
 
 #: The last release of each series most public installs pin (the count on
 #: #1312). Neither carries DuckDB macros and both carry Postgres ones, so these
-#: run on Postgres only.
+#: build on Postgres only. DuckDB still parses 0.16.4, which the resolver's
+#: cases use.
 LEGACY_VERSIONS = ("0.16.4", "0.15.2")
 
 #: What Elementary's own models build into: dbt's default schema naming joins the

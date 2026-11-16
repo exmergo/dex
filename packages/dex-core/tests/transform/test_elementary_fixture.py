@@ -17,7 +17,9 @@ import yaml
 from .elementary_fixture import (
     ABSENT,
     BEHAVIOUR,
+    CURRENT_VERSION,
     ELEMENTARY_SCHEMA,
+    LEGACY_VERSIONS,
     MATERIALIZATION_LINE,
     TEMP_TABLE_LINE,
     VARIANTS,
@@ -302,3 +304,84 @@ def test_a_failing_rendered_test_leaves_no_sample_of_its_rows(
     assert sampled() == 0
     _strip_sampling_switch(project)
     assert sampled() == 1
+
+
+# --- the resolver (#1305) ---------------------------------------------------------
+
+#: What the resolver reads for each variant on ``dev``: whether the package is
+#: enabled, what its run hooks do, and whose ``test`` materialization dbt picks.
+RESOLVED = {
+    "a": (True, "run", "elementary"),
+    "b": (True, "run", "dbt"),
+    "c": (True, "run", "elementary"),
+    # dbt picks the package's materialization, which hands every test to dbt's
+    # because the package is disabled, so the tests get dbt's behaviour.
+    "d": (False, "disabled", "dbt"),
+    "e": (True, "run", "elementary"),
+    "f": (True, "run", "elementary"),
+}
+
+#: Each variant at the current release, and three at the oldest release most
+#: installs pin. DuckDB parses 0.16.4, though it cannot build it.
+RESOLVER_CASES = [(CURRENT_VERSION, v) for v in VARIANTS] + [
+    (LEGACY_VERSIONS[0], v) for v in ("a", "b", "d")
+]
+
+
+def _parsed(project: Path, target: str) -> dict:
+    dbt(
+        "parse",
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(project),
+        "--target",
+        target,
+        cwd=project,
+    )
+    return json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+
+
+@requires_elementary
+@pytest.mark.parametrize(("version", "variant"), RESOLVER_CASES)
+def test_the_resolver_reads_what_each_variant_does_on_dev(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    version: str,
+    variant: str,
+):
+    """The record for ``dev`` matches the variant's row, and agrees with what
+    the run itself shows: Elementary's materialization announces itself in the
+    debug log exactly where the record says the tests get its behaviour (the
+    first column of ``BEHAVIOUR``, read from a run in
+    ``test_each_variant_changes_what_elementary_does_in_a_run``)."""
+
+    from exmergo_dex_core.transform.elementary import read
+
+    project = elementary_project(tmp_path, variant, elementary_installs(version))
+    record = read(project, _parsed(project, "dev"))
+
+    assert record.installed
+    assert record.release == version
+    assert (record.enabled, record.hooks, record.materialization) == RESOLVED[variant]
+    assert (record.materialization == "elementary") is BEHAVIOUR[variant][0]
+    assert not (tmp_path / "prod.duckdb").exists()
+
+
+@requires_elementary
+@pytest.mark.parametrize("version", [CURRENT_VERSION, LEGACY_VERSIONS[0]])
+def test_the_resolver_reads_variant_d_as_enabled_where_the_project_enables_it(
+    tmp_path: Path, elementary_installs: Callable[[str], Path], version: str
+):
+    """Variant d disables the package for ``dev`` only, with a Jinja expression on
+    the target name that only a parse can settle. Parsed for ``prod``, which is
+    never built, the package and its hooks are back."""
+
+    from exmergo_dex_core.transform.elementary import read
+
+    project = elementary_project(tmp_path, "d", elementary_installs(version))
+    record = read(project, _parsed(project, "prod"))
+
+    assert (record.enabled, record.hooks) == (True, "run")
+    assert all(record.uploads.values())
+    assert not (tmp_path / "prod.duckdb").exists()

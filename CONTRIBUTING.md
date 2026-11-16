@@ -457,7 +457,8 @@ Without the variable they collect as skipped with it named in the skip reason.
 They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
 the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
 run and fails `dbt build` on DuckDB), and most installs pin 0.15 or 0.16, so
-those run on Postgres instead. `tests/integration/test_postgres_elementary.py`
+those build on Postgres instead. DuckDB still parses 0.16.4, so the resolver's
+cases install it there for `dbt parse` alone. `tests/integration/test_postgres_elementary.py`
 builds the same variants at 0.16.4 and 0.15.2 against the seeded container
 `scripts/setup_postgres_dev.sh` starts, and needs both opt-ins:
 
