@@ -937,7 +937,7 @@ fragment's name the way CI does:
 
 ```
 python3 scripts/uvx_locked.py towncrier build --draft --version preview
-python3 scripts/check_changelog_fragments.py
+uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py
 ```
 
 ### Writing the entry
@@ -1051,7 +1051,7 @@ scripts/prepare_release.sh <engine-version> <plugin-version>
 Running the script again for a version whose section already exists leaves
 `CHANGELOG.md` and any newer fragments alone. A fragment towncrier cannot parse
 stops the script before it changes anything, and
-`python3 scripts/check_changelog_fragments.py` names the file at fault.
+`uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py` names the file at fault.
 
 ## Maintainers
 
