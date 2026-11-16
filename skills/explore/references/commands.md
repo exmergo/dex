@@ -597,8 +597,8 @@ it as `execution` (`dex` or `vendor`).
   nothing held to a file; every result carries `definition_source: account`
   (on a query or values result) and a warning saying so. A configured file
   describing a view is named in its `coverage` as `repository_file`, and
-  `--local` holds the view to it. `relationships|map
-  --use-hosted-semantic-layer` folds the account's keys and joins in.
+  `--local` holds the view to it. `explore relationships` and `explore map`
+  with `--use-hosted-semantic-layer` fold the account's keys and joins in.
 - `semantic.vendor: slayer` reads the SLayer model files named in
   `semantic.slayer.models` (needs the `[slayer]` extra). `list` and
   `--for-dimension` answer: a metric is a saved measure named `model.measure`,
