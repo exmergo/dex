@@ -7,6 +7,7 @@ Elementary package from the dbt hub, so they run only with
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -274,13 +275,27 @@ def test_a_failing_rendered_test_leaves_no_sample_of_its_rows(
     project_args = ("--project-dir", str(project), "--profiles-dir", str(project))
     dbt("run", *project_args, cwd=project)
     rows = (ELEMENTARY_SCHEMA, "test_result_rows", "BASE TABLE")
+    run_results = project / "target" / "run_results.json"
 
     def sampled() -> int:
         before = duckdb_census(warehouse)
+        # Removed first, so a run that wrote no results cannot be read as the
+        # previous arm's.
+        run_results.unlink(missing_ok=True)
         log = dbt(
             "test", *project_args, "--select", "unique_fct_id", cwd=project, check=False
         )
-        assert "ERROR=1" in log, f"the rendered unique test is meant to fail:\n{log}"
+        # dbt prints ERROR=1 for a test that errored as well as for one that
+        # failed, and an errored test also leaves no sample. Only a completed
+        # failure on the one duplicated key measures the switch.
+        [result] = [
+            r
+            for r in json.loads(run_results.read_text(encoding="utf-8"))["results"]
+            if r["unique_id"].startswith("test.")
+        ]
+        assert (result["status"], result["failures"]) == ("fail", 1), (
+            f"the rendered unique test is meant to fail on one key:\n{log}"
+        )
         was, now = footprint(before, duckdb_census(warehouse)).get(rows, (0, 0))
         return now - was
 
