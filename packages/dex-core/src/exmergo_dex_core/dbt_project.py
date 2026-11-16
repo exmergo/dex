@@ -20,6 +20,7 @@ but transform and maintain require one, since dbt is what they edit and diff.
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import re
@@ -1046,19 +1047,31 @@ def mask_yaml_comments(content: str) -> str:
     """
 
     try:
-        ranges = [(t.start_mark.index, t.end_mark.index) for t in yaml.scan(content)]
+        tokens = [
+            t for t in yaml.scan(content) if t.start_mark.index < t.end_mark.index
+        ]
+        ranges = [(t.start_mark.index, t.end_mark.index) for t in tokens]
     except yaml.YAMLError:
         return re.sub(r"(?m)^[ \t]*#.*$", lambda m: " " * len(m.group()), content)
 
+    starts = [s for s, _ in ranges]
     chars = list(content)
-    for m in re.finditer(r"#.*", content):
-        start, end = m.span()
-        inside = any(
-            tok_start <= start and end <= tok_end for tok_start, tok_end in ranges
-        )
-        if not inside:
-            for i in range(start, end):
-                chars[i] = " "
+    n = len(content)
+    i = 0
+    while i < n:
+        hash_pos = content.find("#", i)
+        if hash_pos == -1:
+            break
+        pos = bisect.bisect_right(starts, hash_pos) - 1
+        if pos < 0 or not (ranges[pos][0] <= hash_pos < ranges[pos][1]):
+            line_end = content.find("\n", hash_pos)
+            if line_end == -1:
+                line_end = n
+            for j in range(hash_pos, line_end):
+                chars[j] = " "
+            i = line_end
+        else:
+            i = hash_pos + 1
     return "".join(chars)
 
 

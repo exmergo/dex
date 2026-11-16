@@ -1138,3 +1138,50 @@ def test_yaml_comments_are_excluded_from_var_reference_discovery(tmp_path):
     report = find_references(view, ["feature_fee"], kind="var", index=index)
     assert report.completeness == "complete"
     assert not report.limits
+
+
+def test_yaml_scalar_containing_hash_preserves_var_reference_discovery(tmp_path):
+    """YAML scalar containing literal hash preserves var reference (#1318)."""
+    (tmp_path / "models").mkdir()
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: demo\n"
+        'version: "1.0"\n'
+        "profile: demo\n"
+        "models:\n"
+        "  demo:\n"
+        "    +schema: \"prefix#{{ var('schema_suffix') }}\" # trailing note\n"
+        "vars:\n"
+        "  schema_suffix: test\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: my_model\n"
+        "    description: \"prefix # {{ var('feature_fee') }}\" # actual comment\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "models/my_model.sql").write_text("select 1 as id\n", encoding="utf-8")
+
+    view = load(tmp_path)
+    index = ReferenceIndex(view, scan_packages=False)
+
+    refs_schema, _ = index.references_to("schema_suffix", "var")
+    calls_schema = [r for r in refs_schema if r.form == "var_call"]
+    assert len(calls_schema) == 1
+    assert calls_schema[0].path == "dbt_project.yml"
+    assert calls_schema[0].line == 6
+
+    refs_fee, _ = index.references_to("feature_fee", "var")
+    calls_fee = [r for r in refs_fee if r.form == "var_call"]
+    assert len(calls_fee) == 1
+    assert calls_fee[0].path == "models/schema.yml"
+    assert calls_fee[0].line == 4
+
+    assert index.indeterminate_for("var") == []
+
+    report = find_references(
+        view, ["schema_suffix", "feature_fee"], kind="var", index=index
+    )
+    assert report.completeness == "complete"
+    assert not report.limits

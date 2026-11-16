@@ -22,6 +22,7 @@ from exmergo_dex_core.dbt_project import (
     jinja_calls,
     jinja_regions,
     load,
+    mask_yaml_comments,
     model_file,
     resolve_target,
     write_edits,
@@ -951,6 +952,27 @@ def test_jinja_drops_a_keyword_argument_and_keeps_the_positional_name(template, 
 def test_jinja_regions_returns_a_region_that_calls_nothing():
     regions, _masked = jinja_regions("select {{ some_var }}")
     assert [(r.kind, r.calls) for r in regions] == [("expression", [])]
+
+
+def test_mask_yaml_comments_preserves_hashes_in_scalars():
+    source = (
+        "description: \"prefix # {{ var('feature_fee') }}\" # actual comment\n"
+        "+schema: \"prefix#{{ var('schema_suffix') }}\" # note\n"
+        "# full line comment\n"
+        "key: value\n"
+    )
+    masked = mask_yaml_comments(source)
+    assert len(masked) == len(source)
+    assert (
+        masked.splitlines()[0]
+        == "description: \"prefix # {{ var('feature_fee') }}\"                 "
+    )
+    assert (
+        masked.splitlines()[1]
+        == "+schema: \"prefix#{{ var('schema_suffix') }}\"       "
+    )
+    assert masked.splitlines()[2] == "                   "
+    assert masked.splitlines()[3] == "key: value"
 
 
 # --- versioned models ----------------------------------------------------------

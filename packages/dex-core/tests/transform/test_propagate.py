@@ -761,3 +761,17 @@ class TestYamlVarPropagation:
         with pytest.raises(PropagationRefusedError) as exc:
             _propagate(project, "var", "using_department", "dept_enabled")
         assert "dynamic_flag" in str(exc.value) or "dbt_project.yml" in str(exc.value)
+
+    def test_var_rename_rewrites_yaml_scalar_with_hash_and_comment(self, project: Path):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            "    +schema: \"prefix#{{ var('using_department') }}\" # note\n"
+            "vars:\n  using_department: true\n",
+        )
+        result = _propagate(project, "var", "using_department", "dept_enabled")
+        edits = {e.path: e.new_content for e in result.edits}
+        assert "prefix#{{ var('dept_enabled') }}\" # note" in edits["dbt_project.yml"]
+        assert "using_department" not in edits["dbt_project.yml"]
+        assert result.sites["var_call"] == 1
