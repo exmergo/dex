@@ -41,10 +41,10 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from ..cache import match_identifier, relation_verdict
 from ..dbt_project import manifest_node_label, strip_relation_quoting
@@ -3373,15 +3373,15 @@ def _model_joins(
                 tuple[
                     str,
                     str,
-                    tuple,
-                    tuple,
-                    tuple,
-                    tuple,
+                    tuple[str, ...],
+                    tuple[str, ...],
+                    tuple[str, ...],
+                    tuple[str, ...],
                     bool,
                     bool,
-                    tuple,
-                    tuple,
-                    tuple,
+                    tuple[tuple[str, str], ...],
+                    tuple[tuple[str, str], ...],
+                    tuple[str, ...],
                 ],
                 list[tuple[str, str, str | None, str | None]],
             ] = {}
@@ -3593,10 +3593,13 @@ def _model_joins(
     return candidates, skipped
 
 
-def _distinct(items) -> tuple[str, ...]:
+_T = TypeVar("_T")
+
+
+def _distinct(items: Iterable[_T]) -> tuple[_T, ...]:
     """``items`` in first-seen order with repeats dropped."""
 
-    out: list[str] = []
+    out: list[_T] = []
     for item in items:
         if item not in out:
             out.append(item)
@@ -3879,7 +3882,9 @@ def _final_relation_body(relation, cte_scopes):
     return None
 
 
-def _projection_scope_keys(scope, column, cte_scopes, depth: int = 0):
+def _projection_scope_keys(
+    scope, column, cte_scopes, depth: int = 0
+) -> set[tuple[int, str, str]]:
     """The ``(scope, relation, column)`` keys one bare projection reads.
 
     The projection is keyed where it is written, and then followed through an
@@ -3971,8 +3976,8 @@ def _final_output_map(
                 if cte is not None and isinstance(cte_scopes[cte], exp.Select):
                     body = cte_scopes[cte]
             if body is not None:
-                for key, outputs in _final_output_map(body, depth + 1).items():
-                    names.setdefault(key, list(outputs))
+                for key, body_outputs in _final_output_map(body, depth + 1).items():
+                    names.setdefault(key, list(body_outputs))
             continue
         if isinstance(projection, exp.Alias) and projection.alias:
             output = projection.alias.lower()
@@ -3988,9 +3993,9 @@ def _final_output_map(
         if not table:
             continue
         for key in _projection_scope_keys(tree, column, cte_scopes):
-            outputs = names.setdefault(key, [])
-            if output not in outputs:
-                outputs.append(output)
+            mapped_outputs = names.setdefault(key, [])
+            if output not in mapped_outputs:
+                mapped_outputs.append(output)
     return {key: tuple(outputs) for key, outputs in names.items()}
 
 
@@ -4757,9 +4762,9 @@ def join_coverage(
         adapter,
         relationships,
         timeout_seconds=timeout_seconds,
-        **({"key_exprs": exprs} if exprs else {}),
-        **({"scope_filters": filters} if filters else {}),
-        **({"grouped_sides": grouped} if grouped else {}),
+        key_exprs=exprs,
+        scope_filters=filters,
+        grouped_sides=grouped,
     )
     counts_of = {id(rel): counts for rel, counts in measured}
     refused_of = {id(rel): text for rel, text in refused}
