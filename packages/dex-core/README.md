@@ -120,7 +120,7 @@ Additional capabilities have their own extras:
 | `slayer` | SLayer model files, validated against one pinned SLayer release |
 | `cube` | Reading and authoring plain-YAML Cube model files, with no Node and no Cube server |
 | `metric-views` | Reading and authoring Databricks Unity Catalog Metric View YAML files, with no workspace connection |
-| `semantic-views` | Reading and authoring Snowflake Semantic View YAML files, with no Snowflake connection; a governed query adds `[snowflake]` |
+| `semantic-views` | Reading and authoring Snowflake Semantic View YAML files, with no Snowflake connection; a governed query, or reading the account (`snowflake_account`), adds `[snowflake]` |
 | `cluster` | Bounded k-means exploration with `explore cluster` |
 | `all` | Every connector and optional capability above; a substantially larger install |
 
@@ -319,6 +319,7 @@ Choose the layer in `.dex/config.yml` using `semantic.vendor` and
 | Cube | `vendor: cube`, `deployment: local` | Reads and authors configured plain-YAML model files statically; catalog, authoring, and drift checks, with no query runtime yet |
 | Databricks Metric Views | `vendor: databricks`, `deployment: local` | Reads and authors configured Metric View YAML files statically (`semantic databricks`, derivation from declared marts); catalog and drift checks, never deploying, with no query runtime yet |
 | Snowflake Semantic Views | `vendor: snowflake`, `deployment: local` | Reads and authors configured Semantic View YAML files statically (`semantic snowflake`, derivation from declared marts); catalog, keys, relationships and drift checks, never deploying; Dex renders `SEMANTIC_VIEW()` queries and runs them through the Snowflake connector and cost guard, after holding the deployed view to the file |
+| Snowflake Semantic Views, account | `vendor: snowflake`, `deployment: snowflake_account` | Reads the catalog from the semantic views deployed on the account, with no file needed; Dex still renders and runs the query under the cost guard, and every result says its definition was read from the account and not checked against a reviewed file |
 
 Discover the catalog before choosing a metric or filter. On a dbt layer, for
 example, with a declared `revenue` metric:

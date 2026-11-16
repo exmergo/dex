@@ -4350,6 +4350,7 @@ def _semantic_catalog(
     """
 
     from .semantic import resolve_semantic_layer
+    from .semantic.backend import resolve_hosted_semantic_layer
 
     if not use_project and not use_hosted_semantic_layer:
         return None
@@ -4375,12 +4376,20 @@ def _semantic_catalog(
 
     hosted_view = None
     try:
-        hosted_view = resolve_semantic_layer(engine, api=True).list_definitions().view
-        hosted_view.notes.append(
-            "hosted semantic metadata was read by --use-hosted-semantic-layer; "
-            "this backend does not expose physical relations, so it cannot add "
-            "map exposure annotations or relationship edges on its own"
-        )
+        hosted_view = resolve_hosted_semantic_layer(engine).list_definitions().view
+        if any(model.relation for model in hosted_view.semantic_models):
+            # A deployment read through dex's own connection (Snowflake's
+            # account, #1357) names the relations its definitions sit on.
+            hosted_view.notes.append(
+                "deployed semantic metadata was read by --use-hosted-semantic-"
+                "layer, with the relations each definition sits on"
+            )
+        else:
+            hosted_view.notes.append(
+                "hosted semantic metadata was read by --use-hosted-semantic-layer; "
+                "this backend does not expose physical relations, so it cannot add "
+                "map exposure annotations or relationship edges on its own"
+            )
     except (DexError, ValueError, OSError):
         hosted_view = None
 
@@ -4775,9 +4784,11 @@ def _native_semantic_edges(
                 resolve_semantic_layer(engine, local=True).declared_relationships()
             )
     if use_hosted_semantic_layer:
+        from .semantic.backend import resolve_hosted_semantic_layer
+
         with contextlib.suppress(DexError, ValueError, OSError):
             declarations.extend(
-                resolve_semantic_layer(engine, api=True).declared_relationships()
+                resolve_hosted_semantic_layer(engine).declared_relationships()
             )
     if not declarations:
         return [], []

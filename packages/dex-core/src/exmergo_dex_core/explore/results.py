@@ -634,6 +634,11 @@ class SemanticQueryResult(Result):
     # dbt Cloud's handle for the executed query, for correlating with its own
     # run history. Local queries have no such handle.
     query_id: str | None = None
+    # Where the definitions the statement was rendered from came from, for a
+    # layer that says (`account` under Snowflake's `snowflake_account`, #1357:
+    # read from the account, not checked against a reviewed file). Absent
+    # otherwise.
+    definition_source: str | None = None
 
     @classmethod
     def from_capped(
@@ -666,6 +671,8 @@ class SemanticQueryResult(Result):
         }
         if self.query_id is not None:
             payload["query_id"] = self.query_id
+        if self.definition_source is not None:
+            payload["definition_source"] = self.definition_source
         return payload
 
 

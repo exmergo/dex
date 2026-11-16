@@ -18,7 +18,7 @@ packaging suite installs `[semantic-api]` alone and asserts sqlglot is absent.
 from __future__ import annotations
 
 import argparse
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ... import envelope as env
 from ...results import to_envelope
@@ -197,7 +197,23 @@ def semantic_list(
 
     catalog = catalog.capped(full=full)
     catalog.notes = [*catalog.notes, *notes]
-    return SemanticListResult(catalog=catalog, notes=list(catalog.notes))
+    return _disclosed(
+        backend, SemanticListResult(catalog=catalog, notes=list(catalog.notes))
+    )
+
+
+def _disclosed(backend: Any, result: Any) -> Any:
+    """``result`` with the warnings its backend puts on every result, and the
+    source of its definitions where the backend says, read off the backend's
+    declarations rather than a vendor name (#1357)."""
+
+    disclose = getattr(backend, "disclosure", None)
+    if disclose is not None:
+        result.warnings.extend(w for w in disclose() if w not in result.warnings)
+    source = getattr(backend, "definition_source", None)
+    if source is not None and hasattr(result, "definition_source"):
+        result.definition_source = source
+    return result
 
 
 def semantic_values(
@@ -225,7 +241,9 @@ def semantic_values(
     read = getattr(backend, "values", None)
     if read is None:
         raise SemanticBackendError(values_gap(backend))
-    return read(dimension, SemanticQuery(metrics=list(metrics or [])).metrics)
+    return _disclosed(
+        backend, read(dimension, SemanticQuery(metrics=list(metrics or [])).metrics)
+    )
 
 
 def semantic_query(
@@ -273,7 +291,7 @@ def semantic_query(
     backend = resolve_backend(engine, api=api, local=local)
     if not query.metrics and not getattr(backend, "metricless_queries", False):
         raise refusal
-    result = backend.query(query)
+    result = _disclosed(backend, backend.query(query))
     from ...config import QueryLimits
 
     limits = getattr(engine.config, "query", None) or QueryLimits()

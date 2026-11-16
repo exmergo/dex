@@ -58,6 +58,17 @@ __all__ = [
 #: The semantic vendor this source answers for, as `semantic.vendor` spells it.
 VENDOR_NAME = "snowflake"
 
+#: The deployment whose catalog is the account rather than these files (#1357).
+ACCOUNT_DEPLOYMENT = "snowflake_account"
+
+NO_FILES_NOTE = (
+    "no Semantic View file is configured: under semantic.deployment: "
+    "snowflake_account the layer is read from the account by `explore semantic` "
+    "and `explore relationships|map --use-hosted-semantic-layer`, and `maintain`, "
+    "`transform` and `--use-project` read no account layer, so nothing here was "
+    "read or compared. Configure semantic.snowflake.files to give them one"
+)
+
 
 class SemanticViewSemanticLayer:
     """The Snowflake Semantic View YAML files committed to this repository.
@@ -68,12 +79,21 @@ class SemanticViewSemanticLayer:
     """
 
     def __init__(
-        self, repo_root: Path | str, files: list[str], connector: str | None = None
+        self,
+        repo_root: Path | str,
+        files: list[str],
+        connector: str | None = None,
+        deployment: str | None = None,
     ) -> None:
         """Hold the coordinates; nothing is read until a channel asks."""
         self.repo_root = Path(repo_root)
         self.files = list(files)
         self.connector = connector
+        #: The configured semantic deployment. Under ``snowflake_account`` the
+        #: catalog `explore` reads is the account's, and these files (optional
+        #: there) are what `maintain`, `transform`, `--use-project` and `--local`
+        #: read.
+        self.deployment = deployment
         self._loaded: LoadResult | None = None
         self._resolved: Resolution | None = None
 
@@ -113,14 +133,23 @@ class SemanticViewSemanticLayer:
                 for error in exc.errors()
             )
             raise ConfigurationError(problems) from exc
-        if not section.files:
+        deployment = getattr(context, "deployment", None)
+        if not section.files and deployment != ACCOUNT_DEPLOYMENT:
             raise ConfigurationError(
                 "the Snowflake Semantic View source needs semantic.snowflake.files: "
                 "the Semantic View YAML files to read, named relative to the "
                 "repository root"
             )
         ensure_available()
-        return cls(context.repo_root, section.files, context.connector)
+        return cls(context.repo_root, section.files, context.connector, deployment)
+
+    def no_files_note(self) -> str | None:
+        """Why this source reads nothing, where it was configured with no files:
+        the layer is the account's, which only `explore` reads."""
+
+        if self.files:
+            return None
+        return NO_FILES_NOTE
 
     def loaded(self) -> LoadResult:
         """This command's one validated read of the configured files."""
@@ -155,8 +184,8 @@ class SemanticViewSemanticLayer:
                 notes=[f"Semantic View files could not be read: {exc}"]
             )
         if loaded.empty:
-            return ProjectDefinitions(notes=loaded.notes())
-        return catalog_mod.definitions(loaded, resolved, notes=loaded.notes())
+            return ProjectDefinitions(notes=self._notes(loaded))
+        return catalog_mod.definitions(loaded, resolved, notes=self._notes(loaded))
 
     # --- the catalog channel ---------------------------------------------------
 
@@ -178,7 +207,7 @@ class SemanticViewSemanticLayer:
                 f"layer:\n  {listed}"
             )
         return catalog_mod.semantic_catalog(
-            loaded, self._resolution(), notes=loaded.notes()
+            loaded, self._resolution(), notes=self._notes(loaded)
         )
 
     # --- the snapshot channel --------------------------------------------------
@@ -198,7 +227,10 @@ class SemanticViewSemanticLayer:
             return SemanticLayerSnapshot(
                 notes=[f"Semantic View files could not be read: {exc}"]
             )
-        return snapshot_mod.semantic_layer(loaded, resolved)
+        snapshot = snapshot_mod.semantic_layer(loaded, resolved)
+        if note := self.no_files_note():
+            snapshot.notes.append(note)
+        return snapshot
 
     # --- the schema channel (#1293) ----------------------------------------------
 
@@ -325,6 +357,13 @@ class SemanticViewSemanticLayer:
         from .derivation import derive
 
         return derive(self, request)
+
+    def _notes(self, loaded: LoadResult) -> list[str]:
+        """The reader's notes, and why nothing was read where nothing is
+        configured."""
+
+        note = self.no_files_note()
+        return [*loaded.notes(), *([note] if note else [])]
 
     def _load(self) -> LoadResult:
         """This command's validated read of the configured files, memoized."""

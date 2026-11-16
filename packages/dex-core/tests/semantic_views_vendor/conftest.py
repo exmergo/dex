@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 VIEW_DIR = "views"
@@ -191,3 +192,14 @@ SHOP = sv(
         {"name": "revenue_x2", "expr": "orders.revenue * 2"},
     ],
 )
+
+
+@pytest.fixture
+def account(monkeypatch):
+    """The fake Snowflake account behind dex's adapter funnel
+    (:mod:`.account_fake`). Imported here, lazily, so a test module that does
+    not ask for it needs neither sqlglot nor the Snowflake connector."""
+
+    from .account_fake import route_to_fake_account
+
+    return route_to_fake_account(monkeypatch)

@@ -138,7 +138,17 @@ class LocalSemanticViewLayer:
                 "they are git-reviewable files, so build the engine with "
                 "DexEngine.from_repo(repo_root)"
             )
-        return cls(engine.semantic_catalog_source(), engine)
+        source = engine.semantic_catalog_source()
+        if not getattr(source, "files", True):
+            # Reached only under semantic.deployment: snowflake_account, where
+            # the files are optional and `--local` asked for them.
+            raise SemanticBackendError(
+                "`--local` reads the repository's Semantic View files and holds "
+                "the deployed views to them, and no semantic.snowflake.files is "
+                "configured. Drop --local to read the account "
+                "(semantic.deployment: snowflake_account), or configure the files"
+            )
+        return cls(source, engine)
 
     # ---- discovery ---------------------------------------------------------
 
@@ -152,14 +162,14 @@ class LocalSemanticViewLayer:
     def declared_relationships(self) -> list[Any]:
         """Each key-equality relationship, with every ordered column pair."""
 
-        return self._source.declared_definitions().declared_relationships
+        return self._definitions().declared_relationships
 
     def declared_keys(self) -> tuple[list[Any], list[Any]]:
         """Each primary and unique key, single-column and composite. A Semantic
         View is never the transformation project, so this is the only route its
         keys have to grain detection."""
 
-        defs = self._source.declared_definitions()
+        defs = self._definitions()
         return defs.declared_keys, defs.declared_composite_keys
 
     def declared_models(self) -> tuple[dict[str, Any], list[str]]:
@@ -167,7 +177,7 @@ class LocalSemanticViewLayer:
         Semantic View has no metadata block a dex declaration could live in, so
         this is empty by construction."""
 
-        defs = self._source.declared_definitions()
+        defs = self._definitions()
         return defs.model_declarations, defs.declaration_notes
 
     def _catalog_view(self):
@@ -412,9 +422,7 @@ class LocalSemanticViewLayer:
         from ...semantic_views.query import QueryRefused
 
         try:
-            return build(
-                self._loaded(), self._source.resolution(), self._catalog_view()
-            )
+            return build(self._loaded(), self._resolution(), self._catalog_view())
         except QueryRefused as exc:
             if exc.guard:
                 raise SemanticQueryRefusedError(str(exc)) from exc
@@ -433,7 +441,7 @@ class LocalSemanticViewLayer:
 
         from ...semantic_views.query import BASE_COLUMN, token_of, value_inputs
 
-        resolved = self._source.resolution()
+        resolved = self._resolution()
         refs: list[str] = []
         aliases: dict[str, list[str]] = {}
         for item in [*plan.dimensions, *plan.facts, *plan.filters]:
@@ -491,9 +499,7 @@ class LocalSemanticViewLayer:
         for item in plan.members:
             members.extend(row_inputs(view, item.member))
         unique = list({(m.table or "", m.name.lower()): m for m in members}.values())
-        differences = compare(
-            view, read.view, unique, plan.tables(self._source.resolution())
-        )
+        differences = compare(view, read.view, unique, plan.tables(self._resolution()))
         if differences:
             listed = "; ".join(d.render() for d in differences[:5])
             more = f" (and {len(differences) - 5} more)" if len(differences) > 5 else ""
@@ -566,7 +572,7 @@ class LocalSemanticViewLayer:
     def _base_relations(self, plan: Any) -> list[str]:
         """The base tables of every logical table the statement reaches."""
 
-        resolved = self._source.resolution()
+        resolved = self._resolution()
         found: list[str] = []
         for table in sorted(plan.tables(resolved)):
             relation = resolved.relations.get((plan.view.name.lower(), table))
@@ -575,6 +581,15 @@ class LocalSemanticViewLayer:
         return found
 
     # ---- plumbing ------------------------------------------------------------
+
+    def _definitions(self) -> Any:
+        """What the layer declares: keys, joins and their relations."""
+        return self._source.declared_definitions()
+
+    def _resolution(self) -> Any:
+        """This command's resolution of the layer: model names, relations,
+        columns and reach."""
+        return self._source.resolution()
 
     def _loaded(self):
         try:

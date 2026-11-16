@@ -285,8 +285,8 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         "semantic-layers/snowflake-semantic-views",
         PageMeta(
             "Snowflake Semantic View compatibility",
-            "How dex reads Snowflake Semantic View YAML with no Snowflake "
-            "connection, queries the deployed view through SEMANTIC_VIEW(), "
+            "How dex reads Semantic View YAML from the repository or the "
+            "account alone, queries the deployed view through SEMANTIC_VIEW(), "
             "and what it declines.",
             "Snowflake Semantic Views",
         ),
