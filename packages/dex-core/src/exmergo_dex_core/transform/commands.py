@@ -4659,7 +4659,7 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 getattr(args, "plan_id", None),
                 model=getattr(args, "model", None),
                 column_mapping=_column_map(getattr(args, "map", None)),
-                key_columns=getattr(args, "key", None),
+                key_columns=_key_columns_arg(getattr(args, "key", None)),
                 target=getattr(args, "target", None),
                 accepted_type_changes=getattr(args, "accept_type", None),
                 expectation=_expectation_arg(args),
@@ -4667,6 +4667,15 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         )
     except ValueError as exc:
         return env.error_for(exc, **_resolution_error(exc))
+
+
+def _key_columns_arg(values: Sequence[str] | None) -> list[str] | None:
+    """Expand comma-separated ``--key`` values while preserving repeats."""
+
+    if values is None:
+        return None
+
+    return [column.strip() for value in values for column in value.split(",")]
 
 
 def _expectation_arg(args: argparse.Namespace) -> str | None:

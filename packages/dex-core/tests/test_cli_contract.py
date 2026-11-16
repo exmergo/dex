@@ -1213,6 +1213,29 @@ def test_transform_build_select_accepts_several_values_or_quoted(monkeypatch):
     assert seen["select"] == "stg_accounts stg_users"
 
 
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--key", "a,b,c"],
+        ["--key", "a", "--key", "b", "--key", "c"],
+    ],
+)
+def test_transform_compare_accepts_comma_separated_or_repeated_keys(flags, monkeypatch):
+    from exmergo_dex_core.cli import _build_parser
+    from exmergo_dex_core.transform import commands, refactor_compare
+
+    args = _build_parser().parse_args(["transform", "compare", *flags])
+    seen: dict = {}
+
+    def capture(_engine, _plan_id, **kwargs):
+        seen.update(kwargs)
+        raise ValueError("captured")
+
+    monkeypatch.setattr(refactor_compare, "compare", capture)
+    commands.cmd_compare(args, engine=None)
+    assert seen["key_columns"] == ["a", "b", "c"]
+
+
 # --- the config file, as every command reads it -----------------------------------
 
 

@@ -1502,7 +1502,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="append",
                         default=None,
                         metavar="COLUMN",
-                        help="baseline key column, repeatable; default: declared grain",
+                        help=(
+                            "baseline key column, repeatable or comma-separated; "
+                            "default: declared grain"
+                        ),
                     )
                     sp.add_argument(
                         "--accept-type",
