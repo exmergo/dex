@@ -309,9 +309,21 @@ def declarations(
 
     # A fact two sources declare on one relation is one fact: listed per
     # source, counted once, checked by whatever checks either record.
-    groups: dict[tuple, list[dict[str, Any]]] = defaultdict(list)
+    # Two records of one source share an `_id` only when they differ in
+    # cardinality: two declarations, so they never fill one group.
+    by_id: dict[tuple, list[list[dict[str, Any]]]] = defaultdict(list)
     for fact in facts:
-        groups[fact["_id"]].append(fact)
+        slots = by_id[fact["_id"]]
+        slot = next(
+            (g for g in slots if all(f["source"] != fact["source"] for f in g)), None
+        )
+        if slot is None:
+            slots.append([fact])
+        else:
+            slot.append(fact)
+    groups = {
+        (key, n): group for key, slots in by_id.items() for n, group in enumerate(slots)
+    }
     by_kind: dict[str, dict[str, int]] = {}
     by_checker = dict.fromkeys(CHECKERS, 0)
     shared = 0
@@ -463,14 +475,12 @@ def _filter(includes: Any, excludes: Any) -> tuple:
     return (values(includes), values(excludes))
 
 
-def _parent(parent: Any) -> tuple:
-    """A population parent's model and key, for identity only."""
+def _parent_key(parent: Any) -> tuple:
+    """A population parent's key pairs, for identity only. The parent itself
+    is the record's target, matched by relation like a join's."""
 
     key = parent.key if isinstance(parent.key, dict) else {}
-    return (
-        _bare(parent.model),
-        tuple(sorted((_bare(k), _bare(str(v))) for k, v in key.items())),
-    )
+    return tuple(sorted((_bare(k), _bare(str(v))) for k, v in key.items()))
 
 
 def _record(
@@ -656,6 +666,10 @@ def _native_facts(
             )
             pairs = tuple((_bare(a), _bare(b)) for a, b in rel.column_pairs)
             joins[(source, _bare(rel.model), target, pairs)] = rel.cardinality
+    # A declared model names its relation too, for a parent or a target the
+    # fingerprint does not hold.
+    named = {n: d.relation for n, d in models.items() if d.relation}
+    relations = {**named, **{k: v for k, v in relations.items() if v}}
     for name in sorted(models):
         facts.extend(_declared_model_facts(models[name], relations, joins))
     return facts
@@ -727,7 +741,10 @@ def _declared_model_facts(
             add(
                 "population_parent",
                 ", ".join(population.parent.key),
-                what=_parent(population.parent),
+                target=_target_of(
+                    relations.get(population.parent.model), population.parent.model
+                ),
+                what=_parent_key(population.parent),
             )
         if (
             population.rule
@@ -887,7 +904,13 @@ def _model_facts(
                 record_column,
                 [],
                 ["parent_population_missing", "parent_population_unexpected"],
-                what=_parent(stated),
+                target=_target_of(
+                    (nodes.get(tests._resolve(stated.model, near=uid) or "") or {}).get(
+                        "relation_name"
+                    ),
+                    stated.model,
+                ),
+                what=_parent_key(stated),
             )
         rule = population.get("rule")
         if (

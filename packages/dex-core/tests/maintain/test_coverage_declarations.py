@@ -901,3 +901,46 @@ def test_a_filter_value_keeps_its_type() -> None:
     out = _run(_manifest([model]), native_models=declared)
     assert out["summary"]["facts"]["by_kind"]["population_filter"]["count"] == 2
     assert "True" not in json.dumps(out) and "true" not in json.dumps(out)
+
+
+def test_one_parent_under_two_names_is_one_population_fact() -> None:
+    customers = _model("customers")
+    customers["relation_name"] = '"prod"."analytics"."customers"'
+    orders = _model(
+        "orders",
+        dex={"population": {"parent": {"model": "customers", "key": {"cid": "id"}}}},
+    )
+    orders["relation_name"] = '"prod"."analytics"."orders"'
+    declared = {
+        "orders": ModelDeclaration(
+            model="orders",
+            relation="analytics.orders",
+            source="ossie",
+            population=DeclaredPopulation(
+                parent={"model": "customers_layer", "key": {"cid": "id"}}
+            ),
+        ),
+        "customers_layer": ModelDeclaration(
+            model="customers_layer", relation="analytics.customers", source="ossie"
+        ),
+    }
+    out = _run(_manifest([customers, orders]), native_models=declared)
+    assert out["summary"]["facts"]["by_kind"]["population_parent"]["count"] == 1
+    shared = [f for f in out["facts"] if f["fact"] == "population_parent"]
+    assert sorted(f["also_declared_by"][0] for f in shared) == ["dbt", "ossie"]
+
+
+def test_one_join_declared_with_two_cardinalities_counts_twice() -> None:
+    layer = _layer(
+        models=[
+            _sm("orders", [["id"]], ["primary"]),
+            _sm("users", [["id"]], ["primary"]),
+        ],
+        relationships=[
+            _rel("a", "orders", "users", [("user_id", "id")], "many_to_one"),
+            _rel("b", "orders", "users", [("user_id", "id")], "many_to_many"),
+        ],
+    )
+    out = declarations(_manifest([]), selected=set(), semantic=layer)
+    joins = out["summary"]["facts"]["by_kind"]["references"]
+    assert (joins["count"], joins["dex_verify"], joins["none"]) == (2, 1, 1)

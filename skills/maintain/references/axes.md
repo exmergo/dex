@@ -553,8 +553,9 @@ one coverage number.
   `declared_join_orphans`, plus `join_cardinality_exceeded` where it is declared
   `many_to_one` or `one_to_one`, and a `many_to_many` join neither. What its
   `dex` metadata states reads `none`. A fact a dbt model and the layer both
-  declare on one relation is listed per source with `also_declared_by` and
-  counted once.
+  declare on one relation, spelled alike (a quoted part keeps its case, so
+  `DB.SCHEMA.ORDERS` and `"DB"."SCHEMA"."ORDERS"` are two), is listed per source
+  with `also_declared_by` and counted once.
 
 ## `maintain reconcile [<class>]`
 
