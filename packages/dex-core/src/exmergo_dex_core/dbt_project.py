@@ -20,6 +20,7 @@ but transform and maintain require one, since dbt is what they edit and diff.
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import re
@@ -921,6 +922,7 @@ _JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 _JINJA_REGION = re.compile(r"\{\{(.*?)\}\}|\{%(.*?)%\}", re.DOTALL)
 _CALL_START = re.compile(r"(?<![A-Za-z0-9_.])([A-Za-z_][A-Za-z0-9_.]*)\s*\(")
 _QUOTED_ARG = re.compile(r"^(['\"])([^'\"]*)\1$")
+_QUOTED_DOUBLED_ARG = re.compile(r"^''([^']*)''$")
 # `==` is a comparison, not a keyword argument.
 _KEYWORD_ARG = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*=(?!=)")
 
@@ -1037,6 +1039,43 @@ def jinja_calls(content: str) -> list[JinjaCall]:
     return [call for region in regions for call in region.calls]
 
 
+def mask_yaml_comments(content: str) -> str:
+    """Mask YAML comments with spaces, preserving character positions and lines.
+
+    Jinja expressions inside YAML comments must not become referenced sites,
+    while expressions in YAML scalar values (quoted, unquoted, or multi-line block
+    scalars) keep their original line and column positions.
+    """
+
+    try:
+        tokens = [
+            t for t in yaml.scan(content) if t.start_mark.index < t.end_mark.index
+        ]
+        ranges = [(t.start_mark.index, t.end_mark.index) for t in tokens]
+    except yaml.YAMLError:
+        return re.sub(r"(?m)^[ \t]*#.*$", lambda m: " " * len(m.group()), content)
+
+    starts = [s for s, _ in ranges]
+    chars = list(content)
+    n = len(content)
+    i = 0
+    while i < n:
+        hash_pos = content.find("#", i)
+        if hash_pos == -1:
+            break
+        pos = bisect.bisect_right(starts, hash_pos) - 1
+        if pos < 0 or not (ranges[pos][0] <= hash_pos < ranges[pos][1]):
+            line_end = content.find("\n", hash_pos)
+            if line_end == -1:
+                line_end = n
+            for j in range(hash_pos, line_end):
+                chars[j] = " "
+            i = line_end
+        else:
+            i = hash_pos + 1
+    return "".join(chars)
+
+
 #: One argument as read: its literal value (``None`` when dex did not resolve it)
 #: and the absolute half-open span of that literal's contents (``None`` likewise).
 _Argument = tuple[str | None, tuple[int, int] | None]
@@ -1125,10 +1164,13 @@ def _literal(text: str, base: int) -> _Argument | None:
     stripped = text.strip()
     if _KEYWORD_ARG.match(stripped):
         return None
+    offset = base + len(text) - len(text.lstrip())
+    doubled = _QUOTED_DOUBLED_ARG.match(stripped)
+    if doubled is not None:
+        return doubled.group(1), (offset + doubled.start(1), offset + doubled.end(1))
     quoted = _QUOTED_ARG.match(stripped)
     if quoted is None:
         return None, None
-    offset = base + len(text) - len(text.lstrip())
     return quoted.group(2), (offset + quoted.start(2), offset + quoted.end(2))
 
 

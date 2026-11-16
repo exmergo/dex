@@ -44,6 +44,7 @@ from .dbt_project import (
     _project_vars,
     jinja_calls,
     jinja_regions,
+    mask_yaml_comments,
     metric_inputs,
     node_files,
     node_name,
@@ -755,6 +756,8 @@ class ReferenceIndex:
                 self._scan_sql(source.content, path, node_kinds, package=package)
             elif family == "seed" and path.endswith(".csv"):
                 self._scan_seed_header(source.content, path, package=package)
+            elif path.endswith((".yml", ".yaml")):
+                self._scan_yaml_calls(source.content, path, package=package)
         # The loader reads SQL only, so a Python model's name usually comes
         # from the file on disk. `dbt.ref` and `dbt.source` in that file are
         # reads of other nodes and are indexed here. The model itself stays a
@@ -1747,6 +1750,31 @@ class ReferenceIndex:
                     package=package,
                 )
             )
+
+    def _scan_yaml_calls(self, content: str, path: str, *, package: str | None) -> None:
+        """Index jinja var() calls written in YAML configuration.
+
+        A static var() call in supported YAML scalar expressions is indexed with
+        its exact file and line under form "var_call"; an unreadable or dynamic
+        call is recorded as indeterminate so completeness claims stay honest.
+        YAML comments are excluded from discovery.
+        """
+
+        masked = mask_yaml_comments(content)
+        for call in jinja_calls(masked):
+            if call.callee == "var":
+                target = call.args[0] if call.args else None
+                self._record(
+                    Reference(
+                        path=path,
+                        line=call.line,
+                        form="var_call",
+                        kind="var",
+                        name=target,
+                        resolution=RESOLVED if target else INDETERMINATE,
+                        package=package,
+                    )
+                )
 
     def _scan_packages(self) -> None:
         """Index each installed package as the project it is.

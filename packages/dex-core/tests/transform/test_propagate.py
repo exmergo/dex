@@ -710,3 +710,84 @@ class TestPythonAndYamlSnapshotReaders:
             _propagate(project, "model", "stg_isolated")
 
         assert "py_isolated.py" in str(exc.value)
+
+
+class TestYamlVarPropagation:
+    def test_var_rename_rewrites_yaml_var_calls(self, project: Path):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            "    +enabled: \"{{ var('using_department') }}\"\n"
+            "vars:\n  using_department: true\n",
+        )
+        _write(
+            project / "models/staging/schema.yml",
+            "version: 2\nmodels:\n  - name: stg_orders\n    config:\n"
+            "      enabled: \"{{ var('using_department') }}\"\n",
+        )
+        result = _propagate(project, "var", "using_department", "dept_enabled")
+        edits = {e.path: e.new_content for e in result.edits}
+        assert "dept_enabled: true" in edits["dbt_project.yml"]
+        assert "var('dept_enabled')" in edits["dbt_project.yml"]
+        assert "using_department" not in edits["dbt_project.yml"]
+        assert "var('dept_enabled')" in edits["models/staging/schema.yml"]
+        assert "using_department" not in edits["models/staging/schema.yml"]
+        assert result.sites["project_yml_var"] == 1
+        assert result.sites["var_call"] == 2
+
+    def test_plain_var_removal_refuses_when_yaml_readers_survive(self, project: Path):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            "    +enabled: \"{{ var('using_department') }}\"\n"
+            "vars:\n  using_department: true\n",
+        )
+        with pytest.raises(PropagationRefusedError) as exc:
+            _propagate(project, "var", "using_department")
+        assert "dbt_project.yml" in str(exc.value)
+
+    def test_var_rename_refuses_when_yaml_contains_dynamic_var_read(
+        self, project: Path
+    ):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            '    +enabled: "{{ var(dynamic_flag) }}"\n'
+            "vars:\n  using_department: true\n",
+        )
+        with pytest.raises(PropagationRefusedError) as exc:
+            _propagate(project, "var", "using_department", "dept_enabled")
+        assert "dynamic_flag" in str(exc.value) or "dbt_project.yml" in str(exc.value)
+
+    def test_var_rename_rewrites_yaml_scalar_with_hash_and_comment(self, project: Path):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            "    +schema: \"prefix#{{ var('using_department') }}\" # note\n"
+            "vars:\n  using_department: true\n",
+        )
+        result = _propagate(project, "var", "using_department", "dept_enabled")
+        edits = {e.path: e.new_content for e in result.edits}
+        assert "prefix#{{ var('dept_enabled') }}\" # note" in edits["dbt_project.yml"]
+        assert "using_department" not in edits["dbt_project.yml"]
+        assert result.sites["var_call"] == 1
+
+    def test_var_rename_rewrites_single_quoted_yaml_scalar_with_doubled_quotes(
+        self, project: Path
+    ):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            "    +schema: '{{ var(''using_department'') }}'\n"
+            "vars:\n  using_department: true\n",
+        )
+        result = _propagate(project, "var", "using_department", "dept_enabled")
+        edits = {e.path: e.new_content for e in result.edits}
+        assert "var(''dept_enabled'')" in edits["dbt_project.yml"]
+        assert "using_department" not in edits["dbt_project.yml"]
+        assert result.sites["var_call"] == 1

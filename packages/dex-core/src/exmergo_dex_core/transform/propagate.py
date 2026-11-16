@@ -36,7 +36,14 @@ from io import StringIO
 from typing import TYPE_CHECKING, Any
 
 from .. import model_versions as mv
-from ..dbt_project import DbtProjectView, EditOp, node_files, node_name, path_family
+from ..dbt_project import (
+    DbtProjectView,
+    EditOp,
+    mask_yaml_comments,
+    node_files,
+    node_name,
+    path_family,
+)
 from ..errors import RequestError
 from ..references import KINDS, ReferenceIndex, column_parse_limit
 from ..yaml_spans import with_leading_comments
@@ -721,6 +728,15 @@ class _Builder:
             span = self._replacement_span(name, content)
             if span is not None:
                 self._spans[path].append(span)
+        if self.kind == "var":
+            masked = mask_yaml_comments(content)
+            for name in jinja_names(masked):
+                if not self._matches(name.name, name.kind):
+                    continue
+                self.sites[name.form] += 1
+                span = self._replacement_span(name)
+                if span is not None:
+                    self._spans[path].append(span)
 
     def _yaml_removal(self, path: str, content: str) -> None:
         for block in yaml_blocks(content, versions=True):
