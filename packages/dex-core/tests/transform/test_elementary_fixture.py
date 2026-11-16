@@ -314,7 +314,9 @@ RESOLVED = {
     "a": (True, "run", "elementary"),
     "b": (True, "run", "dbt"),
     "c": (True, "run", "elementary"),
-    "d": (False, "disabled", "elementary"),
+    # dbt picks the package's materialization, which hands every test to dbt's
+    # because the package is disabled, so the tests get dbt's behaviour.
+    "d": (False, "disabled", "dbt"),
     "e": (True, "run", "elementary"),
     "f": (True, "run", "elementary"),
 }
@@ -350,8 +352,8 @@ def test_the_resolver_reads_what_each_variant_does_on_dev(
 ):
     """The record for ``dev`` matches the variant's row, and agrees with what
     the run itself shows: Elementary's materialization announces itself in the
-    debug log exactly where the record says it is picked and the package is
-    enabled (the first column of ``BEHAVIOUR``, read from a run in
+    debug log exactly where the record says the tests get its behaviour (the
+    first column of ``BEHAVIOUR``, read from a run in
     ``test_each_variant_changes_what_elementary_does_in_a_run``)."""
 
     from exmergo_dex_core.transform.elementary import read
@@ -362,8 +364,7 @@ def test_the_resolver_reads_what_each_variant_does_on_dev(
     assert record.installed
     assert record.release == version
     assert (record.enabled, record.hooks, record.materialization) == RESOLVED[variant]
-    announced = record.enabled and record.materialization == "elementary"
-    assert announced is BEHAVIOUR[variant][0]
+    assert (record.materialization == "elementary") is BEHAVIOUR[variant][0]
     assert not (tmp_path / "prod.duckdb").exists()
 
 

@@ -17,8 +17,8 @@ caller asking about a target parses for that target first.
 
 Every field is read from what dbt and the package will do, not from whether the
 package is installed. Read at dbt-core 1.12.5, in the manifests the fixture's
-variants parse to at Elementary 0.16.4 and 0.26.1, and in the package's source at
-0.15.2:
+variants parse to at Elementary 0.16.4 and 0.26.1, and in the package's source
+at the release tags each function names:
 
 - **Enabled.** A package model is under ``nodes`` when enabled for the target
   and under ``disabled`` when not, including one disabled with a Jinja
@@ -34,10 +34,13 @@ variants parse to at Elementary 0.16.4 and 0.26.1, and in the package's source a
   and while ``require_explicit_package_overrides_for_builtin_materializations``
   is true an imported candidate is passed over wherever dbt has one of its own.
   The flag defaults to true in every dbt-core from 1.8.0 (read at 1.8.0, 1.9.0,
-  1.10.0 and 1.11.0).
-- **Vars.** The package reads each var with ``var(name, default)`` and takes the
-  strings ``"true"`` and ``"false"`` as booleans (``get_config_var``). A value
-  the project writes as Jinja is reported as unknown, never guessed.
+  1.10.0 and 1.11.0), and dbt keeps that default unless the project's whole
+  ``flags`` block validates: a string such as ``'false'`` or Jinja leaves the
+  flag true (``read_project_flags`` in ``dbt/config/project.py``, run).
+- **Vars.** The package reads each var with ``var(name, default)``, takes the
+  exact strings ``"true"`` and ``"false"`` in any case as booleans, and otherwise
+  uses the value as Jinja would (``get_config_var``). A value the project writes
+  as Jinja is reported as unknown, never guessed.
 """
 
 from __future__ import annotations
@@ -76,7 +79,7 @@ DEFAULTS: Mapping[str, bool] = {"edr_cli_run": False} | dict.fromkeys(
 )
 
 Hooks = Literal["run", "return_early", "disabled", "absent", "unknown"]
-Materialization = Literal["elementary", "dbt", "unknown"]
+Materialization = Literal["elementary", "dbt"]
 
 
 @dataclass(frozen=True)
@@ -89,12 +92,19 @@ class ElementaryRuntime:
     models, ``absent`` when the manifest holds none of them, and ``unknown`` when
     a var they read is unknown. ``uploads`` says which uploads ``on_run_end``
     performs; each is off unless ``hooks`` is ``run`` and the installed release
-    has it, and ``None`` where its var is unknown. The package also keeps two to
+    has it, and ``None`` where its var is unknown. An upload that is on is one the
+    hook attempts: it writes nothing where the package's table has not been
+    built, as on a first run in a fresh dev schema. The package also keeps two to
     the commands it recognises (``is_test_command``, ``is_freshness_command``),
-    which no record of a target can say. ``materialization_macro`` is the macro
-    dbt picks, and ``materialization`` says whose test materialization runs: a
-    root-project macro that calls the package's is the package's. ``notes`` says
-    why a field is ``unknown``.
+    which no record of a target can say.
+
+    ``materialization_macro`` is the ``test`` materialization dbt picks, and
+    ``materialization`` says whose behaviour the tests get. It is
+    ``elementary`` only where the pick is the package's, or a root-project macro
+    that calls the package's, and the package is enabled: where it is not, the
+    package's materialization hands each test straight to dbt's
+    (``materialize_test``, read at 0.16.4 and 0.26.1). ``notes`` says why a field
+    is ``unknown``.
     """
 
     installed: bool
@@ -124,15 +134,50 @@ def _project_config(project_yml: str | None) -> dict[str, Any]:
 
 
 def _as_bool(value: Any) -> bool | None:
-    """A var's value as the package reads it, or ``None`` where it cannot be told."""
+    """Whether the package's ``if`` on this var's value is taken.
+
+    ``get_config_var`` turns the exact strings ``"true"`` and ``"false"``, in any
+    case, into booleans and returns anything else as it is, so ``" false"`` is a
+    truthy string to the package. Jinja is ``None``: dbt renders a var before
+    the package sees it, and only dbt can.
+    """
 
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in ("true", "false"):
-            return lowered == "true"
-    return None
+        if "{{" in value or "{%" in value:
+            return None
+        if value.lower() in ("true", "false"):
+            return value.lower() == "true"
+    return bool(value)
+
+
+def _override_flag(project: Mapping[str, Any]) -> bool:
+    """The override flag as dbt reads it from ``dbt_project.yml``.
+
+    dbt validates the whole ``flags`` block and, where it does not validate,
+    uses every flag's default, so a string or Jinja value for this flag, or an
+    invalid value for any other, leaves it true (``read_project_flags``, 1.12.5,
+    run). dbt's own schema is used where dbt is installed; without it, only
+    this flag's own value is checked. Flags set in ``profiles.yml``, which dbt
+    still reads with a deprecation, are not read here.
+    """
+
+    flags = project.get("flags")
+    if not isinstance(flags, Mapping):
+        return True
+    value = flags.get(OVERRIDE_FLAG, True)
+    if not isinstance(value, bool):
+        return True
+    try:
+        from dbt.contracts.project import ProjectFlags
+    except ImportError:
+        return value
+    try:
+        ProjectFlags.validate(dict(flags))
+    except Exception:  # dbt's ValidationError; dbt catches it the same way
+        return True
+    return value
 
 
 def var_value(
@@ -144,8 +189,8 @@ def var_value(
 
     dbt resolves a var for a node of the package from ``--vars`` first, then the
     root project's ``vars.elementary`` scope, then its global ``vars``, and the
-    package supplies the default. A value that is not a boolean, or the string of
-    one, is ``None``: most often Jinja that only dbt can render.
+    package supplies the default. A value written as Jinja is ``None``, since
+    only dbt can render it.
     """
 
     if cli_vars and name in cli_vars:
@@ -300,21 +345,14 @@ def resolve(
     models, _ = _elementary_entries(manifest, "model")
     enabled = bool(models)
 
-    flags = project.get("flags")
-    flag_value = flags.get(OVERRIDE_FLAG, True) if isinstance(flags, Mapping) else True
-    flag = _as_bool(flag_value)
-    picked: str | None = None
-    materialization: Materialization
-    if flag is None:
-        materialization = "unknown"
-        notes.append(f"{OVERRIDE_FLAG} is not a boolean: {flag_value!r}")
-    else:
-        picked = _materialization(manifest, root, installed_packages, flag)
-        materialization = (
-            "elementary"
-            if picked and _is_elementary_materialization(manifest, picked)
-            else "dbt"
-        )
+    picked = _materialization(
+        manifest, root, installed_packages, _override_flag(project)
+    )
+    materialization: Materialization = (
+        "elementary"
+        if enabled and picked and _is_elementary_materialization(manifest, picked)
+        else "dbt"
+    )
 
     operations, disabled_operations = _elementary_entries(manifest, "operation")
     edr_cli_run = var_value("edr_cli_run", project, cli_vars)

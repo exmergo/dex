@@ -7,6 +7,7 @@ The fixture's real manifests are read in ``test_elementary_fixture.py``.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -160,8 +161,13 @@ def test_enabled_reads_whether_a_package_model_is_in_the_graph(models, enabled):
         ("true", "dbt", "macro.dbt.materialization_test_default"),
         # dbt's default since 1.8.0 is true.
         (None, "dbt", "macro.dbt.materialization_test_default"),
-        # The package reads the strings as booleans; so does dbt for a flag.
-        ("'false'", "elementary", ELEMENTARY_MAT),
+        # dbt refuses a flag that is not a YAML boolean and keeps its default.
+        ("'false'", "dbt", "macro.dbt.materialization_test_default"),
+        (
+            "\"{{ env_var('X', 'false') }}\"",
+            "dbt",
+            "macro.dbt.materialization_test_default",
+        ),
     ],
 )
 def test_the_flag_decides_between_the_package_and_dbt(flag, expected, macro):
@@ -224,12 +230,61 @@ def test_the_flag_passes_over_a_more_specific_package_materialization():
     assert (on.materialization, off.materialization) == ("dbt", "elementary")
 
 
-def test_a_flag_written_as_jinja_is_unknown_and_says_so():
-    record = resolve(manifest(), project_yml(flag="\"{{ env_var('X') }}\""))
+def _flags_with_a_bad_sibling() -> str:
+    return project_yml(flag="false") + "  send_anonymous_usage_stats: 'nope'\n"
 
-    assert record.materialization == "unknown"
-    assert record.materialization_macro is None
-    assert any(OVERRIDE_FLAG in note for note in record.notes)
+
+def test_an_invalid_sibling_flag_leaves_the_override_flag_true():
+    """dbt validates the whole ``flags`` block: one invalid value anywhere and
+    every flag keeps its default, so dbt's materialization is picked even with
+    this flag false (``read_project_flags``, dbt-core 1.12.5)."""
+
+    pytest.importorskip("dbt.contracts.project")
+
+    record = resolve(manifest(), _flags_with_a_bad_sibling())
+
+    assert record.materialization_macro == "macro.dbt.materialization_test_default"
+
+
+def test_without_dbt_only_the_override_flag_itself_is_checked(monkeypatch):
+    # The other arm: with no dbt to validate the block, the sibling is unseen.
+    monkeypatch.setitem(sys.modules, "dbt.contracts.project", None)
+
+    record = resolve(manifest(), _flags_with_a_bad_sibling())
+
+    assert record.materialization_macro == ELEMENTARY_MAT
+
+
+def test_the_package_s_materialization_is_inert_where_it_is_not_enabled():
+    """Variant d for dev: dbt still picks the package's materialization, which
+    hands each test straight to dbt's because the package is disabled."""
+
+    record = resolve(
+        manifest(models="disabled", hooks="disabled"), project_yml(flag="false")
+    )
+
+    assert record.materialization_macro == ELEMENTARY_MAT
+    assert record.materialization == "dbt"
+
+
+def test_the_flag_falls_back_to_a_root_shim_over_a_more_specific_package_one():
+    """On Snowflake the package's own ``materialization_test_snowflake`` is the
+    most specific candidate. With the flag true dbt passes over it, and the
+    best of what is left is the root project's shim, not dbt's default."""
+
+    snowflake = _macro(
+        "elementary",
+        "materialization_test_snowflake",
+        depends=("macro.elementary.materialize_test",),
+    )
+    shim = _macro(ROOT, "materialization_test_default", depends=(ELEMENTARY_MAT,))
+    record = resolve(
+        manifest(adapter="snowflake", extra_macros=(snowflake, shim)),
+        project_yml(flag="true"),
+    )
+
+    assert record.materialization_macro == f"macro.{ROOT}.materialization_test_default"
+    assert record.materialization == "elementary"
 
 
 # --- hooks and uploads -----------------------------------------------------------
@@ -265,6 +320,10 @@ def test_a_manifest_without_the_package_s_hooks_reads_absent():
     [
         ({"edr_cli_run": True}, None, "return_early"),
         ({"edr_cli_run": "true"}, None, "return_early"),
+        ({"edr_cli_run": "FALSE"}, None, "run"),
+        # Not the exact string, so a truthy one to the package's ``if``.
+        ({"edr_cli_run": " false"}, None, "return_early"),
+        ({"edr_cli_run": 0}, None, "run"),
         # The package's scope wins over the global value for its own nodes.
         ({"edr_cli_run": True, "elementary": {"edr_cli_run": False}}, None, "run"),
         # --vars wins over both.
