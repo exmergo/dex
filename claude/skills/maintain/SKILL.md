@@ -1,6 +1,6 @@
 ---
 name: maintain
-description: 'Use this to find out whether an existing dbt project or semantic layer (dbt, Ossie, SLayer or Cube) is correct against its warehouse, and if not, why. `maintain verify` checks the project as it stands; against a .dex/ snapshot, `maintain check` finds schema, volume, grain, and semantic drift and `maintain reconcile` proposes the fix. Reach for it whenever an existing project is suspected wrong, whether or not anything is known to have changed: "this model is wrong, work out why", "the numbers look too high", "some rows are missing", "this column is empty", "duplicates in my fact table", "the project is broken", "diagnose why this test fails", "a test fails and nobody changed the model", "the dashboard moved but the code did not", "did anything drift", "the row count dropped", "the metric definition changed". Read-only; fixes come back as reviewable diffs and never overwrite hand-written work. Writing the fix, or repairing a model you just edited, is transform''s; a data question with no project is explore''s.'
+description: 'Use this to find out whether an existing dbt project or semantic layer (dbt, Ossie, SLayer or Cube) is correct against its warehouse, and if not, why. `maintain verify` checks the project as it stands; against a .dex/ snapshot, `maintain check` finds schema, volume, grain, and semantic drift and `maintain reconcile` proposes the fix. Reach for it whenever an existing project is suspected wrong, whether or not anything is known to have changed: "this model is wrong, work out why", "the numbers look too high", "some rows are missing", "this column is empty", "duplicates in my fact table", "the project is broken", "diagnose why this test fails", "a test fails and nobody changed the model", "which models have no tests", "how good is our test coverage", "did anything drift", "the metric definition changed". Read-only; fixes come back as reviewable diffs and never overwrite hand-written work. Writing the fix, or repairing a model you just edited, is transform''s; a data question with no project is explore''s.'
 compatibility: 'Needs a local shell and uv. On first use, uv builds the exmergo-dex-core engine from the source bundled with the plugin, or installs it from PyPI at the version scripts/run.py pins when no source is bundled. Runs in Claude Code or another agent that loads Agent Skills and has a shell, not in claude.ai chat.'
 ---
 
@@ -104,7 +104,13 @@ the project edits, migrations and dev builds described below.
    change reached beyond its statement.
 4. **Apply.** `dex transform apply <plan-id>` writes the plan as a reviewable
    diff. A `needs_confirmation` here means a file changed since planning:
-   plan again against it. A commit carrying files Dex wrote ends with the
+   plan again against it. Apply refuses a plan whose `change_scope` holds an
+   `undeclared` population change, naming each under
+   `data.undeclared_population_changes`: record an assumption naming its
+   `column` (a re-driven model needs `request` or `contract` tier) and plan
+   again, or undo it. `--accept-population-change "<reason>"` applies it
+   anyway and records the reason on the plan; use it only where the request
+   settles the change. A commit carrying files Dex wrote ends with the
    `data.commit_trailer` line, after a blank line.
 5. **Build and verify on dev.**
    `dex transform build --target dev --verify --for-plan <plan-id>`. Read
@@ -112,6 +118,24 @@ the project edits, migrations and dev builds described below.
    a cut-off read, and `details` names where the rest is. A required deliverable
    that `failed`, was `skipped` or is `missing` is not done, whatever relation is
    left in dev from an earlier run; fix what `blockers` names and build again.
+   `outcome: built_unverified` means every deliverable built and part of the
+   change is still open: `data.completion.unverified` names each model and
+   reason (`comparison_not_run`, `comparison_contradicted`,
+   `undeclared_population_change`, `introduced_high_finding`,
+   `unattributed_high_finding`, `downstream_population_changed`). It is not
+   done.
+   `data.verification.introduced` lists the findings this plan introduced,
+   judged against the last `--verify` build before it was applied, and they
+   lead `findings`; an `existing` finding predates the plan, an `unattributed`
+   one could not be placed. Never dismiss an introduced finding as inherited.
+   `data.completion.impact` says what the plan did to the models it rewrote and
+   to every unedited model below them, measured against the tree before the
+   plan, largest change first: rows, keys removed and added, and on a mart the
+   columns that changed on kept keys. A model you did not edit whose rows or
+   keys moved (`downstream_population_changed`, naming the edit upstream) is
+   a defect in that edit unless the request asked for it; when it did, record
+   the new population on that model as an assumption naming its key `column`
+   at `request` or `contract` tier. An `unchecked` model was not measured.
    `build_only` means nothing checked those rows. Then read
    `data.verification.ran`, every finding and everything under
    `suppressed`. A green build says dbt ran, not that the rows are right: a
@@ -410,6 +434,21 @@ fetches the engine's dependencies from PyPI or your configured index.
    comes back as a conflict, never an overwrite.
 5. **Re-baseline** once the result is known-good: `explore map`, then
    `maintain snapshot`.
+
+For a question about the tests rather than the data ("which models have no
+tests", "would our tests catch a bug", "did they pass"), run `maintain coverage`.
+It is free and needs no baseline. Report its answers apart, each with the
+denominator it states: which resources and columns have tests, each test's
+status in the last run (with that run's age), each model's recorded mutation
+score (`fresh` or `stale`, never quoted as current when stale), and what checks
+each declared fact. Never combine them into one coverage number. A column only
+a singular test reads is `referenced`, with the role it is read in, and never
+counts as asserted: a `join` read asserts nothing about the key. A model with
+no score is measured with `transform test --mutate <model>`; to refresh every
+stale and missing score at once, run `maintain coverage --mutate`. It takes 25
+models at most per run, and runs again on the rest. It is priced and confirmed
+once for the whole batch on a metered connector, under the same spending rules
+as any confirmation.
 
 Per-axis fields and finding codes are in
 `${CLAUDE_SKILL_DIR}/references/axes.md`. Read it when a finding's code or field

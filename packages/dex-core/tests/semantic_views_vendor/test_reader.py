@@ -167,6 +167,76 @@ class TestSemanticViewSemanticSource(
         return source(self.root, SHOP), "shop.orders", dimensions, measures
 
 
+class TestAccountSemanticViewSource(SemanticSourceFactoryContract):
+    """Under `semantic.deployment: snowflake_account` (#1357) the files are
+    optional: a source with none builds, reads nothing, and says why."""
+
+    @pytest.fixture(autouse=True)
+    def _root(self, tmp_path: Path) -> None:
+        self.root = tmp_path
+
+    def build_source(self, context: SemanticSourceContext):
+        return SemanticViewSemanticLayer.from_context(context)
+
+    def empty_source_context(self) -> SemanticSourceContext:
+        """No file at all: the catalog is the account's."""
+        return SemanticSourceContext(
+            repo_root=str(self.root),
+            connector="snowflake",
+            options={"files": []},
+            deployment="snowflake_account",
+        )
+
+    def absent_document_context(self) -> SemanticSourceContext:
+        return self.empty_source_context()
+
+    def test_with_no_file_every_channel_says_why(self) -> None:
+        built = self.build_source(self.empty_source_context())
+
+        for notes in (
+            built.semantic_catalog().notes,
+            built.declared_definitions().notes,
+            built.semantic_layer().notes,
+        ):
+            assert any("snowflake_account" in note for note in notes)
+
+    def test_local_still_refuses_no_file(self) -> None:
+        context = SemanticSourceContext(
+            repo_root=str(self.root), connector="snowflake", options={"files": []}
+        )
+        with pytest.raises(Exception, match=r"semantic\.snowflake\.files"):
+            self.build_source(context)
+
+
+class TestAccountSemanticViewBackend(SemanticBackendContract):
+    """The `snowflake_account` layer, held to the backend contract over a seeded
+    account read (no engine, no connection)."""
+
+    def make_backend(self):
+        from exmergo_dex_core.explore.semantic.semantic_views_account import (
+            AccountSemanticViewLayer,
+        )
+
+        from .account_fake import SALES, _deployed_yaml
+
+        return AccountSemanticViewLayer(
+            reader=(
+                lambda: ["SHOP.PUBLIC.SALES"],
+                lambda _fq: _deployed_yaml(SALES),
+            )
+        )
+
+    def test_it_says_where_its_definitions_came_from(self) -> None:
+        payload = self.make_backend().list_definitions().to_data()
+
+        assert payload["source"] == "account"
+        assert payload["coverage"][0]["coverage"] == "full"
+        assert (payload["deployment"], payload["execution"]) == (
+            "snowflake_account",
+            "dex",
+        )
+
+
 class TestSemanticViewBackend(SemanticBackendContract):
     """The `explore semantic` layer, held to the backend contract."""
 

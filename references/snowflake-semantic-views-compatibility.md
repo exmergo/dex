@@ -36,11 +36,12 @@ rather than as every definition changing.
 |---|---|---|
 | `config validate` and `config get` on a `semantic.snowflake` block | none | always available |
 | reading the layer: `explore semantic list`, `--use-project`, `maintain` | `[semantic-views]`, the dialect engine (every connector extra already carries it) | refused by name, `reason: prerequisite` |
-| a governed `explore semantic query` or `values`, and `list --deployed` | `[semantic-views]` and `[snowflake]`, the warehouse connector | refused by name |
+| a governed `explore semantic query` or `values`, `list --deployed`, and every `explore semantic` command under `semantic.deployment: snowflake_account` | `[semantic-views]` and `[snowflake]`, the warehouse connector | refused by name |
 
-Reading the layer installs no Snowflake package and opens no Snowflake
-connection. The `[snowflake]` extra is the warehouse connector, which only a
-governed query, a values read and `list --deployed` need.
+Reading the repository's files installs no Snowflake package and opens no
+Snowflake connection. The `[snowflake]` extra is the warehouse connector, which
+only a governed query, a values read, `list --deployed`, and a catalog read from
+the account (`snowflake_account`) need.
 
 ## The YAML document is read; the DDL is not
 
@@ -272,8 +273,47 @@ Snowflake. On the dogfood account a role holding only SELECT on the view, with
 secondary roles off, read every private member back, so `limited` guards a
 behaviour Snowflake does not show today.
 
+## The account alone: `semantic.deployment: snowflake_account` (#1357)
+
+With `snowflake_account`, the catalog is read from the account, and no repository
+file is needed. It is the Snowflake counterpart of a hosted dbt Cloud layer, read
+by `explore` only.
+
+1. `SHOW SEMANTIC VIEWS` per allowlisted scope lists every view (no warehouse).
+2. `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` reads each one back (cloud services, no
+   warehouse). `query` and `values` read back only the view their tokens name.
+3. Each read-back is validated by the reader that reads a file, with every rule
+   above. A read-back that does not validate is `refused` in `coverage`, with
+   the reader's diagnostics as its reasons.
+
+What is the same as under `local`: the render, the refusals before anything
+billed is sent, the PII gate through the catalog's lineage, pricing from the base
+tables, the allowlist as a cost boundary, and execution through Dex's own
+Snowflake connector (`execution: dex`).
+
+What is different:
+
+| | `local` | `snowflake_account` |
+|---|---|---|
+| Where the catalog comes from | the configured files | every semantic view in the source allowlist's scopes |
+| The deployed view, before a query | held to the file; any difference refuses | held to nothing: the account is the source of truth |
+| Said on every result | nothing extra | a warning that the definitions were read from the account and not checked against a reviewed file; `source: account` on the catalog, `definition_source: account` on a query or values result |
+| A configured file for the same view | is the definition | named on the view (`repository_file` in `coverage`, a note on each query or values result), never compared; `--local` holds the deployment to it |
+| Names | the file's spelling | the file's spelling where a configured file describes the view, else Snowflake's (an unquoted name comes back upper-cased); tokens match ignoring case |
+| `coverage: limited` | a private member of the file the role could not read back | also a read-back that reads a member it does not carry; a query relying on one is refused |
+| A name in two allowlisted scopes | refused when queried | `refused` in `coverage` for each copy, naming both and `--scope` |
+| The PII gate | before anything is sent | after the free read-back, before any warehouse statement: a token resolves only against the account's definitions |
+| `maintain`, `transform`, `--use-project` | the files | the files, where configured; with none, each says so instead of reporting a clean layer |
+| `explore relationships` and `explore map` with `--use-hosted-semantic-layer` | refused (no hosted read) | folds the account's keys and relationships in, on the base tables they join |
+
+`--deployed` changes nothing here, and `--api` is refused: Dex executes, so there
+is no vendor execution to switch to.
+
 ## What this release does not do
 
+- **The account as a maintain or transform source.** `maintain` and `transform`
+  read no account layer (#1357 is explore only), and a deployed view is not
+  adopted into the repository as a file.
 - **DDL and dbt models.** A `CREATE SEMANTIC VIEW` file and a
   `dbt_semantic_view` model are refused by name; only the YAML specification is
   read and authored (#1298).
@@ -464,6 +504,9 @@ scratch schema, under a deployer role kept apart from the identity Dex runs as
   each equal to SQL written by hand over the base tables;
 - a repository edited away from its deployment, refused before the cost
   handshake, with nothing reaching the spend ledger;
+- with `semantic.deployment: snowflake_account` and no file, `list` finding both
+  views at `full` coverage, and every query and values case above equal to the
+  same hand-written SQL;
 - the `maintain` loop on a table the test creates: a dropped column found as
   `declared_column_missing`, cut by `maintain reconcile`, applied, and clean.
 

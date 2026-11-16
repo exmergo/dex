@@ -14,6 +14,103 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.18.0] - 2026-11-16
+
+### Added
+
+- **`maintain verify` judges a project format's declared foreign keys without dbt
+  artifacts.** A project format other than dbt (one named under `project.format`)
+  can declare foreign keys, but nothing measured them: verify suppressed the join
+  contract and parent population for want of a dbt `target/`, and dbt's own
+  `relationships` test result was the only judge. Each declared foreign key is now
+  measured against its parent with the join contract's coverage probe, placed
+  where the format's `model_relations` puts each side, and reported as one record
+  per key under `data.foreign_key_coverage` (`model`, `column`, `to_model`,
+  `to_column`, and a `status` of `satisfied`, `contradicted`, `not_applicable` or
+  `unchecked` with a `reason_code`). Any non-NULL child value the parent lacks is a
+  high `foreign_key_orphans` finding, since a foreign key states containment. A
+  model the format places in no relation is `unchecked` with
+  `no_declared_relation`, never found by name. On a metered connector the probe is
+  priced in verify's one offer. A dbt project is unchanged: dbt still judges these
+  through its own `relationships` tests. ([#1217](https://github.com/exmergo/dex/pull/1217))
+- **`dex maintain coverage` inventories the tests a dbt project declares.** It
+  reads a fresh `dbt parse` of a copy of the project, so it is free on every
+  connector, opens no connection and needs no baseline. For each enabled model,
+  source, snapshot and seed it counts its own generic, singular, unit and
+  freshness tests (with each test's severity), lists the tests on downstream
+  resources apart, says whether an incremental model has a unit test that takes
+  its `is_incremental()` branch, and splits documented columns into asserted and
+  unasserted. Every ratio in `data.summary` names its numerator, denominator and
+  what the denominator counts; package and disabled resources are counted and
+  named under `excluded`. It takes the `maintain verify` selector and `--full`,
+  reports only (never fails on low coverage), and is reviewed for values-free
+  mode. `DexEngine.coverage()` is the library spelling. ([#1328](https://github.com/exmergo/dex/pull/1328))
+- `transform build --verify --for-plan` now measures what a plan did to the models below its edits (#1231). The models the plan rewrote and every unedited model below them are re-executed against the tree before the plan, which `transform apply` now records on the plan as `baseline_sources` (else the git `HEAD` blob whose hash the plan recorded). Per model, `data.verification.impact` counts rows and keys on each side (kept, removed, added, duplicated; keys compared as text, so a retyped key still matches) and, on a mart, the kept keys each column changed on; counts and names only. An unedited model whose rows or keys moved is a `downstream_population_changed` finding naming the edit upstream, attributed `introduced`, and an `unverified` reason that keeps the build from reading `validated`, unless its declaration records the population as an assumption at `request` or `contract` tier. `data.completion.impact` leads with the largest changes. On billed connectors the statements are priced with the build as `(downstream impact)`, and a model above a quarter of the command ceiling is `unchecked: cost`. `data.change_scope.downstream` names, at plan time and for free, the unedited models below each rewrite. ([#1333](https://github.com/exmergo/dex/pull/1333))
+- **`dex maintain coverage` reports last-run status, recorded mutation strength
+  and declared-fact coverage beside the test inventory.** Each test carries its
+  status in the newest `run_results.json` a dbt build wrote (Dex's or a plain
+  `dbt build`'s), `not_run` where that run did not include it, with the run's
+  invocation and age. `transform test --mutate` now records each model's result
+  in `.dex/`, and coverage reads it back as the model's `strength`: `fresh`,
+  `stale` (naming whether the model's SQL, its tests or a downstream test it ran
+  changed), `missing` or `untestable`, counted per status with score bands and
+  no project score. A `declarations` section names, for each declared fact, the
+  dbt tests and `maintain verify` checks that can judge it, or that nothing does.
+  All of it is free and connectionless. Store backends gain an optional
+  `MutationRecords` capability, held to the conformance suite as
+  `MutationRecordsContract`. ([#1343](https://github.com/exmergo/dex/pull/1343))
+- **`maintain coverage --mutate` refreshes stale and missing mutation scores, and coverage lists the columns singular tests read.** `--mutate` runs `transform test --mutate` for each model whose recorded score is `stale` or `missing`, in selector order (else missing first, upstream first), at most 25 per run (`--max-models` narrows), and reports what it did under `data.refresh`. On a metered connector the whole batch is priced and confirmed once, each run draws on what the budget has left, and the models it did not reach are `not_run`; it is free on DuckDB, dev target only, and refused in values-free mode. Without `--mutate` the command still opens no connection. A model with no SQL to plant a defect in is now recorded and reads `untestable` until it changes, so a refresh always moves on. Each resource's `columns.referenced_columns` lists the columns its singular tests read, with the role each is read in (`predicate`, `join`, `aggregation`, `grouping`, `projection`), counted apart as `columns_referenced_only` and never as asserted; `data.singular_tests` names every test that could not be read, with a reason code. ([#1349](https://github.com/exmergo/dex/pull/1349))
+- **Governed `explore semantic query` and `values` on Snowflake Semantic Views, and `explore semantic list --deployed`.** Under `semantic.vendor: snowflake`, Dex renders `SELECT * FROM SEMANTIC_VIEW(<deployed view> DIMENSIONS ... METRICS ... [WHERE ...])` from the repository's catalog and runs it through its own Snowflake connector under the cost guard (`execution: dex`); every other connector is refused by name. Tokens are the catalog's (`sales.orders.revenue`, `sales.revenue_per_customer`), one view per query, and result columns carry them. A grain-suffixed time dimension (`sales.orders.order_date__month`) renders as `DATE_TRUNC`, `--where` is a Snowflake predicate over dimensions and facts, and a query of facts alone takes `--group-by <fact>` and no metric. Refused by name before anything is sent: facts beside metrics or dimensions, a private, window, level-of-detail or `using_relationships` member, a view declaring `variables`, a dimension the metric's table does not reach many-to-one, a grain on a categorical dimension, a bare `--grain`, and a `--where` naming a metric or one Dex cannot read. The PII gate screens grouped and filtered members and the inputs of a metric that returns one of its values, through the catalog's lineage. Before the cost handshake, Dex locates the deployed view with a warehouse-free `SHOW SEMANTIC VIEWS` over the source allowlist, reads it back with `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` (which resumes no warehouse), and refuses the query when anything it relies on differs from the repository's file, naming the member and the field; a view defined only in the repository, or in two allowlisted schemas, is refused by name. The statement is priced from the base tables the members reach, since Snowflake keeps no bytes for a semantic view. `explore semantic list --deployed` reads the deployed views instead of the files, with `source: deployed` and per-view `coverage` (`full`, `limited`, `refused`); a plain `list` never contacts Snowflake. ([#1355](https://github.com/exmergo/dex/pull/1355))
+- **A live integration suite for Snowflake Semantic Views, and the CI role it deploys with.** `tests/integration/test_snowflake_semantic_views.py` deploys two corpus views over the TPC-H sample data into a scratch schema and holds Dex to them: the read-back comparing clean, `list --deployed`, five governed queries and values against SQL written by hand over the base tables, the stale-definition refusal, and the `maintain` drift loop through `reconcile` and `apply`. `scripts/setup_snowflake_ci.sh` provisions `DEX_CI_SV_DEPLOYER`, the role the suite deploys with, kept apart from the role Dex runs as, and `scripts/setup_snowflake_semantic_views.sh` grants the read role OPERATE on its warehouse so `snowflake.suspend_after_command` works. The docs now state plainly what the Snowflake Semantic View vendor does not do in this release. ([#1356](https://github.com/exmergo/dex/pull/1356))
+- **`maintain coverage` lists a native semantic layer's declarations.** Under `semantic.vendor` set to Ossie, SLayer, Cube, Databricks or Snowflake, the declarations section adds the layer's own facts beside the dbt manifest's, and every record names its `source`. The keys and joins the layer declares are the ones `maintain grain` re-verifies, so they read `dex_verify` with `declared_grain_not_unique`, `declared_join_orphans` and, for a join declared `many_to_one` or `one_to_one`, `join_cardinality_exceeded`. What the layer's `dex` metadata states (roles, references, population, unit, additivity) reads `none`, since nothing checks it on that layer. A fact a dbt model and the layer both declare on the same relation, spelled alike, is listed once per source with `also_declared_by` and counted once. Still free and connectionless, and no population value or rule text is shown. ([#1358](https://github.com/exmergo/dex/pull/1358))
+- **Snowflake Semantic Views read from the account alone: `semantic.deployment: snowflake_account`.** Under `semantic.vendor: snowflake`, the new deployment reads the catalog from every semantic view in the source allowlist's scopes, with no repository file needed: a warehouse-free `SHOW SEMANTIC VIEWS` per scope, then `SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW` per view, each read-back checked by the same validator that reads a file. It is the Snowflake counterpart of `dbt_cloud` and, like it, is read only by `explore semantic list|values|query` and by `explore relationships|map --use-hosted-semantic-layer`, which now fold in the account's keys and joins on their base tables. Dex still renders `SEMANTIC_VIEW(...)` and runs it through its own Snowflake connector (`execution: dex`), so the cost guard, the source allowlist and the PII gate apply exactly as under `local`. What changes is trust. The deployed definition is the only one, so nothing is checked against a file, and every result says so: `list` carries `source: account`, `query` and `values` carry `definition_source: account`, and each carries a warning. `coverage` names every view: `full`; `limited`, where a read-back reads a member it does not carry; or `refused`, for a read-back that was refused or failed validation, or for a name held in two allowlisted scopes, with both copies named and `--scope` suggested. The deployment is opt-in only and never a fallback when `semantic.snowflake.files` is empty. Configured files stay optional and keep serving `maintain`, `transform`, `--use-project` and `--local`, which checks the deployment against them. A deployed view that a configured file describes is named on its result (`repository_file`), takes the file's spelling, and is never silently passed over. ([#1360](https://github.com/exmergo/dex/pull/1360))
+
+### Changed
+
+- **A build says what the plan introduced, and an unfinished change no longer reads as validated.**
+  A `transform build --verify --for-plan` now classifies each finding as
+  `introduced`, `unattributed` or `existing`, judged against the last `--verify`
+  build recorded before the plan was applied and against the manifest's lineage,
+  and lists the introduced ones first, in `data.verification.introduced` and at the
+  head of `data.completion.verification`, so a new high-severity finding is never
+  cut or buried below inherited ones. Where every deliverable built but part of the
+  change is still open (a rewrite applied uncompared while its baseline was ready,
+  an undeclared population change, or an introduced high-severity finding),
+  `data.outcome` reads `built_unverified` with each reason under
+  `data.completion.unverified`; `data.evidence.outcome` keeps `validated`.
+  `transform apply` now refuses a plan whose change scope records an undeclared
+  population change, naming each under `data.undeclared_population_changes`, until
+  an assumption records it or `--accept-population-change "<reason>"` accepts it,
+  which is recorded on the plan. ([#1329](https://github.com/exmergo/dex/pull/1329))
+- **The skills stay on a supported Python when your newest is 3.15.** Dex supports
+  Python 3.11 to 3.14. The skill wrappers now hold both their own interpreter and
+  the engine's environment to that range, so uv picks an installed 3.14 or older,
+  or downloads one, instead of installing the engine on 3.15, where dependencies
+  that ship no 3.15 wheels fail to build (the Databricks extra did). An explicit
+  `UV_PYTHON` still wins. The README, the installation page and the package README
+  state the range, and the installation page shows `uv tool install --python 3.14`
+  for a standalone install on a machine whose newest Python is 3.15. ([#1335](https://github.com/exmergo/dex/pull/1335))
+- **Query results now serialize list and array cells as JSON arrays instead of Python repr strings.** Cells with array types previously fell back to string coercion in `json_safe`, emitting Python repr strings like `"[1, 2]"`. Array cells now serialize as JSON arrays, with nested cell-width truncation applied to long string elements and payload-byte caps preserved. ([#1337](https://github.com/exmergo/dex/pull/1337))
+
+### Fixed
+
+- **Qualifying a GROUP BY key is no longer reported as a grain change.**
+  Table qualifiers on GROUP BY keys are stripped during comparison so alias-only
+  refactors do not trigger `group_by_changed` and keep the population classified
+  as kept. Real grain changes, including case changes in quoted identifiers and
+  string literals, continue to be reported. ([#1174](https://github.com/exmergo/dex/pull/1174))
+- **Honor runtime error and partial success dbt statuses in standalone maintain verify.** The standalone build status sweep now reuses shared build status classification, reporting `runtime error` and `failed` as `node_failed` findings, tracing skipped descendants back to their failed ancestors, and noting unrecognized statuses like `partial success` and `no-op` as unchecked rather than omitting them. ([#1338](https://github.com/exmergo/dex/pull/1338))
+- **Establish build completion and coverage for plans that only add dbt tests.** `required_nodes` now resolves singular test edits (`EditKind.TEST_SQL`) and native unit test definitions (`unit_tests:` in schema YAML) to their expected test nodes, including across configured test paths. Build completion recognizes passing and warning test runs as satisfied test deliverables without conflating test execution with model rebuilds. Skipped, disabled, failed, or missing tests are reported explicitly and prevent validated completion, while unrelated model builds report `unrelated` outcome. ([#1340](https://github.com/exmergo/dex/pull/1340))
+- **SLayer authoring and retype checks resolve measure references read through joins.** Saved measures that aggregate a column across single-hop or multi-hop joins now evaluate that column's allowed aggregation rules, including primary key restrictions and type defaults for ARRAY and TEXT columns. When a joined column is retyped, maintain schema lists affected dependent measures under `breaks_measures` and advises on the required measure rewrites. Unknown or unresolvable joins remain explicitly unchecked during authoring validation. ([#1344](https://github.com/exmergo/dex/pull/1344))
+- **Reconcile links covered advisories to the native semantic plan.**
+  When a mechanical semantic plan is validated during reconcile, advisories that
+  the plan already repairs are linked to it instead of being repeated as
+  independent manual proposals. Uncovered advisories, such as removals held back
+  by guards or unrepresentable repairs, remain separate manual proposals. ([#1345](https://github.com/exmergo/dex/pull/1345))
+- **A nation, country, region or continent name is no longer flagged as a personal name.** The generic `*_name` PII match now treats `nation`, `country`, `region` and `continent` as non-person qualifiers, so `nation_name` can be grouped by in a governed semantic query instead of being refused as PII. A bare `name`, a `customer_name`, an ambiguous `n_name` and a `city_name` (address data) are still flagged. ([#1356](https://github.com/exmergo/dex/pull/1356))
+- **Ossie snapshots record which key is the primary key and which are `unique_keys`.** A violated or lapsed `unique_keys` entry was worded as a primary-key claim, in the finding and in the `maintain reconcile` advice. The snapshot now records `key_claims` for each Ossie key, so both say the layer declares the columns unique. A key left out because a field links no column drops its claim too. Snapshots taken before this read as they did.
+
+
 ## [1.17.9] - 2026-11-13
 
 ### Added

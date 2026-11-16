@@ -641,13 +641,25 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # here, read statically. The views deployed in a workspace are a second copy
     # dex neither reads nor writes in this release (#964 reads them, explicitly).
     "databricks": ("local",),
-    # Snowflake Semantic Views: the Semantic View YAML documents committed here,
-    # read statically. The views deployed on an account are a second copy dex
-    # never writes; it reads them only explicitly (#1290): a governed query reads
-    # back the view it runs on, and `explore semantic list --deployed` reads them
-    # all. Neither is a deployment setting, so `local` stays the only one.
-    "snowflake": ("local",),
+    # Snowflake Semantic Views. `local` is the Semantic View YAML documents
+    # committed here, read statically; a governed query reads back the view it
+    # runs on and holds it to the file, and `list --deployed` reads the views
+    # deployed from the files (#1290). `snowflake_account` (#1357) reads the
+    # catalog from the account alone, every semantic view the source allowlist
+    # holds, with no file needed: the Snowflake counterpart of `dbt_cloud`, read
+    # by `explore` only. Dex still renders and executes the query, so only the
+    # catalog source changes, and the trust reverses: the deployed definition is
+    # the only one, and every result says it was not checked against a file.
+    "snowflake": ("local", "snowflake_account"),
 }
+
+#: The (vendor, deployment) pairs whose catalog is not the vendor's repository
+#: files, so `semantic.<vendor>.<listing>` is optional under them. The files,
+#: when configured, keep serving `maintain`, `transform`, `--use-project` and
+#: `--local`, as a local dbt project does beside `dbt_cloud`.
+SEMANTIC_DEPLOYMENTS_READING_NO_FILES: frozenset[tuple[str, str]] = frozenset(
+    {("snowflake", "snowflake_account")}
+)
 
 #: The factory that builds a vendor's own semantic source, for the vendors whose
 #: layer is not the transformation project. A table rather than a branch, and
@@ -695,6 +707,7 @@ _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "dbt_cloud": "dbt_cloud",
     "api": "dbt_cloud",
     "cloud": "dbt_cloud",
+    "snowflake_account": "snowflake_account",
 }
 
 
@@ -1135,6 +1148,13 @@ class SemanticConfig(BaseModel):
     ``databricks.files`` is the Metric View equivalent (see
     :class:`DatabricksSemanticConfig`), on the same terms.
 
+    ``snowflake.files`` is the Semantic View equivalent. Snowflake has a second
+    deployment, ``snowflake_account`` (#1357): ``explore semantic`` reads the
+    catalog from the semantic views the source allowlist holds on the account,
+    and dex still renders and executes the query. ``files`` is optional there;
+    configured files keep serving ``maintain``, ``transform``, ``--use-project``
+    and ``--local``, as a local dbt project does beside ``dbt_cloud``.
+
     A third property, **who executes**, is derived from those two and never
     configured, because it is what decides whether the cost guard can apply at
     all. Each backend declares it (``execution``: ``dex`` or ``vendor``) and every
@@ -1221,7 +1241,11 @@ class SemanticConfig(BaseModel):
         # conditions here.
         for named, section in _vendor_sections(self):
             listing = section.LISTING
-            if named == vendor and not getattr(section, listing):
+            if (
+                named == vendor
+                and not getattr(section, listing)
+                and (vendor, deployment) not in SEMANTIC_DEPLOYMENTS_READING_NO_FILES
+            ):
                 raise ValueError(
                     f"semantic.vendor: {named} needs semantic.{named}.{listing}: "
                     f"{section.LISTING_MEANS}"

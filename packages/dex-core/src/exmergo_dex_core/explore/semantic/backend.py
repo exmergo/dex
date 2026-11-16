@@ -232,6 +232,12 @@ def _local_semantic_views(engine: Any) -> SemanticLayer:
     return LocalSemanticViewLayer.from_engine(engine)
 
 
+def _account_semantic_views(engine: Any) -> SemanticLayer:
+    from .semantic_views_account import AccountSemanticViewLayer
+
+    return AccountSemanticViewLayer.from_engine(engine)
+
+
 # Which backend answers for a resolved (vendor, deployment) pair. A table rather
 # than a chain of conditions, so a vendor is a row here and nowhere else, and so
 # a deployment that resolved is a deployment that gets used: the previous shape
@@ -249,6 +255,7 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("cube", "local"): _local_cube,
     ("databricks", "local"): _local_metric_views,
     ("snowflake", "local"): _local_semantic_views,
+    ("snowflake", "snowflake_account"): _account_semantic_views,
 }
 
 # Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
@@ -290,6 +297,13 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
         "a semantic source supplies a hosted dbt Cloud token and has no "
         "meaning for Snowflake Semantic View files, which are files in this "
         "repository. Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+    ("snowflake", "snowflake_account"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Snowflake Semantic Views read from the account, which are "
+        "read through this engine's own Snowflake connection and credential. "
+        "Drop the source, or select a hosted dbt semantic layer with "
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),
 }
@@ -358,6 +372,29 @@ def resolve_semantic_layer(
         if refusal is not None:
             raise SemanticBackendError(refusal)
     return build(engine)
+
+
+def resolve_hosted_semantic_layer(engine: Any) -> SemanticLayer:
+    """The layer ``--use-hosted-semantic-layer`` reads: the configured
+    deployment where it is not the repository's own (dbt Cloud, or Snowflake's
+    account, #1357), else the vendor's hosted execution override (``--api``).
+
+    Read off the configured deployment rather than a vendor name, so a deployment
+    whose catalog is the account folds in what it read there instead of being
+    sent to an override the vendor does not have.
+    """
+
+    from ...config import canonical_semantic_deployment
+
+    semantic = getattr(engine.config, "semantic", None)
+    configured = canonical_semantic_deployment(
+        getattr(semantic, "deployment", None)
+        or getattr(semantic, "backend", None)
+        or "local"
+    )
+    if configured != "local":
+        return resolve_semantic_layer(engine)
+    return resolve_semantic_layer(engine, api=True)
 
 
 # RETRO: Compatibility names retained for callers that imported the first version of

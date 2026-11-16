@@ -172,9 +172,12 @@ def _repo(
     files: dict[str, str],
     *,
     databases: list[str],
+    semantic_deployment: str = "local",
 ) -> Path:
     """A repository holding ``files`` as its Semantic View layer, read by dex's
-    own identity (the suite's connection, never the deployer's)."""
+    own identity (the suite's connection, never the deployer's).
+    ``semantic_deployment="snowflake_account"`` reads the account alone, where
+    ``files`` may be empty (#1357)."""
 
     paths = []
     for name, text in files.items():
@@ -193,7 +196,11 @@ def _repo(
         "connector": "snowflake",
         "snowflake": snowflake,
         "budget": integration_budget(),
-        "semantic": {"vendor": "snowflake", "snowflake": {"files": paths}},
+        "semantic": {
+            "vendor": "snowflake",
+            "deployment": semantic_deployment,
+            **({"snowflake": {"files": paths}} if paths else {}),
+        },
     }
     (root / ".dex").mkdir(parents=True, exist_ok=True)
     (root / ".dex" / "config.yml").write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -381,6 +388,53 @@ def test_a_governed_answer_matches_sql_over_the_base_tables(
     assert _rows(data["cells"]) == _rows(deployment.truth(by_hand))
     if argv[2] == "values":
         assert data["scoped_to"] == ["star.orders.order_count"]
+
+
+# --- the account alone (#1357) --------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def account_layer(
+    tmp_path_factory: pytest.TempPathFactory, deployment: Deployment
+) -> Path:
+    """A repository with no Semantic View file: the catalog is the account's."""
+
+    return _repo(
+        tmp_path_factory.mktemp("account"),
+        deployment,
+        {},
+        databases=[deployment.scope, TPCH],
+        semantic_deployment="snowflake_account",
+    )
+
+
+def test_account_only_list_reads_every_deployed_view(account_layer: Path, capsys):
+    rc, envelope = run_cli(
+        ["--repo-root", str(account_layer), "explore", "semantic", "list"], capsys
+    )
+
+    data = assert_ok(rc, envelope)["data"]
+    assert (data["deployment"], data["source"]) == ("snowflake_account", "account")
+    assert {c["view"].lower(): c["coverage"] for c in data["coverage"]} == (
+        dict.fromkeys(VIEWS, "full")
+    )
+    # No file lends a spelling: Snowflake's own (an unquoted name, upper-cased).
+    assert "star.orders.order_count" in {m["name"].lower() for m in data["metrics"]}
+    assert any("not checked against one" in w for w in envelope["warnings"])
+
+
+@pytest.mark.parametrize("case", sorted(CASES))
+def test_an_account_only_answer_matches_sql_over_the_base_tables(
+    account_layer: Path, deployment: Deployment, capsys, case: str
+):
+    argv, by_hand = CASES[case]
+    envelope = _ask_then_run(account_layer, capsys, *argv)
+    data = envelope["data"]
+
+    assert data["deployment"] == "snowflake_account"
+    assert data["definition_source"] == "account"
+    assert not data.get("truncated"), data
+    assert _rows(data["cells"]) == _rows(deployment.truth(by_hand))
 
 
 # --- the stale-definition refusal ----------------------------------------------------

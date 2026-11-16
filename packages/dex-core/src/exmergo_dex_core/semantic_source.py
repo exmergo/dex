@@ -79,10 +79,10 @@ class SemanticSourceContext:
     resolved, never a live adapter and never a credential: a source may have to
     read an authored relation name the way the active warehouse would, and
     identifier arity, quoting, and unquoted-case folding are the connector's
-    rules. ``options`` is the source's own non-secret coordinates, passed through
-    verbatim from the configuration section named after the vendor, and it is the
-    source's job to refuse an option it cannot honor rather than accept and
-    ignore it.
+    rules. ``deployment`` is the configured semantic deployment. ``options`` is
+    the source's own non-secret coordinates, passed through verbatim from the
+    configuration section named after the vendor, and it is the source's job to
+    refuse an option it cannot honor rather than accept and ignore it.
 
     **Construction has to be cheap and must read nothing.** dex builds a source
     per command rather than holding one, because a document is an artifact a
@@ -96,6 +96,11 @@ class SemanticSourceContext:
     repo_root: str | None = None
     connector: str | None = None
     options: Mapping[str, Any] = field(default_factory=dict)
+    #: The configured ``semantic.deployment``, canonical, or None where no config
+    #: says. A source whose files are optional under one deployment (Snowflake's
+    #: ``snowflake_account``, whose catalog is the account) reads it to accept an
+    #: empty listing there and refuse it everywhere else.
+    deployment: str | None = None
 
 
 @runtime_checkable

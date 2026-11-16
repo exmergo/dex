@@ -22,14 +22,16 @@ def _config(**snowflake) -> DexConfig:
 
 
 def test_the_vendor_reads_its_files() -> None:
-    """Local only, and authored through `semantic snowflake` (#1292)."""
+    """Local, or read from the account (#1357); authored through `semantic
+    snowflake` (#1292)."""
     config = _config(files=["semantic/orders.yaml", "semantic/lines.yml"])
 
     assert config.semantic.snowflake.files == [
         "semantic/orders.yaml",
         "semantic/lines.yml",
     ]
-    assert SEMANTIC_DEPLOYMENTS["snowflake"] == ("local",)
+    assert SEMANTIC_DEPLOYMENTS["snowflake"] == ("local", "snowflake_account")
+    assert config.semantic.deployment == "local"
     assert "snowflake" in SEMANTIC_DOCUMENT_AUTHORING
 
 
@@ -72,3 +74,74 @@ def test_the_files_are_only_valid_for_this_vendor() -> None:
         DexConfig.model_validate(
             {"semantic": {"vendor": "dbt", "snowflake": {"files": ["a.yaml"]}}}
         )
+
+
+# --- semantic.deployment: snowflake_account (#1357) ---------------------------------
+
+
+def _account(**semantic) -> DexConfig:
+    return DexConfig.model_validate(
+        {
+            "connector": "snowflake",
+            "semantic": {
+                "vendor": "snowflake",
+                "deployment": "snowflake_account",
+                **semantic,
+            },
+        }
+    )
+
+
+def test_the_account_deployment_needs_no_files() -> None:
+    """The catalog is the account's, so the listing is optional there."""
+    config = _account()
+
+    assert config.semantic.deployment == "snowflake_account"
+    assert config.semantic.backend == "snowflake_account"
+    assert config.semantic.snowflake.files == []
+
+
+def test_the_account_deployment_keeps_configured_files() -> None:
+    """As a local dbt project sits beside dbt_cloud: maintain, transform and
+    --local keep reading them."""
+    config = _account(snowflake={"files": ["views/sales.yaml"]})
+
+    assert config.semantic.snowflake.files == ["views/sales.yaml"]
+
+
+def test_local_still_needs_its_files() -> None:
+    """Never a fallback when the listing is empty."""
+    with pytest.raises(ValidationError, match=r"semantic\.snowflake\.files"):
+        DexConfig.model_validate(
+            {"semantic": {"vendor": "snowflake", "deployment": "local"}}
+        )
+
+
+def test_the_released_backend_spelling_agrees_or_is_refused() -> None:
+    config = DexConfig.model_validate(
+        {"semantic": {"vendor": "snowflake", "backend": "snowflake_account"}}
+    )
+    assert config.semantic.deployment == "snowflake_account"
+
+    with pytest.raises(ValidationError, match="name different deployments"):
+        _account(backend="local", snowflake={"files": ["a.yaml"]})
+
+
+@pytest.mark.parametrize("deployment", ["dbt_cloud", "account"])
+def test_another_deployment_is_refused_by_name(deployment: str) -> None:
+    with pytest.raises(ValidationError, match="snowflake_account"):
+        DexConfig.model_validate(
+            {"semantic": {"vendor": "snowflake", "deployment": deployment}}
+        )
+
+
+def test_the_account_deployment_belongs_to_snowflake_only() -> None:
+    with pytest.raises(ValidationError, match="local, dbt_cloud"):
+        DexConfig.model_validate(
+            {"semantic": {"vendor": "dbt", "deployment": "snowflake_account"}}
+        )
+
+
+def test_the_dbt_cloud_coordinates_are_still_refused() -> None:
+    with pytest.raises(ValidationError, match="hosted dbt"):
+        _account(host="sl.cloud.getdbt.com")

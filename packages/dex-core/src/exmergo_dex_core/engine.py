@@ -929,6 +929,7 @@ class DexEngine:
                 repo_root=self.repo_root,
                 connector=self.connector or self.config.connector,
                 options=options,
+                deployment=getattr(self.config.semantic, "deployment", None),
             ),
         )
 

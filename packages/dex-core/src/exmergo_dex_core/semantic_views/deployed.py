@@ -37,15 +37,24 @@ from ..errors import DexError
 from .model import LogicalTable, Member, SemanticView
 
 __all__ = [
+    "AccountRead",
     "Coverage",
     "DeployedRead",
     "Difference",
     "LocateRefused",
     "compare",
     "locate",
+    "read_account",
     "read_deployed",
     "respell",
 ]
+
+#: A query is priced from its base tables, which must stay inside the scope, so
+#: a `--scope` picking one copy of a view repeats for the schema holding them.
+SCOPE_BASE_TABLES = (
+    ", repeated for the schema holding the view's base tables where it is "
+    "another (the scope is also the cost boundary a query is priced within)"
+)
 
 FULL = "full"
 LIMITED = "limited"
@@ -88,6 +97,9 @@ class Coverage:
     deployed_as: str | None
     status: str
     reasons: list[str] = field(default_factory=list)
+    #: Under ``snowflake_account``: the configured repository file describing
+    #: this view, which was not checked against it (#1357).
+    repository_file: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """The payload form."""
@@ -98,6 +110,8 @@ class Coverage:
         }
         if self.reasons:
             found["reasons"] = list(self.reasons)
+        if self.repository_file is not None:
+            found["repository_file"] = self.repository_file
         return found
 
 
@@ -111,6 +125,9 @@ class DeployedRead:
     view: SemanticView | None
     coverage: Coverage
     diagnostics: list[str] = field(default_factory=list)
+    #: Elements whose expression qualifies a read with a table that has no such
+    #: member: what a role that cannot see a private member reads back.
+    unresolved: list[str] = field(default_factory=list)
 
 
 # --- locating ---------------------------------------------------------------------
@@ -139,7 +156,7 @@ def locate(listed: Iterable[str], name: str) -> str:
             f"refused: semantic view '{name}' is deployed in more than one "
             f"allowlisted schema ({', '.join(matches)}), so dex cannot tell which "
             "one the repository's file describes. Narrow the command with "
-            "`--scope <database>.<schema>`"
+            f"`--scope <database>.<schema>`{SCOPE_BASE_TABLES}"
         )
     return matches[0]
 
@@ -185,7 +202,18 @@ def read_deployed(
                 "this role reads no private member back (it needs REFERENCES or "
                 f"OWNERSHIP on the view): {', '.join(hidden)} could not be read"
             ]
-    return DeployedRead(name, deployed_as, text, view, coverage, diagnostics)
+    if view is not None and diagnostics:
+        # The view validated, and the reader refused some of its elements: the
+        # catalog carries the rest, so the read is partial and says what is
+        # missing rather than reading as complete.
+        coverage.status = LIMITED
+        coverage.reasons = [*coverage.reasons, *diagnostics]
+    unresolved = sorted(
+        {d.element for d in loaded.diagnostics if d.rule == "unresolved_member"}
+    )
+    return DeployedRead(
+        name, deployed_as, text, view, coverage, diagnostics, unresolved
+    )
 
 
 def _first_line(message: str) -> str:
@@ -209,6 +237,130 @@ def _hidden_privates(repository: SemanticView, deployed: SemanticView) -> list[s
         if member.private and deployed.metric(member.name) is None
     )
     return hidden
+
+
+# --- the account alone (#1357) -------------------------------------------------------
+
+
+#: Said on every result under ``semantic.deployment: snowflake_account``.
+ACCOUNT_DISCLOSURE = (
+    "definitions read from the semantic views deployed on the account "
+    "(semantic.deployment: snowflake_account), not from a reviewed repository "
+    "file, and not checked against one: the account is the source of truth here"
+)
+
+
+def unchecked_file_reason(file: str) -> str:
+    """Said of a deployed view a configured repository file also describes."""
+
+    return (
+        f"a reviewed repository file ({file}) describes this view and it was not "
+        "checked against it; `--local` holds the deployment to the file"
+    )
+
+
+@dataclass
+class AccountRead:
+    """The semantic views the source allowlist holds, read back.
+
+    ``views`` are the ones that validated, each spelled as a configured file
+    describing it spells it, else as Snowflake returns it; ``coverage`` names
+    every view SHOW listed, the refused included; ``locations`` maps each
+    view's name, lower-cased, to its ``DB.SCHEMA.NAME``; ``files`` each name to
+    the configured file describing it.
+    """
+
+    views: list[SemanticView] = field(default_factory=list)
+    coverage: list[Coverage] = field(default_factory=list)
+    locations: dict[str, str] = field(default_factory=dict)
+    files: dict[str, str] = field(default_factory=dict)
+    listed: list[str] = field(default_factory=list)
+    #: Per view name, lower-cased, the elements its read-back reads and does not
+    #: carry (see :attr:`DeployedRead.unresolved`).
+    unresolved: dict[str, list[str]] = field(default_factory=dict)
+
+    def coverage_of(self, name: str) -> Coverage | None:
+        """The coverage entry for ``name`` (ignoring case), or None."""
+        lowered = name.lower()
+        return next((c for c in self.coverage if c.view.lower() == lowered), None)
+
+
+def read_account(
+    listed: Iterable[str],
+    reader: Callable[[str], str],
+    repository: Iterable[SemanticView] = (),
+    *,
+    names: Iterable[str] | None = None,
+) -> AccountRead:
+    """Every semantic view ``listed`` holds, read back with ``reader``.
+
+    ``listed`` is what SHOW returned over the allowlist's scopes. A name held in
+    two scopes is ``refused`` for each, naming both and ``--scope``, because dex
+    cannot tell which one a token means. ``repository`` is the configured files'
+    views: one describing a deployed view is named on its coverage, never
+    compared, and lends it its spelling. ``names`` narrows the read-back to the
+    views a query names; SHOW already listed every view, so a name not held is
+    still reported.
+    """
+
+    listed = sorted(set(listed))
+    by_name: dict[str, list[str]] = {}
+    for fq in listed:
+        by_name.setdefault(fq.rsplit(".", 1)[-1].lower(), []).append(fq)
+    files = {view.name.lower(): view for view in repository}
+    wanted = None if names is None else {n.lower() for n in names}
+    found = AccountRead(listed=listed)
+    for key in sorted(by_name):
+        if wanted is not None and key not in wanted:
+            continue
+        holders = by_name[key]
+        file_view = files.get(key)
+        display = (
+            file_view.name if file_view is not None else holders[0].rsplit(".", 1)[-1]
+        )
+        file = file_view.file if file_view is not None else None
+        if len(holders) > 1:
+            found.coverage.extend(
+                Coverage(
+                    display,
+                    fq,
+                    REFUSED,
+                    [_ambiguous(display, holders)],
+                    repository_file=file,
+                )
+                for fq in holders
+            )
+            continue
+        where = holders[0]
+        read = read_deployed(display, where, reader, file_view)
+        coverage = read.coverage
+        coverage.repository_file = file
+        if read.view is not None:
+            if read.unresolved:
+                found.unresolved[key] = list(read.unresolved)
+            if coverage.status == FULL and (missing := read.unresolved):
+                coverage.status = LIMITED
+                coverage.reasons = [
+                    "the read-back reads members it does not carry ("
+                    f"{', '.join(missing)}): a private member this role cannot "
+                    "read back, or a column of the base table only the warehouse "
+                    "can vouch for. A query relying on one is refused"
+                ]
+            view = respell(read.view, file_view) if file_view else read.view
+            found.views.append(view)
+            found.locations[key] = where
+            if file is not None:
+                found.files[key] = file
+        found.coverage.append(coverage)
+    return found
+
+
+def _ambiguous(name: str, holders: list[str]) -> str:
+    return (
+        f"semantic view '{name}' is deployed in more than one allowlisted schema "
+        f"({', '.join(holders)}), so dex cannot tell which one a token means. "
+        f"Narrow the command with `--scope <database>.<schema>`{SCOPE_BASE_TABLES}"
+    )
 
 
 # --- comparing ---------------------------------------------------------------------
