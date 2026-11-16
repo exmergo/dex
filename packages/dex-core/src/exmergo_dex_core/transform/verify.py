@@ -406,7 +406,7 @@ def verify_build(
 
     findings, notes = verify_mod.build_status_findings(project_dir)
     result.warnings.extend(notes)
-    if notes:
+    if any("no dbt run results found" in n for n in notes):
         result.suppressed["build_status"] = notes[0]
 
     # dbt just told us which nodes it built, and it is a better authority on

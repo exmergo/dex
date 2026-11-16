@@ -245,6 +245,26 @@ def _vendor_semantic_layer(engine: DexEngine) -> SemanticLayer | None:
         return None
 
 
+def _native_declared_models(engine: DexEngine) -> tuple[dict[str, Any], list[str]]:
+    """The configured semantic vendor's declared models, the `dex` metadata
+    `explore profile --use-project` reads (#1346), and what that metadata held
+    that could not be read. Empty for dbt's own layer, whose declarations come
+    from the manifest. Never raises, like :func:`_vendor_semantic_layer`.
+    """
+
+    from ..config import SEMANTIC_SOURCE_FACTORIES
+
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor not in SEMANTIC_SOURCE_FACTORIES or engine.repo_root is None:
+        return {}, []
+    try:
+        from ..explore.semantic import resolve_semantic_layer
+
+        return resolve_semantic_layer(engine, local=True).declared_models()
+    except (DexError, ValidationError, OSError, ValueError):
+        return {}, []
+
+
 def _semantic_schema_source(engine: DexEngine):
     """The configured semantic source, where it holds its declarations to the
     warehouse schema itself (``SemanticSchemaSource``), else ``None``.
@@ -1141,7 +1161,7 @@ def verify(
         build_findings, build_notes = verify_mod.build_status_findings(project_dir)
         findings.extend(build_findings)
         warnings.extend(build_notes)
-        if build_notes:
+        if any("no dbt run results found" in n for n in build_notes):
             suppressed["build_status"] = build_notes[0]
 
     # A scope may be spelled as separate arguments, comma-separated, or as one
@@ -1962,12 +1982,26 @@ def coverage(
     selected_models = {
         uid for uid in coverage_mod.selected_ids(inventory) if uid.startswith("model.")
     }
+    native_models, native_notes = _native_declared_models(engine)
+    semantic = _vendor_semantic_layer(engine)
+    vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+    if vendor != "dbt" and semantic is None and not native_models:
+        native_notes.append(
+            f"the {vendor} semantic layer could not be read, so its declarations "
+            "are not listed; `maintain semantic` names what failed"
+        )
+    if semantic is not None:
+        native_notes.extend(semantic.notes)
     declared = coverage_declarations.declarations(
         manifest,
         selected=selected_models,
         values_free=_values_free(engine),
         full=full,
+        semantic=semantic,
+        native_models=native_models,
+        selector=selector,
     )
+    notes.extend(native_notes)
     elided = dict(inventory.elided)
     elided["declared_facts"] = declared["elided"]
     return CoverageResult(

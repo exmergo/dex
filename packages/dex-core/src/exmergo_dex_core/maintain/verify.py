@@ -53,11 +53,12 @@ from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
 from ..transform.build import shadow_parse
+from ..transform.evidence import FAILED_STATUSES, status_kind
 from ..value_mask import mask_values
 from .drift import DriftFinding, _grain_severity
 
 #: dbt's own run_results.json status strings that mean the node did not build.
-_FAILURE_STATUSES = frozenset({"error", "fail"})
+_FAILURE_STATUSES = FAILED_STATUSES
 
 # A test dbt ran at `severity: warn` passed the run and failed the assertion.
 # Neither a failure nor a skip, so it fell through both branches and was
@@ -233,22 +234,25 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
         node = nodes.get(uid) or {}
         for dep in (node.get("depends_on") or {}).get("nodes", []):
             status = status_by_uid.get(dep)
-            if status in _FAILURE_STATUSES:
+            if status and status_kind(status) == "failed":
                 return name_of(dep)
-            if status == "skipped":
+            if status and status_kind(status) == "skipped":
                 found = failed_ancestor(dep, seen)
                 if found:
                     return found
         return None
 
     findings: list[DriftFinding] = []
+    notes: list[str] = []
+    unrecognized: list[str] = []
     for result in results:
         uid = result.get("unique_id")
-        status = str(result.get("status", "unknown"))
-        if not uid or status not in _FAILURE_STATUSES | _WARNING_STATUSES | {"skipped"}:
+        if not uid:
             continue
+        status = str(result.get("status", "unknown"))
+        kind = status_kind(status)
         name = name_of(uid)
-        if status in _WARNING_STATUSES:
+        if status.lower() in _WARNING_STATUSES:
             message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
@@ -261,7 +265,7 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                 )
             )
             continue
-        if status in _FAILURE_STATUSES:
+        if kind == "failed":
             message = _dbt_message(result, status)
             findings.append(
                 DriftFinding(
@@ -274,25 +278,37 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                 )
             )
             continue
-        cause = failed_ancestor(uid, set())
-        findings.append(
-            DriftFinding(
-                axis="build",
-                code="node_skipped",
-                identifier=name,
-                # A named cause is a definite causal chain; an unnamed one
-                # (a selector exclusion, an upstream error dbt did not
-                # attribute) is real but less actionable, so it ranks lower.
-                severity="medium" if cause else "low",
-                detail=(
-                    f"'{name}' was skipped because '{cause}' failed to build"
-                    if cause
-                    else f"'{name}' was skipped"
-                ),
-                data={"caused_by": cause} if cause else {},
+        if kind == "skipped":
+            cause = failed_ancestor(uid, set())
+            findings.append(
+                DriftFinding(
+                    axis="build",
+                    code="node_skipped",
+                    identifier=name,
+                    # A named cause is a definite causal chain; an unnamed one
+                    # (a selector exclusion, an upstream error dbt did not
+                    # attribute) is real but less actionable, so it ranks lower.
+                    severity="medium" if cause else "low",
+                    detail=(
+                        f"'{name}' was skipped because '{cause}' failed to build"
+                        if cause
+                        else f"'{name}' was skipped"
+                    ),
+                    data={"caused_by": cause} if cause else {},
+                )
             )
+            continue
+        if kind == "unrecognized":
+            unrecognized.append(name)
+            continue
+
+    if unrecognized:
+        models_str = ", ".join(sorted(unrecognized))
+        notes.append(
+            f"build status unchecked for {models_str}: "
+            "reported a status dex does not recognize"
         )
-    return findings, []
+    return findings, notes
 
 
 def _dbt_message(result: dict, status: str) -> str:
@@ -2480,9 +2496,13 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
         model = manifest_node_label(
             attached, parent if isinstance(parent, dict) else None
         )
-        if status[unique_id] in _FAILURE_STATUSES | _WARNING_STATUSES:
+        st = status.get(unique_id, "")
+        if (
+            status_kind(st) in ("failed", "unrecognized")
+            or st.lower() in _WARNING_STATUSES
+        ):
             unproven.add(model)
-        elif status[unique_id] == "pass":
+        elif st.lower() == "pass":
             proven.setdefault(model, {"columns": columns, "source": source})
     return {model: grain for model, grain in proven.items() if model not in unproven}
 

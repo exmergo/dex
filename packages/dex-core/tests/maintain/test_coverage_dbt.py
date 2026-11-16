@@ -346,3 +346,64 @@ def test_a_missing_git_package_is_named_without_its_credentials(repo: Path, caps
     assert "github.com/org/private-pkg" in json.dumps(envelope)
     assert "s3cr3t" not in json.dumps(envelope)
     assert "transform deps" in json.dumps(envelope)
+
+
+def test_a_native_semantic_layer_adds_its_declared_facts(repo: Path, capsys):
+    """#1346: an Ossie layer beside the dbt project adds its keys to the
+    declarations section, named by source and judged by `maintain grain`."""
+
+    import yaml
+
+    (repo / "layer.ossie.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "version": "0.2.0.dev0",
+                "name": "shop",
+                "datasets": [
+                    {
+                        "name": "orders_layer",
+                        "source": "dev.main.fct_orders",
+                        "primary_key": ["order_id"],
+                        "fields": [
+                            {"name": c, "expression": {"sql": c}}
+                            for c in ("order_id", "amount")
+                        ],
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    config = repo / ".dex" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "semantic:\n  vendor: ossie\n"
+        + "  ossie:\n    files:\n      - layer.ossie.yaml\n",
+        encoding="utf-8",
+    )
+
+    data = _run(repo, capsys, "--full")["data"]
+
+    native = [f for f in data["declarations"]["facts"] if f["source"] == "ossie"]
+    assert native, data["declarations"]
+    grain = next(f for f in native if f["fact"] == "grain")
+    assert grain["column"] == "order_id"
+    assert grain["checked_by"] == "dex_verify"
+    assert grain["verify"] == ["declared_grain_not_unique"]
+    assert data["declarations"]["summary"]["facts"]["by_source"]["ossie"] == len(native)
+
+
+def test_a_semantic_layer_that_cannot_be_read_is_named(repo: Path, capsys):
+    config = repo / ".dex" / "config.yml"
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "semantic:\n  vendor: ossie\n"
+        + "  ossie:\n    files:\n      - missing.ossie.yaml\n",
+        encoding="utf-8",
+    )
+
+    data = _run(repo, capsys)["data"]
+
+    assert not [f for f in data["declarations"]["facts"] if f["source"] == "ossie"]
+    assert any("missing.ossie.yaml" in note for note in data["notes"]), data["notes"]

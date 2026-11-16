@@ -167,6 +167,112 @@ def test_a_successful_node_reports_nothing(tmp_path: Path):
     assert findings == [] and notes == []
 
 
+@pytest.mark.parametrize("status", ["runtime error", "failed"])
+def test_runtime_error_and_failed_statuses_produce_node_failed(
+    tmp_path: Path, status: str
+):
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.a": {"name": "a", "resource_type": "model"}},
+        results=[
+            {"unique_id": "model.p.a", "status": status, "message": "fail detail"}
+        ],
+    )
+    findings, notes = build_status_findings(tmp_path)
+    assert notes == []
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.code == "node_failed"
+    assert finding.identifier == "a"
+    assert finding.severity == "high"
+    assert finding.data["status"] == status
+    assert "fail detail" in finding.detail
+
+
+def test_skipped_child_traces_back_to_runtime_error_parent(tmp_path: Path):
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.parent": {
+                "name": "parent",
+                "resource_type": "model",
+                "depends_on": {"nodes": []},
+            },
+            "model.p.child": {
+                "name": "child",
+                "resource_type": "model",
+                "depends_on": {"nodes": ["model.p.parent"]},
+            },
+        },
+        results=[
+            {
+                "unique_id": "model.p.parent",
+                "status": "runtime error",
+                "message": "failed at runtime",
+            },
+            {"unique_id": "model.p.child", "status": "skipped"},
+        ],
+    )
+    findings, _notes = build_status_findings(tmp_path)
+    assert len(findings) == 2
+    by_identifier = {f.identifier: f for f in findings}
+    assert by_identifier["parent"].code == "node_failed"
+    skipped = by_identifier["child"]
+    assert skipped.code == "node_skipped"
+    assert skipped.severity == "medium"
+    assert skipped.data["caused_by"] == "parent"
+    assert "'parent' failed to build" in skipped.detail
+
+
+@pytest.mark.parametrize("status", ["partial success", "no-op", "unknown"])
+def test_partial_success_and_unrecognized_statuses_are_reported_in_notes(
+    tmp_path: Path, status: str
+):
+    _write_artifacts(
+        tmp_path,
+        nodes={"model.p.a": {"name": "a", "resource_type": "model"}},
+        results=[{"unique_id": "model.p.a", "status": status}],
+    )
+    findings, notes = build_status_findings(tmp_path)
+    assert findings == []
+    assert len(notes) == 1
+    assert "build status unchecked for a" in notes[0]
+    assert "reported a status dex does not recognize" in notes[0]
+
+
+def test_passed_grain_tests_excludes_unrecognized_and_runtime_error_statuses(
+    tmp_path: Path,
+):
+    from exmergo_dex_core.maintain.verify import passed_grain_tests
+
+    _write_artifacts(
+        tmp_path,
+        nodes={
+            "model.p.m1": {"name": "m1", "resource_type": "model"},
+            "model.p.m2": {"name": "m2", "resource_type": "model"},
+            "test.p.unique_m1": {
+                "name": "unique_m1",
+                "resource_type": "test",
+                "attached_node": "model.p.m1",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+            "test.p.unique_m2": {
+                "name": "unique_m2",
+                "resource_type": "test",
+                "attached_node": "model.p.m2",
+                "test_metadata": {"name": "unique", "kwargs": {"column_name": "id"}},
+            },
+        },
+        results=[
+            {"unique_id": "test.p.unique_m1", "status": "runtime error"},
+            {"unique_id": "test.p.unique_m2", "status": "partial success"},
+        ],
+    )
+    proven = passed_grain_tests(tmp_path)
+    assert "m1" not in proven
+    assert "m2" not in proven
+
+
 # --- missing_relation_findings: pure ---------------------------------------------
 
 
