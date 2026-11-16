@@ -2,9 +2,11 @@
 """Check the changelog fragments in changelog.d/, and that a pull request has one.
 
 Usage:
-    uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py
+    uv run --project packages/dex-core --no-sync python \
+        scripts/check_changelog_fragments.py
     git diff --name-status --no-renames origin/main... \\
-        | uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py --changes -
+        | uv run --project packages/dex-core --no-sync python \
+            scripts/check_changelog_fragments.py --changes -
     ... --changes - --labels no-changelog
 
 With no arguments it checks every file in changelog.d/: a name towncrier will
