@@ -1163,10 +1163,13 @@ def _literal(text: str, base: int) -> _Argument | None:
     stripped = text.strip()
     if _KEYWORD_ARG.match(stripped):
         return None
+    offset = base + len(text) - len(text.lstrip())
+    if stripped.startswith("''") and stripped.endswith("''") and len(stripped) >= 4:
+        content = stripped[2:-2]
+        return content.replace("''", "'"), (offset + 2, offset + len(stripped) - 2)
     quoted = _QUOTED_ARG.match(stripped)
     if quoted is None:
         return None, None
-    offset = base + len(text) - len(text.lstrip())
     return quoted.group(2), (offset + quoted.start(2), offset + quoted.end(2))
 
 

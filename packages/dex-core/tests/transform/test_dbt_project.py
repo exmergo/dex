@@ -954,6 +954,13 @@ def test_jinja_regions_returns_a_region_that_calls_nothing():
     assert [(r.kind, r.calls) for r in regions] == [("expression", [])]
 
 
+def test_jinja_calls_resolves_doubled_single_quoted_literals():
+    (call,) = jinja_calls("{{ var(''feature_fee'') }}")
+    assert call.callee == "var"
+    assert call.args == ("feature_fee",)
+    assert call.arg_spans == (((9, 20)),)
+
+
 def test_mask_yaml_comments_preserves_hashes_in_scalars():
     source = (
         "description: \"prefix # {{ var('feature_fee') }}\" # actual comment\n"

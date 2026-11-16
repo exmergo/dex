@@ -775,3 +775,19 @@ class TestYamlVarPropagation:
         assert "prefix#{{ var('dept_enabled') }}\" # note" in edits["dbt_project.yml"]
         assert "using_department" not in edits["dbt_project.yml"]
         assert result.sites["var_call"] == 1
+
+    def test_var_rename_rewrites_single_quoted_yaml_scalar_with_doubled_quotes(
+        self, project: Path
+    ):
+        _write(
+            project / "dbt_project.yml",
+            'name: shop\nprofile: shop\nversion: "1.0"\n'
+            "models:\n  shop:\n"
+            "    +schema: '{{ var(''using_department'') }}'\n"
+            "vars:\n  using_department: true\n",
+        )
+        result = _propagate(project, "var", "using_department", "dept_enabled")
+        edits = {e.path: e.new_content for e in result.edits}
+        assert "var(''dept_enabled'')" in edits["dbt_project.yml"]
+        assert "using_department" not in edits["dbt_project.yml"]
+        assert result.sites["var_call"] == 1
