@@ -445,8 +445,30 @@ def _parts(relation: str | None) -> tuple[str, ...] | None:
 
     if not relation:
         return None
-    parts = tuple(p for p in (_part(part) for part in str(relation).split(".")) if p)
+    parts = tuple(p for p in (_part(part) for part in _split_dots(str(relation))) if p)
     return parts or None
+
+
+def _split_dots(relation: str) -> list[str]:
+    """A relation split at the dots outside quotes, so a quoted identifier
+    that holds a dot stays one part."""
+
+    closers = {'"': '"', "`": "`", "[": "]"}
+    parts: list[str] = []
+    current: list[str] = []
+    closer: str | None = None
+    for char in relation:
+        if closer is None and char in closers:
+            closer = closers[char]
+        elif char == closer:
+            closer = None
+        elif closer is None and char == ".":
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
 
 
 def _target_of(relation: str | None, name: str | None) -> tuple[str, ...] | None:
@@ -886,7 +908,11 @@ def _model_facts(
             and (entry.get("includes") or entry.get("excludes"))
         ]
         for entry in filters if isinstance(filters, list) else []:
-            if isinstance(entry, dict) and entry.get("column") in filter_columns:
+            if (
+                isinstance(entry, dict)
+                and entry.get("column") in filter_columns
+                and (entry.get("includes") or entry.get("excludes"))
+            ):
                 add(
                     "population_filter",
                     entry["column"],

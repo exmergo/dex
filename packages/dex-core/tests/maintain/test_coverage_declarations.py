@@ -944,3 +944,50 @@ def test_one_join_declared_with_two_cardinalities_counts_twice() -> None:
     out = declarations(_manifest([]), selected=set(), semantic=layer)
     joins = out["summary"]["facts"]["by_kind"]["references"]
     assert (joins["count"], joins["dex_verify"], joins["none"]) == (2, 1, 1)
+
+
+def test_a_quoted_dot_stays_inside_its_identifier() -> None:
+    first = _model("a", dex={"grain": ["id"]})
+    first["relation_name"] = '"prod"."analytics"."orders.archive"'
+    layer = _layer(
+        models=[
+            _sm(
+                "b",
+                [["id"]],
+                ["primary"],
+                relation='"prod"."analytics.orders"."archive"',
+            )
+        ]
+    )
+    out = _run(_manifest([first]), semantic=layer)
+    assert out["summary"]["facts"]["count"] == 2
+    assert all("also_declared_by" not in f for f in out["facts"])
+    from exmergo_dex_core.maintain.coverage_declarations import _parts
+
+    assert _parts('"prod"."analytics"."orders.archive"') == (
+        "prod",
+        "analytics",
+        "orders.archive",
+    )
+    assert _parts('"prod"."analytics.orders"."archive"') == (
+        "prod",
+        "analytics.orders",
+        "archive",
+    )
+    assert _parts("PROD.Analytics.Orders") == ("prod", "analytics", "orders")
+
+
+def test_a_filter_entry_with_no_condition_states_no_fact() -> None:
+    model = _model(
+        "orders",
+        dex={
+            "population": {
+                "filters": [
+                    {"column": "status", "includes": ["active"]},
+                    {"column": "status"},
+                ]
+            }
+        },
+    )
+    out = _run(_manifest([model]))
+    assert out["summary"]["facts"]["by_kind"]["population_filter"]["count"] == 1
