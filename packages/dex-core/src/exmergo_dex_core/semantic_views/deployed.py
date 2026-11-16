@@ -202,6 +202,12 @@ def read_deployed(
                 "this role reads no private member back (it needs REFERENCES or "
                 f"OWNERSHIP on the view): {', '.join(hidden)} could not be read"
             ]
+    if view is not None and diagnostics:
+        # The view validated, and the reader refused some of its elements: the
+        # catalog carries the rest, so the read is partial and says what is
+        # missing rather than reading as complete.
+        coverage.status = LIMITED
+        coverage.reasons = [*coverage.reasons, *diagnostics]
     unresolved = sorted(
         {d.element for d in loaded.diagnostics if d.rule == "unresolved_member"}
     )

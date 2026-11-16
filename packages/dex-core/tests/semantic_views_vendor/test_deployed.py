@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytest.importorskip("sqlglot")
 
@@ -88,6 +89,33 @@ def test_a_refused_read_is_coverage_not_a_crash():
     read = read_deployed("sales", "A.B.SALES", refuse, None)
     assert read.coverage.status == "refused"
     assert "Insufficient privileges" in read.coverage.reasons[0]
+
+
+def test_a_read_back_with_a_refused_element_is_limited_and_says_why():
+    """The view validates, the reader refuses one of its elements: the catalog
+    carries the rest, so the read is partial, never `full`."""
+
+    text = yaml.safe_dump(
+        {
+            "name": "sales",
+            "tables": [
+                {
+                    "name": "orders",
+                    "base_table": {"database": "A", "schema": "B", "table": "ORDERS"},
+                    "dimensions": [{"name": "status", "expr": "o_orderstatus"}],
+                    "metrics": [
+                        {"name": "order_count", "expr": "COUNT(o_orderkey)"},
+                        {"name": "broken", "expr": "o_totalprice"},
+                    ],
+                }
+            ],
+        }
+    )
+    read = read_deployed("sales", "A.B.SALES", lambda _: text, None)
+
+    assert read.view is not None
+    assert read.coverage.status == "limited"
+    assert any("broken" in reason for reason in read.coverage.reasons)
 
 
 # --- goldens -------------------------------------------------------------------------
