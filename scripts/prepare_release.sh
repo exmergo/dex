@@ -99,7 +99,7 @@ else
     "${TOWNCRIER_CMD[@]}" build --yes --version "${ENGINE_VERSION}" --date "${RELEASE_DATE}"
   ) >/dev/null; then
     echo "towncrier could not build the notes; nothing was changed." >&2
-    echo "python3 scripts/check_changelog_fragments.py names the fragment at fault." >&2
+    echo "uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py names the fragment at fault." >&2
     exit 1
   fi
 fi
