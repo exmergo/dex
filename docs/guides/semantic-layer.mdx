@@ -17,6 +17,8 @@ backend that can execute queries.
 | Apache Ossie | Native YAML documents in the repository | [Ossie walkthrough](/dex/guides/ossie-semantic-layer) |
 | SLayer | Native model files in the repository | [SLayer support](/dex/semantic-layers/overview#slayer-models-vendor-slayer) |
 | Cube | Cube YAML model files in the repository | [Cube compatibility](/dex/semantic-layers/cube) |
+| Databricks Metric Views | Metric View YAML files in the repository | [Metric View compatibility](/dex/semantic-layers/databricks-metric-views) |
+| Snowflake Semantic Views | Semantic View YAML files in the repository, deployed by you | [Semantic View compatibility](/dex/semantic-layers/snowflake-semantic-views) |
 
 Use the configuration and extras for that backend. Keep the existing format as
 the source of truth; choosing Dex does not require converting it to another one.
@@ -46,7 +48,9 @@ returned by the catalog and the [semantic query reference](/dex/semantic-layers/
 
 **To change definitions**, ask the agent to prepare a plan using `semantic
 define|update|plan` for dbt semantic models, or the matching `semantic ossie`,
-`semantic slayer`, or `semantic cube` command for native documents. Review the
+`semantic slayer`, `semantic cube`, `semantic databricks` or `semantic snowflake`
+command for native documents. Dex never deploys a Metric View or a Semantic
+View: applying the plan writes the file, and you deploy it. Review the
 plan and apply it through `transform apply`.
 
 <Warning>
@@ -64,5 +68,7 @@ how to ask a governed warehouse question instead.
 
 For exact schemas and validation limits, use the
 [semantic layer reference](/dex/semantic-layers/overview),
-[Ossie compatibility](/dex/semantic-layers/ossie), or
-[Cube compatibility](/dex/semantic-layers/cube).
+[Ossie compatibility](/dex/semantic-layers/ossie),
+[Cube compatibility](/dex/semantic-layers/cube),
+[Metric View compatibility](/dex/semantic-layers/databricks-metric-views), or
+[Semantic View compatibility](/dex/semantic-layers/snowflake-semantic-views).

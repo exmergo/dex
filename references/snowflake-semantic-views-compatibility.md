@@ -220,7 +220,10 @@ and executes through its own Snowflake connector, under the cost guard
 
 Refused before anything is sent, each by name:
 - facts with metrics (Snowflake refuses the combination), and facts with
-  dimensions (refused from Snowflake's 2026_07 behaviour change on);
+  dimensions (refused from Snowflake's 2026_07 behaviour change on). Checked
+  live with the bundle enabled: Snowflake answers "Querying FACTS with
+  DIMENSIONS in a semantic view is not supported" for a dimension on the fact's
+  own table too, at compile time, with no warehouse resumed;
 - a private member as a query member or in `--where`;
 - a window metric, a level-of-detail member, a member naming
   `using_relationships`, or a metric reading one of them; a view declaring
@@ -269,9 +272,24 @@ Snowflake. On the dogfood account a role holding only SELECT on the view, with
 secondary roles off, read every private member back, so `limited` guards a
 behaviour Snowflake does not show today.
 
-**Not in this release:** the standard-SQL form (`SELECT AGG(metric) FROM sv`),
-window metrics, `variables`, LOD and `using_relationships` selections, a query
-spanning views, Cortex Analyst, and deploying a view.
+## What this release does not do
+
+- **DDL and dbt models.** A `CREATE SEMANTIC VIEW` file and a
+  `dbt_semantic_view` model are refused by name; only the YAML specification is
+  read and authored (#1298).
+- **The Ossie bridge.** Neither Snowflake's Ossie procedures nor a converter
+  are in the path (#1297).
+- **Deployment.** Dex never creates, replaces or drops a semantic view, and
+  never calls `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`. Applying a plan writes the
+  file; a maintainer runs `verify_only` and deploys it.
+- **Cortex Analyst.** No natural-language request, and the Cortex Analyst keys
+  (`verified_queries`, `custom_instructions`, ...) are carried, never acted on.
+- **Query forms.** The standard-SQL form (`SELECT AGG(metric) FROM sv`), a
+  query spanning views, and window, `variables`, level-of-detail and
+  `using_relationships` members are not rendered.
+- **Carried, not modelled.** Window metrics, `NON ADDITIVE BY`, ASOF and range
+  relationships, filters and `variables` are named in the catalog rather than
+  modelled, and `sample_values` is counted, never surfaced.
 
 ## Deployed semantic views and the warehouse
 
@@ -372,7 +390,10 @@ deploys: nothing runs `CREATE SEMANTIC VIEW` or
 `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`, nothing grants a privilege, and no
 authoring path opens a Snowflake connection. Check a file with
 `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML('<database>.<schema>', $$ <file> $$, TRUE)`
-(verify_only) before you deploy it yourself.
+(verify_only) before you deploy it yourself. Both need SELECT on every
+`base_table` the file names, so a logical table derived from a dbt mart needs
+the deploying role to read the table the build created, which the role dbt
+builds as owns.
 
 - **The write surface** is exactly `semantic.snowflake.files`. A path off it, a
   `.sql` file and another suffix are refused by name, the first with the
@@ -428,3 +449,21 @@ corpus and what a maintainer deploys to a scratch schema with
 
 `verify_only` needs a running warehouse and resumes it, so each verify run bills
 at least a warehouse resume.
+
+## Qualified live
+
+`packages/dex-core/tests/integration/test_snowflake_semantic_views.py` runs in
+the Snowflake integration job. It deploys `valid/star.yaml` and
+`valid/derived_metrics.yaml` over `SNOWFLAKE_SAMPLE_DATA.TPCH_SF1` into a
+scratch schema, under a deployer role kept apart from the identity Dex runs as
+(`scripts/setup_snowflake_ci.sh`), and holds Dex to:
+- the read-back of each view comparing clean with its file, and
+  `list --deployed` reporting `full` coverage for both;
+- a metric by a dimension, a view-level metric by a joined dimension, a
+  grain-suffixed time dimension, a filtered query and a metric-scoped `values`,
+  each equal to SQL written by hand over the base tables;
+- a repository edited away from its deployment, refused before the cost
+  handshake, with nothing reaching the spend ledger;
+- the `maintain` loop on a table the test creates: a dropped column found as
+  `declared_column_missing`, cut by `maintain reconcile`, applied, and clean.
+

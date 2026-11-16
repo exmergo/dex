@@ -423,6 +423,38 @@ def test_extras_read_the_vendor_from_the_walked_up_config(
     assert wrapper._extras(["explore", "inventory"]) == ["snowflake"]
 
 
+def test_the_semantic_views_vendor_and_the_connector_are_kept_apart(
+    wrapper, tmp_path, monkeypatch
+):
+    """`connector: snowflake` names the warehouse extra and `vendor: snowflake`
+    the Semantic View dialect engine (#1296): read from one walked-up config,
+    a governed query takes both, and a command that reads no layer takes only
+    the connector's."""
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: snowflake\nsemantic:\n  vendor: snowflake\n"
+        "  snowflake:\n    files: [views/sales.yaml]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    query = ["explore", "semantic", "query", "sales.orders.revenue"]
+    assert wrapper._extras(query) == [
+        "snowflake",
+        "ossie",
+        "semantic-views",
+        "semantic-api",
+    ]
+    assert wrapper._extras(["maintain", "check"]) == [
+        "snowflake",
+        "ossie",
+        "semantic-views",
+    ]
+    assert wrapper._extras(["explore", "inventory"]) == ["snowflake"]
+
+
 def test_a_flag_value_is_never_read_as_the_mode(wrapper):
     """The peek has to consume value-taking flags, or `--metric query` reads as
     `explore semantic query` and installs MetricFlow for a catalog read. Worse in

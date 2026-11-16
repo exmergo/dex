@@ -27,6 +27,8 @@
 #     query the deployed views and cannot create, replace or drop one.
 #     SELECT (query) and REFERENCES (DESCRIBE SEMANTIC VIEW, GET_DDL, private
 #     items) on every semantic view in DEX_SV.FIXTURES, current and future.
+#     OPERATE on DEX_SV_WH too, so `snowflake.suspend_after_command` can
+#     suspend the warehouse after each command instead of failing.
 #   - DEX_SV_SELECT_ONLY: SELECT alone, with no REFERENCES, granted to the
 #     DEX_DEV user, to exercise what a permission-limited reader of a deployed
 #     view can and cannot see. A session uses it alone with
@@ -126,7 +128,7 @@ sql "CREATE ROLE IF NOT EXISTS ${DEPLOYER};
 
 echo "-- Reader role (query and describe; nothing that creates, alters or drops)"
 sql "CREATE ROLE IF NOT EXISTS ${READER};
-     GRANT USAGE ON WAREHOUSE ${WAREHOUSE} TO ROLE ${READER};
+     GRANT USAGE, OPERATE ON WAREHOUSE ${WAREHOUSE} TO ROLE ${READER};
      GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE_SAMPLE_DATA TO ROLE ${READER};
      GRANT USAGE ON DATABASE ${DATABASE} TO ROLE ${READER};
      GRANT USAGE ON SCHEMA ${DATABASE}.${SCHEMA} TO ROLE ${READER};

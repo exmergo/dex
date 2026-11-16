@@ -245,6 +245,13 @@ _NONPERSON_NAME_QUALIFIERS = frozenset(
         "company",
         "app",
         "service",
+        # Geography: a nation, country, region or continent is named, but it is
+        # not a person. City, street and state stay flagged, since those sit
+        # beside address data.
+        "nation",
+        "country",
+        "region",
+        "continent",
     }
 )
 
@@ -513,8 +520,11 @@ def classify_pii(column_name: str, data_type: str) -> tuple[PIIFlag | None, bool
             return PIIFlag(category=category, confidence=confidence), False
 
     if _is_string_type(data_type):
-        match = _GENERIC_NAME.search(name)
-        if match is not None:
+        # Every `name` token is judged, not only the first: a qualified token
+        # such as `region.customer_name` normalizes to `region__customer_name`,
+        # whose first match is qualified by `region` and whose second is a
+        # person's name. A column is cleared only when each match is.
+        for match in _GENERIC_NAME.finditer(name):
             qualifier = name[: match.start()].rstrip("_").rsplit("_", 1)[-1]
             if qualifier not in _NONPERSON_NAME_QUALIFIERS:
                 flag = PIIFlag(

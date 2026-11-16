@@ -260,8 +260,9 @@ scan on a production Postgres primary is a real cost too.
 ## Semantic layers
 
 Choose the semantic layer independently of your database connector. Dex supports
-dbt semantic models and native Ossie, SLayer, or Cube files. Configure the choice
-in `.dex/config.yml`; Ossie, SLayer, and Cube need no dbt project.
+dbt semantic models and native Ossie, SLayer, Cube, Databricks Metric View or
+Snowflake Semantic View files. Configure the choice in `.dex/config.yml`; none
+of the native formats needs a dbt project.
 ([overview](https://docs.exmergo.com/dex/semantic-layers/overview))
 
 | Semantic layer                                                                                                                                                                              | Authorable | Hosted | Queryable | `vendor` / `deployment`        | Read through                                                                                                                                                  | Documentation                                                                                             |
