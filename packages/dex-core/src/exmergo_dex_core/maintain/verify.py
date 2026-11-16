@@ -3932,7 +3932,7 @@ def _projection_scope_keys(
 
 
 def _final_output_map(
-    tree, depth: int = 0
+    tree, depth: int = 0, inherited_ctes: dict | None = None
 ) -> dict[tuple[int, str, str], tuple[str, ...]]:
     """Each ``(query scope, join alias, column)`` the model's final SELECT
     names, mapped to the output column(s) it is projected as (#1324).
@@ -3954,11 +3954,11 @@ def _final_output_map(
     if depth > 8 or not isinstance(tree, exp.Select):
         return {}
     with_clause = tree.args.get("with_") or tree.args.get("with")
-    cte_scopes = (
-        {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
-        if with_clause is not None
-        else {}
-    )
+    cte_scopes: dict = dict(inherited_ctes or {})
+    if with_clause is not None:
+        cte_scopes.update(
+            {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        )
     names: dict[tuple[int, str, str], list[str]] = {}
     for projection in tree.expressions:
         if isinstance(projection, exp.Star):
@@ -3976,7 +3976,9 @@ def _final_output_map(
                 if cte is not None and isinstance(cte_scopes[cte], exp.Select):
                     body = cte_scopes[cte]
             if body is not None:
-                for key, body_outputs in _final_output_map(body, depth + 1).items():
+                for key, body_outputs in _final_output_map(
+                    body, depth + 1, cte_scopes
+                ).items():
                     names.setdefault(key, list(body_outputs))
             continue
         if isinstance(projection, exp.Alias) and projection.alias:
@@ -4758,13 +4760,18 @@ def join_coverage(
     # Only a join that converts a key passes the conversions, and only one
     # read through a filter passes the filters (#1085), so the call is the one
     # every other join has always made.
+    extra: dict[str, Any] = {}
+    if exprs:
+        extra["key_exprs"] = exprs
+    if filters:
+        extra["scope_filters"] = filters
+    if grouped:
+        extra["grouped_sides"] = grouped
     measured, refused = rel_mod.measure_coverage(
         adapter,
         relationships,
         timeout_seconds=timeout_seconds,
-        key_exprs=exprs,
-        scope_filters=filters,
-        grouped_sides=grouped,
+        **extra,
     )
     counts_of = {id(rel): counts for rel, counts in measured}
     refused_of = {id(rel): text for rel, text in refused}

@@ -493,6 +493,48 @@ def test_a_grouped_output_renamed_through_an_outer_cte_keeps_its_provenance(
     assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
 
 
+def test_a_star_final_keeps_an_outer_cte_binding(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`select * from final` recurses into final's body, which reads `base`
+    from the enclosing WITH. The outer binding must come along, or final's
+    rename cannot reach the grouped join (#1324)."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, sum(amount) as total_amount "
+        f"from {W}.child_orders where status = 'paid' group by customer_id), "
+        "base as ("
+        "select c.id as customer_id, o.total_amount "
+        f"from {W}.roster c left join orders_by_customer o "
+        "on c.id = o.customer_id), "
+        "final as ("
+        "select b.customer_id, b.total_amount as spend from base b) "
+        "select * from final"
+    )
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    _model(
+        maintain_repo,
+        sql,
+        columns={
+            "customer_id": {"role": "key"},
+            "spend": {"role": "measure", "null_rule": "never"},
+        },
+    )
+
+    data = _verify(maintain_repo, "rpt_customers")
+    (record,) = _records(data, "rpt_customers")
+
+    assert record["declared"]["derived_columns"] == ["spend"]
+    assert record["declared"]["required"] is True
+    assert record["status"] == "contradicted"
+    assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
+
+
 def test_a_star_final_follows_the_cte_to_the_grouped_outputs():
     """A `select * from final` closing still maps the grouped output through
     final's own projection, so a rename inside final keeps its provenance."""
