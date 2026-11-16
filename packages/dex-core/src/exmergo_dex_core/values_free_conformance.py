@@ -56,7 +56,7 @@ from typing import Any
 import pytest
 
 from . import envelope as env
-from .config import DexConfig
+from .config import SEMANTIC_SOURCE_FACTORIES, DexConfig
 from .demo.warehouse import DemoTable, generate_fixture_warehouse
 from .engine import DexEngine
 from .errors import WarehouseQueryError
@@ -611,6 +611,12 @@ def _coverage_fields() -> frozenset[str]:
         "declarations.summary.facts.by_checker",
     }
     paths |= {f"declarations.summary.facts.by_checker.{c}" for c in _CHECKERS}
+    # A record's source is `dbt` or a semantic vendor's name (#1346), never a value.
+    paths.add("declarations.summary.facts.by_source")
+    paths |= {
+        f"declarations.summary.facts.by_source.{source}"
+        for source in ("dbt", "semantic", *SEMANTIC_SOURCE_FACTORIES)
+    }
     for kind in _FACT_KINDS:
         paths |= _under(
             f"declarations.summary.facts.by_kind.{kind}",
@@ -623,11 +629,14 @@ def _coverage_fields() -> frozenset[str]:
         "[].model",
         "[].fact",
         "[].column",
+        "[].source",
         "[].checked_by",
         "[].tests",
         "[].tests[]",
         "[].verify",
         "[].verify[]",
+        "[].also_declared_by",
+        "[].also_declared_by[]",
     )
     return _COMMON | frozenset(paths)
 

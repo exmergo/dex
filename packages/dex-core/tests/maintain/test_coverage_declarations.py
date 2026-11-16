@@ -517,3 +517,387 @@ def test_a_conditional_to_expression_is_not_read_as_its_first_ref() -> None:
         ],
     )
     assert _fact(_run(manifest), "references", "customer_id")["checked_by"] == "none"
+
+
+# --- A native semantic layer's declarations (#1346) --------------------------
+
+from exmergo_dex_core.maintain.snapshot import (  # noqa: E402
+    RelationshipDef,
+    SemanticLayer,
+    SemanticModelDef,
+)
+from exmergo_dex_core.project_definitions import (  # noqa: E402
+    DeclaredColumnMeaning,
+    DeclaredPopulation,
+    DeclaredPopulationFilter,
+    ModelDeclaration,
+)
+
+
+def _layer(
+    *, models=(), relationships=(), cardinality=True, captured=True
+) -> SemanticLayer:
+    return SemanticLayer(
+        vendor="ossie",
+        relationships_and_keys_captured=captured,
+        relationship_cardinality_captured=cardinality,
+        semantic_models=list(models),
+        relationships=list(relationships),
+    )
+
+
+def _sm(name: str, keys, claims=None, relation=None) -> SemanticModelDef:
+    return SemanticModelDef(
+        name=name,
+        content_sha256="0" * 64,
+        relation=relation or f"analytics.{name}",
+        keys=[list(k) for k in keys],
+        key_claims=claims,
+    )
+
+
+def _rel(name: str, model: str, to: str, pairs, cardinality=None) -> RelationshipDef:
+    return RelationshipDef(
+        name=name,
+        content_sha256="0" * 64,
+        model=model,
+        to_model=to,
+        column_pairs=list(pairs),
+        cardinality=cardinality,
+    )
+
+
+def test_native_keys_and_joins_are_what_maintain_grain_judges() -> None:
+    layer = _layer(
+        models=[
+            _sm(
+                "orders", [["order_id"], ["store_id", "number"]], ["primary", "unique"]
+            ),
+            _sm("customers", [["id"]], ["primary"]),
+        ],
+        relationships=[
+            _rel(
+                "orders_customers",
+                "orders",
+                "customers",
+                [("customer_id", "id")],
+                "many_to_one",
+            ),
+            _rel(
+                "orders_tags", "orders", "customers", [("tag", "tag")], "many_to_many"
+            ),
+            _rel(
+                "orders_stores",
+                "orders",
+                "customers",
+                [("store_id", "id")],
+                "one_to_many",
+            ),
+        ],
+    )
+    out = declarations(_manifest([]), selected=set(), semantic=layer)
+    grain = _fact(out, "grain", "order_id", "orders")
+    assert grain["source"] == "ossie"
+    assert grain["checked_by"] == "dex_verify"
+    assert grain["tests"] == []
+    assert grain["verify"] == ["declared_grain_not_unique"]
+    key = _fact(out, "key", "store_id, number", "orders")
+    assert key["verify"] == ["declared_grain_not_unique"]
+    joined = _fact(out, "references", "customer_id", "orders")
+    assert joined["verify"] == ["declared_join_orphans", "join_cardinality_exceeded"]
+    # A many-to-many join bounds nothing; one-to-many has no arity check.
+    assert _fact(out, "references", "tag", "orders")["checked_by"] == "none"
+    assert _fact(out, "references", "store_id", "orders")["verify"] == [
+        "declared_join_orphans"
+    ]
+    assert out["summary"]["facts"]["by_source"] == {"ossie": 6}
+    assert any("ossie semantic layer" in note for note in out["notes"])
+
+
+def test_a_layer_that_captured_no_keys_or_joins_adds_none() -> None:
+    layer = _layer(models=[_sm("orders", [["order_id"]], ["primary"])], captured=False)
+    out = declarations(_manifest([]), selected=set(), semantic=layer)
+    assert out["facts"] == []
+    assert out["summary"]["facts"]["count"] == 0
+
+
+def test_native_dex_metadata_is_listed_and_checked_by_nothing_never_a_value() -> None:
+    declared = {
+        "orders": ModelDeclaration(
+            model="orders",
+            relation="analytics.orders",
+            source="ossie",
+            grain=["order_id"],
+            columns={
+                "margin": DeclaredColumnMeaning(unit="percent", additivity="additive"),
+                "customer_id": DeclaredColumnMeaning(references="customers.id"),
+            },
+            population=DeclaredPopulation(
+                rule="Only paid orders, per finance",
+                filters=[DeclaredPopulationFilter(column="status", includes=["paid"])],
+            ),
+        ),
+        "refunds": ModelDeclaration(
+            model="refunds",
+            source="ossie",
+            population=DeclaredPopulation(rule="Refunds the support desk approved"),
+        ),
+    }
+    layer = _layer(models=[_sm("orders", [["order_id"]], ["primary"])])
+    out = declarations(
+        _manifest([]), selected=set(), semantic=layer, native_models=declared
+    )
+    # The dex grain is the primary key the layer declares: one fact, judged.
+    grain = _fact(out, "grain", "order_id", "orders")
+    assert grain["checked_by"] == "dex_verify"
+    for kind, column in [
+        ("unit", "margin"),
+        ("additivity", "margin"),
+        ("references", "customer_id"),
+        ("population_filter", "status"),
+    ]:
+        fact = _fact(out, kind, column, "orders")
+        assert (fact["checked_by"], fact["source"]) == ("none", "ossie"), fact
+    assert _fact(out, "population_rule", model="refunds")["checked_by"] == "prose"
+    text = json.dumps(out)
+    assert "paid" not in text and "finance" not in text and "support desk" not in text
+
+
+def test_a_fact_dbt_and_the_native_layer_both_declare_is_counted_once() -> None:
+    model = _model("orders", dex={"grain": ["order_id"]})
+    model["relation_name"] = '"warehouse"."analytics"."orders"'
+    manifest = _manifest([model], [_test("unique", "orders", "order_id")])
+    layer = _layer(models=[_sm("orders", [["order_id"]], ["primary"])])
+    out = _run(manifest, semantic=layer)
+    listed = [f for f in out["facts"] if f["fact"] == "grain"]
+    assert sorted(f["source"] for f in listed) == ["dbt", "ossie"]
+    by_source = {f["source"]: f for f in listed}
+    assert by_source["dbt"]["also_declared_by"] == ["ossie"]
+    assert by_source["ossie"]["also_declared_by"] == ["dbt"]
+    facts = out["summary"]["facts"]
+    assert facts["count"] == 1
+    assert facts["by_kind"]["grain"]["both"] == 1
+    assert facts["checked"] == {
+        "numerator": 1,
+        "denominator": 1,
+        "of": facts["checked"]["of"],
+    }
+
+
+def test_the_same_model_name_on_another_relation_is_not_merged() -> None:
+    model = _model("orders", dex={"grain": ["order_id"]})
+    model["relation_name"] = '"warehouse"."staging"."orders"'
+    layer = _layer(models=[_sm("orders", [["order_id"]], ["primary"])])
+    out = _run(_manifest([model]), semantic=layer)
+    assert out["summary"]["facts"]["count"] == 2
+    assert all("also_declared_by" not in f for f in out["facts"])
+
+
+def test_a_selector_narrows_the_native_records_by_model_name() -> None:
+    layer = _layer(
+        models=[
+            _sm("orders", [["order_id"]], ["primary"]),
+            _sm("customers", [["id"]], ["primary"]),
+        ]
+    )
+    out = declarations(
+        _manifest([]), selected=set(), semantic=layer, selector=["Customers"]
+    )
+    assert [f["model"] for f in out["facts"]] == ["customers"]
+
+
+def test_dbt_records_name_their_source() -> None:
+    out = _run(_manifest([_model("a", dex={"grain": ["x"]})]))
+    assert _fact(out, "grain", "x", "a")["source"] == "dbt"
+    assert out["summary"]["facts"]["by_source"] == {"dbt": 1}
+
+
+def test_one_table_name_in_two_databases_is_two_relations() -> None:
+    prod = _model("orders", dex={"grain": ["order_id"]})
+    prod["relation_name"] = '"prod"."analytics"."orders"'
+    layer = _layer(
+        models=[
+            _sm(
+                "orders",
+                [["order_id"]],
+                ["primary"],
+                relation="archive.analytics.orders",
+            ),
+            _sm(
+                "orders_copy",
+                [["order_id"]],
+                ["primary"],
+                relation="prod.analytics.orders_copy",
+            ),
+        ]
+    )
+    out = _run(_manifest([prod]), semantic=layer)
+    assert out["summary"]["facts"]["count"] == 3
+    assert all("also_declared_by" not in f for f in out["facts"])
+
+
+def test_a_partial_relation_two_databases_end_with_is_not_matched() -> None:
+    prod = _model("orders", dex={"grain": ["order_id"]})
+    prod["relation_name"] = '"prod"."analytics"."orders"'
+    archive = _model("orders_archive", dex={"grain": ["order_id"]})
+    archive["relation_name"] = '"archive"."analytics"."orders"'
+    layer = _layer(models=[_sm("orders", [["order_id"]], ["primary"])])
+    out = _run(_manifest([prod, archive]), semantic=layer)
+    assert out["summary"]["facts"]["count"] == 3
+    assert all("also_declared_by" not in f for f in out["facts"])
+
+
+def test_two_joins_on_one_column_stay_two_facts() -> None:
+    layer = _layer(
+        models=[
+            _sm("projects", [["id"]], ["primary"]),
+            _sm("users", [["id"]], ["primary"]),
+            _sm("teams", [["id"]], ["primary"]),
+        ],
+        relationships=[
+            _rel(
+                "owner_user", "projects", "users", [("owner_id", "id")], "many_to_one"
+            ),
+            _rel(
+                "owner_team", "projects", "teams", [("owner_id", "id")], "many_to_many"
+            ),
+        ],
+    )
+    declared = {
+        "projects": ModelDeclaration(
+            model="projects",
+            relation="analytics.projects",
+            source="ossie",
+            columns={"owner_id": DeclaredColumnMeaning(references="users.id")},
+        )
+    }
+    out = declarations(
+        _manifest([]), selected=set(), semantic=layer, native_models=declared
+    )
+    joins = [f for f in out["facts"] if f["fact"] == "references"]
+    # The dex reference is the many-to-one join to users, so it merges there.
+    assert sorted(f["checked_by"] for f in joins) == ["dex_verify", "none"]
+    assert out["summary"]["facts"]["by_kind"]["references"] == {
+        "count": 2,
+        "dbt_test": 0,
+        "dex_verify": 1,
+        "both": 0,
+        "none": 1,
+        "prose": 0,
+    }
+
+
+def test_a_dex_reference_to_another_table_does_not_take_a_join_checker() -> None:
+    layer = _layer(
+        models=[
+            _sm("projects", [["id"]], ["primary"]),
+            _sm("users", [["id"]], ["primary"]),
+        ],
+        relationships=[
+            _rel("owner_user", "projects", "users", [("owner_id", "id")], "many_to_one")
+        ],
+    )
+    declared = {
+        "projects": ModelDeclaration(
+            model="projects",
+            relation="analytics.projects",
+            source="ossie",
+            columns={"owner_id": DeclaredColumnMeaning(references="accounts.id")},
+        )
+    }
+    out = declarations(
+        _manifest([]), selected=set(), semantic=layer, native_models=declared
+    )
+    joins = sorted(f["checked_by"] for f in out["facts"] if f["fact"] == "references")
+    assert joins == ["dex_verify", "none"]
+
+
+def test_a_partial_relation_is_not_matched_when_an_undeclared_model_shares_it() -> None:
+    prod = _model("orders", dex={"grain": ["order_id"]})
+    prod["relation_name"] = '"prod"."analytics"."orders"'
+    archive = _model("orders_archive")  # declares nothing, but is a relation
+    archive["relation_name"] = '"archive"."analytics"."orders"'
+    layer = _layer(models=[_sm("orders", [["order_id"]], ["primary"])])
+    out = _run(_manifest([prod, archive]), semantic=layer)
+    assert out["summary"]["facts"]["count"] == 2
+    assert all("also_declared_by" not in f for f in out["facts"])
+
+
+def test_joins_to_one_table_name_in_two_databases_stay_two_facts() -> None:
+    layer = _layer(
+        models=[
+            _sm("orders", [["id"]], ["primary"], relation="prod.analytics.orders"),
+            _sm("users", [["id"]], ["primary"], relation="prod.analytics.users"),
+            _sm("users_old", [["id"]], ["primary"], relation="archive.analytics.users"),
+        ],
+        relationships=[
+            _rel("a", "orders", "users", [("user_id", "id")], "many_to_one"),
+            _rel("b", "orders", "users_old", [("user_id", "id")], "many_to_one"),
+        ],
+    )
+    out = declarations(_manifest([]), selected=set(), semantic=layer)
+    assert out["summary"]["facts"]["by_kind"]["references"]["count"] == 2
+
+
+def test_facts_that_assert_different_things_are_not_merged() -> None:
+    model = _model(
+        "orders",
+        dex={"population": {"parent": {"model": "customers", "key": {"cid": "id"}}}},
+        columns={"margin": {"unit": "percent"}, "rate": {"unit": "fraction"}},
+    )
+    model["relation_name"] = '"prod"."analytics"."orders"'
+    declared = {
+        "orders": ModelDeclaration(
+            model="orders",
+            relation="analytics.orders",
+            source="ossie",
+            columns={
+                "margin": DeclaredColumnMeaning(unit="fraction"),
+                "rate": DeclaredColumnMeaning(unit="fraction"),
+            },
+            population=DeclaredPopulation(
+                parent={"model": "accounts", "key": {"cid": "account_id"}}
+            ),
+        )
+    }
+    out = _run(_manifest([model]), native_models=declared)
+    units = out["summary"]["facts"]["by_kind"]["unit"]
+    # margin: percent vs fraction, two facts; rate: fraction on both, one.
+    assert units["count"] == 3
+    assert out["summary"]["facts"]["by_kind"]["population_parent"]["count"] == 2
+    shared = [f for f in out["facts"] if "also_declared_by" in f]
+    assert [(f["fact"], f["column"]) for f in shared] == [
+        ("unit", "rate"),
+        ("unit", "rate"),
+    ]
+
+
+def test_a_quoted_identifier_keeps_its_case() -> None:
+    model = _model("orders", dex={"grain": ["order_id"]})
+    model["relation_name"] = '"DB"."PUBLIC"."orders"'
+    layer = _layer(
+        models=[_sm("orders", [["order_id"]], ["primary"], relation="DB.PUBLIC.ORDERS")]
+    )
+    out = _run(_manifest([model]), semantic=layer)
+    assert out["summary"]["facts"]["count"] == 2
+
+
+def test_a_filter_value_keeps_its_type() -> None:
+    model = _model(
+        "orders",
+        dex={"population": {"filters": [{"column": "paid", "includes": [True]}]}},
+    )
+    model["relation_name"] = '"prod"."analytics"."orders"'
+    declared = {
+        "orders": ModelDeclaration(
+            model="orders",
+            relation="analytics.orders",
+            source="ossie",
+            population=DeclaredPopulation(
+                filters=[DeclaredPopulationFilter(column="paid", includes=["True"])]
+            ),
+        )
+    }
+    out = _run(_manifest([model]), native_models=declared)
+    assert out["summary"]["facts"]["by_kind"]["population_filter"]["count"] == 2
+    assert "True" not in json.dumps(out) and "true" not in json.dumps(out)
