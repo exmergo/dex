@@ -258,7 +258,10 @@ class TestColumnDeclarations:
     def test_a_flow_list_gains_a_name_without_reflowing_its_line(self):
         out = self._spliced(self.FLOW, "order_id", ["not_null", "unique"])
 
-        assert "        tests: [not_null, unique]\n" in out
+        assert (
+            "        tests: [not_null, "
+            "{unique: {config: {meta: {disable_test_samples: true}}}}]\n"
+        ) in out
         assert "      # the natural key\n" in out
         assert "        description: who ordered\n" in out
 
@@ -272,7 +275,11 @@ class TestColumnDeclarations:
     def test_a_column_with_no_test_list_gains_one_at_the_field_indent(self):
         out = self._spliced(self.FLOW, "status", ["not_null"])
 
-        assert out.endswith("      - name: status\n        tests: [not_null]\n\n")
+        assert out.endswith(
+            "      - name: status\n"
+            "        tests: "
+            "[{not_null: {config: {meta: {disable_test_samples: true}}}}]\n\n"
+        )
 
     def test_two_columns_carrying_the_same_test_are_edited_independently(self):
         content = (
@@ -294,7 +301,28 @@ class TestColumnDeclarations:
         )
 
         assert "          - accepted_values:\n              values: [1, 2]\n" in out
-        assert "          - unique\n" in out
+        assert (
+            "          - unique:\n              config:\n                meta:\n"
+            "                  disable_test_samples: true\n"
+        ) in out
+
+    def test_a_rendered_unsampled_test_is_removable_and_a_configured_one_is_not(self):
+        # The flag dex renders marks the item as dex's own; any other body is
+        # someone's configuration and stays (#1306).
+        rendered = (
+            "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+            "      - name: order_id\n        tests:\n          - unique\n"
+            "          - not_null:\n              config:\n                meta:\n"
+            "                  disable_test_samples: true\n"
+        )
+        configured = rendered.replace(
+            "true\n", "true\n                severity: warn\n"
+        )
+
+        assert self._spliced(rendered, "order_id", ["unique"]).endswith(
+            "        tests:\n          - unique\n"
+        )
+        assert self._spliced(configured, "order_id", ["unique"]) == configured
 
     def test_a_block_list_loses_only_the_item_named(self):
         out = self._spliced(self.BLOCK, "order_id", ["accepted_values"])

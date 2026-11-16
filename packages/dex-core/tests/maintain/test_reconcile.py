@@ -464,7 +464,10 @@ def test_the_unique_test_edit_is_a_one_line_splice_not_a_reprinted_file(maintain
     maintain_repo.dex("transform", "apply", payload["data"]["plan_id"])
     written = (maintain_repo.root / "models" / "staging" / "stg_orders.yml").read_text()
     assert "# built from the orders source" in written
-    assert "tests: [not_null, unique]" in written
+    # The added `unique` carries the unsampled flag a declaration renders (#1306).
+    assert (
+        "tests: [not_null, {unique: {config: {meta: {disable_test_samples: true}}}}]"
+    ) in written
 
 
 def test_schema_and_grain_drift_produce_one_edit_for_the_shared_yaml(maintain_repo):
