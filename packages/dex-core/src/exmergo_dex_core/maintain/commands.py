@@ -1161,7 +1161,7 @@ def verify(
         build_findings, build_notes = verify_mod.build_status_findings(project_dir)
         findings.extend(build_findings)
         warnings.extend(build_notes)
-        if build_notes:
+        if any("no dbt run results found" in n for n in build_notes):
             suppressed["build_status"] = build_notes[0]
 
     # A scope may be spelled as separate arguments, comma-separated, or as one
