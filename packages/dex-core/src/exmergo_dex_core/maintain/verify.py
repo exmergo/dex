@@ -2846,7 +2846,8 @@ def _group_key_columns(select, source, cte_scopes, sql_shape, dialect):
             if isinstance(expression, node):
                 return f"a grouping modifier ({label})"
         column = expression
-        if isinstance(expression, exp.Literal) and expression.is_int:
+        ordinal = isinstance(expression, exp.Literal) and expression.is_int
+        if ordinal:
             index = int(expression.this) - 1
             if index < 0 or index >= len(select.expressions):
                 return "a GROUP BY ordinal outside the select list"
@@ -2856,20 +2857,24 @@ def _group_key_columns(select, source, cte_scopes, sql_shape, dialect):
         if not isinstance(column, exp.Column):
             return "a grouping expression (only a bare key column is carried)"
         # ``group by cid`` where ``cid`` is a projection alias: group by the
-        # column the projection reads, not the output name.
-        aliased = next(
-            (
-                projection.this
-                for projection in select.expressions
-                if isinstance(projection, exp.Alias)
-                and projection.alias.lower() == column.name.lower()
-            ),
-            None,
-        )
-        if aliased is not None:
-            if not isinstance(aliased, exp.Column):
-                return "a grouping over a computed projection"
-            column = aliased
+        # column the projection reads, not the output name. An ordinal has
+        # already resolved the projection, and a qualified column names its
+        # source directly; re-resolving either through an alias would let one
+        # projection's alias rewrite a different grouping key (#1352 review).
+        if not ordinal and not column.table:
+            aliased = next(
+                (
+                    projection.this
+                    for projection in select.expressions
+                    if isinstance(projection, exp.Alias)
+                    and projection.alias.lower() == column.name.lower()
+                ),
+                None,
+            )
+            if aliased is not None:
+                if not isinstance(aliased, exp.Column):
+                    return "a grouping over a computed projection"
+                column = aliased
         walk = _FilterWalk(dialect=dialect, keep_rows=True)
         resolved = _resolve_join_column(
             source, column.name, cte_scopes, sql_shape, walk=walk
@@ -3842,6 +3847,85 @@ def _output_lineage(tree, sql_shape, depth: int = 0) -> dict[str, tuple[str, str
     return _select_lineage(tree, cte_scopes, sql_shape, depth, root)
 
 
+def _final_scope_relations(scope, cte_scopes) -> dict[str, object]:
+    """The relations one final-projection scope reads, by alias or name."""
+
+    from sqlglot import expressions as exp
+
+    relations: dict[str, object] = {}
+    from_ = scope.args.get("from_") or scope.args.get("from")
+    if from_ is not None and isinstance(from_.this, (exp.Table, exp.Subquery)):
+        relations[from_.this.alias_or_name.lower()] = from_.this
+    for join in scope.args.get("joins") or []:
+        relation = join.this
+        if isinstance(relation, (exp.Table, exp.Subquery)):
+            relations[relation.alias_or_name.lower()] = relation
+    return relations
+
+
+def _final_relation_body(relation, cte_scopes):
+    """The SELECT a final projection's relation reads, when it is a CTE or a
+    subquery, else ``None``."""
+
+    from sqlglot import expressions as exp
+
+    if isinstance(relation, exp.Subquery) and isinstance(relation.this, exp.Select):
+        return relation.this
+    if isinstance(relation, exp.Table):
+        name = _cte_name(relation, cte_scopes)
+        body = cte_scopes.get(name) if name is not None else None
+        if isinstance(body, exp.Select):
+            return body
+    return None
+
+
+def _projection_scope_keys(scope, column, cte_scopes, depth: int = 0):
+    """The ``(scope, relation, column)`` keys one bare projection reads.
+
+    The projection is keyed where it is written, and then followed through an
+    explicit bare-column hop (``select b.total from base b``) to the SELECT that
+    supplies it, so an aggregate a grouped CTE writes is still found when an
+    outer CTE renames it (#1324). A computed hop (``coalesce(...)``, an
+    aggregate itself) stops the walk: its output is not the grouped join's
+    column, exactly as :func:`_final_output_map` refuses to map a computed
+    projection.
+    """
+
+    from sqlglot import expressions as exp
+
+    table = (column.table or "").replace('"', "").replace("`", "").lower()
+    if not table:
+        return set()
+    key = (id(scope), table, column.name.lower())
+    if depth >= 8:
+        return {key}
+    relation = _final_scope_relations(scope, cte_scopes).get(table)
+    if relation is None:
+        return {key}
+    body = _final_relation_body(relation, cte_scopes)
+    if body is None:
+        return {key}
+    with_clause = body.args.get("with_") or body.args.get("with")
+    inner_scopes = dict(cte_scopes)
+    if with_clause is not None:
+        inner_scopes.update(
+            {cte.alias_or_name.lower(): cte.this for cte in with_clause.expressions}
+        )
+    target = column.name.lower()
+    inner = None
+    for projection in body.expressions:
+        if isinstance(projection, exp.Alias) and projection.alias:
+            if projection.alias.lower() == target:
+                inner = projection.this
+                break
+        elif isinstance(projection, exp.Column) and projection.name.lower() == target:
+            inner = projection
+            break
+    if not isinstance(inner, exp.Column):
+        return {key}
+    return {key} | _projection_scope_keys(body, inner, inner_scopes, depth + 1)
+
+
 def _final_output_map(
     tree, depth: int = 0
 ) -> dict[tuple[int, str, str], tuple[str, ...]]:
@@ -3903,10 +3987,10 @@ def _final_output_map(
         table = (column.table or "").replace('"', "").replace("`", "").lower()
         if not table:
             continue
-        key = (id(tree), table, column.name.lower())
-        outputs = names.setdefault(key, [])
-        if output not in outputs:
-            outputs.append(output)
+        for key in _projection_scope_keys(tree, column, cte_scopes):
+            outputs = names.setdefault(key, [])
+            if output not in outputs:
+                outputs.append(output)
     return {key: tuple(outputs) for key, outputs in names.items()}
 
 

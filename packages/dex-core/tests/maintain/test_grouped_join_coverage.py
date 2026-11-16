@@ -198,6 +198,44 @@ def test_a_group_by_ordinal_and_a_projection_alias_resolve_to_the_key_column():
     assert candidate.to_columns == ("customer_id",)
 
 
+def test_a_group_by_ordinal_does_not_reread_a_colliding_projection_alias():
+    """`GROUP BY 2` already names the second projection. Looking that name up
+    again as a projection alias would rewrite it to the first projection when
+    the two aliases collide, collapsing a two-key grouping into one key."""
+
+    sql = (
+        "with grouped as ("
+        "select customer_id as region, region as original_region, "
+        f"count(*) as n from {W}.child_orders group by 1, 2) "
+        "select c.id as customer_id, g.n "
+        f"from {W}.roster c left join grouped g on c.id = g.region"
+    )
+    candidates, skipped = _joins(sql)
+    assert not [candidate for candidate in candidates if candidate.to_grouped]
+    assert any(
+        skip.code == "filtered_cte" and "key columns" in skip.reason for skip in skipped
+    )
+
+
+def test_a_qualified_group_key_is_not_rewritten_through_a_projection_alias():
+    """A qualified grouping column names its physical source directly. Looking
+    it up as a projection alias would let the colliding alias rewrite it."""
+
+    sql = (
+        "with grouped as ("
+        "select o.customer_id as original_id, o.region as customer_id, "
+        f"count(*) as n from {W}.child_orders o "
+        "group by o.customer_id, o.region) "
+        "select c.id as customer_id, g.n "
+        f"from {W}.roster c left join grouped g on c.id = g.customer_id"
+    )
+    candidates, skipped = _joins(sql)
+    assert not [candidate for candidate in candidates if candidate.to_grouped]
+    assert any(
+        skip.code == "filtered_cte" and "key columns" in skip.reason for skip in skipped
+    )
+
+
 def test_a_group_key_resolves_case_insensitively():
     sql = (
         "with grouped as (select CUSTOMER_ID, count(*) as n "
@@ -391,6 +429,46 @@ def test_a_grouped_aggregate_renamed_in_the_model_keeps_its_provenance(
         "select c.id as customer_id, c.name, o.total_amount as spend "
         f"from {W}.roster c left join orders_by_customer o "
         "on c.id = o.customer_id"
+    )
+    _world(
+        maintain_repo,
+        roster=[(1, "Ada"), (2, "Grace")],
+        orders=[(1, 10.0, "paid")],
+    )
+    _model(
+        maintain_repo,
+        sql,
+        columns={
+            "customer_id": {"role": "key"},
+            "spend": {"role": "measure", "null_rule": "never"},
+        },
+    )
+
+    data = _verify(maintain_repo, "rpt_customers")
+    (record,) = _records(data, "rpt_customers")
+
+    assert record["declared"]["derived_columns"] == ["spend"]
+    assert record["declared"]["required"] is True
+    assert record["status"] == "contradicted"
+    assert _codes(data, "rpt_customers")["join_orphans"]["severity"] == "high"
+
+
+def test_a_grouped_output_renamed_through_an_outer_cte_keeps_its_provenance(
+    maintain_repo, _assume_the_project_compiles
+):
+    """`base` reads the grouped aggregate, and the final query renames
+    `b.total_amount as spend`. The rename is one bare-column hop away, so the
+    declaration on `spend` must still reach the grouped join (#1324)."""
+
+    sql = (
+        "with orders_by_customer as ("
+        "select customer_id, sum(amount) as total_amount "
+        f"from {W}.child_orders where status = 'paid' group by customer_id), "
+        "base as ("
+        "select c.id as customer_id, o.total_amount "
+        f"from {W}.roster c left join orders_by_customer o "
+        "on c.id = o.customer_id) "
+        "select b.customer_id, b.total_amount as spend from base b"
     )
     _world(
         maintain_repo,
