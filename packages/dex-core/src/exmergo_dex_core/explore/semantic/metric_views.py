@@ -1,21 +1,46 @@
 """The local Databricks Metric View layer: the Metric View files in this
-repository, read.
+repository, read, and queried through the views deployed from them.
 
 The reading is the semantic source's job and reaches this layer through the
 engine's semantic-source seam. What this layer adds is provenance, the declared
-gaps, and the two governed entry points a later release fills in.
+gaps, and the governed query.
 
 **The catalog needs no workspace.** ``explore semantic list`` reads the
 repository's Metric View YAML statically, and the declaration channel carries
 each join and each ``rely.at_most_one_match`` key to ``explore
 relationships|map|profile --use-project``.
 
-**Querying is not available yet.** A governed Metric View query is SQL over the
-view with ``MEASURE()``, executed by dex through the Databricks connector, and it
-is the next release's (#964). Until then ``query`` refuses by name, and
-``values`` runs the values PII gate first, so a PII field is refused as PII
-before it is refused for want of a runtime: the order the governed path will
-keep.
+**Dex renders, Databricks executes, through dex's connector (#1362).** A governed
+query is a ``SELECT ... MEASURE(...) FROM <deployed view> GROUP BY ALL``
+statement rendered from the catalog (:mod:`...metric_views.query`), in this order,
+because the safety contract is the order:
+
+1. the connector check: Databricks only;
+2. translation: every refusal the request can earn on its own (a window or
+   ``partition`` measure, ``parameters``, a ``materialization``, two views, a
+   grain on a field that is not a date, a ``--where`` naming a measure, a query
+   with no measure), before anything is sent;
+3. the PII request-gate, through the catalog's lineage, on every grouped field,
+   every field ``--where`` names, the field a grain buckets, and every column a
+   measure returns the values of (``MIN``, ``MAX``, ``ANY_VALUE``,
+   ``COLLECT_LIST``, ...);
+4. the deployed view, found by its file's stem among the Metric Views the source
+   allowlist holds, with a warehouse-free Unity Catalog read; the comparison of
+   the deployed definition with the file is #1363's, and every result says it was
+   not made;
+5. the base tables the request reaches through the view, which must lie inside
+   the scoped inventory, since they are what the statement is priced by;
+6. the render, against the deployed view's own name;
+7. the governed spine (:mod:`.governed`): SELECT-only, the relation pre-check
+   (the deployed view admitted by name, since the inventory leaves Metric Views
+   out), the cost handshake priced from those base tables (Databricks keeps no
+   size for a Metric View), dex's connector under ``STATEMENT_TIMEOUT``, the
+   columnar cap.
+
+``values`` screens the field first, as every vendor does, so a PII field is
+refused as PII wherever this runs; then it runs the same spine behind a
+fields-only ``GROUP BY ALL``, or one carrying the ``--metric`` that scopes the
+values, which ``scoped_to`` names.
 """
 
 from __future__ import annotations
@@ -24,9 +49,23 @@ from typing import Any
 
 from ...config import QueryLimits
 from ...errors import ProjectError
-from .backend import EXECUTION_DEX, BackendDescriptor, SemanticBackendError
+from ..results import SemanticQueryResult, SemanticValuesResult
+from .backend import (
+    EXECUTION_DEX,
+    BackendDescriptor,
+    SemanticBackendError,
+    SemanticQueryRefusedError,
+)
 from .catalog import SemanticCatalog
-from .policy import resolve_values_request, screen_values_request
+from .governed import GovernedSql
+from .model import SemanticQuery
+from .policy import (
+    name_only_note,
+    screen_dimension_refs,
+    screen_values_request,
+    sub_threshold_note,
+    unadjudicated_refs,
+)
 
 __all__ = ["METRIC_VIEW_CATALOG_GAPS", "LocalMetricViewLayer"]
 
@@ -47,11 +86,11 @@ METRIC_VIEW_CATALOG_GAPS: dict[str, list[str]] = {
     "entities": ["name", "type", "label", "description", "roles"],
 }
 
-_NO_RUNTIME = (
-    "governed Metric View queries (`SELECT ... MEASURE(m) ... FROM <view>`, "
-    "executed by dex through the Databricks connector under the cost guard) are "
-    "not available in this release (#964)"
-)
+# A relation that resolves to the wrong namespace is a view whose `source` names
+# another catalog or schema than the one dex reads.
+_RECOMPILE_HINT = "correct the Metric View's `source`"
+
+_CONNECTOR = "databricks"
 
 
 class LocalMetricViewLayer:
@@ -71,12 +110,17 @@ class LocalMetricViewLayer:
     )
 
     def __init__(self, source: Any, engine: Any = None) -> None:
-        """Wrap a Metric View source; an engine, where given, backs the PII gate."""
+        """Wrap a Metric View source; an engine, where given, backs the PII gate
+        and the governed query."""
         self._source = source
         # Optional: reading the catalog needs no engine. With one, the values
         # gate reads the profiled cache rather than the name alone.
         self._dex = engine
         self._view: Any = None
+        self._governed: GovernedSql | None = None
+        #: Columns a value-returning measure reads directly, registered by the
+        #: PII gate's screening for this command (see :meth:`_screened`).
+        self._base_columns: dict[str, tuple[str, str]] = {}
 
     @classmethod
     def from_engine(cls, engine: Any) -> LocalMetricViewLayer:
@@ -128,57 +172,390 @@ class LocalMetricViewLayer:
 
     # ---- query -------------------------------------------------------------
 
-    def filter_refs(self, _clauses: list[str]) -> list[str] | None:
-        """None: no filter dialect is read yet, so a filtered query is refused
-        rather than screened by half."""
+    def filter_refs(self, clauses: list[str]) -> list[str] | None:
+        """The ``view.field`` tokens these ``--where`` predicates name, or None
+        for a clause dex cannot read (refused rather than screened by half) or
+        one naming something a filter may not."""
 
-        return None
+        from ...metric_views.query import QueryRefused, filter_fields
+
+        try:
+            read = filter_fields(self._loaded(), clauses)
+        except (QueryRefused, SemanticBackendError):
+            return None
+        if read is None:
+            return None
+        return [resolved.canonical for resolved in read[0]]
 
     def time_axis_refs(self, _metrics: list[str]) -> list[str] | None:
-        """None: a Metric View names no time axis for a metric to bucket."""
+        """None: a Metric View names no time axis for a measure to bucket; a
+        grain is always written on the field it buckets, which the gate screens
+        directly."""
 
         return None
 
-    def query(self, _q: Any) -> Any:
-        """Refused by name until #964."""
-        raise SemanticBackendError(
-            f"{_NO_RUNTIME}. Read the layer with `explore semantic list`, then "
-            "query the relations it names with `explore query`, which runs under "
-            "the firewall and the cost guard"
+    def query(self, q: SemanticQuery) -> SemanticQueryResult:
+        """One governed query, rendered with ``MEASURE()`` and run here."""
+
+        from ...metric_views.query import translate_query
+
+        self._supported_connector("a governed Metric View query")
+        governed = self._governed_sql()
+        plan = self._translate(
+            lambda loaded: translate_query(
+                loaded,
+                metrics=q.metrics,
+                group_by=q.group_by,
+                where=q.where,
+                grain=q.grain,
+            )
+        )
+        try:
+            return self._run_query(q, plan, governed)
+        finally:
+            governed.release()
+
+    def _run_query(
+        self, q: SemanticQuery, plan: Any, governed: GovernedSql
+    ) -> SemanticQueryResult:
+        cache = governed.load_cache()
+        refs, aliases = self._screened(plan)
+        lookup = governed.pii_lookup(cache)
+        blocked = screen_dimension_refs(refs, meta_lookup=lookup, aliases=aliases)
+        if blocked:
+            named = ", ".join(f"{ref} ({reason})" for ref, reason in blocked)
+            raise SemanticQueryRefusedError(
+                f"refused: grouping, filtering or returning the values of {named} "
+                "would surface PII. PII is flagged, never surfaced; query a non-PII "
+                "field instead."
+            )
+        command = "explore semantic query"
+        where, notes = self._deployed(plan, command)
+        priced = self._in_scope(plan, command)
+        rendered = self._render(plan, where, order_by=q.order_by, limit=q.limit)
+        return governed.run(
+            rendered.sql,
+            cache,
+            backend=self,
+            command=command,
+            result_type=SemanticQueryResult,
+            extra_notes=[
+                *notes,
+                *name_only_note(
+                    unadjudicated_refs(refs, meta_lookup=lookup, aliases=aliases)
+                ),
+                *sub_threshold_note(refs, meta_lookup=lookup, aliases=aliases),
+            ],
+            column_names=rendered.names,
+            priced_relations=priced,
+            live_relations=[where],
         )
 
-    def values(self, dimension: str, metrics: list[str]) -> Any:
-        """Refused, after the values gate: a PII field is refused as PII."""
+    def values(self, dimension: str, metrics: list[str]) -> SemanticValuesResult:
+        """One field's values, rendered as a fields-only ``GROUP BY ALL`` and run
+        here, after the values gate."""
 
-        view = self._catalog_view()
-        request = resolve_values_request(
-            view,
-            dimension,
-            metrics,
-            grains=(),
-            spelling="named view.field (orders.order_status)",
+        from ...metric_views.model import FIELD
+        from ...metric_views.query import QueryRefused, resolve_token
+
+        # The token is resolved and screened before the connector is asked for:
+        # a personal field is refused as PII wherever this runs.
+        try:
+            token = resolve_token(self._loaded(), dimension)
+        except QueryRefused as exc:
+            raise SemanticBackendError(str(exc)) from exc
+        if token.kind != FIELD:
+            raise SemanticBackendError(f"{token.token} is a measure, not a field")
+        # Screened as the catalog spells it: a token written in another case
+        # resolves to the same field and must meet the same evidence. Resolved
+        # before the lookup is built, which reads the columns it registers.
+        aliases = {token.token: self._field_aliases(token)}
+        lookup = None
+        if self._dex is not None:
+            governed = self._governed_sql()
+            lookup = governed.pii_lookup(governed.load_cache())
+        notes = screen_values_request(token.token, meta_lookup=lookup, aliases=aliases)
+        self._supported_connector("reading a Metric View field's values")
+        governed = self._governed_sql()
+        try:
+            return self._run_values(dimension, metrics, token, notes, governed)
+        finally:
+            governed.release()
+
+    def _run_values(
+        self,
+        dimension: str,
+        metrics: list[str],
+        token: Any,
+        notes: list[str],
+        governed: GovernedSql,
+    ) -> SemanticValuesResult:
+        from ...metric_views.query import translate_values
+
+        plan = self._translate(
+            lambda loaded: translate_values(loaded, dimension, metrics)
         )
-        screen_values_request(request.name, meta_lookup=self._pii_lookup())
-        raise SemanticBackendError(
-            f"{_NO_RUNTIME}, and reading a field's values is one of them. "
-            f"{request.token} sits on a column the catalog names: profile that "
-            "relation with `explore profile` instead"
+        cache = governed.load_cache()
+        command = "explore semantic values"
+        where, deployed_notes = self._deployed(plan, command)
+        priced = self._in_scope(plan, command)
+        rendered = self._render(plan, where)
+        return governed.run(
+            rendered.sql,
+            cache,
+            backend=self,
+            command=command,
+            result_type=SemanticValuesResult,
+            extra_notes=[*deployed_notes, *notes],
+            column_names=rendered.names,
+            priced_relations=priced,
+            live_relations=[where],
+            dimension=token.token,
+            scoped_to=[m.token for m in plan.measures],
         )
 
-    def _pii_lookup(self):
-        """The cache-backed PII lookup when an engine is present, else None (the
-        name heuristic alone, which still refuses an obviously personal name)."""
+    # ---- the steps -----------------------------------------------------------
 
-        if self._dex is None:
-            return None
-        from .governed import GovernedSql
+    def _translate(self, build) -> Any:
+        """Run a translation, turning its refusals into backend errors."""
 
-        governed = GovernedSql(
-            self._dex,
-            self._dex.connector or getattr(self._dex.config, "connector", "") or "",
-            getattr(self._dex.config, "query", None) or QueryLimits(),
-            lambda: dict(self._catalog_view().physical_columns),
-            recompile_hint="correct the Metric View's `source`",
-            computed_columns=lambda: dict(self._catalog_view().computed_columns),
+        from ...metric_views.query import QueryRefused
+
+        try:
+            return build(self._loaded())
+        except QueryRefused as exc:
+            if exc.guard:
+                raise SemanticQueryRefusedError(str(exc)) from exc
+            raise SemanticBackendError(str(exc)) from exc
+
+    def _screened(self, plan: Any) -> tuple[list[str], dict[str, list[str]]]:
+        """Every token the PII gate screens, and the tokens each stands for.
+
+        Each field is screened as the catalog spells it, since a token written
+        in another case, or with a grain suffix, reads the same field and must
+        meet the same evidence; the refusal still names the caller's spelling.
+        A column a value-returning measure reads directly (``MAX(customer.email)``)
+        has no catalog token, so it is screened through its physical column,
+        registered for this command in :meth:`_physical_columns`.
+        """
+
+        from ...metric_views.query import value_columns
+
+        refs: list[str] = []
+        aliases: dict[str, list[str]] = {}
+        for item in [*plan.fields, *plan.filters]:
+            refs.append(item.token)
+            aliases[item.token] = self._field_aliases(item)
+        for measure in plan.measures:
+            columns = value_columns(
+                plan.view, measure.member, self._source.resolution(), self._fold
+            )
+            if columns is None:
+                raise SemanticQueryRefusedError(
+                    f"refused: dex could not read which columns measure "
+                    f"{measure.token} returns the values of, so the PII gate cannot "
+                    "screen them"
+                )
+            refs.extend(self._register(columns))
+        return list(dict.fromkeys(refs)), aliases
+
+    def _field_aliases(self, item: Any) -> list[str]:
+        """The tokens one field is screened as: its catalog token, and, where the
+        catalog's lineage has no column or expression for it (a field computed
+        over more than one table), every column its expression reads, so a
+        neutral name cannot carry a flagged column through."""
+
+        from ...metric_views.query import field_columns
+
+        catalog = self._catalog_view()
+        if item.canonical in {*catalog.physical_columns, *catalog.computed_columns}:
+            return [item.canonical]
+        columns = field_columns(
+            item.view, item.member, self._source.resolution(), self._fold
         )
-        return governed.pii_lookup(governed.load_cache())
+        if columns is None:
+            raise SemanticQueryRefusedError(
+                f"refused: dex could not read which columns field {item.base} "
+                "reads, so the PII gate cannot screen them"
+            )
+        return [item.canonical, *self._register(columns)]
+
+    def _register(self, columns: list[Any]) -> list[str]:
+        """Each column's token, its physical column registered for the gate."""
+        for column in columns:
+            if column.gate is not None:
+                self._base_columns[column.token] = column.gate
+        return [column.token for column in columns]
+
+    def _fold(self, column: str) -> str:
+        """A column name spelled the way the connector folds an unquoted one."""
+        from ...adapters import fold_identifier
+
+        return fold_identifier(self._connector(), column)
+
+    def _deployed(self, plan: Any, command: str) -> tuple[str, list[str]]:
+        """Locate the deployed view, before any spend: its name, and notes for
+        the result."""
+
+        from ...semantic_deployment import LocateRefused, ObjectKind, locate
+
+        adapter = self._governed_sql().adapter(command)
+        view = plan.view
+        kind = ObjectKind(
+            noun="metric view",
+            scope="<catalog>.<schema>",
+            deploy=(
+                "deploy the reviewed file with `CREATE VIEW <catalog>.<schema>."
+                f"{view.name} WITH METRICS LANGUAGE YAML AS $$ ... $$` into a "
+                "schema the allowlist names, then query again"
+            ),
+            narrow=(
+                ", repeated for the schema holding the view's source and join "
+                "tables where it is another (the scope is also the cost boundary "
+                "a query is priced within)"
+            ),
+        )
+        try:
+            where = locate(adapter.list_metric_views(), view.name, kind)
+        except LocateRefused as exc:
+            raise SemanticQueryRefusedError(str(exc)) from exc
+        notes = [
+            f"executed against the metric view deployed as {where}, found by the "
+            f"stem of {view.file} among the Metric Views the source allowlist "
+            "holds. Its deployed definition was not compared with the file (that "
+            "check is #1363), so the answer is the deployment's"
+        ]
+        if view.filter:
+            notes.append(
+                f"view '{view.name}' declares a `filter`, which Databricks applies "
+                "to every query of it; dex does not repeat it"
+            )
+        return where, notes
+
+    def _render(
+        self,
+        plan: Any,
+        where: str,
+        *,
+        order_by: list[str] | None = None,
+        limit: int | None = None,
+    ) -> Any:
+        from ...metric_views.query import QueryRefused
+
+        try:
+            return plan.render(
+                where,
+                order_by=order_by or [],
+                limit=limit,
+                max_rows=self._limits().max_rows,
+            )
+        except QueryRefused as exc:
+            raise SemanticBackendError(str(exc)) from exc
+
+    def _in_scope(self, plan: Any, command: str) -> list[str]:
+        """The base tables the statement reaches, refused unless every one is in
+        the scoped inventory.
+
+        The statement is priced from those tables' sizes, and the inventory is
+        the source allowlist, narrowed by ``--scope``: a table outside it has no
+        size to read and would be quoted as nothing, while Databricks still scans
+        it. The allowlist is a cost boundary a command may narrow and never
+        widen, so such a query is refused by name rather than under-priced.
+        """
+
+        from ...adapters import normalize_relation
+        from ...cache import match_identifier
+        from ...metric_views.query import base_tables
+
+        tables = base_tables(plan.view, plan)
+        if tables is None:
+            raise SemanticQueryRefusedError(
+                f"refused: dex could not read which tables view '{plan.view.name}' "
+                "reads for this query (its `source`, or the expression of a join "
+                "or member it reaches), so it cannot price what the query would "
+                "scan"
+            )
+        relations = [
+            normalize_relation(_CONNECTOR, name) or name.lower() for name in tables
+        ]
+        adapter = self._governed_sql().adapter(command)
+        listed = [meta.identifier for meta in adapter.list_objects()]
+        outside = [
+            name
+            for name in relations
+            if not match_identifier(name, listed)
+            and not any(match_identifier(item, [name]) for item in listed)
+        ]
+        if outside:
+            raise SemanticQueryRefusedError(
+                f"refused: this query reads {', '.join(outside)} through the "
+                "metric view, outside the source allowlist (or the --scope it was "
+                "narrowed to), so dex cannot price what it would scan. Add the "
+                "schema to databricks.catalogs in .dex/config.yml, or widen "
+                "--scope to it"
+            )
+        return relations
+
+    # ---- plumbing ------------------------------------------------------------
+
+    def _loaded(self):
+        try:
+            loaded = self._source.loaded()
+        except ProjectError as exc:
+            raise SemanticBackendError(str(exc)) from exc
+        if loaded.errors and loaded.empty:
+            self._catalog_view()  # raises, naming every file the reader refused
+        return loaded
+
+    def _supported_connector(self, what: str) -> str:
+        connector = self._connector() or ""
+        if connector == _CONNECTOR:
+            return connector
+        raise SemanticQueryRefusedError(
+            f"refused: {what} runs on the Databricks connector, and this "
+            f"repository's connector is {connector or 'not set'}: a Metric View "
+            "is a Unity Catalog object, queried with MEASURE() on a Databricks SQL "
+            "warehouse. Read the layer with `explore semantic list`, then query "
+            "the relations it names with `explore query`, which runs under the "
+            "firewall and the cost guard"
+        )
+
+    def _connector(self) -> str | None:
+        if self._dex is not None:
+            return self._dex.connector or getattr(self._dex.config, "connector", None)
+        return getattr(self._source, "connector", None)
+
+    def _governed_sql(self) -> GovernedSql:
+        if self._governed is None:
+            if self._dex is None:
+                raise SemanticBackendError(
+                    "a Metric View query runs through dex's own connection, so "
+                    "build the layer from an engine "
+                    "(LocalMetricViewLayer.from_engine)"
+                )
+            self._governed = GovernedSql(
+                self._dex,
+                self._connector() or "",
+                self._limits(),
+                self._physical_columns,
+                recompile_hint=_RECOMPILE_HINT,
+                computed_columns=self._computed_columns,
+            )
+        return self._governed
+
+    def _physical_columns(self) -> dict[str, tuple[str, str]]:
+        try:
+            columns = dict(self._catalog_view().physical_columns)
+        except SemanticBackendError:
+            columns = {}
+        return {**columns, **self._base_columns}
+
+    def _computed_columns(self) -> dict[str, tuple[str, str]]:
+        try:
+            return dict(self._catalog_view().computed_columns)
+        except SemanticBackendError:
+            return {}
+
+    def _limits(self) -> QueryLimits:
+        config = getattr(self._dex, "config", None)
+        return getattr(config, "query", None) or QueryLimits()
