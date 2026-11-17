@@ -32,12 +32,17 @@ read between the delimiters.
 An identity that can browse a view and is not shown its ``view_definition``
 reads nothing back: that view's coverage is ``refused``, naming why, never a
 catalog presented as complete.
+
+Under ``semantic.deployment: databricks_workspace`` (#1364) there is no file to
+compare with: :func:`read_workspace` reads back every Metric View the
+allowlist's scopes hold, each validated as a file is, and holds it to nothing.
+A configured file describing one is named on its coverage, never compared.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..semantic_deployment import (
@@ -58,15 +63,19 @@ __all__ = [
     "FULL",
     "LIMITED",
     "REFUSED",
+    "WORKSPACE_DISCLOSURE",
     "Coverage",
     "DeployedRead",
     "Difference",
     "LocateRefused",
     "Reliance",
+    "WorkspaceRead",
     "compare",
     "locate",
     "read_deployed",
+    "read_workspace",
     "relied_on",
+    "unchecked_file_reason",
     "unwrap",
 ]
 
@@ -171,6 +180,114 @@ def read_deployed(
     unresolved = sorted({d.element for d in loaded.errors})
     return DeployedRead(
         name, deployed_as, text, view, coverage, diagnostics, unresolved
+    )
+
+
+# --- Unity Catalog alone (#1364) -----------------------------------------------------
+
+
+#: Said on every result under ``semantic.deployment: databricks_workspace``.
+WORKSPACE_DISCLOSURE = (
+    "definitions read from the Metric Views deployed in Unity Catalog "
+    "(semantic.deployment: databricks_workspace), not from a reviewed repository "
+    "file, and not checked against one: Unity Catalog is the source of truth here"
+)
+
+
+def unchecked_file_reason(file: str) -> str:
+    """Said of a deployed view a configured repository file also describes."""
+
+    return (
+        f"a reviewed repository file ({file}) describes this view and it was not "
+        "checked against it; `--local` holds the deployment to the file"
+    )
+
+
+@dataclass
+class WorkspaceRead:
+    """The Metric Views the source allowlist holds, read back.
+
+    ``views`` are the ones that validated, each named by its Unity Catalog name;
+    ``coverage`` names every view the listing found, the refused included;
+    ``locations`` maps each view's name, lower-cased, to its
+    ``catalog.schema.name``; ``files`` each name to the configured file
+    describing it; ``unresolved`` each name to the elements the reader refused
+    in its read-back.
+    """
+
+    views: list[MetricView] = field(default_factory=list)
+    coverage: list[Coverage] = field(default_factory=list)
+    locations: dict[str, str] = field(default_factory=dict)
+    files: dict[str, str] = field(default_factory=dict)
+    listed: list[str] = field(default_factory=list)
+    unresolved: dict[str, list[str]] = field(default_factory=dict)
+
+    def coverage_of(self, name: str) -> Coverage | None:
+        """The coverage entry for ``name`` (ignoring case), or None. A name
+        refused as ambiguous has one entry per schema; the first answers."""
+        lowered = name.lower()
+        return next((c for c in self.coverage if c.view.lower() == lowered), None)
+
+
+def read_workspace(
+    listed: Iterable[str],
+    reader: Callable[[str], str],
+    repository: Iterable[MetricView] = (),
+    *,
+    names: Iterable[str] | None = None,
+) -> WorkspaceRead:
+    """Every Metric View ``listed`` holds, read back with ``reader``.
+
+    ``listed`` is what ``tables.list`` returned over the allowlist's scopes. A
+    name held in two scopes is ``refused`` for each, naming both and
+    ``--scope``, because dex cannot tell which one a token means; neither is read
+    back. ``repository`` is the configured files' views: one describing a
+    deployed view (by its stem, ignoring case) is named on its coverage and never
+    compared. ``names`` narrows the read-back to the views a query names; the
+    listing already found every view, so a name it does not hold is still told
+    apart from one it holds and could not read.
+    """
+
+    listed = sorted(set(listed))
+    by_name: dict[str, list[str]] = {}
+    for fq in listed:
+        by_name.setdefault(fq.rsplit(".", 1)[-1].lower(), []).append(fq)
+    files = {view.name.lower(): view.file for view in repository}
+    wanted = None if names is None else {n.lower() for n in names}
+    found = WorkspaceRead(listed=listed)
+    for key in sorted(by_name):
+        if wanted is not None and key not in wanted:
+            continue
+        holders = by_name[key]
+        name = holders[0].rsplit(".", 1)[-1]
+        file = files.get(key)
+        if len(holders) > 1:
+            reason = _ambiguous(name, holders)
+            found.coverage.extend(
+                Coverage(name, fq, REFUSED, [reason], repository_file=file)
+                for fq in holders
+            )
+            continue
+        where = holders[0]
+        read = read_deployed(name, where, reader)
+        read.coverage.repository_file = file
+        found.coverage.append(read.coverage)
+        if read.view is None:
+            continue
+        found.views.append(read.view)
+        found.locations[key] = where
+        if read.unresolved:
+            found.unresolved[key] = list(read.unresolved)
+        if file is not None:
+            found.files[key] = file
+    return found
+
+
+def _ambiguous(name: str, holders: list[str]) -> str:
+    return (
+        f"metric view '{name}' is deployed in more than one allowlisted schema "
+        f"({', '.join(holders)}), so dex cannot tell which one a token means. "
+        f"Narrow the command with `--scope <catalog>.<schema>`{SCOPE_BASE_TABLES}"
     )
 
 

@@ -35,10 +35,12 @@ than as every view changing.
 |---|---|---|
 | `config validate` and `config get` on a `semantic.databricks` block | none | always available |
 | reading the layer: `explore semantic list`, `--use-project`, `maintain` | `[metric-views]`, the dialect engine (every connector extra already carries it) | refused by name, `reason: prerequisite` |
+| `explore semantic` under `semantic.deployment: databricks_workspace`, and `explore relationships\|map --use-hosted-semantic-layer` there | `[metric-views]` and `[databricks]` | refused by name, `reason: prerequisite` |
 
 Reading the layer installs no Databricks package and opens no workspace
 connection. The `[databricks]` extra is the warehouse connector. Only a governed
-query (#1362) needs it.
+query (#1362), `list --deployed` (#1363), and every `explore semantic` command
+under `semantic.deployment: databricks_workspace` (#1364) need it.
 
 ## The YAML body is read; the DDL is not
 
@@ -348,6 +350,44 @@ member and the field (`orders.revenue has a different expr there`). A
 deployment that cannot be read back refuses it too, with the coverage reason. A
 query that reads nothing that changed still runs, and its result says the
 definition was read back and matches the file.
+
+## Unity Catalog alone: `semantic.deployment: databricks_workspace` (#1364)
+
+With `databricks_workspace`, the catalog is read from Unity Catalog, and no
+repository file is needed. It is the Databricks counterpart of Snowflake's
+`snowflake_account`, read by `explore` only.
+
+1. `tables.list` per allowlisted scope lists every Metric View (REST, no
+   warehouse).
+2. `tables.get` reads each one back (REST, no warehouse). `query` and `values`
+   read back only the view their tokens name.
+3. Each read-back is validated by the reader that reads a file, with every rule
+   above. A read-back that does not validate is `refused` in `coverage`, with the
+   reader's diagnostics as its reasons.
+
+What is the same as under `local`: the render, the refusals before a SQL session
+opens, the PII gate through the catalog's lineage, pricing from the base tables,
+the allowlist as a cost boundary, and execution through Dex's own Databricks
+connector (`execution: dex`).
+
+What is different:
+
+| | `local` | `databricks_workspace` |
+|---|---|---|
+| Where the catalog comes from | the configured files | every Metric View in the source allowlist's scopes |
+| The deployed view, before a query | held to the file; any difference refuses | held to nothing: Unity Catalog is the source of truth |
+| Said on every result | nothing extra | a warning that the definitions were read from Unity Catalog and not checked against a reviewed file; `source: account` on the catalog, `definition_source: account` on a query or values result |
+| A configured file for the same view | is the definition | named on the view (`repository_file` in `coverage`, a note on each query or values result), never compared; `--local` holds the deployment to it |
+| Names | the file's stem | the Unity Catalog name (stored lower-cased); a file describes a view whose name matches its stem ignoring case; tokens match ignoring case |
+| A name in two allowlisted scopes | refused when queried | `refused` in `coverage` for each copy, naming both and `--scope`, and not read back |
+| The PII gate | before anything is sent | after the free read-back, before any SQL session: a token resolves only against the deployed definitions |
+| `maintain`, `transform`, `--use-project` | the files | the files, where configured; with none, each says so instead of reporting a clean layer |
+| `explore relationships` and `explore map` with `--use-hosted-semantic-layer` | refused (no hosted read) | folds the deployed views' joins and `rely` keys in, on the tables they join |
+
+`--deployed` changes nothing here, and `--api` is refused: Dex executes, so there
+is no vendor execution to switch to. Out of scope in this release: `maintain`
+over views read from Unity Catalog alone, adopting a deployed view into the
+repository as a file, Genie, and deploying anything.
 
 ## What `maintain` makes of the layer
 

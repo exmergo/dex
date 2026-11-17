@@ -579,6 +579,16 @@ it as `execution` (`dex` or `vendor`).
   Catalog and held to the file first: a difference in anything the query relies
   on refuses, naming the member and the field (#1363). `list --deployed` reads
   the deployed views instead, with `source: deployed` and per-view `coverage`.
+  `semantic.deployment: databricks_workspace` (#1364) reads the catalog from
+  Unity Catalog alone (every Metric View the allowlist holds, `tables.list` then
+  `tables.get`, no warehouse, `source: account`, per-view `coverage`, no file
+  needed, each view named by its Unity Catalog name) and runs `query` and
+  `values` over it with nothing held to a file; every result carries
+  `definition_source: account` (on a query or values result) and a warning
+  saying so. A configured file describing a view is named in its `coverage` as
+  `repository_file`, and `--local` holds the view to it.
+  `explore relationships` and `explore map` with `--use-hosted-semantic-layer`
+  fold the deployed views' joins and `rely` keys in.
 - `semantic.vendor: snowflake` reads the Snowflake Semantic View YAML files
   named in `semantic.snowflake.files` statically (needs the `[semantic-views]`
   extra; no Snowflake connection, nothing deployed), each validated by Dex's own

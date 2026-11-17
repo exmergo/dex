@@ -137,7 +137,18 @@ class LocalMetricViewLayer:
                 "they are git-reviewable files, so build the engine with "
                 "DexEngine.from_repo(repo_root)"
             )
-        return cls(engine.semantic_catalog_source(), engine)
+        source = engine.semantic_catalog_source()
+        if not getattr(source, "files", True):
+            # Reached only under semantic.deployment: databricks_workspace, where
+            # the files are optional and `--local` asked for them.
+            raise SemanticBackendError(
+                "`--local` reads the repository's Metric View files and holds the "
+                "deployed views to them, and no semantic.databricks.files is "
+                "configured. Drop --local to read Unity Catalog "
+                "(semantic.deployment: databricks_workspace), or configure the "
+                "files"
+            )
+        return cls(source, engine)
 
     # ---- discovery ---------------------------------------------------------
 
@@ -151,14 +162,14 @@ class LocalMetricViewLayer:
     def declared_relationships(self) -> list[Any]:
         """Each join with key pairs, with every ordered column pair."""
 
-        return self._source.declared_definitions().declared_relationships
+        return self._definitions().declared_relationships
 
     def declared_keys(self) -> tuple[list[Any], list[Any]]:
         """Each ``rely.at_most_one_match`` key, on the joined table. A Metric
         View is never the transformation project, so this is the only route its
         keys have to grain detection."""
 
-        defs = self._source.declared_definitions()
+        defs = self._definitions()
         return defs.declared_keys, defs.declared_composite_keys
 
     def declared_models(self) -> tuple[dict[str, Any], list[str]]:
@@ -166,7 +177,7 @@ class LocalMetricViewLayer:
         View has no metadata block a declaration could live in, so this is empty
         by construction."""
 
-        defs = self._source.declared_definitions()
+        defs = self._definitions()
         return defs.model_declarations, defs.declaration_notes
 
     def _catalog_view(self):
@@ -428,7 +439,7 @@ class LocalMetricViewLayer:
             aliases[item.token] = self._field_aliases(item)
         for measure in plan.measures:
             columns = value_columns(
-                plan.view, measure.member, self._source.resolution(), self._fold
+                plan.view, measure.member, self._resolution(), self._fold
             )
             if columns is None:
                 raise SemanticQueryRefusedError(
@@ -456,9 +467,7 @@ class LocalMetricViewLayer:
         catalog = self._catalog_view()
         if item.canonical in {*catalog.physical_columns, *catalog.computed_columns}:
             return [item.canonical]
-        columns = field_columns(
-            item.view, item.member, self._source.resolution(), self._fold
-        )
+        columns = field_columns(item.view, item.member, self._resolution(), self._fold)
         if columns is None:
             raise SemanticQueryRefusedError(
                 f"refused: dex could not read which columns field {item.base} "
@@ -619,6 +628,15 @@ class LocalMetricViewLayer:
         return resolved
 
     # ---- plumbing ------------------------------------------------------------
+
+    def _definitions(self) -> Any:
+        """What the layer declares: keys, joins and their relations."""
+        return self._source.declared_definitions()
+
+    def _resolution(self) -> Any:
+        """This command's resolution of the layer: relations, columns and join
+        pairs."""
+        return self._source.resolution()
 
     def _loaded(self):
         try:
