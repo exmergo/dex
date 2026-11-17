@@ -1255,6 +1255,7 @@ def relationships(
 
     identifiers = [d.identifier for d in datasets]
     declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    test_keys = {_relationship_edge_key(rel) for rel in declared}
     declaration_edges, declaration_edge_notes = rel_mod.declaration_relationships(
         defs, identifiers
     )
@@ -1265,7 +1266,6 @@ def relationships(
     declared_notes.extend(
         _declaration_join_notes(declaration_edges, declaration_already_declared)
     )
-    test_keys = {_relationship_edge_key(rel) for rel in declared}
     native_edges, native_edge_notes = _native_semantic_edges(
         engine,
         use_project,
@@ -2859,6 +2859,7 @@ def map(
     # about this warehouse, and both channels are read on the same terms.
     identifiers = [m.identifier for m in metas]
     declared, declared_notes = rel_mod.declared_relationships(defs, identifiers)
+    test_keys = {_relationship_edge_key(rel) for rel in declared}
     declaration_edges, declaration_edge_notes = rel_mod.declaration_relationships(
         defs, identifiers
     )
@@ -2869,7 +2870,6 @@ def map(
     declared_notes.extend(
         _declaration_join_notes(declaration_edges, declaration_already_declared)
     )
-    test_keys = {_relationship_edge_key(rel) for rel in declared}
     native_edges, native_edge_notes = _native_semantic_edges(
         engine,
         use_project,
