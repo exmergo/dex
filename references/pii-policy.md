@@ -34,7 +34,7 @@ confidence against the blocking threshold.
 | dbt `meta` stamping | presence, any confidence | the flag is stamped into model and column `config.meta`, on a scaffolded model, a reconciled column and a model `transform plan` creates (see [PII metadata on authored models](#pii-metadata-on-authored-models)) |
 | cluster feature selection | presence, any confidence | flagged columns are excluded; naming one is opt-in and mean only |
 | the query firewall | threshold | at or above, projection is refused; below, it runs with a warning |
-| the seed header gate | threshold | a seed column at or above the threshold is refused, except that on a seed file the plan creates a flag exactly at the threshold warns and names the override |
+| the seed header gate | threshold | a seed column at or above the threshold is refused, except that on a seed file the plan creates, a flag exactly at the threshold that only the header name raised warns and names the override |
 | declaration population reporting | presence, any confidence | a flagged filter withholds its values and the entire free-text population rule |
 | the semantic request gate | presence, any confidence | a flagged dimension refuses the whole command |
 | warehouse error text | none: every column | the value a conversion failure quotes is masked (see [Warehouse error text](#warehouse-error-text)) |
@@ -123,11 +123,12 @@ Permission belongs to the command and operation being performed. A supported
 model pass-through does not authorize exporting the field as a seed: the seed
 header gate still applies because seed values enter the repository. The one
 relaxation is for a seed file the plan creates, whose columns were authored in
-that same plan: a column whose strongest flag is exactly at the threshold (a
-name pattern such as `*_note`, read as free text at 0.5) warns and names the
-`pii_overrides` entry instead of refusing. A rewrite of an existing seed, and any
-stronger flag (an email, a person-name token, a generic name at 0.6), still
-refuses.
+that same plan: a column whose strongest flag is exactly at the threshold and
+comes from its header name alone (a name pattern such as `*_note`, read as free
+text at 0.5) warns and names the `pii_overrides` entry instead of refusing. A
+column a profile already flagged is a warehouse column being exported and still
+refuses, as do a rewrite of an existing seed and any stronger flag (an email, a
+person-name token, a generic name at 0.6).
 
 ## PII metadata on authored models
 

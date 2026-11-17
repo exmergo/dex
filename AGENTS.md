@@ -577,8 +577,9 @@ declaring a dbt package is a reviewable diff too), `macro_sql`, `snapshot_sql`
 naming a `unique_key` and a strategy), `seed_csv` (a small reference CSV under
 the seed paths, capped at 5,000 rows and 1 MiB and refused when a column name
 looks like personal data, since a seed puts values into a diff and a diff goes
-into git; on a seed file the plan creates, a flag exactly at the threshold warns
-and names the `pii_overrides` entry instead), `test_sql` (a file under the test paths: a singular test, which is a
+into git; on a seed file the plan creates, a header-name flag exactly at the
+threshold that no profile raised warns and names the `pii_overrides` entry
+instead), `test_sql` (a file under the test paths: a singular test, which is a
 SELECT that must return no rows, or a generic test definition, which is a
 `{% test %}` block checked like a macro), `analysis_sql` (SQL under the analysis
 paths that dbt compiles and never runs, held to the same read-only SELECT

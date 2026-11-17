@@ -1207,8 +1207,9 @@ against the flags already in the `.dex/` cache. A column at or above the
 blocking threshold is refused, and the refusal names the `pii_overrides` entry
 that would clear it, never a value ([`pii-policy.md`](pii-policy.md)). On a seed
 file the plan creates, a column whose strongest flag is exactly at the threshold
-warns with that entry instead, since the plan authored it; a rewrite of an
-existing seed, and any stronger flag, still refuses. The
+and comes from its header name alone warns with that entry instead, since the
+plan authored it; a column a profile flagged, a rewrite of an existing seed, and
+any stronger flag still refuse. The
 standing limit is worth knowing: dex detects PII from names and types and never
 from values, everywhere, so a seed column named `code` full of email addresses
 passes this gate.

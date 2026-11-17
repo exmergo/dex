@@ -218,6 +218,17 @@ def test_a_flag_above_the_threshold_refuses_a_created_seed_too():
         validate_seed("seeds/labs.csv", NOTED, cache=cache, created=True)
 
 
+def test_a_profiled_column_exported_into_a_created_seed_still_refuses():
+    """The relaxation covers a header-name guess only: a column a profile
+    already flagged is a warehouse column being exported, at any threshold."""
+
+    cache = _cache_flagging("comments", PIICategory.FREE_TEXT, 0.5)
+    with pytest.raises(EditValidationError, match="'comments' looks like free_text"):
+        validate_seed(
+            "seeds/report_export.csv", "report_id,comments\n", cache=cache, created=True
+        )
+
+
 def test_the_override_still_clears_a_created_seed_without_a_warning():
     overrides = pii_override_paths([PIIOverride(column="labs.lab_note")])
     assert (

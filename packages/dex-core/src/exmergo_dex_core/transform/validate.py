@@ -622,8 +622,9 @@ def validate_seed(
     weaker one, and the detector's own provisional generic-name match, warns.
     ``created`` marks a seed file this plan creates rather than rewrites: its
     columns were authored in this same plan, so a hit exactly at the threshold
-    (a name-pattern guess such as ``*_note`` read as free text) warns and names
-    the override instead of refusing (#647). Anything above it still refuses.
+    that only the header name raised (a name-pattern guess such as ``*_note``
+    read as free text) warns and names the override instead of refusing (#647).
+    A column a profile flagged, and anything above the threshold, still refuses.
 
     **What this cannot see:** dex detects PII from names and types, never from
     values, everywhere. A seed column named ``code`` holding email addresses
@@ -761,12 +762,14 @@ def _seed_pii_warnings(
             # It warns instead, loudly, and every non-generic pattern (email,
             # phone, national id, address) still blocks.
             warned.append((column, flag, "unrefined"))
-        elif created and flag.confidence <= PII_BLOCK_CONFIDENCE:
+        elif created and from_cache is None and flag.confidence <= PII_BLOCK_CONFIDENCE:
             # A seed this plan creates was authored in the same plan, and a
-            # flag no stronger than the threshold is a name-pattern guess
-            # (free text at 0.5): the plan names the override rather than
-            # stopping on it (#647). A rewrite of an existing seed, and any
-            # stronger flag, still refuses.
+            # flag no stronger than the threshold that only the header name
+            # raised is a name-pattern guess (free text at 0.5): the plan
+            # names the override rather than stopping on it (#647). A column
+            # a profile already flagged is a warehouse column being exported,
+            # which still refuses, as does a rewrite of an existing seed and
+            # any stronger flag.
             warned.append((column, flag, "authored"))
         elif flag.confidence >= PII_BLOCK_CONFIDENCE:
             blocked.append((column, flag))

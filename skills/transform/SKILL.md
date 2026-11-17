@@ -667,8 +667,9 @@ a field, flag, or macro you need is not described here.
   personal data under a neutral column name.
 - A seed whose header looks like personal data is refused; the refusal names the
   `pii_overrides` entry a human can add to `.dex/config.yml`. On a seed file the
-  plan creates, a flag exactly at the threshold (a `*_note` column read as free
-  text) warns with the same entry instead: review the column's values before
+  plan creates, a header-name flag exactly at the threshold (a `*_note` column
+  read as free text, never a column a profile flagged) warns with the same entry
+  instead: review the column's values before
   applying, and relay the warning. Recommend it. If the
   user agrees, propose it with `dex config set pii_overrides '<list>'` (the whole
   list, existing entries included: read them with `dex config get pii_overrides`)
