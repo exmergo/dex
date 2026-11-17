@@ -601,6 +601,20 @@ def _balanced_call(text: str, start: int) -> tuple[str | None, int]:
     return None, len(text)
 
 
+class _UnreadableCache:
+    """Stands in for an exploration cache that exists and could not be read.
+
+    It holds no flag, like an absent cache, but it is not evidence that no
+    profile flagged a column: the created-seed relaxation (#647) refuses to
+    treat a read failure as "nothing flagged this" and keeps the refusal.
+    """
+
+    datasets: tuple[()] = ()
+
+
+UNREADABLE_CACHE = _UnreadableCache()
+
+
 def validate_seed(
     path: str,
     content: str,
@@ -762,7 +776,12 @@ def _seed_pii_warnings(
             # It warns instead, loudly, and every non-generic pattern (email,
             # phone, national id, address) still blocks.
             warned.append((column, flag, "unrefined"))
-        elif created and from_cache is None and flag.confidence <= PII_BLOCK_CONFIDENCE:
+        elif (
+            created
+            and from_cache is None
+            and cache is not UNREADABLE_CACHE
+            and flag.confidence <= PII_BLOCK_CONFIDENCE
+        ):
             # A seed this plan creates was authored in the same plan, and a
             # flag no stronger than the threshold that only the header name
             # raised is a name-pattern guess (free text at 0.5): the plan
@@ -799,8 +818,8 @@ def _seed_pii_warnings(
                 f"(confidence {flag.confidence:g}, at the "
                 f"{PII_BLOCK_CONFIDENCE:g} block threshold); this plan creates "
                 "the seed, so it is not refused, but its values land in git and "
-                "stay there: review them before applying. If the column is "
-                "reviewed as not personal data, record "
+                "stay there: have a person review them before applying. If the "
+                "column is reviewed as not personal data, record "
                 f"`- {{column: {seed}.{column}}}` under pii_overrides in "
                 ".dex/config.yml; if it is, take it out of the seed"
             )

@@ -669,8 +669,9 @@ a field, flag, or macro you need is not described here.
   `pii_overrides` entry a human can add to `.dex/config.yml`. On a seed file the
   plan creates, a header-name flag exactly at the threshold (a `*_note` column
   read as free text, never a column a profile flagged) warns with the same entry
-  instead: review the column's values before
-  applying, and relay the warning. Recommend it. If the
+  instead. Relay the warning and ask the user to review that column's values
+  before applying; never read them yourself, since they may be personal data.
+  Recommend it. If the
   user agrees, propose it with `dex config set pii_overrides '<list>'` (the whole
   list, existing entries included: read them with `dex config get pii_overrides`)
   and let them confirm the diff; never confirm it yourself.

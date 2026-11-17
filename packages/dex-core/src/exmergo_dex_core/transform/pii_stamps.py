@@ -182,7 +182,10 @@ def _producers_first(
         model: {
             found
             for found in re.findall(
-                r"""ref\(\s*['"]([^'"]+)['"]\s*\)""", files.get(path, "")
+                # `ref('model')` and the two-argument `ref('project', 'model')`,
+                # whose last argument names the model.
+                r"""ref\(\s*(?:['"][^'"]+['"]\s*,\s*)?['"]([^'"]+)['"]""",
+                files.get(path, ""),
             )
             if found in models and found != model
         }

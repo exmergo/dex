@@ -527,7 +527,9 @@ def plan(
                 # An unreadable cache narrows the seed's PII gate to the header
                 # detector rather than stopping the plan. Said out loud, because
                 # a check that quietly got weaker is worse than one that failed.
-                cached.append(None)
+                from .validate import UNREADABLE_CACHE
+
+                cached.append(UNREADABLE_CACHE)
                 warnings.append(
                     f"the exploration cache could not be read ({exc}), so a "
                     "seed's columns were checked against their own names only, "

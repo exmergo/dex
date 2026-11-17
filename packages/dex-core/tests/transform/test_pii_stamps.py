@@ -682,7 +682,7 @@ def test_a_new_mart_reads_the_stamp_of_a_new_staging_model_in_the_same_plan(
         {
             "edits": [
                 _sql(
-                    "select phone from {{ ref('z_stage') }}\n",
+                    "select phone from {{ ref('dex_test', 'z_stage') }}\n",
                     path="models/marts/a_report.sql",
                 ),
                 _sql(

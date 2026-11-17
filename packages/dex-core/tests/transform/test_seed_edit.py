@@ -229,6 +229,15 @@ def test_a_profiled_column_exported_into_a_created_seed_still_refuses():
         )
 
 
+def test_an_unreadable_cache_keeps_the_threshold_refusal_on_a_created_seed():
+    """A cache that could not be read is no evidence nothing flagged the column."""
+
+    from exmergo_dex_core.transform.validate import UNREADABLE_CACHE
+
+    with pytest.raises(EditValidationError, match="'lab_note' looks like free_text"):
+        validate_seed("seeds/labs.csv", NOTED, cache=UNREADABLE_CACHE, created=True)
+
+
 def test_the_override_still_clears_a_created_seed_without_a_warning():
     overrides = pii_override_paths([PIIOverride(column="labs.lab_note")])
     assert (
