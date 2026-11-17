@@ -758,6 +758,10 @@ class _Lineage:
 
         shape = self.shape
         self._read_driving()
+        # Inputs first: a statement whose columns cannot be followed (a set
+        # operation) still names what it reads, so a reader can say which
+        # protected relation an untraced output may carry (#1100).
+        self._read_inputs()
         if shape.SET_OPERATIONS and isinstance(self.tree, shape.SET_OPERATIONS):
             self.reading.incomplete.append(
                 "the model is a set operation (UNION and the like), so no column "
@@ -810,6 +814,9 @@ class _Lineage:
                     self._collect_usage(branch)
             else:
                 self._collect_usage(scope)
+
+    def _read_inputs(self) -> None:
+        from sqlglot import expressions as exp
 
         # Warehouse relations only, in the order the statement names them.
         # ``range()`` and ``read_csv_auto()`` parse as a table with an empty
@@ -1228,7 +1235,9 @@ class _Lineage:
             if any(
                 star.args.get(modifier)
                 for star in stars
-                for modifier in ("except", "replace", "rename")
+                # sqlglot stores EXCLUDE/EXCEPT as `except_` (older releases
+                # as `except`), and an ILIKE filter narrows the star too.
+                for modifier in ("except_", "except", "replace", "rename", "ilike")
             ):
                 # `* REPLACE (phone AS note)` puts another column under the
                 # name: an unmodified star is the only one the name follows.

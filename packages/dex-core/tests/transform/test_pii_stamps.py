@@ -846,3 +846,84 @@ def test_a_star_replace_is_not_traced_through_the_original_name(
     )
     note = envelope["data"]["pii_metadata"]["models"]["dim_contacts"]["columns"]["note"]
     assert note == {"status": "unchecked", "reason_code": "lineage_unfollowed"}
+
+
+def test_a_star_exclude_with_a_renamed_column_is_not_traced_by_name(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _contacts(dbt_project_dir, "false")
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "with s as (\n"
+                    "    select * exclude (note), phone as note\n"
+                    "    from {{ ref('stg_contacts') }}\n"
+                    ")\n"
+                    "select note from s\n",
+                    path="models/marts/dim_contacts.sql",
+                )
+            ]
+        },
+    )
+    note = envelope["data"]["pii_metadata"]["models"]["dim_contacts"]["columns"]["note"]
+    assert note == {"status": "unchecked", "reason_code": "lineage_unfollowed"}
+
+
+def test_a_stale_profile_of_a_created_relation_never_clears_its_stamp(
+    project: Path, tmp_path: Path, capsys
+):
+    """The cache holds an older, clean `z_stage`; the plan creates a new one
+    that carries `email`, and the mart reading it must take the new stamp."""
+
+    store = FilesystemStore(tmp_path)
+    cache = store.load_cache()
+    cache.datasets.append(
+        Dataset(
+            identifier="dev.main.z_stage",
+            columns=[ColumnProfile(name="contact", data_type="VARCHAR")],
+        )
+    )
+    store.save_cache(cache)
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select email as contact from {{ ref('stg_reports') }}\n",
+                    path="models/staging/z_stage.sql",
+                ),
+                _sql(
+                    "select contact from {{ ref('z_stage') }}\n",
+                    path="models/marts/a_report.sql",
+                ),
+            ]
+        },
+    )
+    models = envelope["data"]["pii_metadata"]["models"]
+    assert models["z_stage"]["columns"]["contact"]["status"] == "stamped"
+    assert models["a_report"]["columns"]["contact"]["status"] == "stamped"
+    assert models["a_report"]["columns"]["contact"]["evidence"] == "upstream_metadata"
+
+
+def test_a_set_operation_over_a_literal_relation_still_reports_its_input(
+    project: Path, tmp_path: Path, capsys
+):
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select email from dev.main.stg_reports\n"
+                    "union all\n"
+                    "select email from dev.main.stg_reports\n"
+                )
+            ]
+        },
+    )
+    model = envelope["data"]["pii_metadata"]["models"]["rpt_reports"]
+    assert model["columns"]["*"]["status"] == "unchecked"

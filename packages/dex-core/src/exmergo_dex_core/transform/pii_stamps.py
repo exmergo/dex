@@ -99,6 +99,10 @@ def stamp(
 
     report: dict[str, Any] = {}
     warnings: list[str] = []
+    # A relation this plan creates is judged by the plan's own stamps: a cached
+    # profile of the same name describes something else (an older build).
+    fresh = {name for name, (_path, created) in models.items() if created}
+    cache = _without_profiles_of(cache, fresh, files, view, manifest)
     for model in _producers_first(models, files):
         sql_path, created = models[model]
         if mv.split_label(model)[1] is not None or mv.lookup(versions, model):
@@ -167,6 +171,38 @@ def stamp(
     for model, entry in report.items():
         warnings.extend(_warnings(model, entry))
     return edits, warnings, ({"models": report} if report else None)
+
+
+def _without_profiles_of(
+    cache: Any,
+    models: set[str],
+    files: Mapping[str, str],
+    view: Any,
+    manifest: Mapping[str, Any] | None,
+) -> Any:
+    """``cache`` without the profiles that resolve to a model this plan creates.
+
+    Such a profile was taken of an older relation that happened to share the
+    name; it says nothing about the model the plan writes, whose columns are
+    judged by its own lineage and the stamps the plan gives it.
+    """
+
+    from . import drafting
+
+    if cache is None or not models:
+        return cache
+    stale = set()
+    for model in models:
+        found = drafting._dataset_for_model(
+            cache, model, files, view.model_paths, manifest=manifest
+        )
+        if found is not None:
+            stale.add(found.identifier)
+    if not stale:
+        return cache
+    return cache.model_copy(
+        update={"datasets": [d for d in cache.datasets if d.identifier not in stale]}
+    )
 
 
 def _producers_first(

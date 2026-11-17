@@ -572,7 +572,10 @@ def plan(
                         edit,
                         cache=read_cache() if edit.kind is EditKind.SEED_CSV else None,
                         pii_overrides=pii_overrides,
-                        created=edit.path not in view.files,
+                        # Another format's keys are not paths dex can
+                        # check on disk, so a seed absent from its view is
+                        # never assumed new: the relaxation is dbt's only.
+                        created=False,
                     )
                 )
         current = view.files.get(edit.path)
