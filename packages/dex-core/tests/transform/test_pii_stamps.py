@@ -1042,3 +1042,35 @@ def test_a_column_sharing_a_yaml_anchor_is_reported_not_written(
     email = _status(envelope, "email")
     assert email["status"] == "not_written"
     assert email["reason_code"] == "unwritable_yaml"
+
+
+def test_a_model_config_shared_through_an_anchor_is_not_written(
+    project: Path, tmp_path: Path, capsys
+):
+    schema = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: other\n"
+        "    config: &shared\n"
+        "      tags: [x]\n"
+        "  - name: rpt_reports\n"
+        "    config: *shared\n"
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql("select report_id, email from {{ ref('stg_reports') }}\n"),
+                _sql("select 1 as id\n", path="models/marts/other.sql"),
+                {
+                    "path": "models/marts/_marts.yml",
+                    "kind": "schema_yml",
+                    "content": schema,
+                },
+            ]
+        },
+    )
+    model = envelope["data"]["pii_metadata"]["models"]["rpt_reports"]
+    assert model["model_stamp"] == "not_written"
+    assert model["columns"]["email"]["reason_code"] == "unwritable_yaml"

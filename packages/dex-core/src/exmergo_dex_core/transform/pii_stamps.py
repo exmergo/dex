@@ -603,6 +603,12 @@ def _write(
     meta = entry_meta(model_entry)
     if any(key in meta for key in PII_MARK_KEYS):
         return text, (KEPT if _says(meta) else DISAGREEMENT)
+    root = decl._compose(text)
+    config = decl._child(entry(root), "config")
+    if config is not None and decl._carries_anchor(root, config[1]):
+        # The model's `config` is shared through a YAML anchor: a mark spliced
+        # in would land on every entry that aliases it.
+        raise decl.RewriteError(f"the config of '{model}' shares a YAML anchor")
     return decl._set_meta(text, entry, CONTAINS_PII, True), STAMPED
 
 
