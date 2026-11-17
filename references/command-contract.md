@@ -1086,9 +1086,10 @@ check the package is enabled) out of every run. Where its models must stay
 enabled, the copy sets `require_explicit_package_overrides_for_builtin_materializations`
 so the tests run under dbt's own test materialization, since Elementary's needs
 the hooks that were stripped; where a test materialization in the project still
-hands them to Elementary's, the run is refused. Either way the tests never pass
-through Elementary's materialization, so none of its temp tables or samples are
-written (#1307).
+hands them to Elementary's, the run is refused. Either way Elementary's
+materialization handles no test: with the package disabled it hands each one
+straight to dbt's, and with the flag set dbt never picks it, so none of its temp
+tables or samples are written (#1307).
 
 **What the verdicts mean.** `killed` is a defect at least one test caught, named
 in `caught_by`. `survived` is one nothing caught. `rejected` is one the warehouse

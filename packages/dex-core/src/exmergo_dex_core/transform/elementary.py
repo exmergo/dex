@@ -415,11 +415,13 @@ _REFERRING_SECTIONS = ("exposures", "metrics", "semantic_models", "saved_queries
 def package_model_dependents(manifest: Mapping[str, Any]) -> list[str]:
     """What outside the package refers to one of its models, by unique id.
 
-    Disabling the package's models makes dbt refuse the parse wherever one of
-    these exists, so a caller that wants them disabled must leave them on where
-    this is not empty. Tests are left out: dbt only warns for a test, and
-    disables it. The package's models are looked for in ``nodes`` and in
-    ``disabled``, since a project may already disable them for some targets.
+    Disabling the package's models makes dbt refuse the parse wherever a node
+    other than a test refers to one. For a test dbt only warns, and disables
+    the test, so a test of the project's own that reads a package model would
+    drop out of the run unseen; it counts too. A caller that wants the models
+    disabled leaves them on where this is not empty. The package's models are
+    looked for in ``nodes`` and in ``disabled``, since a project may already
+    disable them for some targets.
     """
 
     models = {
@@ -437,11 +439,7 @@ def package_model_dependents(manifest: Mapping[str, Any]) -> list[str]:
     if not models:
         return []
     referring: list[str] = []
-    entries = [
-        (uid, node)
-        for uid, node in (manifest.get("nodes") or {}).items()
-        if node.get("resource_type") != "test"
-    ]
+    entries = list((manifest.get("nodes") or {}).items())
     for section in _REFERRING_SECTIONS:
         entries.extend((manifest.get(section) or {}).items())
     for uid, node in entries:
@@ -474,15 +472,16 @@ def monitoring_tests(manifest: Mapping[str, Any]) -> dict[str, list[str]]:
     """The enabled tests whose package test reads ``is_elementary_enabled()``.
 
     Read from the macros the manifest holds, since the set varies by release.
-    These are the package's monitoring tests: its anomaly tests,
-    ``schema_changes``, ``json_schema`` and, from 0.20.0, the freshness and SLA
-    tests. Each returns no rows wherever the package is not enabled, so it
-    checks nothing there; where it is enabled, each one reads the package's
-    history and leaves rows or tables for the next run to read. ``volume_anomalies``
-    reads it through ``test_table_anomalies``, so the macros a test macro calls
-    count too. The ``*_with_context`` tests do not read it at 0.16.4 or 0.26.1.
-    Returned as ``{node name: the nodes it reads}``, sorted by name, so a caller
-    can keep only the tests its selection reaches.
+    These are the package's monitoring tests, among them its anomaly tests,
+    ``schema_changes``, ``json_schema``, ``python`` and, from 0.20.0, the
+    freshness and SLA tests. Each returns no rows wherever the package is not
+    enabled, so it checks nothing there; where it is enabled, each one reads
+    the package's history or writes a table into its schema, or both.
+    ``volume_anomalies`` reads it through ``test_table_anomalies``, so the
+    macros a test macro calls count too. The ``*_with_context`` tests do not
+    read it at 0.16.4 or 0.26.1. Returned as ``{node name: the nodes it
+    reads}``, sorted by name, so a caller can keep only the tests its
+    selection reaches.
     """
 
     macros = manifest.get("macros") or {}

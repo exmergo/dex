@@ -391,20 +391,28 @@ def _reading(node: dict[str, Any], *nodes: str, macros: tuple[str, ...] = ()):
 
 def test_a_root_node_that_refers_to_a_package_model_is_a_dependent():
     """Variant e: dbt refuses the parse when a model, or an exposure, refers to a
-    disabled model. A test only warns, so it is no dependent."""
+    disabled model. For a test it only warns and disables the test, which would
+    drop out of a mutation run unseen, so a test of the project's own counts too.
+    A test of the package's own does not."""
 
     built = manifest()
     invocations = "model.elementary.dbt_invocations"
     runs = _reading(_node(ROOT, "model", "elementary_runs"), invocations)
-    test = _reading(_node(ROOT, "test", "not_null_dbt_invocations_id"), invocations)
+    test = _reading(
+        _node(ROOT, "test", "relationships_fct_invocation_id"),
+        "model.shop.fct",
+        invocations,
+    )
+    own = _reading(_node("elementary", "test", "unique_invocations_id"), invocations)
     exposure = _reading(_node(ROOT, "exposure", "dashboard"), invocations)
     unrelated = _reading(_node(ROOT, "model", "fct2"), "model.shop.fct")
-    built["nodes"].update({n["unique_id"]: n for n in (runs, test, unrelated)})
+    built["nodes"].update({n["unique_id"]: n for n in (runs, test, own, unrelated)})
     built["exposures"] = {exposure["unique_id"]: exposure}
 
     assert package_model_dependents(built) == [
         "exposure.shop.dashboard",
         "model.shop.elementary_runs",
+        "test.shop.relationships_fct_invocation_id",
     ]
 
 

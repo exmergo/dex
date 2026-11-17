@@ -484,6 +484,64 @@ def test_disabling_a_package_s_models_in_the_copy_overrides_the_project_and_undo
     assert root.read_text(encoding="utf-8") == original
 
 
+_LEFT_OUT = {
+    "name": "elementary_volume_anomalies_fct_ordered_at",
+    "reason_code": "elementary_disabled",
+    "reason": "checks nothing while the package is disabled",
+}
+
+
+def test_a_left_out_test_is_listed_when_the_baseline_never_runs():
+    """The budget can stop a run before its baseline, and a model whose tests
+    all run the incremental branch has no full-build baseline. A test kept out
+    of every run is still named, so the warning that points at
+    ``baseline.excluded`` is true on every path (#1307)."""
+
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    result = transform_commands._run_mutants(
+        None,
+        "models/fct.sql",
+        SimpleNamespace(mutants=[], incremental=None),
+        model="fct",
+        paradigm=Paradigm.FREE_LOCAL,
+        connector="duckdb",
+        store=None,
+        ceiling=None,
+        estimate=None,
+        mutation_mod=mutation,
+        settle_uptime=False,
+        left_out=[_LEFT_OUT],
+    )
+
+    assert result["baseline"]["excluded"] == [{**_LEFT_OUT, "status": "not_run"}]
+
+
+def test_only_the_left_out_tests_the_selection_reaches_are_named():
+    """A monitoring test on a model the run does not select is not one it would
+    have run, and one the downstream routing already excludes is named there."""
+
+    def candidate(name: str, *reads: str) -> dict:
+        return {**_LEFT_OUT, "name": name, "_reads": list(reads)}
+
+    candidates = [
+        candidate("on_fct", "model.shop.fct"),
+        candidate("on_other", "model.shop.other"),
+        candidate("routed_away", "model.shop.fct", "model.shop.stale"),
+    ]
+
+    left_out, warnings = transform_commands._left_out_of(
+        candidates, {"model.shop.fct"}, skip={"routed_away"}
+    )
+
+    assert [entry["name"] for entry in left_out] == ["on_fct"]
+    assert "_reads" not in left_out[0]
+    assert warnings and "baseline.excluded" in warnings[0]
+    assert transform_commands._left_out_of(candidates, {"model.shop.none"}) == ([], [])
+
+
 def test_shadow_run_strip_semantic_models(project):
     from exmergo_dex_core.transform.build import ShadowRun
 

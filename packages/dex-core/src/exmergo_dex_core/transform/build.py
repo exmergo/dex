@@ -936,10 +936,12 @@ class ShadowRun:
             )
         stripped: list[str] = []
         for path in files:
-            with contextlib.suppress(OSError, ValueError):
-                if not path.resolve().is_relative_to(shadow.resolve()):
-                    continue
-            if not path.is_file():
+            try:
+                inside = path.resolve().is_relative_to(shadow.resolve())
+            except (OSError, ValueError):
+                inside = False
+            # A file that may lie outside the copy is never written.
+            if not inside or not path.is_file():
                 continue
             try:
                 parsed = yaml.safe_load(path.read_text(encoding="utf-8"))

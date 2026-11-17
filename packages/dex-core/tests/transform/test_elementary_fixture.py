@@ -294,6 +294,33 @@ def test_a_mutation_run_refuses_where_a_root_shim_keeps_elementary_s_materializa
 
 
 @requires_elementary
+def test_a_model_whose_only_tests_are_monitoring_tests_is_refused_as_untested(
+    tmp_path: Path, installed_elementary: Path
+):
+    """With every test but the two Elementary ones removed from ``fct``, nothing
+    left could catch a mutant, so the run is refused for that reason and not as
+    a baseline that failed, which ``maintain coverage`` would retry (#1307)."""
+
+    from exmergo_dex_core.transform.mutation import MutationError
+
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    (project / "models" / "schema.yml").write_text(
+        "version: 2\nmodels:\n  - name: fct\n    data_tests:\n"
+        "      - elementary.volume_anomalies:\n          timestamp_column: ordered_at\n"
+        "      - elementary.schema_changes\n",
+        encoding="utf-8",
+    )
+    engine = _engine(project)
+    engine.build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+
+    before = duckdb_census(warehouse)
+    with pytest.raises(MutationError, match="every test of 'fct' is an Elementary"):
+        engine.test_mutations("fct")
+    assert footprint(before, duckdb_census(warehouse)) == {}
+
+
+@requires_elementary
 @pytest.mark.parametrize("version", VERSIONS)
 def test_without_the_fix_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
     tmp_path: Path,

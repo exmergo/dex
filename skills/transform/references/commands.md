@@ -1119,8 +1119,11 @@ the model's own tests against each, and reports which defects nothing caught.
   Elementary monitoring tests kept out of every run, with status `not_run` and a
   `reason_code` (`elementary_disabled` or `elementary_history`): with the
   package installed, the copy strips its run hooks, disables its models where
-  nothing else refers to them, and keeps these tests out, so the run writes
-  nothing to the dev target (#1307).
+  nothing else refers to them (and otherwise has dbt run the tests under its own
+  test materialization, refusing where a project materialization still hands
+  them to Elementary's), and keeps these tests out, so the run writes nothing to
+  the dev target (#1307). A model whose only tests are these is refused, since
+  nothing would measure it.
 - An incremental model's `{% if is_incremental() %}` branch is compiled a second
   time with the branch taken, and its own comparisons and filters are planted
   there (#1132). Only unit tests overriding `is_incremental` to true run against
