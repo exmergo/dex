@@ -1217,11 +1217,21 @@ class _Lineage:
             # from it.
             if not isinstance(target, exp.Select) or len(self.sources(target)) != 1:
                 return None
-            if not any(
-                isinstance(e, exp.Star)
-                or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+            stars = [
+                e.this if isinstance(e, exp.Column) else e
                 for e in target.expressions
+                if isinstance(e, exp.Star)
+                or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+            ]
+            if not stars:
+                return None
+            if any(
+                star.args.get(modifier)
+                for star in stars
+                for modifier in ("except", "replace", "rename")
             ):
+                # `* REPLACE (phone AS note)` puts another column under the
+                # name: an unmodified star is the only one the name follows.
                 return None
             return self._column_paths(target, exp.column(column.name), depth + 1)
         return self.value_paths(target, inner, depth + 1)

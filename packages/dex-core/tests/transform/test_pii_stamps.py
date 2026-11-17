@@ -819,3 +819,30 @@ def test_a_flow_style_column_list_is_reported_rather_than_failing_the_plan(
     assert email["reason_code"] == "unwritable_yaml"
     assert any("could not splice" in w for w in envelope["warnings"])
     assert "models/marts/rpt_reports.sql" in envelope["data"]["paths"]
+
+
+def test_a_star_replace_is_not_traced_through_the_original_name(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`* REPLACE (phone AS note)` puts `phone` under `note`: the cleared upstream
+    `note` must not vouch for it, so the lineage is reported unfollowed."""
+
+    _contacts(dbt_project_dir, "false")
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "with s as (\n"
+                    "    select * replace (phone as note)\n"
+                    "    from {{ ref('stg_contacts') }}\n"
+                    ")\n"
+                    "select note from s\n",
+                    path="models/marts/dim_contacts.sql",
+                )
+            ]
+        },
+    )
+    note = envelope["data"]["pii_metadata"]["models"]["dim_contacts"]["columns"]["note"]
+    assert note == {"status": "unchecked", "reason_code": "lineage_unfollowed"}
