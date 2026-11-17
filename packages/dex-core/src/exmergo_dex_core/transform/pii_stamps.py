@@ -99,10 +99,11 @@ def stamp(
 
     report: dict[str, Any] = {}
     warnings: list[str] = []
-    # A relation this plan creates is judged by the plan's own stamps: a cached
-    # profile of the same name describes something else (an older build).
-    fresh = {name for name, (_path, created) in models.items() if created}
-    cache = _without_profiles_of(cache, fresh, files, view, manifest)
+    # A model this plan writes, created or rewritten, is judged by the plan's
+    # own stamps when another model reads it through `ref()`: a cached profile
+    # describes the relation as it was built before the plan (#1100). Only the
+    # `ref()` is set aside, so a source sharing the bare name keeps its profile.
+    fresh = frozenset(models)
     for model in _producers_first(models, files):
         sql_path, created = models[model]
         if mv.split_label(model)[1] is not None or mv.lookup(versions, model):
@@ -116,6 +117,7 @@ def stamp(
                 vars,
                 manifest,
                 pii_overrides,
+                fresh & _refs(files.get(sql_path, "")),
             )
             if columns:
                 report[model] = {
@@ -126,7 +128,16 @@ def stamp(
                 }
             continue
         columns = _columns(
-            model, sql_path, files, view, cache, dialect, vars, manifest, pii_overrides
+            model,
+            sql_path,
+            files,
+            view,
+            cache,
+            dialect,
+            vars,
+            manifest,
+            pii_overrides,
+            fresh & _refs(files.get(sql_path, "")),
         )
         if not columns:
             continue
@@ -173,36 +184,19 @@ def stamp(
     return edits, warnings, ({"models": report} if report else None)
 
 
-def _without_profiles_of(
-    cache: Any,
-    models: set[str],
-    files: Mapping[str, str],
-    view: Any,
-    manifest: Mapping[str, Any] | None,
-) -> Any:
-    """``cache`` without the profiles that resolve to a model this plan creates.
+_REF = r"""ref\(\s*(?:['"][^'"]+['"]\s*,\s*)?['"]([^'"]+)['"]"""
 
-    Such a profile was taken of an older relation that happened to share the
-    name; it says nothing about the model the plan writes, whose columns are
-    judged by its own lineage and the stamps the plan gives it.
-    """
 
-    from . import drafting
+def _refs(sql: str) -> set[str]:
+    """The model names ``sql`` reads through ``ref()``, one- or two-argument.
 
-    if cache is None or not models:
-        return cache
-    stale = set()
-    for model in models:
-        found = drafting._dataset_for_model(
-            cache, model, files, view.model_paths, manifest=manifest
-        )
-        if found is not None:
-            stale.add(found.identifier)
-    if not stale:
-        return cache
-    return cache.model_copy(
-        update={"datasets": [d for d in cache.datasets if d.identifier not in stale]}
-    )
+    A ``source()`` renders to the same relation token as a ``ref()`` in the
+    lineage, so this is what tells a project model from a source table that
+    happens to share its name."""
+
+    import re
+
+    return set(re.findall(_REF, sql))
 
 
 def _producers_first(
@@ -212,17 +206,10 @@ def _producers_first(
     so a stamp written on a new staging model is the evidence for a new mart
     reading it in the same plan. Ties, and a cycle, fall back to name order."""
 
-    import re
-
     refs = {
         model: {
             found
-            for found in re.findall(
-                # `ref('model')` and the two-argument `ref('project', 'model')`,
-                # whose last argument names the model.
-                r"""ref\(\s*(?:['"][^'"]+['"]\s*,\s*)?['"]([^'"]+)['"]""",
-                files.get(path, ""),
-            )
+            for found in _refs(files.get(path, ""))
             if found in models and found != model
         }
         for model, (path, _created) in models.items()
@@ -249,6 +236,7 @@ def _columns(
     vars: Mapping[str, Any] | None,
     manifest: Mapping[str, Any] | None,
     pii_overrides: Any = None,
+    fresh: frozenset[str] = frozenset(),
 ) -> dict[str, dict[str, Any]]:
     """Per output column that reads a flagged (or unreadable) input, its status
     before precedence: ``stamped`` meaning "would be stamped"."""
@@ -269,7 +257,7 @@ def _columns(
         reasons = reading.incomplete or ["the SELECT list could not be read"]
         # A model whose outputs cannot be read is reported only where it reads
         # an input something flags, so a plan over clean inputs stays quiet.
-        if _reads_flagged(reading, files, view, cache, manifest):
+        if _reads_flagged(reading, files, view, cache, manifest, fresh):
             out["*"] = {
                 "status": UNCHECKED,
                 "reason_code": "unreadable_sql",
@@ -280,11 +268,13 @@ def _columns(
     for name in reading.produced:
         paths = reading.value_paths.get(name)
         if paths is None:
-            if _reads_flagged(reading, files, view, cache, manifest):
+            if _reads_flagged(reading, files, view, cache, manifest, fresh):
                 out[name] = {"status": UNCHECKED, "reason_code": "lineage_unfollowed"}
             continue
         if not paths:
-            redacted = _same_name_flag(name, reading, files, view, cache, manifest)
+            redacted = _same_name_flag(
+                name, reading, files, view, cache, manifest, fresh
+            )
             if redacted is not None:
                 out[name] = {
                     "status": REDACTED,
@@ -296,7 +286,9 @@ def _columns(
         unprofiled: list[str] = []
         cleared: list[str] = []
         for origin, kind in paths:
-            evidence = _evidence(origin, files, view, cache, manifest, pii_overrides)
+            evidence = _evidence(
+                origin, files, view, cache, manifest, pii_overrides, fresh
+            )
             source = f"{origin.relation}.{origin.column}"
             if evidence is None:
                 unprofiled.append(source)
@@ -344,6 +336,7 @@ def _evidence(
     cache: Any,
     manifest: Mapping[str, Any] | None,
     pii_overrides: Any = None,
+    fresh: frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """What says whether ``origin`` is PII: the profile, else the upstream
     model's stamp. ``None`` when nothing says either way. A reviewed override
@@ -351,12 +344,16 @@ def _evidence(
 
     from . import drafting
 
-    dataset = drafting._dataset_for_model(
-        cache,
-        origin.relation,
-        files,
-        view.model_paths,
-        manifest=manifest if origin.is_ref else None,
+    dataset = (
+        None
+        if origin.is_ref and origin.relation in fresh
+        else drafting._dataset_for_model(
+            cache,
+            origin.relation,
+            files,
+            view.model_paths,
+            manifest=manifest if origin.is_ref else None,
+        )
     )
     profile = drafting._column(dataset, origin.column)
     if profile is not None:
@@ -441,10 +438,11 @@ def _reads_flagged(
     view: Any,
     cache: Any,
     manifest: Mapping[str, Any] | None,
+    fresh: frozenset[str] = frozenset(),
 ) -> bool:
     """Whether any relation the model reads has a column something flags."""
 
-    return bool(_flagged_columns(reading, files, view, cache, manifest))
+    return bool(_flagged_columns(reading, files, view, cache, manifest, fresh))
 
 
 def _flagged_columns(
@@ -453,6 +451,7 @@ def _flagged_columns(
     view: Any,
     cache: Any,
     manifest: Mapping[str, Any] | None,
+    fresh: frozenset[str] = frozenset(),
 ) -> dict[str, tuple[str, str | None]]:
     """Lowered column name to (``relation.column``, category) over every input."""
 
@@ -466,13 +465,16 @@ def _flagged_columns(
         for relation in reading.tokens.values()
     ]
     for relation, is_ref in inputs:
-        dataset = drafting._dataset_for_model(
-            cache,
-            relation,
-            files,
-            view.model_paths,
-            manifest=manifest if is_ref else None,
-        )
+        if is_ref and relation in fresh:
+            dataset = None
+        else:
+            dataset = drafting._dataset_for_model(
+                cache,
+                relation,
+                files,
+                view.model_paths,
+                manifest=manifest if is_ref else None,
+            )
         for column in dataset.columns if dataset is not None else []:
             if column.pii is not None:
                 found.setdefault(
@@ -503,10 +505,13 @@ def _same_name_flag(
     view: Any,
     cache: Any,
     manifest: Mapping[str, Any] | None,
+    fresh: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None] | None:
     """A flagged input column a constant output stands in for, by its name."""
 
-    return _flagged_columns(reading, files, view, cache, manifest).get(name.lower())
+    return _flagged_columns(reading, files, view, cache, manifest, fresh).get(
+        name.lower()
+    )
 
 
 # --- precedence ----------------------------------------------------------------
@@ -577,6 +582,14 @@ def _write(
             continue
         text = decl._ensure_column(text, model, name)
         locate = decl._column_locator(model, name)
+        root = decl._compose(text)
+        if decl._carries_anchor(root, locate(root)):
+            # A column whose entry, or its config, is shared through a YAML
+            # anchor: a stamp spliced in would mark every column that aliases
+            # it. Refused here, and reported `not_written` by the caller.
+            raise decl.RewriteError(
+                f"the entry for column '{name}' shares a YAML anchor with another"
+            )
         text = decl._set_meta(text, locate, CONTAINS_PII, True)
         if column.get("category"):
             text = decl._set_meta(text, locate, PII_CATEGORY, column["category"])

@@ -927,3 +927,118 @@ def test_a_set_operation_over_a_literal_relation_still_reports_its_input(
     )
     model = envelope["data"]["pii_metadata"]["models"]["rpt_reports"]
     assert model["columns"]["*"]["status"] == "unchecked"
+
+
+def test_a_source_sharing_a_created_models_name_keeps_its_profile(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The plan creates `customers`; the raw `customers` table it reads keeps
+    its profile, so the flagged column is still stamped."""
+
+    FilesystemStore(tmp_path).save_cache(
+        DexCache(
+            connector="duckdb",
+            datasets=[
+                Dataset(
+                    identifier="warehouse.raw.customers",
+                    columns=[
+                        ColumnProfile(
+                            name="email", data_type="VARCHAR", pii=_flag("email", 0.9)
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+    (dbt_project_dir / "models/staging/_sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    tables:\n      - name: customers\n",
+        encoding="utf-8",
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select email from {{ source('raw', 'customers') }}\n",
+                    path="models/marts/customers.sql",
+                )
+            ]
+        },
+    )
+    email = envelope["data"]["pii_metadata"]["models"]["customers"]["columns"]["email"]
+    assert email["status"] == "stamped" and email["evidence"] == "profile"
+
+
+def test_a_rewritten_producers_stale_profile_is_not_the_consumers_evidence(
+    project: Path, tmp_path: Path, capsys
+):
+    """`stg_reports` is rewritten so `comments` now carries `email`; its old,
+    profiled `comments` (free text) must not decide the new mart's stamp."""
+
+    # The rewrite's change scope quotes the prior SQL, which in this fixture
+    # spells its sample values as literals, so the envelope is read directly.
+    payload = tmp_path / "payload.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    _sql(
+                        "select 1 as report_id, cast(null as varchar) as comments\n",
+                        path="models/staging/stg_reports.sql",
+                    ),
+                    _sql("select report_id, comments from {{ ref('stg_reports') }}\n"),
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "rewrite",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    model = (envelope["data"].get("pii_metadata") or {}).get("models", {})
+    comments = model.get("rpt_reports", {}).get("columns", {}).get("comments")
+    assert comments is None or comments["status"] != "stamped"
+
+
+def test_a_column_sharing_a_yaml_anchor_is_reported_not_written(
+    project: Path, tmp_path: Path, capsys
+):
+    schema = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: rpt_reports\n"
+        "    columns:\n"
+        "      - name: report_id\n"
+        "        config: &shared\n"
+        "          tags: [x]\n"
+        "      - name: email\n"
+        "        config: *shared\n"
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql("select report_id, email from {{ ref('stg_reports') }}\n"),
+                {
+                    "path": "models/marts/_marts.yml",
+                    "kind": "schema_yml",
+                    "content": schema,
+                },
+            ]
+        },
+    )
+    email = _status(envelope, "email")
+    assert email["status"] == "not_written"
+    assert email["reason_code"] == "unwritable_yaml"
