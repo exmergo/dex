@@ -390,7 +390,9 @@ def admit_edit(
         pii_overrides=pii_overrides,
         compiled=compiled,
         defer_compilation=defer_compilation,
-        created=edit.path not in view.files,
+        # Both the project view and the disk: a file the view skipped (an
+        # existing seed it could not decode) is not a new one (#647).
+        created=edit.path not in view.files and not resolved.exists(),
     )
 
 

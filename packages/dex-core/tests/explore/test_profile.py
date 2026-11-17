@@ -476,7 +476,7 @@ def test_an_unrefined_flag_serializes_with_its_two_fields_only():
 
 @pytest.mark.parametrize(
     "column",
-    ["team_name", "lab_name", "org_name", "organization_name", "vendor_name"],
+    ["team_name", "lab_name", "org_name", "organization_name", "university_name"],
 )
 def test_organization_qualifiers_are_not_person_names(column: str):
     """#647: a team, lab or vendor is named, but it is not a person."""
@@ -484,7 +484,20 @@ def test_organization_qualifiers_are_not_person_names(column: str):
     assert detect_pii(column, "VARCHAR") is None
 
 
-@pytest.mark.parametrize("column", ["developer_name", "owner_name", "author_name"])
+@pytest.mark.parametrize(
+    "column",
+    [
+        "developer_name",
+        "owner_name",
+        "author_name",
+        # A sole trader, a physician or a self-publisher is a person.
+        "vendor_name",
+        "provider_name",
+        "supplier_name",
+        "merchant_name",
+        "publisher_name",
+    ],
+)
 def test_person_capable_qualifiers_stay_flagged(column: str):
     """A developer or an owner is a person as often as an organization, so the
     name alone never clears it; value evidence or a reviewed override does."""

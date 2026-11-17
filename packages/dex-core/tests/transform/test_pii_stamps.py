@@ -636,3 +636,186 @@ def test_a_plan_over_clean_inputs_carries_no_pii_metadata(
         {"edits": [_sql("select report_id, channel from {{ ref('stg_reports') }}\n")]},
     )
     assert "pii_metadata" not in envelope["data"]
+
+
+# --- review follow-ups -------------------------------------------------------------
+
+
+def test_a_lag_default_carries_its_value(project: Path, tmp_path: Path, capsys):
+    """`lag(channel, 1, email)` returns `email` on the first row."""
+
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select report_id,\n"
+                    "    lag(channel, 1, email) over (order by report_id) as prior\n"
+                    "from {{ ref('stg_reports') }}\n"
+                )
+            ]
+        },
+    )
+    assert _status(envelope, "prior")["status"] == "stamped"
+    assert _status(envelope, "prior")["from"] == "stg_reports.email"
+
+
+def test_a_new_mart_reads_the_stamp_of_a_new_staging_model_in_the_same_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`a_report` sorts before `z_stage` but reads it: the producer is stamped
+    first, so its stamp is the consumer's evidence."""
+
+    (dbt_project_dir / "models/staging/stg_contacts.sql").write_text(
+        "select 1 as id, 'x' as phone\n", encoding="utf-8"
+    )
+    (dbt_project_dir / "models/staging/_contacts.yml").write_text(
+        "version: 2\nmodels:\n  - name: stg_contacts\n    columns:\n"
+        "      - name: phone\n        config:\n          meta:\n"
+        "            contains_pii: true\n            pii_category: phone\n",
+        encoding="utf-8",
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select phone from {{ ref('z_stage') }}\n",
+                    path="models/marts/a_report.sql",
+                ),
+                _sql(
+                    "select id, phone from {{ ref('stg_contacts') }}\n",
+                    path="models/staging/z_stage.sql",
+                ),
+            ]
+        },
+    )
+    models = envelope["data"]["pii_metadata"]["models"]
+    assert models["z_stage"]["columns"]["phone"]["status"] == "stamped"
+    assert models["a_report"]["columns"]["phone"]["status"] == "stamped"
+    assert models["a_report"]["columns"]["phone"]["evidence"] == "upstream_metadata"
+
+
+def test_the_model_mark_is_written_when_every_column_mark_was_already_there(
+    project: Path, tmp_path: Path, capsys
+):
+    schema = (
+        "version: 2\nmodels:\n  - name: rpt_reports\n    columns:\n"
+        "      - name: email\n        config:\n          meta:\n"
+        "            contains_pii: true\n"
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql("select report_id, email from {{ ref('stg_reports') }}\n"),
+                {
+                    "path": "models/marts/_marts.yml",
+                    "kind": "schema_yml",
+                    "content": schema,
+                },
+            ]
+        },
+    )
+    assert _status(envelope, "email")["status"] == "kept"
+    model = envelope["data"]["pii_metadata"]["models"]["rpt_reports"]
+    assert model["model_stamp"] == "stamped"
+    _apply(tmp_path, capsys, envelope)
+    entry = _read_entry(project, "models/marts/_marts.yml")
+    assert entry_meta(entry) == {"contains_pii": True}
+    assert entry_meta(_column(entry, "email")) == {"contains_pii": True}
+
+
+def _contacts(project: Path, note_meta: str) -> None:
+    (project / "models/staging/stg_contacts.sql").write_text(
+        "select 1 as id, 'x' as phone, 'y' as note\n", encoding="utf-8"
+    )
+    (project / "models/staging/_contacts.yml").write_text(
+        "version: 2\nmodels:\n  - name: stg_contacts\n    columns:\n"
+        "      - name: phone\n        config:\n          meta:\n"
+        "            contains_pii: true\n"
+        "      - name: note\n        config:\n          meta:\n"
+        f"            contains_pii: {note_meta}\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_cleared_input_does_not_hide_an_unchecked_one(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _contacts(dbt_project_dir, "false")
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select coalesce(note, cast(id as varchar)) as label\n"
+                    "from {{ ref('stg_contacts') }}\n",
+                    path="models/marts/dim_contacts.sql",
+                )
+            ]
+        },
+    )
+    label = envelope["data"]["pii_metadata"]["models"]["dim_contacts"]["columns"][
+        "label"
+    ]
+    assert label["status"] == "unchecked"
+    assert label["from"] == "stg_contacts.id"
+
+
+def test_an_override_on_the_upstream_column_beats_its_stale_stamp(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _contacts(dbt_project_dir, "false")
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: duckdb\npii_overrides:\n  - column: stg_contacts.phone\n",
+        encoding="utf-8",
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql(
+                    "select phone from {{ ref('stg_contacts') }}\n",
+                    path="models/marts/dim_contacts.sql",
+                )
+            ]
+        },
+    )
+    columns = envelope["data"]["pii_metadata"]["models"]["dim_contacts"]["columns"]
+    assert columns["phone"]["status"] == "cleared_upstream"
+    assert not any(p.endswith(".yml") for p in envelope["data"]["paths"])
+
+
+def test_a_flow_style_column_list_is_reported_rather_than_failing_the_plan(
+    project: Path, tmp_path: Path, capsys
+):
+    schema = (
+        "version: 2\nmodels:\n  - name: rpt_reports\n"
+        "    columns: [{name: email, description: keep}]\n"
+    )
+    envelope = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                _sql("select report_id, email from {{ ref('stg_reports') }}\n"),
+                {
+                    "path": "models/marts/_marts.yml",
+                    "kind": "schema_yml",
+                    "content": schema,
+                },
+            ]
+        },
+    )
+    email = _status(envelope, "email")
+    assert email["status"] == "not_written"
+    assert email["reason_code"] == "unwritable_yaml"
+    assert any("could not splice" in w for w in envelope["warnings"])
+    assert "models/marts/rpt_reports.sql" in envelope["data"]["paths"]

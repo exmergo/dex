@@ -99,10 +99,19 @@ def stamp(
 
     report: dict[str, Any] = {}
     warnings: list[str] = []
-    for model, (sql_path, created) in sorted(models.items()):
+    for model in _producers_first(models, files):
+        sql_path, created = models[model]
         if mv.split_label(model)[1] is not None or mv.lookup(versions, model):
             columns = _columns(
-                model, sql_path, files, view, cache, dialect, vars, manifest
+                model,
+                sql_path,
+                files,
+                view,
+                cache,
+                dialect,
+                vars,
+                manifest,
+                pii_overrides,
             )
             if columns:
                 report[model] = {
@@ -112,7 +121,9 @@ def stamp(
                     "columns": columns,
                 }
             continue
-        columns = _columns(model, sql_path, files, view, cache, dialect, vars, manifest)
+        columns = _columns(
+            model, sql_path, files, view, cache, dialect, vars, manifest, pii_overrides
+        )
         if not columns:
             continue
         entry: dict[str, Any] = {"created": created, "columns": columns}
@@ -124,7 +135,7 @@ def stamp(
                     column["status"] = NOT_WRITTEN
                     column["reason_code"] = "existing_model"
             continue
-        if any(c["status"] == STAMPED for c in columns.values()):
+        if any(c["status"] in (STAMPED, KEPT) for c in columns.values()):
             path = decl.schema_path(files, model) or decl._default_schema_path(
                 sql_path, model
             )
@@ -135,15 +146,55 @@ def stamp(
                         column["reason_code"] = "top_level_meta"
                 entry["model_stamp"] = NOT_WRITTEN
             else:
-                files[path], entry["model_stamp"] = _write(
-                    files.get(path), model, columns
-                )
+                try:
+                    files[path], entry["model_stamp"] = _write(
+                        files.get(path), model, columns
+                    )
+                except (decl.RewriteError, ValueError, yaml.YAMLError) as exc:
+                    # Metadata dex adds on its own must never cost the plan:
+                    # a layout the splice cannot write (a flow-style column
+                    # list, say) is reported for a person to stamp by hand.
+                    for column in columns.values():
+                        if column["status"] == STAMPED:
+                            column["status"] = NOT_WRITTEN
+                            column["reason_code"] = "unwritable_yaml"
+                    entry["model_stamp"] = NOT_WRITTEN
+                    entry["detail"] = f"{type(exc).__name__}: {exc}"
+                    continue
                 edits = _merge(edits, path, files[path])
                 entry["path"] = path
 
     for model, entry in report.items():
         warnings.extend(_warnings(model, entry))
     return edits, warnings, ({"models": report} if report else None)
+
+
+def _producers_first(
+    models: Mapping[str, tuple[str, bool]], files: Mapping[str, str]
+) -> list[str]:
+    """The plan's models with each one after the plan's models it ``ref()``s,
+    so a stamp written on a new staging model is the evidence for a new mart
+    reading it in the same plan. Ties, and a cycle, fall back to name order."""
+
+    import re
+
+    refs = {
+        model: {
+            found
+            for found in re.findall(
+                r"""ref\(\s*['"]([^'"]+)['"]\s*\)""", files.get(path, "")
+            )
+            if found in models and found != model
+        }
+        for model, (path, _created) in models.items()
+    }
+    ordered: list[str] = []
+    pending = sorted(models)
+    while pending:
+        ready = [m for m in pending if refs[m] <= set(ordered)] or pending[:1]
+        ordered.append(ready[0])
+        pending.remove(ready[0])
+    return ordered
 
 
 # --- reading -----------------------------------------------------------------
@@ -158,6 +209,7 @@ def _columns(
     dialect: str,
     vars: Mapping[str, Any] | None,
     manifest: Mapping[str, Any] | None,
+    pii_overrides: Any = None,
 ) -> dict[str, dict[str, Any]]:
     """Per output column that reads a flagged (or unreadable) input, its status
     before precedence: ``stamped`` meaning "would be stamped"."""
@@ -205,7 +257,7 @@ def _columns(
         unprofiled: list[str] = []
         cleared: list[str] = []
         for origin, kind in paths:
-            evidence = _evidence(origin, files, view, cache, manifest)
+            evidence = _evidence(origin, files, view, cache, manifest, pii_overrides)
             source = f"{origin.relation}.{origin.column}"
             if evidence is None:
                 unprofiled.append(source)
@@ -233,7 +285,9 @@ def _columns(
             if evidence.get("category"):
                 column["category"] = evidence["category"]
             out[name] = column
-        elif unprofiled and not cleared:
+        elif unprofiled:
+            # A cleared input never vouches for another the lineage also
+            # reads: `coalesce(note, phone)` is unchecked while `phone` is.
             out[name] = {
                 "status": UNCHECKED,
                 "reason_code": "unprofiled_input",
@@ -250,9 +304,11 @@ def _evidence(
     view: Any,
     cache: Any,
     manifest: Mapping[str, Any] | None,
+    pii_overrides: Any = None,
 ) -> dict[str, Any] | None:
     """What says whether ``origin`` is PII: the profile, else the upstream
-    model's stamp. ``None`` when nothing says either way."""
+    model's stamp. ``None`` when nothing says either way. A reviewed override
+    naming the upstream column clears it, whichever of the two would speak."""
 
     from . import drafting
 
@@ -276,6 +332,11 @@ def _evidence(
             "evidence": "profile",
         }
     if origin.is_ref:
+        if (
+            pii_overrides is not None
+            and f"{origin.relation}.{origin.column}" in pii_overrides
+        ):
+            return {"cleared": True}
         marked = _upstream_mark(files, origin.relation, origin.column)
         if marked is not None:
             return marked
@@ -536,6 +597,13 @@ def _warnings(model: str, entry: Mapping[str, Any]) -> list[str]:
                 "no stamp; '{model}' already exists, so dex reports this rather "
                 "than editing its YAML: ".replace("{model}", model)
                 + fixes.replace("<column>", name)
+            )
+        elif status == NOT_WRITTEN and column.get("reason_code") == "unwritable_yaml":
+            out.append(
+                f"'{model}.{name}' carries {source}, which is PII-flagged, and was "
+                f"not stamped: dex could not splice into the YAML entry for "
+                f"'{model}' predictably ({entry.get('detail', 'unsupported layout')})"
+                ". Rewrite that entry in block style, or stamp it by hand"
             )
         elif status == NOT_WRITTEN and column.get("reason_code") == "top_level_meta":
             out.append(

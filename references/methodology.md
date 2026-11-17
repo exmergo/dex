@@ -157,11 +157,11 @@ dbt.
 The generic `name` pattern skips a column whose qualifier names something that
 is not a person: a table, file, product, brand, company or service, a nation,
 country, region or continent, and an organization such as a team, org, lab,
-vendor, provider, publisher, supplier, merchant, store, league, agency,
-institution, university, school, bank or carrier, so `team_name` and `lab_name`
-are not flagged at all. A qualifier that names a person as often as an
-organization (`developer`, `owner`, `author`) stays flagged and clears only on
-value evidence or a reviewed override.
+store, league, agency, institution, university, school, bank or carrier, so
+`team_name` and `lab_name` are not flagged at all. A qualifier that names an
+individual as often as an organization (`developer`, `owner`, `author`,
+`vendor`, `provider`, `supplier`, `merchant`, `publisher`) stays flagged and
+clears only on value evidence or a reviewed override.
 
 For the weakest signal, a generic `*_name` string column, the profiling scan also
 computes four **value-shape statistics** as in-engine SQL aggregates: the

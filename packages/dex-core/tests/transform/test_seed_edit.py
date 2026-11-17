@@ -253,6 +253,24 @@ def test_plan_warns_on_a_seed_it_creates_and_refuses_one_it_rewrites(
         make_plan("rewrite the lookup", [labs], dbt_project_dir, tmp_path, store=store)
 
 
+def test_an_existing_seed_the_view_could_not_read_is_not_a_created_one(
+    dbt_project_dir: Path, tmp_path: Path
+):
+    """A seed on disk the project view skipped (it does not decode) is still a
+    rewrite, so the created-seed relaxation does not apply to it."""
+
+    (dbt_project_dir / "seeds").mkdir(exist_ok=True)
+    (dbt_project_dir / "seeds" / "labs.csv").write_bytes(b"lab_id\n\xff\xfe\n")
+    with pytest.raises(EditValidationError, match="'lab_note' looks like free_text"):
+        make_plan(
+            "rewrite the lookup",
+            [_seed(NOTED, path="seeds/labs.csv")],
+            dbt_project_dir,
+            tmp_path,
+            store=FilesystemStore(tmp_path),
+        )
+
+
 # --- containment, kind agreement, and the project view ---------------------------
 
 

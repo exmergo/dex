@@ -253,22 +253,19 @@ _NONPERSON_NAME_QUALIFIERS = frozenset(
         "country",
         "region",
         "continent",
-        # Organizations (#647): a team, lab, vendor or university is named, but
-        # it is not a person. `developer`, `owner`, `author` and the like stay
-        # flagged, since those name a person as often as an organization; such
-        # a column clears on value evidence (an organization suffix) or a
-        # reviewed pii_overrides entry, never on its name.
+        # Organizations (#647): a team, lab or university is named, but it is
+        # not a person. `developer`, `owner`, `author`, `vendor`, `provider`,
+        # `supplier`, `merchant` and `publisher` stay flagged, since each names
+        # an individual (a sole trader, a physician, a self-publisher) as often
+        # as an organization; such a column clears on value evidence (an
+        # organization suffix) or a reviewed pii_overrides entry, never on its
+        # name.
         "team",
         "org",
         "organization",
         "organisation",
         "lab",
-        "vendor",
-        "provider",
-        "publisher",
         "manufacturer",
-        "supplier",
-        "merchant",
         "retailer",
         "store",
         "league",

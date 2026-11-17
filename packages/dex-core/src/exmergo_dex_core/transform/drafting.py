@@ -1909,7 +1909,10 @@ def _value_children(node: Any, layer: str) -> list[Any]:
 
     if layer == "preserved":
         if isinstance(node, (exp.Lag, exp.Lead)):
-            return [node.this]
+            # The value, and the default a missing neighbour falls back to;
+            # never the offset, which is a count of rows.
+            default = node.args.get("default")
+            return [node.this] + ([default] if default is not None else [])
         if isinstance(node, (exp.Cast, exp.TryCast)):
             return [node.this]
         children = [node.this] if node.this is not None else []
