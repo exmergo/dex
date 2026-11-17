@@ -774,14 +774,18 @@ def parse_definition_payload(entries: Iterable[Any]) -> list[DefinitionEdit]:
             raise EditValidationError(f"{where}: name must be a string")
 
         if op is EditOp.DELETE:
+            # Both refusals show the accepted entry, since `name` is the field a
+            # delete adds and `content` the one it drops (#1388).
+            shape = f'{{"kind": "{kind}", "op": "delete", "name": "<name>"}}'
             if entry.get("content") is not None:
                 raise EditValidationError(
                     f"{where}: a delete names the definition to remove and carries "
-                    "no content"
+                    f"no content: {shape}"
                 )
             if not declared:
                 raise EditValidationError(
-                    f"{where}: a delete needs the name of the definition to remove"
+                    f"{where}: a delete needs the name of the definition to remove: "
+                    f"{shape}"
                 )
             definition = DefinitionEdit(kind, declared, "", {}, path, op)
         else:
