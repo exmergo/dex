@@ -925,6 +925,41 @@ class ShadowRun:
         the project names whose hooks went, the root project's first.
         """
 
+        stripped: list[str] = []
+        for path, inside in self._project_files():
+            # A file that may lie outside the copy is never written.
+            if not inside:
+                continue
+            parsed = _hooked_project(path)
+            if parsed is None:
+                continue
+            for key in _RUN_HOOK_KEYS:
+                parsed.pop(key, None)
+            path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+            stripped.append(_project_label(parsed, path))
+        return stripped
+
+    def run_hooks_outside_copy(self) -> list[str]:
+        """The installed packages whose run hooks ``strip_run_hooks`` cannot reach.
+
+        An absolute or far-climbing ``packages-install-path`` names the same
+        directory from the copy as from the project, so the packages there are
+        not copied and their ``dbt_project.yml`` is the real one, which is
+        never written. dbt still runs the hooks it declares on every
+        invocation, so a caller that runs dbt once per mutant refuses where
+        this is not empty. Read only.
+        """
+
+        return [
+            _project_label(parsed, path)
+            for path, inside in self._project_files()
+            if not inside and (parsed := _hooked_project(path)) is not None
+        ]
+
+    def _project_files(self) -> list[tuple[Path, bool]]:
+        """The copy's root ``dbt_project.yml`` and each installed package's,
+        with whether it lies inside the copy."""
+
         shadow = self._require_shadow()
         files = [shadow / "dbt_project.yml"]
         packages = packages_dir(shadow)
@@ -934,30 +969,14 @@ class ShadowRun:
                 for directory in sorted(packages.iterdir())
                 if directory.is_dir()
             )
-        stripped: list[str] = []
+        located: list[tuple[Path, bool]] = []
         for path in files:
             try:
                 inside = path.resolve().is_relative_to(shadow.resolve())
             except (OSError, ValueError):
                 inside = False
-            # A file that may lie outside the copy is never written.
-            if not inside or not path.is_file():
-                continue
-            try:
-                parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, yaml.YAMLError):
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            present = [key for key in ("on-run-start", "on-run-end") if key in parsed]
-            if not present:
-                continue
-            for key in present:
-                parsed.pop(key)
-            path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
-            name = parsed.get("name")
-            stripped.append(str(name) if name else path.parent.name)
-        return stripped
+            located.append((path, inside))
+        return located
 
     def disable_package_models(self, package: str) -> Callable[[], None]:
         """Disable every model of ``package`` in the copy, and return the undo.
@@ -1828,6 +1847,28 @@ def packages_dir(project_dir: Path | str) -> Path:
     if not isinstance(configured, str) or not configured or _is_templated(configured):
         configured = "dbt_packages"
     return project / configured
+
+
+_RUN_HOOK_KEYS = ("on-run-start", "on-run-end")
+
+
+def _hooked_project(path: Path) -> dict[str, Any] | None:
+    """A ``dbt_project.yml`` that declares a run hook, parsed, or ``None``."""
+
+    try:
+        if not path.is_file():
+            return None
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    if not isinstance(parsed, dict) or not any(k in parsed for k in _RUN_HOOK_KEYS):
+        return None
+    return parsed
+
+
+def _project_label(parsed: dict[str, Any], path: Path) -> str:
+    name = parsed.get("name")
+    return str(name) if name else path.parent.name
 
 
 def _configured_install_path(project: Path) -> Any:

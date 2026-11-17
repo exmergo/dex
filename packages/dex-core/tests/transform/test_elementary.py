@@ -193,6 +193,43 @@ def test_a_root_shim_that_calls_the_package_is_the_package_s():
     assert record.materialization == "elementary"
 
 
+def test_a_root_shim_that_reaches_the_package_through_a_helper_is_the_package_s():
+    """dbt records each call on the macro that makes it, so a shim that hands
+    the test on through a macro of its own reaches the package's only by
+    following the calls. A cycle among them ends the walk."""
+
+    shim = _macro(
+        ROOT,
+        "materialization_test_default",
+        depends=(f"macro.{ROOT}.forward_test",),
+    )
+    forward = _macro(
+        ROOT,
+        "forward_test",
+        depends=(f"macro.{ROOT}.materialization_test_default", ELEMENTARY_MAT),
+    )
+    record = resolve(manifest(extra_macros=(shim, forward)), project_yml(flag="true"))
+
+    assert record.materialization_macro == f"macro.{ROOT}.materialization_test_default"
+    assert record.materialization == "elementary"
+
+
+def test_a_root_shim_whose_helpers_loop_without_the_package_is_not_the_package_s():
+    shim = _macro(
+        ROOT,
+        "materialization_test_default",
+        depends=(f"macro.{ROOT}.forward_test",),
+    )
+    forward = _macro(
+        ROOT,
+        "forward_test",
+        depends=(f"macro.{ROOT}.materialization_test_default", "macro.dbt.statement"),
+    )
+    record = resolve(manifest(extra_macros=(shim, forward)), project_yml(flag="true"))
+
+    assert record.materialization == "dbt"
+
+
 def test_a_root_materialization_of_its_own_is_not_the_package_s():
     own = _macro(ROOT, "materialization_test_default", depends=("macro.dbt.statement",))
     record = resolve(manifest(extra_macros=(own,)), project_yml(flag="false"))
@@ -478,6 +515,45 @@ def test_monitoring_tests_are_those_whose_package_test_checks_it_is_enabled():
     built["nodes"].update({t["unique_id"]: t for t in tests})
 
     assert monitoring_tests(built) == {"changes": [fct], "volume": [fct]}
+
+
+def test_a_project_test_that_wraps_a_monitoring_test_is_one():
+    """dbt records the call to the package's test on the project's own test
+    macro, not on the test node, so the wrapper is followed through, at any
+    depth. A project macro that only calls dbt's is not one."""
+
+    check = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+    macros = (
+        _macro(
+            ROOT,
+            "test_my_volume",
+            depends=(f"macro.{ROOT}.my_volume_body",),
+        ),
+        _macro(
+            ROOT,
+            "my_volume_body",
+            depends=(f"macro.{ROOT}.test_my_volume", "macro.elementary.test_volume"),
+        ),
+        _macro("elementary", "test_volume", sql=check),
+        _macro(ROOT, "test_positive", depends=("macro.dbt.test_not_null",)),
+    )
+    built = manifest(extra_macros=macros)
+    fct = "model.shop.fct"
+    tests = [
+        _reading(
+            _node(ROOT, "test", "my_volume_fct"),
+            fct,
+            macros=(f"macro.{ROOT}.test_my_volume", "macro.dbt.get_where_subquery"),
+        ),
+        _reading(
+            _node(ROOT, "test", "positive_fct"),
+            fct,
+            macros=(f"macro.{ROOT}.test_positive",),
+        ),
+    ]
+    built["nodes"].update({t["unique_id"]: t for t in tests})
+
+    assert monitoring_tests(built) == {"my_volume_fct": [fct]}
 
 
 def test_each_disable_var_turns_off_its_own_upload():

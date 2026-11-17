@@ -1079,10 +1079,13 @@ the model and cascading that skip onto every data test attached to it. The
 `on-run-start` and `on-run-end` hooks of the project and of every installed
 package are stripped from the copy, since dbt is invoked once per mutant and a
 hook that grants, audits or uploads should not fire N+1 times; a note names
-whose hooks went. Where the Elementary package is installed, the copy also
-disables its models unless something outside the package refers to one, and
-leaves its monitoring tests (anomaly tests, `schema_changes` and the others that
-check the package is enabled) out of every run. Where its models must stay
+whose hooks went. A package an absolute or far-climbing `packages-install-path`
+puts outside the project is not in the copy, so its hooks cannot be stripped,
+and a run where one declares a hook is refused. Where the Elementary package is
+installed, the copy also disables its models unless something outside the
+package refers to one, and leaves its monitoring tests (anomaly tests,
+`schema_changes` and the others that check the package is enabled, and a
+project's own test that wraps one of them) out of every run. Where its models must stay
 enabled, the copy sets `require_explicit_package_overrides_for_builtin_materializations`
 so the tests run under dbt's own test materialization, since Elementary's needs
 the hooks that were stripped; where a test materialization in the project still

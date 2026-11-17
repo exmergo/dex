@@ -2643,6 +2643,17 @@ def test_mutations(
                     + "): mutation coverage invokes dbt once per mutant, and a hook "
                     "that grants, audits or uploads would otherwise fire once per run"
                 )
+            unreachable = shadow.run_hooks_outside_copy()
+            if unreachable:
+                # Not recorded: it is the project's configuration that decides
+                # it, and a change there leaves no digest a record could hold.
+                raise mutation_mod.MutationError(
+                    "packages-install-path puts the installed packages outside the "
+                    "project, so dex cannot remove the on-run-start/on-run-end "
+                    "hooks of " + ", ".join(unreachable) + " from the copy it runs "
+                    "dbt in, and they would fire once per mutant run. Point "
+                    "packages-install-path inside the project, then measure"
+                )
             if shadow.strip_semantic_models(model):
                 warnings.append(
                     f"semantic models referencing '{model}' were omitted from the "
@@ -2747,8 +2758,15 @@ def test_mutations(
                 if branch is not None
                 else []
             )
+            # A monitoring test is attached to the model but runs nowhere, so it
+            # is no test of the full build either (#1307).
             full_tests = bool(below.tests) or _runs_full_build(
-                shadow.manifest(), node, incremental_tests
+                shadow.manifest(),
+                node,
+                incremental_tests,
+                left_out=_test_ids_named(
+                    shadow.manifest(), {entry["name"] for entry in quiet}
+                ),
             )
             if not batch.mutants:
                 equivalence = _EquivalenceCheck(
@@ -3374,6 +3392,21 @@ def _left_out_of(
         "baseline or any mutant; each is in data.baseline.excluded with its "
         "reason_code"
     ]
+
+
+def _test_ids_named(manifest: dict, names: set[str]) -> set[str]:
+    """The unique ids of the data tests named in ``names``.
+
+    The left-out tests are keyed by name, the way a run's exclusions are, while
+    ``runs_full_build`` compares unique ids."""
+
+    if not names:
+        return set()
+    return {
+        uid
+        for uid, other in (manifest.get("nodes") or {}).items()
+        if other.get("resource_type") == "test" and other.get("name") in names
+    }
 
 
 def _mutable_model(engine, shadow, model: str, mutation_mod):

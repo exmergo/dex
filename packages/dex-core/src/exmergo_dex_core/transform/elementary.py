@@ -296,13 +296,24 @@ def _is_elementary_materialization(manifest: Mapping[str, Any], uid: str) -> boo
     macro = macros.get(uid) or {}
     if macro.get("package_name") == PACKAGE:
         return True
-    # A root shim hands the test to the package's materialization (variant c).
-    depends = (macro.get("depends_on") or {}).get("macros") or []
-    return any(
-        str(dep).startswith(f"macro.{PACKAGE}.materialization_test_")
-        or dep == f"macro.{PACKAGE}.materialize_test"
-        for dep in depends
-    )
+    # A root shim hands the test to the package's materialization (variant c),
+    # directly or through macros of its own: dbt records each call on the macro
+    # that makes it, so the calls are followed to any depth.
+    seen: set[str] = set()
+    todo = [str(dep) for dep in (macro.get("depends_on") or {}).get("macros") or []]
+    while todo:
+        dep = todo.pop()
+        if dep in seen:
+            continue
+        seen.add(dep)
+        if (
+            dep.startswith(f"macro.{PACKAGE}.materialization_test_")
+            or dep == f"macro.{PACKAGE}.materialize_test"
+        ):
+            return True
+        called = (macros.get(dep) or {}).get("depends_on") or {}
+        todo.extend(str(d) for d in called.get("macros") or [])
+    return False
 
 
 def resolve(
@@ -452,20 +463,35 @@ def package_model_dependents(manifest: Mapping[str, Any]) -> list[str]:
 
 
 def _test_macros(manifest: Mapping[str, Any], uids: list[str]) -> set[str]:
-    """The package's ``test_*`` macros among ``uids``, and every one they call."""
+    """The package's ``test_*`` macros that ``uids`` reach.
+
+    dbt records a call on the macro that makes it, not on the test, so a
+    project's own generic test that wraps one of the package's is followed
+    through: every call out of a macro outside the package is followed, however
+    many macros lie between. Inside the package only the calls into its other
+    ``test_*`` macros are, so the set the package's own tests reach is the one
+    its releases were read for.
+    """
 
     macros = manifest.get("macros") or {}
-    prefix = f"macro.{PACKAGE}.test_"
+    inside = f"macro.{PACKAGE}."
+    prefix = f"{inside}test_"
     seen: set[str] = set()
-    todo = [uid for uid in uids if uid.startswith(prefix)]
+    todo = list(uids)
     while todo:
         uid = todo.pop()
         if uid in seen:
             continue
         seen.add(uid)
+        if uid.startswith(inside) and not uid.startswith(prefix):
+            continue
         called = ((macros.get(uid) or {}).get("depends_on") or {}).get("macros") or []
-        todo.extend(dep for dep in called if dep.startswith(prefix))
-    return seen
+        todo.extend(
+            str(dep)
+            for dep in called
+            if not uid.startswith(inside) or str(dep).startswith(prefix)
+        )
+    return {uid for uid in seen if uid.startswith(prefix)}
 
 
 def monitoring_tests(manifest: Mapping[str, Any]) -> dict[str, list[str]]:

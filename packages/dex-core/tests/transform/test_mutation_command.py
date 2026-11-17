@@ -449,6 +449,100 @@ def test_a_package_s_own_run_hooks_are_stripped_from_the_copy(project):
     assert (package / "dbt_project.yml").read_text(encoding="utf-8") == hooked
 
 
+def _packages_outside(project: Path, outside: Path) -> str:
+    """Install a hooked Elementary at ``outside`` and point the project there."""
+
+    package = outside / "elementary"
+    package.mkdir(parents=True)
+    hooked = (
+        "name: elementary\nversion: '0.26.1'\nconfig-version: 2\n"
+        'on-run-start:\n  - "{{ elementary.on_run_start() }}"\n'
+    )
+    (package / "dbt_project.yml").write_text(hooked, encoding="utf-8")
+    root = project / "dbt_project.yml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + f"packages-install-path: '{outside.as_posix()}'\n",
+        encoding="utf-8",
+    )
+    return hooked
+
+
+def test_a_package_installed_outside_the_copy_keeps_its_hooks_and_says_so(
+    project, tmp_path
+):
+    """An absolute packages-install-path names the same directory from the copy,
+    so the package there is the real one: never written, and named as out of
+    reach (#1307)."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    hooked = _packages_outside(project, tmp_path / "shared_packages")
+
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.strip_run_hooks() == []
+        assert shadow.run_hooks_outside_copy() == ["elementary"]
+
+    package = tmp_path / "shared_packages" / "elementary" / "dbt_project.yml"
+    assert package.read_text(encoding="utf-8") == hooked
+
+
+def test_packages_inside_the_copy_leave_no_hook_out_of_reach(project):
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    package = project / "dbt_packages" / "elementary"
+    package.mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        'name: elementary\non-run-end:\n  - "select 1"\n', encoding="utf-8"
+    )
+
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.run_hooks_outside_copy() == []
+        assert shadow.strip_run_hooks() == ["elementary"]
+
+
+def test_a_mutation_run_refuses_hooks_it_cannot_strip(
+    project, tmp_path, recorded_dbt, monkeypatch
+):
+    """They would fire once per mutant run, so the run stops before dbt is
+    asked anything, and nothing is recorded."""
+
+    calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = _results()
+    _packages_outside(project, tmp_path / "shared_packages")
+    _skip_dev_target_check(monkeypatch)
+
+    with pytest.raises(mutation.MutationError, match="packages-install-path"):
+        transform_commands.test_mutations(_engine(project), "fct")
+    assert calls == []
+
+
+def test_a_left_out_test_is_no_test_of_the_full_build():
+    """An incremental model whose only other test runs the branch: its
+    monitoring test runs nowhere, so no test runs the full build (#1307)."""
+
+    from exmergo_dex_core.transform.commands import _runs_full_build, _test_ids_named
+
+    node = {"unique_id": "model.p.fct", "name": "fct", "resource_type": "model"}
+    monitoring = {
+        "unique_id": "test.p.elementary_volume_anomalies_fct",
+        "name": "elementary_volume_anomalies_fct",
+        "resource_type": "test",
+        "attached_node": "model.p.fct",
+        "depends_on": {"nodes": ["model.p.fct"]},
+    }
+    manifest = {
+        "nodes": {"model.p.fct": node, monitoring["unique_id"]: monitoring},
+        "unit_tests": {},
+    }
+
+    assert _runs_full_build(manifest, node, []) is True
+    left_out = _test_ids_named(manifest, {"elementary_volume_anomalies_fct"})
+    assert left_out == {monitoring["unique_id"]}
+    assert _runs_full_build(manifest, node, [], left_out=left_out) is False
+
+
 def test_disabling_a_package_s_models_in_the_copy_overrides_the_project_and_undoes(
     project,
 ):
