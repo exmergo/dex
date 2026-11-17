@@ -16,6 +16,8 @@ import pytest
 from exmergo_dex_core.transform.elementary import (
     OVERRIDE_FLAG,
     UPLOAD_VARS,
+    monitoring_tests,
+    package_model_dependents,
     read,
     resolve,
 )
@@ -358,6 +360,116 @@ def test_hooks_of_a_package_not_enabled_return_early_where_they_check(checks, ho
     )
 
     assert record.hooks == hooks
+
+
+@pytest.mark.parametrize(
+    ("checks", "hooks"), [(True, "return_early"), (False, "unknown")]
+)
+def test_an_unreadable_edr_cli_run_cannot_matter_where_the_hooks_return_first(
+    checks, hooks
+):
+    """From 0.20.0 the hooks check that the package is enabled before they read
+    ``edr_cli_run``, so with every package model disabled and the hooks left on
+    (``models: elementary: edr: +enabled: false``) a Jinja value for it cannot
+    change what they do (#1307; CodeRabbit on #1382). Up to 0.19.0 it still
+    can."""
+
+    record = resolve(
+        manifest(models="disabled", hooks_check_enabled=checks),
+        project_yml(vars_={"edr_cli_run": "{{ env_var('EDR') }}"}),
+    )
+
+    assert record.hooks == hooks
+
+
+# --- what a mutation run keeps out of the copy (#1307) ----------------------------
+
+
+def _reading(node: dict[str, Any], *nodes: str, macros: tuple[str, ...] = ()):
+    return {**node, "depends_on": {"nodes": list(nodes), "macros": list(macros)}}
+
+
+def test_a_root_node_that_refers_to_a_package_model_is_a_dependent():
+    """Variant e: dbt refuses the parse when a model, or an exposure, refers to a
+    disabled model. A test only warns, so it is no dependent."""
+
+    built = manifest()
+    invocations = "model.elementary.dbt_invocations"
+    runs = _reading(_node(ROOT, "model", "elementary_runs"), invocations)
+    test = _reading(_node(ROOT, "test", "not_null_dbt_invocations_id"), invocations)
+    exposure = _reading(_node(ROOT, "exposure", "dashboard"), invocations)
+    unrelated = _reading(_node(ROOT, "model", "fct2"), "model.shop.fct")
+    built["nodes"].update({n["unique_id"]: n for n in (runs, test, unrelated)})
+    built["exposures"] = {exposure["unique_id"]: exposure}
+
+    assert package_model_dependents(built) == [
+        "exposure.shop.dashboard",
+        "model.shop.elementary_runs",
+    ]
+
+
+def test_a_reference_to_a_package_model_already_disabled_still_counts():
+    built = manifest(models="disabled")
+    runs = _reading(
+        _node(ROOT, "model", "elementary_runs"), "model.elementary.dbt_invocations"
+    )
+    built["nodes"][runs["unique_id"]] = runs
+
+    assert package_model_dependents(built) == ["model.shop.elementary_runs"]
+
+
+def test_a_project_without_a_reference_to_the_package_has_no_dependent():
+    assert package_model_dependents(manifest()) == []
+    assert package_model_dependents(manifest(elementary=False)) == []
+
+
+def test_monitoring_tests_are_those_whose_package_test_checks_it_is_enabled():
+    """``volume_anomalies`` makes the check through ``test_table_anomalies``;
+    a ``*_with_context`` test and dbt's own make none."""
+
+    check = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+    macros = (
+        _macro(
+            "elementary",
+            "test_volume_anomalies",
+            depends=("macro.elementary.test_table_anomalies",),
+        ),
+        _macro("elementary", "test_table_anomalies", sql=check),
+        _macro("elementary", "test_schema_changes", sql=check),
+        _macro("elementary", "test_not_null_with_context"),
+        # The check outside a test macro does not make the test a monitoring one.
+        _macro("elementary", "get_context_select_clause", sql=check),
+    )
+    built = manifest(extra_macros=macros)
+    fct = "model.shop.fct"
+    tests = [
+        _reading(
+            _node(ROOT, "test", "volume"),
+            fct,
+            macros=("macro.elementary.test_volume_anomalies",),
+        ),
+        _reading(
+            _node(ROOT, "test", "changes"),
+            fct,
+            macros=("macro.elementary.test_schema_changes",),
+        ),
+        _reading(
+            _node(ROOT, "test", "with_context"),
+            fct,
+            macros=(
+                "macro.elementary.test_not_null_with_context",
+                "macro.elementary.get_context_select_clause",
+            ),
+        ),
+        _reading(
+            _node(ROOT, "test", "not_null_fct_id"),
+            fct,
+            macros=("macro.dbt.test_not_null",),
+        ),
+    ]
+    built["nodes"].update({t["unique_id"]: t for t in tests})
+
+    assert monitoring_tests(built) == {"changes": [fct], "volume": [fct]}
 
 
 def test_each_disable_var_turns_off_its_own_upload():

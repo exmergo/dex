@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytest.importorskip("sqlglot")
 
@@ -413,6 +414,74 @@ def test_run_hooks_are_stripped_from_the_copy_and_said_so(
     result = transform_commands.test_mutations(_engine(project), "fct")
     assert any("hooks are not run" in w for w in result.warnings)
     assert "on-run-start" in manifest_path.read_text()
+
+
+def test_a_package_s_own_run_hooks_are_stripped_from_the_copy(project):
+    """dbt runs the hooks an installed package declares, and Elementary declares
+    its hooks there and nowhere else, so a root project with none to strip still
+    has hooks that fire per mutant (#1307). Only the copy is written."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    package = project / "dbt_packages" / "elementary"
+    package.mkdir(parents=True)
+    hooked = (
+        "name: elementary\nversion: '0.26.1'\nconfig-version: 2\n"
+        'on-run-start:\n  - "{{ elementary.on_run_start() }}"\n'
+        'on-run-end:\n  - "{{ elementary.on_run_end() }}"\n'
+    )
+    (package / "dbt_project.yml").write_text(hooked, encoding="utf-8")
+    quiet = project / "dbt_packages" / "dbt_utils"
+    quiet.mkdir()
+    (quiet / "dbt_project.yml").write_text("name: dbt_utils\n", encoding="utf-8")
+    root_before = (project / "dbt_project.yml").read_text(encoding="utf-8")
+
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.strip_run_hooks() == ["elementary"]
+        copied = yaml.safe_load(
+            (shadow.shadow / "dbt_packages/elementary/dbt_project.yml").read_text()
+        )
+        assert "on-run-start" not in copied and "on-run-end" not in copied
+        assert copied["name"] == "elementary"
+        assert (shadow.shadow / "dbt_project.yml").read_text() == root_before
+        assert shadow.strip_run_hooks() == [], "a second pass found hooks again"
+
+    assert (package / "dbt_project.yml").read_text(encoding="utf-8") == hooked
+
+
+def test_disabling_a_package_s_models_in_the_copy_overrides_the_project_and_undoes(
+    project,
+):
+    """Variant d writes its own ``+enabled`` for the package; the copy's write
+    wins over it, and the undo puts the project's text back exactly."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    root = project / "dbt_project.yml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + "models:\n  elementary:\n    +schema: elementary\n"
+        "    +enabled: \"{{ target.name != 'dev' }}\"\n",
+        encoding="utf-8",
+    )
+    original = root.read_text(encoding="utf-8")
+
+    with ShadowRun(project, target="dev") as shadow:
+        copy = shadow.shadow / "dbt_project.yml"
+        undo = shadow.disable_package_models("elementary")
+        written = yaml.safe_load(copy.read_text(encoding="utf-8"))
+        assert written["models"]["elementary"] == {
+            "+schema": "elementary",
+            "+enabled": False,
+        }
+        undo()
+        assert copy.read_text(encoding="utf-8") == original
+        shadow.set_project_flag("require_explicit_x", True)
+        assert yaml.safe_load(copy.read_text(encoding="utf-8"))["flags"] == {
+            "require_explicit_x": True
+        }
+
+    assert root.read_text(encoding="utf-8") == original
 
 
 def test_shadow_run_strip_semantic_models(project):

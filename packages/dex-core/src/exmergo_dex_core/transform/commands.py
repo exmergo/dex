@@ -2635,11 +2635,13 @@ def test_mutations(
             paradigm=paradigm,
             ceiling=ceiling,
         ) as shadow:
-            if shadow.strip_run_hooks():
+            stripped = shadow.strip_run_hooks()
+            if stripped:
                 warnings.append(
-                    "this project's on-run-start/on-run-end hooks are not run: "
-                    "mutation coverage invokes dbt once per mutant, and a hook "
-                    "that grants or audits would otherwise fire once per run"
+                    "on-run-start/on-run-end hooks are not run ("
+                    + ", ".join(stripped)
+                    + "): mutation coverage invokes dbt once per mutant, and a hook "
+                    "that grants, audits or uploads would otherwise fire once per run"
                 )
             if shadow.strip_semantic_models(model):
                 warnings.append(
@@ -2647,6 +2649,8 @@ def test_mutations(
                     "shadow project: mutation coverage runs with an ephemeral mutant, "
                     "which the semantic layer cannot anchor"
                 )
+            quiet, quiet_warnings = _quiet_elementary(shadow)
+            warnings.extend(quiet_warnings)
             node, model_path = _mutable_model(engine, shadow, model, mutation_mod)
             # Taken before anything in the copy is rewritten, from the fields a
             # plain parse carries too, so `maintain coverage` can tell later
@@ -2672,6 +2676,8 @@ def test_mutations(
                     f"(`transform test --scaffold {model}` scaffolds a unit test), "
                     "then measure it" + below.no_tests_hint()
                 )
+            left_out, left_out_warnings = _left_out_of(quiet, below.selected_ids)
+            warnings.extend(left_out_warnings)
             prepared, batch, incremental_reason = _plan_mutants(
                 shadow,
                 node,
@@ -2770,7 +2776,7 @@ def test_mutations(
                     mutation_mod,
                     equivalence=equivalence,
                     reads=below.selected_ids,
-                    skip=below.excluded_names,
+                    skip=below.excluded_names | {entry["name"] for entry in left_out},
                     incremental_tests=incremental_tests,
                 )
                 warnings.extend(price_notes)
@@ -2816,6 +2822,7 @@ def test_mutations(
                     full_tests=full_tests,
                     settle_uptime=refresh_batch is None,
                     on_meter=meters.append,
+                    left_out=left_out,
                 )
             except mutation_mod.MutationError as exc:
                 # A baseline that billed and then passed no test still spent:
@@ -3209,6 +3216,135 @@ def _mutation_cost(paradigm, estimate, ceiling, adapter):
     )
 
 
+#: Why an Elementary monitoring test is kept out of a mutation run (#1307), by
+#: the reason code the baseline's ``excluded`` carries.
+_ELEMENTARY_LEFT_OUT = {
+    "elementary_disabled": (
+        "the copy disables the Elementary package's models so that no run "
+        "writes to its schema, and this test checks nothing while the package "
+        "is disabled"
+    ),
+    "elementary_history": (
+        "this Elementary test reads the package's history and leaves rows or "
+        "tables behind, so each mutant's run would join the next one's baseline; "
+        "the package stays enabled in the copy because the project refers to "
+        "its models"
+    ),
+}
+
+
+def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
+    """Keep the Elementary package from writing to the dev target in the copy.
+
+    ``strip_run_hooks`` has already removed the package's run hooks, which do
+    the uploads. What is left is the package's models, its monitoring tests,
+    which create real tables and read history, and its ``test``
+    materialization (#1307):
+
+    1. Where nothing outside the package refers to one of its models, they are
+       disabled in the copy. dbt raises on any other node that refers to a
+       disabled model, so where one does they stay on. With them disabled, the
+       package's materialization hands every test to dbt's.
+    2. Where they stay on, the copy sets dbt's
+       ``require_explicit_package_overrides_for_builtin_materializations``, so
+       dbt picks its own ``test`` materialization over the package's. The
+       package's needs the cache its stripped ``on_run_start`` builds and fails
+       every test without it (measured on the fixture's variant e at 0.26.1),
+       so it cannot be left to run. Where a root-project materialization still
+       hands the tests to the package's, the run is refused.
+    3. Each monitoring test is kept out of every run, the baseline included:
+       with the package disabled it checks nothing, and with it enabled it
+       reads and writes the package's history. Each is returned with its
+       reason code, for the baseline's ``excluded``.
+
+    A project without the package costs nothing here: it is read from the
+    copy's installed packages before dbt is asked anything. Returns the tests
+    left out and the warnings to add.
+    """
+
+    from . import elementary as elementary_mod
+    from .build import DbtRunError
+    from .mutation import MutationError
+    from .package_overrides import _installed
+
+    root = getattr(shadow, "shadow", None)
+    if root is None or not any(
+        name == elementary_mod.PACKAGE for name, _, _ in _installed(root)
+    ):
+        return [], []
+    warnings: list[str] = []
+    manifest = shadow.parse()
+    dependents = elementary_mod.package_model_dependents(manifest)
+    disabled = False
+    if dependents:
+        warnings.append(
+            "the Elementary package's models stay enabled in the copy, because "
+            f"{dependents[0]} refers to one and dbt would refuse the parse without "
+            "them; the tests run under dbt's own test materialization and its "
+            "monitoring tests are left out instead"
+        )
+    else:
+        undo = shadow.disable_package_models(elementary_mod.PACKAGE)
+        try:
+            manifest = shadow.parse()
+            disabled = not elementary_mod.read(root, manifest).enabled
+        except DbtRunError:
+            pass
+        if not disabled:
+            undo()
+            manifest = shadow.parse()
+            warnings.append(
+                "dex could not disable the Elementary package's models in the "
+                "copy, so they stay enabled; the tests run under dbt's own test "
+                "materialization and its monitoring tests are left out instead"
+            )
+    if not disabled:
+        shadow.set_project_flag(elementary_mod.OVERRIDE_FLAG, True)
+        manifest = shadow.parse()
+        if elementary_mod.read(root, manifest).materialization == "elementary":
+            raise MutationError(
+                "the Elementary package stays enabled in this project's copy, and "
+                "a test materialization in the project still hands every test to "
+                "Elementary's, which needs the run hooks a mutation run cannot "
+                "fire. Measuring would write to the dev target or fail every "
+                "test, so dex does not run it"
+            )
+    code = "elementary_disabled" if disabled else "elementary_history"
+    left_out = [
+        {
+            "name": name,
+            "reason_code": code,
+            "reason": _ELEMENTARY_LEFT_OUT[code],
+            "_reads": reads,
+        }
+        for name, reads in elementary_mod.monitoring_tests(manifest).items()
+    ]
+    return left_out, warnings
+
+
+def _left_out_of(
+    candidates: list[dict], selected: set[str]
+) -> tuple[list[dict[str, str]], list[str]]:
+    """The candidates a run over ``selected`` would reach, and the warning.
+
+    dbt's eager indirect selection runs a test that reads any selected node, so
+    a test is kept where one of the nodes it reads is selected.
+    """
+
+    left_out = [
+        {key: value for key, value in entry.items() if key != "_reads"}
+        for entry in candidates
+        if set(entry["_reads"]) & selected
+    ]
+    if not left_out:
+        return [], []
+    return left_out, [
+        f"{len(left_out)} Elementary monitoring test(s) are not run against the "
+        "baseline or any mutant; each is in data.baseline.excluded with its "
+        "reason_code"
+    ]
+
+
 def _mutable_model(engine, shadow, model: str, mutation_mod):
     """The node to mutate, or the free refusal saying why this model is not one.
 
@@ -3581,8 +3717,13 @@ def _run_mutants(
     full_tests: bool = True,
     settle_uptime: bool = True,
     on_meter=None,
+    left_out: Sequence[dict[str, str]] = (),
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
+
+    ``left_out`` names tests kept out of every run, the baseline included, each
+    with its ``reason_code`` and ``reason``; they are reported in the
+    baseline's ``excluded`` beside the tests that did not pass there (#1307).
 
     A survivor is compared with the model on the dev data straight after its
     own run, while its body is still the model file, so the comparison costs
@@ -3607,6 +3748,7 @@ def _run_mutants(
     exclude = [
         *(downstream.exclude if downstream is not None else []),
         *sorted({f"unit_test:{test.select}" for test in incremental_tests}),
+        *(entry["name"] for entry in left_out),
     ]
     below = set(downstream.tests) if downstream is not None else set()
     warnings: list[str] = []
@@ -3665,7 +3807,7 @@ def _run_mutants(
             {"name": name, "status": status, "reason": _exclusion_reason(status)}
             for name, status in sorted(baseline.items())
             if status != "pass"
-        ]
+        ] + [{**entry, "status": "not_run"} for entry in left_out]
         if not any(status == "pass" for status in baseline.values()):
             raise mutation_mod.MutationError(
                 f"no test of '{model}' passes against the unmutated model, so there "

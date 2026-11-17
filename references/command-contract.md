@@ -1076,9 +1076,19 @@ test as a CTE and materializes nothing: no relation is created, replaced or
 dropped, and there is nothing to clean up afterwards. The run uses `dbt test`
 rather than `dbt build`, which is what keeps a failing unit test from skipping
 the model and cascading that skip onto every data test attached to it. The
-project's `on-run-start` and `on-run-end` hooks are stripped from the copy,
-since dbt is invoked once per mutant and a hook that grants or audits should not
-fire N+1 times; a note says so when it happens.
+`on-run-start` and `on-run-end` hooks of the project and of every installed
+package are stripped from the copy, since dbt is invoked once per mutant and a
+hook that grants, audits or uploads should not fire N+1 times; a note names
+whose hooks went. Where the Elementary package is installed, the copy also
+disables its models unless something outside the package refers to one, and
+leaves its monitoring tests (anomaly tests, `schema_changes` and the others that
+check the package is enabled) out of every run. Where its models must stay
+enabled, the copy sets `require_explicit_package_overrides_for_builtin_materializations`
+so the tests run under dbt's own test materialization, since Elementary's needs
+the hooks that were stripped; where a test materialization in the project still
+hands them to Elementary's, the run is refused. Either way the tests never pass
+through Elementary's materialization, so none of its temp tables or samples are
+written (#1307).
 
 **What the verdicts mean.** `killed` is a defect at least one test caught, named
 in `caught_by`. `survived` is one nothing caught. `rejected` is one the warehouse
@@ -1087,7 +1097,10 @@ and counting it as caught would flatter the suite. `not_run` is a mutant the
 budget stopped. Every verdict is relative to the tests that passed against the
 unmutated model, and any test that did not is listed in `baseline.excluded` with
 the reason, so a suite measured against its own broken tests cannot read as
-clean. A run where nothing passes at baseline is an error, not a clean sweep.
+clean. An Elementary monitoring test kept out of the run is listed there too,
+with status `not_run` and a `reason_code`: `elementary_disabled` where the copy
+disabled the package and the test would check nothing, `elementary_history`
+where the package stays enabled and the test would read and write its history. A run where nothing passes at baseline is an error, not a clean sweep.
 
 **Equivalent on the dev data.** A survivor is not always a gap in the
 assertions. Some mutants produce exactly the model's rows on the data the dev

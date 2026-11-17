@@ -358,10 +358,14 @@ def resolve(
     edr_cli_run = var_value("edr_cli_run", project, cli_vars)
     hooks: Hooks
     if operations:
-        if edr_cli_run is None:
+        # The enabled check comes first because, from 0.20.0, the hooks make it
+        # before they read `edr_cli_run`, so that var cannot matter there.
+        if not enabled and _hooks_check_enabled(manifest):
+            hooks = "return_early"
+        elif edr_cli_run is None:
             hooks = "unknown"
             notes.append("edr_cli_run is not a boolean the repository can read")
-        elif edr_cli_run or (not enabled and _hooks_check_enabled(manifest)):
+        elif edr_cli_run:
             hooks = "return_early"
         else:
             hooks = "run"
@@ -400,6 +404,99 @@ def resolve(
         uploads=uploads,
         notes=tuple(notes),
     )
+
+
+#: The resource types a manifest keeps outside ``nodes`` that can refer to a
+#: model. dbt raises when any of them, or any node but a test, refers to a
+#: disabled model; for a test it only warns (``parser/manifest.py``, 1.11.11).
+_REFERRING_SECTIONS = ("exposures", "metrics", "semantic_models", "saved_queries")
+
+
+def package_model_dependents(manifest: Mapping[str, Any]) -> list[str]:
+    """What outside the package refers to one of its models, by unique id.
+
+    Disabling the package's models makes dbt refuse the parse wherever one of
+    these exists, so a caller that wants them disabled must leave them on where
+    this is not empty. Tests are left out: dbt only warns for a test, and
+    disables it. The package's models are looked for in ``nodes`` and in
+    ``disabled``, since a project may already disable them for some targets.
+    """
+
+    models = {
+        uid
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if node.get("package_name") == PACKAGE and node.get("resource_type") == "model"
+    } | {
+        uid
+        for uid, entries in (manifest.get("disabled") or {}).items()
+        if any(
+            e.get("package_name") == PACKAGE and e.get("resource_type") == "model"
+            for e in entries
+        )
+    }
+    if not models:
+        return []
+    referring: list[str] = []
+    entries = [
+        (uid, node)
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if node.get("resource_type") != "test"
+    ]
+    for section in _REFERRING_SECTIONS:
+        entries.extend((manifest.get(section) or {}).items())
+    for uid, node in entries:
+        if node.get("package_name") == PACKAGE:
+            continue
+        reads = (node.get("depends_on") or {}).get("nodes") or []
+        if any(dep in models for dep in reads):
+            referring.append(uid)
+    return sorted(referring)
+
+
+def _test_macros(manifest: Mapping[str, Any], uids: list[str]) -> set[str]:
+    """The package's ``test_*`` macros among ``uids``, and every one they call."""
+
+    macros = manifest.get("macros") or {}
+    prefix = f"macro.{PACKAGE}.test_"
+    seen: set[str] = set()
+    todo = [uid for uid in uids if uid.startswith(prefix)]
+    while todo:
+        uid = todo.pop()
+        if uid in seen:
+            continue
+        seen.add(uid)
+        called = ((macros.get(uid) or {}).get("depends_on") or {}).get("macros") or []
+        todo.extend(dep for dep in called if dep.startswith(prefix))
+    return seen
+
+
+def monitoring_tests(manifest: Mapping[str, Any]) -> dict[str, list[str]]:
+    """The enabled tests whose package test reads ``is_elementary_enabled()``.
+
+    Read from the macros the manifest holds, since the set varies by release.
+    These are the package's monitoring tests: its anomaly tests,
+    ``schema_changes``, ``json_schema`` and, from 0.20.0, the freshness and SLA
+    tests. Each returns no rows wherever the package is not enabled, so it
+    checks nothing there; where it is enabled, each one reads the package's
+    history and leaves rows or tables for the next run to read. ``volume_anomalies``
+    reads it through ``test_table_anomalies``, so the macros a test macro calls
+    count too. The ``*_with_context`` tests do not read it at 0.16.4 or 0.26.1.
+    Returned as ``{node name: the nodes it reads}``, sorted by name, so a caller
+    can keep only the tests its selection reaches.
+    """
+
+    macros = manifest.get("macros") or {}
+    found: dict[str, list[str]] = {}
+    for node in (manifest.get("nodes") or {}).values():
+        if node.get("resource_type") != "test":
+            continue
+        depends = node.get("depends_on") or {}
+        if any(
+            "is_elementary_enabled" in str((macros.get(uid) or {}).get("macro_sql"))
+            for uid in _test_macros(manifest, list(depends.get("macros") or []))
+        ):
+            found[str(node.get("name"))] = sorted(depends.get("nodes") or [])
+    return dict(sorted(found.items()))
 
 
 def read(

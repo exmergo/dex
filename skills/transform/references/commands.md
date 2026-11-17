@@ -1115,7 +1115,12 @@ the model's own tests against each, and reports which defects nothing caught.
   excluded (a unit test on a downstream model, a test that also reads a relation
   the mutant cannot reach) and why, and a `reason` when it was off.
 - `baseline.excluded` names tests already failing against the unmutated model;
-  every verdict is relative to the tests that passed.
+  every verdict is relative to the tests that passed. It also names the
+  Elementary monitoring tests kept out of every run, with status `not_run` and a
+  `reason_code` (`elementary_disabled` or `elementary_history`): with the
+  package installed, the copy strips its run hooks, disables its models where
+  nothing else refers to them, and keeps these tests out, so the run writes
+  nothing to the dev target (#1307).
 - An incremental model's `{% if is_incremental() %}` branch is compiled a second
   time with the branch taken, and its own comparisons and filters are planted
   there (#1132). Only unit tests overriding `is_incremental` to true run against

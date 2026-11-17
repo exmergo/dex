@@ -911,25 +911,101 @@ class ShadowRun:
             missing_ok=True
         )
 
-    def strip_run_hooks(self) -> bool:
-        """Drop ``on-run-start`` and ``on-run-end`` from the copy. True if any went.
+    def strip_run_hooks(self) -> list[str]:
+        """Drop ``on-run-start`` and ``on-run-end`` from the copy.
 
         A hook fires once per invocation, and this runs dbt once per mutant, so a
         project whose hooks grant permissions or write an audit row would do that
         N+1 times for a command the user thinks of as read-only.
+
+        dbt also runs the hooks every installed package declares in its own
+        ``dbt_project.yml`` (``task/run.py``, 1.11.11 and 1.12.5), and a
+        package such as Elementary declares them there and nowhere else, so
+        those go too (#1307). Only files inside the copy are written. Returns
+        the project names whose hooks went, the root project's first.
         """
 
-        manifest = self._require_shadow() / "dbt_project.yml"
-        if not manifest.is_file():
-            return False
-        parsed = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-        present = [key for key in ("on-run-start", "on-run-end") if key in parsed]
-        if not present:
-            return False
-        for key in present:
-            parsed.pop(key)
-        manifest.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
-        return True
+        shadow = self._require_shadow()
+        files = [shadow / "dbt_project.yml"]
+        packages = packages_dir(shadow)
+        if packages.is_dir():
+            files.extend(
+                directory / "dbt_project.yml"
+                for directory in sorted(packages.iterdir())
+                if directory.is_dir()
+            )
+        stripped: list[str] = []
+        for path in files:
+            with contextlib.suppress(OSError, ValueError):
+                if not path.resolve().is_relative_to(shadow.resolve()):
+                    continue
+            if not path.is_file():
+                continue
+            try:
+                parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, yaml.YAMLError):
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            present = [key for key in ("on-run-start", "on-run-end") if key in parsed]
+            if not present:
+                continue
+            for key in present:
+                parsed.pop(key)
+            path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+            name = parsed.get("name")
+            stripped.append(str(name) if name else path.parent.name)
+        return stripped
+
+    def disable_package_models(self, package: str) -> Callable[[], None]:
+        """Disable every model of ``package`` in the copy, and return the undo.
+
+        Written as ``models: <package>: +enabled: false`` in the copy's root
+        ``dbt_project.yml``, over whatever the project set there. dbt gives a
+        package's ``on-run-*`` operations the package's model config, so they
+        are disabled with the models (read at Elementary 0.16.4 and 0.26.1). A
+        more specific ``+enabled`` further down the package's tree still wins,
+        so a caller reads the parse afterwards rather than trusting the write.
+        """
+
+        def disable(parsed: dict[str, Any]) -> None:
+            models = parsed.get("models")
+            if not isinstance(models, dict):
+                models = parsed["models"] = {}
+            scope = models.get(package)
+            if not isinstance(scope, dict):
+                scope = models[package] = {}
+            scope.pop("enabled", None)
+            scope["+enabled"] = False
+
+        return self._edit_root_project(disable)
+
+    def set_project_flag(self, name: str, value: Any) -> Callable[[], None]:
+        """Set one of dbt's ``flags`` in the copy's root ``dbt_project.yml``, and
+        return the undo. dbt validates the whole block, so a caller reads the
+        parse afterwards rather than trusting the write."""
+
+        def flag(parsed: dict[str, Any]) -> None:
+            flags = parsed.get("flags")
+            if not isinstance(flags, dict):
+                flags = parsed["flags"] = {}
+            flags[name] = value
+
+        return self._edit_root_project(flag)
+
+    def _edit_root_project(
+        self, change: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        path = self._require_shadow() / "dbt_project.yml"
+        original = path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(original) or {}
+        change(parsed)
+        path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+
+        def undo() -> None:
+            path.write_text(original, encoding="utf-8")
+
+        return undo
 
     def strip_semantic_models(self, model: str) -> bool:
         """Drop semantic models referencing ``model`` from the copy.
@@ -1003,6 +1079,15 @@ class ShadowRun:
         if not path.is_file():
             raise DbtRunError("dbt wrote no manifest for the copied project")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def parse(self) -> dict[str, Any]:
+        """Parse the copy and return the manifest dbt wrote. Opens no connection."""
+
+        completed = self._invoke("parse")
+        if completed.returncode != 0:
+            messages = _collect_messages(completed)
+            raise DbtRunError(messages[0] if messages else "dbt parse failed")
+        return self.manifest()
 
     def compile(
         self, select: str, *, vars_: Mapping[str, Any] | None = None

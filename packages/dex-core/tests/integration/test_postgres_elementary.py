@@ -146,19 +146,59 @@ def test_each_variant_builds_at_the_releases_most_installs_pin(
     assert (MATERIALIZATION_LINE in log, TEMP_TABLE_LINE in log) == BEHAVIOUR[variant]
 
 
-@pytest.mark.parametrize("version", LEGACY_VERSIONS)
-def test_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
+@pytest.mark.parametrize(
+    ("version", "variant"),
+    [(version, variant) for version in LEGACY_VERSIONS for variant in ("a", "e")],
+)
+def test_a_mutation_run_leaves_the_dev_schemas_as_it_found_them(
     tmp_path: Path,
     elementary_installs: Callable[[str], Path],
     target: PostgresTarget,
     dev_dsn: str,
     version: str,
+    variant: str,
 ):
-    """The failing arm (#1307) at the releases DuckDB cannot build: on variant a
-    a mutation run leaves an invocation behind for its baseline and for every
-    mutant, as it does on DuckDB at 0.23.0 and 0.26.1. This asserts the defect;
-    the fix inverts it."""
+    """The holding arm (#1307) at the releases DuckDB cannot build. On variant a
+    the copy disables the package's models, which at 0.15 and 0.16 is also what
+    keeps its hooks from running, since those releases' hooks do not check that
+    the package is enabled; on variant e they stay enabled and only the
+    monitoring tests are left out. Either way the dev schemas are unchanged."""
 
+    project = elementary_project(
+        tmp_path, variant, elementary_installs(version), postgres=target
+    )
+    engine = _engine(project)
+    engine.build(target="dev")
+
+    before = postgres_census(dev_dsn)
+    result = engine.test_mutations("fct")
+
+    assert result.counts["not_run"] == 0, "the budget stopped the run short"
+    assert result.counts["generated"] >= 1, "no mutant ran, so nothing was measured"
+    assert footprint(before, postgres_census(dev_dsn)) == {}
+    codes = {e.get("reason_code") for e in result.baseline["excluded"]} - {None}
+    assert codes == {"elementary_history" if variant == "e" else "elementary_disabled"}
+
+
+@pytest.mark.parametrize("version", LEGACY_VERSIONS)
+def test_without_the_fix_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    target: PostgresTarget,
+    dev_dsn: str,
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The failing arm: with the copy left as it was before #1307, variant a
+    leaves an invocation behind for its baseline and for every mutant, as it
+    does on DuckDB at 0.23.0 and 0.26.1, so the census can see what the holding
+    arm finds absent."""
+
+    from exmergo_dex_core.transform import commands
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    monkeypatch.setattr(ShadowRun, "strip_run_hooks", lambda self: [])
+    monkeypatch.setattr(commands, "_quiet_elementary", lambda shadow: ([], []))
     project = elementary_project(
         tmp_path, "a", elementary_installs(version), postgres=target
     )

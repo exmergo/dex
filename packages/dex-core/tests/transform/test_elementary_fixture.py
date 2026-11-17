@@ -21,6 +21,7 @@ from .elementary_fixture import (
     ELEMENTARY_SCHEMA,
     LEGACY_VERSIONS,
     MATERIALIZATION_LINE,
+    OLDEST_DUCKDB_VERSION,
     TEMP_TABLE_LINE,
     VARIANTS,
     VERSIONS,
@@ -191,18 +192,126 @@ def test_each_variant_changes_what_elementary_does_in_a_run(
     assert (MATERIALIZATION_LINE in log, TEMP_TABLE_LINE in log) == BEHAVIOUR[variant]
 
 
+def _executed(result) -> int:
+    # `generated` is the batch size, set whether or not a mutant was ever tested.
+    return sum(
+        result.counts[outcome]
+        for outcome in ("killed", "caught_downstream", "survived", "rejected")
+    )
+
+
+#: The two Elementary tests on ``fct``, which a mutation run keeps out (#1307).
+MONITORING_TESTS = {
+    "elementary_volume_anomalies_fct_ordered_at",
+    "elementary_schema_changes_fct_",
+}
+
+#: Each variant at the current release, and variant a at the oldest release
+#: DuckDB can build.
+MUTATION_CASES = [(CURRENT_VERSION, v) for v in VARIANTS] + [
+    (OLDEST_DUCKDB_VERSION, "a")
+]
+
+
+@requires_elementary
+@pytest.mark.parametrize(("version", "variant"), MUTATION_CASES)
+def test_a_mutation_run_leaves_the_dev_warehouse_as_it_found_it(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    version: str,
+    variant: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The holding arm (#1307): with Elementary installed, a mutation run changes
+    nothing in the dev warehouse. Where nothing refers to the package's models
+    the copy disables them (every variant but e); on e they stay enabled, dbt is
+    made to pick its own test materialization, and the monitoring tests are left
+    out for their history. Either way each left-out test is named with its
+    reason code.
+
+    Variant f's temp tables are session ``temporary`` on DuckDB and gone before
+    the census reads, so an empty footprint there says nothing about them. Only
+    the package's materialization creates them, so the record read before every
+    run, which must say the tests get dbt's, is what covers f."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+    from exmergo_dex_core.transform.elementary import read
+
+    picked: list[str] = []
+    test = ShadowRun.test
+
+    def recording(self, select, **kwargs):
+        picked.append(read(self.shadow, self.manifest()).materialization)
+        return test(self, select, **kwargs)
+
+    monkeypatch.setattr(ShadowRun, "test", recording)
+    project = elementary_project(tmp_path, variant, elementary_installs(version))
+    engine = _engine(project)
+    engine.build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+
+    before = duckdb_census(warehouse)
+    result = engine.test_mutations("fct")
+
+    assert _executed(result) >= 1, "no mutant ran, so nothing was measured"
+    assert footprint(before, duckdb_census(warehouse)) == {}
+    code = "elementary_history" if variant == "e" else "elementary_disabled"
+    left_out = {
+        entry["name"]: entry["reason_code"]
+        for entry in result.baseline["excluded"]
+        if "reason_code" in entry
+    }
+    assert left_out == dict.fromkeys(MONITORING_TESTS, code)
+    assert not MONITORING_TESTS & {t["name"] for t in result.baseline["tests"]}
+    assert picked and set(picked) == {"dbt"}
+
+
+@requires_elementary
+def test_a_mutation_run_refuses_where_a_root_shim_keeps_elementary_s_materialization(
+    tmp_path: Path, installed_elementary: Path
+):
+    """Variant c's shim with variant e's root model: the package must stay
+    enabled, and the shim hands every test to Elementary's materialization
+    whatever dbt's flag says, so no copy dex can make runs the tests quietly.
+    The run is refused, and nothing in the warehouse changes."""
+
+    from exmergo_dex_core.transform.mutation import MutationError
+
+    from .elementary_fixture import READS_ELEMENTARY_SQL
+
+    project = elementary_project(tmp_path, "c", installed_elementary)
+    (project / "models" / "elementary_runs.sql").write_text(
+        READS_ELEMENTARY_SQL, encoding="utf-8"
+    )
+    engine = _engine(project)
+    engine.build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+
+    before = duckdb_census(warehouse)
+    with pytest.raises(MutationError, match="hands every test to Elementary's"):
+        engine.test_mutations("fct")
+    assert footprint(before, duckdb_census(warehouse)) == {}
+
+
 @requires_elementary
 @pytest.mark.parametrize("version", VERSIONS)
-def test_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
-    tmp_path: Path, elementary_installs: Callable[[str], Path], version: str
+def test_without_the_fix_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    version: str,
+    monkeypatch: pytest.MonkeyPatch,
 ):
-    """The failing arm (#1307), on variant a: a mutation run is meant to leave the
-    dev warehouse as it found it, and with Elementary installed it does not. The
-    package's run hooks fire on the baseline and on every mutant, so each one
-    uploads an invocation. This asserts the defect, which is what proves the
-    census can see one; the fix inverts it. Run on the current release and on the
-    oldest one DuckDB can build."""
+    """The failing arm, on variant a: with the copy left as it was before #1307
+    (no package hooks stripped, nothing disabled, nothing left out), the
+    package's hooks fire on the baseline and on every mutant and each uploads an
+    invocation. This is what proves the census can see the footprint the
+    holding arm finds empty."""
 
+    from exmergo_dex_core.transform import commands
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    monkeypatch.setattr(ShadowRun, "strip_run_hooks", lambda self: [])
+    monkeypatch.setattr(commands, "_quiet_elementary", lambda shadow: ([], []))
     project = elementary_project(tmp_path, "a", elementary_installs(version))
     engine = _engine(project)
     engine.build(target="dev")
@@ -212,36 +321,10 @@ def test_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
     result = engine.test_mutations("fct")
     change = footprint(before, duckdb_census(warehouse))
 
-    assert result.counts["generated"] >= 1, "no mutant ran, so nothing was measured"
+    assert result.counts["not_run"] == 0, "the budget stopped the run short"
     assert {schema for schema, _, _ in change} == {ELEMENTARY_SCHEMA}
     was, now = change[(ELEMENTARY_SCHEMA, "dbt_invocations", "BASE TABLE")]
     assert now - was == result.counts["generated"] + 1
-
-
-@requires_elementary
-def test_a_mutation_run_with_elementary_disabled_leaves_no_footprint(
-    tmp_path: Path, installed_elementary: Path
-):
-    """The holding arm, on variant d: the same command over a project that differs
-    from variant a only in disabling the package's models for dev changes
-    nothing, so the footprint on variant a is Elementary's and not the
-    fixture's."""
-
-    project = elementary_project(tmp_path, "d", installed_elementary)
-    engine = _engine(project)
-    engine.build(target="dev")
-    warehouse = tmp_path / "dev.duckdb"
-
-    before = duckdb_census(warehouse)
-    result = engine.test_mutations("fct")
-
-    # `generated` is the batch size, set whether or not a mutant was ever tested.
-    executed = sum(
-        result.counts[outcome]
-        for outcome in ("killed", "caught_downstream", "survived", "rejected")
-    )
-    assert executed >= 1, "no mutant ran, so nothing was measured"
-    assert footprint(before, duckdb_census(warehouse)) == {}
 
 
 def _strip_sampling_switch(project: Path) -> None:
