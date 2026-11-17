@@ -210,7 +210,14 @@ def test_airbnb_pii_columns_are_flagged_with_min_max_suppressed(
     assert reviews["COMMENTS"]["pii"]["category"] == "free_text"
     for col in (hosts["NAME"], reviews["REVIEWER_NAME"], reviews["COMMENTS"]):
         assert col["min_value"] is None and col["max_value"] is None
-        assert set(col["pii"]) == {"category", "confidence"}  # never a value
+        # Never a value: a generic name flag adds only the refinement verdict.
+        assert set(col["pii"]) <= {"category", "confidence", "refinement"}
+    assert set(reviews["COMMENTS"]["pii"]) == {"category", "confidence"}
+    assert hosts["NAME"]["pii"]["refinement"] in {
+        "person_shape",
+        "partial_person_shape",
+        "unsettled",
+    }
 
 
 def test_tpch_reference_names_derate_below_threshold_and_person_names_hold(
@@ -248,7 +255,11 @@ def test_tpch_reference_names_derate_below_threshold_and_person_names_hold(
     # De-rating never weakens min/max suppression: string columns stay hidden.
     for col in (r_name, n_name, p_name, person):
         assert col["min_value"] is None and col["max_value"] is None
-        assert set(col["pii"]) == {"category", "confidence"}
+        assert set(col["pii"]) == {"category", "confidence", "refinement"}
+    # The verdict names the rule that decided each one (#647).
+    assert r_name["pii"]["refinement"] == "reference_vocabulary"
+    assert p_name["pii"]["refinement"] == "label_text"
+    assert person["pii"]["refinement"] == "person_shape"
 
 
 def test_date_dim_enumerations_derate_below_threshold(date_dim_duckdb: Path, capsys):
@@ -344,6 +355,16 @@ def _generic_name_flag():
         ({"person_shape_fraction": 0.0, "avg_token_count": 2.0}, 0.6),
         # Fail closed: no evidence moves nothing.
         ({}, 0.6),
+        # Organization suffixes (#647): 'Acme Inc', 'Stability AI', 'Bell Labs'.
+        ({"person_shape_fraction": 0.0, "org_suffix_fraction": 0.5}, 0.3),
+        ({"person_shape_fraction": 0.0, "org_suffix_fraction": 1.0}, 0.3),
+        # A minority of suffixed values settles nothing.
+        ({"person_shape_fraction": 0.0, "org_suffix_fraction": 0.4}, 0.6),
+        # Person shape outranks the suffix: some values look like people.
+        ({"person_shape_fraction": 0.2, "org_suffix_fraction": 1.0}, 0.6),
+        ({"person_shape_fraction": 0.6, "org_suffix_fraction": 1.0}, 0.75),
+        # Fail closed: an absent suffix statistic moves nothing.
+        ({"person_shape_fraction": 0.0, "org_suffix_fraction": None}, 0.6),
     ],
 )
 def test_shape_rules_move_generic_name_confidence(aggregate: dict, expected: float):
@@ -391,6 +412,129 @@ def test_low_cardinality_enumeration_derates_generic_name(
     )
     assert refined.category == PIICategory.NAME, "the flag is never removed"
     assert refined.confidence == expected
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "row_count", "verdict"),
+    [
+        ({}, None, "no_evidence"),
+        ({"person_shape_fraction": 0.6}, None, "person_shape"),
+        ({"person_shape_fraction": 0.2}, None, "partial_person_shape"),
+        (
+            {
+                "person_shape_fraction": 0.0,
+                "upper_vocab_fraction": 1.0,
+                "distinct_count": 5,
+            },
+            None,
+            "reference_vocabulary",
+        ),
+        ({"person_shape_fraction": 0.0, "avg_token_count": 4.0}, None, "label_text"),
+        ({"person_shape_fraction": 0.0, "distinct_count": 7}, 5000, "enumeration"),
+        (
+            {"person_shape_fraction": 0.0, "org_suffix_fraction": 0.8},
+            None,
+            "organization",
+        ),
+        ({"person_shape_fraction": 0.0}, None, "unsettled"),
+    ],
+)
+def test_each_shape_rule_names_its_verdict(
+    aggregate: dict, row_count: int | None, verdict: str
+):
+    """#647: a refined flag says which rule decided it, so a flag that held at
+    0.6 reads as `unsettled` or `partial_person_shape` rather than as nothing."""
+
+    from exmergo_dex_core.explore.profile import _refine_confidence
+
+    refined = _refine_confidence(
+        _generic_name_flag(), _aggregate(**aggregate), generic=True, row_count=row_count
+    )
+    assert refined.refinement == verdict
+    assert refined.model_dump(mode="json")["refinement"] == verdict
+
+
+def test_a_generic_name_with_no_aggregate_says_it_had_no_evidence():
+    from exmergo_dex_core.explore.profile import _refine_confidence
+
+    refined = _refine_confidence(_generic_name_flag(), None, generic=True)
+    assert refined.confidence == 0.6
+    assert refined.refinement == "no_evidence"
+
+
+def test_an_unrefined_flag_serializes_with_its_two_fields_only():
+    from exmergo_dex_core.cache import PIIFlag
+    from exmergo_dex_core.explore.profile import _refine_confidence
+
+    exact = PIIFlag(category=PIICategory.NAME, confidence=0.75)
+    refined = _refine_confidence(
+        exact, _aggregate(person_shape_fraction=0.0, distinct_count=5), generic=False
+    )
+    assert refined.refinement is None
+    assert set(refined.model_dump(mode="json")) == {"category", "confidence"}
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["team_name", "lab_name", "org_name", "organization_name", "vendor_name"],
+)
+def test_organization_qualifiers_are_not_person_names(column: str):
+    """#647: a team, lab or vendor is named, but it is not a person."""
+
+    assert detect_pii(column, "VARCHAR") is None
+
+
+@pytest.mark.parametrize("column", ["developer_name", "owner_name", "author_name"])
+def test_person_capable_qualifiers_stay_flagged(column: str):
+    """A developer or an owner is a person as often as an organization, so the
+    name alone never clears it; value evidence or a reviewed override does."""
+
+    flag = detect_pii(column, "VARCHAR")
+    assert flag is not None and flag.category is PIICategory.NAME
+    assert flag.confidence == 0.6
+
+
+def test_organization_names_derate_below_threshold_and_people_hold(
+    tmp_path: Path, capsys
+):
+    """#647 end to end on DuckDB: a `developer_name` column of organizations
+    de-rates on its suffixes, while one of people's names holds."""
+
+    import duckdb
+
+    path = tmp_path / "orgs.duckdb"
+    con = duckdb.connect(str(path))
+    con.execute("create table models (model_id integer, developer_name varchar)")
+    orgs = ["Acme AI", "Bell Labs", "Initech Inc.", "Globex Corp", "Hooli, LLC"]
+    con.executemany(
+        "insert into models values (?, ?)",
+        [(i, orgs[i % len(orgs)]) for i in range(40)],
+    )
+    con.execute("create table commits (commit_id integer, developer_name varchar)")
+    people = ["Grace Hopper", "Alan Turing", "Ada Lovelace", "Edsger Dijkstra"]
+    con.executemany(
+        "insert into commits values (?, ?)",
+        [(i, people[i % len(people)]) for i in range(40)],
+    )
+    con.close()
+
+    payload = _run(
+        ["explore", "profile", "models", "commits", "--path", str(path)], capsys
+    )
+    ds = {d["identifier"].split(".")[-1]: d for d in payload["data"]["datasets"]}
+    orgs_col = {c["name"]: c for c in ds["models"]["columns"]}["developer_name"]
+    people_col = {c["name"]: c for c in ds["commits"]["columns"]}["developer_name"]
+
+    assert orgs_col["pii"] == {
+        "category": "name",
+        "confidence": 0.3,
+        "refinement": "organization",
+    }
+    assert people_col["pii"]["confidence"] == 0.75
+    assert people_col["pii"]["refinement"] == "person_shape"
+    rendered = json.dumps(payload)
+    for value in orgs + people:
+        assert value not in rendered, "refinement never surfaces a value"
 
 
 def test_shape_rules_apply_only_to_generic_marked_name_flags():

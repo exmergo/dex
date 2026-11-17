@@ -607,6 +607,7 @@ def validate_seed(
     *,
     cache: object | None = None,
     pii_overrides: object | None = None,
+    created: bool = False,
 ) -> list[str]:
     """Refuse a seed dbt could not load, one too large to review, or one whose
     columns look like PII. Returns warnings.
@@ -619,6 +620,10 @@ def validate_seed(
     cache, which is where a column a human reviewed and cleared has already
     stopped being flagged. A hit at or above the block threshold refuses; a
     weaker one, and the detector's own provisional generic-name match, warns.
+    ``created`` marks a seed file this plan creates rather than rewrites: its
+    columns were authored in this same plan, so a hit exactly at the threshold
+    (a name-pattern guess such as ``*_note`` read as free text) warns and names
+    the override instead of refusing (#647). Anything above it still refuses.
 
     **What this cannot see:** dex detects PII from names and types, never from
     values, everywhere. A seed column named ``code`` holding email addresses
@@ -685,7 +690,9 @@ def validate_seed(
                 f"names {len(header)}; every row needs one field per column"
             )
 
-    return _seed_pii_warnings(path, header, cache=cache, pii_overrides=pii_overrides)
+    return _seed_pii_warnings(
+        path, header, cache=cache, pii_overrides=pii_overrides, created=created
+    )
 
 
 def _seed_pii_warnings(
@@ -694,6 +701,7 @@ def _seed_pii_warnings(
     *,
     cache: object | None,
     pii_overrides: object | None,
+    created: bool = False,
 ) -> list[str]:
     """The two detections, unioned at the strongest confidence per column.
 
@@ -753,6 +761,13 @@ def _seed_pii_warnings(
             # It warns instead, loudly, and every non-generic pattern (email,
             # phone, national id, address) still blocks.
             warned.append((column, flag, "unrefined"))
+        elif created and flag.confidence <= PII_BLOCK_CONFIDENCE:
+            # A seed this plan creates was authored in the same plan, and a
+            # flag no stronger than the threshold is a name-pattern guess
+            # (free text at 0.5): the plan names the override rather than
+            # stopping on it (#647). A rewrite of an existing seed, and any
+            # stronger flag, still refuses.
+            warned.append((column, flag, "authored"))
         elif flag.confidence >= PII_BLOCK_CONFIDENCE:
             blocked.append((column, flag))
         else:
@@ -775,7 +790,18 @@ def _seed_pii_warnings(
 
     warnings: list[str] = []
     for column, flag, why in warned:
-        if why == "unrefined":
+        if why == "authored":
+            warnings.append(
+                f"{path}: '{column}' looks like {flag.category.value} "
+                f"(confidence {flag.confidence:g}, at the "
+                f"{PII_BLOCK_CONFIDENCE:g} block threshold); this plan creates "
+                "the seed, so it is not refused, but its values land in git and "
+                "stay there: review them before applying. If the column is "
+                "reviewed as not personal data, record "
+                f"`- {{column: {seed}.{column}}}` under pii_overrides in "
+                ".dex/config.yml; if it is, take it out of the seed"
+            )
+        elif why == "unrefined":
             warnings.append(
                 f"{path}: '{column}' matches the generic name pattern, which "
                 "dex refines against values on a warehouse column and cannot "
@@ -842,8 +868,12 @@ def validate_edit(
     pii_overrides: object | None = None,
     compiled: CompiledModel | None = None,
     defer_compilation: bool = False,
+    created: bool = False,
 ) -> list[str]:
     """Validate one edit for its kind. Returns warnings; raises on a hard failure.
+
+    ``created`` says the edit creates its file rather than rewriting one; only
+    the seed gate reads it (see :func:`validate_seed`).
 
     ``cache`` and ``pii_overrides`` are the exploration cache and the reviewed
     columns a human has cleared, and only the seed gate reads them. They are
@@ -912,6 +942,7 @@ def validate_edit(
                 edit.new_content,
                 cache=cache,
                 pii_overrides=pii_overrides,
+                created=created,
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:

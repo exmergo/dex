@@ -154,17 +154,34 @@ weakens it). The result is recorded strictly as (column, category, confidence)
 with no example value, and that flag is what propagates downstream into emitted
 dbt.
 
+The generic `name` pattern skips a column whose qualifier names something that
+is not a person: a table, file, product, brand, company or service, a nation,
+country, region or continent, and an organization such as a team, org, lab,
+vendor, provider, publisher, supplier, merchant, store, league, agency,
+institution, university, school, bank or carrier, so `team_name` and `lab_name`
+are not flagged at all. A qualifier that names a person as often as an
+organization (`developer`, `owner`, `author`) stays flagged and clears only on
+value evidence or a reviewed override.
+
 For the weakest signal, a generic `*_name` string column, the profiling scan also
-computes three **value-shape statistics** as in-engine SQL aggregates: the
+computes four **value-shape statistics** as in-engine SQL aggregates: the
 fraction of values that are all-caps tokens, the fraction shaped like a given
-name plus surname, and the average token count. These are regex predicates
-inside measuring aggregates, so only numeric fractions leave the engine, never a
-value. The evidence moves confidence in both directions: a person-shaped
-distribution corroborates the flag up to the exact-token level, while a tiny
-closed all-caps vocabulary (a region or nation dimension) or long multi-token
-labels (part and product descriptions) de-rate it to reference-data confidence.
-When the evidence is missing or ambiguous, the name-derived confidence stands:
-absence of evidence never weakens a flag.
+name plus surname, the average token count, and the fraction ending in an
+organization suffix (`Inc`, `LLC`, `Ltd`, `Corp`, `GmbH`, `PLC`, `AI`, `Labs`,
+`Group`, `Holdings`, `Foundation`, `University` and a few more, as a token of
+their own). A value ending in such a suffix is not counted as person-shaped, so
+"Bell Labs" does not read as a given name and a surname. These are regex
+predicates inside measuring aggregates, so only numeric fractions leave the
+engine, never a value. The evidence moves confidence in both directions: a
+person-shaped distribution corroborates the flag up to the exact-token level,
+while, with person shape absent, a tiny closed all-caps vocabulary (a region or
+nation dimension), long multi-token labels (part and product descriptions), a
+closed enumeration (at most 32 distinct values making up at most 1% of the
+rows, such as weekday or month names), or a majority of values ending in an
+organization suffix de-rate it to reference-data confidence. When the evidence
+is missing or ambiguous, the name-derived confidence stands: absence of
+evidence never weakens a flag. The profile reports which rule decided as the
+flag's `refinement` ([`pii-policy.md`](pii-policy.md#the-refinement-verdict)).
 
 The flag itself is never removed by evidence. What a weak flag means is the
 consumer's decision, and the consumers differ: some gate on a flag's presence at

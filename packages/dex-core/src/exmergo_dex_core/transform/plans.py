@@ -390,6 +390,7 @@ def admit_edit(
         pii_overrides=pii_overrides,
         compiled=compiled,
         defer_compilation=defer_compilation,
+        created=edit.path not in view.files,
     )
 
 
@@ -560,7 +561,16 @@ def plan(
             if edit.op is EditOp.UPSERT and edit.kind is not EditKind.SEMANTIC_DOCUMENT:
                 from .validate import validate_edit
 
-                warnings.extend(validate_edit(edit))
+                # The seed gate reads the cache and the reviewed overrides on
+                # every format, so an override clears a seed column here too.
+                warnings.extend(
+                    validate_edit(
+                        edit,
+                        cache=read_cache() if edit.kind is EditKind.SEED_CSV else None,
+                        pii_overrides=pii_overrides,
+                        created=edit.path not in view.files,
+                    )
+                )
         current = view.files.get(edit.path)
         if edit.op is EditOp.DELETE and current is None:
             raise PlanError(

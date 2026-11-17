@@ -1138,3 +1138,21 @@ def test_referenced_relations_is_silent_where_it_cannot_speak():
         referenced_relations("SELECT * FROM generate_series(1, 10)", dialect="postgres")
         == []
     )
+
+
+def test_refusal_says_why_a_refined_name_flag_still_blocks(cache: DexCache):
+    """#647: a generic name flag value evidence could not settle says so, so the
+    reader learns why the flag held rather than only that it did."""
+
+    (hosts, *_rest) = cache.datasets
+    hosts.columns[1].pii = PIIFlag(
+        category="name", confidence=0.6, refinement="unsettled"
+    )
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", cache)
+    assert "value-shape evidence did not clear RAW_HOSTS.NAME (name)" in message
+    assert "no shape rule settled whether its values name people" in message
+
+
+def test_refusal_without_a_refinement_adds_no_verdict(cache: DexCache):
+    message = _refusal("SELECT NAME FROM RAW_HOSTS", cache)
+    assert "value-shape evidence" not in message

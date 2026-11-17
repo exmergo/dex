@@ -188,6 +188,60 @@ def test_detection_reads_names_and_types_and_never_values():
     assert validate_seed("seeds/x.csv", "code\nsomeone@example.com\n") == []
 
 
+# --- a seed this plan creates (#647) ---------------------------------------------
+
+NOTED = "lab_id,lab_note\n1,frontier lab\n2,open weights\n"
+
+
+def test_a_threshold_flag_on_a_created_seed_warns_and_names_the_override():
+    """`lab_note` reads as free text at exactly the 0.5 threshold. The plan
+    authors the seed, so the gate names the override rather than refusing."""
+
+    warnings = validate_seed("seeds/labs.csv", NOTED, created=True)
+    (warning,) = warnings
+    assert "'lab_note' looks like free_text (confidence 0.5" in warning
+    assert "`- {column: labs.lab_note}`" in warning
+    assert "pii_overrides" in warning
+    assert "frontier lab" not in warning, "the warning carries no value"
+
+
+def test_the_same_flag_on_a_rewritten_seed_still_refuses():
+    with pytest.raises(EditValidationError, match="'lab_note' looks like free_text"):
+        validate_seed("seeds/labs.csv", NOTED, created=False)
+
+
+def test_a_flag_above_the_threshold_refuses_a_created_seed_too():
+    with pytest.raises(EditValidationError, match="'email' looks like email"):
+        validate_seed("seeds/labs.csv", "id,email\n1,a@b.c\n", created=True)
+    cache = _cache_flagging("lab_note", PIICategory.FREE_TEXT, 0.6)
+    with pytest.raises(EditValidationError, match="'lab_note' looks like free_text"):
+        validate_seed("seeds/labs.csv", NOTED, cache=cache, created=True)
+
+
+def test_the_override_still_clears_a_created_seed_without_a_warning():
+    overrides = pii_override_paths([PIIOverride(column="labs.lab_note")])
+    assert (
+        validate_seed("seeds/labs.csv", NOTED, pii_overrides=overrides, created=True)
+        == []
+    )
+
+
+def test_plan_warns_on_a_seed_it_creates_and_refuses_one_it_rewrites(
+    dbt_project_dir: Path, tmp_path: Path
+):
+    store = FilesystemStore(tmp_path)
+    labs = _seed(NOTED, path="seeds/labs.csv")
+    _stored, _diffs, warnings = make_plan(
+        "add the labs lookup", [labs], dbt_project_dir, tmp_path, store=store
+    )
+    assert any("this plan creates the seed" in w for w in warnings)
+
+    (dbt_project_dir / "seeds").mkdir(exist_ok=True)
+    (dbt_project_dir / "seeds" / "labs.csv").write_text("lab_id\n1\n", encoding="utf-8")
+    with pytest.raises(EditValidationError, match="'lab_note' looks like free_text"):
+        make_plan("rewrite the lookup", [labs], dbt_project_dir, tmp_path, store=store)
+
+
 # --- containment, kind agreement, and the project view ---------------------------
 
 

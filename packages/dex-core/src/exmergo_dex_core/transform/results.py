@@ -86,6 +86,12 @@ class PlanResult(Result):
     # layer, offered here where it does not. Absent when no declared mart was
     # touched.
     semantic_proposal: dict[str, Any] | None = None
+    # Per model the plan writes whose outputs read a PII-flagged input (#1100):
+    # each such column's stamp status (`stamped`, `kept`, `overridden`,
+    # `disagreement`, `measured`, `redacted`, `unresolved`, `unchecked`,
+    # `not_written`), where its flag came from, and never a value. Absent when
+    # no written model reads a flagged input.
+    pii_metadata: dict[str, Any] | None = None
     # The free pointer to `transform compare` on a plan that rewrites a model
     # that already exists (#856). Planning scans nothing for it. Absent when the
     # plan rewrites none.
@@ -139,6 +145,8 @@ class PlanResult(Result):
             payload["declarations"] = self.declarations
         if self.semantic_proposal is not None:
             payload["semantic_proposal"] = self.semantic_proposal
+        if self.pii_metadata is not None:
+            payload["pii_metadata"] = self.pii_metadata
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:

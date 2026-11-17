@@ -309,9 +309,19 @@ class _Taint(NamedTuple):
     identifier: str
     column: str
     category: PIICategory
+    #: The value-shape verdict of a generic name flag (#647), else None.
+    refinement: str | None = None
 
 
 _Outputs = dict[str, set[_Taint]]
+
+# Why a generic name flag still blocks, by its refinement verdict (#647).
+_HELD_BECAUSE = {
+    "no_evidence": "no value-shape statistic came back",
+    "person_shape": "most values look like a given name and a surname",
+    "partial_person_shape": "some values look like a given name and a surname",
+    "unsettled": "no shape rule settled whether its values name people",
+}
 _Source = Dataset | dict
 
 # Warehouse-layer prefixes stripped before entity matching, so stg_products and
@@ -547,6 +557,16 @@ def inspect_query(
             + "; ".join(_override_suggestion(t, cache) for t in blocking)
             + "."
         )
+        held = [t for t in blocking if t.refinement is not None]
+        if held:
+            message += (
+                " The value-shape evidence did not clear "
+                + "; ".join(
+                    f"{t.label} ({_HELD_BECAUSE.get(t.refinement, t.refinement)})"
+                    for t in held
+                )
+                + "."
+            )
         if cache.schema_version < CACHE_SCHEMA_VERSION and any(
             "(name)" in label for label in offending
         ):
@@ -936,6 +956,7 @@ def _column_taint(dataset: Dataset, column_name: str) -> set[_Taint]:
                     dataset.identifier,
                     col.name,
                     col.pii.category,
+                    col.pii.refinement.value if col.pii.refinement else None,
                 )
             }
     raise QueryRefusedError(
@@ -1214,6 +1235,13 @@ def _source_column_taint(source: _Source, name: str) -> set[_Taint]:
     if taint is None:
         raise QueryRefusedError(f"column '{name}' does not exist in the subquery")
     return set(taint)
+
+
+def measures(node: exp.Func) -> bool:
+    """Whether ``node`` is a measuring aggregate, the function that cuts the
+    value path from its arguments to its result (public for #1100's lineage)."""
+
+    return _measures(node)
 
 
 def _measures(node: exp.Func) -> bool:

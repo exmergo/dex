@@ -157,6 +157,16 @@ class _Reading:
     referenced: dict[tuple[str, str, bool], set[str]] = field(default_factory=dict)
     #: Column names read that could not be traced to a relation, when asked.
     unreferenced: set[str] = field(default_factory=set)
+    #: Per output column, every upstream column its value is computed from and
+    #: how (#1100): ``pass_through`` (carried unchanged, an alias included),
+    #: ``preserved`` (through a function that keeps the value: a cast, case
+    #: folding, trimming, ``coalesce``, ``min``/``max``), ``measured`` (through
+    #: a measuring aggregate such as ``count`` or ``sum``) or ``unresolved``
+    #: (any other expression, a hash included). ``None`` where the lineage
+    #: could not be followed; an empty list for a constant.
+    value_paths: dict[str, list[tuple[_Origin, str]] | None] = field(
+        default_factory=dict
+    )
 
 
 def draft(
@@ -775,6 +785,12 @@ class _Lineage:
                 if origin is not None:
                     self.reading.origins[name] = origin
             self._read_children(outputs)
+            noted = len(self.reading.incomplete)
+            for name, expression in outputs.items():
+                self.reading.value_paths[name] = self.value_paths(self.tree, expression)
+            # Commentary only, as `_read_children` is: what `origin` could not
+            # follow is already recorded once.
+            del self.reading.incomplete[noted:]
 
         keys, evidence = self.keys(self.tree)
         if keys:
@@ -1129,6 +1145,86 @@ class _Lineage:
         if carried is not None and carried.outer_join is None:
             carried.outer_join = outer
         return carried
+
+    def value_paths(
+        self, select: Any, expression: Any, depth: int = 0
+    ) -> list[tuple[_Origin, str]] | None:
+        """Every upstream column ``expression``'s value is computed from, each
+        with how it gets there (see ``_Reading.value_paths``), followed through
+        CTEs and subqueries. ``None`` where any column it reads cannot be
+        followed, so a partial answer never reads as a complete one."""
+
+        from sqlglot import expressions as exp
+
+        if depth > 32 or expression is None:
+            return None
+        if self.shape.SET_OPERATIONS and isinstance(select, self.shape.SET_OPERATIONS):
+            return None
+        node = expression.this if isinstance(expression, exp.Alias) else expression
+        while isinstance(node, exp.Paren):
+            node = node.this
+        if isinstance(node, exp.Column):
+            if isinstance(node.this, exp.Star):
+                return None
+            return self._column_paths(select, node, depth)
+        if isinstance(node, (exp.Subquery, exp.Select)) or (
+            self.shape.SET_OPERATIONS and isinstance(node, self.shape.SET_OPERATIONS)
+        ):
+            # A scalar subquery reads its own scope, which this walk does not
+            # enter: not followed, rather than read against the wrong scope.
+            return None
+        if isinstance(node, exp.Window):
+            # The function's value is the output; its partition and order are
+            # not part of it.
+            return self.value_paths(select, node.this, depth + 1)
+        layer = _value_layer(node)
+        paths: list[tuple[_Origin, str]] = []
+        for child in _value_children(node, layer):
+            found = self.value_paths(select, child, depth + 1)
+            if found is None:
+                return None
+            paths.extend(
+                (origin, _VALUE_KINDS[max(_VALUE_RANK[kind], _VALUE_RANK[layer])])
+                for origin, kind in found
+            )
+        return paths
+
+    def _column_paths(
+        self, select: Any, column: Any, depth: int
+    ) -> list[tuple[_Origin, str]] | None:
+        from sqlglot import expressions as exp
+
+        found = self.source_of(select, column)
+        if found is None:
+            return None
+        _alias, relation, _join = found
+        kind, target = self.target(relation)
+        if kind in {"physical", "ref"}:
+            return [
+                (
+                    _Origin(target, column.name, None, is_ref=(kind == "ref")),
+                    "pass_through",
+                )
+            ]
+        if kind == "generated":
+            return []
+        if kind != "scope":
+            return None
+        outputs = self.outputs(target)
+        inner = None if outputs is None else outputs.get(column.name.lower())
+        if inner is None:
+            # `select *` over one relation: a column of that name can only come
+            # from it.
+            if not isinstance(target, exp.Select) or len(self.sources(target)) != 1:
+                return None
+            if not any(
+                isinstance(e, exp.Star)
+                or (isinstance(e, exp.Column) and isinstance(e.this, exp.Star))
+                for e in target.expressions
+            ):
+                return None
+            return self._column_paths(target, exp.column(column.name), depth + 1)
+        return self.value_paths(target, inner, depth + 1)
 
     def resolve_expression(self, select: Any, expression: Any, depth: int = 0) -> Any:
         """Resolve a column expression back through CTEs to its producing expression."""
@@ -1778,6 +1874,75 @@ class _Lineage:
                     is_ref=origin.is_ref,
                 )
             )
+
+
+# How a value travels from an upstream column into an output (#1100), ranked so
+# the strongest step on the path decides: a `count` over a hash is a count, and
+# a hash over a cast is a hash.
+_VALUE_KINDS = ("pass_through", "preserved", "unresolved", "measured")
+_VALUE_RANK = {kind: rank for rank, kind in enumerate(_VALUE_KINDS)}
+
+
+def _value_layer(node: Any) -> str:
+    """How one expression node treats the values of what it reads."""
+
+    from sqlglot import expressions as exp
+
+    from ..guards.query_firewall import measures
+
+    if isinstance(node, exp.Func) and measures(node):
+        return "measured"
+    if isinstance(node, _preserving_types()):
+        return "preserved"
+    return "unresolved"
+
+
+def _value_children(node: Any, layer: str) -> list[Any]:
+    """The child expressions whose values flow into ``node``'s value.
+
+    A preserving function passes its value-bearing arguments through (a cast's
+    operand, every argument of ``coalesce``, ``lag``'s first); a type or a
+    literal carries nothing. Any other node reads every column beneath it.
+    """
+
+    from sqlglot import expressions as exp
+
+    if layer == "preserved":
+        if isinstance(node, (exp.Lag, exp.Lead)):
+            return [node.this]
+        if isinstance(node, (exp.Cast, exp.TryCast)):
+            return [node.this]
+        children = [node.this] if node.this is not None else []
+        children.extend(node.expressions or [])
+        return [c for c in children if isinstance(c, exp.Expression)]
+    return [c for c in node.iter_expressions() if not isinstance(c, exp.DataType)]
+
+
+def _preserving_types() -> tuple[type, ...]:
+    """Functions whose result is one of their arguments' values, or that value
+    re-typed, re-cased or trimmed: what reaches the output is still the input's
+    value, so a stamp on the input belongs on the output too (#1100)."""
+
+    from sqlglot import expressions as exp
+
+    names = (
+        "Cast",
+        "TryCast",
+        "Lower",
+        "Upper",
+        "Trim",
+        "Coalesce",
+        "Min",
+        "Max",
+        "AnyValue",
+        "First",
+        "Last",
+        "FirstValue",
+        "LastValue",
+        "Lag",
+        "Lead",
+    )
+    return tuple(getattr(exp, name) for name in names if hasattr(exp, name))
 
 
 def _conjuncts(node: Any) -> list[Any]:

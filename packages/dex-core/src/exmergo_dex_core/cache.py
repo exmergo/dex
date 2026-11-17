@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_serializer
 
@@ -56,16 +56,49 @@ class PIICategory(str, Enum):
     OTHER = "other"
 
 
+class ShapeRefinement(str, Enum):
+    """What the value-shape evidence said about a generic ``*_name`` flag (#647).
+
+    Each names the rule that decided the flag's confidence, so a flag that held
+    says why it held: ``no_evidence`` (no shape statistic came back),
+    ``person_shape`` (raised: half the values look like "Given Surname"),
+    ``partial_person_shape`` (some values look like people, so it stands),
+    ``reference_vocabulary``, ``label_text``, ``enumeration`` and
+    ``organization`` (each de-rated: a closed all-caps vocabulary, long labels, a
+    small set of repeated values, values ending in an organization suffix), and
+    ``unsettled`` (no rule decided, so it stands).
+    """
+
+    NO_EVIDENCE = "no_evidence"
+    PERSON_SHAPE = "person_shape"
+    PARTIAL_PERSON_SHAPE = "partial_person_shape"
+    REFERENCE_VOCABULARY = "reference_vocabulary"
+    LABEL_TEXT = "label_text"
+    ENUMERATION = "enumeration"
+    ORGANIZATION = "organization"
+    UNSETTLED = "unsettled"
+
+
 class PIIFlag(BaseModel):
     """PII recorded as (column, category, confidence). Never an example value.
 
     There is intentionally no field for a sample value, so PII can be flagged but
     never surfaced. The flag is what propagates into emitted dbt (model and column
-    `meta`).
+    `meta`). ``refinement`` is set only on a generic ``*_name`` flag the
+    profiling scan refined against value shape, and is left out of the serialized
+    flag otherwise, so every other flag keeps its two fields.
     """
 
     category: PIICategory
     confidence: float = Field(ge=0.0, le=1.0)
+    refinement: ShapeRefinement | None = None
+
+    @model_serializer(mode="wrap")
+    def _drop_unset_refinement(self, handler: Any) -> dict[str, Any]:
+        data = handler(self)
+        if isinstance(data, dict) and data.get("refinement") is None:
+            data.pop("refinement", None)
+        return data
 
 
 class ValueCount(BaseModel):
