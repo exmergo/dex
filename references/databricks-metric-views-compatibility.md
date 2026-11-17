@@ -278,8 +278,11 @@ LIMIT 51
   two views in one query.
 - The PII gate screens every grouped and filtered field, and every column a
   value-returning measure (`MIN`, `MAX`, `ANY_VALUE`, `COLLECT_LIST`, ...) reads,
-  through `MEASURE()` at any depth. `values` screens its field before the
-  connector is checked, so a personal field is refused as PII anywhere.
+  through `MEASURE()` at any depth, a field a measure reads included.
+  `values` screens its field before the connector is checked, so a personal
+  field is refused as PII anywhere. The lineage it screens is the repository
+  file's: a column only the deployed definition reads is not screened until the
+  deployment is compared with the file (#1363).
 - The deployed view is found by its file's stem among the Metric Views the
   source allowlist holds, with a warehouse-free Unity Catalog listing: one defined
   only in the repository is refused, and one in two allowlisted schemas is
@@ -289,7 +292,9 @@ LIMIT 51
   base tables the request reaches (the view's `source`, every table a query
   source reads, and each join a member reads through), with the startup floor
   when the warehouse is stopped. A base table outside the scoped inventory is
-  refused, since it could not be priced.
+  refused, since it could not be priced. The base tables are read from the
+  repository file, so one only the deployed definition reads is neither priced
+  nor refused until #1363.
 - Any other connector is refused by name.
 
 ## What `maintain` makes of the layer

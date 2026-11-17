@@ -146,7 +146,8 @@ def resolve_token(loaded: LoadResult, token: str) -> Resolved:
 
     ``view.field`` or ``view.measure``, matched ignoring case, with an optional
     ``__<grain>`` on a field. A grain is read only where the name without it is a
-    member and the name with it is not.
+    member and the name with it is not, and is refused on a measure, which
+    ``MEASURE()`` would return unbucketed under the grained name.
     """
 
     raw = (token or "").strip()
@@ -165,6 +166,12 @@ def resolve_token(loaded: LoadResult, token: str) -> Resolved:
             grain = tail.lower()
     if member is None:
         raise QueryRefused(_unknown(raw))
+    if grain is not None and member.kind != FIELD:
+        raise QueryRefused(
+            f"{raw}: a grain buckets a date or timestamp field, and "
+            f"{view.name}.{member.name} is a measure; name the measure without the "
+            "suffix and put the grain on a date field in --group-by"
+        )
     return Resolved(token=raw, view=view, member=member, grain=grain)
 
 
@@ -557,6 +564,9 @@ class ValueColumn:
 
     token: str
     gate: tuple[str, str] | None
+    #: The view's field this column is, where it is one: a field computed over
+    #: several tables is screened through the columns it reads.
+    field: str | None = None
 
 
 def value_columns(
@@ -587,7 +597,7 @@ def value_columns(
         for ref in reads:
             field_ = view.member(ref.column) if not ref.qualifier else None
             if field_ is not None and field_.kind == FIELD:
-                found.append(ValueColumn(token_of(view, field_), None))
+                found.append(ValueColumn(token_of(view, field_), None, field_.name))
                 continue
             column = _column(view, ref, resolution, fold)
             if column is None:
@@ -604,6 +614,10 @@ def field_columns(
 ) -> list[ValueColumn] | None:
     """Every column a field's expression reads, followed through the earlier
     fields it reads, or None where an expression cannot be read.
+
+    A field sees only the fields declared before it, as Databricks resolves
+    them: a bare name that is the field itself or a later one is a source
+    column (``tag: CONCAT(tag, customer.segment)`` reads the source's ``tag``).
 
     What the PII gate screens a field as where the catalog's lineage has no
     column or expression for it: one computed over more than one table
@@ -622,8 +636,10 @@ def field_columns(
         if refs is None:
             return None
         for ref in refs:
-            earlier = view.member(ref.column) if not ref.qualifier else None
-            if earlier is not None and earlier.kind == FIELD:
+            earlier = (
+                None if ref.qualifier else _earlier_field(view, current, ref.column)
+            )
+            if earlier is not None:
                 if earlier.name.lower() not in seen:
                     seen.add(earlier.name.lower())
                     pending.append(earlier)
@@ -633,6 +649,18 @@ def field_columns(
                 return None
             found.append(column)
     return list(dict.fromkeys(found))
+
+
+def _earlier_field(view: MetricView, current: Member, name: str) -> Member | None:
+    """The field named ``name`` declared before ``current``, or None."""
+
+    lowered = name.lower()
+    for candidate in view.fields:
+        if candidate.name.lower() == current.name.lower():
+            return None
+        if candidate.name.lower() == lowered:
+            return candidate
+    return None
 
 
 def _column(

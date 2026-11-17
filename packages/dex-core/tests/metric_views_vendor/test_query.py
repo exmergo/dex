@@ -10,6 +10,7 @@ in what order, and that nothing reached the warehouse before a refusal.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -325,6 +326,7 @@ def test_python_and_the_cli_give_the_same_answer(tmp_path, capsys, workspace):
         (["orders.running_share"], "reads running, which is a window measure"),
         (["orders.revenue", "--grain", "month"], "bare --grain"),
         (["orders.revenue", "--group-by", "orders.priority__month"], "date"),
+        (["orders.revenue__month"], "orders.revenue is a measure"),
         (["orders.revenue", "--where", "revenue > 10"], "a measure"),
         (["orders.revenue", "--where", "MEASURE(revenue) > 10"], "MEASURE(revenue)"),
         (["orders.revenue", "--where", "o_custkey = 1"], "no such field"),
@@ -473,3 +475,54 @@ def test_a_field_over_two_tables_is_screened_through_both(tmp_path, capsys, work
     assert refused["status"] == "error"
     assert refused["reason"] == "guard", refused
     assert len(workspace["workspace"].queries) == 1
+
+
+def _with_measures(**exprs: str) -> dict:
+    body = copy.deepcopy(ORDERS)
+    body["measures"].extend({"name": n, "expr": e} for n, e in exprs.items())
+    return body
+
+
+def test_a_measure_over_a_field_is_screened_through_its_columns(
+    tmp_path, capsys, workspace
+):
+    """`MAX(contact)` returns the values of `contact`, a field over two tables
+    the catalog's lineage traces neither column of: the gate reads its columns
+    as it does when `contact` is grouped, so the personal one is refused."""
+
+    root = _repo(
+        tmp_path,
+        orders=_with_measures(top_contact="MAX(contact)", top_place="MAX(place)"),
+    )
+    refused = _query(capsys, root, "orders.top_contact")
+    assert refused["status"] == "error"
+    assert refused["reason"] == "guard", refused
+    assert "customer.c_email" in refused["errors"][0], refused["errors"]
+    _nothing_reached_the_warehouse(workspace["workspace"])
+
+    workspace["workspace"].rows = [{"orders.top_place": "BUILDING/FR"}]
+    passed = _query(capsys, root, "orders.top_place")
+    assert passed["status"] == "ok", passed["errors"]
+
+
+def test_a_source_named_partially_is_priced_by_its_inventory_entry(
+    tmp_path, capsys, workspace, monkeypatch
+):
+    """`core.orders` names `shop.core.orders`: the statement is priced by the
+    inventory's identifier, which is what the adapter holds a size under."""
+
+    from exmergo_dex_core.adapters.databricks import DatabricksAdapter
+
+    priced: list[list[str]] = []
+    estimate = DatabricksAdapter.relations_estimate
+
+    def spy(self, identifiers):
+        priced.append(list(identifiers))
+        return estimate(self, identifiers)
+
+    monkeypatch.setattr(DatabricksAdapter, "relations_estimate", spy)
+    root = _repo(tmp_path, orders={**ORDERS, "source": "core.orders"})
+    envelope = _query(capsys, root, "orders.order_count", confirm=False)
+
+    assert envelope["status"] == "needs_confirmation", envelope["errors"]
+    assert priced and priced[-1] == ["shop.core.orders"], priced

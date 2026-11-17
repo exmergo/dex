@@ -336,10 +336,13 @@ class LocalMetricViewLayer:
         meet the same evidence; the refusal still names the caller's spelling.
         A column a value-returning measure reads directly (``MAX(customer.email)``)
         has no catalog token, so it is screened through its physical column,
-        registered for this command in :meth:`_physical_columns`.
+        registered for this command in :meth:`_physical_columns`. A field a
+        measure reads (``MAX(location)``) is screened as a grouped field is, so
+        one computed over several tables is screened through every column it
+        reads.
         """
 
-        from ...metric_views.query import value_columns
+        from ...metric_views.query import Resolved, value_columns
 
         refs: list[str] = []
         aliases: dict[str, list[str]] = {}
@@ -356,6 +359,12 @@ class LocalMetricViewLayer:
                     f"{measure.token} returns the values of, so the PII gate cannot "
                     "screen them"
                 )
+            for column in columns:
+                member = plan.view.member(column.field) if column.field else None
+                if member is not None and column.token not in aliases:
+                    aliases[column.token] = self._field_aliases(
+                        Resolved(token=column.token, view=plan.view, member=member)
+                    )
             refs.extend(self._register(columns))
         return list(dict.fromkeys(refs)), aliases
 
@@ -494,7 +503,18 @@ class LocalMetricViewLayer:
                 "schema to databricks.catalogs in .dex/config.yml, or widen "
                 "--scope to it"
             )
-        return relations
+        # Priced by the inventory's own identifiers: a name written partially
+        # (`core.orders`) has no size of its own to read, and would be quoted as
+        # nothing while Databricks still scans it.
+        resolved: list[str] = []
+        for name in relations:
+            matches = match_identifier(name, listed) or [
+                item for item in listed if match_identifier(item, [name])
+            ]
+            for match in matches:
+                if match.lower() not in resolved:
+                    resolved.append(match.lower())
+        return resolved
 
     # ---- plumbing ------------------------------------------------------------
 

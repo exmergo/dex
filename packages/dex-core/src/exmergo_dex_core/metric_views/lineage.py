@@ -643,9 +643,11 @@ def source_tables(source: str) -> list[str] | None:
     where it cannot be read.
 
     A table name is itself. A query is every table it names, a table in a
-    subquery or a join included, and a name its own ``WITH`` defines excluded:
+    subquery or a join included, and a name a ``WITH`` in scope defines excluded:
     what Databricks scans to answer the view, which is what a statement over it
-    is priced by.
+    is priced by. A one-part name is a CTE only where a ``WITH`` enclosing it
+    defines one of that name; a CTE in a subquery is not visible outside it, so
+    a table of the same name there is still read.
     """
 
     if _TABLE_NAME.match(source) and not _QUERY.match(source):
@@ -655,13 +657,45 @@ def source_tables(source: str) -> list[str] | None:
     tree = _parse(source)
     if tree is None:
         return None
-    ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
     found: list[str] = []
     for table in tree.find_all(exp.Table):
         parts = [p for p in (table.catalog, table.db, table.name) if p]
-        if not parts or (len(parts) == 1 and parts[0].lower() in ctes):
+        if not parts or (len(parts) == 1 and _cte_in_scope(table, parts[0])):
             continue
         name = ".".join(parts)
         if name not in found:
             found.append(name)
     return found or None
+
+
+def _cte_in_scope(table: exp.Table, name: str) -> bool:
+    """Whether a ``WITH`` lexically enclosing ``table`` defines ``name``.
+
+    Walked outward from the reference: a query's ``WITH`` is visible to the
+    query's body and every subquery in it, and within one ``WITH`` a CTE sees
+    those listed before it (and itself, where the ``WITH`` is recursive).
+    """
+
+    lowered = name.lower()
+    child: exp.Expression = table
+    node = table.parent
+    while node is not None:
+        if isinstance(node, exp.With):
+            ctes = list(node.expressions)
+            index = next((i for i, c in enumerate(ctes) if c is child), len(ctes))
+            visible = ctes[: index + 1] if node.args.get("recursive") else ctes[:index]
+            if any(cte.alias_or_name.lower() == lowered for cte in visible):
+                return True
+        else:
+            for value in node.args.values():
+                if (
+                    isinstance(value, exp.With)
+                    and value is not child
+                    and any(
+                        cte.alias_or_name.lower() == lowered
+                        for cte in value.expressions
+                    )
+                ):
+                    return True
+        child, node = node, node.parent
+    return False

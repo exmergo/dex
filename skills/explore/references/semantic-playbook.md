@@ -237,9 +237,10 @@ anywhere else:
   measure is listed as `derived` with its spec there, and is not modelled. The
   view's `filter` is on every metric's `filter`.
 - **`query` and `values` run on the Databricks connector only** (#1362). One
-  view per query, at least one measure; a window or `partition` measure, a view
-  declaring `parameters` or a `materialization`, and a measure in `--where` are
-  refused by name. On any other connector, use `explore profile` and
+  view per query; `query` needs at least one measure, while `values` reads a
+  field alone and takes `--metric` only to scope it. A window or `partition`
+  measure, a view declaring `parameters` or a `materialization`, and a measure in
+  `--where` are refused by name. On any other connector, use `explore profile` and
   `explore query` on the relations the catalog names.
 - **The answer is the deployment's.** The deployed view is found by its file's
   stem and not yet compared with the file (#1363); relay the note that says so.

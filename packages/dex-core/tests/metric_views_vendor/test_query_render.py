@@ -123,3 +123,68 @@ def test_a_clause_dex_cannot_screen_is_not_read(loaded, clause):
 def test_a_name_from_another_view_or_a_join_column_is_refused(loaded):
     with pytest.raises(QueryRefused, match="no such field"):
         filter_fields(loaded, ["customer.c_name = 'x'"])
+
+
+def test_a_field_reads_only_the_fields_declared_before_it(tmp_path):
+    """Databricks resolves a bare name in a field against the fields before it:
+    `tag: CONCAT(tag, ...)` reads the source's `tag`, and so does a field
+    naming one declared after it."""
+
+    from exmergo_dex_core.metric_views.query import field_columns
+
+    layer = source(
+        tmp_path,
+        connector="databricks",
+        orders={
+            **ORDERS,
+            "fields": [
+                {"name": "first", "expr": "CONCAT(later, '-')"},
+                {"name": "tag", "expr": "CONCAT(tag, customer.c_mktsegment)"},
+                {"name": "later", "expr": "o_orderpriority"},
+                {"name": "after", "expr": "CONCAT(later, customer.c_mktsegment)"},
+            ],
+            "measures": [{"name": "order_count", "expr": "COUNT(1)"}],
+        },
+    )
+    (orders,) = layer.loaded().views
+
+    def read(name: str) -> list[str]:
+        found = field_columns(orders, orders.member(name), layer.resolution(), str)
+        return [column.token for column in found or []]
+
+    assert read("tag") == ["orders.source.tag", "orders.customer.c_mktsegment"]
+    assert read("first") == ["orders.source.later"]
+    assert sorted(read("after")) == [
+        "orders.customer.c_mktsegment",
+        "orders.source.o_orderpriority",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("source_sql", "tables"),
+    [
+        # A CTE inside a subquery is not visible to the query around it.
+        (
+            "SELECT r.* FROM restricted_data r CROSS JOIN (WITH restricted_data AS "
+            "(SELECT * FROM shop.core.orders) SELECT * FROM restricted_data) x",
+            ["restricted_data", "shop.core.orders"],
+        ),
+        # A CTE sees those before it, and the body sees them all.
+        (
+            "WITH a AS (SELECT * FROM t1), b AS (SELECT * FROM a) "
+            "SELECT * FROM b JOIN c ON b.k = c.k",
+            ["c", "t1"],
+        ),
+        # ... and not one declared after it.
+        (
+            "WITH b AS (SELECT * FROM a), a AS (SELECT * FROM t1) SELECT * FROM b",
+            ["a", "t1"],
+        ),
+        # An outer WITH is visible inside a subquery.
+        ("WITH a AS (SELECT * FROM t1) SELECT * FROM (SELECT * FROM a) s", ["t1"]),
+    ],
+)
+def test_a_cte_name_is_read_by_lexical_scope(source_sql, tables):
+    from exmergo_dex_core.metric_views.lineage import source_tables
+
+    assert sorted(source_tables(source_sql) or []) == sorted(tables)
