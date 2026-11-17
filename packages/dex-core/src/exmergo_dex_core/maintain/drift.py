@@ -177,9 +177,11 @@ def schema_drift(
     """Structural drift: metadata only, free on every connector.
 
     ``current_transform`` (the live project's fingerprint, not the baseline's)
-    enables ``orphan_relation``: a table present at the baseline and now, that
-    the baseline's project built or sourced but the live project no longer
-    does. Without it (no project available), that check is skipped.
+    enables ``orphan_relation`` and filters ``dangling_source``: a table present
+    at the baseline and now that the project no longer builds or sources is an
+    orphan, and a baseline source the live project no longer declares is skipped
+    rather than reported dangling against the warehouse. Without it (no project
+    available), those checks are skipped or fall back to the baseline.
 
     ``transform_drift`` is the same transform layer compared a second way (a
     model added, removed, or content-changed since the baseline) and is its
@@ -375,8 +377,22 @@ def schema_drift(
             if scope is not None
             else None
         )
+        current_sources = (
+            {
+                (s.source_name.lower(), s.table.lower())
+                for s in current_transform.sources
+            }
+            if current_transform is not None
+            else None
+        )
         for source in snap.transform_layer.sources:
             if scoped_tables is not None and source.table.lower() not in scoped_tables:
+                continue
+            if (
+                current_sources is not None
+                and (source.source_name.lower(), source.table.lower())
+                not in current_sources
+            ):
                 continue
             if not match_identifier(source.table, current_identifiers):
                 findings.append(
