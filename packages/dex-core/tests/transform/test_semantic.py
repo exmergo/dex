@@ -1798,6 +1798,9 @@ def test_a_delete_entry_is_a_name_and_no_content(
     )
     assert rc == 1
     assert "needs the name" in envelope["errors"][0]
+    assert envelope["errors"][0].endswith(
+        '{"kind": "metric", "op": "delete", "name": "<name>"}'
+    )
 
     rc, envelope = _plan_definitions(
         tmp_path,
@@ -1814,6 +1817,9 @@ def test_a_delete_entry_is_a_name_and_no_content(
     )
     assert rc == 1
     assert "carries no content" in envelope["errors"][0]
+    assert envelope["errors"][0].endswith(
+        '{"kind": "metric", "op": "delete", "name": "<name>"}'
+    )
 
 
 def test_one_payload_names_each_definition_once(

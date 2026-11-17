@@ -17,6 +17,7 @@ from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
 from exmergo_dex_core.cache import ColumnProfile, Dataset, DexCache, PIIFlag
 from exmergo_dex_core.config import QueryLimits
 from exmergo_dex_core.transform.expected_change import (
+    ACCEPTED_SHAPE,
     Expectation,
     ExpectationError,
     lookup_relations,
@@ -264,6 +265,7 @@ def test_an_expectation_that_does_not_fit_is_not_checked(
     assert result.status == "not_checked"
     assert result.reason_code == "invalid_expectation"
     assert message in result.detail
+    assert result.detail.endswith(f"An expectation is {ACCEPTED_SHAPE}")
     assert result.expectation is None
 
 
@@ -294,10 +296,12 @@ def test_a_pii_key_is_withheld_from_the_sample_and_the_counts_stay(warehouse):
     ],
 )
 def test_a_malformed_expectation_is_refused(raw, message):
-    """Malformed JSON or a wrong field is refused, naming the field."""
+    """Malformed JSON or a wrong field is refused, naming the field and showing
+    the whole accepted shape (#1388)."""
 
-    with pytest.raises(ExpectationError, match=message):
+    with pytest.raises(ExpectationError, match=message) as refused:
         parse_expectation(raw)
+    assert str(refused.value).endswith(f"An expectation is {ACCEPTED_SHAPE}")
 
 
 def test_the_issue_spelling_and_defaults_parse():

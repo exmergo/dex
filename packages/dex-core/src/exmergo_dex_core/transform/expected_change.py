@@ -50,13 +50,26 @@ RESERVED_COLUMNS = frozenset(
 )
 
 
+#: The whole accepted ``--expect`` shape, which every refusal ends with, so one
+#: error shows every field at once rather than only the first wrong one (#1388).
+ACCEPTED_SHAPE = (
+    '{"added": "none" | "any" | {"where": "<predicate>"}, '
+    '"removed": "none" | "any" | {"where": "<predicate>"}, '
+    '"changed_columns": ["<column>", ...], "key": "unchanged" | "any"}'
+)
+
+
 class ExpectationError(RequestError):
     """An expectation that cannot be judged as stated (#1157).
 
     Malformed JSON or an unknown field is raised to the caller as a request
     error; one that does not fit the compared columns becomes ``not_checked``
-    with ``invalid_expectation``.
+    with ``invalid_expectation``. Either way the message ends with
+    ``ACCEPTED_SHAPE``.
     """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"{message}. An expectation is {ACCEPTED_SHAPE}")
 
 
 @dataclass(frozen=True)
