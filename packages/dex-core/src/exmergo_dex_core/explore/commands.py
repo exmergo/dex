@@ -1265,15 +1265,28 @@ def relationships(
     declared_notes.extend(
         _declaration_join_notes(declaration_edges, declaration_already_declared)
     )
+    test_keys = {_relationship_edge_key(rel) for rel in declared}
     native_edges, native_edge_notes = _native_semantic_edges(
         engine,
         use_project,
         identifiers,
         use_hosted_semantic_layer=use_hosted_semantic_layer,
     )
+    native_keys = {_relationship_edge_key(rel) for rel in native_edges}
     declared, _native_already_declared = _fold_semantic_edges(declared, native_edges)
     semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
-    declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
+    declared, _semantic_already_declared = _fold_semantic_edges(
+        declared, semantic_edges
+    )
+    semantic_test_declared = sum(
+        1 for rel in semantic_edges if _relationship_edge_key(rel) in test_keys
+    )
+    semantic_native_declared = sum(
+        1
+        for rel in semantic_edges
+        if _relationship_edge_key(rel) in native_keys
+        and _relationship_edge_key(rel) not in test_keys
+    )
     relationship_conflicts = _declared_relationship_conflicts(declared)
     rels, confirmed = _merge_relationships(declared, inferred)
 
@@ -1418,7 +1431,12 @@ def relationships(
     notes.extend(native_edge_notes)
     notes.extend(semantic_edge_notes)
     notes.extend(
-        _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
+        _semantic_join_notes(
+            semantic_edges,
+            semantic_test_declared,
+            inferred,
+            native_already_declared=semantic_native_declared,
+        )
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
     notes.extend(defs.notes)
@@ -2851,15 +2869,28 @@ def map(
     declared_notes.extend(
         _declaration_join_notes(declaration_edges, declaration_already_declared)
     )
+    test_keys = {_relationship_edge_key(rel) for rel in declared}
     native_edges, native_edge_notes = _native_semantic_edges(
         engine,
         use_project,
         identifiers,
         use_hosted_semantic_layer=use_hosted_semantic_layer,
     )
+    native_keys = {_relationship_edge_key(rel) for rel in native_edges}
     declared, _native_already_declared = _fold_semantic_edges(declared, native_edges)
     semantic_edges, semantic_edge_notes = _semantic_edges(catalog, identifiers)
-    declared, semantic_already_declared = _fold_semantic_edges(declared, semantic_edges)
+    declared, _semantic_already_declared = _fold_semantic_edges(
+        declared, semantic_edges
+    )
+    semantic_test_declared = sum(
+        1 for rel in semantic_edges if _relationship_edge_key(rel) in test_keys
+    )
+    semantic_native_declared = sum(
+        1
+        for rel in semantic_edges
+        if _relationship_edge_key(rel) in native_keys
+        and _relationship_edge_key(rel) not in test_keys
+    )
     relationship_conflicts = _declared_relationship_conflicts(declared)
     relationship_set, confirmed = _merge_relationships(declared, inferred)
 
@@ -3078,7 +3109,12 @@ def map(
     notes.extend(native_edge_notes)
     notes.extend(semantic_edge_notes)
     notes.extend(
-        _semantic_join_notes(semantic_edges, semantic_already_declared, inferred)
+        _semantic_join_notes(
+            semantic_edges,
+            semantic_test_declared,
+            inferred,
+            native_already_declared=semantic_native_declared,
+        )
     )
     notes.extend(_relationship_conflict_notes(relationship_conflicts))
     for ident, err in profile_errors:
@@ -4860,7 +4896,11 @@ def _declaration_join_notes(
 
 
 def _semantic_join_notes(
-    semantic: list[Relationship], already_declared: int, inferred: list[Relationship]
+    semantic: list[Relationship],
+    already_declared: int,
+    inferred: list[Relationship],
+    *,
+    native_already_declared: int = 0,
 ) -> list[str]:
     """What the declared entity graph added, and specifically what it rescued.
 
@@ -4894,6 +4934,11 @@ def _semantic_join_notes(
         notes.append(
             f"{already_declared} of them are also declared by a relationships "
             "test; counted once"
+        )
+    if native_already_declared:
+        notes.append(
+            f"{native_already_declared} of them are also declared by the "
+            "layer's own relationships; counted once"
         )
     return notes
 

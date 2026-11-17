@@ -2836,6 +2836,53 @@ def test_an_edge_inference_also_found_is_not_reported_as_rescued():
     assert not any("not found by name-based" in note for note in notes)
 
 
+def test_semantic_join_notes_attributes_native_layer_when_no_dbt_tests():
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    notes = _semantic_join_notes(semantic, 0, [], native_already_declared=1)
+
+    assert any(
+        "1 of them are also declared by the layer's own relationships; counted once"
+        in note
+        for note in notes
+    )
+    assert not any("relationships test" in note for note in notes)
+
+
+def test_semantic_join_notes_attributes_relationships_test_when_declared_by_test():
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    notes = _semantic_join_notes(semantic, 1, [], native_already_declared=0)
+
+    assert any(
+        "1 of them are also declared by a relationships test; counted once" in note
+        for note in notes
+    )
+    assert not any("the layer's own relationships" in note for note in notes)
+
+
+def test_semantic_join_notes_distinguishes_both_sources():
+    semantic, _ = semantic_relationships(
+        [_join()], ["wh.main.orders", "wh.main.customers"]
+    )
+
+    notes = _semantic_join_notes(semantic, 1, [], native_already_declared=2)
+
+    assert any(
+        "1 of them are also declared by a relationships test; counted once" in note
+        for note in notes
+    )
+    assert any(
+        "2 of them are also declared by the layer's own relationships; counted once"
+        in note
+        for note in notes
+    )
+
+
 # --- issue #719: cross-namespace inference and orphan scaling -----------------
 
 
