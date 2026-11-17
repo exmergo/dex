@@ -79,6 +79,24 @@ WINDOW_CHOICE = "max"
 #: dimension's ``time_granularity``.
 _GRANULARITIES = ("day", "week", "month", "quarter", "year")
 
+#: MetricFlow's time granularities (``TimeGranularity``), which no entity,
+#: dimension or measure may be named, in any case.
+_RESERVED_NAMES = frozenset(
+    {
+        "nanosecond",
+        "microsecond",
+        "millisecond",
+        "second",
+        "minute",
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year",
+    }
+)
+
 #: Layer prefixes stripped from a model name when it names an entity.
 _LAYER_PREFIX = re.compile(r"^(fct|fact|dim|mart|marts)_", re.IGNORECASE)
 
@@ -413,9 +431,39 @@ def derive(
     if meta:
         body["config"] = {"meta": {DEX_META_KEY: meta}}
     derivation.body = body
+    reserved = [
+        f"{element.get('expr', element['name'])}: the {kind} would be named "
+        f"'{element['name']}', a time granularity MetricFlow reserves, so dbt cannot "
+        "parse it. Rename the output column, or name the "
+        f"{kind} '{semantic_model_name}_{element['name']}' with "
+        f"`expr: {element.get('expr', element['name'])}`"
+        + (
+            ", point `defaults.agg_time_dimension`"
+            + (
+                " and each semi_additive measure's `non_additive_dimension.name`"
+                if any("non_additive_dimension" in m for m in measures)
+                else ""
+            )
+            + " at it,"
+            if kind == "dimension" and element["name"] == agg_time
+            else ""
+        )
+        + " and pass the definition to `semantic plan --definitions-file`"
+        for kind, elements in (
+            ("entity", entities),
+            ("dimension", dimensions),
+            ("measure", measures),
+        )
+        for element in elements
+        if element["name"].lower() in _RESERVED_NAMES
+    ]
+    limitations.extend(reserved)
     if primary is None:
         derivation.status = "failed"
         derivation.blocked = limitations[0]
+    elif reserved:
+        derivation.status = "failed"
+        derivation.blocked = "; ".join(reserved)
     notes.append(
         "metrics are not derived: a measure is what a column holds, a metric is a "
         "business definition, and that stays the author's"

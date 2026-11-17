@@ -60,6 +60,42 @@ def test_a_composite_grain_names_the_limitation_and_guesses_no_primary_entity():
     assert "primary_entity" in found.blocked
 
 
+def test_a_column_named_for_a_time_granularity_fails_with_the_fix_named():
+    found = _derive(_declared(year={"role": "dimension"}))
+
+    assert found.status == "failed"
+    assert found.blocked.startswith("year: the dimension would be named 'year'")
+    assert "`expr: year`" in found.blocked
+    assert "'fct_orders_year'" in found.blocked
+    (warning,) = sd._warnings([found])
+    assert "year: the dimension would be named 'year'" in warning
+    assert "Encountered an error" not in warning
+
+
+def test_a_reserved_time_column_also_names_the_references_to_repoint():
+    found = _derive(_declared(month={"role": "time"}))
+
+    assert found.status == "failed"
+    assert found.blocked.startswith("month: the dimension would be named 'month'")
+    assert "`defaults.agg_time_dimension`" in found.blocked
+    assert "non_additive_dimension" not in found.blocked
+
+    semi = _derive(
+        _declared(
+            month={"role": "time"},
+            balance={
+                "role": "measure",
+                "aggregation": "sum",
+                "additivity": "semi_additive",
+            },
+        )
+    )
+
+    assert semi.status == "failed"
+    assert "`defaults.agg_time_dimension`" in semi.blocked
+    assert "`non_additive_dimension.name`" in semi.blocked
+
+
 def test_a_foreign_key_takes_the_entity_name_its_parent_already_declares():
     on_ref = {
         "dim_customers": [
