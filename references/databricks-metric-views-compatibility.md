@@ -286,8 +286,9 @@ LIMIT 51
 - The deployed view is found by its file's stem among the Metric Views the
   source allowlist holds, with a warehouse-free Unity Catalog listing: one defined
   only in the repository is refused, and one in two allowlisted schemas is
-  refused until `--scope` narrows it. Its definition is not yet compared with the
-  file (#1363), and every result says so.
+  refused until `--scope` narrows it.
+- The deployed view is then read back and held to the file (#1363), before
+  anything is priced or run. See "The deployed views" below.
 - Databricks keeps no size for a Metric View, so the statement is priced from the
   base tables the request reaches (the view's `source`, every table a query
   source reads, and each join a member reads through), with the startup floor
@@ -296,6 +297,57 @@ LIMIT 51
   repository file, so one only the deployed definition reads is neither priced
   nor refused until #1363.
 - Any other connector is refused by name.
+
+## The deployed views
+
+Dex never deploys a Metric View, and it reads one back only when a command needs
+it: a governed `query` or `values`, or `explore semantic list --deployed`. A plain
+`list`, and every authoring and `maintain` command, reads the repository's files
+and never contacts Databricks.
+
+**Reading back.** The views are listed with the Unity Catalog REST API
+(`tables.list`, `table_type = METRIC_VIEW`) over the source allowlist, which
+`--scope` can narrow and never widen, and each one is read back with
+`tables.get`, whose `view_definition` holds the YAML body. Neither call touches
+a SQL warehouse. A body handed back inside its `CREATE VIEW ... AS $$ ... $$`
+statement is read between the delimiters. The text is validated by the reader a
+file goes through, so a view re-saved in a spec version other than `1.1` is
+refused, named.
+
+**`list --deployed`** answers with the views deployed from the configured files
+instead of the files. The catalog says `source: deployed`, and `coverage` names,
+per view, where it is deployed and how it was read:
+
+| Coverage | When |
+|---|---|
+| `full` | the read-back validated whole |
+| `limited` | the read-back validated with some elements refused by the reader; they are named in `reasons` and missing from the catalog |
+| `refused` | not deployed, deployed in two allowlisted schemas, or not readable: the identity was refused, it can browse the view and is not shown its `view_definition`, or the read-back does not validate (another spec version, for one) |
+
+A read-back is named after the file it was deployed from, so its tokens line up
+with the repository's. A refused view is not in the catalog, and a note says
+coverage is not full, so a partial read is never presented as the layer.
+
+**The stale-definition check.** Before a governed query is rendered, dex holds
+what it relies on, as deployed, to the repository's file:
+
+- the view's `source` (a query source's SQL included) and `filter`, and whether
+  it declares a `materialization` or `parameters`;
+- each field and measure the query names, and every field or measure it reads,
+  followed transitively (a bare field name, `MEASURE()`), compared by
+  expression, kind, `window` and `partition`;
+- a field's `format.type`, where a grain buckets it;
+- every join those expressions reach, with its ancestors: `source`, `on` or
+  `using`, `cardinality` and `rely.at_most_one_match`.
+
+Expressions are compared as parsed Databricks SQL with identifiers folded, and
+the YAML as parsed values, so reserialization, key order, whitespace and case are
+not differences; neither are a `comment`, a `display_name`, `synonyms` or a
+`format` no grain reads. The first differences refuse the query, naming the
+member and the field (`orders.revenue has a different expr there`). A
+deployment that cannot be read back refuses it too, with the coverage reason. A
+query that reads nothing that changed still runs, and its result says the
+definition was read back and matches the file.
 
 ## What `maintain` makes of the layer
 
@@ -355,6 +407,14 @@ A Metric View already deployed in the connector's source scope is not a
 relation Dex reads: Databricks refuses a plain `SELECT` of its measure columns,
 so the Databricks connector leaves Unity Catalog objects of type `METRIC_VIEW`
 out of its inventory. The view's YAML in the repository is what Dex reads.
+
+**The repository against the deployment is not drift.** `maintain` compares the
+repository's files with the baseline it accepted, never with the workspace. A
+deployed view that differs from its file is reported where it is used: the
+governed query refuses, naming the member and the field, and `list --deployed`
+is how to look at the deployed copy. Neither writes a baseline nor raises a
+drift finding, so accepting a change into the baseline and redeploying it stay
+two separate, reviewable steps.
 
 ## The Ossie bridge
 

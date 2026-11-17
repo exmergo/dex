@@ -114,7 +114,7 @@ def test_a_measure_by_field_runs_through_dex_s_connector(tmp_path, capsys, works
     )
     notes = " ".join(data["notes"])
     assert "deployed as shop.metrics.orders" in notes
-    assert "#1363" in notes, "the unmade definition check is said, never implied"
+    assert "read back from Unity Catalog and matches the file" in notes
 
 
 def test_the_view_filter_is_databricks_and_not_repeated(tmp_path, capsys, workspace):
@@ -433,6 +433,7 @@ def test_a_view_deployed_twice_is_refused_and_scope_narrows_it(
 
 def test_a_base_table_outside_the_allowlist_is_refused(tmp_path, capsys, monkeypatch):
     holder = route_to_fake_workspace(monkeypatch)
+    holder["workspace"] = Workspace(definitions={"shop.metrics.orders": ELSEWHERE})
     root = _repo(tmp_path, orders=ELSEWHERE)
     envelope = _query(capsys, root, "orders.entries")
 

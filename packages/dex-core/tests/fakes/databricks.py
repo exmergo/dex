@@ -48,6 +48,11 @@ class FakeDatabricksTable:
     rows: int | None = 0
     bytes: int = 0
     kind: str = "table"
+    # What `tables.get` hands back as `view_definition` (a Metric View's YAML
+    # body), and, where set, the error it raises instead: an identity refused
+    # the read (#1363). None for a definition the identity is not shown.
+    view_definition: str | None = None
+    get_error: str | None = None
 
     @property
     def identifier(self) -> str:
@@ -189,6 +194,8 @@ class FakeWorkspaceClient:
         self.metadata_calls.append(f"tables.get:{full_name}")
         for t in self._tables:
             if t.identifier == full_name:
+                if t.get_error is not None:
+                    raise PermissionError(t.get_error)
                 return self._table_info(t, with_columns=True)
         raise KeyError(f"table not found: {full_name}")
 
@@ -219,6 +226,7 @@ class FakeWorkspaceClient:
                 t.kind, "MANAGED"
             ),
             columns=columns,
+            view_definition=t.view_definition,
         )
 
 

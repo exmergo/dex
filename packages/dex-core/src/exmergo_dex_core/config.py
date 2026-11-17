@@ -639,8 +639,9 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     "cube": ("local",),
     # Databricks Unity Catalog Metric Views: the Metric View YAML bodies committed
     # here, read statically. A governed query finds the view deployed from a file
-    # by its stem and runs on it (#1362); dex never writes a deployed view, and
-    # reading one back to hold it to the file is #1363.
+    # by its stem (#1362), reads it back from Unity Catalog and holds it to the
+    # file before it runs (#1363); `list --deployed` reads the deployed views on
+    # request. dex never writes a deployed view.
     "databricks": ("local",),
     # Snowflake Semantic Views. `local` is the Semantic View YAML documents
     # committed here, read statically; a governed query reads back the view it
