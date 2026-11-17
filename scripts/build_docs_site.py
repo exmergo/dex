@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-"""Build the Dex section of the documentation site from the repository.
+"""Build the Dex documentation site from the repository.
 
 Usage:
     uv run --project packages/dex-core python scripts/build_docs_site.py \
-        [--out DIR] [--release vX.Y.Z] [--require-help] [--site DOCS_CHECKOUT] \
+        [--out DIR] [--release vX.Y.Z] [--require-help] \
         [--latest vX.Y.Z] [--archive vX.Y.Z=DIR ...]
 
-docs.exmergo.com is served from exmergo/docs, which owns the site's settings and
-home page; each product publishes one folder of it. This script builds the Dex
-folder, `dex/`, served at docs.exmergo.com/dex: every page, plus the menu
-(`dex/navigation.json`) and redirects (`dex/redirects.json`) that exmergo/docs's
-`docs.json` reads with `$ref`. With `--site`, it writes the whole site instead:
-that exmergo/docs checkout with this section in place of its `dex/`, which is
-what CI validates and `mint dev` previews.
+docs.trydex.ai is a Mintlify site of its own. This script builds all of it:
+every page at the root of the output, and the `docs.json` that holds the site's
+settings, menu and redirects. The output is what CI validates, what `mint dev`
+previews, and what the release workflow publishes to the `docs-site` branch that
+Mintlify deploys from.
 
 It reads four sources and writes nothing back into the repository:
 
-  - `docs/`: hand-written pages, and the section's navigation and redirects
-    (`section.json`).
+  - `docs/`: hand-written pages, assets, and the site's settings, navigation and
+    redirects (`docs.json`).
   - `references/`: the canonical reference documents, each published at the
     route the mapping below gives it.
   - the CLI parser: one reference page per command group, rendered from the
@@ -26,8 +24,10 @@ It reads four sources and writes nothing back into the repository:
 
 With `--archive`, older minor releases stay readable beside the latest one, in a
 version switcher: latest at the routes it has always had, and each archive under
-its label (`/dex/v1.14/...`). An archive is the `dex/` folder that release's own
-script built from its own tag, so it shows exactly what was published for it.
+its label (`/v1.14/...`). An archive is what that release's own script built from
+its own tag, so it shows exactly what was published for it: a whole site, or for
+a release from before the site stood alone, the `dex/` folder it built for
+docs.exmergo.com, whose `/dex` routes are moved under the label.
 
 `references/` stays the one place a fact changes. The pages it publishes are
 transformed copies (MDX escaping, links rewritten to site routes, the H1 lifted
@@ -45,7 +45,7 @@ is read on GitHub too and a link must work there. Mintlify derives heading IDs
 differently for a few headings (a `/` or an apostrophe in the text, and
 repeated headings), so CI also runs `mint broken-links --check-anchors` on the
 output; an anchor has to resolve on both hosts. On Windows that command reports
-every link to a page two folders deep (`/dex/connectors/bigquery`) as broken: it
+every link to a page in a folder (`/connectors/bigquery`) as broken: it
 compares a link's `/`-separated folder with the `\\`-separated one Windows gives
 it. Trust its result on Linux, which is what CI runs.
 """
@@ -71,21 +71,23 @@ sys.path.insert(0, str(REPO_ROOT / "packages" / "dex-core" / "src"))
 
 REPOSITORY = "exmergo/dex"
 GITHUB = f"https://github.com/{REPOSITORY}"
-SITE = "https://docs.exmergo.com"
-# The site is shared: exmergo/docs owns docs.exmergo.com and its settings, and
-# each product repository publishes one section of it. This repository's section
-# is the dex/ folder, served at docs.exmergo.com/dex.
-SECTION = "dex"
-SECTION_CONFIG = "section.json"
+SITE = "https://docs.trydex.ai"
+# The site's settings, menu and redirects, in docs/: the `docs.json` the build
+# writes is this file with the menu and redirects completed.
+SITE_CONFIG = "docs.json"
+# Before docs.trydex.ai, the docs were a section of the shared docs.exmergo.com,
+# served under /dex. An archive built by a release from then is that section's
+# folder, and its menu and links carry this prefix.
+LEGACY_SECTION = "dex"
 DESCRIPTION_LENGTH = range(140, 161)
 CHANGELOG_RELEASES = 10
 DEFAULT_OUT = REPO_ROOT / "build" / "docs-site"
 
-# The first line of the README written into the section of every build. `write`
-# recognizes a previous build by it (at <out>/dex/README.md) and refuses to clear
-# any directory that lacks it. In exmergo/docs the same file tells a reader the
-# folder is generated.
-OUT_MARKER = "# Generated documentation section"
+# The first line of the README written at the root of every build. `write`
+# recognizes a previous build by it (at <out>/README.md) and refuses to clear any
+# directory that lacks it. On the docs-site branch the same file tells a reader
+# the branch is generated.
+OUT_MARKER = "# Generated documentation site"
 
 # Components a hand-written page may use. Anything else that opens with `<` in
 # prose is a typo or raw HTML, and Mintlify would either reject it or render it
@@ -886,9 +888,9 @@ def render_cli_reference(
 ) -> tuple[dict[str, str], list[str]]:
     """Render the CLI reference: an overview page plus one page per group.
 
-    `base` is the route the pages sit under (`/dex`), which every link between
-    them carries. Returns ({page id: MDX body}, gaps), where each gap names a
-    subcommand or an argument that carries no help text.
+    `base` is the route the pages sit under, empty at the site's root, which
+    every link between them carries. Returns ({page id: MDX body}, gaps), where
+    each gap names a subcommand or an argument that carries no help text.
     """
 
     gaps: list[str] = []
@@ -1102,32 +1104,15 @@ def _navigation_pages(node: Any) -> list[str]:
     return []
 
 
-def _prefix_pages(node: Any, prefix: str) -> Any:
-    """A navigation tree with every page id moved under `prefix`.
+def _relocate_pages(node: Any, label: str) -> Any:
+    """An archived navigation tree with every page id moved into `<label>/`.
 
-    Sources name pages as the section sees them (`connectors/bigquery`); the
-    shared site names them by their path in exmergo/docs (`dex/connectors/bigquery`).
+    A legacy archive names its pages by their path in docs.exmergo.com
+    (`dex/connectors/bigquery`), so that prefix gives way to the label.
     """
 
     if isinstance(node, str):
-        return prefix + node
-    if isinstance(node, list):
-        return [_prefix_pages(item, prefix) for item in node]
-    if isinstance(node, dict):
-        return {
-            key: _prefix_pages(value, prefix)
-            if key in ("tabs", "groups", "pages", "anchors", "dropdowns")
-            else value
-            for key, value in node.items()
-        }
-    return node
-
-
-def _relocate_pages(node: Any, label: str) -> Any:
-    """An archived navigation tree with every page id moved into `dex/<label>/`."""
-
-    if isinstance(node, str):
-        return f"{SECTION}/{label}/{node.removeprefix(f'{SECTION}/')}"
+        return f"{label}/{node.removeprefix(f'{LEGACY_SECTION}/')}"
     if isinstance(node, list):
         return [_relocate_pages(item, label) for item in node]
     if isinstance(node, dict):
@@ -1152,24 +1137,28 @@ def _minor(release: str) -> str:
     return ".".join(release.split(".")[:2])
 
 
-#: A link to a route of this section, in Markdown or in a component's `href`.
-#: An archived page's links are moved into its own version, so a reader who
-#: picked v1.14 stays in v1.14 as they follow them.
-SECTION_LINK = re.compile(r'(\]\(|href=")/' + SECTION + r'(?=[/#)"])')
+#: A link to a route of the site, in Markdown or in a component's `href`. An
+#: archived page's links are moved into its own version, so a reader who picked
+#: v1.14 stays in v1.14 as they follow them. A legacy archive's links start with
+#: /dex, which the label replaces; a whole site's start at the root.
+LEGACY_LINK = re.compile(r'(\]\(|href=")/' + LEGACY_SECTION + r'(?=[/#)"])')
+ROOT_LINK = re.compile(r'(\]\(|href=")/(?!/)')
 
 
 @dataclass(frozen=True)
 class Archive:
-    """An older minor release's section, readable beside the latest one.
+    """An older minor release's docs, readable beside the latest one.
 
-    `path` is the `dex/` folder that release's own `build_docs_site.py` wrote
-    from its own tag, so an archive shows exactly what was published for it.
+    `path` is what that release's own `build_docs_site.py` wrote from its own
+    tag, so an archive shows exactly what was published for it: a whole site
+    (with its `docs.json`), or the `dex/` folder a release from before
+    docs.trydex.ai built for docs.exmergo.com (with its `navigation.json`).
     Nothing is stored between releases: CI rebuilds every archive on each run,
     which is also what drops a minor release once it falls out of range.
 
     `release` is the exact tag it was built from, which its pages' notice
     names; the menu, its folder and its route use that release's minor, so a
-    link to `/dex/v1.14/` survives a patch release.
+    link to `/v1.14/` survives a patch release.
     """
 
     release: str
@@ -1178,6 +1167,21 @@ class Archive:
     @property
     def label(self) -> str:
         return _minor(self.release)
+
+    @property
+    def legacy(self) -> bool:
+        """Whether this is a docs.exmergo.com section rather than a whole site."""
+
+        return not (self.path / SITE_CONFIG).is_file()
+
+    def menu(self) -> dict[str, Any] | None:
+        """The archive's own navigation tree, or None when it has none."""
+
+        path = self.path / ("navigation.json" if self.legacy else SITE_CONFIG)
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if self.legacy else data.get("navigation")
 
 
 def _json(value: Any) -> str:
@@ -1197,9 +1201,9 @@ def _frontmatter(text: str) -> tuple[dict[str, Any], str, int]:
     return data, body, text.count("\n", 0, end + 5) + 1
 
 
-#: Appended to the title a shared link shows. The site's name is Exmergo, which
-#: Mintlify appends to the browser title; a link to a Dex page should also say
-#: which product it is about, and "dex" alone is a crowded word to search for.
+#: Appended to the title a shared link shows. Mintlify appends the site's name,
+#: Dex, to the browser title, but "dex" alone is a crowded word to search for,
+#: so a shared link also names the company.
 SOCIAL_TITLE_SUFFIX = " · Exmergo Dex"
 
 
@@ -1274,27 +1278,21 @@ class SiteBuilder:
 
     @staticmethod
     def route_for(page: str) -> str:
-        """The site route of a page in this section: `/dex/connectors/bigquery`."""
+        """The site route of a page: `/connectors/bigquery`, and `/` for the home."""
 
-        return f"/{SECTION}" if page == "index" else f"/{SECTION}/{page}"
+        return "/" if page == "index" else f"/{page}"
 
     def _section_page(self, route: str) -> str | None:
-        """The page a route names, when it is inside this section."""
+        """The page a site route names, or None for anything but a route."""
 
+        if not route.startswith("/"):
+            return None
         path = route.split("#")[0].rstrip("/")
-        if path == f"/{SECTION}":
-            return "index"
-        if path.startswith(f"/{SECTION}/"):
-            return path[len(SECTION) + 2 :]
-        return None
+        return path[1:] or "index"
 
     def _route_exists(self, route: str) -> bool:
-        """Whether a route resolves. The site home (`/`) belongs to exmergo/docs
-        and always exists; any other route outside this section is unknown here,
-        so it does not resolve."""
+        """Whether a route resolves to a page this build writes."""
 
-        if route.split("#")[0] in ("", "/"):
-            return True
         page = self._section_page(route)
         return page is not None and page in self.pages
 
@@ -1382,14 +1380,14 @@ class SiteBuilder:
         self.pages[page.page] = page
 
     def _collect_config(self) -> None:
-        """Read `docs/section.json`: this section's navigation and redirects.
+        """Read `docs/docs.json`: the site's settings, navigation and redirects.
 
-        The site's own settings (name, theme, colours, navbar, analytics) live in
-        exmergo/docs, so nothing here can change them for every product at once.
+        Its menu and redirects are completed by the build; every other setting
+        (name, theme, colours, navbar, analytics) is published as written.
         """
 
-        path = self.docs_dir / SECTION_CONFIG
-        source = f"docs/{SECTION_CONFIG}"
+        path = self.docs_dir / SITE_CONFIG
+        source = f"docs/{SITE_CONFIG}"
         if not path.is_file():
             self.problems.append(Problem(source, 1, "missing"))
             return
@@ -1398,16 +1396,8 @@ class SiteBuilder:
         except json.JSONDecodeError as exc:
             self.problems.append(Problem(source, exc.lineno, exc.msg))
             return
-        unexpected = sorted(set(self.config) - {"navigation", "redirects"})
-        if unexpected:
-            self.problems.append(
-                Problem(
-                    source,
-                    1,
-                    f"holds {', '.join(unexpected)}; a section carries only its "
-                    "navigation and redirects, and site settings live in exmergo/docs",
-                )
-            )
+        if "navigation" not in self.config:
+            self.problems.append(Problem(source, 1, "has no navigation"))
 
     def _collect_hand_written(self) -> None:
         if not self.docs_dir.is_dir():
@@ -1416,7 +1406,7 @@ class SiteBuilder:
             if not path.is_file():
                 continue
             rel = path.relative_to(self.docs_dir).as_posix()
-            if rel == SECTION_CONFIG:
+            if rel == SITE_CONFIG:
                 continue
             if path.suffix == ".mdx" and not rel.startswith("snippets/"):
                 text = path.read_text(encoding="utf-8")
@@ -1499,7 +1489,6 @@ class SiteBuilder:
             self.parser_factory(),
             self.shared_options_factory(),
             group_order=self.group_order_factory(),
-            base=f"/{SECTION}",
         )
         if self.require_help:
             self.problems += [
@@ -1534,17 +1523,16 @@ class SiteBuilder:
     def redirects(self) -> list[dict[str, str]]:
         """The configured redirects plus one per reference file path.
 
-        A repository path pasted after the section (`/dex/references/storage.md`)
-        lands on the page it became. Every source is inside the section, because
-        the rest of the site's routes belong to exmergo/docs and to other products.
+        A repository path pasted after the host (`/references/storage.md`) lands
+        on the page it became.
         """
 
         generated = [
             {"source": source, "destination": self.route_for(ref.page)}
             for ref in self.reference_pages
             for source in (
-                f"/{SECTION}/references/{ref.source.removesuffix('.md')}",
-                f"/{SECTION}/references/{ref.source}",
+                f"/references/{ref.source.removesuffix('.md')}",
+                f"/references/{ref.source}",
             )
         ]
         return [*self.config.get("redirects", []), *generated]
@@ -1620,25 +1608,19 @@ class SiteBuilder:
                             page.source,
                             number,
                             f"links to {target}; pages under docs/ link by "
-                            f"site route, such as /{SECTION}/guardrails/cost-controls",
+                            "site route, such as /guardrails/cost-controls",
                         )
                     )
                     continue
                 inside = self._section_page(target)
                 asset = inside is not None and (self.docs_dir / inside).is_file()
                 if not self._route_exists(target) and not asset:
-                    why = (
-                        "not a page"
-                        if inside is not None
-                        else f"outside the /{SECTION} section; link to another part "
-                        f"of the site by its full {SITE} URL"
-                    )
                     self.problems.append(
-                        Problem(page.source, number, f"links to {target}, {why}")
+                        Problem(page.source, number, f"links to {target}, not a page")
                     )
 
     def _validate_navigation(self) -> None:
-        config = f"docs/{SECTION_CONFIG}"
+        config = f"docs/{SITE_CONFIG}"
         navigation = _navigation_pages(self.config.get("navigation", {}))
         seen: set[str] = set()
         for page in navigation:
@@ -1657,25 +1639,23 @@ class SiteBuilder:
                 Problem(
                     self.pages[page].source,
                     1,
-                    f"builds {self.route_for(page)}, which is not in the section's "
+                    f"builds {self.route_for(page)}, which is not in the site's "
                     "navigation",
                 )
             )
 
     def _validate_redirects(self) -> None:
-        config = f"docs/{SECTION_CONFIG}"
+        config = f"docs/{SITE_CONFIG}"
         for redirect in self.redirects():
             source, destination = redirect["source"], redirect["destination"]
             if self._section_page(source) is None:
                 self.problems.append(
-                    Problem(
-                        config,
-                        1,
-                        f"redirect source {source} is outside /{SECTION}; the rest "
-                        "of the site's routes belong to exmergo/docs",
-                    )
+                    Problem(config, 1, f"redirect source {source} is not a route")
                 )
-            if not self._route_exists(destination):
+            # A wildcard (`/dex/:slug*`) names many pages, which `mint
+            # broken-links --check-redirects` resolves; only a fixed
+            # destination is one this build can check.
+            if ":" not in destination and not self._route_exists(destination):
                 self.problems.append(
                     Problem(config, 1, f"redirect {source} goes to a missing page")
                 )
@@ -1705,10 +1685,6 @@ class SiteBuilder:
             for number, line in enumerate(text.splitlines(), start=1):
                 for match in pattern.finditer(line):
                     route = (match.group(1) or "/").split("#")[0].rstrip(".,;:")
-                    # Only this section's routes are checkable here; the rest of
-                    # the site is exmergo/docs's to answer for.
-                    if self._section_page(route) is None:
-                        continue
                     if not self._route_exists(route):
                         self.problems.append(
                             Problem(
@@ -1725,22 +1701,21 @@ class SiteBuilder:
         """Every text file the build emits, keyed by its path in the output."""
 
         files = {
-            f"{SECTION}/{page.page}.mdx": _render_page(
+            f"{page.page}.mdx": _render_page(
                 {**page.meta, **_social_titles(page)}, page.body
             )
             for page in self.pages.values()
         }
-        # The two files exmergo/docs's docs.json reads with `$ref`, so this
-        # section owns its own menu and redirects without editing the shared file.
-        navigation = _prefix_pages(self.config.get("navigation", {}), f"{SECTION}/")
+        navigation = self.config.get("navigation", {})
         if self.archives:
             navigation = self.versioned_navigation(navigation)
-        files[f"{SECTION}/navigation.json"] = _json(navigation)
-        files[f"{SECTION}/redirects.json"] = _json(self.redirects())
-        files[f"{SECTION}/README.md"] = (
+        files[SITE_CONFIG] = _json(
+            {**self.config, "navigation": navigation, "redirects": self.redirects()}
+        )
+        files["README.md"] = (
             f"{OUT_MARKER}\n\n"
             f"Built by `scripts/build_docs_site.py` in {GITHUB} at `{self.ref}`,\n"
-            f"and published here by its release workflow. Do not edit this folder:\n"
+            "and published here by its release workflow. Do not edit this branch:\n"
             "every release replaces it. Change `docs/`, `references/`,\n"
             f"`CHANGELOG.md` or the CLI in {GITHUB} instead.\n"
         )
@@ -1749,7 +1724,7 @@ class SiteBuilder:
     # Versions ----------------------------------------------------------------
 
     def versioned_navigation(self, navigation: dict[str, Any]) -> dict[str, Any]:
-        """The section's menu with a version switcher: latest, then each archive.
+        """The site's menu with a version switcher: latest, then each archive.
 
         Latest keeps the routes it has always had, so every link already shared
         still lands on the current docs; an archive lives under its label.
@@ -1771,10 +1746,9 @@ class SiteBuilder:
             }
         ]
         for archive in self.archives:
-            path = archive.path / "navigation.json"
-            if not path.is_file():
+            menu = archive.menu()
+            if menu is None:
                 continue  # reported by _validate_archives
-            menu = json.loads(path.read_text(encoding="utf-8"))
             versions.append(
                 {"version": archive.label, **body(_relocate_pages(menu, archive.label))}
             )
@@ -1789,25 +1763,30 @@ class SiteBuilder:
         search always lands on the latest docs, and a notice at the top names the
         release and links to the latest docs, since a reader who arrives from an
         old link never saw the version menu. Each archive's own menu is folded
-        into the section's, and its redirects and README are left behind.
+        into the site's, and its settings, redirects and README are left behind.
         """
 
         files: dict[str, bytes] = {}
         for archive in self.archives:
+            link = LEGACY_LINK if archive.legacy else ROOT_LINK
+            replacement = (
+                rf"\1/{archive.label}" if archive.legacy else rf"\1/{archive.label}/"
+            )
             for source in sorted(archive.path.rglob("*")):
                 rel = source.relative_to(archive.path).as_posix()
                 if not source.is_file() or rel in {
+                    SITE_CONFIG,
                     "navigation.json",
                     "redirects.json",
                     "README.md",
                 }:
                     continue
-                name = f"{SECTION}/{archive.label}/{rel}"
+                name = f"{archive.label}/{rel}"
                 if source.suffix != ".mdx":
                     files[name] = source.read_bytes()
                     continue
                 text = source.read_text(encoding="utf-8")
-                text = SECTION_LINK.sub(rf"\1/{SECTION}/{archive.label}", text)
+                text = link.sub(replacement, text)
                 notice = self._archive_notice(archive, rel.removesuffix(".mdx"))
                 if text.startswith("---\n"):
                     end = text.find("\n---\n", 4)
@@ -1820,7 +1799,7 @@ class SiteBuilder:
 
     def _archive_notice(self, archive: Archive, page: str) -> str:
         """The callout an archived page opens with: which release it shows, and
-        the same page in the latest docs, or the section's home where the latest
+        the same page in the latest docs, or the site's home where the latest
         release no longer has it."""
 
         target = self.route_for(page if page in self.pages else "index")
@@ -1848,15 +1827,16 @@ class SiteBuilder:
                 self.problems.append(
                     Problem(where, 1, f"{archive.label} is listed more than once")
                 )
-            menu = archive.path / "navigation.json"
-            if not menu.is_file():
+            menu = archive.menu()
+            if menu is None:
                 self.problems.append(
-                    Problem(where, 1, f"{archive.path} holds no built section")
+                    Problem(where, 1, f"{archive.path} holds no built site")
                 )
                 continue
-            pages = _navigation_pages(json.loads(menu.read_text(encoding="utf-8")))
-            for page in pages:
-                rel = page.removeprefix(f"{SECTION}/")
+            for page in _navigation_pages(menu):
+                rel = (
+                    page.removeprefix(f"{LEGACY_SECTION}/") if archive.legacy else page
+                )
                 if not (archive.path / f"{rel}.mdx").is_file():
                     self.problems.append(
                         Problem(where, 1, f"its menu lists {page}, which it lacks")
@@ -1888,29 +1868,19 @@ class SiteBuilder:
                     line = text.count("\n", 0, match.start()) + 1
                     self.problems.append(Problem(f"(built) {name}", line, why))
 
-    def write(self, out: Path, site: Path | None = None) -> list[str]:
-        """Write the section to `out/dex/`.
+    def write(self, out: Path) -> list[str]:
+        """Write the whole site to `out`, which `mint dev` previews from."""
 
-        With `site`, a checkout of exmergo/docs, `out` becomes the whole site:
-        that checkout's files with this section in place of its `dex/`, which is
-        what CI validates and what `mint dev` previews.
-        """
-
-        # A checkout of exmergo/docs carries the same marker in its dex/ folder,
-        # so the marker alone would let `--out ../docs` clear a real repository,
-        # history included. Refuse any git checkout, and the site itself.
-        if (out / ".git").exists() or (
-            site is not None and out.resolve() == site.resolve()
-        ):
+        # A checkout of the docs-site branch carries the same marker, so the
+        # marker alone would let `--out` clear a real repository, history
+        # included. Refuse any git checkout.
+        if (out / ".git").exists():
             raise SystemExit(
                 f"refusing to write into {out}: it is a git checkout. Pass --out "
-                "with a new or empty directory, and --site for the exmergo/docs "
-                "checkout to read from."
+                "with a new or empty directory."
             )
-        if site is not None and site.resolve().is_relative_to(out.resolve()):
-            raise SystemExit(f"refusing to write into {out}: it contains --site {site}")
         if out.exists() and any(out.iterdir()):
-            readme = out / SECTION / "README.md"
+            readme = out / "README.md"
             if not (
                 readme.is_file()
                 and readme.read_text(encoding="utf-8").startswith(OUT_MARKER)
@@ -1925,17 +1895,6 @@ class SiteBuilder:
                 else:
                     child.unlink()
         out.mkdir(parents=True, exist_ok=True)
-        if site is not None:
-            root = str(site.resolve())
-
-            def skip_at_root(directory: str, names: list[str]) -> set[str]:
-                # Only the site's own .git and its copy of this section; a
-                # deeper folder that happens to be called dex/ is content.
-                if str(Path(directory).resolve()) != root:
-                    return set()
-                return {name for name in names if name in (".git", SECTION)}
-
-            shutil.copytree(site, out, ignore=skip_at_root, dirs_exist_ok=True)
         written = []
         for name, text in sorted(self.rendered().items()):
             target = out / name
@@ -1943,7 +1902,7 @@ class SiteBuilder:
             target.write_bytes(text.encode("utf-8"))
             written.append(name)
         for name, source in sorted(self.assets.items()):
-            target = out / SECTION / name
+            target = out / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             written.append(name)
@@ -1981,19 +1940,14 @@ def main(argv: list[str] | None = None) -> int:
         help="treat a CLI argument or subcommand without help text as a problem",
     )
     parser.add_argument(
-        "--site",
-        type=Path,
-        help="a checkout of exmergo/docs: write the whole site, with this section "
-        "in place of its dex/ folder, for validating and previewing",
-    )
-    parser.add_argument(
         "--archive",
         action="append",
         default=[],
         metavar="vX.Y.Z=DIR",
         help="an older minor release to keep readable: the tag it was built from "
-        "and the dex/ folder that build wrote. Repeatable, newest first; each "
-        "becomes a version in the menu, served under /dex/vX.Y/",
+        "and what that build wrote (a whole site, or the dex/ folder of a release "
+        "from before docs.trydex.ai). Repeatable, newest first; each becomes a "
+        "version in the menu, served under /vX.Y/",
     )
     parser.add_argument(
         "--latest",
@@ -2002,8 +1956,6 @@ def main(argv: list[str] | None = None) -> int:
         "defaults to --release",
     )
     args = parser.parse_args(argv)
-    if args.site is not None and not (args.site / "docs.json").is_file():
-        parser.error(f"--site {args.site} holds no docs.json")
     archives = []
     for spec in args.archive:
         release, sep, directory = spec.partition("=")
@@ -2025,7 +1977,7 @@ def main(argv: list[str] | None = None) -> int:
             print(problem, file=sys.stderr)
         print(f"\n{len(problems)} problem(s); nothing written.", file=sys.stderr)
         return 1
-    written = builder.write(args.out, site=args.site)
+    written = builder.write(args.out)
     print(
         f"Wrote {len(written)} files ({len(builder.pages)} pages) to {args.out}. "
         f"CLI help gaps: {len(builder.help_gaps)}."

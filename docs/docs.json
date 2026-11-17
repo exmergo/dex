@@ -1,7 +1,32 @@
 {
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Dex",
+  "description": "Documentation for Dex, the agent-native analytics engineering toolkit by Exmergo: explore a warehouse, transform a dbt project, and maintain it as the data changes.",
+  "colors": {
+    "primary": "#2563eb",
+    "light": "#51a2ff",
+    "dark": "#2563eb"
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "favicon": "/favicon.svg",
+  "fonts": {
+    "family": "Geist"
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "thumbnails": {
+    "appearance": "dark",
+    "background": "/images/og-background.png",
+    "fonts": {
+      "family": "Geist"
+    }
+  },
   "navigation": {
-    "product": "Dex",
-    "description": "Agent-native analytics engineering",
     "tabs": [
       {
         "tab": "Documentation",
@@ -117,14 +142,83 @@
       }
     ]
   },
+  "navbar": {
+    "links": [
+      {
+        "label": "Discord",
+        "href": "https://trydex.ai/discord?ref=docs"
+      },
+      {
+        "label": "Dex Enterprise",
+        "href": "https://trydex.ai/enterprise"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/exmergo/dex"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/exmergo/dex",
+      "x": "https://x.com/exmergo",
+      "linkedin": "https://www.linkedin.com/company/exmergo/",
+      "discord": "https://trydex.ai/discord?ref=docs",
+      "website": "https://trydex.ai"
+    }
+  },
+  "seo": {
+    "indexing": "navigable",
+    "metatags": {
+      "canonical": "https://docs.trydex.ai",
+      "og:site_name": "Dex",
+      "twitter:site": "@exmergo"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "claude",
+      "chatgpt",
+      "perplexity",
+      "mcp",
+      "add-mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "integrations": {
+    "ga4": {
+      "measurementId": "G-D0VN4G61JD"
+    }
+  },
+  "search": {
+    "prompt": "Search the Dex docs"
+  },
   "redirects": [
     {
-      "source": "/dex/cli",
-      "destination": "/dex/cli/overview"
+      "source": "/cli",
+      "destination": "/cli/overview"
     },
     {
-      "source": "/dex/reference",
-      "destination": "/dex/reference/command-contract"
+      "source": "/reference",
+      "destination": "/reference/command-contract"
+    },
+    {
+      "source": "/dex",
+      "destination": "/"
+    },
+    {
+      "source": "/dex/:slug*",
+      "destination": "/:slug*"
     }
-  ]
+  ],
+  "errors": {
+    "404": {
+      "redirect": false,
+      "title": "Page not found",
+      "description": "Search the docs, or start from the [home page](/)."
+    }
+  }
 }

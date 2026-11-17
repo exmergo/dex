@@ -12,13 +12,13 @@ backend that can execute queries.
 
 | Your project uses | Where definitions live | Read next |
 | --- | --- | --- |
-| dbt semantic models | MetricFlow YAML in the dbt project | [Semantic layer reference](/dex/semantic-layers/overview) |
-| dbt Cloud Semantic Layer | Hosted catalog and query API | [Hosted backend](/dex/semantic-layers/overview#hosted-backend-api-dbt-cloud-semantic-layer) |
-| Apache Ossie | Native YAML documents in the repository | [Ossie walkthrough](/dex/guides/ossie-semantic-layer) |
-| SLayer | Native model files in the repository | [SLayer support](/dex/semantic-layers/overview#slayer-models-vendor-slayer) |
-| Cube | Cube YAML model files in the repository | [Cube compatibility](/dex/semantic-layers/cube) |
-| Databricks Metric Views | Metric View YAML files in the repository | [Metric View compatibility](/dex/semantic-layers/databricks-metric-views) |
-| Snowflake Semantic Views | Semantic View YAML files in the repository, deployed by you; or the views deployed on the account, read alone (`deployment: snowflake_account`) | [Semantic View compatibility](/dex/semantic-layers/snowflake-semantic-views) |
+| dbt semantic models | MetricFlow YAML in the dbt project | [Semantic layer reference](/semantic-layers/overview) |
+| dbt Cloud Semantic Layer | Hosted catalog and query API | [Hosted backend](/semantic-layers/overview#hosted-backend-api-dbt-cloud-semantic-layer) |
+| Apache Ossie | Native YAML documents in the repository | [Ossie walkthrough](/guides/ossie-semantic-layer) |
+| SLayer | Native model files in the repository | [SLayer support](/semantic-layers/overview#slayer-models-vendor-slayer) |
+| Cube | Cube YAML model files in the repository | [Cube compatibility](/semantic-layers/cube) |
+| Databricks Metric Views | Metric View YAML files in the repository | [Metric View compatibility](/semantic-layers/databricks-metric-views) |
+| Snowflake Semantic Views | Semantic View YAML files in the repository, deployed by you; or the views deployed on the account, read alone (`deployment: snowflake_account`) | [Semantic View compatibility](/semantic-layers/snowflake-semantic-views) |
 
 Use the configuration and extras for that backend. Keep the existing format as
 the source of truth; choosing Dex does not require converting it to another one.
@@ -44,7 +44,7 @@ Explain their dimensions and physical sources before running a query.
 
 **To answer a metric question**, use `explore semantic query` or
 `explore semantic values` on a backend that supports it. Start with the names
-returned by the catalog and the [semantic query reference](/dex/semantic-layers/overview).
+returned by the catalog and the [semantic query reference](/semantic-layers/overview).
 
 **To change definitions**, ask the agent to prepare a plan using `semantic
 define|update|plan` for dbt semantic models, or the matching `semantic ossie`,
@@ -61,14 +61,14 @@ reading a native document does not authorize a hosted catalog or query request.
 
 ## A complete local example
 
-The [Apache Ossie walkthrough](/dex/guides/ossie-semantic-layer) takes a native
+The [Apache Ossie walkthrough](/guides/ossie-semantic-layer) takes a native
 layer from local files through catalog inspection, exploration, a drift baseline,
 and authoring. It also explains the cases where metric queries are refused and
 how to ask a governed warehouse question instead.
 
 For exact schemas and validation limits, use the
-[semantic layer reference](/dex/semantic-layers/overview),
-[Ossie compatibility](/dex/semantic-layers/ossie),
-[Cube compatibility](/dex/semantic-layers/cube),
-[Metric View compatibility](/dex/semantic-layers/databricks-metric-views), or
-[Semantic View compatibility](/dex/semantic-layers/snowflake-semantic-views).
+[semantic layer reference](/semantic-layers/overview),
+[Ossie compatibility](/semantic-layers/ossie),
+[Cube compatibility](/semantic-layers/cube),
+[Metric View compatibility](/semantic-layers/databricks-metric-views), or
+[Semantic View compatibility](/semantic-layers/snowflake-semantic-views).

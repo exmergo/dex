@@ -9,11 +9,11 @@ its dbt project, and check that the results are right. You keep your existing
 project; Dex adds profiling, reviewable plans, dev builds, and drift checks.
 
 <CardGroup cols={2}>
-  <Card title="Try Dex locally" icon="play" href="/dex/quickstart">
+  <Card title="Try Dex locally" icon="play" href="/quickstart">
     Map a demo warehouse and investigate its deliberately broken joins and keys.
     No cloud account or credentials needed.
   </Card>
-  <Card title="Use Dex with your agent" icon="terminal" href="/dex/installation">
+  <Card title="Use Dex with your agent" icon="terminal" href="/installation">
     Install the skills, open your project, and ask your agent to explore or make
     a change.
   </Card>
@@ -22,16 +22,16 @@ project; Dex adds profiling, reviewable plans, dev builds, and drift checks.
 ## What do you want to do?
 
 <CardGroup cols={2}>
-  <Card title="Explore a warehouse" href="/dex/guides/explore">
+  <Card title="Explore a warehouse" href="/guides/explore">
     Understand unfamiliar data with a ranked map, measured keys, and verified joins.
   </Card>
-  <Card title="Transform a project" href="/dex/guides/transform">
+  <Card title="Transform a project" href="/guides/transform">
     Review a model change, build on dev, and check the resulting rows.
   </Card>
-  <Card title="Maintain a project" href="/dex/guides/maintain">
+  <Card title="Maintain a project" href="/guides/maintain">
     Find drift against a baseline and review the proposed fixes.
   </Card>
-  <Card title="Use a semantic layer" href="/dex/guides/semantic-layer">
+  <Card title="Use a semantic layer" href="/guides/semantic-layer">
     Discover metric definitions and choose a path for querying or authoring them.
   </Card>
 </CardGroup>
@@ -46,14 +46,14 @@ files; applying a plan writes those files, and a build writes to a dev target.
 Your repository remains the source of truth.
 
 Cost checks and PII handling live in the engine. Before using a warehouse of your
-own, follow [Connect your data](/dex/connect) to set the scope and spending limits.
+own, follow [Connect your data](/connect) to set the scope and spending limits.
 For the precise boundaries, including the hosted dbt semantic-layer exception,
-read [cost controls](/dex/guardrails/cost-controls) and the
-[PII policy](/dex/guardrails/pii-policy).
+read [cost controls](/guardrails/cost-controls) and the
+[PII policy](/guardrails/pii-policy).
 
 ## Find the right level of detail
 
 **Documentation** takes you through setup and common tasks. **Reference** holds
 connector settings, command flags, compatibility rules, and integration contracts.
 If you know the command you need, go straight to the
-[CLI reference](/dex/cli/overview).
+[CLI reference](/cli/overview).

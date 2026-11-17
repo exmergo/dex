@@ -5,24 +5,24 @@ description: Choose a warehouse connector, verify access, and narrow the data De
 ---
 
 Use this path when you already have a warehouse or DuckDB file. If you want to
-learn the commands first, the [quickstart](/dex/quickstart) creates a local demo.
+learn the commands first, the [quickstart](/quickstart) creates a local demo.
 
 ## 1. Choose the connector
 
 The skill wrapper selects the connector extra from your project's configuration.
 For a standalone CLI, install the matching extra as described in
-[Installation](/dex/installation).
+[Installation](/installation).
 
 | Your data | Setup and configuration | CLI extra |
 | --- | --- | --- |
-| Local DuckDB file | [DuckDB](/dex/connectors/duckdb) | `duckdb` |
-| Google BigQuery | [BigQuery](/dex/connectors/bigquery) | `bigquery` |
-| Snowflake | [Snowflake](/dex/connectors/snowflake) | `snowflake` |
-| Databricks SQL | [Databricks](/dex/connectors/databricks) | `databricks` |
-| Amazon Redshift | [Redshift](/dex/connectors/redshift) | `redshift` |
-| PostgreSQL | [PostgreSQL](/dex/connectors/postgres) | `postgres` |
-| ClickHouse | [ClickHouse](/dex/connectors/clickhouse) | `clickhouse` |
-| Trino or Starburst | [Trino](/dex/connectors/trino) | `trino` |
+| Local DuckDB file | [DuckDB](/connectors/duckdb) | `duckdb` |
+| Google BigQuery | [BigQuery](/connectors/bigquery) | `bigquery` |
+| Snowflake | [Snowflake](/connectors/snowflake) | `snowflake` |
+| Databricks SQL | [Databricks](/connectors/databricks) | `databricks` |
+| Amazon Redshift | [Redshift](/connectors/redshift) | `redshift` |
+| PostgreSQL | [PostgreSQL](/connectors/postgres) | `postgres` |
+| ClickHouse | [ClickHouse](/connectors/clickhouse) | `clickhouse` |
+| Trino or Starburst | [Trino](/connectors/trino) | `trino` |
 
 Each connector page names its authentication sources and configuration keys.
 Keep credentials in the connector's credential store or environment, rather than
@@ -51,7 +51,7 @@ and discovery rules on your connector's page.
 
 `dex config get` shows effective settings and where they came from.
 `dex config set` first returns a diff; reissue it with `--confirm` only after
-reviewing that diff. See the [configuration commands](/dex/cli/config).
+reviewing that diff. See the [configuration commands](/cli/config).
 
 </Accordion>
 
@@ -65,7 +65,7 @@ On a metered warehouse, read the estimate before approving work. Budget units
 vary by connector. The person running the session chooses the per-command and
 daily limits; an agent must not invent them.
 
-See [cost controls](/dex/guardrails/cost-controls) for the confirmation flow and
+See [cost controls](/guardrails/cost-controls) for the confirmation flow and
 what belongs in each ceiling. Hosted dbt Cloud semantic queries have a different
 boundary and are outside Dex's cost guard.
 
@@ -76,5 +76,5 @@ dex explore inventory --rank
 ```
 
 Use that shortlist to decide what to profile, or ask your agent to
-[explore the warehouse](/dex/guides/explore). A successful connection proves
+[explore the warehouse](/guides/explore). A successful connection proves
 access; it does not prove the tables' grain or the joins between them.

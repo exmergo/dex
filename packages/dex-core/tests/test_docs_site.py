@@ -86,7 +86,7 @@ def make_repo(
     pages = (
         {
             "index.mdx": (
-                f"---\ntitle: Home\ndescription: {DESC}\n---\n\nSee [a](/dex/alpha).\n"
+                f"---\ntitle: Home\ndescription: {DESC}\n---\n\nSee [a](/alpha).\n"
             )
         }
         if pages is None
@@ -110,25 +110,8 @@ def make_repo(
     nav = [Path(n).with_suffix("").as_posix() for n in pages]
     nav += [r.removesuffix(".md") for r in references]
     nav += ["cli/overview", "cli/tool", "changelog"]
-    (root / "docs" / "section.json").write_text(
-        json.dumps({"navigation": {"product": "Dex", "pages": nav}}),
-        encoding="utf-8",
-    )
-    return root
-
-
-def make_site(root: Path) -> Path:
-    """A minimal exmergo/docs checkout, with a stale dex/ to be replaced."""
-
-    (root / "dex").mkdir(parents=True)
-    (root / "dex" / "stale.mdx").write_text("old", encoding="utf-8")
-    (root / ".git").mkdir()
-    (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-    (root / "index.mdx").write_text(
-        "---\ntitle: Exmergo\n---\n\nHome.\n", encoding="utf-8"
-    )
-    (root / "docs.json").write_text(
-        json.dumps({"navigation": {"products": [{"$ref": "./dex/navigation.json"}]}}),
+    (root / "docs" / "docs.json").write_text(
+        json.dumps({"name": "Dex", "navigation": {"pages": nav}}),
         encoding="utf-8",
     )
     return root
@@ -204,10 +187,10 @@ def test_every_cli_group_and_subcommand_has_a_page_and_a_heading(real_build):
             assert f"\n## dex {group} {sub}\n" in body
         # Shared options are documented once, on the overview, not per command.
         assert "`--repo-root" not in body
-        assert "](/dex/cli/overview#global-options)" in body
+        assert "](/cli/overview#global-options)" in body
     overview = builder.pages["cli/overview"].body
     assert "`--repo-root DIR`" in overview
-    assert "](/dex/cli/explore)" in overview
+    assert "](/cli/explore)" in overview
 
 
 def test_two_builds_are_byte_identical(tmp_path, real_build):
@@ -298,7 +281,7 @@ def test_links_are_rewritten_to_routes_and_repository_urls(tmp_path):
     builder = make_builder(root)
     assert not builder.build(), messages(builder.problems)
     body = builder.pages["alpha"].body
-    assert "[b](/dex/beta)" in body and "[b2](/dex/beta#two)" in body
+    assert "[b](/beta)" in body and "[b2](/beta#two)" in body
     assert "[here](#local)" in body
     assert f"[agents]({site.GITHUB}/blob/main/AGENTS.md)" in body
     assert f"[dir]({site.GITHUB}/tree/main/skills)" in body
@@ -329,29 +312,26 @@ def test_hand_written_pages_link_by_route_only(tmp_path):
         pages={
             "index.mdx": (
                 f"---\ntitle: Home\ndescription: {DESC}\n---\n\n"
-                "[ok](/dex/alpha) [home](/) [rel](alpha.md) [gone](/dex/nowhere) "
-                "[out](/viz/start)\n"
+                "[ok](/alpha) [home](/) [rel](alpha.md) [gone](/nowhere)\n"
             )
         },
     )
     problems = messages(make_builder(root).build())
-    assert "pages under docs/ link by site route, such as /dex/" in problems
-    assert "links to /dex/nowhere, not a page" in problems
-    assert "links to /viz/start, outside the /dex section" in problems
-    assert "/dex/alpha," not in problems and "links to /," not in problems
+    assert "pages under docs/ link by site route, such as /guardrails/" in problems
+    assert "links to /nowhere, not a page" in problems
+    assert "/alpha," not in problems and "links to /," not in problems
 
 
 def test_a_tracked_file_linking_an_unknown_docs_page_fails(tmp_path):
     root = make_repo(tmp_path)
-    url = site.SITE + "/dex/no-such-page"
+    url = site.SITE + "/no-such-page"
     (root / "README.md").write_text(
-        f"Docs: {url}, {site.SITE}/dex/alpha, {site.SITE}/viz and {site.SITE}\n",
-        encoding="utf-8",
+        f"Docs: {url}, {site.SITE}/alpha and {site.SITE}\n", encoding="utf-8"
     )
     builder = make_builder(root, list_tracked_files=lambda: ["README.md"])
     problems = messages(builder.build())
     assert f"README.md:1: {url} is not a page on the site" in problems
-    # Our own page resolves; the rest of the site is exmergo/docs's to answer for.
+    # A page and the home resolve.
     assert problems.count("is not a page") == 1
 
 
@@ -374,8 +354,8 @@ def test_a_link_whose_text_is_code_keeps_its_text(tmp_path):
     builder = make_builder(root)
     assert not builder.build(), messages(builder.problems)
     body = builder.pages["alpha"].body
-    assert "[`beta.md`](/dex/beta)" in body
-    assert "[the `x` key](/dex/beta)" in body
+    assert "[`beta.md`](/beta)" in body
+    assert "[the `x` key](/beta)" in body
     assert not any(c in body for c in "\x00\x01")
 
 
@@ -393,12 +373,10 @@ def test_every_page_shares_with_a_title_naming_exmergo_dex(tmp_path):
     builder = make_builder(root)
     assert not builder.build(), messages(builder.problems)
     files = builder.rendered()
-    assert (
-        "og:title: Exmergo Dex\ntwitter:title: Exmergo Dex\n" in files["dex/index.mdx"]
-    )
-    assert "og:title: alpha.md · Exmergo Dex\n" in files["dex/alpha.mdx"]
-    assert "og:title: Chosen by hand\n" in files["dex/own.mdx"]
-    assert "twitter:title: Chosen by hand · Exmergo Dex" not in files["dex/own.mdx"]
+    assert "og:title: Exmergo Dex\ntwitter:title: Exmergo Dex\n" in files["index.mdx"]
+    assert "og:title: alpha.md · Exmergo Dex\n" in files["alpha.mdx"]
+    assert "og:title: Chosen by hand\n" in files["own.mdx"]
+    assert "twitter:title: Chosen by hand · Exmergo Dex" not in files["own.mdx"]
 
 
 def test_a_control_character_in_a_page_fails_the_build(tmp_path):
@@ -487,8 +465,8 @@ def test_getting_started_and_workflows_are_separate_from_reference(real_build):
     assert "reference/command-contract" in reference_pages
     assert "connectors/duckdb" in reference_pages
     assert "reference/command-contract" not in docs_pages
-    assert 'href="/dex/quickstart"' in builder.pages["index"].body
-    assert 'href="/dex/installation"' in builder.pages["index"].body
+    assert 'href="/quickstart"' in builder.pages["index"].body
+    assert 'href="/installation"' in builder.pages["index"].body
 
 
 def test_missing_help_is_a_gap_and_a_problem_when_required(tmp_path):
@@ -559,87 +537,65 @@ def test_write_replaces_a_previous_build(tmp_path):
     assert not builder.build(), messages(builder.problems)
     out = tmp_path / "out"
     builder.write(out)
-    (out / "dex" / "stale.mdx").write_text("old", encoding="utf-8")
+    (out / "stale.mdx").write_text("old", encoding="utf-8")
     builder.write(out)
-    assert sorted(p.name for p in out.iterdir()) == ["dex"]
-    assert not (out / "dex" / "stale.mdx").exists()
-    assert (out / "dex" / "alpha.mdx").is_file()
-    readme = (out / "dex" / "README.md").read_text(encoding="utf-8")
+    assert not (out / "stale.mdx").exists()
+    assert (out / "alpha.mdx").is_file() and (out / "docs.json").is_file()
+    readme = (out / "README.md").read_text(encoding="utf-8")
     assert readme.startswith(site.OUT_MARKER)
 
 
-def test_write_with_a_site_assembles_the_whole_site(tmp_path):
-    root = make_repo(tmp_path / "repo")
-    builder = make_builder(root)
-    assert not builder.build(), messages(builder.problems)
-    out = tmp_path / "out"
-    builder.write(out, site=make_site(tmp_path / "docs"))
-    assert (out / "index.mdx").is_file() and (out / "docs.json").is_file()
-    assert (out / "dex" / "alpha.mdx").is_file()
-    assert not (out / "dex" / "stale.mdx").exists()  # the site's old dex/ is gone
-    assert not (out / ".git").exists()
-
-
-def test_write_never_clears_a_git_checkout_or_the_site_itself(tmp_path):
-    """An exmergo/docs checkout carries the build marker in its dex/ folder, so
-    the marker alone would let `--out ../docs` wipe a real repository."""
+def test_write_never_clears_a_git_checkout(tmp_path):
+    """A checkout of the docs-site branch carries the build marker, so the
+    marker alone would let `--out` wipe a real repository."""
 
     root = make_repo(tmp_path / "repo")
     builder = make_builder(root)
     assert not builder.build(), messages(builder.problems)
-    docs = make_site(tmp_path / "docs")
-    (docs / "dex" / "README.md").write_text(site.OUT_MARKER + "\n", encoding="utf-8")
+    checkout = tmp_path / "docs-site"
+    (checkout / ".git").mkdir(parents=True)
+    (checkout / "README.md").write_text(site.OUT_MARKER + "\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="it is a git checkout"):
-        builder.write(docs)
-    with pytest.raises(SystemExit, match="it is a git checkout"):
-        builder.write(docs, site=docs)
-    with pytest.raises(SystemExit, match="it contains --site"):
-        builder.write(tmp_path, site=docs)
-    assert (docs / ".git" / "HEAD").is_file() and (docs / "index.mdx").is_file()
+        builder.write(checkout)
+    assert (checkout / ".git").is_dir() and (checkout / "README.md").is_file()
 
 
-def test_the_site_copy_skips_only_its_top_level_dex_and_git(tmp_path):
-    root = make_repo(tmp_path / "repo")
-    builder = make_builder(root)
-    assert not builder.build(), messages(builder.problems)
-    docs = make_site(tmp_path / "docs")
-    (docs / "images" / "dex").mkdir(parents=True)
-    (docs / "images" / "dex" / "logo.svg").write_text("<svg/>", encoding="utf-8")
-    out = tmp_path / "out"
-    builder.write(out, site=docs)
-    assert (out / "images" / "dex" / "logo.svg").is_file()
-    assert not (out / ".git").exists() and not (out / "dex" / "stale.mdx").exists()
-
-
-def test_the_section_ships_its_own_menu_and_redirects(tmp_path):
+def test_the_site_ships_its_settings_menu_and_redirects(tmp_path):
     root = make_repo(tmp_path)
     builder = make_builder(root)
     assert not builder.build(), messages(builder.problems)
-    files = builder.rendered()
-    navigation = json.loads(files["dex/navigation.json"])
-    assert navigation["product"] == "Dex"
-    assert "dex/alpha" in navigation["pages"] and "dex/index" in navigation["pages"]
-    redirects = json.loads(files["dex/redirects.json"])
-    assert {"source": "/dex/references/alpha.md", "destination": "/dex/alpha"} in (
-        redirects
-    )
-    assert {"source": "/dex/references/alpha", "destination": "/dex/alpha"} in (
-        redirects
-    )
-    assert "dex/docs.json" not in files and "docs.json" not in files
+    config = json.loads(builder.rendered()["docs.json"])
+    assert config["name"] == "Dex"  # every other setting is published as written
+    assert "alpha" in config["navigation"]["pages"]
+    assert "index" in config["navigation"]["pages"]
+    redirects = config["redirects"]
+    assert {"source": "/references/alpha.md", "destination": "/alpha"} in redirects
+    assert {"source": "/references/alpha", "destination": "/alpha"} in redirects
 
 
-def test_a_section_cannot_carry_site_settings_or_claim_other_routes(tmp_path):
+def test_a_redirect_must_go_from_a_route_to_a_page(tmp_path):
     root = make_repo(tmp_path)
-    config = json.loads((root / "docs" / "section.json").read_text(encoding="utf-8"))
-    config["theme"] = "maple"
-    config["redirects"] = [{"source": "/start", "destination": "/dex/alpha"}]
-    (root / "docs" / "section.json").write_text(json.dumps(config), encoding="utf-8")
+    path = root / "docs" / "docs.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["redirects"] = [
+        {"source": "start", "destination": "/alpha"},
+        {"source": "/old", "destination": "/nowhere"},
+        {"source": "/alpha", "destination": "/beta"},
+        # A wildcard names many pages, which Mintlify's own check resolves.
+        {"source": "/dex/:slug*", "destination": "/:slug*"},
+    ]
+    path.write_text(json.dumps(config), encoding="utf-8")
     problems = messages(make_builder(root).build())
-    assert (
-        "holds theme; a section carries only its navigation and redirects" in problems
-    )
-    assert "redirect source /start is outside /dex" in problems
+    assert "redirect source start is not a route" in problems
+    assert "redirect /old goes to a missing page" in problems
+    assert "redirect source /alpha is also a page" in problems
+    assert "/dex/:slug*" not in problems
+
+
+def test_the_site_config_must_carry_a_navigation(tmp_path):
+    root = make_repo(tmp_path)
+    (root / "docs" / "docs.json").write_text('{"name": "Dex"}', encoding="utf-8")
+    assert "docs/docs.json:1: has no navigation" in messages(make_builder(root).build())
 
 
 def test_private_material_never_reaches_a_page(tmp_path):
@@ -658,7 +614,8 @@ def test_private_material_never_reaches_a_page(tmp_path):
 
 
 def make_archive(root: Path) -> Path:
-    """The `dex/` folder an older release's own build wrote."""
+    """The `dex/` folder a release from before docs.trydex.ai built for the
+    shared docs.exmergo.com: a legacy archive."""
 
     root.mkdir(parents=True)
     (root / "navigation.json").write_text(
@@ -686,17 +643,15 @@ def test_archives_become_versions_beside_the_latest_routes(tmp_path):
     builder = make_builder(root, archives=(archive,), latest="v1.15.2")
     assert not builder.build(), messages(builder.problems)
 
-    navigation = json.loads(builder.rendered()["dex/navigation.json"])
-    assert navigation["product"] == "Dex" and "pages" not in navigation
+    navigation = json.loads(builder.rendered()["docs.json"])["navigation"]
+    assert "pages" not in navigation
     latest, older = navigation["versions"]
     # The menu names minor releases; the exact tag is on the pages' notice.
     assert latest["version"] == "v1.15" and latest["default"] is True
     assert latest["tag"] == "Latest" and "tag" not in older
-    assert "dex/alpha" in latest["pages"]  # latest keeps the routes links point at
-    assert older == {
-        "version": "v1.14",
-        "pages": ["dex/v1.14/index", "dex/v1.14/alpha"],
-    }
+    assert "alpha" in latest["pages"]  # latest keeps the routes links point at
+    # A legacy archive's dex/ prefix gives way to the label.
+    assert older == {"version": "v1.14", "pages": ["v1.14/index", "v1.14/alpha"]}
 
 
 def test_an_archived_page_stays_in_its_version_and_out_of_search(tmp_path):
@@ -707,18 +662,51 @@ def test_an_archived_page_stays_in_its_version_and_out_of_search(tmp_path):
     out = tmp_path / "out"
     builder.write(out)
 
-    page = (out / "dex" / "v1.14" / "index.mdx").read_text(encoding="utf-8")
+    page = (out / "v1.14" / "index.mdx").read_text(encoding="utf-8")
     assert page.startswith("---\nnoindex: true\ntitle: Dex\n---\n\n<Note>\n")
-    assert "[Alpha](/dex/v1.14/alpha#top)" in page
-    assert '<Card href="/dex/v1.14/alpha" />' in page
-    assert "[home](/dex/v1.14)" in page
-    # A full URL is a deliberate link to the live site, and is left alone.
+    assert "[Alpha](/v1.14/alpha#top)" in page
+    assert '<Card href="/v1.14/alpha" />' in page
+    assert "[home](/v1.14)" in page
+    # A full URL is a deliberate link to a live site, and is left alone.
     assert "[site](https://docs.exmergo.com/dex)" in page
-    assert (out / "dex" / "v1.14" / "images" / "map.png").read_bytes() == b"\x89PNG"
-    # Its menu is folded into the section's; its redirects and README stay behind.
+    assert (out / "v1.14" / "images" / "map.png").read_bytes() == b"\x89PNG"
+    # Its menu is folded into the site's; its redirects and README stay behind.
     for left in ("navigation.json", "redirects.json", "README.md"):
-        assert not (out / "dex" / "v1.14" / left).exists()
-    assert "noindex" not in (out / "dex" / "alpha.mdx").read_text(encoding="utf-8")
+        assert not (out / "v1.14" / left).exists()
+    assert "noindex" not in (out / "alpha.mdx").read_text(encoding="utf-8")
+
+
+def test_an_archive_built_as_a_whole_site_moves_under_its_label(tmp_path):
+    old = tmp_path / "v1.16"
+    old.mkdir()
+    (old / "docs.json").write_text(
+        json.dumps({"name": "Dex", "navigation": {"pages": ["index", "alpha"]}}),
+        encoding="utf-8",
+    )
+    (old / "index.mdx").write_text(
+        "---\ntitle: Dex\n---\n\nSee [Alpha](/alpha#top), "
+        "[home](/) and [cdn](//cdn.example/x).\n",
+        encoding="utf-8",
+    )
+    (old / "alpha.mdx").write_text("---\ntitle: Alpha\n---\n\nOld.\n", encoding="utf-8")
+    (old / "README.md").write_text(site.OUT_MARKER + "\n", encoding="utf-8")
+    archive = site.Archive("v1.16.3", old)
+    builder = make_builder(
+        make_repo(tmp_path / "repo"), archives=(archive,), latest="v1.17.0"
+    )
+    assert not builder.build(), messages(builder.problems)
+
+    navigation = json.loads(builder.rendered()["docs.json"])["navigation"]
+    assert navigation["versions"][1] == {
+        "version": "v1.16",
+        "pages": ["v1.16/index", "v1.16/alpha"],
+    }
+    files = builder.archived()
+    page = files["v1.16/index.mdx"].decode("utf-8")
+    assert "[Alpha](/v1.16/alpha#top)" in page and "[home](/v1.16/)" in page
+    assert "[cdn](//cdn.example/x)" in page  # a protocol-relative URL is not a route
+    # Its own settings are the latest site's to give, so they stay behind.
+    assert "v1.16/docs.json" not in files and "v1.16/README.md" not in files
 
 
 def test_an_archived_page_names_its_release_and_links_to_the_latest(tmp_path):
@@ -730,20 +718,21 @@ def test_an_archived_page_names_its_release_and_links_to_the_latest(tmp_path):
     assert not builder.build(), messages(builder.problems)
     files = builder.archived()
 
-    index = files["dex/v1.14/index.mdx"].decode("utf-8")
+    index = files["v1.14/index.mdx"].decode("utf-8")
     assert "You are reading the docs for dex v1.14 (v1.14.1)." in index
-    assert "See the [latest version](/dex)." in index
-    alpha = files["dex/v1.14/alpha.mdx"].decode("utf-8")
-    assert "See the [latest version](/dex/alpha)." in alpha
+    assert "See the [latest version](/)." in index
+    alpha = files["v1.14/alpha.mdx"].decode("utf-8")
+    assert "See the [latest version](/alpha)." in alpha
     # A page the latest release no longer has sends the reader to its home.
-    gone = files["dex/v1.14/gone.mdx"].decode("utf-8")
-    assert "See the [latest version](/dex)." in gone
+    gone = files["v1.14/gone.mdx"].decode("utf-8")
+    assert "See the [latest version](/)." in gone
 
 
 def test_a_build_without_archives_has_no_version_menu(tmp_path):
     builder = make_builder(make_repo(tmp_path), latest="v1.15.2")
     assert not builder.build(), messages(builder.problems)
-    assert "versions" not in json.loads(builder.rendered()["dex/navigation.json"])
+    config = json.loads(builder.rendered()["docs.json"])
+    assert "versions" not in config["navigation"]
 
 
 @pytest.mark.parametrize(
@@ -777,7 +766,7 @@ def test_an_archive_must_hold_every_page_its_menu_lists(tmp_path):
     builder = make_builder(
         make_repo(tmp_path / "repo2"), archives=(site.Archive("v1.14.1", empty),)
     )
-    assert "holds no built section" in messages(builder.build())
+    assert "holds no built site" in messages(builder.build())
 
 
 def test_a_backfilled_release_drops_only_the_menu_pages_it_cannot_build():
