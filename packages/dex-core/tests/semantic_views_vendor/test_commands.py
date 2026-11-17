@@ -222,6 +222,73 @@ def test_relationships_carry_each_join_at_full_confidence(warehouse, capsys):
     assert edge["verified"] is True and edge["orphan_fraction"] == 0.0
 
 
+def test_relationships_native_layer_without_tests_attributes_to_layer_relationships(
+    warehouse, capsys
+):
+    rc, envelope = _run(capsys, warehouse, "explore", "relationships", "--use-project")
+    assert rc == 0, envelope["errors"]
+    notes = envelope["data"]["notes"]
+    assert any("also declared by the layer's own relationships" in n for n in notes)
+    assert not any("also declared by a relationships test" in n for n in notes)
+
+
+def test_relationships_native_layer_with_matching_relationships_test_attributes_to_test(
+    warehouse, capsys
+):
+    (warehouse / "models").mkdir(exist_ok=True)
+    (warehouse / "dbt_project.yml").write_text(
+        'name: test_proj\nversion: "1.0"\nmodel-paths: ["models"]\n', encoding="utf-8"
+    )
+    (warehouse / "models" / "schema.yml").write_text(
+        """
+version: 2
+models:
+  - name: orders
+    columns:
+      - name: customer_id
+        tests:
+          - relationships:
+              to: ref("customers")
+              field: customer_key
+""",
+        encoding="utf-8",
+    )
+    rc, envelope = _run(capsys, warehouse, "explore", "relationships", "--use-project")
+    assert rc == 0, envelope["errors"]
+    notes = envelope["data"]["notes"]
+    assert any("also declared by a relationships test" in n for n in notes)
+    assert not any("also declared by the layer's own relationships" in n for n in notes)
+
+
+def test_relationships_native_layer_with_references_declaration_does_not_claim_test(
+    warehouse, capsys
+):
+    (warehouse / "models").mkdir(exist_ok=True)
+    (warehouse / "dbt_project.yml").write_text(
+        'name: test_proj\nversion: "1.0"\nmodel-paths: ["models"]\n', encoding="utf-8"
+    )
+    (warehouse / "models" / "schema.yml").write_text(
+        """
+version: 2
+models:
+  - name: orders
+    columns:
+      - name: customer_id
+        config:
+          meta:
+            dex:
+              role: foreign_key
+              references: customers.customer_key
+""",
+        encoding="utf-8",
+    )
+    rc, envelope = _run(capsys, warehouse, "explore", "relationships", "--use-project")
+    assert rc == 0, envelope["errors"]
+    notes = envelope["data"]["notes"]
+    assert any("also declared by the layer's own relationships" in n for n in notes)
+    assert not any("also declared by a relationships test" in n for n in notes)
+
+
 def test_map_carries_the_semantic_model_and_the_declared_grain(warehouse, capsys):
     rc, envelope = _run(capsys, warehouse, "explore", "map", "--use-project")
 
@@ -229,6 +296,9 @@ def test_map_carries_the_semantic_model_and_the_declared_grain(warehouse, capsys
     by_relation = {o["identifier"]: o for o in envelope["data"]["objects"]}
     assert by_relation["demo.main.orders"]["semantic_models"] == ["sales.orders"]
     assert by_relation["demo.main.customers"]["grain"] == ["customer_key"]
+    notes = envelope["data"]["notes"]
+    assert any("also declared by the layer's own relationships" in n for n in notes)
+    assert not any("also declared by a relationships test" in n for n in notes)
 
 
 def test_maintain_snapshot_fingerprints_the_layer(warehouse, capsys):
