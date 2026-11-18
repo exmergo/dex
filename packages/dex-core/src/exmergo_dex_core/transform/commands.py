@@ -2654,7 +2654,10 @@ def test_mutations(
                     "dbt in, and they would fire once per mutant run. Point "
                     "packages-install-path inside the project, then measure"
                 )
-            if shadow.strip_semantic_models(model):
+            from ..dbt_project import manifest_node_label
+            from ..model_versions import split_label
+
+            if shadow.strip_semantic_models(split_label(model)[0]):
                 warnings.append(
                     f"semantic models referencing '{model}' were omitted from the "
                     "shadow project: mutation coverage runs with an ephemeral mutant, "
@@ -2663,6 +2666,16 @@ def test_mutations(
             quiet, quiet_warnings = _quiet_elementary(shadow)
             warnings.extend(quiet_warnings)
             node, model_path = _mutable_model(engine, shadow, model, mutation_mod)
+            label = manifest_node_label(str(node.get("unique_id")), node)
+            if node.get("version") not in (None, "") and split_label(model)[1] is None:
+                warnings.append(
+                    f"'{model}' is a versioned model, so this measures {label}, "
+                    f"the version an unversioned ref('{model}') resolves to; "
+                    f"name another as {node['name']}.v<N>"
+                )
+            # The version label from here on: it is what dbt selects one
+            # version by, and what the envelope names (#1374).
+            model = label
             # Taken before the mutants and the downstream routing rewrite the
             # copy, from the fields a plain parse carries too, so `maintain
             # coverage` can tell later whether this run still describes the
@@ -2838,7 +2851,7 @@ def test_mutations(
                     shadow,
                     model_path,
                     batch,
-                    model=node["name"],
+                    model=model,
                     paradigm=paradigm,
                     connector=connector,
                     store=store,
@@ -2938,7 +2951,7 @@ def test_mutations(
 
     return MutationCoverageResult(
         record=record_at,
-        model=node["name"],
+        model=model,
         target=target,
         baseline=result["baseline"],
         mutants=result["mutants"],
@@ -3418,13 +3431,15 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
     """
 
     from ..dbt_project import load as load_project
-    from ..dbt_project import model_file
+    from ..model_versions import version_text
 
     view = load_project(shadow.project)
-    path = model_file(view, model)
+    name, version, path = _version_to_mutate(view, model, mutation_mod)
+    if version is not None:
+        model = f"{name}.v{version}"
     content = view.files[path].content
     if hasattr(shadow, "strip_semantic_models"):
-        shadow.strip_semantic_models(model)
+        shadow.strip_semantic_models(name)
     # The header is appended rather than prepended: dbt gives a scalar config key
     # to the last `config()` call in a file, so a model declaring its own
     # `materialized` would otherwise win and the mutant would build a relation.
@@ -3434,7 +3449,9 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
     matches = [
         node
         for uid, node in manifest.get("nodes", {}).items()
-        if uid.startswith("model.") and node.get("name") == model
+        if uid.startswith("model.")
+        and node.get("name") == name
+        and (version is None or version_text(node.get("version")) == version)
     ]
     if not matches:
         raise mutation_mod.MutationError(f"dbt compiled no model named '{model}'")
@@ -3463,6 +3480,54 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
             "run mutants that would materialize into your dev target"
         )
     return node, path
+
+
+def _version_to_mutate(view, model: str, mutation_mod) -> tuple[str, str | None, str]:
+    """The model name, version and file ``--mutate <model>`` names (#1374).
+
+    ``orders.v2`` names one version of a versioned model, the label
+    ``transform declare`` takes. A bare ``orders`` names the version an
+    unversioned ``ref('orders')`` resolves to (its ``latest_version``), which
+    is the version a reader of the model gets. A version's file stem
+    (``orders_v2``) is refused with its label, as ``transform declare`` refuses
+    it. The version is ``None`` for a model with no versions.
+    """
+
+    from .. import model_versions as mv
+    from ..dbt_project import model_file
+
+    files = {path: source.content for path, source in view.files.items()}
+    vmap = mv.cached_version_map(files, view.model_paths)
+    base, version = mv.split_label(model)
+    versioned = mv.lookup(vmap, base)
+    if versioned is None:
+        if version is not None:
+            raise mutation_mod.MutationError(
+                f"'{model}' names a version, and the project declares no "
+                f"versioned model '{base}'"
+            )
+        label = mv.label_for_stem(model, vmap)
+        if label is not None:
+            raise mutation_mod.MutationError(
+                f"'{model}' is the file that builds '{label}', a version of a "
+                f"versioned model; name it as '{label}'"
+            )
+        return model, None, model_file(view, model)
+    item = versioned.version(version if version is not None else versioned.default)
+    if item is None:
+        raise mutation_mod.MutationError(
+            f"'{model}' names version {version} of '{versioned.base}', which "
+            f"lists versions {', '.join(v.v for v in versioned.versions)}"
+        )
+    if item.file is None:
+        raise mutation_mod.MutationError(
+            f"no file builds '{item.label}', so dbt compiles no such version"
+        )
+    if not item.file.endswith(".sql"):
+        raise mutation_mod.MutationError(
+            f"'{item.label}' is a Python model; mutation coverage plants defects in SQL"
+        )
+    return versioned.base, item.v, item.file
 
 
 def _plan_mutants(
@@ -3574,7 +3639,7 @@ def _parent_relations(manifest: dict, node: dict, mutation_mod) -> list:
             continue
         ephemeral = (parent.get("config") or {}).get("materialized") == "ephemeral"
         rendered = (
-            f"{mutation_mod.DBT_CTE_PREFIX}{parent['name']}"
+            f"{mutation_mod.DBT_CTE_PREFIX}{parent.get('alias') or parent['name']}"
             if ephemeral
             else parent.get("relation_name")
         )
@@ -3690,7 +3755,10 @@ def _price_mutations(
     def spliced(statement: str, body: str) -> str:
         return (
             mutation_mod.inline_into_test(
-                statement, model_name=node["name"], body=body, dialect=adapter.dialect
+                statement,
+                model_name=node.get("alias") or node["name"],
+                body=body,
+                dialect=adapter.dialect,
             )
             or statement
         )
