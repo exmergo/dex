@@ -46,6 +46,7 @@ at the release tags each function names:
 from __future__ import annotations
 
 import contextlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -522,6 +523,128 @@ def monitoring_tests(manifest: Mapping[str, Any]) -> dict[str, list[str]]:
         ):
             found[str(node.get("name"))] = sorted(depends.get("nodes") or [])
     return dict(sorted(found.items()))
+
+
+#: Elementary's ``no_results_query()``: a test that compiled to it returns no
+#: rows whatever the data holds, so it passed having checked nothing. The text is
+#: the same at 0.16.4 and 0.26.1 and the macro has no adapter dispatch; the
+#: literal it compares ``num`` with is matched loosely, in case a release moves
+#: it.
+_NO_RESULTS = re.compile(
+    r"\s*with\s+nothing\s+as\s*\(\s*select\s+1\s+as\s+num\s*\)\s*"
+    r"select\s+\*\s+from\s+nothing\s+where\s+num\s*=\s*\d+\s*;?\s*",
+    re.IGNORECASE,
+)
+
+#: The package's tests whose verdict rests on what earlier runs stored in its
+#: schema, by test macro (#1308): the anomaly tests, which score this run's
+#: metrics against a training set of earlier ones; ``schema_changes``, which
+#: compares against the last column snapshot; ``volume_threshold`` and
+#: ``metric_stability``, which compare against cached metrics; and
+#: ``execution_sla``, which reads the runs ``on_run_end`` recorded. Each passes
+#: where that history is missing. Read at 0.26.1 (0.16.4 carries the anomaly
+#: tests and ``schema_changes`` only). Not Elementary's own ``get_test_type``
+#: map, which leaves the last three out. ``schema_changes_from_baseline`` reads
+#: the baseline the YAML declares, ``json_schema`` and ``data_freshness_sla``
+#: read this run's rows, and the ``*_with_context`` tests wrap dbt's own, so none
+#: is here.
+HISTORY_TESTS = frozenset(
+    f"macro.{PACKAGE}.test_{name}"
+    for name in (
+        "table_anomalies",
+        "volume_anomalies",
+        "freshness_anomalies",
+        "event_freshness_anomalies",
+        "column_anomalies",
+        "all_columns_anomalies",
+        "dimension_anomalies",
+        "schema_changes",
+        "volume_threshold",
+        "metric_stability",
+        "execution_sla",
+    )
+)
+
+#: Why a passing Elementary test checked nothing (#1308), by reason code.
+UncheckedReason = Literal[
+    "package_disabled", "compiled_to_no_results", "history_unmeasured"
+]
+
+UNCHECKED_REASONS: Mapping[str, str] = {
+    "package_disabled": (
+        "the Elementary package's models are disabled for this target, and the "
+        "test compiled to the package's no-results query, so it passed without "
+        "reading the model"
+    ),
+    "compiled_to_no_results": (
+        "the test compiled to the Elementary package's no-results query, so it "
+        "passed without reading the model"
+    ),
+    "history_unmeasured": (
+        "the test judges this run against what earlier runs stored in the "
+        "Elementary schema, and passes where that history is missing; dex does "
+        "not measure how much history the target holds"
+    ),
+}
+
+
+def is_no_results_query(sql: str | None) -> bool:
+    """Whether ``sql`` is the package's ``no_results_query()`` and nothing else."""
+
+    return bool(sql) and _NO_RESULTS.fullmatch(str(sql)) is not None
+
+
+def unchecked_tests(
+    manifest: Mapping[str, Any], runtime: ElementaryRuntime
+) -> dict[str, UncheckedReason]:
+    """The Elementary tests whose pass says nothing about the rows (#1308).
+
+    Keyed by unique id, for every enabled test that reaches one of the package's
+    ``test_*`` macros, directly or through a project's own generic test. A test
+    of dbt's own, or of another package, is never listed. In order:
+
+    1. A test whose compiled SQL (what the manifest of the build recorded) is
+       the no-results query checked nothing, whatever its name:
+       ``package_disabled`` where the package's models are disabled for the
+       target, ``compiled_to_no_results`` where they are not
+       (``collect_metrics`` returns it whenever it runs).
+    2. Where no compiled SQL was recorded and the package is disabled, a test
+       whose package macro checks ``is_elementary_enabled()`` is
+       ``package_disabled``: that check is what compiles it to the no-results
+       query.
+    3. Where the package is enabled, a test that reaches one of
+       :data:`HISTORY_TESTS` is ``history_unmeasured``.
+
+    A caller holds a failed test to its failure: only a pass is read as nothing
+    checked. Nothing here opens a connection or counts the history.
+    """
+
+    if not runtime.installed:
+        return {}
+    macros = manifest.get("macros") or {}
+    found: dict[str, UncheckedReason] = {}
+    for uid, node in (manifest.get("nodes") or {}).items():
+        if not isinstance(node, Mapping) or node.get("resource_type") != "test":
+            continue
+        reached = _test_macros(
+            manifest, list((node.get("depends_on") or {}).get("macros") or [])
+        )
+        if not reached:
+            continue
+        compiled = node.get("compiled_code")
+        if is_no_results_query(compiled):
+            found[str(uid)] = (
+                "compiled_to_no_results" if runtime.enabled else "package_disabled"
+            )
+        elif not runtime.enabled:
+            if compiled is None and any(
+                "is_elementary_enabled" in str((macros.get(m) or {}).get("macro_sql"))
+                for m in reached
+            ):
+                found[str(uid)] = "package_disabled"
+        elif reached & HISTORY_TESTS:
+            found[str(uid)] = "history_unmeasured"
+    return found
 
 
 def read(

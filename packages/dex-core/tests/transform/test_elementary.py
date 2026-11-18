@@ -16,10 +16,12 @@ import pytest
 from exmergo_dex_core.transform.elementary import (
     OVERRIDE_FLAG,
     UPLOAD_VARS,
+    is_no_results_query,
     monitoring_tests,
     package_model_dependents,
     read,
     resolve,
+    unchecked_tests,
 )
 
 ROOT = "shop"
@@ -616,3 +618,144 @@ def test_read_without_the_package_files_has_no_release(tmp_path: Path):
 
     assert record.installed
     assert record.release is None
+
+
+# --- tests that checked nothing (#1308) -------------------------------------------
+
+#: What ``no_results_query()`` compiles to at 0.16.4 and 0.26.1.
+NO_RESULTS = (
+    "\n    with nothing as (select 1 as num)\n    select * from nothing where num = 2\n"
+)
+
+
+def test_the_no_results_query_is_matched_and_nothing_else_is():
+    assert is_no_results_query(NO_RESULTS)
+    assert is_no_results_query(
+        "WITH nothing AS (SELECT 1 AS num) SELECT * FROM nothing WHERE num = 0;"
+    )
+    assert not is_no_results_query(None)
+    assert not is_no_results_query("")
+    assert not is_no_results_query(
+        f"{NO_RESULTS} union all select 1 from fct where amount < 0"  # noqa: S608
+    )
+    assert not is_no_results_query("select * from fct where id is null")
+
+
+def _elementary_test_manifest(*, models: str) -> dict[str, Any]:
+    """Every kind of test the classifier tells apart, on ``fct``.
+
+    ``compiled`` maps a test's name to the SQL the build recorded for it, with
+    ``None`` for a test the manifest holds no compiled SQL for.
+    """
+
+    check = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+    macros = (
+        _macro(
+            "elementary",
+            "test_volume_anomalies",
+            depends=("macro.elementary.test_table_anomalies",),
+        ),
+        _macro("elementary", "test_table_anomalies", sql=check),
+        _macro("elementary", "test_schema_changes", sql=check),
+        _macro("elementary", "test_volume_threshold", sql=check),
+        _macro("elementary", "test_json_schema", sql=check),
+        _macro("elementary", "test_collect_metrics", sql=check),
+        _macro("elementary", "test_not_null_with_context"),
+        _macro(
+            ROOT, "test_my_volume", depends=("macro.elementary.test_volume_anomalies",)
+        ),
+    )
+    return manifest(models=models, extra_macros=macros)
+
+
+def _with_tests(built: dict[str, Any], compiled: dict[str, str | None]) -> dict:
+    macro_of = {
+        "volume": "macro.elementary.test_volume_anomalies",
+        "changes": "macro.elementary.test_schema_changes",
+        "threshold": "macro.elementary.test_volume_threshold",
+        "json": "macro.elementary.test_json_schema",
+        "collect": "macro.elementary.test_collect_metrics",
+        "with_context": "macro.elementary.test_not_null_with_context",
+        "wrapped_volume": f"macro.{ROOT}.test_my_volume",
+        "not_null_fct_id": "macro.dbt.test_not_null",
+    }
+    for name, sql in compiled.items():
+        node = _reading(
+            _node(ROOT, "test", name), "model.shop.fct", macros=(macro_of[name],)
+        )
+        if sql is not None:
+            node["compiled_code"] = sql
+        built["nodes"][node["unique_id"]] = node
+    return built
+
+
+def _classified(built: dict[str, Any]) -> dict[str, str]:
+    record = resolve(built, project_yml())
+    return {
+        uid.split(".")[2]: reason
+        for uid, reason in unchecked_tests(built, record).items()
+    }
+
+
+def test_with_the_package_disabled_every_test_compiled_to_no_results_is_unchecked():
+    """Acceptance, first half: whatever the name, a test that compiled to the
+    no-results query is listed; a dbt test, and an Elementary test that
+    compiled to a real query, are not."""
+
+    built = _with_tests(
+        _elementary_test_manifest(models="disabled"),
+        {
+            "volume": NO_RESULTS,
+            "changes": NO_RESULTS,
+            "json": NO_RESULTS,
+            "wrapped_volume": NO_RESULTS,
+            "with_context": "select * from fct where id is null",
+            "not_null_fct_id": "select id from fct where id is null",
+        },
+    )
+    assert _classified(built) == dict.fromkeys(
+        ("volume", "changes", "json", "wrapped_volume"), "package_disabled"
+    )
+
+
+def test_with_the_package_disabled_and_no_compiled_sql_the_enabled_check_decides():
+    built = _with_tests(
+        _elementary_test_manifest(models="disabled"),
+        {"volume": None, "with_context": None, "not_null_fct_id": None},
+    )
+    assert _classified(built) == {"volume": "package_disabled"}
+
+
+def test_with_the_package_enabled_the_history_tests_are_unchecked():
+    """Acceptance, second half: the anomaly tests (through a project's wrapper
+    too), ``schema_changes`` and ``volume_threshold`` rest on history; a
+    ``*_with_context`` test, ``json_schema`` and dbt's own do not. A test that
+    still compiled to the no-results query checked nothing for that reason."""
+
+    real = "select * from elementary_test_results_tmp where is_anomalous"
+    built = _with_tests(
+        _elementary_test_manifest(models="enabled"),
+        {
+            "volume": real,
+            "changes": real,
+            "threshold": None,
+            "wrapped_volume": real,
+            "json": "select * from fct where not valid",
+            "collect": NO_RESULTS,
+            "with_context": "select * from fct where id is null",
+            "not_null_fct_id": "select id from fct where id is null",
+        },
+    )
+    assert _classified(built) == {
+        "volume": "history_unmeasured",
+        "changes": "history_unmeasured",
+        "threshold": "history_unmeasured",
+        "wrapped_volume": "history_unmeasured",
+        "collect": "compiled_to_no_results",
+    }
+
+
+def test_a_project_without_the_package_has_no_unchecked_tests():
+    built = manifest(elementary=False)
+    built = _with_tests(built, {"not_null_fct_id": NO_RESULTS})
+    assert unchecked_tests(built, resolve(built, project_yml())) == {}

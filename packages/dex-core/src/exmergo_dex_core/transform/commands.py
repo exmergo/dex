@@ -7719,12 +7719,43 @@ def _attach_completion(
             incremental_replay=_incremental_replay_inputs(result, inputs),
             repair=inputs.get("repair"),
             population_accepted=inputs.get("population_accepted"),
+            unchecked_tests=_unchecked_tests(inputs),
         )
+        unchecked = result.completion.assurance.unchecked_tests
+        if unchecked:
+            # A pointer line, like verification's, so a caller reading the
+            # warnings alone learns that a passing test vouched for nothing.
+            result.warnings.append(
+                f"{len(unchecked)} passing Elementary test(s) checked nothing in "
+                "this run and count toward no model's assurance; each is under "
+                "data.completion.assurance.unchecked_tests with its reason_code"
+            )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
+    """The tests whose pass checked nothing in this build, with why (#1308).
+
+    Read from the build's own manifest, which holds each test's compiled SQL,
+    and from what the installed Elementary package does for the target that
+    manifest was parsed for. A project without the package has none. Best
+    effort: an unreadable manifest leaves every test counted as it was.
+    """
+
+    manifest = inputs.get("manifest")
+    project = inputs.get("project")
+    if not isinstance(manifest, dict) or project is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        runtime = elementary_mod.read(project, manifest)
+        return dict(elementary_mod.unchecked_tests(manifest, runtime)) or None
+    return None
 
 
 def _incremental_replay_inputs(
