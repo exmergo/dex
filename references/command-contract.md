@@ -566,7 +566,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      attempted them (#1114). baseline_never_built (model_built_at,
                                      rebuilt_after, row_count) is set where an input changed after
                                      the model's last build, so the verdict was computed against a
-                                     baseline no build wrote (#1387).
+                                     baseline no build wrote (#1387). A seed or snapshot the plan
+                                     changes makes it inputs_unsynchronized only where the proposed
+                                     model reads it, through any model upstream; the detail names it
+                                     and says to plan it on its own (#1429).
                                      --expect <json> | --expect-file <f> states an intended change
                                      (#1157): added and removed ("none", "any" or {"where": <row
                                      predicate over output columns, which may test a column with
