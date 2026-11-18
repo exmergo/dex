@@ -491,10 +491,9 @@ def test_a_measure_over_a_field_is_screened_through_its_columns(
     the catalog's lineage traces neither column of: the gate reads its columns
     as it does when `contact` is grouped, so the personal one is refused."""
 
-    root = _repo(
-        tmp_path,
-        orders=_with_measures(top_contact="MAX(contact)", top_place="MAX(place)"),
-    )
+    orders = _with_measures(top_contact="MAX(contact)", top_place="MAX(place)")
+    workspace["workspace"] = Workspace(definitions={"shop.metrics.orders": orders})
+    root = _repo(tmp_path, orders=orders)
     refused = _query(capsys, root, "orders.top_contact")
     assert refused["status"] == "error"
     assert refused["reason"] == "guard", refused
@@ -522,7 +521,9 @@ def test_a_source_named_partially_is_priced_by_its_inventory_entry(
         return estimate(self, identifiers)
 
     monkeypatch.setattr(DatabricksAdapter, "relations_estimate", spy)
-    root = _repo(tmp_path, orders={**ORDERS, "source": "core.orders"})
+    orders = {**ORDERS, "source": "core.orders"}
+    workspace["workspace"] = Workspace(definitions={"shop.metrics.orders": orders})
+    root = _repo(tmp_path, orders=orders)
     envelope = _query(capsys, root, "orders.order_count", confirm=False)
 
     assert envelope["status"] == "needs_confirmation", envelope["errors"]
