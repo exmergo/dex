@@ -182,3 +182,54 @@ def test_check_without_project_skips_semantic_with_warning(dex, tmp_path):
     warnings = " ".join(payload["warnings"])
     assert "semantic axis skipped" in warnings
     assert "metadata-only" in warnings
+
+
+def test_removed_source_declaration_is_not_flagged_dangling(maintain_repo):
+    """Removing a source declaration omits dangling_source on check (#1383)."""
+    sources_yml = maintain_repo.root / "models" / "staging" / "_dex_sources.yml"
+    sources_yml.write_text(
+        "version: 2\n"
+        "\n"
+        "sources:\n"
+        "  - name: main\n"
+        "    schema: main\n"
+        "    tables:\n"
+        "      - name: customers\n"
+        "      - name: orders\n"
+        "      - name: unpopulated\n",
+        encoding="utf-8",
+    )
+    maintain_repo.snapshot()
+
+    rc, payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0 and payload["status"] == "ok"
+    findings = payload["data"]["findings"]
+    dangling = [f for f in findings if f["code"] == "dangling_source"]
+    assert len(dangling) == 1
+    assert dangling[0]["identifier"] == "main.unpopulated"
+
+    sources_yml.write_text(
+        "version: 2\n"
+        "\n"
+        "sources:\n"
+        "  - name: main\n"
+        "    schema: main\n"
+        "    tables:\n"
+        "      - name: customers\n"
+        "      - name: orders\n",
+        encoding="utf-8",
+    )
+
+    rc, payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0 and payload["status"] == "ok"
+    findings = payload["data"]["findings"]
+    dangling = [f for f in findings if f["code"] == "dangling_source"]
+    assert dangling == []
+
+    maintain_repo.sql("DROP TABLE orders")
+    rc, payload = maintain_repo.dex("maintain", "check")
+    assert rc == 0 and payload["status"] == "ok"
+    findings = payload["data"]["findings"]
+    dangling = [f for f in findings if f["code"] == "dangling_source"]
+    assert len(dangling) == 1
+    assert dangling[0]["identifier"] == "main.orders"
