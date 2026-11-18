@@ -124,6 +124,7 @@ def test_demo_names_no_paradigm_because_it_resolved_no_connector(capsys):
         # which is a different state from priced-and-unknowable.
         "estimate_quality": None,
         "unit": None,
+        "unpriced": None,
     }
 
 
