@@ -1,0 +1,261 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "Dex",
+  "description": "Documentation for Dex, the agent-native analytics engineering toolkit by Exmergo: explore a warehouse, transform a dbt project, and maintain it as the data changes.",
+  "colors": {
+    "primary": "#2563eb",
+    "light": "#60a5fa",
+    "dark": "#2563eb"
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "favicon": "/favicon.svg",
+  "fonts": {
+    "heading": {
+      "family": "IBM Plex Sans",
+      "weight": 600
+    },
+    "body": {
+      "family": "IBM Plex Sans"
+    }
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "background": {
+    "color": {
+      "light": "#f5f4ef",
+      "dark": "#0b1220"
+    }
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs",
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "github-dark-dimmed"
+      }
+    }
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "thumbnails": {
+    "appearance": "dark",
+    "background": "/images/og-background.png",
+    "fonts": {
+      "family": "IBM Plex Sans"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "quickstart",
+              "installation",
+              "connect"
+            ],
+            "icon": "rocket"
+          },
+          {
+            "group": "Workflows",
+            "pages": [
+              "guides/explore",
+              "guides/transform",
+              "guides/maintain",
+              "guides/semantic-layer"
+            ],
+            "icon": "workflow"
+          },
+          {
+            "group": "Tutorials and help",
+            "pages": [
+              "guides/ossie-semantic-layer",
+              "guides/troubleshooting"
+            ],
+            "icon": "life-buoy"
+          }
+        ],
+        "icon": "book-open"
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "CLI",
+            "pages": [
+              "cli/overview",
+              "cli/init",
+              "cli/connect",
+              "cli/explore",
+              "cli/transform",
+              "cli/semantic",
+              "cli/maintain",
+              "cli/config",
+              "cli/demo",
+              "cli/procedure",
+              "cli/feedback"
+            ],
+            "icon": "terminal"
+          },
+          {
+            "group": "Connectors",
+            "pages": [
+              "connectors/duckdb",
+              "connectors/bigquery",
+              "connectors/snowflake",
+              "connectors/databricks",
+              "connectors/redshift",
+              "connectors/postgres",
+              "connectors/clickhouse",
+              "connectors/trino"
+            ],
+            "icon": "database"
+          },
+          {
+            "group": "Safety and spending",
+            "pages": [
+              "guardrails/cost-controls",
+              "guardrails/pii-policy",
+              "guardrails/values-free-mode"
+            ],
+            "icon": "shield-check"
+          },
+          {
+            "group": "Project and exploration",
+            "pages": [
+              "concepts/source-of-truth",
+              "concepts/methodology",
+              "concepts/dbt-project"
+            ],
+            "icon": "compass"
+          },
+          {
+            "group": "Semantic layer compatibility",
+            "pages": [
+              "semantic-layers/dex-semantics",
+              "semantic-layers/overview",
+              "semantic-layers/ossie",
+              "semantic-layers/cube",
+              "semantic-layers/databricks-metric-views",
+              "semantic-layers/snowflake-semantic-views"
+            ],
+            "icon": "layers"
+          },
+          {
+            "group": "Integration contracts",
+            "pages": [
+              "reference/command-contract",
+              "reference/project-formats",
+              "reference/storage-backends",
+              "reference/host-integration"
+            ],
+            "icon": "file-code"
+          },
+          {
+            "group": "Project quality",
+            "pages": [
+              "reference/evaluation"
+            ],
+            "icon": "badge-check"
+          }
+        ],
+        "icon": "square-terminal"
+      },
+      {
+        "tab": "Changelog",
+        "pages": [
+          "changelog"
+        ],
+        "icon": "history"
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Discord",
+        "href": "https://trydex.ai/discord?ref=docs"
+      },
+      {
+        "label": "Dex Enterprise",
+        "href": "https://trydex.ai/enterprise"
+      }
+    ],
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/exmergo/dex"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/exmergo/dex",
+      "x": "https://x.com/exmergo",
+      "linkedin": "https://www.linkedin.com/company/exmergo/",
+      "discord": "https://trydex.ai/discord?ref=docs",
+      "website": "https://trydex.ai"
+    }
+  },
+  "seo": {
+    "indexing": "navigable",
+    "metatags": {
+      "canonical": "https://docs.trydex.ai",
+      "og:site_name": "Dex",
+      "twitter:site": "@exmergo"
+    }
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "claude",
+      "chatgpt",
+      "perplexity",
+      "mcp",
+      "add-mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "integrations": {
+    "ga4": {
+      "measurementId": "G-D0VN4G61JD"
+    }
+  },
+  "search": {
+    "prompt": "Search the Dex docs"
+  },
+  "redirects": [
+    {
+      "source": "/cli",
+      "destination": "/cli/overview"
+    },
+    {
+      "source": "/reference",
+      "destination": "/reference/command-contract"
+    },
+    {
+      "source": "/dex",
+      "destination": "/"
+    },
+    {
+      "source": "/dex/:slug*",
+      "destination": "/:slug*"
+    }
+  ],
+  "errors": {
+    "404": {
+      "redirect": false,
+      "title": "Page not found",
+      "description": "Search the docs, or start from the [home page](/)."
+    }
+  }
+}
