@@ -236,8 +236,14 @@ anywhere else:
 - **Read `vendor_params` before trusting a metric.** A window or `partition`
   measure is listed as `derived` with its spec there, and is not modelled. The
   view's `filter` is on every metric's `filter`.
-- **`query` and `values` refuse until #964.** Use `explore profile` and
+- **`query` and `values` run on the Databricks connector only** (#1362). One
+  view per query; `query` needs at least one measure, while `values` reads a
+  field alone and takes `--metric` only to scope it. A window or `partition`
+  measure, a view declaring `parameters` or a `materialization`, and a measure in
+  `--where` are refused by name. On any other connector, use `explore profile` and
   `explore query` on the relations the catalog names.
+- **The answer is the deployment's.** The deployed view is found by its file's
+  stem and not yet compared with the file (#1363); relay the note that says so.
 - **A `rely` key is a claim Databricks never checks.** A wrong one returns wrong
   numbers silently, so `explore profile --use-project` and `maintain grain`
   measure it; a duplicate there is a finding to report.

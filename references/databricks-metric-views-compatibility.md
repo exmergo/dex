@@ -38,7 +38,7 @@ than as every view changing.
 
 Reading the layer installs no Databricks package and opens no workspace
 connection. The `[databricks]` extra is the warehouse connector. Only a governed
-query (#964) needs it.
+query (#1362) needs it.
 
 ## The YAML body is read; the DDL is not
 
@@ -250,16 +250,52 @@ A Metric View has no time grains: a time bucket is a field's own SQL
 A Metric View has no metadata block a Dex declaration (`meta.dex`) could live in,
 so `declaration` is never carried from this layer.
 
-## `query` and `values` are not available yet
+## `query` and `values` run on the Databricks connector
 
-A governed Metric View query is SQL over the view with `MEASURE()`, executed by
-Dex through the Databricks connector under the cost guard. That is #964. Until
-then:
+A governed Metric View query is SQL over the deployed view with `MEASURE()`,
+rendered by Dex and executed through its own Databricks connector under the cost
+guard (#1362):
 
-- `explore semantic query` refuses by name.
-- `explore semantic values` resolves the token and runs the values PII gate
-  first, so a personal field is refused as PII before it is refused for want of a
-  runtime.
+```sql
+SELECT `order_status` AS `orders.order_status`, MEASURE(`revenue`) AS `orders.revenue`
+FROM `main`.`sales`.`orders`
+WHERE (`priority` = '1-URGENT')
+GROUP BY ALL
+LIMIT 51
+```
+
+- Tokens are `view.field` and `view.measure`, one view per query, with at least
+  one measure. A `ratio` or `derived` measure is selected through `MEASURE()`, so
+  Databricks composes it, and the view's `filter` is Databricks' to apply.
+- A grain suffix (`orders.order_date__month`) renders `DATE_TRUNC('MONTH', ...)`
+  over a field whose `format` is `date` or `date_time`. A grain on any other
+  field, and a bare `--grain`, are refused.
+- `--where` is a Databricks predicate over the view's fields. A measure, a
+  `MEASURE()` call, a name that is not a field, a subquery, an aggregate, a window
+  or a placeholder is refused rather than screened by half.
+- Refused by name before anything is sent: a window or `partition` measure (or a
+  measure reading one), a view declaring `parameters` or a `materialization`, and
+  two views in one query.
+- The PII gate screens every grouped and filtered field, and every column a
+  value-returning measure (`MIN`, `MAX`, `ANY_VALUE`, `COLLECT_LIST`, ...) reads,
+  through `MEASURE()` at any depth, a field a measure reads included.
+  `values` screens its field before the connector is checked, so a personal
+  field is refused as PII anywhere. The lineage it screens is the repository
+  file's: a column only the deployed definition reads is not screened until the
+  deployment is compared with the file (#1363).
+- The deployed view is found by its file's stem among the Metric Views the
+  source allowlist holds, with a warehouse-free Unity Catalog listing: one defined
+  only in the repository is refused, and one in two allowlisted schemas is
+  refused until `--scope` narrows it. Its definition is not yet compared with the
+  file (#1363), and every result says so.
+- Databricks keeps no size for a Metric View, so the statement is priced from the
+  base tables the request reaches (the view's `source`, every table a query
+  source reads, and each join a member reads through), with the startup floor
+  when the warehouse is stopped. A base table outside the scoped inventory is
+  refused, since it could not be priced. The base tables are read from the
+  repository file, so one only the deployed definition reads is neither priced
+  nor refused until #1363.
+- Any other connector is refused by name.
 
 ## What `maintain` makes of the layer
 

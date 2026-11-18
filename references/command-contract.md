@@ -2107,7 +2107,13 @@ MEASURE(b)` a `ratio` and any other composition `derived`, with the view's
 `--for-dimension` answers. Entities and time grains are declared `unavailable`;
 each join's key pairs and arity, and each `rely.at_most_one_match` key on the
 joined table, reach `explore` through the declaration channel at confidence 1.0.
-`query` and `values` refuse by name until #964, `values` after the PII gate.
+`query` and `values` run governed on the Databricks connector (#1362): dex
+renders `SELECT ... MEASURE(<measure>) ... FROM <deployed view> GROUP BY ALL`
+from the catalog, finds the deployed view by its file's stem with a
+warehouse-free Unity Catalog listing, prices the statement from the base tables
+the request reaches, and executes it through its own connector under
+`STATEMENT_TIMEOUT`; `values` runs the PII gate first. The deployed definition
+is not yet compared with the file (#1363), and every result says so.
 `semantic databricks define|update|plan` authors the files through a stored plan,
 never deploying them, and a declared dbt mart derives a view of its own (see
 `transform plan` above).
