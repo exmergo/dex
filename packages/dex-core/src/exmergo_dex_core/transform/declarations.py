@@ -271,47 +271,131 @@ def _version_sql_path(
     return item.file
 
 
-def _parse_version(v: str) -> tuple[int, ...] | None:
-    try:
-        parts: list[int] = []
-        for segment in v.split("."):
-            digits = "".join(c for c in segment if c.isdigit())
-            if not digits:
-                break
-            parts.append(int(digits))
-        return tuple(parts) if parts else None
-    except Exception:
-        return None
+_SEMVER_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?"
+    r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?"
+    r"(?:\+[0-9A-Za-z.-]+)?$"
+)
 
 
-def _elementary_sampling_warning(runtime: Any) -> str | None:
-    if runtime.materialization != "elementary":
+def _is_below_0_20(release: str | None) -> bool | None:
+    """Whether Elementary release ``release`` is strictly below 0.20.0.
+
+    Returns ``None`` when ``release`` is absent or cannot be parsed as a
+    supported version format.
+    """
+    if not release:
         return None
-    v = _parse_version(runtime.release) if runtime.release else None
-    if runtime.release is not None and v is not None:
-        if v < (0, 20, 0):
-            return (
-                f"installed Elementary release {runtime.release} ignores "
-                "disable_test_samples; upgrade the package to 0.20.0 or later, or "
-                "set test_sample_row_count: 0 for the project"
+    match = _SEMVER_RE.match(release.strip())
+    if not match:
+        return None
+    major = int(match.group("major"))
+    minor = int(match.group("minor"))
+    patch = int(match.group("patch") or 0)
+    prerelease = match.group("prerelease") is not None
+
+    triplet = (major, minor, patch)
+    return triplet < (0, 20, 0) or (triplet == (0, 20, 0) and prerelease)
+
+
+def _elementary_sampling_warning(
+    view: DbtProjectView,
+    files: Mapping[str, str],
+) -> str | None:
+    """A warning if Elementary's test materialization runs and ignores sampling.
+
+    ``None`` when Elementary is not installed, when dbt's materialization is
+    confirmed, or when the installed package is 0.20.0 or later.
+    """
+    from . import elementary
+    from .package_overrides import _installed
+
+    root = Path(view.root)
+    installed_packages: set[str] = set()
+    release: str | None = None
+    with contextlib.suppress(Exception):
+        for name, directory, _ in _installed(root):
+            installed_packages.add(name)
+            if name == elementary.PACKAGE:
+                own_yml = directory / "dbt_project.yml"
+                if own_yml.is_file():
+                    with contextlib.suppress(Exception):
+                        own = yaml.safe_load(own_yml.read_text(encoding="utf-8"))
+                        if isinstance(own, dict) and own.get("version") is not None:
+                            release = str(own["version"])
+
+    project_yml_text = files.get("dbt_project.yml")
+    if project_yml_text is None:
+        with contextlib.suppress(Exception):
+            project_yml_text = (root / "dbt_project.yml").read_text(encoding="utf-8")
+
+    manifest = view.manifest
+    if manifest is None:
+        from ..dbt_project import manifest_file
+
+        with contextlib.suppress(Exception):
+            compiled = manifest_file(view.root)
+            if compiled.is_file():
+                manifest = json.loads(compiled.read_text(encoding="utf-8"))
+
+    materialization = None
+    if manifest and isinstance(manifest, Mapping):
+        with contextlib.suppress(Exception):
+            runtime = elementary.resolve(
+                manifest,
+                project_yml_text,
+                release=release,
+                installed_packages=installed_packages or None,
             )
+            if runtime.installed:
+                materialization = runtime.materialization
+                if runtime.release:
+                    release = runtime.release
+
+    if materialization is None:
+        if elementary.PACKAGE not in installed_packages:
+            return None
+        project = elementary._project_config(project_yml_text)
+        models_cfg = project.get("models")
+        if isinstance(models_cfg, Mapping):
+            elem_cfg = models_cfg.get(elementary.PACKAGE)
+            if isinstance(elem_cfg, Mapping):
+                enabled = elem_cfg.get("+enabled", elem_cfg.get("enabled", True))
+                if enabled is False:
+                    return None
+
+        has_shim = False
+        for path, content in files.items():
+            if (
+                any(path.startswith(mp + "/") for mp in view.macro_paths)
+                and "materialization test" in content
+                and elementary.PACKAGE in content
+            ):
+                has_shim = True
+                break
+
+        if not elementary._override_flag(project) or has_shim:
+            materialization = "elementary"
+        else:
+            return None
+
+    if materialization != "elementary":
         return None
-    return (
-        "could not tell the installed Elementary release; releases below 0.20.0 "
-        "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
-        "set test_sample_row_count: 0 for the project"
-    )
 
-
-def _renders_unsampled_tests(declaration: Declaration) -> bool:
-    if declaration.grain and len(declaration.grain) == 1:
-        return True
-    for col in declaration.columns.values():
-        if col.null_rule is not None and col.null_rule.strip().lower() == "never":
-            return True
-        if col.references is not None:
-            return True
-    return False
+    below = _is_below_0_20(release)
+    if below is True and release is not None:
+        return (
+            f"installed Elementary release {release} ignores "
+            "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+            "set test_sample_row_count: 0 for the project"
+        )
+    if below is None:
+        return (
+            "could not tell the installed Elementary release; releases below 0.20.0 "
+            "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
+            "set test_sample_row_count: 0 for the project"
+        )
+    return None
 
 
 # --- the whole pass -------------------------------------------------------------
@@ -350,6 +434,7 @@ def apply_declarations(
             _check(declaration, files, view, cache=cache, pii_overrides=pii_overrides)
         )
 
+    initial_files = dict(files)
     rendered: dict[str, str] = {}
     for declaration in declarations:
         sql_path = model_sql_path(files, view.model_paths, declaration.model)
@@ -385,19 +470,13 @@ def apply_declarations(
                 PlanEdit(path=path, kind=EditKind.SCHEMA_YML, new_content=content)
             )
 
-    if any(_renders_unsampled_tests(d) for d in declarations):
-        from . import elementary
-
-        manifest = view.manifest
-        if manifest is None:
-            from ..dbt_project import manifest_file
-
-            compiled = manifest_file(view.root)
-            if compiled.is_file():
-                with contextlib.suppress(Exception):
-                    manifest = json.loads(compiled.read_text(encoding="utf-8"))
-        runtime = elementary.read(view.root, manifest or {})
-        warn = _elementary_sampling_warning(runtime)
+    flagged_test_added = any(
+        files[path].count("disable_test_samples: true")
+        > (initial_files.get(path) or "").count("disable_test_samples: true")
+        for path in rendered
+    )
+    if flagged_test_added:
+        warn = _elementary_sampling_warning(view, files)
         if warn is not None and warn not in warnings:
             warnings.append(warn)
 

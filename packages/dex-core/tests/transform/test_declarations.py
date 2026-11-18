@@ -1281,6 +1281,22 @@ def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owe
             ),
         ),
         (
+            "0.20.0-rc.1",
+            "elementary",
+            True,
+            (
+                "installed Elementary release 0.20.0-rc.1 ignores "
+                "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+                "set test_sample_row_count: 0 for the project"
+            ),
+        ),
+        (
+            "0.20.0",
+            "elementary",
+            False,
+            None,
+        ),
+        (
             "0.26.1",
             "elementary",
             False,
@@ -1294,6 +1310,16 @@ def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owe
         ),
         (
             None,
+            "elementary",
+            True,
+            (
+                "could not tell the installed Elementary release; releases "
+                "below 0.20.0 ignore disable_test_samples; upgrade the package "
+                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            ),
+        ),
+        (
+            "unknown-build-42",
             "elementary",
             True,
             (
@@ -1380,3 +1406,127 @@ def test_elementary_sampling_warning_not_emitted_when_no_unsampled_tests_rendere
     )
     _edits, warnings = apply_declarations(parsed, view, [])
     assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_no_warning_when_existing_plain_tests_are_preserved(tmp_path: Path):
+    """Preserving plain unique/not_null tests adds no flag, so emit no warning."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    schema_with_plain_tests = (
+        "version: 2\nmodels:\n  - name: fct_orders\n    columns:\n"
+        "      - name: order_id\n        data_tests: [unique, not_null]\n"
+    )
+    project_files = _project()
+    project_files["models/marts/fct_orders.yml"] = schema_with_plain_tests
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_warning_when_no_manifest_available(tmp_path: Path):
+    """Detect Elementary 0.16.4 from packages when manifest is absent."""
+    from tests.transform.test_elementary import _write, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=None,
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)
+
+    # Variant b: flag is true, so dbt materialization is confirmed even without manifest
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="true"))
+    _edits_b, warnings_b = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings_b)
+
+
+def test_malformed_manifest_does_not_abort_declarations(tmp_path: Path):
+    """A malformed manifest does not raise; declarations are safely rendered."""
+    from tests.transform.test_elementary import _write, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest={"nodes": ["invalid"]},
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    edits, _warnings = apply_declarations(parsed, view, [])
+    assert len(edits) > 0
+
+
+def test_warning_uses_proposed_project_config(tmp_path: Path):
+    """The check evaluates the configuration proposed by edits in the plan."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="true"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    # Plan includes an edit changing flag to false
+    proposed_edit = PlanEdit(
+        path="dbt_project.yml",
+        kind=EditKind.PROJECT_YML,
+        new_content=project_yml(flag="false"),
+    )
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [proposed_edit])
+    assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)
