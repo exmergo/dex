@@ -92,6 +92,32 @@ information for the user, not an error to fix.
 
 Unnested JSON and array outputs inherit the source column's flags.
 
+### Elementary's schema
+
+The Elementary dbt package writes source values into its own schema, in columns
+whose names give no sign of it (#1310). The firewall holds them whatever the
+cache flagged, and a `pii_overrides` entry does not clear them, since they are
+held for where their values come from:
+
+- `result_row` (`test_result_rows`) and `result_rows` (`elementary_test_results`
+  and the `alerts_*` views): a test's failing rows, serialized. Held at the
+  blocking threshold; a measuring aggregate over them runs.
+- `dimension_value` (`data_monitoring_metrics`, `metrics_anomaly_score`): the raw
+  values of whichever column each row's `dimension` names. It carries the flags
+  of the columns the SELECT that reads the table bounds its rows to, with a
+  top-level `dimension = '<column>'` or `dimension IN (...)` over string literals,
+  each name taking the flags of every profiled column of that name. With no such
+  bound, or a name no profiled column carries, it is held: rows a removed
+  monitoring test wrote stay in the table.
+- A relation in a schema named `elementary` or `*_elementary` that is none of the
+  package's models (a test's whole result, written there with
+  `tests_use_temp_tables`) is refused as a whole, a count included.
+
+`explore profile` records no minimum, maximum or value domain for any of these.
+The models are recognised by name in any schema; the schema rule reads the
+schema's name, so a project that gives the package another schema name gets the
+column rules only.
+
 ## Protected values and transformation columns
 
 A refusal to return protected values to an agent does not instruct it to remove,

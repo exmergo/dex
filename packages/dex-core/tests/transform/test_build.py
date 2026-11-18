@@ -4716,3 +4716,114 @@ def test_a_failed_build_message_never_carries_the_value_a_cast_failed_on():
         )
     )
     assert stderr_only == ["Bad int64 value: <value withheld>"]
+
+
+def _write_elementary_artifacts(project: Path) -> None:
+    """A pricing compile's artifacts for a project with Elementary enabled: its
+    hooks declared, an anomaly test and dbt's own test selected (#1309)."""
+
+    from .test_elementary import _built
+
+    built = _built()
+    built["nodes"]["model.shop.fct"].update(
+        compiled_code="select 1", config={"materialized": "table"}
+    )
+    dex_target(project).mkdir(parents=True, exist_ok=True)
+    (dex_target(project) / "manifest.json").write_text(
+        json.dumps(built), encoding="utf-8"
+    )
+    (dex_target(project) / "run_results.json").write_text(
+        json.dumps({"results": [{"unique_id": uid} for uid in built["nodes"]]}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_a_billed_build_names_the_elementary_work_it_does_not_price(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch, confirmed
+):
+    """The ask, and a refusal over the ceiling, both say the estimate is a floor:
+    in ``cost.unpriced`` by code, and in a warning per kind of work. The
+    project's own flag is unset, so dbt keeps its own test materialization and
+    no per-test extras are owed."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"fct": 7_000_000_000.0},
+        confirmed=confirmed,
+        ceiling=10_000_000_000 if not confirmed else 5_000_000_000,
+    )
+    _write_elementary_artifacts(bigquery_project_dir)
+    budget = "10000000000" if not confirmed else "5000000000"
+    _rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            *(["--confirm"] if confirmed else []),
+            "--budget",
+            budget,
+        ],
+        capsys,
+    )
+    codes = ["elementary_hooks", "elementary_monitoring_tests"]
+    assert envelope["cost"]["unpriced"] == codes
+    if confirmed:
+        assert envelope["status"] == "error"
+        return
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["data"]["unpriced"]["work"] == codes
+    assert envelope["data"]["unpriced"]["monitoring_tests"][1] == {
+        "name": "volume",
+        "days_back": 14,
+        "days_back_source": "default",
+    }
+    notes = " ".join(envelope["data"]["notes"])
+    assert "on-run-start and on-run-end hooks run" in notes
+    assert "volume over 14 days" in notes
+    assert "test materialization" not in notes
+
+
+def test_a_billed_build_without_elementary_claims_nothing_unpriced(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"stg_events": 6_000_000_000.0, "dim_customers": 1_000_000_000.0},
+        confirmed=False,
+        ceiling=10_000_000_000,
+    )
+    _write_incremental_artifacts(bigquery_project_dir)
+    _rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "10000000000",
+        ],
+        capsys,
+    )
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["cost"]["unpriced"] is None
+    assert "unpriced" not in envelope["data"]

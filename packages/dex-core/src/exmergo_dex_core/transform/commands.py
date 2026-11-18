@@ -6144,7 +6144,15 @@ def _build_project(
         ),
         impact=impact,
     )
+    unpriced = None
     if estimate is not None:
+        # The estimate prices compiled nodes, and the Elementary package runs
+        # work no node shows (#1309); read off the pricing compile's artifacts,
+        # so it answers for the build's own target and selection.
+        from .build import unpriced_elementary_work
+
+        unpriced = unpriced_elementary_work(checkout, artifacts_dir)
+        price_notes = [*price_notes, *unpriced.warnings()]
         command_args.billed_handshake(
             "transform build",
             adapter,
@@ -6152,6 +6160,7 @@ def _build_project(
             per_table=per_node or None,
             notes=price_notes or None,
             upper_bounds=upper_bounds or None,
+            unpriced=unpriced.as_dict() if unpriced.codes else None,
         )
     try:
         summary, cost = run_build(
@@ -6176,6 +6185,9 @@ def _build_project(
             full_refresh=full_refresh,
         )
         logged_id = summary.pop("logged_invocation_id", None)
+        if unpriced is not None and unpriced.codes:
+            cost.unpriced = unpriced.codes
+            summary["unpriced"] = unpriced.as_dict()
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
         # why the confirm ask carries no number. `billed_handshake` never ran on

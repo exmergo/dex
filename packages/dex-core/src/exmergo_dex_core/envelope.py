@@ -114,6 +114,12 @@ class Cost(BaseModel):
     :attr:`EstimateQuality.UNKNOWN` means pricing was attempted and produced no
     number. A host that collapses the two admits an unpriced build believing it
     was priced.
+
+    ``unpriced`` names, by code, work the command will run that ``estimate``
+    leaves out, so any entry makes the estimate a floor rather than the whole
+    cost (#1309: the Elementary package's hooks, monitoring tests and per-test
+    extras, which a build priced from its compiled nodes cannot see). ``None``
+    claims nothing either way, which is every command but a build.
     """
 
     # `validate_assignment` so the derivation below also runs when a field is
@@ -127,6 +133,7 @@ class Cost(BaseModel):
     ceiling: float | None = None
     estimate_quality: EstimateQuality | None = None
     unit: str | None = None
+    unpriced: list[str] | None = None
 
     @model_validator(mode="after")
     def _unit_follows_paradigm(self) -> Cost:

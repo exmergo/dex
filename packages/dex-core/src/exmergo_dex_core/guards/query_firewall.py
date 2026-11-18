@@ -55,7 +55,7 @@ from ..cache import (
 )
 from ..config import QueryLimits
 from ..errors import DexError
-from . import PII_BLOCK_CONFIDENCE
+from . import PII_BLOCK_CONFIDENCE, elementary_values
 from .sql_guard import NotSelectOnlyError, assert_select_only
 from .sql_guard import function_name as _func_name
 
@@ -309,6 +309,10 @@ class _Taint(NamedTuple):
     identifier: str
     column: str
     category: PIICategory
+    #: Why the column is held whatever the cache says (#1310): set on the
+    #: columns of Elementary's schema that hold source rows, which no
+    #: `pii_overrides` entry clears. ``None`` for a cache flag.
+    protected: str | None = None
 
 
 _Outputs = dict[str, set[_Taint]]
@@ -525,6 +529,9 @@ def inspect_query(
         (t for t in flagged if t.confidence >= PII_BLOCK_CONFIDENCE),
         key=lambda t: t.label,
     )
+    held = [t for t in blocking if t.protected]
+    if held:
+        raise QueryRefusedError(_held_message(held, blocking))
     offending = [t.label for t in blocking]
     if offending:
         message = (
@@ -572,6 +579,173 @@ def inspect_query(
         tables=sorted(tables),
         warnings=warnings,
     )
+
+
+def _held_message(held: list[_Taint], blocking: list[_Taint]) -> str:
+    """The refusal for a projection of Elementary's row values (#1310)."""
+
+    reasons = sorted({t.protected for t in held if t.protected})
+    message = (
+        "the projection would carry source values the Elementary package wrote "
+        "into its schema: "
+        + "; ".join(t.label for t in held)
+        + ". "
+        + " ".join(reasons)
+        + " Use a measuring aggregate over them (COUNT, COUNTIF, "
+        "APPROX_COUNT_DISTINCT, AVG(LENGTH(...))), or drop them from the output. "
+        "A pii_overrides entry does not clear these columns: they are held for "
+        "where their values come from, not for their names."
+    )
+    others = [t.label for t in blocking if not t.protected]
+    if others:
+        message += (
+            " The projection also carries PII-flagged column(s): "
+            + "; ".join(others)
+            + "."
+        )
+    return message
+
+
+_ROW_VALUES = (
+    "Elementary stores failing rows of a test there, serialized, which can hold "
+    "any value of the tested model."
+)
+_DIMENSION_UNBOUNDED = (
+    "dimension_value holds the raw values of whichever column each row's "
+    "dimension names, so it carries their flags only where the SELECT that "
+    "reads the table bounds its rows to named dimensions: add WHERE "
+    "dimension = '<column>' (or IN (...)) there, naming columns dex has "
+    "profiled."
+)
+
+
+def _held_dimension(identifier: str, table: str) -> _Taint:
+    return _Taint(
+        f"{table}.dimension_value (a monitored dimension's raw values)",
+        PII_BLOCK_CONFIDENCE,
+        identifier,
+        elementary_values.DIMENSION_VALUE_COLUMN,
+        PIICategory.OTHER,
+        _DIMENSION_UNBOUNDED,
+    )
+
+
+def _named_dimensions(
+    select: exp.Select, alias: str, only_source: bool
+) -> set[str] | None:
+    """The dimension columns the select's WHERE bounds ``alias``'s rows to.
+
+    Read from the top-level conjuncts ``dimension = '<lit>'`` and ``dimension
+    IN ('<lit>', ...)``, the column bare where the table is the select's only
+    source, or qualified by ``alias``. A row's ``dimension`` joins several
+    columns with ``"; "`` (``dimension_monitoring_query``), so each literal is split
+    there. ``None`` where nothing bounds them: any other shape, including a
+    function over the column, leaves the rows unbounded.
+    """
+
+    where = select.args.get("where")
+    if where is None:
+        return None
+    clause = where.this
+    conjuncts = list(clause.flatten()) if isinstance(clause, exp.And) else [clause]
+
+    def is_dimension(node: exp.Expression) -> bool:
+        if not isinstance(node, exp.Column) or node.name.lower() != "dimension":
+            return False
+        qualifier = node.table.lower() if node.table else ""
+        return qualifier == alias if qualifier else only_source
+
+    def literal(node: exp.Expression) -> str | None:
+        if isinstance(node, exp.Literal) and node.is_string:
+            return node.this
+        return None
+
+    bound: set[str] | None = None
+    for conjunct in conjuncts:
+        values: list[str | None] | None = None
+        if isinstance(conjunct, exp.EQ):
+            if is_dimension(conjunct.this):
+                values = [literal(conjunct.expression)]
+            elif is_dimension(conjunct.expression):
+                values = [literal(conjunct.this)]
+        elif (
+            isinstance(conjunct, exp.In)
+            and is_dimension(conjunct.this)
+            and not conjunct.args.get("query")
+        ):
+            values = [literal(e) for e in conjunct.expressions]
+        if values is None:
+            continue
+        if not values or any(v is None for v in values):
+            return None
+        names = {
+            part.strip().lower()
+            for v in values
+            if v is not None
+            for part in v.split(";")
+            if part.strip()
+        }
+        bound = names if bound is None else bound & names
+    return bound
+
+
+def _dimension_taint(
+    known: dict[str, Dataset], names: set[str], identifier: str, table: str
+) -> set[_Taint]:
+    """The flags a ``dimension_value`` bounded to ``names`` carries.
+
+    A row's ``dimension`` names a column, not the relation it came from, and
+    rows a test since removed wrote stay in the table, so each name takes the
+    flags of every profiled column of that name outside the package's own
+    tables. A name no profiled column carries leaves the value held.
+    """
+
+    taint: set[_Taint] = set()
+    for name in names:
+        found = False
+        for dataset in known.values():
+            if elementary_values.documented(
+                dataset.identifier
+            ) or elementary_values.in_elementary_schema(dataset.identifier):
+                continue
+            for col in dataset.columns:
+                if col.name.lower() == name:
+                    found = True
+                    taint |= _column_taint(dataset, col.name)
+        if not found:
+            return {_held_dimension(identifier, table)}
+    return taint
+
+
+def _bound_dimension_values(
+    select: exp.Select, sources: dict[str, _Source], known: dict[str, Dataset]
+) -> dict[str, _Source]:
+    """Each of Elementary's tables read here, its ``dimension_value`` carrying
+    the flags of the dimensions this select bounds its rows to (#1310)."""
+
+    bound = dict(sources)
+    for alias, source in sources.items():
+        if not isinstance(source, Dataset) or not any(
+            elementary_values.dimension_value_column(source.identifier, c.name)
+            for c in source.columns
+        ):
+            continue
+        table = _table(source)
+        names = _named_dimensions(select, alias, len(sources) == 1)
+        dimension = (
+            _dimension_taint(known, names, source.identifier, table)
+            if names
+            else {_held_dimension(source.identifier, table)}
+        )
+        bound[alias] = {
+            c.name.lower(): (
+                set(dimension)
+                if elementary_values.dimension_value_column(source.identifier, c.name)
+                else _column_taint(source, c.name)
+            )
+            for c in source.columns
+        }
+    return bound
 
 
 # --- taint analysis ------------------------------------------------------------
@@ -691,7 +865,9 @@ def _select_outputs(
 ) -> _Outputs:
     env = dict(outer_env)
 
-    sources = _resolve_sources(select, env, known, tables, dialect)
+    sources = _bound_dimension_values(
+        select, _resolve_sources(select, env, known, tables, dialect), known
+    )
     _resolve_clause_subqueries(select, sources, env, known, tables, dialect, correlated)
     if correlated:
         # A correlated subquery's projection may name the enclosing query's
@@ -904,6 +1080,14 @@ def _resolve_dataset(
             f"'{dotted}' is ambiguous in the cache: {', '.join(matches)}; qualify it"
         )
     dataset = known[matches[0]]
+    if elementary_values.protected_relation(dataset.identifier):
+        raise QueryRefusedError(
+            f"'{dataset.identifier}' is in the Elementary package's schema and is "
+            "none of the package's models, so it can hold a test's whole result "
+            "(Elementary writes one there with tests_use_temp_tables): no query "
+            "reads it, not even a count. Query the package's own models instead, "
+            "such as elementary_test_results, by their aggregate columns"
+        )
     if not dataset.columns:
         raise QueryRefusedError(
             f"'{dataset.identifier}' is inventoried but not profiled; run "
@@ -922,9 +1106,29 @@ def _expand_star(source: _Source, alias: str) -> _Outputs:
     return {name: set(taint) for name, taint in source.items()}
 
 
+def _table(dataset: Dataset) -> str:
+    return dataset.identifier.rsplit(".", 1)[-1]
+
+
 def _column_taint(dataset: Dataset, column_name: str) -> set[_Taint]:
     for col in dataset.columns:
         if col.name.lower() == column_name.lower():
+            if elementary_values.row_value_column(dataset.identifier, col.name):
+                table = dataset.identifier.rsplit(".", 1)[-1]
+                return {
+                    _Taint(
+                        f"{table}.{col.name} (failing rows of a test)",
+                        PII_BLOCK_CONFIDENCE,
+                        dataset.identifier,
+                        col.name,
+                        PIICategory.FREE_TEXT,
+                        _ROW_VALUES,
+                    )
+                }
+            if elementary_values.dimension_value_column(dataset.identifier, col.name):
+                # Reached only where no select bounds the rows (see
+                # `_bound_dimension_values`), so the value is held.
+                return {_held_dimension(dataset.identifier, _table(dataset))}
             if col.pii is None:
                 return set()
             table = dataset.identifier.rsplit(".", 1)[-1]

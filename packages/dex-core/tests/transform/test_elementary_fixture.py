@@ -8,6 +8,7 @@ Elementary package from the dbt hub, so they run only with
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -495,3 +496,58 @@ def test_the_resolver_reads_variant_d_as_enabled_where_the_project_enables_it(
     assert (record.enabled, record.hooks) == (True, "run")
     assert all(record.uploads.values())
     assert not (tmp_path / "prod.duckdb").exists()
+
+
+#: The work a build's estimate leaves out on each variant (#1309): the hooks and
+#: the monitoring tests where the package runs, the per-test extras only where
+#: its materialization handles the tests.
+UNPRICED = {
+    "a": ["elementary_hooks", "elementary_monitoring_tests", "elementary_test_extras"],
+    "b": ["elementary_hooks", "elementary_monitoring_tests"],
+    "d": [],
+}
+
+
+@requires_elementary
+@pytest.mark.parametrize("variant", sorted(UNPRICED))
+def test_build_cost_names_what_each_variant_does_not_price(
+    tmp_path: Path, installed_elementary: Path, variant: str
+):
+    from exmergo_dex_core.transform.elementary import read, unpriced_work
+
+    project = elementary_project(tmp_path, variant, installed_elementary)
+    manifest = _parsed(project, "dev")
+    text = (project / "dbt_project.yml").read_text("utf-8")
+    work = unpriced_work(read(project, manifest), manifest, text)
+
+    assert work.codes == UNPRICED[variant]
+    assert len(work.warnings()) == len(UNPRICED[variant])
+    if variant != "d":
+        # The fixture's one anomaly test, at the package's default window.
+        anomaly = [t for t in work.gated_tests if t.days_back is not None]
+        assert [(t.days_back, t.days_back_source) for t in anomaly] == [(14, "default")]
+
+
+@requires_elementary
+def test_build_cost_names_nothing_for_a_project_without_the_package(
+    tmp_path: Path, installed_elementary: Path
+):
+    from exmergo_dex_core.transform.elementary import read, unpriced_work
+
+    project = elementary_project(tmp_path, "b", installed_elementary)
+    for name in ("packages.yml", "package-lock.yml"):
+        (project / name).unlink()
+    shutil.rmtree(project / "dbt_packages")
+    (project / "models" / "schema.yml").write_text(
+        "version: 2\nmodels:\n  - name: fct\n    columns:\n      - name: id\n"
+        "        data_tests: [unique, not_null]\n",
+        encoding="utf-8",
+    )
+    project_yml = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+    project_yml["models"].pop("elementary")
+    (project / "dbt_project.yml").write_text(yaml.safe_dump(project_yml), "utf-8")
+    manifest = _parsed(project, "dev")
+
+    record = read(project, manifest)
+    assert not record.installed
+    assert unpriced_work(record, manifest).codes == []

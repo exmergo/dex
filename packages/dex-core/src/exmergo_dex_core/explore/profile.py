@@ -37,6 +37,7 @@ from ..cache import (
 )
 from ..config import PIIOverrideMatcher
 from ..errors import WarehouseQueryError
+from ..guards import elementary_values
 from ..progress import ProgressReporter
 from ..semantic_types import list_element
 
@@ -986,10 +987,16 @@ def profile(
                 ):
                     overridden[c.name] = flag.category
                     prelim_pii[c.name] = None
+            # Columns of Elementary's schema that hold source rows (#1310): no
+            # minimum, maximum or value domain, whatever the name detector said.
+            withheld = elementary_values.withheld_columns(
+                identifier, (c.name for c in columns)
+            )
             safe = {
                 c.name
                 for c in columns
                 if is_min_max_safe(c.data_type, prelim_pii[c.name])
+                and c.name not in withheld
             }
             # Shape evidence is bought only for generic-name flags that still stand:
             # exact person tokens need no corroboration, and a human-cleared column
@@ -1007,6 +1014,7 @@ def profile(
                 c.name
                 for c in columns
                 if prelim_pii[c.name] is None
+                and c.name not in withheld
                 and (_is_string_type(c.data_type) or is_integer_type(c.data_type))
             }
             # Heterogeneous-key-shape checks (#205) are string-only, unlike
@@ -1015,14 +1023,18 @@ def profile(
             key_shape_stats = {
                 c.name
                 for c in columns
-                if prelim_pii[c.name] is None and _is_string_type(c.data_type)
+                if prelim_pii[c.name] is None
+                and c.name not in withheld
+                and _is_string_type(c.data_type)
             }
             # Temporal-continuity checks (#206): non-PII date/timestamp columns
             # only, same eligibility rule as above.
             temporal_stats = {
                 c.name
                 for c in columns
-                if prelim_pii[c.name] is None and is_temporal_type(c.data_type)
+                if prelim_pii[c.name] is None
+                and c.name not in withheld
+                and is_temporal_type(c.data_type)
             }
 
             # Blob-type columns can only ever yield a null fraction and a distinct
@@ -1078,6 +1090,7 @@ def profile(
                 aggregates,
                 prelim_pii,
                 composite_keys,
+                withheld=withheld,
             )
         except WarehouseQueryError as exc:
             named = exc.naming(identifier)
@@ -1586,6 +1599,8 @@ def _probe_value_domains(
     aggregates: dict[str, ColumnAggregate],
     prelim_pii: dict[str, PIIFlag | None],
     composite_keys: list[list[str]],
+    *,
+    withheld: set[str] | None = None,
 ) -> dict[str, ValueDomain]:
     """Report the value domain of a column with no PII flag at any
     confidence, a distinct count that clears both the absolute cap and the
@@ -1617,6 +1632,8 @@ def _probe_value_domains(
     for name, agg in aggregates.items():
         if prelim_pii.get(name) is not None:
             continue  # flagged at any confidence: never a domain
+        if withheld and name in withheld:
+            continue  # source rows Elementary wrote (#1310): never a domain
         if name in composite_members:
             continue
         if agg.is_unique and agg.null_fraction in (0.0, None):
