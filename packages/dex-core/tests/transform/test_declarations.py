@@ -1265,3 +1265,118 @@ def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owe
 
     files = {"snapshots/snap.sql": "{% snapshot snap %}select 1{% endsnapshot %}"}
     assert drafting._reads_snapshot_history(sql, files) is owed
+
+
+@pytest.mark.parametrize(
+    ("release", "materialization", "warns", "expected_msg"),
+    [
+        (
+            "0.16.4",
+            "elementary",
+            True,
+            (
+                "installed Elementary release 0.16.4 ignores "
+                "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+                "set test_sample_row_count: 0 for the project"
+            ),
+        ),
+        (
+            "0.26.1",
+            "elementary",
+            False,
+            None,
+        ),
+        (
+            "0.16.4",
+            "dbt",
+            False,
+            None,
+        ),
+        (
+            None,
+            "elementary",
+            True,
+            (
+                "could not tell the installed Elementary release; releases "
+                "below 0.20.0 ignore disable_test_samples; upgrade the package "
+                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            ),
+        ),
+    ],
+)
+def test_elementary_sampling_warning_when_declaring_model(
+    tmp_path: Path, release, materialization, warns, expected_msg
+):
+    """When Elementary ignores disable_test_samples on rendered tests, warn (#1381)."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    install = "dbt_packages"
+    flag = "false" if materialization == "elementary" else "true"
+    _write(tmp_path, "dbt_project.yml", project_yml(flag=flag))
+    if release is not None:
+        _write(
+            tmp_path,
+            f"{install}/elementary/dbt_project.yml",
+            f'name: elementary\nversion: "{release}"\n',
+        )
+    else:
+        _write(
+            tmp_path,
+            f"{install}/elementary/dbt_project.yml",
+            "name: elementary\n",
+        )
+
+    m = manifest(elementary=True)
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=m,
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+
+    if warns:
+        assert any("disable_test_samples" in w for w in warnings)
+        assert expected_msg in warnings
+    else:
+        assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_elementary_sampling_warning_not_emitted_when_no_unsampled_tests_rendered(
+    tmp_path: Path,
+):
+    """No warning when declarations render no tests carrying the sampling flag."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    m = manifest(elementary=True)
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=m,
+    )
+
+    # Multi-column grain renders no unique or not_null test
+    parsed = parse_declarations(
+        [{"model": "fct_orders", "grain": ["order_id", "customer_id"]}]
+    )
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings)

@@ -34,6 +34,8 @@ Three rules hold throughout:
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
@@ -269,6 +271,49 @@ def _version_sql_path(
     return item.file
 
 
+def _parse_version(v: str) -> tuple[int, ...] | None:
+    try:
+        parts: list[int] = []
+        for segment in v.split("."):
+            digits = "".join(c for c in segment if c.isdigit())
+            if not digits:
+                break
+            parts.append(int(digits))
+        return tuple(parts) if parts else None
+    except Exception:
+        return None
+
+
+def _elementary_sampling_warning(runtime: Any) -> str | None:
+    if runtime.materialization != "elementary":
+        return None
+    v = _parse_version(runtime.release) if runtime.release else None
+    if runtime.release is not None and v is not None:
+        if v < (0, 20, 0):
+            return (
+                f"installed Elementary release {runtime.release} ignores "
+                "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+                "set test_sample_row_count: 0 for the project"
+            )
+        return None
+    return (
+        "could not tell the installed Elementary release; releases below 0.20.0 "
+        "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
+        "set test_sample_row_count: 0 for the project"
+    )
+
+
+def _renders_unsampled_tests(declaration: Declaration) -> bool:
+    if declaration.grain and len(declaration.grain) == 1:
+        return True
+    for col in declaration.columns.values():
+        if col.null_rule is not None and col.null_rule.strip().lower() == "never":
+            return True
+        if col.references is not None:
+            return True
+    return False
+
+
 # --- the whole pass -------------------------------------------------------------
 
 
@@ -339,6 +384,23 @@ def apply_declarations(
             merged.append(
                 PlanEdit(path=path, kind=EditKind.SCHEMA_YML, new_content=content)
             )
+
+    if any(_renders_unsampled_tests(d) for d in declarations):
+        from . import elementary
+
+        manifest = view.manifest
+        if manifest is None:
+            from ..dbt_project import manifest_file
+
+            compiled = manifest_file(view.root)
+            if compiled.is_file():
+                with contextlib.suppress(Exception):
+                    manifest = json.loads(compiled.read_text(encoding="utf-8"))
+        runtime = elementary.read(view.root, manifest or {})
+        warn = _elementary_sampling_warning(runtime)
+        if warn is not None and warn not in warnings:
+            warnings.append(warn)
+
     return merged, warnings
 
 
