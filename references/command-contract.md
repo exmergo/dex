@@ -46,7 +46,10 @@ logic.
   an interactive caller's clock, and resolving through the shared path is what
   keeps it from warming an environment the next command would contradict.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
-  else. Diagnostics go to stderr.
+  else. Diagnostics go to stderr. That includes an argv the parser refuses (a
+  missing argument, an unknown flag or command, a bad value): a `reason: request`
+  error envelope carrying the parser's message, exit 1, with the usage on stderr.
+  Only `--help` and a bare `dex` print their own text, and exit 0.
 - Every envelope carries a constant `connection` block. On success it names the
   resolved connector, its non-secret target coordinates, and the source of that
   resolution (`flag`, `.dex/config.yml`, `environment variable`,

@@ -13,6 +13,7 @@ import pytest
 from exmergo_dex_core import envelope as env
 from exmergo_dex_core.cli import COMMAND_SURFACE, main
 from exmergo_dex_core.engine import DexEngine
+from exmergo_dex_core.session_cap import SESSION_CEILING_CAP_ENV
 
 _VALID_STATUSES = {s.value for s in env.Status}
 
@@ -96,12 +97,101 @@ def test_every_command_emits_one_valid_envelope(argv, capsys):
 
 
 def test_removed_viz_preview_is_an_unknown_command(capsys):
-    with pytest.raises(SystemExit) as exc:
-        main(["viz", "preview"])
-    assert exc.value.code == 2
+    assert main(["viz", "preview"]) == 1
     captured = capsys.readouterr()
-    assert captured.out == ""
+    assert "invalid choice: 'viz'" in json.loads(captured.out)["errors"][0]
     assert "invalid choice: 'viz'" in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv,message",
+    [
+        (
+            ["explore", "profile"],
+            "dex explore profile: error: the following arguments are required: object",
+        ),
+        (["--bogus-flag", "explore", "map"], "unrecognized arguments: --bogus-flag"),
+        (["explore"], "the following arguments are required: subcommand"),
+        (["explore", "query", "--budget", "abc", "x"], "invalid float value: 'abc'"),
+    ],
+    ids=["missing-positional", "unknown-flag", "missing-verb", "bad-type"],
+)
+def test_an_argparse_refusal_prints_one_request_envelope(
+    argv, message, tmp_path, capsys
+):
+    """An argv argparse refuses still prints exactly one envelope (#1404), so a
+    host reading stdout can tell a bad argument from a crash. The usage stays on
+    stderr for a person at a terminal."""
+
+    rc = main(["--repo-root", str(tmp_path), *argv])
+    captured = capsys.readouterr()
+    assert rc == 1
+    payload = json.loads(captured.out)
+    assert payload["status"] == "error"
+    assert payload["reason"] == "request"
+    assert message in payload["errors"][0]
+    assert "usage: dex" in captured.err
+
+
+def test_an_argparse_refusal_carries_the_bare_subcommand_tip(capsys):
+    assert main(["plan"]) == 1
+    errors = json.loads(capsys.readouterr().out)["errors"]
+    assert "invalid choice: 'plan'" in errors[0]
+    assert "subcommand 'plan' is ambiguous" in errors[1]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["semantic", "ossie", "plan", "--from-ossie", "x"],
+        ["--confirm", "profile"],
+    ],
+    ids=["group-name", "rewritten-bare-subcommand"],
+)
+def test_an_argparse_refusal_tips_only_an_ambiguous_bare_subcommand(argv, capsys):
+    """A group name, or a bare subcommand main already rewrote, was refused for
+    some other reason; a tip there would point an agent at the wrong fix."""
+
+    assert main(argv) == 1
+    captured = capsys.readouterr()
+    assert len(json.loads(captured.out)["errors"]) == 1
+    assert "did you mean" not in captured.err
+    assert "is ambiguous" not in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv,pinned",
+    [
+        (["plan"], True),
+        (["explore", "profile"], True),
+        (["--values-free", "explore"], False),
+        (["--values-fr", "explore"], False),
+    ],
+    ids=["ambiguous-verb", "missing-positional", "flag", "abbreviated-flag"],
+)
+def test_an_argparse_refusal_in_values_free_mode_states_the_mode(
+    argv, pinned, tmp_path, monkeypatch, capsys
+):
+    """Every envelope a values-free process prints carries data.result_mode
+    (#591), and a capped one the cap (#787), an argument refusal included."""
+
+    if pinned:
+        monkeypatch.setenv("DEX_RESULT_MODE", "values_free")
+    else:
+        monkeypatch.delenv("DEX_RESULT_MODE", raising=False)
+    monkeypatch.setenv(SESSION_CEILING_CAP_ENV, "5")
+    assert main(["--repo-root", str(tmp_path), *argv]) == 1
+    data = json.loads(capsys.readouterr().out)["data"]
+    assert data["result_mode"] == "values_free"
+    assert "session_ceiling_cap" in data
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["explore", "profile", "--help"]])
+def test_help_still_exits_zero_without_an_envelope(argv, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(argv)
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.startswith("usage: dex")
 
 
 def test_root_help_does_not_advertise_viz(capsys):
