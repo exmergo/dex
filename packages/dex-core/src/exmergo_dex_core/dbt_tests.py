@@ -10,7 +10,7 @@ connection.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any, NamedTuple
 
 
@@ -98,16 +98,21 @@ def incremental_unit_tests(manifest: dict, node: dict) -> list[IncrementalUnitTe
 
 
 def runs_full_build(
-    manifest: dict, node: dict, incremental: Sequence[IncrementalUnitTest]
+    manifest: dict,
+    node: dict,
+    incremental: Sequence[IncrementalUnitTest],
+    *,
+    left_out: Collection[str] = (),
 ) -> bool:
     """Whether any test of the model's own runs its full build.
 
     Compared by unique id, which is what tells one version's unit test from
     another's: a unit test that tests another version of the model, or one that
-    runs the incremental branch, does not count.
+    runs the incremental branch, does not count. Nor does a test in
+    ``left_out``, the unique ids a run keeps out of every invocation (#1307).
     """
 
-    branch = {test.unique_id for test in incremental}
+    branch = {test.unique_id for test in incremental} | set(left_out)
     units = manifest.get("unit_tests") or {}
     return any(
         unique_id not in branch

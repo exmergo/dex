@@ -296,13 +296,24 @@ def _is_elementary_materialization(manifest: Mapping[str, Any], uid: str) -> boo
     macro = macros.get(uid) or {}
     if macro.get("package_name") == PACKAGE:
         return True
-    # A root shim hands the test to the package's materialization (variant c).
-    depends = (macro.get("depends_on") or {}).get("macros") or []
-    return any(
-        str(dep).startswith(f"macro.{PACKAGE}.materialization_test_")
-        or dep == f"macro.{PACKAGE}.materialize_test"
-        for dep in depends
-    )
+    # A root shim hands the test to the package's materialization (variant c),
+    # directly or through macros of its own: dbt records each call on the macro
+    # that makes it, so the calls are followed to any depth.
+    seen: set[str] = set()
+    todo = [str(dep) for dep in (macro.get("depends_on") or {}).get("macros") or []]
+    while todo:
+        dep = todo.pop()
+        if dep in seen:
+            continue
+        seen.add(dep)
+        if (
+            dep.startswith(f"macro.{PACKAGE}.materialization_test_")
+            or dep == f"macro.{PACKAGE}.materialize_test"
+        ):
+            return True
+        called = (macros.get(dep) or {}).get("depends_on") or {}
+        todo.extend(str(d) for d in called.get("macros") or [])
+    return False
 
 
 def resolve(
@@ -358,10 +369,14 @@ def resolve(
     edr_cli_run = var_value("edr_cli_run", project, cli_vars)
     hooks: Hooks
     if operations:
-        if edr_cli_run is None:
+        # The enabled check comes first because, from 0.20.0, the hooks make it
+        # before they read `edr_cli_run`, so that var cannot matter there.
+        if not enabled and _hooks_check_enabled(manifest):
+            hooks = "return_early"
+        elif edr_cli_run is None:
             hooks = "unknown"
             notes.append("edr_cli_run is not a boolean the repository can read")
-        elif edr_cli_run or (not enabled and _hooks_check_enabled(manifest)):
+        elif edr_cli_run:
             hooks = "return_early"
         else:
             hooks = "run"
@@ -400,6 +415,113 @@ def resolve(
         uploads=uploads,
         notes=tuple(notes),
     )
+
+
+#: The resource types a manifest keeps outside ``nodes`` that can refer to a
+#: model. dbt raises when any of them, or any node but a test, refers to a
+#: disabled model; for a test it only warns (``parser/manifest.py``, 1.11.11).
+_REFERRING_SECTIONS = ("exposures", "metrics", "semantic_models", "saved_queries")
+
+
+def package_model_dependents(manifest: Mapping[str, Any]) -> list[str]:
+    """What outside the package refers to one of its models, by unique id.
+
+    Disabling the package's models makes dbt refuse the parse wherever a node
+    other than a test refers to one. For a test dbt only warns, and disables
+    the test, so a test of the project's own that reads a package model would
+    drop out of the run unseen; it counts too. A caller that wants the models
+    disabled leaves them on where this is not empty. The package's models are
+    looked for in ``nodes`` and in ``disabled``, since a project may already
+    disable them for some targets.
+    """
+
+    models = {
+        uid
+        for uid, node in (manifest.get("nodes") or {}).items()
+        if node.get("package_name") == PACKAGE and node.get("resource_type") == "model"
+    } | {
+        uid
+        for uid, entries in (manifest.get("disabled") or {}).items()
+        if any(
+            e.get("package_name") == PACKAGE and e.get("resource_type") == "model"
+            for e in entries
+        )
+    }
+    if not models:
+        return []
+    referring: list[str] = []
+    entries = list((manifest.get("nodes") or {}).items())
+    for section in _REFERRING_SECTIONS:
+        entries.extend((manifest.get(section) or {}).items())
+    for uid, node in entries:
+        if node.get("package_name") == PACKAGE:
+            continue
+        reads = (node.get("depends_on") or {}).get("nodes") or []
+        if any(dep in models for dep in reads):
+            referring.append(uid)
+    return sorted(referring)
+
+
+def _test_macros(manifest: Mapping[str, Any], uids: list[str]) -> set[str]:
+    """The package's ``test_*`` macros that ``uids`` reach.
+
+    dbt records a call on the macro that makes it, not on the test, so a
+    project's own generic test that wraps one of the package's is followed
+    through: every call out of a macro outside the package is followed, however
+    many macros lie between. Inside the package only the calls into its other
+    ``test_*`` macros are, so the set the package's own tests reach is the one
+    its releases were read for.
+    """
+
+    macros = manifest.get("macros") or {}
+    inside = f"macro.{PACKAGE}."
+    prefix = f"{inside}test_"
+    seen: set[str] = set()
+    todo = list(uids)
+    while todo:
+        uid = todo.pop()
+        if uid in seen:
+            continue
+        seen.add(uid)
+        if uid.startswith(inside) and not uid.startswith(prefix):
+            continue
+        called = ((macros.get(uid) or {}).get("depends_on") or {}).get("macros") or []
+        todo.extend(
+            str(dep)
+            for dep in called
+            if not uid.startswith(inside) or str(dep).startswith(prefix)
+        )
+    return {uid for uid in seen if uid.startswith(prefix)}
+
+
+def monitoring_tests(manifest: Mapping[str, Any]) -> dict[str, list[str]]:
+    """The enabled tests whose package test reads ``is_elementary_enabled()``.
+
+    Read from the macros the manifest holds, since the set varies by release.
+    These are the package's monitoring tests, among them its anomaly tests,
+    ``schema_changes``, ``json_schema``, ``python`` and, from 0.20.0, the
+    freshness and SLA tests. Each returns no rows wherever the package is not
+    enabled, so it checks nothing there; where it is enabled, each one reads
+    the package's history or writes a table into its schema, or both.
+    ``volume_anomalies`` reads it through ``test_table_anomalies``, so the
+    macros a test macro calls count too. The ``*_with_context`` tests do not
+    read it at 0.16.4 or 0.26.1. Returned as ``{node name: the nodes it
+    reads}``, sorted by name, so a caller can keep only the tests its
+    selection reaches.
+    """
+
+    macros = manifest.get("macros") or {}
+    found: dict[str, list[str]] = {}
+    for node in (manifest.get("nodes") or {}).values():
+        if node.get("resource_type") != "test":
+            continue
+        depends = node.get("depends_on") or {}
+        if any(
+            "is_elementary_enabled" in str((macros.get(uid) or {}).get("macro_sql"))
+            for uid in _test_macros(manifest, list(depends.get("macros") or []))
+        ):
+            found[str(node.get("name"))] = sorted(depends.get("nodes") or [])
+    return dict(sorted(found.items()))
 
 
 def read(

@@ -16,6 +16,8 @@ import pytest
 from exmergo_dex_core.transform.elementary import (
     OVERRIDE_FLAG,
     UPLOAD_VARS,
+    monitoring_tests,
+    package_model_dependents,
     read,
     resolve,
 )
@@ -191,6 +193,43 @@ def test_a_root_shim_that_calls_the_package_is_the_package_s():
     assert record.materialization == "elementary"
 
 
+def test_a_root_shim_that_reaches_the_package_through_a_helper_is_the_package_s():
+    """dbt records each call on the macro that makes it, so a shim that hands
+    the test on through a macro of its own reaches the package's only by
+    following the calls. A cycle among them ends the walk."""
+
+    shim = _macro(
+        ROOT,
+        "materialization_test_default",
+        depends=(f"macro.{ROOT}.forward_test",),
+    )
+    forward = _macro(
+        ROOT,
+        "forward_test",
+        depends=(f"macro.{ROOT}.materialization_test_default", ELEMENTARY_MAT),
+    )
+    record = resolve(manifest(extra_macros=(shim, forward)), project_yml(flag="true"))
+
+    assert record.materialization_macro == f"macro.{ROOT}.materialization_test_default"
+    assert record.materialization == "elementary"
+
+
+def test_a_root_shim_whose_helpers_loop_without_the_package_is_not_the_package_s():
+    shim = _macro(
+        ROOT,
+        "materialization_test_default",
+        depends=(f"macro.{ROOT}.forward_test",),
+    )
+    forward = _macro(
+        ROOT,
+        "forward_test",
+        depends=(f"macro.{ROOT}.materialization_test_default", "macro.dbt.statement"),
+    )
+    record = resolve(manifest(extra_macros=(shim, forward)), project_yml(flag="true"))
+
+    assert record.materialization == "dbt"
+
+
 def test_a_root_materialization_of_its_own_is_not_the_package_s():
     own = _macro(ROOT, "materialization_test_default", depends=("macro.dbt.statement",))
     record = resolve(manifest(extra_macros=(own,)), project_yml(flag="false"))
@@ -358,6 +397,163 @@ def test_hooks_of_a_package_not_enabled_return_early_where_they_check(checks, ho
     )
 
     assert record.hooks == hooks
+
+
+@pytest.mark.parametrize(
+    ("checks", "hooks"), [(True, "return_early"), (False, "unknown")]
+)
+def test_an_unreadable_edr_cli_run_cannot_matter_where_the_hooks_return_first(
+    checks, hooks
+):
+    """From 0.20.0 the hooks check that the package is enabled before they read
+    ``edr_cli_run``, so with every package model disabled and the hooks left on
+    (``models: elementary: edr: +enabled: false``) a Jinja value for it cannot
+    change what they do (#1307; CodeRabbit on #1382). Up to 0.19.0 it still
+    can."""
+
+    record = resolve(
+        manifest(models="disabled", hooks_check_enabled=checks),
+        project_yml(vars_={"edr_cli_run": "{{ env_var('EDR') }}"}),
+    )
+
+    assert record.hooks == hooks
+
+
+# --- what a mutation run keeps out of the copy (#1307) ----------------------------
+
+
+def _reading(node: dict[str, Any], *nodes: str, macros: tuple[str, ...] = ()):
+    return {**node, "depends_on": {"nodes": list(nodes), "macros": list(macros)}}
+
+
+def test_a_root_node_that_refers_to_a_package_model_is_a_dependent():
+    """Variant e: dbt refuses the parse when a model, or an exposure, refers to a
+    disabled model. For a test it only warns and disables the test, which would
+    drop out of a mutation run unseen, so a test of the project's own counts too.
+    A test of the package's own does not."""
+
+    built = manifest()
+    invocations = "model.elementary.dbt_invocations"
+    runs = _reading(_node(ROOT, "model", "elementary_runs"), invocations)
+    test = _reading(
+        _node(ROOT, "test", "relationships_fct_invocation_id"),
+        "model.shop.fct",
+        invocations,
+    )
+    own = _reading(_node("elementary", "test", "unique_invocations_id"), invocations)
+    exposure = _reading(_node(ROOT, "exposure", "dashboard"), invocations)
+    unrelated = _reading(_node(ROOT, "model", "fct2"), "model.shop.fct")
+    built["nodes"].update({n["unique_id"]: n for n in (runs, test, own, unrelated)})
+    built["exposures"] = {exposure["unique_id"]: exposure}
+
+    assert package_model_dependents(built) == [
+        "exposure.shop.dashboard",
+        "model.shop.elementary_runs",
+        "test.shop.relationships_fct_invocation_id",
+    ]
+
+
+def test_a_reference_to_a_package_model_already_disabled_still_counts():
+    built = manifest(models="disabled")
+    runs = _reading(
+        _node(ROOT, "model", "elementary_runs"), "model.elementary.dbt_invocations"
+    )
+    built["nodes"][runs["unique_id"]] = runs
+
+    assert package_model_dependents(built) == ["model.shop.elementary_runs"]
+
+
+def test_a_project_without_a_reference_to_the_package_has_no_dependent():
+    assert package_model_dependents(manifest()) == []
+    assert package_model_dependents(manifest(elementary=False)) == []
+
+
+def test_monitoring_tests_are_those_whose_package_test_checks_it_is_enabled():
+    """``volume_anomalies`` makes the check through ``test_table_anomalies``;
+    a ``*_with_context`` test and dbt's own make none."""
+
+    check = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+    macros = (
+        _macro(
+            "elementary",
+            "test_volume_anomalies",
+            depends=("macro.elementary.test_table_anomalies",),
+        ),
+        _macro("elementary", "test_table_anomalies", sql=check),
+        _macro("elementary", "test_schema_changes", sql=check),
+        _macro("elementary", "test_not_null_with_context"),
+        # The check outside a test macro does not make the test a monitoring one.
+        _macro("elementary", "get_context_select_clause", sql=check),
+    )
+    built = manifest(extra_macros=macros)
+    fct = "model.shop.fct"
+    tests = [
+        _reading(
+            _node(ROOT, "test", "volume"),
+            fct,
+            macros=("macro.elementary.test_volume_anomalies",),
+        ),
+        _reading(
+            _node(ROOT, "test", "changes"),
+            fct,
+            macros=("macro.elementary.test_schema_changes",),
+        ),
+        _reading(
+            _node(ROOT, "test", "with_context"),
+            fct,
+            macros=(
+                "macro.elementary.test_not_null_with_context",
+                "macro.elementary.get_context_select_clause",
+            ),
+        ),
+        _reading(
+            _node(ROOT, "test", "not_null_fct_id"),
+            fct,
+            macros=("macro.dbt.test_not_null",),
+        ),
+    ]
+    built["nodes"].update({t["unique_id"]: t for t in tests})
+
+    assert monitoring_tests(built) == {"changes": [fct], "volume": [fct]}
+
+
+def test_a_project_test_that_wraps_a_monitoring_test_is_one():
+    """dbt records the call to the package's test on the project's own test
+    macro, not on the test node, so the wrapper is followed through, at any
+    depth. A project macro that only calls dbt's is not one."""
+
+    check = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+    macros = (
+        _macro(
+            ROOT,
+            "test_my_volume",
+            depends=(f"macro.{ROOT}.my_volume_body",),
+        ),
+        _macro(
+            ROOT,
+            "my_volume_body",
+            depends=(f"macro.{ROOT}.test_my_volume", "macro.elementary.test_volume"),
+        ),
+        _macro("elementary", "test_volume", sql=check),
+        _macro(ROOT, "test_positive", depends=("macro.dbt.test_not_null",)),
+    )
+    built = manifest(extra_macros=macros)
+    fct = "model.shop.fct"
+    tests = [
+        _reading(
+            _node(ROOT, "test", "my_volume_fct"),
+            fct,
+            macros=(f"macro.{ROOT}.test_my_volume", "macro.dbt.get_where_subquery"),
+        ),
+        _reading(
+            _node(ROOT, "test", "positive_fct"),
+            fct,
+            macros=(f"macro.{ROOT}.test_positive",),
+        ),
+    ]
+    built["nodes"].update({t["unique_id"]: t for t in tests})
+
+    assert monitoring_tests(built) == {"my_volume_fct": [fct]}
 
 
 def test_each_disable_var_turns_off_its_own_upload():
