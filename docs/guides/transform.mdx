@@ -145,7 +145,7 @@ the nodes the plan changed were built, failed, skipped, missing or stale (and,
 when dbt reports a status Dex does not recognize, such as a microbatch model's
 `partial success`, `unrecognized`), and `blocked` names what stopped each one. A skipped report is not done, even if dev
 still holds a table from an earlier run. `assurance.build_only` lists what built
-with nothing checking its rows. A test that passed without checking anything, such as an Elementary test whose package is disabled for the dev target or an anomaly test with no history to compare against, does not count, and `assurance.unchecked_tests` names it with a `reason_code`. `assurance.failed_checks.checks` says which
+with nothing checking its rows. A pass that cannot vouch for the rows does not count: an Elementary test whose package is disabled for the dev target compiled to a query that returns nothing, and an anomaly test compares against stored history Dex does not measure. `assurance.unchecked_tests` names up to five such tests with a `reason_code`, and counts the rest under `elided`. `assurance.failed_checks.checks` says which
 kind of check failed on each model: a data test by name, or a verification
 record such as `join_coverage` with its finding and join. An INNER join used as
 a filter is not a failure when the declaration says so: name the driving key in

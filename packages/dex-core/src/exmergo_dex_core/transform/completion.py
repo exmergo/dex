@@ -842,6 +842,31 @@ def _checked(
     return passed - failed, failed, failures, empty
 
 
+def _covered(
+    tests: list[UncheckedTest], evidence: BuildEvidence, covered: list[str]
+) -> list[UncheckedTest]:
+    """The unchecked tests on a model the assurance covers.
+
+    Over the same models the rest of the assurance is: a test on a model
+    outside it vouches for nothing this block reports. A test names its models
+    by label (``dim_customers.v2``) and a deliverable may be the file stem
+    (``dim_customers_v2``), so each label is matched by every name its node
+    answers to.
+    """
+
+    wanted = set(covered)
+    answers = {
+        n.name: node_answers(n)
+        for n in evidence.nodes
+        if n.unique_id.startswith("model.") or n.resource_type == "model"
+    }
+    return [
+        t
+        for t in tests
+        if any(answers.get(model, {model}) & wanted for model in t.models)
+    ]
+
+
 def _bounded(text: str, limit: int = _MESSAGE) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
@@ -1021,10 +1046,7 @@ def summarize_completion(
             build_only=_names(
                 n for n in built_names if n not in asserted and n not in failed_checks
             ),
-            # Over the same models the rest of the assurance is: a test on a
-            # model outside it vouches for nothing this block reports.
-            unchecked_tests=[t for t in empty if set(t.models) & set(built_names)]
-            or None,
+            unchecked_tests=_covered(empty, evidence, built_names) or None,
         ),
         verification=_verification(
             verification, findings_dropped, verification_offered

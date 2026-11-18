@@ -482,11 +482,13 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      which deliverables anything checked (assurance.failed_checks
                                      lists each failed check's kind: a data_test by name, or a
                                      contradicted record by kind, finding and join;
-                                     assurance.unchecked_tests lists each test that passed having
-                                     checked nothing, which makes no model asserted: an Elementary
-                                     test compiled to its no-results query, package_disabled or
+                                     assurance.unchecked_tests lists, at most five with the rest
+                                     counted under elided, each passing test whose pass is not
+                                     counted, which makes no model asserted: an Elementary test
+                                     compiled to its no-results query, package_disabled or
                                      compiled_to_no_results, or one judging the run against stored
-                                     history with the package enabled, history_unmeasured, #1308),
+                                     history dex did not measure, whenever the package is enabled,
+                                     history_unmeasured, #1308),
                                      what verification
                                      ran and suppressed, the declared obligations by status, and where the
                                      full evidence is, so a truncated read still has the answer.

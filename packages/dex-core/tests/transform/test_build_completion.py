@@ -1058,3 +1058,48 @@ def test_with_a_plan_only_tests_on_a_deliverable_are_listed():
     )
     assert [t.test for t in completion.assurance.unchecked_tests] == ["volume_only"]
     assert completion.assurance.build_only.names == ["only_anomaly"]
+
+
+def test_a_versioned_deliverable_named_by_its_file_stem_keeps_its_tests_listed():
+    """A plan requires ``dim_customers_v2`` (the file stem), the node's label
+    is ``dim_customers.v2``, and the test names its model by the label."""
+
+    uid = "model.dex_test.dim_customers.v2"
+    test = "test.dex_test.volume_dim.1"
+    nodes = [
+        BuildNode(unique_id=uid, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=test, name="volume_dim", resource_type="test", status="pass"
+        ),
+    ]
+    completion = summarize_completion(
+        _evidence(nodes, required=["dim_customers_v2"]),
+        None,
+        graph={test: [uid]},
+        unchecked_tests={test: "history_unmeasured"},
+    )
+    assert [t.test for t in completion.assurance.unchecked_tests] == ["volume_dim"]
+
+
+def test_the_warning_counts_the_unchecked_tests_the_cap_cut(monkeypatch):
+    from exmergo_dex_core.transform import commands
+
+    nodes = [BuildNode(unique_id=_uid("m"), name="m", status="success")]
+    graph: dict[str, list[str]] = {}
+    unchecked: dict[str, str] = {}
+    for i in range(9):
+        uid = f"test.dex_test.anomaly_{i}.{i}"
+        nodes.append(
+            BuildNode(
+                unique_id=uid, name=f"anomaly_{i}", resource_type="test", status="pass"
+            )
+        )
+        graph[uid] = [_uid("m")]
+        unchecked[uid] = "history_unmeasured"
+    monkeypatch.setattr(commands, "_unchecked_tests", lambda inputs: unchecked)
+    result = BuildResult(
+        success=True, summary={"success": True}, evidence=_evidence(nodes)
+    )
+    commands._attach_completion(result, None, {"graph": graph})
+    assert len(result.completion.assurance.unchecked_tests) == 5
+    assert any(line.startswith("9 passing Elementary") for line in result.warnings)

@@ -7721,14 +7721,21 @@ def _attach_completion(
             population_accepted=inputs.get("population_accepted"),
             unchecked_tests=_unchecked_tests(inputs),
         )
-        unchecked = result.completion.assurance.unchecked_tests
+        # The list may be capped, or cut whole by the budget: the count is
+        # what was listed plus what the cut took.
+        unchecked = len(
+            result.completion.assurance.unchecked_tests or []
+        ) + result.completion.elided.get("assurance.unchecked_tests", 0)
         if unchecked:
             # A pointer line, like verification's, so a caller reading the
             # warnings alone learns that a passing test vouched for nothing.
             result.warnings.append(
-                f"{len(unchecked)} passing Elementary test(s) checked nothing in "
-                "this run and count toward no model's assurance; each is under "
-                "data.completion.assurance.unchecked_tests with its reason_code"
+                f"{unchecked} passing Elementary test(s) are not counted toward "
+                "any model's assurance (compiled to the package's no-results "
+                "query, or judged against history dex did not measure); they are "
+                "under data.completion.assurance.unchecked_tests with a "
+                "reason_code, any past the list's cap counted in "
+                "data.completion.elided"
             )
     except Exception as exc:
         result.notes.append(
