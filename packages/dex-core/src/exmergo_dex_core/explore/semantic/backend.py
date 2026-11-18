@@ -226,6 +226,12 @@ def _local_metric_views(engine: Any) -> SemanticLayer:
     return LocalMetricViewLayer.from_engine(engine)
 
 
+def _workspace_metric_views(engine: Any) -> SemanticLayer:
+    from .metric_views_workspace import WorkspaceMetricViewLayer
+
+    return WorkspaceMetricViewLayer.from_engine(engine)
+
+
 def _local_semantic_views(engine: Any) -> SemanticLayer:
     from .semantic_views import LocalSemanticViewLayer
 
@@ -254,6 +260,7 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("slayer", "local"): _local_slayer,
     ("cube", "local"): _local_cube,
     ("databricks", "local"): _local_metric_views,
+    ("databricks", "databricks_workspace"): _workspace_metric_views,
     ("snowflake", "local"): _local_semantic_views,
     ("snowflake", "snowflake_account"): _account_semantic_views,
 }
@@ -291,6 +298,13 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
         "a semantic source supplies a hosted dbt Cloud token and has no "
         "meaning for Databricks Metric View files, which are files in this "
         "repository. Drop the source, or select a hosted dbt semantic layer with "
+        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+    ),
+    ("databricks", "databricks_workspace"): (
+        "a semantic source supplies a hosted dbt Cloud token and has no "
+        "meaning for Databricks Metric Views read from Unity Catalog, which are "
+        "read through this engine's own Databricks connection and credential. "
+        "Drop the source, or select a hosted dbt semantic layer with "
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),
     ("snowflake", "local"): (
@@ -376,8 +390,9 @@ def resolve_semantic_layer(
 
 def resolve_hosted_semantic_layer(engine: Any) -> SemanticLayer:
     """The layer ``--use-hosted-semantic-layer`` reads: the configured
-    deployment where it is not the repository's own (dbt Cloud, or Snowflake's
-    account, #1357), else the vendor's hosted execution override (``--api``).
+    deployment where it is not the repository's own (dbt Cloud, Snowflake's
+    account, #1357, or Databricks' Unity Catalog, #1364), else the vendor's
+    hosted execution override (``--api``).
 
     Read off the configured deployment rather than a vendor name, so a deployment
     whose catalog is the account folds in what it read there instead of being

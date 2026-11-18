@@ -59,6 +59,18 @@ __all__ = [
 #: The semantic vendor this source answers for, as `semantic.vendor` spells it.
 VENDOR_NAME = "databricks"
 
+#: The deployment whose catalog is Unity Catalog rather than these files (#1364).
+WORKSPACE_DEPLOYMENT = "databricks_workspace"
+
+NO_FILES_NOTE = (
+    "no Metric View file is configured: under semantic.deployment: "
+    "databricks_workspace the layer is read from Unity Catalog by `explore "
+    "semantic` and `explore relationships|map --use-hosted-semantic-layer`, and "
+    "`maintain`, `transform` and `--use-project` read no workspace layer, so "
+    "nothing here was read or compared. Configure semantic.databricks.files to "
+    "give them one"
+)
+
 
 class MetricViewSemanticLayer:
     """The Metric View YAML files committed to this repository.
@@ -69,12 +81,21 @@ class MetricViewSemanticLayer:
     """
 
     def __init__(
-        self, repo_root: Path | str, files: list[str], connector: str | None = None
+        self,
+        repo_root: Path | str,
+        files: list[str],
+        connector: str | None = None,
+        deployment: str | None = None,
     ) -> None:
         """Hold the coordinates; nothing is read until a channel asks."""
         self.repo_root = Path(repo_root)
         self.files = list(files)
         self.connector = connector
+        #: The configured semantic deployment. Under ``databricks_workspace`` the
+        #: catalog `explore` reads is Unity Catalog's, and these files (optional
+        #: there) are what `maintain`, `transform`, `--use-project` and `--local`
+        #: read.
+        self.deployment = deployment
         self._loaded: LoadResult | None = None
         self._resolved: Resolution | None = None
 
@@ -114,14 +135,23 @@ class MetricViewSemanticLayer:
                 for error in exc.errors()
             )
             raise ConfigurationError(problems) from exc
-        if not section.files:
+        deployment = getattr(context, "deployment", None)
+        if not section.files and deployment != WORKSPACE_DEPLOYMENT:
             raise ConfigurationError(
                 "the Databricks Metric View source needs semantic.databricks.files: "
                 "the Metric View YAML files to read, named relative to the "
                 "repository root"
             )
         ensure_available()
-        return cls(context.repo_root, section.files, context.connector)
+        return cls(context.repo_root, section.files, context.connector, deployment)
+
+    def no_files_note(self) -> str | None:
+        """Why this source reads nothing, where it was configured with no files:
+        the layer is Unity Catalog's, which only `explore` reads."""
+
+        if self.files:
+            return None
+        return NO_FILES_NOTE
 
     def loaded(self) -> LoadResult:
         """This command's one validated read of the configured files."""
@@ -156,8 +186,8 @@ class MetricViewSemanticLayer:
                 notes=[f"Metric View files could not be read: {exc}"]
             )
         if loaded.empty:
-            return ProjectDefinitions(notes=loaded.notes())
-        return catalog_mod.definitions(loaded, resolved, notes=loaded.notes())
+            return ProjectDefinitions(notes=self._notes(loaded))
+        return catalog_mod.definitions(loaded, resolved, notes=self._notes(loaded))
 
     # --- the catalog channel ---------------------------------------------------
 
@@ -179,7 +209,7 @@ class MetricViewSemanticLayer:
                 f"layer:\n  {listed}"
             )
         return catalog_mod.semantic_catalog(
-            loaded, self._resolution(), notes=loaded.notes()
+            loaded, self._resolution(), notes=self._notes(loaded)
         )
 
     # --- the snapshot channel --------------------------------------------------
@@ -199,7 +229,10 @@ class MetricViewSemanticLayer:
             return SemanticLayerSnapshot(
                 notes=[f"Metric View files could not be read: {exc}"]
             )
-        return snapshot_mod.semantic_layer(loaded, resolved)
+        snapshot = snapshot_mod.semantic_layer(loaded, resolved)
+        if note := self.no_files_note():
+            snapshot.notes.append(note)
+        return snapshot
 
     # --- the schema channel (#1259) ----------------------------------------------
 
@@ -325,6 +358,13 @@ class MetricViewSemanticLayer:
         from .derivation import derive
 
         return derive(self, request)
+
+    def _notes(self, loaded: LoadResult) -> list[str]:
+        """The reader's notes, and why nothing was read where nothing is
+        configured."""
+
+        note = self.no_files_note()
+        return [*loaded.notes(), *([note] if note else [])]
 
     def _load(self) -> LoadResult:
         """This command's validated read of the configured files, memoized."""

@@ -251,6 +251,16 @@ anywhere else:
 - **A `rely` key is a claim Databricks never checks.** A wrong one returns wrong
   numbers silently, so `explore profile --use-project` and `maintain grain`
   measure it; a duplicate there is a finding to report.
+- **`deployment: databricks_workspace` reads Unity Catalog alone** (#1364): every
+  Metric View the source allowlist holds, with no file needed, and `query` and
+  `values` run the same way over it. Nothing is held to a file, so every result
+  warns that its definitions were read from Unity Catalog and not checked (and
+  says `source: account` or `definition_source: account`): relay that, and treat
+  a deployed view as the definition, not a reviewed one. A view is named by its
+  Unity Catalog name, not a file's stem. A view a configured file describes is
+  named on its `coverage` (`repository_file`); `--local` holds it to that file.
+  `coverage: refused` for two copies of one name means two allowlisted schemas
+  hold it: narrow with `--scope` (and the schema holding its source tables).
 
 ## When the layer is Snowflake Semantic Views
 
