@@ -33,16 +33,22 @@ plan. Nothing here
 refuses a plan. An undeclared change is either one the request asked for, which
 an assumption should record with the evidence that settles it, or one nobody
 decided, which should be undone.
+
+Beside the models, ``removed_tests`` lists each unit test, data test and
+singular test the plan removes (#1420), by name and model, with a warning: a
+removed test weakens the project as quietly as a removed output.
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Any
 
 import sqlglot
+import yaml
 from pydantic import BaseModel, Field
 from sqlglot import expressions as exp
 
@@ -226,6 +232,198 @@ def downstream(
         "count": len(every),
         "measured_by": "transform build --target dev --verify --for-plan <plan-id>",
     }
+
+
+_GENERIC_TEST_BLOCK = re.compile(r"\{%-?\s*test\s")
+
+#: The YAML keys whose entries carry data tests the way a model does, and the
+#: field a removed test names its owner under. Sources are read apart (by table).
+_TESTED = (("models", "model"), ("snapshots", "snapshot"), ("seeds", "seed"))
+
+
+def removed_tests(view: Any, edits: Iterable[Any]) -> list[dict[str, Any]]:
+    """The unit tests, data tests and singular tests the plan removes (#1420).
+
+    Read from the files the plan touches, before and after, and compared as a
+    whole so a test moved from one file to another is not a removal. dbt names
+    unit tests and singular tests uniquely, so each is the same test while its
+    name stands: a unit test by its ``name`` (retargeting its ``model`` is an
+    edit), a singular test by its file under the test paths (editing the SQL
+    is an edit; the models it ``ref()``s are shown from before). A data test
+    is its generic name on a model, version, snapshot, seed or source table,
+    and on a column where it has one.
+
+    A data test is carried to a renamed model, not removed, only on the
+    plan's own word: its edits delete a model file named for the old model
+    and create one named for the new, and the same test and column appear on
+    the new name. Anything else is listed, a renamed versioned model (whose
+    files are named for its versions) and every source, snapshot and seed
+    included: a spurious warning on an unusual rename is better than a
+    removal hidden as one. A YAML file either side cannot parse is left out
+    on both sides rather than read as emptied. Only listed and warned about:
+    nothing here refuses a plan.
+    """
+
+    from ..edits import EditOp
+    from .declarations import post_change_files
+
+    edits = list(edits)
+    touched = {str(edit.path) for edit in edits}
+    after_files = post_change_files(view, edits)
+    before = {p: view.files[p].content for p in touched if p in view.files}
+    after = {p: after_files[p] for p in touched if p in after_files}
+    test_paths = tuple(p.rstrip("/") + "/" for p in view.test_paths)
+    unread = _unparsed(before) | _unparsed(after)
+    found_before, shown = _tests_in(before, test_paths, unread)
+    found_after, _ = _tests_in(after, test_paths, unread)
+    gone = found_before - found_after
+    added = found_after - found_before
+    model_roots = tuple(p.rstrip("/") + "/" for p in view.model_paths)
+    model_files = [
+        edit
+        for edit in edits
+        if str(edit.path).startswith(model_roots)
+        and str(edit.path).endswith((".sql", ".py"))
+    ]
+    deleted = {
+        PurePosixPath(str(e.path)).stem.lower()
+        for e in model_files
+        if e.op is EditOp.DELETE
+    }
+    created = {
+        PurePosixPath(str(e.path)).stem.lower()
+        for e in model_files
+        if e.op is not EditOp.DELETE and str(e.path) not in view.files
+    }
+    for key in list(gone.elements()):
+        if key[:2] != ("data_test", "model") or key[2].lower() not in deleted:
+            continue
+        carried = next(
+            (
+                new
+                for new in added
+                if added[new] > 0
+                and new[:2] == ("data_test", "model")
+                and new[2].lower() in created
+                and new[3:] == key[3:]
+            ),
+            None,
+        )
+        if carried is not None:
+            added[carried] -= 1
+            gone[key] -= 1
+    return [shown[key] for key in sorted(gone.elements(), key=str)]
+
+
+def _unparsed(files: Mapping[str, str]) -> set[str]:
+    """The YAML files in ``files`` that do not parse."""
+
+    out: set[str] = set()
+    for path, content in files.items():
+        if path.endswith((".yml", ".yaml")):
+            try:
+                yaml.safe_load(content)
+            except yaml.YAMLError:
+                out.add(path)
+    return out
+
+
+def _tests_in(
+    files: Mapping[str, str], test_paths: tuple[str, ...], skip: set[str]
+) -> tuple[
+    Counter[tuple[Any, ...]],
+    dict[tuple[Any, ...], dict[str, Any]],
+]:
+    """Each test ``files`` define, counted by its identity (``removed_tests``),
+    with how the first of each is shown; ``skip`` is left out."""
+
+    from .model_versions import model_refs
+
+    found: Counter[tuple[Any, ...]] = Counter()
+    shown: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    def add(key: tuple[Any, ...], entry: dict[str, Any], path: str) -> None:
+        found[key] += 1
+        shown.setdefault(key, {**entry, "path": path})
+
+    def owned(field: str, owner: str, node: Mapping[str, Any], version: Any, path: str):
+        """The data tests on ``node`` and on each of its columns."""
+        at = None if version is None else str(version)
+        columns = [(None, node)] + [
+            (str(c["name"]), c) for c in _entries(node.get("columns")) if c.get("name")
+        ]
+        for column, holder in columns:
+            for test in _declared_tests(holder):
+                name = _test_name(test)
+                entry = {"kind": "data_test", "name": name, field: owner}
+                entry.update(
+                    {k: v for k, v in (("version", at), ("column", column)) if v}
+                )
+                add(("data_test", field, owner, at, column, name), entry, path)
+
+    for path, content in files.items():
+        if path in skip:
+            continue
+        if path.endswith(".sql") and path.startswith(test_paths):
+            if _GENERIC_TEST_BLOCK.search(content):
+                continue  # a generic test's definition, not a test
+            stem = PurePosixPath(path).stem
+            refs = sorted({name for name, _, _ in model_refs(content)})
+            entry = {"kind": "singular_test", "name": stem, "models": refs}
+            add(("singular_test", stem), entry, path)
+            continue
+        if not path.endswith((".yml", ".yaml")):
+            continue
+        data = yaml.safe_load(content)
+        if not isinstance(data, dict):
+            continue
+        for unit in _entries(data.get("unit_tests")):
+            if unit.get("name"):
+                name = str(unit["name"])
+                entry = {"kind": "unit_test", "name": name, "model": unit.get("model")}
+                add(("unit_test", name), entry, path)
+        for key, field in _TESTED:
+            for node in _entries(data.get(key)):
+                if not node.get("name"):
+                    continue
+                owner = str(node["name"])
+                owned(field, owner, node, None, path)
+                for version in _entries(node.get("versions")):
+                    owned(field, owner, version, version.get("v"), path)
+        for source in _entries(data.get("sources")):
+            for table in _entries(source.get("tables")):
+                if source.get("name") and table.get("name"):
+                    owner = f"{source['name']}.{table['name']}"
+                    owned("source", owner, table, None, path)
+    return found, shown
+
+
+def _entries(value: Any) -> list[dict[str, Any]]:
+    """The mappings in a YAML list; nothing for anything else."""
+
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def _declared_tests(entry: Mapping[str, Any]) -> list[Any]:
+    """Tests under either key dbt accepts, ``tests`` and ``data_tests``."""
+
+    return [
+        test
+        for key in ("tests", "data_tests")
+        if isinstance(entry.get(key), list)
+        for test in entry[key]
+    ]
+
+
+def _test_name(test: Any) -> str:
+    """A generic test as its YAML names it: ``unique``, ``dbt_utils.x``."""
+
+    if isinstance(test, dict):
+        if isinstance(test.get("test_name"), str):
+            return test["test_name"]
+        if len(test) == 1:
+            return str(next(iter(test)))
+    return str(test)
 
 
 def scope_for(
@@ -1279,7 +1477,37 @@ def warnings(report: Mapping[str, Any] | None) -> list[str]:
             "`column`, with the evidence that settles it; otherwise undo it "
             "(data.change_scope)"
         )
+    removed = (report or {}).get("removed_tests") or []
+    if removed:
+        parts = [_describe_test(t) for t in removed[:4]]
+        if len(removed) > 4:
+            parts.append(f"{len(removed) - 4} more")
+        out.append(
+            f"this plan removes {len(removed)} test"
+            f"{'' if len(removed) == 1 else 's'} ({'; '.join(parts)}), which "
+            "weakens what the project checks. If the request asks for it, say so; "
+            "otherwise keep the test in the edit "
+            "(data.change_scope.removed_tests)"
+        )
     return out
+
+
+def _describe_test(test: Mapping[str, Any]) -> str:
+    """One removed test as words: its kind, name and what it is on."""
+
+    kind = str(test.get("kind", "test")).replace("_", " ")
+    if test.get("models") is not None:
+        on = ", ".join(f"`{m}`" for m in test["models"]) or "no model"
+    else:
+        owner = next(
+            (test[f] for f in ("model", "source", "snapshot", "seed") if f in test),
+            None,
+        )
+        column = f".{test['column']}" if test.get("column") else ""
+        on = f"`{owner}{column}`"
+        if test.get("version"):
+            on += f" (version {test['version']})"
+    return f"{kind} `{test.get('name')}` on {on}"
 
 
 def stored_form(report: Mapping[str, Any] | None) -> dict[str, list[dict[str, Any]]]:

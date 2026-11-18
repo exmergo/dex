@@ -1637,3 +1637,424 @@ def test_an_old_plan_without_an_axis_is_read_by_kind():
             ]
         }
     ) == [{"model": "m", "kind": "predicate_added"}]
+
+
+# --- removed tests (#1420) ----------------------------------------------------------
+
+ROSTER_YML = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: dim_accounts\n"
+    "    columns:\n"
+    "      - name: account_id\n"
+    "        data_tests:\n"
+    "          - unique\n"
+    "          - not_null\n"
+    "      - name: region\n"
+    "        data_tests:\n"
+    "          - accepted_values:\n"
+    "              values: ['emea', 'amer']\n"
+    "unit_tests:\n"
+    "  - name: roster_keeps_every_account\n"
+    "    model: dim_accounts\n"
+    "    given:\n"
+    "      - input: source('raw', 'accounts')\n"
+    "        rows:\n"
+    "          - {account_id: 1, region: emea, is_sandbox: false}\n"
+    "    expect:\n"
+    "      rows:\n"
+    "        - {account_id: 1, region: emea, is_sandbox: false}\n"
+)
+ROSTER_YML_PATH = "models/marts/dim_accounts.yml"
+SINGULAR = (
+    "select account_id from {{ ref('dim_accounts') }}\n"
+    "where region not in ('emea', 'amer')\n"
+)
+
+
+@pytest.fixture
+def tested_project(accounts_project) -> tuple[Path, Path]:
+    repo, warehouse = accounts_project
+    project = repo / "analytics"
+    (project / "models" / "marts" / "dim_accounts.yml").write_text(ROSTER_YML)
+    (project / "tests").mkdir()
+    (project / "tests" / "assert_known_regions.sql").write_text(SINGULAR)
+    return repo, warehouse
+
+
+def _yml_edit(content: str, path: str = ROSTER_YML_PATH) -> dict:
+    return {"path": path, "kind": "schema_yml", "content": content}
+
+
+def _removed(envelope: dict) -> list[tuple]:
+    return [
+        (t["kind"], t["name"], t.get("model") or tuple(t.get("models", ())))
+        + ((t["column"],) if "column" in t else ())
+        for t in envelope["data"].get("change_scope", {}).get("removed_tests", [])
+    ]
+
+
+def test_a_yaml_rewritten_as_a_stub_lists_every_test_it_drops(tested_project, capsys):
+    repo, warehouse = tested_project
+    stub = "version: 2\nmodels:\n  - name: dim_accounts\n"
+    envelope = _plan(repo, warehouse, {"edits": [_yml_edit(stub)]}, capsys)
+    assert _removed(envelope) == [
+        ("data_test", "not_null", "dim_accounts", "account_id"),
+        ("data_test", "unique", "dim_accounts", "account_id"),
+        ("data_test", "accepted_values", "dim_accounts", "region"),
+        ("unit_test", "roster_keeps_every_account", "dim_accounts"),
+    ]
+    removed = envelope["data"]["change_scope"]["removed_tests"]
+    assert {t["path"] for t in removed} == {ROSTER_YML_PATH}
+    (warning,) = [w for w in envelope["warnings"] if "removes 4 tests" in w]
+    assert "unit test `roster_keeps_every_account` on `dim_accounts`" in warning
+    assert "data test `unique` on `dim_accounts.account_id`" in warning
+
+
+def test_a_deleted_yaml_block_lists_only_what_it_held(tested_project, capsys):
+    repo, warehouse = tested_project
+    without_units = ROSTER_YML[: ROSTER_YML.index("unit_tests:")]
+    without_not_null = without_units.replace("          - not_null\n", "")
+    envelope = _plan(repo, warehouse, {"edits": [_yml_edit(without_not_null)]}, capsys)
+    assert _removed(envelope) == [
+        ("data_test", "not_null", "dim_accounts", "account_id"),
+        ("unit_test", "roster_keeps_every_account", "dim_accounts"),
+    ]
+    assert "models" not in envelope["data"]["change_scope"]
+
+
+def test_a_deleted_singular_test_file_is_listed_with_the_models_it_reads(
+    tested_project, capsys
+):
+    repo, warehouse = tested_project
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                {
+                    "path": "tests/assert_known_regions.sql",
+                    "kind": "test_sql",
+                    "op": "delete",
+                }
+            ]
+        },
+        capsys,
+    )
+    assert envelope["data"]["change_scope"]["removed_tests"] == [
+        {
+            "kind": "singular_test",
+            "name": "assert_known_regions",
+            "models": ["dim_accounts"],
+            "path": "tests/assert_known_regions.sql",
+        }
+    ]
+    assert any(
+        "singular test `assert_known_regions` on `dim_accounts`" in w
+        for w in envelope["warnings"]
+    )
+
+
+def test_tests_moved_to_another_file_are_not_removed(tested_project, capsys):
+    repo, warehouse = tested_project
+    unit_block = ROSTER_YML[ROSTER_YML.index("unit_tests:") :]
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                _yml_edit(ROSTER_YML[: ROSTER_YML.index("unit_tests:")]),
+                _yml_edit(
+                    "version: 2\n" + unit_block,
+                    path="models/marts/dim_accounts_unit_tests.yml",
+                ),
+            ]
+        },
+        capsys,
+    )
+    assert "change_scope" not in envelope["data"]
+    assert not any("removes" in w and "test" in w for w in envelope["warnings"])
+
+
+def test_a_model_rewrite_that_keeps_its_tests_reports_none_removed(
+    tested_project, capsys
+):
+    repo, warehouse = tested_project
+    filtered = ROSTER.rstrip() + " where not is_sandbox\n"
+    envelope = _plan(
+        repo, warehouse, {"edits": [_edit("dim_accounts", filtered)]}, capsys
+    )
+    assert "removed_tests" not in envelope["data"]["change_scope"]
+
+
+def test_an_edited_singular_test_is_not_removed(tested_project, capsys):
+    repo, warehouse = tested_project
+    joined = (
+        "select a.account_id from {{ ref('dim_accounts') }} as a\n"
+        "join {{ ref('region_summary') }} as s using (region)\n"
+        "where a.region not in ('emea', 'amer')\n"
+    )
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                {
+                    "path": "tests/assert_known_regions.sql",
+                    "kind": "test_sql",
+                    "content": joined,
+                }
+            ]
+        },
+        capsys,
+    )
+    assert "change_scope" not in envelope["data"]
+
+
+def test_removed_tests_never_drop_the_models_report(
+    tested_project, capsys, monkeypatch
+):
+    def broken(view, edits):
+        raise TypeError("odd yaml")
+
+    monkeypatch.setattr(cs, "removed_tests", broken)
+    repo, warehouse = tested_project
+    filtered = ROSTER.rstrip() + " where not is_sandbox\n"
+    envelope = _plan(
+        repo, warehouse, {"edits": [_edit("dim_accounts", filtered)]}, capsys
+    )
+    assert envelope["data"]["change_scope"]["population"]["changed"] == ["dim_accounts"]
+    assert any(
+        w.startswith("could not read which tests this plan removes (TypeError)")
+        for w in envelope["warnings"]
+    )
+
+
+def _static_removed(before: dict, after: dict) -> list[dict]:
+    """``removed_tests`` over ``before`` files with ``after`` written (None
+    deletes), with no project or CLI."""
+
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+
+    view = SimpleNamespace(
+        files={p: SimpleNamespace(content=c) for p, c in before.items()},
+        test_paths=["tests"],
+        model_paths=["models"],
+    )
+    edits = [
+        PlanEdit(path=p, kind=EditKind.SCHEMA_YML, op=EditOp.DELETE)
+        if c is None
+        else PlanEdit(path=p, kind=EditKind.SCHEMA_YML, new_content=c)
+        for p, c in after.items()
+    ]
+    return [
+        {k: v for k, v in t.items() if k != "path"}
+        for t in cs.removed_tests(view, edits)
+    ]
+
+
+YML = "models/m.yml"
+
+
+def test_a_retargeted_unit_test_is_not_removed():
+    unit = (
+        "unit_tests:\n  - name: keeps_rows\n    model: {}\n"
+        "    given: []\n    expect: {{rows: []}}\n"
+    )
+    before = {YML: unit.format("dim_accounts")}
+    assert _static_removed(before, {YML: unit.format("region_summary")}) == []
+
+
+def test_a_renamed_model_carries_its_tests_and_names_one_it_drops():
+    old = (
+        "models:\n  - name: old_m\n    columns:\n      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+    )
+    before = {YML: old, "models/old_m.sql": "select 1 as id\n"}
+    renamed = {"models/old_m.sql": None, "models/new_m.sql": "select 1 as id\n"}
+    new = old.replace("old_m", "new_m")
+    assert _static_removed(before, {YML: new, **renamed}) == []
+    dropped = new.replace("unique, ", "")
+    assert _static_removed(before, {YML: dropped, **renamed}) == [
+        {"kind": "data_test", "name": "unique", "model": "old_m", "column": "id"}
+    ]
+
+
+def test_tests_moved_to_a_new_model_beside_the_old_one_are_removed():
+    old = (
+        "models:\n  - name: old_m\n    columns:\n      - name: id\n"
+        "        data_tests: [unique]\n"
+    )
+    before = {YML: old, "models/old_m.sql": "select 1 as id\n"}
+    after = {YML: old.replace("old_m", "new_m"), "models/new_m.sql": "select 1\n"}
+    assert _static_removed(before, after) == [
+        {"kind": "data_test", "name": "unique", "model": "old_m", "column": "id"}
+    ]
+    sources = (
+        "sources:\n  - name: raw\n    tables:\n      - name: t\n"
+        "        columns:\n          - name: id\n            data_tests: [unique]\n"
+    )
+    assert _static_removed(
+        {YML: sources}, {YML: sources.replace("t\n", "t2\n", 1)}
+    ) == [{"kind": "data_test", "name": "unique", "source": "raw.t", "column": "id"}]
+
+
+def test_a_yaml_retargeted_to_a_new_model_lists_the_kept_models_tests(
+    tested_project, capsys
+):
+    repo, warehouse = tested_project
+    retargeted = ROSTER_YML.replace(
+        "  - name: dim_accounts\n", "  - name: fct_new\n", 1
+    )
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                _yml_edit(retargeted),
+                _edit("fct_new", "select 1 as account_id, 'emea' as region\n"),
+            ]
+        },
+        capsys,
+    )
+    assert _removed(envelope) == [
+        ("data_test", "not_null", "dim_accounts", "account_id"),
+        ("data_test", "unique", "dim_accounts", "account_id"),
+        ("data_test", "accepted_values", "dim_accounts", "region"),
+    ]
+
+
+def test_tests_under_versions_sources_snapshots_and_seeds_are_read():
+    versions = (
+        "models:\n  - name: m\n    versions:\n      - v: 2\n        columns:\n"
+        "          - include: all\n"
+        "          - name: id\n            tests: [not_null]\n"
+    )
+    assert _static_removed(
+        {YML: versions},
+        {YML: "models:\n  - name: m\n    versions:\n      - v: 2\n"},
+    ) == [
+        {
+            "kind": "data_test",
+            "name": "not_null",
+            "model": "m",
+            "version": "2",
+            "column": "id",
+        }
+    ]
+    source = (
+        "sources:\n  - name: raw\n    tables:\n      - name: t\n"
+        "        columns:\n          - name: id\n            data_tests: [unique]\n"
+    )
+    assert _static_removed(
+        {YML: source},
+        {YML: "sources:\n  - name: raw\n    tables:\n      - name: t\n"},
+    ) == [{"kind": "data_test", "name": "unique", "source": "raw.t", "column": "id"}]
+    tested = (
+        "snapshots:\n  - name: snap\n    columns:\n      - name: id\n"
+        "        tests: [unique]\n"
+        "seeds:\n  - name: codes\n    tests: [dbt_utils.unique_combination]\n"
+    )
+    assert _static_removed(
+        {YML: tested}, {YML: "snapshots:\n  - name: snap\nseeds:\n  - name: codes\n"}
+    ) == [
+        {"kind": "data_test", "name": "dbt_utils.unique_combination", "seed": "codes"},
+        {"kind": "data_test", "name": "unique", "snapshot": "snap", "column": "id"},
+    ]
+    assert (
+        "on `raw.t.id`"
+        in cs.warnings(
+            {
+                "removed_tests": [
+                    {
+                        "kind": "data_test",
+                        "name": "unique",
+                        "source": "raw.t",
+                        "column": "id",
+                    }
+                ]
+            }
+        )[0]
+    )
+
+
+def test_odd_yaml_test_lists_are_skipped_not_raised():
+    odd = "models:\n  - name: m\n    data_tests: 5\n    columns: nope\n"
+    assert _static_removed({YML: odd}, {YML: "models: []\n"}) == []
+
+
+SHARED_YML = "models/marts/schema.yml"
+FCT_NEW_YML = (
+    "version: 2\nmodels:\n  - name: fct_new\n    columns:\n      - name: id\n"
+    "        data_tests: [unique, not_null]\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("entry", "model_file", "expected"),
+    [
+        (
+            "  - name: m\n    latest_version: 1\n    columns:\n"
+            "      - name: id\n        data_tests: [unique]\n    versions:\n"
+            "      - v: 1\n",
+            "m_v1.sql",
+            [("data_test", "unique", "m", "id")],
+        ),
+        (
+            "  - name: py_m\n    columns:\n      - name: id\n"
+            "        data_tests: [unique, not_null]\n",
+            "py_m.py",
+            [
+                ("data_test", "not_null", "py_m", "id"),
+                ("data_test", "unique", "py_m", "id"),
+            ],
+        ),
+    ],
+    ids=["versioned", "python"],
+)
+def test_a_shared_yaml_stubbed_for_a_new_model_lists_the_kept_models_tests(
+    tested_project, capsys, entry, model_file, expected
+):
+    repo, warehouse = tested_project
+    marts = repo / "analytics" / "models" / "marts"
+    (marts / "schema.yml").write_text("version: 2\nmodels:\n" + entry)
+    body = (
+        "def model(dbt, session):\n    return session.sql('select 1 as id')\n"
+        if model_file.endswith(".py")
+        else "select 1 as id\n"
+    )
+    (marts / model_file).write_text(body)
+    envelope = _plan(
+        repo,
+        warehouse,
+        {
+            "edits": [
+                _yml_edit(FCT_NEW_YML, path=SHARED_YML),
+                _edit("fct_new", "select 1 as id\n"),
+            ]
+        },
+        capsys,
+    )
+    assert _removed(envelope) == expected
+
+
+def test_a_renamed_versioned_model_lists_its_tests():
+    old = (
+        "models:\n  - name: m\n    latest_version: 1\n    columns:\n"
+        "      - name: id\n        data_tests: [unique]\n    versions:\n"
+        "      - v: 1\n"
+    )
+    before = {YML: old, "models/m_v1.sql": "select 1 as id\n"}
+    after = {
+        YML: old.replace("name: m\n", "name: n\n"),
+        "models/m_v1.sql": None,
+        "models/n_v1.sql": "select 1 as id\n",
+    }
+    # Its files are named for its versions, so the plan never names the
+    # rename; listed rather than guessed.
+    assert _static_removed(before, after) == [
+        {"kind": "data_test", "name": "unique", "model": "m", "column": "id"}
+    ]

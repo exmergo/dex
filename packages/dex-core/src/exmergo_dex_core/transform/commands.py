@@ -1345,7 +1345,8 @@ def _report_change_scope(
 ) -> None:
     """Say what the plan changes about each model it rewrites beyond what an
     assumption records (#1115): which populations move and which stay, and
-    which outputs are removed, retyped, re-aggregated or re-NULLed.
+    which outputs are removed, retyped, re-aggregated or re-NULLed; and which
+    unit tests, data tests and singular tests the plan removes (#1420).
 
     Static and free: both versions are rendered and read, nothing runs. The plan
     is already stored, so a defect here is a warning and never an error.
@@ -1369,15 +1370,17 @@ def _report_change_scope(
         ]
         earlier, against, parents = _redrive_baselines(engine, view, edits, result)
         rewrites.extend(earlier)
-        if not rewrites:
-            return
-        report = change_scope.analyze(
-            rewrites,
-            result.decisions or [],
-            get_dialect(engine.connector or engine.config.connector),
-            view.vars,
-            parents=parents,
-            against=against,
+        report = (
+            change_scope.analyze(
+                rewrites,
+                result.decisions or [],
+                get_dialect(engine.connector or engine.config.connector),
+                view.vars,
+                parents=parents,
+                against=against,
+            )
+            if rewrites
+            else None
         )
     except Exception as exc:
         result.warnings.append(
@@ -1385,6 +1388,18 @@ def _report_change_scope(
             f"({type(exc).__name__}); the plan itself is unaffected"
         )
         return
+    # Tests the plan removes (#1420), whether or not it rewrites a model; a
+    # defect here drops only this list, never the models' report.
+    try:
+        removed = change_scope.removed_tests(view, edits)
+    except Exception as exc:
+        removed = []
+        result.warnings.append(
+            "could not read which tests this plan removes "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+    if removed:
+        report = {**(report or {}), "removed_tests": removed}
     if report is None:
         return
     with contextlib.suppress(Exception):
