@@ -4716,3 +4716,39 @@ def test_a_failed_build_message_never_carries_the_value_a_cast_failed_on():
         )
     )
     assert stderr_only == ["Bad int64 value: <value withheld>"]
+
+
+def test_a_build_message_masks_a_value_that_spans_a_line_break():
+    """A value holding a line break is whole on no single line, so the message
+    is masked before it is split into lines (#1412)."""
+
+    import subprocess
+
+    from exmergo_dex_core.transform.build import _collect_messages, _failed_node
+
+    value = "zq_sentinel_7_head\nzq_sentinel_7_tail"
+    message = f"Conversion Error: Could not convert string '{value}' to INT32"
+    line = json.dumps(
+        {"info": {"name": "RunResultError", "level": "error", "msg": message}}
+    )
+    messages = _collect_messages(
+        subprocess.CompletedProcess(["dbt"], 1, stdout=line + "\n", stderr="")
+    )
+    assert "zq_sentinel_7" not in json.dumps(messages)
+    stderr_only = _collect_messages(
+        subprocess.CompletedProcess(["dbt"], 1, stdout="", stderr=message)
+    )
+    assert "zq_sentinel_7" not in json.dumps(stderr_only)
+    header = json.dumps(
+        {
+            "info": {
+                "level": "error",
+                "msg": f"Database Error in model bad (models/bad.sql)\n  {message}",
+            }
+        }
+    )
+    found = _failed_node(
+        subprocess.CompletedProcess(["dbt"], 1, stdout=header, stderr="")
+    )
+    assert found is not None
+    assert "zq_sentinel_7" not in found[1]
