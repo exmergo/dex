@@ -483,7 +483,10 @@ def test_schema_and_grain_drift_produce_one_edit_for_the_shared_yaml(maintain_re
     yml = maintain_repo.root / "models" / "staging" / "stg_orders.yml"
     # A key carrying no unique test, which is what makes the grain axis propose one.
     yml.write_text(
-        yml.read_text().replace("[unique, not_null]", "[not_null]"), encoding="utf-8"
+        yml.read_text().replace(
+            "{unique: {config: {meta: {disable_test_samples: true}}}}, ", ""
+        ),
+        encoding="utf-8",
     )
     maintain_repo.dex("explore", "map")
     maintain_repo.snapshot()
