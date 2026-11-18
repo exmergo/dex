@@ -1199,3 +1199,30 @@ def test_a_dimension_served_without_sql_is_stale():
         check_renderer(meta, ["orders.status"], members, where="x")
     served["sql"] = "`status`"
     check_renderer(meta, ["orders.status"], members, where="x")
+
+
+def test_a_grouped_member_named_like_a_bucket_keeps_its_own_sort_key():
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import Target, to_cube_query
+    from exmergo_dex_core.explore.semantic.model import SemanticQuery
+
+    measure = Member(name="count", kind="measure", type="count")
+    time = Member(name="period", kind="dimension", type="time")
+    literal = Member(name="period__month", kind="dimension", type="string")
+    members = {
+        "orders.count": Target("orders.count", "measure", measure, "orders"),
+        "orders.period": Target("orders.period", "dimension", time, "orders"),
+        "orders.period__month": Target(
+            "orders.period__month", "dimension", literal, "orders"
+        ),
+    }
+    q = SemanticQuery(
+        metrics=["orders.count"],
+        group_by=["orders.period__month", "orders.period"],
+        grain="month",
+        order_by=["orders.period__month"],
+    )
+
+    request = to_cube_query(q, members, max_rows=50)
+
+    assert request.query["order"] == [["orders.period__month", "asc"]]

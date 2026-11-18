@@ -379,7 +379,9 @@ the rows:
    stale-renderer check against the repository's files, and the tables: the
    Core is asked over `/v1/sql` for its plan (which runs nothing) and every
    table the plan reads is held to the files' `sql_table`, as on the render
-   path. A Core serving another model is refused before it runs anything.
+   path, and so is the data source it was planned on. A Core serving another
+   model is refused before it runs anything, with one exception the
+   stale-renderer step names: a measure whose own SQL alone changed.
    Where the tables cannot be judged (Dex has no connector whose dialect reads
    the plan, or Cube plans over a pre-aggregation), the result says so.
    A `/v1/meta` that cannot be read refuses the query rather than screening

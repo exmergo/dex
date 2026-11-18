@@ -115,8 +115,6 @@ class CubeVendorLayer:
         self._hosted_view: Any = None
         self._transport_obj: Any = None
         self._governed: GovernedSql | None = None
-        #: What this layer could not check, said on the result.
-        self._notes: list[str] = []
 
     @classmethod
     def from_engine(cls, engine: Any, deployment: str = "local") -> CubeVendorLayer:
@@ -215,7 +213,7 @@ class CubeVendorLayer:
         loaded = self._source.loaded()
         return index(loaded.cubes, loaded.views)
 
-    def _load(self, request: Any, what: str) -> dict[str, Any]:
+    def _load(self, request: Any, what: str) -> tuple[dict[str, Any], list[str]]:
         """Hold a Core to the files, then have the server run ``request``."""
 
         from ...cube.query import (
@@ -242,8 +240,10 @@ class CubeVendorLayer:
                     where=transport.base_url,
                     cubes={cube.name: cube for cube in loaded.cubes},
                 )
-                self._check_core_relations(request)
-            return transport.load(request.query)
+                notes = self._check_core_relations(request, transport.base_url)
+            else:
+                notes = []
+            return transport.load(request.query), notes
         except CubeRefusalError as exc:
             raise SemanticQueryRefusedError(str(exc)) from exc
         except CubeQueryError as exc:
@@ -253,54 +253,73 @@ class CubeVendorLayer:
                 raise SemanticBackendError(f"could not resolve {what}: {exc}") from exc
             raise SemanticBackendError(str(exc)) from exc
 
-    def _check_core_relations(self, request: Any) -> None:
-        """Hold the relations a Core would read to the files' ``sql_table``.
+    def _check_core_relations(self, request: Any, base_url: str) -> list[str]:
+        """Hold the plan a Core would run to the files; return what went unchecked.
 
         ``/v1/meta`` carries no ``sql_table``, so a Core still serving a model
-        whose cube read another table passes the member check. The Core is asked
-        to plan the query over ``/v1/sql`` (which runs nothing) through a render
-        transport of its own, and the plan is held to the files exactly as on
-        the render path. Where that cannot be judged (dex has no connector whose
-        dialect reads the plan, or Cube plans over a pre-aggregation, which a
-        load may use), the result says the relations were not checked.
+        whose cube read another table passes the member check. The Core at
+        ``base_url`` (the one the load is bound to, never re-resolved) is asked
+        to plan the query over ``/v1/sql``, which runs nothing, through a render
+        transport of its own. The plan is held to the files as on the render
+        path: the data source it was planned on, and every table it reads.
+        Where that cannot be judged (dex has no connector whose dialect reads
+        the plan, the plan carries no SQL, Cube plans over a pre-aggregation,
+        which a load may use, or the files' relations cannot be read), the
+        notes returned say so, for this request's result only.
         """
 
+        import os
+
         from ...adapters import get_dialect
-        from ...cube.query import CUBE_CONNECTORS
-        from ...cube.transport import CubeTransport
+        from ...cube.query import CUBE_CONNECTORS, CubeRefusalError
+        from ...cube.transport import URL_ENV, CubeTransport
         from .cube import LocalCubeLayer
 
+        unchecked = (
+            "the tables this Cube Core reads were not checked against the "
+            "repository's sql_table: "
+        )
         connector = (
             getattr(self._dex, "connector", None)
             or getattr(getattr(self._dex, "config", None), "connector", None)
             or getattr(self._source, "connector", None)
         )
         if connector not in CUBE_CONNECTORS:
-            self._notes.append(
-                "the tables this Cube Core reads were not checked against the "
-                "repository's sql_table: dex has no connector whose dialect reads "
-                "the Core's plan"
-            )
-            return
-        render = CubeTransport(getattr(self._source, "url", None))
+            return [unchecked + "dex has no connector whose dialect reads the plan"]
+        # The load's own endpoint: an override read again here could plan on one
+        # Core and load on another.
+        environ = {k: v for k, v in os.environ.items() if k != URL_ENV}
+        render = CubeTransport(base_url, env_vars=environ)
         body = render.sql(request.query)
         plan = body.get("sql") if isinstance(body, dict) else None
-        if not isinstance(plan, dict) or not isinstance(plan.get("sql"), list):
-            self._notes.append(
-                "the tables this Cube Core reads were not checked against the "
-                "repository's sql_table: its plan carried no SQL"
+        rendered = plan.get("sql") if isinstance(plan, dict) else None
+        if (
+            not isinstance(rendered, list)
+            or not rendered
+            or not isinstance(rendered[0], str)
+            or not rendered[0].strip()
+        ):
+            return [unchecked + "its plan carried no SQL"]
+        configured = getattr(self._source, "data_source", None) or "default"
+        served = plan.get("dataSource") or body.get("dataSource") or "default"
+        if served != configured:
+            raise CubeRefusalError(
+                f"refused: the Cube Core planned this query on data source "
+                f"'{served}', and the repository's cubes are on '{configured}' "
+                "(semantic.cube.data_source)"
             )
-            return
         if plan.get("preAggregations"):
-            self._notes.append(
-                "the tables this Cube Core reads were not checked against the "
-                "repository's sql_table: it answers this query from a "
-                "pre-aggregation"
+            return [unchecked + "it answers this query from a pre-aggregation"]
+        layer = LocalCubeLayer(self._source, self._dex)
+        dialect = get_dialect(connector)
+        notes = []
+        if layer._repository_relations(dialect) is None:
+            notes.append(
+                unchecked + "a cube's sql_table is templated or its sql does not "
+                "parse, so only each cube's own table was compared"
             )
-            return
-        LocalCubeLayer(self._source, self._dex)._check_relations(
-            plan["sql"][0], get_dialect(connector)
-        )
+        layer._check_relations(rendered[0], dialect)
+        return notes
 
     # ---- the PII gate ------------------------------------------------------
 
@@ -436,8 +455,8 @@ class CubeVendorLayer:
             request = to_cube_query(q, members, max_rows=self._limits().max_rows)
         except CubeQueryError as exc:
             raise SemanticBackendError(str(exc)) from exc
-        body = self._load(request, "the metric query")
-        notes += self._notes
+        body, unchecked = self._load(request, "the metric query")
+        notes += unchecked
         cost, warnings = cost_posture(self)
         return SemanticQueryResult.from_capped(
             self._shape(body, request, notes),
@@ -477,8 +496,8 @@ class CubeVendorLayer:
             )
         except CubeQueryError as exc:
             raise SemanticBackendError(str(exc)) from exc
-        body = self._load(cube_request, f"the values of {request.token}")
-        notes = [*notes, *self._notes]
+        body, unchecked = self._load(cube_request, f"the values of {request.token}")
+        notes = [*notes, *unchecked]
         cost, warnings = cost_posture(self)
         return SemanticValuesResult.from_capped(
             self._shape(body, cube_request, notes),

@@ -279,8 +279,52 @@ def test_a_quoted_value_spanning_lines_is_masked(shop, monkeypatch, capsys):
     envelope = _run(capsys, shop, *_argv("by_status"), "--api")
 
     dumped = json.dumps(envelope)
+    assert [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+    assert (
+        "Could not convert string <value withheld> to INT32" in (envelope["errors"][0])
+    )
     assert "alice@example.com" not in dumped
     assert "second line" not in dumped
+
+
+def _plan(cube, **changes):
+    plan = json.loads(json.dumps(cube.recordings["by_status"]["response"]))
+    plan["sql"].update(changes)
+    return plan
+
+
+def test_a_core_planning_on_another_data_source_is_refused(shop, monkeypatch, capsys):
+    cube = _server(monkeypatch, shop)
+    plan = _plan(cube, dataSource="reporting")
+    cube.render = lambda query: plan
+
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "error"
+    assert "data source 'reporting'" in envelope["errors"][0]
+    assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+
+
+def test_an_empty_plan_is_disclosed_not_a_crash(shop, monkeypatch, capsys):
+    cube = _server(monkeypatch, shop)
+    cube.render = lambda query: {"sql": {"sql": []}}
+
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert any("its plan carried no SQL" in n for n in envelope["data"]["notes"])
+
+
+def test_an_unchecked_plan_is_said_on_that_result_only(shop, monkeypatch, capsys):
+    cube = _server(monkeypatch, shop)
+    plan = _plan(cube, preAggregations=[{"preAggregationId": "orders.rollup"}])
+    cube.render = lambda query: plan
+    first = _run(capsys, shop, *_argv("by_status"), "--api")
+    cube.render = None
+    second = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert any("pre-aggregation" in n for n in first["data"]["notes"])
+    assert not any("pre-aggregation" in n for n in second["data"]["notes"])
 
 
 def test_continue_wait_is_polled_until_the_rows_arrive(shop, monkeypatch, capsys):

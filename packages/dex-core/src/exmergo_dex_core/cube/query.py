@@ -222,8 +222,10 @@ def to_cube_query(
     own = {token: token for token in (*measures, *dimensions)}
     for entry in times:
         name = entry["dimension"]
-        own[name] = name
-        own[f"{name}__{entry['granularity']}"] = name
+        # A grouped member spelled exactly like a bucket alias keeps its own
+        # sort key: the alias is only added where nothing already holds it.
+        own.setdefault(name, name)
+        own.setdefault(f"{name}__{entry['granularity']}", name)
     order: list[list[str]] = []
     for raw in q.order_by:
         descending = raw.startswith("-")

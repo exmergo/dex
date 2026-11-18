@@ -134,7 +134,16 @@ if [[ $EXECUTE == 1 ]]; then
                 # instead, and leave its host binding as it is.
                 docker network inspect dex-cube >/dev/null 2>&1 \
                     || docker network create dex-cube >/dev/null
-                docker network connect dex-cube "$PG_CONTAINER" 2>/dev/null || true
+                if ! docker network connect dex-cube "$PG_CONTAINER" 2>/dev/null; then
+                    # Already a member is fine; anything else (the container
+                    # went away) would leave Cube with an address it cannot reach.
+                    attached=$(docker inspect "$PG_CONTAINER" \
+                        --format '{{json .NetworkSettings.Networks}}' 2>/dev/null || true)
+                    if [[ "$attached" != *'"dex-cube"'* ]]; then
+                        echo "could not attach $PG_CONTAINER to the dex-cube network" >&2
+                        exit 1
+                    fi
+                fi
                 DB_ENV=(-e CUBEJS_DB_HOST="$PG_CONTAINER" -e CUBEJS_DB_PORT=5432)
                 EXTRA+=(--network dex-cube)
             else

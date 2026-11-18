@@ -309,9 +309,11 @@ class CubeTransport:
         deadline = time.monotonic() + _LOAD_DEADLINE_SECONDS if loading else None
         for _ in range(attempts):
             token, secret = self._token()
-            timeout = self._timeout
+            # Only a load is bounded per request, by what its deadline has left;
+            # a render keeps the client's own timeout.
+            timeout = None
             if deadline is not None:
-                timeout = min(timeout, deadline - time.monotonic())
+                timeout = min(self._timeout, deadline - time.monotonic())
                 if timeout <= 0:
                     break
             try:
@@ -374,11 +376,11 @@ class CubeTransport:
         timeout: float | None = None,
     ) -> Any:
         headers = {"Authorization": token, "Content-Type": "application/json"}
-        limit = self._timeout if timeout is None else timeout
         if self._client is not None:
-            return self._client.request(
-                method, url, headers=headers, timeout=limit, **kwargs
-            )
+            if timeout is not None:
+                kwargs = {**kwargs, "timeout": timeout}
+            return self._client.request(method, url, headers=headers, **kwargs)
+        limit = self._timeout if timeout is None else timeout
         with httpx.Client(timeout=limit, follow_redirects=False) as client:
             return client.request(method, url, headers=headers, **kwargs)
 

@@ -84,13 +84,16 @@ policies() {
     gh api --paginate "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
         --jq '.branch_policies[]? | "\(.id) \(.type) \(.name)"'
 }
+# The whole listing first, and only then any deletion: deleting while a later
+# page is still to be read would shift entries past it.
+ALL_POLICIES="$(policies)"
 while read -r policy_id kind name; do
     [[ -n "$policy_id" ]] || continue
     if [[ "$kind" != "branch" || "$name" != "main" ]]; then
         gh api --method DELETE \
             "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies/$policy_id" >/dev/null
     fi
-done < <(policies)
+done <<<"$ALL_POLICIES"
 if ! policies | grep -q ' branch main$'; then
     gh api --method POST "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
         -f name=main -f type=branch >/dev/null
