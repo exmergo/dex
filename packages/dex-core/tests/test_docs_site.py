@@ -546,7 +546,7 @@ def test_write_replaces_a_previous_build(tmp_path):
 
 
 def test_write_never_clears_a_git_checkout(tmp_path):
-    """A checkout of the docs-site branch carries the build marker, so the
+    """A checkout of exmergo/dex-docs carries the build marker, so the
     marker alone would let `--out` wipe a real repository."""
 
     root = make_repo(tmp_path / "repo")

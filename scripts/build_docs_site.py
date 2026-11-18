@@ -9,8 +9,8 @@ Usage:
 docs.trydex.ai is a Mintlify site of its own. This script builds all of it:
 every page at the root of the output, and the `docs.json` that holds the site's
 settings, menu and redirects. The output is what CI validates, what `mint dev`
-previews, and what the release workflow publishes to the `docs-site` branch that
-Mintlify deploys from.
+previews, and what the release workflow publishes to exmergo/dex-docs, the
+repository Mintlify deploys from.
 
 It reads four sources and writes nothing back into the repository:
 
@@ -85,8 +85,8 @@ DEFAULT_OUT = REPO_ROOT / "build" / "docs-site"
 
 # The first line of the README written at the root of every build. `write`
 # recognizes a previous build by it (at <out>/README.md) and refuses to clear any
-# directory that lacks it. On the docs-site branch the same file tells a reader
-# the branch is generated.
+# directory that lacks it. In exmergo/dex-docs the same file tells a reader the
+# repository is generated.
 OUT_MARKER = "# Generated documentation site"
 
 # Components a hand-written page may use. Anything else that opens with `<` in
@@ -1715,7 +1715,7 @@ class SiteBuilder:
         files["README.md"] = (
             f"{OUT_MARKER}\n\n"
             f"Built by `scripts/build_docs_site.py` in {GITHUB} at `{self.ref}`,\n"
-            "and published here by its release workflow. Do not edit this branch:\n"
+            "and published here by its release workflow. Do not edit this repository:\n"
             "every release replaces it. Change `docs/`, `references/`,\n"
             f"`CHANGELOG.md` or the CLI in {GITHUB} instead.\n"
         )
@@ -1871,7 +1871,7 @@ class SiteBuilder:
     def write(self, out: Path) -> list[str]:
         """Write the whole site to `out`, which `mint dev` previews from."""
 
-        # A checkout of the docs-site branch carries the same marker, so the
+        # A checkout of exmergo/dex-docs carries the same marker, so the
         # marker alone would let `--out` clear a real repository, history
         # included. Refuse any git checkout.
         if (out / ".git").exists():

@@ -3,39 +3,42 @@ name: Docs site
 # Builds and validates the documentation site, docs.trydex.ai, and on a release
 # publishes it.
 #
-# docs.trydex.ai is a Mintlify site of its own, deployed from this repository's
-# `docs-site` branch. scripts/build_docs_site.py builds the whole site from
-# docs/, references/, the CLI parser and CHANGELOG.md: every page, and the
-# docs.json holding its settings, menu and redirects. `main` never holds the
-# built pages: they are transformed copies of references/, and committing them
-# would double every reference diff and break the documentation policy tests,
-# which allow each policy statement in exactly one file.
+# docs.trydex.ai is a Mintlify site of its own, deployed from exmergo/dex-docs.
+# scripts/build_docs_site.py builds the whole site from docs/, references/, the
+# CLI parser and CHANGELOG.md: every page, and the docs.json holding its
+# settings, menu and redirects. This repository never holds the built pages:
+# they are transformed copies of references/, and committing them would double
+# every reference diff and break the documentation policy tests, which allow
+# each policy statement in exactly one file.
 #
 # When it runs:
 #   - on a pull request or a push to main touching the sources: build the site
 #     and validate it, so a broken link, an MDX parse error or a menu Mintlify
 #     cannot read fails review.
 #   - by dispatch (workflow_dispatch): build, validate, and commit the site to
-#     the docs-site branch. release.yml dispatches it for each new final release
+#     exmergo/dex-docs. release.yml dispatches it for each new final release
 #     tag, after PyPI publish, so docs never go live for a release that failed
 #     to publish and always describe what `pip install` gives you. By hand it
 #     publishes the newest final release tag, or any ref with allow_untagged
 #     (bootstrap or rollback only).
 #
-# There is no workflow_call entry: release.yml starts this workflow as a run of
-# its own, so the deploy is gated by the docs-site environment on that run.
+# There is no workflow_call entry: a reusable-workflow call does not receive the
+# docs-site environment's secrets, which the deploy needs, so release.yml starts
+# this workflow as a run of its own instead.
 #
-# The deploy replaces the whole tree of the docs-site branch with the validated
-# build, as one ordinary commit on top of the last one, so the branch's history
-# is the history of what was published. Mintlify deploys every push to it.
+# The deploy replaces the whole tree of exmergo/dex-docs's main branch with the
+# validated build, as one ordinary commit, so that repository's history is the
+# history of what was published. Mintlify deploys every push to it.
 #
 # One-time setup (a maintainer):
-#   - The `docs-site` environment, whose deployment rule allows `main` and `v*`
-#     tags, and whose protection on the docs-site branch (if any) lets this
-#     workflow's GITHUB_TOKEN push to it.
-#   - A Mintlify project deploying from exmergo/dex, branch docs-site, at the
-#     repository root, with docs.trydex.ai as its custom domain.
-#   - Never edit the docs-site branch by hand: every release replaces it.
+#   - exmergo/dex-docs, the repository Mintlify created for docs.trydex.ai, with
+#     Mintlify's GitHub App and the custom domain set up in that project.
+#   - An organization GitHub App (the docs publisher) installed on
+#     exmergo/dex-docs with Contents: read and write. Its client ID is the
+#     DOCS_APP_CLIENT_ID variable and its private key the DOCS_APP_PRIVATE_KEY
+#     secret of this repository's `docs-site` environment, whose deployment
+#     rule allows `main` and `v*` tags. The organization disables deploy keys.
+#   - Never edit exmergo/dex-docs by hand: every release replaces it.
 
 on:
   workflow_dispatch:
@@ -244,55 +247,66 @@ jobs:
     if: needs.build.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # The only write: the docs-site branch of this repository, which holds
-    # nothing but published builds.
+    # This repository is only read. The write is to exmergo/dex-docs, with the
+    # app credentials held by the docs-site environment.
     permissions:
-      contents: write
+      contents: read
     concurrency:
       group: docs-site-deploy
       cancel-in-progress: false
     environment:
       name: docs-site
       url: https://docs.trydex.ai
+    env:
+      DOCS_REPOSITORY: dex-docs
+      DOCS_BRANCH: main
     steps:
+      # A token minted per run by the organization's docs publisher app, valid
+      # for about an hour and narrowed here to one repository and one
+      # permission, whatever else the app is ever granted. The organization
+      # disables deploy keys, which is why this is not one.
+      - name: Get a token that can write exmergo/dex-docs
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.DOCS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DOCS_APP_PRIVATE_KEY }}
+          owner: exmergo
+          repositories: ${{ env.DOCS_REPOSITORY }}
+          permission-contents: write
+      - name: Check out the site repository with write access
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: exmergo/${{ env.DOCS_REPOSITORY }}
+          ref: ${{ env.DOCS_BRANCH }}
+          path: dex-docs
+          token: ${{ steps.token.outputs.token }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: docs-site
           path: ${{ runner.temp }}/site
-      # Replaces the branch's whole tree with the build, as one commit on top of
-      # the last published one (or the branch's first, on the first run). Only
-      # this job writes the branch, and the concurrency group runs one at a
-      # time, so a rejected push means someone else wrote to it, which should
-      # stop the deploy and be looked at. The token is sent as a header, the
-      # way actions/checkout sends it, so it never sits in a remote URL.
-      - name: Commit the site to the docs-site branch
+      # Replaces the repository's whole tree with the build (its .git aside),
+      # as one ordinary commit on top of the last published one, including the
+      # starter content Mintlify created it with on the first run. Only this
+      # job writes it, and the concurrency group runs one at a time, so a
+      # rejected push means someone else wrote to it, which should stop the
+      # deploy and be looked at.
+      - name: Commit the site to exmergo/dex-docs
+        working-directory: dex-docs
         env:
           REF: ${{ needs.build.outputs.ref }}
           SHA: ${{ needs.build.outputs.sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          publish="$RUNNER_TEMP/publish"
-          git init --quiet "$publish"
-          cd "$publish"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
-          echo "::add-mask::${auth}"
-          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${auth}"
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          if git fetch --quiet --depth 1 origin docs-site; then
-            git checkout --quiet -B docs-site FETCH_HEAD
-            git rm -r --quiet --ignore-unmatch .
-          else
-            git checkout --quiet --orphan docs-site
-          fi
+          git rm -r --quiet --ignore-unmatch .
           cp -R "$RUNNER_TEMP/site/." .
           git add --all
           if git diff --cached --quiet; then
-            echo "docs-site already holds this build; nothing to publish"
+            echo "exmergo/${DOCS_REPOSITORY} already holds this build; nothing to publish"
             exit 0
           fi
           git commit --quiet -m "Dex docs for ${REF}" -m "Built from ${GITHUB_REPOSITORY}@${SHA}"
-          git push --quiet origin docs-site
-          echo "Published the site for ${REF}."
+          git push --quiet origin "HEAD:${DOCS_BRANCH}"
+          echo "Published the site for ${REF} to exmergo/${DOCS_REPOSITORY}."

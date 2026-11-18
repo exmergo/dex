@@ -780,8 +780,8 @@ python3 scripts/check_no_em_dashes.py path/to/file.md
 ## The documentation site
 
 The site at https://docs.trydex.ai is a Mintlify site of its own, deployed from
-this repository's `docs-site` branch. `scripts/build_docs_site.py` assembles the
-whole site from four sources, and nothing it produces is committed to `main`:
+[exmergo/dex-docs](https://github.com/exmergo/dex-docs).
+`scripts/build_docs_site.py` assembles the whole site from four sources, and nothing it produces is committed to `main`:
 
 - `docs/`: hand-written pages (`.mdx`), assets (the logo, the favicon, images),
   `skill.md` (what an agent reading the site is told to install), and
@@ -840,9 +840,9 @@ CLI version is set; keep the command above in step with it. On Windows,
 (a path-separator bug in the checker); CI runs on Linux and is the one to trust.
 
 **When it goes live.** After PyPI publish, the release workflow commits the
-built site to the `docs-site` branch, replacing its whole tree, and Mintlify
+built site to exmergo/dex-docs, replacing its whole tree, and Mintlify
 deploys it. A documentation fix therefore ships with the next release. Never
-edit the `docs-site` branch or use Mintlify's web editor: the next release
+edit exmergo/dex-docs or use Mintlify's web editor: the next release
 replaces it.
 
 **Claims.** Public pages state only what dex does today:
@@ -1079,12 +1079,14 @@ credentials:
   when PyPI answers 404 for the name. For protection before that release, you can
   publish a stub once by hand; the CI job then simply skips it. To reserve another
   name, add a stub package, a matrix entry, and a pending publisher.
-- **Documentation site:** Mintlify serves this repository's `docs-site` branch
-  (at the root) on the custom domain `docs.trydex.ai` (a `CNAME docs` record to
-  the target Mintlify gives). The `Docs site` workflow publishes to that branch
-  with its own `GITHUB_TOKEN`, from the `docs-site` environment here, whose
-  deployment rule allows `main` and `v*` tags; any rule protecting the branch
-  must let that token push. To publish outside a release, dispatch the
+- **Documentation site:** Mintlify serves exmergo/dex-docs (branch `main`, at
+  the root) on the custom domain `docs.trydex.ai` (a `CNAME docs` record to the
+  target Mintlify gives). The `Docs site` workflow publishes there through the
+  organization's docs publisher GitHub App (the organization disables deploy
+  keys), installed on exmergo/dex-docs with Contents: read and write. Its client
+  ID is the `DOCS_APP_CLIENT_ID` variable and its private key the
+  `DOCS_APP_PRIVATE_KEY` secret of the `docs-site` environment here, whose
+  deployment rule allows `main` and `v*` tags. To publish outside a release, dispatch the
   `Docs site` workflow from `main` with `allow_untagged`. The old address,
   `docs.exmergo.com/dex`, redirects here from exmergo/docs.
 - **ADE-bench spike:** stand up ADE-bench locally on DuckDB against the no-plugin
