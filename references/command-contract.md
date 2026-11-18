@@ -1295,6 +1295,15 @@ default, or a filter or operator after it is refused. A key naming a location
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests under `data_tests:` and PII flags in model and column `config.meta`)
   generated from the `.dex/` cache.
+- `transform plan` leaves out an edit whose content is identical to the
+  file already on disk (#1415): it is not in the diffs, `data.paths`, the
+  comparison offer or `transform compare`'s seed and snapshot check, and one
+  warning counts and names the skipped files ("N edits match the tree and were
+  skipped: ..."). A payload builder can resend a whole feature without its
+  unchanged files raising obligations. A payload whose every edit matches the
+  tree is refused, since the plan would change nothing. Identical is apply's own
+  no-op test (the file read as text), so a CRLF checkout resending LF content is
+  skipped too. A delete is never skipped.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

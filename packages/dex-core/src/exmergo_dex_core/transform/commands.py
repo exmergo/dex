@@ -342,6 +342,8 @@ def plan(
             "skeleton"
         )
 
+    edits, unchanged_notes = _skip_unchanged(engine, edits)
+
     from . import model_versions as versions_mod
 
     parse_notes: list[str] = []
@@ -474,6 +476,7 @@ def plan(
                 )
 
     result = _make_plan(engine, intent, edits)
+    result.warnings.extend(unchanged_notes)
     result.warnings.extend(scaffold_notes)
     result.warnings.extend(declaration_notes)
     result.warnings.extend(parse_notes)
@@ -492,6 +495,54 @@ def plan(
     if toggle_stated is not None:
         _check_toggle(engine, result, toggle_stated)
     return result
+
+
+def _skip_unchanged(
+    engine: DexEngine, edits: list[PlanEdit]
+) -> tuple[list[PlanEdit], list[str]]:
+    """Leave out the edits whose content is already the file on disk (#1415).
+
+    A payload builder that regenerates a whole feature re-sends files it did not
+    change, and each one counted as a change: an unchanged seed blocked
+    `transform compare` as unsynchronized, and an unchanged model was offered a
+    comparison the build then reported as owed. Dropped here, before any gate and
+    before the plan is stored, no diff, path, offer or check downstream sees them.
+
+    Identical means what apply already treats as a no-op: the content equals the
+    file as the project view reads it (text, universal newlines), the same test
+    `write_edits` makes before writing nothing. Only a file the view holds is
+    compared, so nothing outside the project is read. A delete is never a no-op.
+    """
+
+    if not _has_dbt_project(engine):
+        return edits, []
+    from ..dbt_project import load as load_project
+
+    files = load_project(engine.project_dir()).files
+    kept: list[PlanEdit] = []
+    skipped: list[str] = []
+    for edit in edits:
+        if (
+            edit.op is EditOp.UPSERT
+            and edit.path in files
+            and files[edit.path].content == edit.new_content
+        ):
+            skipped.append(edit.path)
+        else:
+            kept.append(edit)
+    if not skipped:
+        return edits, []
+    listed = ", ".join(skipped)
+    if not kept:
+        raise ValueError(
+            "every edit matches the tree, so this plan would change nothing: " + listed
+        )
+    one = len(skipped) == 1
+    return kept, [
+        f"{len(skipped)} edit{'' if one else 's'} "
+        f"{'matches' if one else 'match'} the tree and "
+        f"{'was' if one else 'were'} skipped: {listed}"
+    ]
 
 
 def _parse_toggle(

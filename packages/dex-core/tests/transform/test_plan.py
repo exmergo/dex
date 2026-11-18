@@ -405,6 +405,110 @@ def test_plan_without_content_is_a_clean_error(
     assert "edits-file" in envelope["errors"][0]
 
 
+# --- edits that match the tree (#1415) ----------------------------------------
+
+_ON_DISK = "select 1 as id, 'a@example.com' as email\n"
+
+
+def _plan_payload(tmp_path: Path, capsys, edits: list[dict]) -> tuple[int, dict]:
+    payload = _write_payload(tmp_path, edits)
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "regenerate",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def test_an_edit_matching_the_tree_is_left_out_of_the_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    rc, envelope = _plan_payload(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "content": _ON_DISK,
+            },
+            {
+                "path": "models/staging/stg_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            },
+        ],
+    )
+    assert rc == 0, envelope
+    data = envelope["data"]
+    assert data["paths"] == ["models/staging/stg_orders.sql"]
+    assert [d["path"] for d in envelope["diffs"]] == ["models/staging/stg_orders.sql"]
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/stg_customers.sql"
+        in envelope["warnings"]
+    )
+
+
+def test_an_edit_differing_only_in_line_endings_is_skipped(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Apply reads a CRLF file as LF text and writes nothing for an LF payload,
+    so a CRLF checkout resending its files is skipped too."""
+
+    on_disk = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    on_disk.write_bytes(_ON_DISK.replace("\n", "\r\n").encode("utf-8"))
+    rc, envelope = _plan_payload(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "content": _ON_DISK,
+            },
+            {
+                "path": "models/staging/stg_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            },
+        ],
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/staging/stg_orders.sql"]
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/stg_customers.sql"
+        in envelope["warnings"]
+    )
+
+
+def test_a_plan_whose_every_edit_matches_the_tree_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    rc, envelope = _plan_payload(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "content": _ON_DISK,
+            }
+        ],
+    )
+    assert rc == 1
+    assert envelope["status"] == "error"
+    assert "would change nothing" in envelope["errors"][0]
+    assert not (tmp_path / ".dex" / "plans").is_dir() or not any(
+        (tmp_path / ".dex" / "plans").iterdir()
+    )
+
+
 # --- project config kinds (project_yml / profiles_yml) ------------------------
 #
 # These exercise the engine directly (`transform.plan`), which does not run dbt
