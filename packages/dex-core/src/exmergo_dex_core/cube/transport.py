@@ -98,10 +98,12 @@ _WAIT_ATTEMPTS = 10
 _WAIT_SECONDS = 0.5
 
 # A load runs the query in the warehouse, and Cube answers "Continue wait" until
-# it has the rows, so its budget is the hosted dbt Cloud backend's: a bounded
-# minute and a half rather than a render's few seconds.
+# it has the rows, so its budget is the hosted dbt Cloud backend's: a minute and
+# a half of wall clock, counted across every request and pause, rather than a
+# render's few seconds.
 _LOAD_ATTEMPTS = 90
 _LOAD_SECONDS = 1.0
+_LOAD_DEADLINE_SECONDS = 90.0
 
 _INSTALL = 'pip install "exmergo-dex-core[cube,semantic-api]"'
 
@@ -304,10 +306,16 @@ class CubeTransport:
         attempts = _LOAD_ATTEMPTS if loading else _WAIT_ATTEMPTS
         pause = _LOAD_SECONDS if loading else _WAIT_SECONDS
         url = f"{self.base_url}{path}"
+        deadline = time.monotonic() + _LOAD_DEADLINE_SECONDS if loading else None
         for _ in range(attempts):
             token, secret = self._token()
+            timeout = self._timeout
+            if deadline is not None:
+                timeout = min(timeout, deadline - time.monotonic())
+                if timeout <= 0:
+                    break
             try:
-                response = self._send(httpx, method, url, token, kwargs)
+                response = self._send(httpx, method, url, token, kwargs, timeout)
             except httpx.HTTPError as exc:
                 raise CubeTransportError(
                     f"could not reach the Cube server at {self.base_url}: "
@@ -333,7 +341,13 @@ class CubeTransport:
                 ) from None
             error = body.get("error") if isinstance(body, dict) else None
             if error == "Continue wait":
-                time.sleep(pause)
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(pause, remaining))
+                else:
+                    time.sleep(pause)
                 continue
             if error is not None or status != 200:
                 detail = self._scrub(
@@ -341,17 +355,31 @@ class CubeTransport:
                 )
                 raise CubeTransportError(detail, resolution=400 <= status < 500)
             return body
-        what = "still running the query" if loading else "still compiling"
+        what = (
+            f"still running the query after {_LOAD_DEADLINE_SECONDS:.0f} seconds"
+            if loading
+            else f"still compiling after {attempts} attempts"
+        )
         raise CubeTransportError(
-            f"the Cube server at {self.base_url} was {what} after {attempts} "
-            "attempts; retry once it has finished"
+            f"the Cube server at {self.base_url} was {what}; retry once it has finished"
         )
 
-    def _send(self, httpx: Any, method: str, url: str, token: str, kwargs: dict) -> Any:
+    def _send(
+        self,
+        httpx: Any,
+        method: str,
+        url: str,
+        token: str,
+        kwargs: dict,
+        timeout: float | None = None,
+    ) -> Any:
         headers = {"Authorization": token, "Content-Type": "application/json"}
+        limit = self._timeout if timeout is None else timeout
         if self._client is not None:
-            return self._client.request(method, url, headers=headers, **kwargs)
-        with httpx.Client(timeout=self._timeout, follow_redirects=False) as client:
+            return self._client.request(
+                method, url, headers=headers, timeout=limit, **kwargs
+            )
+        with httpx.Client(timeout=limit, follow_redirects=False) as client:
             return client.request(method, url, headers=headers, **kwargs)
 
     @staticmethod
@@ -362,7 +390,9 @@ class CubeTransport:
         # A load runs in the warehouse, whose errors can quote a value (a cast
         # that failed on one); a render never reads a row.
         if values:
-            text = mask_values(text)
+            # The masker reads one line at a time, so a quoted value that spans a
+            # line break would reach no line whole: fold the lines first.
+            text = mask_values(" ".join(text.splitlines()))
         return env.redact(text)[:500]
 
     def __repr__(self) -> str:  # never a credential, which is not held here

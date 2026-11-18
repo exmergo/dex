@@ -18,12 +18,16 @@
 #   1. assembles cube.py, shop.sql and the model into a fresh directory and
 #      deploys it (`cube deploy`, which needs the deployment in CLI deploy mode),
 #      pruning every other file of the deployment;
-#   2. rotates the deployment's CUBEJS_API_SECRET to a fresh random one, and
-#      checks that a token signed with it (scripts/cube_cloud/mint_token.py) is
-#      accepted. Tokens Cube Cloud issues itself last a day, too short for a
-#      weekly schedule, so the job mints a one-hour token per run instead;
-#   3. creates the protected environment (deployments from main only), and sets
-#      DEX_TEST_CUBE_CLOUD_URL (a variable) and CUBE_CLOUD_API_SECRET (a secret).
+#   2. creates the protected environment (deployments from main only, checked
+#      across every page of branch policies) and sets DEX_TEST_CUBE_CLOUD_URL;
+#   3. rotates the deployment's CUBEJS_API_SECRET to a fresh random one, checks
+#      that a token signed with it (scripts/cube_cloud/mint_token.py) is
+#      accepted, and stores it as CUBE_CLOUD_API_SECRET. Tokens Cube Cloud
+#      issues itself last a day, too short for a weekly schedule, so the job
+#      mints a one-hour token per run instead. The new key waits in a private
+#      pending file until GitHub holds it, so an interrupted run is resumed by
+#      running the script again. Run it from one machine at a time: two runs
+#      rotating the same deployment at once can leave CI with the older key.
 # --keep-secret also writes the new secret to FILE (mode 0600) for local runs of
 # the suite (CUBE_CLOUD_API_SECRET=$(cat FILE) scripts/cube_cloud/mint_token.py),
 # since the GitHub secret cannot be read back. Neither the secret nor a token is
@@ -70,53 +74,80 @@ if [[ "$DEPLOY" == true ]]; then
         --message "dex integration fixture (scripts/setup_cube_cloud_ci.sh)"
 fi
 
-echo "==> rotating the deployment's API secret"
-SECRET_FILE="$WORK/secret"
-(
-    umask 077
-    openssl rand -hex 32 >"$SECRET_FILE"
-)
+echo "==> creating the protected GitHub environment (deployments from main only)"
+# Before the key is rotated, so nothing here can fail with a new key in Cube
+# Cloud and the old one in CI.
+gh api --method PUT "repos/$REPO/environments/$ENVIRONMENT" --input - >/dev/null <<JSON
+{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}
+JSON
+policies() {
+    gh api --paginate "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
+        --jq '.branch_policies[]? | "\(.id) \(.type) \(.name)"'
+}
+while read -r policy_id kind name; do
+    [[ -n "$policy_id" ]] || continue
+    if [[ "$kind" != "branch" || "$name" != "main" ]]; then
+        gh api --method DELETE \
+            "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies/$policy_id" >/dev/null
+    fi
+done < <(policies)
+if ! policies | grep -q ' branch main$'; then
+    gh api --method POST "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
+        -f name=main -f type=branch >/dev/null
+fi
+REMAINING=$(policies | awk '{print $2" "$3}' | sort -u)
+[[ "$REMAINING" == "branch main" ]] || {
+    echo "the environment allows more than main: $REMAINING" >&2; exit 1; }
+gh variable set DEX_TEST_CUBE_CLOUD_URL --env "$ENVIRONMENT" --repo "$REPO" --body "$URL"
+
+# The new key lives in a private pending file until GitHub holds it, so a run
+# that stops after Cube Cloud accepted the key and before GitHub stored it is
+# resumed by running the script again, with the same key, instead of leaving CI
+# signing with a key Cube Cloud no longer accepts.
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/dex-dogfood"
+PENDING="$STATE_DIR/cube_cloud_secret.$DEPLOYMENT.pending"
+install -d -m 700 "$STATE_DIR"
+if [[ -s "$PENDING" ]]; then
+    echo "==> resuming: publishing the key an interrupted run left in $PENDING"
+else
+    echo "==> generating a new API secret"
+    (
+        umask 077
+        openssl rand -hex 32 >"$PENDING.tmp"
+    )
+    mv "$PENDING.tmp" "$PENDING"
+fi
+echo "==> setting it on the deployment"
 # `cube variables set` takes KEY=VALUE arguments only, so the value is on this
 # one command line for the moment it runs.
-cube variables set "$DEPLOYMENT" "CUBEJS_API_SECRET=$(cat "$SECRET_FILE")" >/dev/null
+cube variables set "$DEPLOYMENT" "CUBEJS_API_SECRET=$(cat "$PENDING")" >/dev/null
 
 echo "==> checking a token signed with it against the deployment"
 code=""
 for _ in $(seq 1 30); do
-    token=$(CUBE_CLOUD_API_SECRET="$(cat "$SECRET_FILE")" python3 "$SCRIPTS/cube_cloud/mint_token.py")
-    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: $token" "$URL/v1/meta")
+    token=$(CUBE_CLOUD_API_SECRET="$(cat "$PENDING")" python3 "$SCRIPTS/cube_cloud/mint_token.py")
+    # A bounded transfer, and a failed one is one more attempt, not an exit.
+    code=$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: $token" "$URL/v1/meta") || code="000"
     unset token
     [[ "$code" == "200" ]] && break
     sleep 10
 done
-[[ "$code" == "200" ]] || { echo "the deployment answered /v1/meta with HTTP $code" >&2; exit 1; }
+[[ "$code" == "200" ]] || {
+    echo "the deployment answered /v1/meta with HTTP $code; the key stays in $PENDING, re-run to resume" >&2
+    exit 1
+}
 
-echo "==> creating the protected GitHub environment and writing configuration"
-gh api --method PUT "repos/$REPO/environments/$ENVIRONMENT" --input - >/dev/null <<JSON
-{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}
-JSON
-POLICIES_JSON=$(gh api "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies")
-while IFS= read -r policy_id; do
-    [[ -n "$policy_id" ]] || continue
-    gh api --method DELETE \
-        "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies/$policy_id" >/dev/null
-done < <(jq -r '.branch_policies[]? | select(.name != "main" or .type != "branch") | .id' \
-    <<<"$POLICIES_JSON")
-if ! jq -e 'any(.branch_policies[]?; .name == "main" and .type == "branch")' \
-    >/dev/null <<<"$POLICIES_JSON"; then
-    gh api --method POST "repos/$REPO/environments/$ENVIRONMENT/deployment-branch-policies" \
-        -f name=main -f type=branch >/dev/null
-fi
-gh variable set DEX_TEST_CUBE_CLOUD_URL --env "$ENVIRONMENT" --repo "$REPO" --body "$URL"
-gh secret set CUBE_CLOUD_API_SECRET --env "$ENVIRONMENT" --repo "$REPO" <"$SECRET_FILE"
+echo "==> publishing it to the environment"
+gh secret set CUBE_CLOUD_API_SECRET --env "$ENVIRONMENT" --repo "$REPO" <"$PENDING"
 if [[ -n "$KEEP" ]]; then
-    (
-        umask 077
-        cp "$SECRET_FILE" "$KEEP"
-    )
-    chmod 600 "$KEEP"
+    # Written private from the start, then moved over the destination.
+    keep_tmp="$(mktemp "$(dirname "$KEEP")/.cube_cloud_secret.XXXXXX")"
+    chmod 600 "$keep_tmp"
+    cat "$PENDING" >"$keep_tmp"
+    mv "$keep_tmp" "$KEEP"
 fi
-rm -f "$SECRET_FILE"
+rm -f "$PENDING"
 # The token secret an earlier version of this script stored, if it is there.
 gh secret delete CUBE_CLOUD_API_TOKEN --env "$ENVIRONMENT" --repo "$REPO" >/dev/null 2>&1 || true
 

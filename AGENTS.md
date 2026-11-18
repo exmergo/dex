@@ -428,8 +428,9 @@ releases), `[cube]` for `semantic.vendor: cube` (Cube YAML model files in the
 repository, read statically by dex's own port of Cube's model rules; the extra is
 the dialect engine, with no Cube package and no Node; only `explore semantic
 query|values` (and `list` under `semantic.deployment: cube_cloud`) asks a running
-Cube server, to render or, with `--api`, to execute, and that adds
-`[semantic-api]` for httpx), `[metric-views]` for `semantic.vendor: databricks`
+Cube server, which renders for dex to execute by default on a Cube Core
+(`--api` has the Core execute) and executes by default on Cube Cloud (`--local`
+has dex execute under the cost guard), and that adds `[semantic-api]` for httpx), `[metric-views]` for `semantic.vendor: databricks`
 (Databricks Unity Catalog Metric View YAML files in the repository, read
 statically by dex's own port of the Metric View YAML 1.1 rules; the extra is the
 dialect engine, with no Databricks package and no workspace connection, and it is

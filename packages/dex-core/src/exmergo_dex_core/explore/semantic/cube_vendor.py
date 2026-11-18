@@ -115,6 +115,8 @@ class CubeVendorLayer:
         self._hosted_view: Any = None
         self._transport_obj: Any = None
         self._governed: GovernedSql | None = None
+        #: What this layer could not check, said on the result.
+        self._notes: list[str] = []
 
     @classmethod
     def from_engine(cls, engine: Any, deployment: str = "local") -> CubeVendorLayer:
@@ -240,6 +242,7 @@ class CubeVendorLayer:
                     where=transport.base_url,
                     cubes={cube.name: cube for cube in loaded.cubes},
                 )
+                self._check_core_relations(request)
             return transport.load(request.query)
         except CubeRefusalError as exc:
             raise SemanticQueryRefusedError(str(exc)) from exc
@@ -250,28 +253,95 @@ class CubeVendorLayer:
                 raise SemanticBackendError(f"could not resolve {what}: {exc}") from exc
             raise SemanticBackendError(str(exc)) from exc
 
+    def _check_core_relations(self, request: Any) -> None:
+        """Hold the relations a Core would read to the files' ``sql_table``.
+
+        ``/v1/meta`` carries no ``sql_table``, so a Core still serving a model
+        whose cube read another table passes the member check. The Core is asked
+        to plan the query over ``/v1/sql`` (which runs nothing) through a render
+        transport of its own, and the plan is held to the files exactly as on
+        the render path. Where that cannot be judged (dex has no connector whose
+        dialect reads the plan, or Cube plans over a pre-aggregation, which a
+        load may use), the result says the relations were not checked.
+        """
+
+        from ...adapters import get_dialect
+        from ...cube.query import CUBE_CONNECTORS
+        from ...cube.transport import CubeTransport
+        from .cube import LocalCubeLayer
+
+        connector = (
+            getattr(self._dex, "connector", None)
+            or getattr(getattr(self._dex, "config", None), "connector", None)
+            or getattr(self._source, "connector", None)
+        )
+        if connector not in CUBE_CONNECTORS:
+            self._notes.append(
+                "the tables this Cube Core reads were not checked against the "
+                "repository's sql_table: dex has no connector whose dialect reads "
+                "the Core's plan"
+            )
+            return
+        render = CubeTransport(getattr(self._source, "url", None))
+        body = render.sql(request.query)
+        plan = body.get("sql") if isinstance(body, dict) else None
+        if not isinstance(plan, dict) or not isinstance(plan.get("sql"), list):
+            self._notes.append(
+                "the tables this Cube Core reads were not checked against the "
+                "repository's sql_table: its plan carried no SQL"
+            )
+            return
+        if plan.get("preAggregations"):
+            self._notes.append(
+                "the tables this Cube Core reads were not checked against the "
+                "repository's sql_table: it answers this query from a "
+                "pre-aggregation"
+            )
+            return
+        LocalCubeLayer(self._source, self._dex)._check_relations(
+            plan["sql"][0], get_dialect(connector)
+        )
+
     # ---- the PII gate ------------------------------------------------------
 
     def _lookup(self):
-        """The gate's lookup: the model's own ``meta: {pii: true}`` first, then
-        the cache through the files' physical columns. None from both leaves the
-        name heuristic in charge, which the result then discloses."""
+        """The gate's lookup, in order:
+
+        1. the model's own ``meta: {pii: true}`` on the member, or on the cube
+           member a view member exposes (``aliasMember``);
+        2. the cache through the files' physical columns. On Cube Cloud a
+           column the files name is not proven to be the one the deployment
+           reads, so there the cache may refuse a member and never clears one;
+        3. otherwise None, which leaves the name heuristic in charge, and the
+           result discloses that it alone spoke.
+
+        A ``/v1/meta`` that cannot be read refuses the query: screening without
+        the model's own marks and then sending it would be the gate passing
+        on half its evidence.
+        """
 
         from ...cube.hosted import meta_pii
 
-        try:
-            marked = meta_pii(self._meta())
-        except SemanticBackendError:
-            marked = {}
+        marked = meta_pii(self._meta())
+        members = self._members()
         governed = self._governed_sql()
         cached = governed.pii_lookup(governed.load_cache()) if governed else None
+        cloud = self._cloud
 
         def lookup(ref: str) -> Any:
             own = marked.get(ref)
             if says_pii(own):
                 return own
+            target = members.get(ref)
+            behind = marked.get(target.alias_of) if target and target.alias_of else None
+            if says_pii(behind):
+                return behind
             verdict = cached(ref) if cached is not None else None
-            return verdict if verdict is not None else own
+            if cloud and verdict is not None and not says_pii(verdict):
+                verdict = None
+            if verdict is not None:
+                return verdict
+            return own if own is not None else behind
 
         return lookup
 
@@ -367,6 +437,7 @@ class CubeVendorLayer:
         except CubeQueryError as exc:
             raise SemanticBackendError(str(exc)) from exc
         body = self._load(request, "the metric query")
+        notes += self._notes
         cost, warnings = cost_posture(self)
         return SemanticQueryResult.from_capped(
             self._shape(body, request, notes),
@@ -407,6 +478,7 @@ class CubeVendorLayer:
         except CubeQueryError as exc:
             raise SemanticBackendError(str(exc)) from exc
         body = self._load(cube_request, f"the values of {request.token}")
+        notes = [*notes, *self._notes]
         cost, warnings = cost_posture(self)
         return SemanticValuesResult.from_capped(
             self._shape(body, cube_request, notes),

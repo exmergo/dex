@@ -11,6 +11,7 @@ import json
 import shutil
 from pathlib import Path
 
+import httpx
 import pytest
 
 pytest.importorskip("sqlglot")
@@ -176,11 +177,110 @@ def test_api_values_match_the_render_path(shop, monkeypatch, capsys, case):
     assert CUBE_VENDOR_COST_WARNING in api["warnings"]
 
 
-def test_api_never_asks_for_a_render(shop, monkeypatch, capsys):
+def test_api_on_a_core_plans_the_query_before_it_loads_it(shop, monkeypatch, capsys):
+    """/v1/meta carries no sql_table, so the Core is asked for its plan (which
+    runs nothing) and the plan's tables are held to the files before the load."""
+
     cube = _server(monkeypatch, shop)
     _run(capsys, shop, *_argv("by_status"), "--api")
 
+    assert [c.url.path.rsplit("/v1", 1)[1] for c in cube.calls] == [
+        "/meta",
+        "/sql",
+        "/load",
+    ]
+
+
+def test_a_core_reading_another_table_is_refused_before_it_runs_anything(
+    shop, monkeypatch, capsys
+):
+    cube = _server(monkeypatch, shop)
+    plan = json.loads(json.dumps(cube.recordings["by_status"]["response"]))
+    plan["sql"]["sql"][0] = plan["sql"]["sql"][0].replace(
+        "app.orders", "app.orders_old"
+    )
+    cube.render = lambda query: plan
+
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "error"
+    assert "orders_old" in envelope["errors"][0]
+    assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+
+
+def test_an_unreadable_meta_refuses_before_anything_runs(shop, monkeypatch, capsys):
+    cube = FakeCube("duckdb")
+    cube.warehouse = shop / "shop.duckdb"
+    original = cube.handler
+
+    def handler(request):
+        if request.url.path.endswith("/v1/meta"):
+            cube.calls.append(request)
+            return httpx.Response(503, json={"error": "unavailable"})
+        return original(request)
+
+    cube.handler = handler
+    cube.install(monkeypatch)
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "error"
+    assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+
+
+def test_a_view_member_exposing_a_pii_member_is_refused(cloud, monkeypatch, capsys):
+    """A view member carries no meta of its own; the cube member it exposes is
+    marked, and that mark governs the view member too."""
+
+    cube = _server(monkeypatch, cloud, cloud=True)
+    for element in cube.meta["cubes"]:
+        for entry in element["dimensions"]:
+            if entry["name"] == "orders.status":
+                entry["meta"] = {"pii": True}
+    envelope = _run(
+        capsys,
+        cloud,
+        "explore",
+        "semantic",
+        "query",
+        "order_facts.revenue",
+        "--group-by",
+        "order_facts.status",
+    )
+
+    assert envelope["status"] == "error"
+    assert "order_facts.status" in envelope["errors"][0]
+    assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+
+
+def test_cube_cloud_never_renders(cloud, monkeypatch, capsys):
+    cube = _server(monkeypatch, cloud, cloud=True)
+    _run(capsys, cloud, *_argv("by_status"))
+
     assert {c.url.path.rsplit("/v1", 1)[1] for c in cube.calls} == {"/meta", "/load"}
+
+
+def test_a_load_past_its_deadline_says_so(shop, monkeypatch, capsys):
+    cube = _server(monkeypatch, shop)
+    cube.waits = 5
+    monkeypatch.setattr("exmergo_dex_core.cube.transport._LOAD_DEADLINE_SECONDS", 0.0)
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "error"
+    assert "still running the query" in envelope["errors"][0]
+
+
+def test_a_quoted_value_spanning_lines_is_masked(shop, monkeypatch, capsys):
+    cube = _server(monkeypatch, shop)
+    cube.load_error = (
+        400,
+        "Conversion Error: Could not convert string 'alice@example.com\nsecond "
+        "line' to INT32",
+    )
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    dumped = json.dumps(envelope)
+    assert "alice@example.com" not in dumped
+    assert "second line" not in dumped
 
 
 def test_continue_wait_is_polled_until_the_rows_arrive(shop, monkeypatch, capsys):
@@ -314,6 +414,16 @@ def test_a_cloud_host_outside_the_allowlist_is_refused_before_the_token(
 ):
     read = []
     with pytest.raises(CubeTransportError, match=named):
+        CubeTransport(url, deployment="cube_cloud", token=lambda: read.append(1) or "t")
+    assert read == []
+
+
+@pytest.mark.parametrize(
+    "url", ["http://localhost:4000/cubejs-api", "https://127.0.0.1/cubejs-api"]
+)
+def test_a_loopback_host_never_receives_a_cloud_token(monkeypatch, url):
+    read = []
+    with pytest.raises(CubeTransportError, match="not a Cube Cloud host"):
         CubeTransport(url, deployment="cube_cloud", token=lambda: read.append(1) or "t")
     assert read == []
 

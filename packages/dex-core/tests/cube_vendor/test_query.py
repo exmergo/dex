@@ -1159,3 +1159,43 @@ def test_a_changed_member_a_calculated_measure_reads_is_stale(
     assert envelope["reason"] == "guard", envelope
     assert "orders.revenue has different SQL there" in envelope["errors"][0]
     assert cube.paths == ["/cubejs-api/v1/meta"]
+
+
+def test_a_member_named_like_a_grain_bucket_is_not_cut_in_two():
+    """A member whose own name ends in `__<grain>` is that member, not the
+    bucket of a time dimension sharing its head (the PII gate screens the token
+    the query sends)."""
+
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import Target, split_time
+
+    time = Member(name="period", kind="dimension", type="time")
+    literal = Member(name="period__month", kind="dimension", type="string")
+    members = {
+        "orders.period": Target("orders.period", "dimension", time, "orders"),
+        "orders.period__month": Target(
+            "orders.period__month", "dimension", literal, "orders"
+        ),
+    }
+
+    assert split_time("orders.period__month", members) == (
+        "orders.period__month",
+        None,
+    )
+    del members["orders.period__month"]
+    assert split_time("orders.period__month", members) == ("orders.period", "month")
+
+
+def test_a_dimension_served_without_sql_is_stale():
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    member = Member(name="status", kind="dimension", type="string", sql="status")
+    members = {"orders.status": Target("orders.status", "dimension", member, "orders")}
+    served = {"name": "orders.status", "type": "string"}
+    meta = {"cubes": [{"name": "orders", "dimensions": [served], "measures": []}]}
+
+    with pytest.raises(StaleRendererError, match="no SQL"):
+        check_renderer(meta, ["orders.status"], members, where="x")
+    served["sql"] = "`status`"
+    check_renderer(meta, ["orders.status"], members, where="x")

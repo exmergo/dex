@@ -165,7 +165,10 @@ def check_cube_url(
             "http://localhost:4000/cubejs-api: a scheme, a host, an optional port "
             "and path, and no credentials, query or fragment"
         )
-    if host in LOOPBACK_HOSTS:
+    # A Core on this machine is a process the user runs. Under `cube_cloud` the
+    # token is the user's Cube Cloud credential, so a loopback host earns no
+    # exemption there: it needs DEX_CUBE_ALLOWED_HOSTS and https like any other.
+    if host in LOOPBACK_HOSTS and deployment != CUBE_CLOUD_DEPLOYMENT:
         return str(url).rstrip("/")
     cloud = deployment == CUBE_CLOUD_DEPLOYMENT and any(
         host == d or host.endswith("." + d) for d in CUBE_CLOUD_DOMAINS

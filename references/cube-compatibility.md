@@ -290,7 +290,10 @@ server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
    granularities, and, for a view member, the same cube member behind it. A
    Cube server outside dev mode does not reload an edited model file, so a
    server still serving yesterday's files is the normal state after an edit,
-   and it is refused naming the member.
+   and it is refused naming the member. A dimension served with no SQL to
+   compare is refused too. A measure's own SQL is the one part `/v1/meta` never
+   serves, on Cube Core or Cube Cloud, so a measure whose expression alone
+   changed is not caught here; restart or redeploy after such an edit.
 6. **Render** over `/v1/sql`, and the plan checks: one statement (a
    `compareDateRange` plans several), no pre-aggregation (Cube matches a
    rollup even one it never built, and the SQL then reads its table), no
@@ -365,14 +368,24 @@ the rows:
 1. **`--where`** is read as on the render path, and a clause Dex cannot read is
    refused before anything is sent.
 2. **PII gate**, before anything is sent: a member the Cube model marks
-   `meta: {pii: true}` is refused on that word; otherwise the `.dex/` cache
-   decides, through the column the repository's files resolve the member to;
-   the name heuristic is the floor, and a result says when it alone spoke.
+   `meta: {pii: true}` is refused on that word, as is a view member exposing a
+   marked cube member; otherwise the `.dex/` cache decides, through the column
+   the repository's files resolve the member to (on Cube Cloud, where that
+   column is not proven to be the deployment's, the cache may refuse a member
+   but never clears one); the name heuristic is the floor, and a result says
+   when it alone spoke.
 3. **Grain and translation**, as on the render path.
-4. **On a Cube Core** (`deployment: local`): the data-source check and the
-   stale-renderer check against the repository's files, so a Core serving
-   another model is refused before it runs anything.
-5. **`/v1/load`**, polled through Cube's "Continue wait" for up to 90 seconds.
+4. **On a Cube Core** (`deployment: local`): the data-source check, the
+   stale-renderer check against the repository's files, and the tables: the
+   Core is asked over `/v1/sql` for its plan (which runs nothing) and every
+   table the plan reads is held to the files' `sql_table`, as on the render
+   path. A Core serving another model is refused before it runs anything.
+   Where the tables cannot be judged (Dex has no connector whose dialect reads
+   the plan, or Cube plans over a pre-aggregation), the result says so.
+   A `/v1/meta` that cannot be read refuses the query rather than screening
+   without the model's own PII marks.
+5. **`/v1/load`**, polled through Cube's "Continue wait" within a 90-second
+   deadline that counts every request and pause.
 6. **The rows**, named by the caller's tokens in the column order Cube's own SQL
    uses. Cube returns every number as text; Dex decodes the ones its
    annotation types `number`. A time bucket is Cube's ISO text in UTC. Capped
@@ -430,7 +443,7 @@ authoring and `maintain` read them, and `--local` holds the deployment to them.
   you sign with it works as one Cube Cloud issues (those last a day).
 - **The host** is admitted when it is a Cube Cloud domain (`*.cubecloudapp.dev`,
   `*.cubecloud.dev`) over https, and refused before any token is read
-  otherwise. A custom domain is admitted only by exact name in
+  otherwise, a loopback host included: the token is your Cube Cloud credential. A custom domain is admitted only by exact name in
   `DEX_CUBE_ALLOWED_HOSTS`, which `.dex/config.yml` cannot widen.
 - **The release** is whatever Cube Cloud runs (its `latest` channel moves on its
   own), and Cube's REST API does not report it. Dex's rules are ported from

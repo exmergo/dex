@@ -18,8 +18,10 @@
 # ports 4010 duckdb, 4011 postgres, 4012 bigquery), configured by
 # scripts/cube/execute.js. It is the only mode that gives Cube a warehouse:
 #   duckdb    in-memory, built from scripts/cube/shop.sql (dex's own fixture rows)
-#   postgres  the dogfood database as dex_ro, read-only, reached on the host
-#             (scripts/setup_postgres_dev.sh, or the CI service container)
+#   postgres  the dogfood database as dex_ro, read-only: the dex-pg container
+#             of scripts/setup_postgres_dev.sh over a private network
+#             (DEX_CUBE_PG_CONTAINER names another), else a database published
+#             on the host (CI's service container; DEX_CUBE_PG_PORT, default 5432)
 #   bigquery  your Application Default Credentials, mounted read-only, on the
 #             project DEX_CUBE_BQ_PROJECT names (dogfood only; CI never runs it)
 # Its URL is exported as DEX_TEST_CUBE_EXEC_URL_<DB>.
@@ -124,9 +126,25 @@ if [[ $EXECUTE == 1 ]]; then
             ;;
         postgres)
             PORT_DEFAULT=4011
-            DB_ENV=(-e CUBEJS_DB_HOST=host.docker.internal -e CUBEJS_DB_PORT="${DEX_CUBE_PG_PORT:-5432}"
-                -e CUBEJS_DB_NAME=dex_dogfood -e CUBEJS_DB_USER=dex_ro -e CUBEJS_DB_SSL=false)
-            EXTRA+=(--add-host host.docker.internal:host-gateway)
+            PG_CONTAINER="${DEX_CUBE_PG_CONTAINER:-dex-pg}"
+            if docker inspect "$PG_CONTAINER" >/dev/null 2>&1; then
+                # The dogfood database (scripts/setup_postgres_dev.sh) publishes
+                # on 127.0.0.1 only, which a container cannot reach through the
+                # host gateway on native Linux. Join it on a private network
+                # instead, and leave its host binding as it is.
+                docker network inspect dex-cube >/dev/null 2>&1 \
+                    || docker network create dex-cube >/dev/null
+                docker network connect dex-cube "$PG_CONTAINER" 2>/dev/null || true
+                DB_ENV=(-e CUBEJS_DB_HOST="$PG_CONTAINER" -e CUBEJS_DB_PORT=5432)
+                EXTRA+=(--network dex-cube)
+            else
+                # A database published on the host's interfaces, as CI's
+                # service container is.
+                DB_ENV=(-e CUBEJS_DB_HOST=host.docker.internal
+                    -e CUBEJS_DB_PORT="${DEX_CUBE_PG_PORT:-5432}")
+                EXTRA+=(--add-host host.docker.internal:host-gateway)
+            fi
+            DB_ENV+=(-e CUBEJS_DB_NAME=dex_dogfood -e CUBEJS_DB_USER=dex_ro -e CUBEJS_DB_SSL=false)
             SECRET_ENV=("CUBEJS_DB_PASS=dex_ro")
             ;;
         bigquery)

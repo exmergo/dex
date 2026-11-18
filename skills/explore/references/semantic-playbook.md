@@ -230,7 +230,11 @@ statically with no Cube server. `list` reads the same shape as anywhere else:
   no relation or column (declared in `unavailable`), and omits primary keys and
   private members. Every result says it was not checked against the repository;
   to hold the deployment to the reviewed files, pass `--local`, which has Cube
-  Cloud render and Dex execute, and refuses a deployment serving another model.
+  Cloud render and Dex execute, and refuses a deployment whose members, kinds,
+  aggregations, filters, dimension SQL, joins or tables differ from the files.
+  A measure's own SQL is the one thing it cannot compare: `/v1/meta` serves it
+  on neither Cube Core nor Cube Cloud, so a measure whose expression alone
+  changed passes. Restart or redeploy after such an edit.
   `CUBE_API_TOKEN` must be exported (never in config); a host that is not
   `*.cubecloudapp.dev` / `*.cubecloud.dev` needs `DEX_CUBE_ALLOWED_HOSTS`.
 
