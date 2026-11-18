@@ -969,7 +969,7 @@ wheels = [
 
 [[package]]
 name = "dbt-trino"
-version = "1.11.0"
+version = "1.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dbt-adapters" },
@@ -978,9 +978,9 @@ dependencies = [
     { name = "requests" },
     { name = "trino" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e5/41/55950269a6fd7f084c24a71755afe775145e5301f9be08fc1ca31ec127b6/dbt_trino-1.11.0.tar.gz", hash = "sha256:b43f41811a6472e9eb7112017b0a7d5584f18d7238a71b42ccd59b7988cc8f86", size = 49706, upload-time = "2026-10-26T15:20:05.699Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b7/f5/6425a5d18f1ecbcc8b80e8fcc8bb125fb43d586c4619ab24f64380b4bfdc/dbt_trino-1.12.0.tar.gz", hash = "sha256:e44ad428c42a08f9abfb4010e16af7a3c0ba91a45d2d9026f61bb25ca3169340", size = 50215, upload-time = "2026-11-13T18:48:19.725Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/5b/2bb4e514597e9751284f14e0c9b14390671af5e15348c9f5cc3ce40f1fc9/dbt_trino-1.11.0-py3-none-any.whl", hash = "sha256:3a6d7ca9bfde4e667a623ccc4379442f09b7f1885aeddc24b028ce28c7462caa", size = 58057, upload-time = "2026-10-26T15:20:04.488Z" },
+    { url = "https://files.pythonhosted.org/packages/82/37/f5c88b22ac0cb337a9cc6e4e389a91363f0f20be4c573f9e7e5dc324c848/dbt_trino-1.12.0-py3-none-any.whl", hash = "sha256:1254dbafa3fa931ba942cce7b8f004f158251d28fc88e5c20b504b48a1f006dd", size = 58696, upload-time = "2026-11-13T18:48:18.444Z" },
 ]
 
 [[package]]
