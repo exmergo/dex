@@ -29,6 +29,7 @@ from exmergo_dex_core.transform.artifact_runtime import (
     artifact_paths,
     readable_artifact_dir,
 )
+from exmergo_dex_core.transform.expected_change import ACCEPTED_SHAPE
 from exmergo_dex_core.transform.native_semantic import plan_hint
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 
@@ -159,6 +160,19 @@ def test_the_offer_says_static_attribution_could_not_establish_the_refactor(
     # The offer leads the large fields, as it did.
     keys = list(planned.data())
     assert keys.index("refactor_comparison_offer") < keys.index("declarations")
+
+
+def test_the_intended_change_hint_spells_the_key_value_and_whole_shape(accounts):
+    """The hint names `"key": "unchanged"`, not "the key holds", and shows the
+    shape --expect accepts, so following it does not cost a refusal (#1421)."""
+
+    offer = _extraction(_engine(accounts), _INNER_INT).data()[
+        "refactor_comparison_offer"
+    ]
+    hint = offer["intended_change"]
+    assert '"key": "unchanged"' in hint
+    assert "key holds" not in hint
+    assert hint.endswith(ACCEPTED_SHAPE)
 
 
 def test_the_next_step_names_the_comparison_before_apply(accounts):

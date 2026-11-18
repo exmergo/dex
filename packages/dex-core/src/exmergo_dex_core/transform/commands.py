@@ -1087,6 +1087,8 @@ def _offer_refactor_comparison(
             + " Keep this plan unapplied until it is compared: applying it "
             "discards the baseline. " + why[0].upper() + why[1:]
         )
+    from .expected_change import ACCEPTED_SHAPE
+
     offer: dict[str, Any] = {
         "plan_id": result.plan_id,
         "recommended_before_apply": recommended,
@@ -1103,9 +1105,8 @@ def _offer_refactor_comparison(
         "intended_change": (
             "if the plan is meant to change rows, compare with --expect, stating "
             "which rows may be added and removed, which columns may change, and "
-            "that the key holds: "
-            '{"added": "none"|"any"|{"where": "<predicate>"}, "removed": ..., '
-            '"changed_columns": [...], "key": "unchanged"}'
+            '"key": "unchanged" (or "any" when the key may stop being unique): '
+            + ACCEPTED_SHAPE
         ),
     }
     if mixed:
