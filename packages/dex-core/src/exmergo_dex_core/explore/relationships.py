@@ -1435,6 +1435,10 @@ class JoinCoverageCounts(NamedTuple):
     #: converts no child key.
     conversion_failed_rows: int | None = None
     conversion_failed_keys: int | None = None
+    #: The number of groups in a side read through a grouped scope (#1324):
+    #: the grouped input's denominator, never the ungrouped relation's rows.
+    #: None where the join has no grouped side.
+    to_group_rows: int | None = None
 
 
 #: Per relationship (by ``id``), the conversion each side applies to each key
@@ -1447,6 +1451,11 @@ KeyExprs = dict[int, tuple[tuple[str | None, ...], tuple[str | None, ...]]]
 #: or None for the whole relation (#1085).
 ScopeFilters = dict[int, tuple[str | None, str | None]]
 
+#: Per relationship (by ``id``), whether each side is read through a scope
+#: grouped by exactly the join's key columns (#1324). A grouped side is probed
+#: over its groups, never over the ungrouped relation underneath.
+GroupedSides = dict[int, tuple[bool, bool]]
+
 
 def coverage_probe_sql(
     batch: list[Relationship],
@@ -1454,6 +1463,7 @@ def coverage_probe_sql(
     key_cast: str | None = None,
     key_exprs: KeyExprs | None = None,
     scope_filters: ScopeFilters | None = None,
+    grouped_sides: GroupedSides | None = None,
 ) -> str:
     """One aggregate statement measuring every edge of ``batch``'s coverage.
 
@@ -1495,16 +1505,30 @@ def coverage_probe_sql(
     def _filters(rel: Relationship) -> tuple[str | None, str | None]:
         return (scope_filters or {}).get(id(rel), (None, None))
 
-    by_child: dict[tuple[str, str | None], list[tuple[int, Relationship]]] = {}
+    def _grouped(rel: Relationship) -> tuple[bool, bool]:
+        return (grouped_sides or {}).get(id(rel), (False, False))
+
+    by_child: dict[
+        tuple[str, str | None, tuple[str, ...]], list[tuple[int, Relationship]]
+    ] = {}
     for index, rel in enumerate(batch):
-        key = (rel.from_dataset, _filters(rel)[0])
+        from_grouped, _to_grouped = _grouped(rel)
+        key = (
+            rel.from_dataset,
+            _filters(rel)[0],
+            tuple(rel.from_columns) if from_grouped else (),
+        )
         by_child.setdefault(key, []).append((index, rel))
 
     aggregates: list[str] = []
-    for (child, child_filter), edges in by_child.items():
+    group_counts: list[str] = []
+    for (child, child_filter, group_by), edges in by_child.items():
         child_sql = _quote_identifier(child)
         if child_filter is not None:
             child_sql = f"(SELECT * FROM {child_sql} WHERE {child_filter})"  # noqa: S608
+        if group_by:
+            keys_sql = ", ".join(_quote_part(column) for column in group_by)
+            child_sql = f"(SELECT {keys_sql} FROM {child_sql} GROUP BY {keys_sql})"  # noqa: S608
         counts: list[str] = []
         joins: list[str] = []
         for index, rel in edges:
@@ -1516,6 +1540,19 @@ def coverage_probe_sql(
             parent = _quote_identifier(rel.to_dataset)
             parent_filter = _filters(rel)[1]
             parent_where = f" WHERE {parent_filter}" if parent_filter else ""
+            to_grouped = _grouped(rel)[1]
+            if to_grouped:
+                parent_keys_sql = ", ".join(_quote_part(c) for c in rel.to_columns)
+                grouped_parent = (
+                    f"(SELECT {parent_keys_sql} FROM {parent}{parent_where} "  # noqa: S608
+                    f"GROUP BY {parent_keys_sql})"
+                )
+                group_counts.append(
+                    f"SELECT COUNT(*) AS dex_cov_to_groups_{index} "  # noqa: S608
+                    f"FROM {grouped_parent} AS dex_g_{index}"
+                )
+                parent = grouped_parent
+                parent_where = ""
             nonnull = " AND ".join(f"c.{fk} IS NOT NULL" for fk in fks)
             parent_keys = ", ".join(
                 f"{_cast_key(_apply(to_exprs[pair], key))} AS pk{pair}"
@@ -1573,6 +1610,7 @@ def coverage_probe_sql(
             f"FROM {child_sql} c {' '.join(joins)}"
         )
 
+    aggregates.extend(group_counts)
     joined = " CROSS JOIN ".join(f"({sql}) a{i}" for i, sql in enumerate(aggregates))
     return f"SELECT * FROM {joined}"  # noqa: S608
 
@@ -1583,12 +1621,18 @@ def coverage_statements(
     *,
     key_exprs: KeyExprs | None = None,
     scope_filters: ScopeFilters | None = None,
+    grouped_sides: GroupedSides | None = None,
 ) -> list[str]:
     """The exact statements :func:`measure_coverage` runs, for pricing first."""
 
     return [
         _transpile_probe(
-            coverage_probe_sql(batch, key_exprs=key_exprs, scope_filters=scope_filters),
+            coverage_probe_sql(
+                batch,
+                key_exprs=key_exprs,
+                scope_filters=scope_filters,
+                grouped_sides=grouped_sides,
+            ),
             dialect,
         )
         for batch in probe_batches(probe_candidates(relationships))
@@ -1603,13 +1647,18 @@ def _run_coverage_batch(
     key_cast: str | None = None,
     key_exprs: KeyExprs | None = None,
     scope_filters: ScopeFilters | None = None,
+    grouped_sides: GroupedSides | None = None,
 ) -> list[tuple[Relationship, JoinCoverageCounts]]:
     """Run one batched coverage probe and read each relationship's counts back from its
     single aggregate row.
     """
     sql = _transpile_probe(
         coverage_probe_sql(
-            batch, key_cast=key_cast, key_exprs=key_exprs, scope_filters=scope_filters
+            batch,
+            key_cast=key_cast,
+            key_exprs=key_exprs,
+            scope_filters=scope_filters,
+            grouped_sides=grouped_sides,
         ),
         adapter.dialect,
     )
@@ -1644,6 +1693,7 @@ def _run_coverage_batch(
                     matched_keys=read(f"dex_cov_matched_keys_{index}"),
                     conversion_failed_rows=maybe(f"dex_cov_failed_{index}"),
                     conversion_failed_keys=maybe(f"dex_cov_failed_keys_{index}"),
+                    to_group_rows=maybe(f"dex_cov_to_groups_{index}"),
                 ),
             )
         )
@@ -1657,6 +1707,7 @@ def measure_coverage(
     timeout_seconds: float = 30.0,
     key_exprs: KeyExprs | None = None,
     scope_filters: ScopeFilters | None = None,
+    grouped_sides: GroupedSides | None = None,
 ) -> tuple[
     list[tuple[Relationship, JoinCoverageCounts]], list[tuple[Relationship, str]]
 ]:
@@ -1684,6 +1735,7 @@ def measure_coverage(
                     timeout_seconds=timeout_seconds,
                     key_exprs=key_exprs,
                     scope_filters=scope_filters,
+                    grouped_sides=grouped_sides,
                 )
             )
             continue
@@ -1698,6 +1750,7 @@ def measure_coverage(
                         timeout_seconds=timeout_seconds,
                         key_exprs=key_exprs,
                         scope_filters=scope_filters,
+                        grouped_sides=grouped_sides,
                     )
                 )
                 continue
@@ -1719,6 +1772,7 @@ def measure_coverage(
                         key_cast=_CLICKHOUSE_INT128,
                         key_exprs=key_exprs,
                         scope_filters=scope_filters,
+                        grouped_sides=grouped_sides,
                     )
                 )
             except WarehouseQueryError as cast_exc:
