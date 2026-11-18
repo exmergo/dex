@@ -279,20 +279,28 @@ class CubeVendorLayer:
             "the tables this Cube Core reads were not checked against the "
             "repository's sql_table: "
         )
-        connector = (
-            getattr(self._dex, "connector", None)
-            or getattr(getattr(self._dex, "config", None), "connector", None)
-            or getattr(self._source, "connector", None)
-        )
-        if connector not in CUBE_CONNECTORS:
-            return [unchecked + "dex has no connector whose dialect reads the plan"]
         # The load's own endpoint: an override read again here could plan on one
         # Core and load on another.
         environ = {k: v for k, v in os.environ.items() if k != URL_ENV}
         render = CubeTransport(base_url, env_vars=environ)
         body = render.sql(request.query)
         plan = body.get("sql") if isinstance(body, dict) else None
-        rendered = plan.get("sql") if isinstance(plan, dict) else None
+        plan = plan if isinstance(plan, dict) else {}
+        # The data source first: it needs neither a dialect nor the SQL, so no
+        # path that leaves the tables unchecked leaves it unchecked too.
+        configured = getattr(self._source, "data_source", None) or "default"
+        served = (
+            plan.get("dataSource")
+            or (body.get("dataSource") if isinstance(body, dict) else None)
+            or "default"
+        )
+        if served != configured:
+            raise CubeRefusalError(
+                f"refused: the Cube Core planned this query on data source "
+                f"'{served}', and the repository's cubes are on '{configured}' "
+                "(semantic.cube.data_source)"
+            )
+        rendered = plan.get("sql")
         if (
             not isinstance(rendered, list)
             or not rendered
@@ -300,14 +308,13 @@ class CubeVendorLayer:
             or not rendered[0].strip()
         ):
             return [unchecked + "its plan carried no SQL"]
-        configured = getattr(self._source, "data_source", None) or "default"
-        served = plan.get("dataSource") or body.get("dataSource") or "default"
-        if served != configured:
-            raise CubeRefusalError(
-                f"refused: the Cube Core planned this query on data source "
-                f"'{served}', and the repository's cubes are on '{configured}' "
-                "(semantic.cube.data_source)"
-            )
+        connector = (
+            getattr(self._dex, "connector", None)
+            or getattr(getattr(self._dex, "config", None), "connector", None)
+            or getattr(self._source, "connector", None)
+        )
+        if connector not in CUBE_CONNECTORS:
+            return [unchecked + "dex has no connector whose dialect reads the plan"]
         if plan.get("preAggregations"):
             return [unchecked + "it answers this query from a pre-aggregation"]
         layer = LocalCubeLayer(self._source, self._dex)

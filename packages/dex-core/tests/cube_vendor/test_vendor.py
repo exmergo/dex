@@ -340,6 +340,21 @@ def test_a_core_planning_on_another_data_source_is_refused(shop, monkeypatch, ca
     assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
 
 
+def test_the_data_source_is_checked_even_when_the_tables_cannot_be(
+    shop, monkeypatch, capsys
+):
+    """An empty plan leaves the tables unchecked, never the data source."""
+
+    cube = _server(monkeypatch, shop)
+    cube.render = lambda query: {"sql": {"sql": [], "dataSource": "reporting"}}
+
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "error"
+    assert "data source 'reporting'" in envelope["errors"][0]
+    assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+
+
 def test_an_empty_plan_is_disclosed_not_a_crash(shop, monkeypatch, capsys):
     cube = _server(monkeypatch, shop)
     cube.render = lambda query: {"sql": {"sql": []}}
