@@ -316,6 +316,19 @@ class _Taint(NamedTuple):
 
 
 _Outputs = dict[str, set[_Taint]]
+
+
+class _Projected(dict[str, set[_Taint]]):
+    """A select's outputs by name, with how many columns it projects.
+
+    Two projections may share a name, and then the dict holds fewer entries
+    than the select has columns; a set operation, which pairs columns by
+    position, cannot pair them by these names (see :func:`_query_outputs`).
+    """
+
+    width: int = 0
+
+
 _Source = Dataset | dict
 
 # Warehouse-layer prefixes stripped before entity matching, so stg_products and
@@ -559,7 +572,7 @@ def inspect_query(
             "(name)" in label for label in offending
         ):
             message += (
-                " This cache was written by an older profiler; re-profile the "
+                " This cache predates value-shape profiling; re-profile the "
                 "table to refine name flags with value-shape evidence."
             )
         raise QueryRefusedError(message)
@@ -598,7 +611,9 @@ def _refuse_protected_relations(
         )
         if not name:
             continue
-        for identifier in match_identifier(name, list(known)):
+        # The name as written too: a held relation the cache has never seen
+        # is refused here rather than told to profile itself first.
+        for identifier in [name, *match_identifier(name, list(known))]:
             if elementary_values.protected_relation(identifier):
                 _refuse_protected(identifier)
 
@@ -821,7 +836,11 @@ def _query_outputs(
         # length mismatch (invalid SQL anyway) merges everything conservatively.
         left_items = list(left.items())
         right_taints = list(right.values())
-        if len(left_items) != len(right_taints):
+        if (
+            len(left_items) != len(right_taints)
+            or getattr(left, "width", len(left)) != len(left)
+            or getattr(right, "width", len(right)) != len(right)
+        ):
             everything = set().union(*left.values(), *right.values())
             return {name: set(everything) for name, _ in left_items}
         return {
@@ -907,12 +926,13 @@ def _select_outputs(
         # enclosing sources are a fallback, never a peer.
         sources = _ScopedSources(sources, outer=correlated)
 
-    outputs: _Outputs = {}
+    outputs = _Projected()
 
     def add(name: str, taint: set[_Taint]) -> None:
         # Two outputs may share a name (`SELECT a AS x, b AS x`, or one column
         # in two sources under `*`): the name carries both, never the last.
         outputs[name] = outputs.get(name, set()) | taint
+        outputs.width += 1
 
     for projection in select.expressions:
         if isinstance(projection, exp.Star):
@@ -1212,7 +1232,16 @@ def _expr_taint(
         # PARTITION BY / ORDER BY route rows; only the function's output crosses.
         return _expr_taint(node.this, sources, known, tables, dialect)
     if isinstance(node, exp.Func) and _measures(node):
-        return set()
+        # The aggregate cuts the path from the rows it reads, not from a
+        # subquery inside it: `SUM((SELECT x FROM t LIMIT 1))` is one value of
+        # `x`. Each subquery is resolved, which checks every relation it reads,
+        # and keeps its taint.
+        taint = set()
+        for query in _clause_queries(node):
+            inner = query.this if isinstance(query, exp.Subquery) else query
+            outputs = _query_outputs(inner, dict(sources), known, tables, dialect)
+            taint |= set().union(*outputs.values()) if outputs else set()
+        return taint
     # Everything else (carrying/unknown functions, operators, CASE, casts)
     # passes taint through from all children: fail closed.
     taint = set()

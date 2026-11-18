@@ -302,3 +302,77 @@ def test_a_dotted_relation_name_stays_in_the_schema():
 
     assert elementary_values.protected_relation("dev.main_elementary.tmp.rows")
     assert not elementary_values.protected_relation("dev.main.tmp.rows")
+
+
+# --- review, second pass -----------------------------------------------------------
+
+
+def test_a_held_relation_the_cache_never_saw_is_refused_inside_an_aggregate(
+    cache: DexCache,
+):
+    message = _refused(
+        "SELECT SUM((SELECT id FROM dev.main_elementary.new_test_result LIMIT 1))",
+        cache,
+    )
+
+    assert "none of the package's models" in message
+
+
+def test_a_subquery_inside_a_measuring_aggregate_keeps_its_taint(cache: DexCache):
+    """One value of a flagged column, summed, is that value."""
+
+    _refused("SELECT SUM((SELECT email FROM customers LIMIT 1))", cache)
+    _refused("SELECT MAX(LENGTH((SELECT result_row FROM test_result_rows)))", cache)
+    inspect_query("SELECT SUM((SELECT COUNT(*) FROM customers))", cache, LIMITS)
+    inspect_query("SELECT COUNT(DISTINCT email) FROM customers", cache, LIMITS)
+
+
+def test_a_set_operation_over_repeated_names_pairs_nothing_by_name(cache: DexCache):
+    """Both sides collapse to three names over four columns, so pairing by those
+    names would hand the held third column to `c` and leave `b` clean."""
+
+    _refused(
+        "SELECT b FROM ("
+        "SELECT 'ok' AS a, 'ok' AS a, 'ok' AS b, 'ok' AS c "
+        "UNION ALL "
+        "SELECT 'ok' AS x, 'ok' AS y, result_row AS z, 'ok' AS z "
+        "FROM test_result_rows) AS q",
+        cache,
+    )
+    inspect_query(
+        "SELECT b FROM (SELECT 1 AS a, 2 AS b UNION ALL SELECT id, id FROM orders) q",
+        cache,
+        LIMITS,
+    )
+
+
+def test_a_cached_profile_never_serves_a_held_value():
+    """A profile written before the profiler withheld them, or carried through
+    a merge, is cleaned wherever a dataset is built or loaded."""
+
+    from exmergo_dex_core.cache import ValueCount, ValueDomain
+
+    legacy = {
+        "identifier": f"{SCHEMA}.test_result_rows",
+        "columns": [
+            {
+                "name": "result_row",
+                "data_type": "VARCHAR",
+                "min_value": "{'email': 'a@x.io'}",
+                "max_value": "{'email': 'z@x.io'}",
+                "value_domain": ValueDomain(
+                    values=[ValueCount(value="{'email': 'a@x.io'}", count=1)]
+                ).model_dump(),
+            },
+            {"name": "status", "data_type": "VARCHAR", "min_value": "fail"},
+        ],
+    }
+    loaded = DexCache.model_validate({"schema_version": 4, "datasets": [legacy]})
+    [dataset] = loaded.datasets
+    rows, status = dataset.columns
+
+    assert (rows.min_value, rows.max_value, rows.value_domain) == (None, None, None)
+    assert status.min_value == "fail"
+    # Carried into a newly built cache, as a merge does.
+    rebuilt = DexCache(datasets=[Dataset.model_validate(legacy)])
+    assert rebuilt.datasets[0].columns[0].min_value is None
