@@ -1,11 +1,11 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
+  "theme": "maple",
   "name": "Dex",
   "description": "Documentation for Dex, the agent-native analytics engineering toolkit by Exmergo: explore a warehouse, transform a dbt project, and maintain it as the data changes.",
   "colors": {
     "primary": "#2563eb",
-    "light": "#51a2ff",
+    "light": "#60a5fa",
     "dark": "#2563eb"
   },
   "logo": {
@@ -14,7 +14,31 @@
   },
   "favicon": "/favicon.svg",
   "fonts": {
-    "family": "Geist"
+    "heading": {
+      "family": "IBM Plex Sans",
+      "weight": 600
+    },
+    "body": {
+      "family": "IBM Plex Sans"
+    }
+  },
+  "icons": {
+    "library": "lucide"
+  },
+  "background": {
+    "color": {
+      "light": "#f5f4ef",
+      "dark": "#0b1220"
+    }
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs",
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "github-dark-dimmed"
+      }
+    }
   },
   "appearance": {
     "default": "system"
@@ -23,7 +47,7 @@
     "appearance": "dark",
     "background": "/images/og-background.png",
     "fonts": {
-      "family": "Geist"
+      "family": "IBM Plex Sans"
     }
   },
   "navigation": {
@@ -38,7 +62,8 @@
               "quickstart",
               "installation",
               "connect"
-            ]
+            ],
+            "icon": "rocket"
           },
           {
             "group": "Workflows",
@@ -47,16 +72,19 @@
               "guides/transform",
               "guides/maintain",
               "guides/semantic-layer"
-            ]
+            ],
+            "icon": "workflow"
           },
           {
             "group": "Tutorials and help",
             "pages": [
               "guides/ossie-semantic-layer",
               "guides/troubleshooting"
-            ]
+            ],
+            "icon": "life-buoy"
           }
-        ]
+        ],
+        "icon": "book-open"
       },
       {
         "tab": "Reference",
@@ -75,7 +103,8 @@
               "cli/demo",
               "cli/procedure",
               "cli/feedback"
-            ]
+            ],
+            "icon": "terminal"
           },
           {
             "group": "Connectors",
@@ -88,7 +117,8 @@
               "connectors/postgres",
               "connectors/clickhouse",
               "connectors/trino"
-            ]
+            ],
+            "icon": "database"
           },
           {
             "group": "Safety and spending",
@@ -96,7 +126,8 @@
               "guardrails/cost-controls",
               "guardrails/pii-policy",
               "guardrails/values-free-mode"
-            ]
+            ],
+            "icon": "shield-check"
           },
           {
             "group": "Project and exploration",
@@ -104,7 +135,8 @@
               "concepts/source-of-truth",
               "concepts/methodology",
               "concepts/dbt-project"
-            ]
+            ],
+            "icon": "compass"
           },
           {
             "group": "Semantic layer compatibility",
@@ -115,7 +147,8 @@
               "semantic-layers/cube",
               "semantic-layers/databricks-metric-views",
               "semantic-layers/snowflake-semantic-views"
-            ]
+            ],
+            "icon": "layers"
           },
           {
             "group": "Integration contracts",
@@ -124,21 +157,25 @@
               "reference/project-formats",
               "reference/storage-backends",
               "reference/host-integration"
-            ]
+            ],
+            "icon": "file-code"
           },
           {
             "group": "Project quality",
             "pages": [
               "reference/evaluation"
-            ]
+            ],
+            "icon": "badge-check"
           }
-        ]
+        ],
+        "icon": "square-terminal"
       },
       {
         "tab": "Changelog",
         "pages": [
           "changelog"
-        ]
+        ],
+        "icon": "history"
       }
     ]
   },
