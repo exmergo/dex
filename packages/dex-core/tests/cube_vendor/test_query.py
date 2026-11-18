@@ -1013,14 +1013,6 @@ def test_a_query_cube_cannot_plan_is_a_resolution_error(shop, cube, capsys):
     assert envelope["errors"][0].startswith("could not resolve the metric query")
 
 
-def test_hosted_execution_is_not_offered(shop, cube, capsys):
-    envelope = _query(capsys, shop, "by_status", "--api")
-
-    assert envelope["status"] == "error"
-    assert "no hosted execution" in envelope["errors"][0]
-    assert cube.calls == []
-
-
 def test_the_secret_and_the_token_never_reach_an_envelope(
     shop, cube, capsys, monkeypatch
 ):

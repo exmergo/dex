@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stand up a local Cube Core that renders SQL for dex, and nothing else.
+# Stand up a local Cube Core that renders SQL for dex, and nothing else; or, with
+# --execute, one that runs queries itself for `explore semantic --api` (#914).
 #
 # dex's governed Cube query (#913) asks a Cube server for the SQL a query would
 # run (`/v1/sql`) and executes it through its own connector. So the Cube server
@@ -10,7 +11,18 @@
 # Usage:
 #   scripts/setup_cube_dev.sh [--db duckdb|postgres|bigquery|snowflake|redshift]
 #                             [--model DIR]
+#   scripts/setup_cube_dev.sh --execute --db duckdb|postgres|bigquery [--model DIR]
 #   scripts/setup_cube_dev.sh --down          # remove every dex-cube-* container
+#
+# --execute starts an *executing* Core instead (container dex-cube-<db>-exec,
+# ports 4010 duckdb, 4011 postgres, 4012 bigquery), configured by
+# scripts/cube/execute.js. It is the only mode that gives Cube a warehouse:
+#   duckdb    in-memory, built from scripts/cube/shop.sql (dex's own fixture rows)
+#   postgres  the dogfood database as dex_ro, read-only, reached on the host
+#             (scripts/setup_postgres_dev.sh, or the CI service container)
+#   bigquery  your Application Default Credentials, mounted read-only, on the
+#             project DEX_CUBE_BQ_PROJECT names (dogfood only; CI never runs it)
+# Its URL is exported as DEX_TEST_CUBE_EXEC_URL_<DB>.
 #
 # --db defaults to postgres. --model defaults to scripts/cube/model, the model the
 # unit tests replay and the integration tests run; it is mounted read-only. One
@@ -49,8 +61,13 @@ SECRET_FILE="$STATE_DIR/cube.secret"
 DB=postgres
 MODEL="$SCRIPTS/cube/model"
 CONF="$SCRIPTS/cube/cube.js"
+EXECUTE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --execute)
+            EXECUTE=1
+            shift
+            ;;
         --down)
             for name in $(docker ps -a --format '{{.Names}}' | grep '^dex-cube-' || true); do
                 docker rm -f "$name" >/dev/null
@@ -67,7 +84,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            echo "usage: $0 [--db duckdb|postgres|bigquery|snowflake|redshift] [--model DIR] | --down" >&2
+            echo "usage: $0 [--execute] [--db duckdb|postgres|bigquery|snowflake|redshift] [--model DIR] | --down" >&2
             exit 2
             ;;
     esac
@@ -88,8 +105,48 @@ case "$DB" in
         exit 2
         ;;
 esac
-PORT="${DEX_CUBE_PORT:-$PORT_DEFAULT}"
 CONTAINER="dex-cube-$DB"
+EXTRA=(-v "$CONF:/cube/conf/cube.js:ro")
+SECRET_ENV=()
+if [[ $EXECUTE == 1 ]]; then
+    # The one mode that hands Cube a warehouse, each type reaching only its own:
+    # nothing here is a credential dex itself uses.
+    CONTAINER="dex-cube-$DB-exec"
+    # Outside dev mode Cube queues and caches queries in Cube Store; one
+    # container with no Cube Store keeps both in memory instead.
+    EXTRA=(-v "$SCRIPTS/cube/execute.js:/cube/conf/cube.js:ro"
+        -e CUBEJS_CACHE_AND_QUEUE_DRIVER=memory)
+    case "$DB" in
+        duckdb)
+            PORT_DEFAULT=4010
+            DB_ENV=()
+            EXTRA+=(-v "$SCRIPTS/cube/shop.sql:/cube/conf/shop.sql:ro")
+            ;;
+        postgres)
+            PORT_DEFAULT=4011
+            DB_ENV=(-e CUBEJS_DB_HOST=host.docker.internal -e CUBEJS_DB_PORT="${DEX_CUBE_PG_PORT:-5432}"
+                -e CUBEJS_DB_NAME=dex_dogfood -e CUBEJS_DB_USER=dex_ro -e CUBEJS_DB_SSL=false)
+            EXTRA+=(--add-host host.docker.internal:host-gateway)
+            SECRET_ENV=("CUBEJS_DB_PASS=dex_ro")
+            ;;
+        bigquery)
+            PORT_DEFAULT=4012
+            ADC="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.config/gcloud/application_default_credentials.json}"
+            if [[ -z "${DEX_CUBE_BQ_PROJECT:-}" || ! -r "$ADC" ]]; then
+                echo "--execute --db bigquery needs DEX_CUBE_BQ_PROJECT and readable ADC ($ADC)" >&2
+                exit 2
+            fi
+            DB_ENV=(-e CUBEJS_DB_BQ_PROJECT_ID="$DEX_CUBE_BQ_PROJECT"
+                -e GOOGLE_APPLICATION_CREDENTIALS=/cube/conf/adc.json)
+            EXTRA+=(-v "$ADC:/cube/conf/adc.json:ro")
+            ;;
+        *)
+            echo "--execute runs duckdb, postgres or bigquery" >&2
+            exit 2
+            ;;
+    esac
+fi
+PORT="${DEX_CUBE_PORT:-$PORT_DEFAULT}"
 
 if ! docker info >/dev/null 2>&1; then
     echo "docker daemon is not running; start Docker Desktop first" >&2
@@ -110,15 +167,18 @@ envfile="$(mktemp)"
 trap 'rm -f "$envfile"' EXIT
 chmod 600 "$envfile"
 printf 'CUBEJS_API_SECRET=%s\n' "$(cat "$SECRET_FILE")" >"$envfile"
+for line in "${SECRET_ENV[@]+"${SECRET_ENV[@]}"}"; do
+    printf '%s\n' "$line" >>"$envfile"
+done
 docker run -d --name "$CONTAINER" \
     "${HARDENING[@]}" \
     --env-file "$envfile" \
     -e CUBEJS_DEV_MODE=false \
     -e CUBEJS_TELEMETRY=false \
     -e CUBEJS_DB_TYPE="$DB" \
-    "${DB_ENV[@]}" \
+    "${DB_ENV[@]+"${DB_ENV[@]}"}" \
     -v "$MODEL:/cube/conf/model:ro" \
-    -v "$CONF:/cube/conf/cube.js:ro" \
+    "${EXTRA[@]}" \
     -p "127.0.0.1:$PORT:4000" \
     "$IMAGE" >/dev/null
 rm -f "$envfile"
@@ -146,9 +206,18 @@ fi
                 upper=$(printf '%s' "$db" | tr '[:lower:]' '[:upper:]')
                 printf 'export DEX_TEST_CUBE_URL_%s=http://127.0.0.1:%s/cubejs-api\n' "$upper" "$port"
             fi
+            if docker inspect "dex-cube-$db-exec" >/dev/null 2>&1; then
+                port=$(docker port "dex-cube-$db-exec" 4000/tcp | head -1 | sed 's/.*://')
+                upper=$(printf '%s' "$db" | tr '[:lower:]' '[:upper:]')
+                printf 'export DEX_TEST_CUBE_EXEC_URL_%s=http://127.0.0.1:%s/cubejs-api\n' "$upper" "$port"
+            fi
         done
     } >"$EXPORTS"
 )
-echo "started $IMAGE as $CONTAINER on 127.0.0.1:$PORT, rendering for $DB"
+if [[ $EXECUTE == 1 ]]; then
+    echo "started $IMAGE as $CONTAINER on 127.0.0.1:$PORT, executing on $DB"
+else
+    echo "started $IMAGE as $CONTAINER on 127.0.0.1:$PORT, rendering for $DB"
+fi
 echo "model: $MODEL (read-only)"
 echo "exports: source $EXPORTS"

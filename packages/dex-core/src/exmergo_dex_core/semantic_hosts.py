@@ -14,9 +14,12 @@ exact name, and only from somewhere the repository cannot write: the
 ``DEX_SL_ALLOWED_HOSTS`` environment variable, or ``SemanticSource.allowed_hosts``
 from an embedding host. Never from ``.dex/config.yml``.
 
-A Cube server is bound the same way for the same reason (:func:`check_cube_url`):
-the JWT dex mints from ``CUBEJS_API_SECRET`` goes to a server on this machine, or
-to a host named exactly in ``DEX_CUBE_ALLOWED_HOSTS`` over https.
+A Cube server is bound the same way for the same reason (:func:`check_cube_url`).
+Under ``deployment: local`` the JWT dex mints from ``CUBEJS_API_SECRET`` goes to a
+server on this machine, or to a host named exactly in ``DEX_CUBE_ALLOWED_HOSTS``
+over https. Under ``deployment: cube_cloud`` the user's ``CUBE_API_TOKEN`` goes to
+a Cube Cloud deployment (:data:`CUBE_CLOUD_DOMAINS`, over https), or to a custom
+domain named exactly in that same variable.
 
 Imports nothing from the package but the error base, so the resolver, the
 backend, and the transport can all hold the same rule without a cycle.
@@ -102,6 +105,15 @@ def check_semantic_layer_host(host: object, *, extra_hosts: Iterable[str] = ()) 
 #: token minted from ``CUBEJS_API_SECRET`` is the user's.
 CUBE_ALLOWED_HOSTS_ENV = "DEX_CUBE_ALLOWED_HOSTS"
 
+#: Cube Cloud's domains, admitted over https under ``deployment: cube_cloud``
+#: only. A deployment answers on ``<name>.<region>.cubecloudapp.dev``; a tenant's
+#: own console is ``<tenant>.cubecloud.dev``. Matched as :data:`DBT_CLOUD_DOMAINS`
+#: are: the domain itself or a name ending in ``.`` plus it.
+CUBE_CLOUD_DOMAINS: tuple[str, ...] = ("cubecloudapp.dev", "cubecloud.dev")
+
+#: The deployment whose built-in hosts are :data:`CUBE_CLOUD_DOMAINS`.
+CUBE_CLOUD_DEPLOYMENT = "cube_cloud"
+
 #: The hosts a ``deployment: local`` Cube server is admitted on without asking:
 #: the machine dex runs on, and nothing a repository could point elsewhere.
 LOOPBACK_HOSTS: tuple[str, ...] = ("localhost", "127.0.0.1", "::1")
@@ -114,15 +126,19 @@ def env_cube_allowed_hosts(env: Mapping[str, str] | os._Environ) -> tuple[str, .
     return tuple(h for h in (normalize_host(part) for part in raw.split(",")) if h)
 
 
-def check_cube_url(url: object, *, extra_hosts: Iterable[str] = ()) -> str:
+def check_cube_url(
+    url: object, *, extra_hosts: Iterable[str] = (), deployment: str = "local"
+) -> str:
     """Return the Cube API base ``url`` if a token may be sent to it; else raise.
 
-    Called before ``CUBEJS_API_SECRET`` is read. A loopback host is admitted,
-    over http or https, because a local Cube Core is a process on this machine.
-    Any other host needs an exact entry in ``DEX_CUBE_ALLOWED_HOSTS`` and https,
-    since the token would otherwise cross a network in the clear. A URL carrying
-    userinfo, a query or a fragment is refused rather than parsed around: the
-    request paths are appended to it, and those would change what they mean.
+    Called before any credential is read. A loopback host is admitted, over http
+    or https, because a local Cube Core is a process on this machine. Under
+    ``deployment: cube_cloud`` a Cube Cloud host (:data:`CUBE_CLOUD_DOMAINS`) is
+    admitted too, over https. Any other host needs an exact entry in
+    ``DEX_CUBE_ALLOWED_HOSTS`` and https, since the token would otherwise cross a
+    network in the clear. A URL carrying userinfo, a query or a fragment is
+    refused rather than parsed around: the request paths are appended to it, and
+    those would change what they mean.
     """
 
     from urllib.parse import urlsplit
@@ -151,7 +167,19 @@ def check_cube_url(url: object, *, extra_hosts: Iterable[str] = ()) -> str:
         )
     if host in LOOPBACK_HOSTS:
         return str(url).rstrip("/")
-    if host not in {normalize_host(h) for h in extra_hosts}:
+    cloud = deployment == CUBE_CLOUD_DEPLOYMENT and any(
+        host == d or host.endswith("." + d) for d in CUBE_CLOUD_DOMAINS
+    )
+    if not cloud and host not in {normalize_host(h) for h in extra_hosts}:
+        if deployment == CUBE_CLOUD_DEPLOYMENT:
+            raise SemanticHostRefusedError(
+                f"refusing to send your CUBE_API_TOKEN to {host!r}: it is not a "
+                "Cube Cloud host (*.cubecloudapp.dev or *.cubecloud.dev). The URL "
+                "can come from .dex/config.yml, which the repository controls, and "
+                "the token is yours, so it is only sent to Cube Cloud. For a "
+                f"custom domain, name it exactly in {CUBE_ALLOWED_HOSTS_ENV} in "
+                "your own environment; .dex/config.yml cannot widen this list"
+            )
         raise SemanticHostRefusedError(
             f"refusing to send a Cube API token to {host!r}: only a Cube server on "
             "this machine (localhost, 127.0.0.1, ::1) is admitted by default. The "

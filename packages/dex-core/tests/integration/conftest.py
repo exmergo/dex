@@ -190,6 +190,23 @@ def _snowflake_enabled() -> bool:
 
 @pytest.fixture(autouse=True)
 def _require_cloud_env(request):
+    if request.node.get_closest_marker("cube_cloud"):
+        # A Cube Cloud deployment serving scripts/cube/model over the rows of
+        # scripts/cube/shop.sql (scripts/setup_cube_cloud_ci.sh), and dex's own
+        # DuckDB file for `--local`.
+        missing = [
+            name
+            for name in ("DEX_TEST_CUBE_CLOUD_URL", "CUBE_API_TOKEN")
+            if not os.environ.get(name)
+        ]
+        if missing:
+            pytest.skip(
+                f"Cube Cloud integration disabled: set {', '.join(missing)} (see "
+                "scripts/setup_cube_cloud_ci.sh)"
+            )
+        pytest.importorskip("httpx")
+        pytest.importorskip("duckdb")
+        return
     if request.node.get_closest_marker("cube"):
         # Ahead of every warehouse branch: a Cube test needs its renderer as
         # well as its warehouse, and one without `postgres` runs on DuckDB.
@@ -197,13 +214,18 @@ def _require_cloud_env(request):
             "postgres" if request.node.get_closest_marker("postgres") else "duckdb"
         )
         required = ["CUBEJS_API_SECRET", f"DEX_TEST_CUBE_URL_{warehouse.upper()}"]
+        if request.node.get_closest_marker("cube_execute"):
+            required.append(f"DEX_TEST_CUBE_EXEC_URL_{warehouse.upper()}")
         if warehouse == "postgres":
             required.append("DEX_TEST_PG_DSN")
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
+            execute = (
+                "--execute " if request.node.get_closest_marker("cube_execute") else ""
+            )
             pytest.skip(
                 f"Cube integration disabled: set {', '.join(missing)} (run "
-                f"scripts/setup_cube_dev.sh --db {warehouse}, then source "
+                f"scripts/setup_cube_dev.sh {execute}--db {warehouse}, then source "
                 "~/.cache/dex-dogfood/cube.env)"
             )
         pytest.importorskip("httpx")

@@ -277,6 +277,19 @@ def test_the_slayer_extra_follows_the_configured_vendor(
             "cube",
             ["ossie", "cube", "semantic-api"],
         ),
+        # `--api` (#914): Cube executes, and the same extras carry the request.
+        (
+            ["explore", "semantic", "query", "orders.revenue", "--api"],
+            "cube",
+            ["ossie", "cube", "semantic-api"],
+        ),
+        (
+            ["explore", "semantic", "list", "--api"],
+            "cube",
+            ["ossie", "cube", "semantic-api"],
+        ),
+        (["maintain", "reconcile"], "cube", ["cube"]),
+        (["maintain", "semantic"], "cube", ["ossie", "cube"]),
         (["explore", "map", "--use-project"], "cube", ["cube"]),
         (["explore", "relationships", "--use-project"], "cube", ["cube"]),
         (["transform", "apply"], "cube", ["cube"]),
