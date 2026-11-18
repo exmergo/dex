@@ -1201,6 +1201,24 @@ def test_a_dimension_served_without_sql_is_stale():
     check_renderer(meta, ["orders.status"], members, where="x")
 
 
+def test_a_measure_served_without_sql_is_stale():
+    """Cube serves a measure's SQL too (`/v1/meta?extended`, Core and Cloud), so
+    one served without it is not passed as though it matched."""
+
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    member = Member(name="revenue", kind="measure", type="sum", sql="total")
+    members = {"orders.revenue": Target("orders.revenue", "measure", member, "orders")}
+    served = {"name": "orders.revenue", "type": "number", "aggType": "sum"}
+    meta = {"cubes": [{"name": "orders", "dimensions": [], "measures": [served]}]}
+
+    with pytest.raises(StaleRendererError, match="no SQL"):
+        check_renderer(meta, ["orders.revenue"], members, where="x")
+    served["sql"] = "`total`"
+    check_renderer(meta, ["orders.revenue"], members, where="x")
+
+
 def test_a_grouped_member_named_like_a_bucket_keeps_its_own_sort_key():
     from exmergo_dex_core.cube.model import Member
     from exmergo_dex_core.cube.query import Target, to_cube_query

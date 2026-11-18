@@ -9,7 +9,7 @@ server compiled, JavaScript models, Jinja templates and ``extends`` included,
 which the static reader can only name as compiled-only. Under
 ``deployment: cube_cloud`` it is the catalog ``explore semantic`` reads. What it
 cannot say is where a cube's rows come from: Cube never emits ``sql_table``, and
-a deployment serving its public surface omits each member's SQL, so a catalog
+a member's SQL arrives as Cube's compiled template rather than a column, so a catalog
 read here carries no relation and no column, and says so in ``unavailable``.
 
 **``/v1/load`` is Cube executing.** Its rows arrive keyed by member, with a
@@ -340,7 +340,8 @@ def meta_catalog(meta: Mapping[str, Any]) -> SemanticCatalogView:
     notes.append(
         "read from the Cube server's compiled /v1/meta: JavaScript, Jinja and "
         "`extends` definitions are answered as compiled, so nothing is named "
-        "compiled-only; /v1/meta carries no sql_table and no member SQL, so no "
+        "compiled-only; /v1/meta carries no sql_table, and member SQL arrives as "
+        "Cube's compiled template, so no "
         "relation or column is claimed (see unavailable)"
     )
     return SemanticCatalogView(

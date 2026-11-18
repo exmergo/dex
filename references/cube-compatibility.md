@@ -290,10 +290,9 @@ server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
    granularities, and, for a view member, the same cube member behind it. A
    Cube server outside dev mode does not reload an edited model file, so a
    server still serving yesterday's files is the normal state after an edit,
-   and it is refused naming the member. A dimension served with no SQL to
-   compare is refused too. A measure's own SQL is the one part `/v1/meta` never
-   serves, on Cube Core or Cube Cloud, so a measure whose expression alone
-   changed is not caught here; restart or redeploy after such an edit.
+   and it is refused naming the member. A member the repository defines with
+   SQL and the server serves without any is refused too, since there is
+   nothing to compare it with.
 6. **Render** over `/v1/sql`, and the plan checks: one statement (a
    `compareDateRange` plans several), no pre-aggregation (Cube matches a
    rollup even one it never built, and the SQL then reads its table), no
@@ -380,8 +379,7 @@ the rows:
    Core is asked over `/v1/sql` for its plan (which runs nothing) and every
    table the plan reads is held to the files' `sql_table`, as on the render
    path, and so is the data source it was planned on. A Core serving another
-   model is refused before it runs anything, with one exception the
-   stale-renderer step names: a measure whose own SQL alone changed.
+   model is refused before it runs anything.
    Where the tables cannot be judged (Dex has no connector whose dialect reads
    the plan, or Cube plans over a pre-aggregation), the result says so.
    A `/v1/meta` that cannot be read refuses the query rather than screening
@@ -426,7 +424,8 @@ authoring and `maintain` read them, and `--local` holds the deployment to them.
 - **The catalog** under `cube_cloud` and vendor execution is the deployment's
   compiled `/v1/meta?extended`. It answers JavaScript models, Jinja templates and
   `extends`, which the static reader can only name, so nothing is listed under
-  `compiled_only`. It carries no `sql_table` and no member SQL, so `relation`,
+  `compiled_only`. It carries no `sql_table`, and a member's SQL arrives as Cube's compiled
+  template rather than a column, so `relation`,
   each dimension's `column` and each measure's `column` and `expr` are declared
   in `unavailable`. It lists what the deployment exposes: primary keys and
   `public: false` members are not in it. Every result says, as a warning and as

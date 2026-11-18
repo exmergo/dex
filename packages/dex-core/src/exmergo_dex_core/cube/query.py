@@ -564,10 +564,10 @@ def _compare(token: str, member: Member, found: Any, stale: Any) -> None:
         and _norm(entry.get("sql")) != _norm(member.sql)
     ):
         raise stale(token, "has different SQL there")
-    # Cube serves a dimension's SQL in `/v1/meta` (a measure's it never does), so
-    # a dimension served without one cannot be compared and is not passed as
-    # though it matched.
-    if kind != MEASURE and member.sql is not None and entry.get("sql") is None:
+    # Cube serves every member's SQL in `/v1/meta` (a `count` with none has
+    # none), so a member the repository defines with SQL and the server serves
+    # without any cannot be compared and is not passed as though it matched.
+    if member.sql is not None and entry.get("sql") is None:
         raise stale(token, "has no SQL in the server's /v1/meta to compare")
     if member.type == "time":
         served_grains = sorted(
