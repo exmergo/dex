@@ -476,8 +476,8 @@ per run (`scripts/cube_cloud/mint_token.py`), since the tokens Cube Cloud issues
 itself last a day.
 
 `scripts/setup_cube_cloud_ci.sh --deployment <id>` deploys the fixture with the
-`cube` CLI (the deployment must be in CLI deploy mode: `cube deployments update
-<id> --data '{"deployMode":"cli"}'`), rotates the deployment's
+`cube` CLI (the deployment must be in CLI deploy mode, which
+`cube deployments update <id> --data '{"deployMode":"cli"}'` sets), rotates the deployment's
 `CUBEJS_API_SECRET`, checks a token signed with it, and writes the environment.
 `--keep-secret FILE` also keeps a 0600 copy for running the suite locally:
 

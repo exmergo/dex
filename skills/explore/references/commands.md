@@ -561,7 +561,8 @@ it as `execution` (`dex` or `vendor`).
   `CUBEJS_API_SECRET` in the environment). Members are `cube.member`; a time
   grouping is `--group-by orders.ordered_at__month`; `--where` is Cube's JSON
   filter (`'{"member": "orders.status", "operator": "equals", "values":
-  ["paid"]}'`). `--api` has the Cube server execute over `/v1/load` instead,
+  ["paid"]}'`).
+  `--api` has the Cube server execute over `/v1/load` instead,
   `execution: vendor`, on any warehouse Cube supports: no `--confirm`, a
   `cost guard unavailable` warning on every result, and the same PII gate before
   anything is sent; a Cube Core is still held to the files first.

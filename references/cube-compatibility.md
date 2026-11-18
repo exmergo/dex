@@ -382,8 +382,8 @@ A warehouse error Cube relays from `/v1/load` can quote a value, so it is
 masked before it reaches an envelope, as on `explore query`.
 
 `--api` on a Cube Core needs a server that can reach the warehouse, which the
-render-only containers cannot. `scripts/setup_cube_dev.sh --execute --db
-duckdb|postgres|bigquery` starts one. The token it is sent claims `dex_scopes:
+render-only containers cannot.
+`scripts/setup_cube_dev.sh --execute --db duckdb|postgres|bigquery` starts one. The token it is sent claims `dex_scopes:
 [meta, data]` (Cube names `/v1/load`'s scope `data`), so a server running
 `scripts/cube/cube.js` refuses it `/v1/sql`, as it refuses a render token
 `/v1/load`.
