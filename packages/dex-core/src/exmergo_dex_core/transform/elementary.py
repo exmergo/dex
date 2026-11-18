@@ -552,7 +552,8 @@ class GatedTest:
 
     ``days_back`` is the window an anomaly test computes its metrics over, and
     ``days_back_source`` says where it came from: ``test`` (the test's own
-    argument or config), ``project`` (the ``days_back`` var), ``default`` (the
+    argument or config), ``model`` (the tested node's Elementary config),
+    ``project`` (the ``days_back`` var), ``default`` (the
     package's 14), ``unread`` where the test sets ``training_period`` or
     ``seasonality``, which Elementary turns into a window of its own, and
     ``unknown`` for a value only dbt can render. A test that is not an anomaly
@@ -677,19 +678,60 @@ def _listing(items: list[str]) -> str:
     return shown
 
 
+def _elementary_config(node: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The package's settings on a model or source, as the package reads them.
+
+    ``config.elementary``, then ``config.meta.elementary``, then
+    ``meta.elementary``, each overriding the one before
+    (``get_elementary_config_from_node``, 0.16.4 and 0.26.1).
+    """
+
+    merged: dict[str, Any] = {}
+    if not node:
+        return merged
+    config = node.get("config") or {}
+    for place in (
+        config.get("elementary"),
+        (config.get("meta") or {}).get("elementary"),
+        (node.get("meta") or {}).get("elementary"),
+    ):
+        if isinstance(place, Mapping):
+            merged.update(place)
+    return merged
+
+
+def _tested_node(
+    manifest: Mapping[str, Any], node: Mapping[str, Any]
+) -> Mapping[str, Any] | None:
+    """The model, snapshot, seed or source a test is attached to."""
+
+    reads = [node.get("attached_node")]
+    reads += list((node.get("depends_on") or {}).get("nodes") or [])
+    for uid in reads:
+        if not uid:
+            continue
+        found = (manifest.get("nodes") or {}).get(uid) or (
+            manifest.get("sources") or {}
+        ).get(uid)
+        if found:
+            return found
+    return None
+
+
 def _days_back(
     node: Mapping[str, Any],
     project: Mapping[str, Any],
     cli_vars: Mapping[str, Any] | None,
+    tested: Mapping[str, Any] | None = None,
 ) -> tuple[int | None, str | None]:
     """The ``days_back`` window of an anomaly test, and where it came from.
 
-    Elementary reads a test argument first, then the test's config, then the
-    ``days_back`` var, then its own default (``get_test_argument``,
-    ``get_anomalies_test_configuration``). ``training_period`` and
-    ``seasonality`` each change the window by rules of their own
-    (``training_period_to_days_back``, ``get_days_back``), so a test setting
-    either is ``unread`` rather than guessed.
+    Elementary takes a test argument first, then the tested node's own
+    Elementary config, then the ``days_back`` var, then its default
+    (``get_test_argument``, ``get_anomalies_test_configuration``).
+    ``training_period`` and ``seasonality`` each change the window by rules of
+    their own (``training_period_to_days_back``, ``get_days_back``), so a test
+    or model setting either is ``unread`` rather than guessed.
     """
 
     meta = node.get("test_metadata") or {}
@@ -697,16 +739,17 @@ def _days_back(
         return None, None
     kwargs = meta.get("kwargs") or {}
     config = node.get("config") or {}
-    for place in (kwargs, config, config.get("meta") or {}):
+    model = _elementary_config(tested)
+    for place in (kwargs, config, config.get("meta") or {}, model):
         if isinstance(place, Mapping) and (
             "training_period" in place or "seasonality" in place
         ):
             return None, "unread"
     value: Any = None
     source = "default"
-    for place in (kwargs, config):
+    for place, where in ((kwargs, "test"), (config, "test"), (model, "model")):
         if isinstance(place, Mapping) and place.get("days_back") is not None:
-            value, source = place["days_back"], "test"
+            value, source = place["days_back"], where
             break
     else:
         if cli_vars and "days_back" in cli_vars:
@@ -785,7 +828,9 @@ def unpriced_work(
         ):
             if not chosen(uid):
                 continue
-            days, source = _days_back(node, project, cli_vars)
+            days, source = _days_back(
+                node, project, cli_vars, _tested_node(manifest, node)
+            )
             gated.append(GatedTest(str(node.get("name")), days, source))
 
     extras: list[str] = []

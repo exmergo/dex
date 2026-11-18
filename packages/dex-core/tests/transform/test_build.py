@@ -4780,6 +4780,9 @@ def test_a_billed_build_names_the_elementary_work_it_does_not_price(
     assert envelope["cost"]["unpriced"] == codes
     if confirmed:
         assert envelope["status"] == "error"
+        message = " ".join(str(e) for e in envelope["errors"])
+        assert "the estimate is a floor" in message
+        assert "elementary_hooks" in message
         return
     assert envelope["status"] == "needs_confirmation"
     assert envelope["data"]["unpriced"]["work"] == codes

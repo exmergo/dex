@@ -314,6 +314,7 @@ def billed_handshake(
         explained = [
             *([reserve["note"]] if reserve is not None else []),
             *upper_bound_notes(upper_bounds, per_table),
+            *_unpriced_notes(unpriced),
         ]
         if not explained:
             raise
@@ -382,6 +383,18 @@ def billed_handshake(
         raise
     if uptime is not None:
         uptime.admit()
+
+
+def _unpriced_notes(unpriced: dict[str, Any] | None) -> list[str]:
+    """The refusal's sentence for work the estimate leaves out (#1309)."""
+
+    if not unpriced or not unpriced.get("work"):
+        return []
+    return [
+        "the estimate is a floor: it leaves out "
+        + ", ".join(unpriced["work"])
+        + ", work no compiled node shows, so the build would cost more"
+    ]
 
 
 def _mark_unpriced(exc: Exception, unpriced: dict[str, Any] | None) -> bool:

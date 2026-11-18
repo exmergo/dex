@@ -269,3 +269,36 @@ def test_a_profile_withholds_every_value_bearing_column():
     }
     assert elementary_values.withheld_columns(f"{SCHEMA}.tmp_x", names) == set(names)
     assert elementary_values.withheld_columns("dev.main.orders", names) == set()
+
+
+# --- review: reads the value paths skip, and names that repeat ---------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT SUM((SELECT COUNT(*) FROM test_3f2a_20261118__tmp_123))",
+        "SELECT COUNT(*) FROM orders WHERE EXISTS "
+        "(SELECT 1 FROM test_3f2a_20261118__tmp_123)",
+    ],
+)
+def test_a_held_relation_inside_a_measuring_aggregate_is_refused(
+    sql: str, cache: DexCache
+):
+    assert "none of the package's models" in _refused(sql, cache)
+
+
+def test_a_repeated_output_name_keeps_every_taint(cache: DexCache):
+    _refused(
+        "SELECT result_row AS x, elementary_test_results_id AS x FROM test_result_rows",
+        cache,
+    )
+    inspect_query("SELECT id AS x, id AS x FROM orders", cache, LIMITS)
+
+
+def test_a_dotted_relation_name_stays_in_the_schema():
+    """DuckDB joins the parts unquoted, so a table named ``tmp.rows`` reads as
+    four parts; the schema is still the package's."""
+
+    assert elementary_values.protected_relation("dev.main_elementary.tmp.rows")
+    assert not elementary_values.protected_relation("dev.main.tmp.rows")

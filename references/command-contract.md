@@ -1474,8 +1474,11 @@ default, or a filter or operator after it is refused. A key naming a location
   `data.unpriced` holds the record (`work`, `hooks`, `monitoring_tests` with
   `days_back` and `days_back_source`, `monitoring_test_count`,
   `materialized_test_count`), and one warning per kind says what was left out.
-  A project without the package, or one that disables it for the target, gets
-  none of it and `cost.unpriced: null`. A free connector prices nothing and
+  A project without the package gets none of it and `cost.unpriced: null`. One
+  that disables the package for the target gets no monitoring test or test
+  extra, and its hooks are named only where they still run: dbt disables them
+  with the package's models, and a release before 0.20.0 whose hooks stay
+  declared runs them without checking. A free connector prices nothing and
   claims nothing. dbt runs with cwd pinned to the project dir
   (relative `profiles.yml` paths resolve there, never against the caller's
   shell). When
@@ -2618,8 +2621,9 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
 
 `cost.unpriced` names work the command runs that `estimate` leaves out, so any
 entry makes the estimate a floor. It is `null` wherever nothing is claimed, which
-is every command but a `transform build` that runs the Elementary package's hooks
-or tests (#1309).
+is every command but a `transform build` on a billed connector that runs the
+Elementary package's hooks or tests (#1309); a free connector's build prices
+nothing and claims nothing.
 
 In values-free mode `data.result_mode` is `"values_free"` on every envelope, and
 an error envelope adds `data.code`, a stable code that quotes no value (see

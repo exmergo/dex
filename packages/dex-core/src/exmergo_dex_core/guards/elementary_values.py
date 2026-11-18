@@ -96,13 +96,21 @@ def table_name(identifier: str) -> str:
 
 
 def in_elementary_schema(identifier: str) -> bool:
-    """Whether the relation sits in a schema named for the package."""
+    """Whether the relation sits in a schema named for the package.
+
+    Any part between the database and the relation's name counts, not only the
+    one before the last: a connector that joins the parts unquoted (DuckDB)
+    turns a table named ``tmp.rows`` into ``dev.main_elementary.tmp.rows``, and
+    reading only ``tmp`` as the schema would let it out.
+    """
 
     parts = _parts(identifier)
     if len(parts) < 2:
         return False
-    schema = parts[-2]
-    return schema == SCHEMA_NAME or schema.endswith(f"_{SCHEMA_NAME}")
+    namespace = parts[1:-1] if len(parts) > 2 else parts[:-1]
+    return any(
+        part == SCHEMA_NAME or part.endswith(f"_{SCHEMA_NAME}") for part in namespace
+    )
 
 
 def documented(identifier: str) -> bool:

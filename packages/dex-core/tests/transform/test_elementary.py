@@ -763,3 +763,37 @@ def test_the_warning_names_each_anomaly_test_s_window():
 
     assert "volume over 14 days" in gated
     assert "2 Elementary monitoring tests" in gated
+
+
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        ({"config": {"elementary": {"days_back": 30}}}, (30, "model")),
+        ({"config": {"meta": {"elementary": {"days_back": 45}}}}, (45, "model")),
+        ({"meta": {"elementary": {"days_back": 60}}}, (60, "model")),
+        ({"config": {"elementary": {"seasonality": "day_of_week"}}}, (None, "unread")),
+    ],
+)
+def test_the_tested_model_s_elementary_config_comes_before_the_vars(
+    model_config, expected
+):
+    built = _built()
+    built["nodes"]["model.shop.fct"].update(model_config)
+
+    [volume] = [
+        t
+        for t in _work(built, vars_={"days_back": 7}).gated_tests
+        if t.name == "volume"
+    ]
+
+    assert (volume.days_back, volume.days_back_source) == expected
+
+
+def test_a_test_argument_beats_the_model_s_config():
+    built = _built()
+    built["nodes"]["model.shop.fct"]["config"] = {"elementary": {"days_back": 30}}
+    built["nodes"]["test.shop.volume"]["test_metadata"]["kwargs"]["days_back"] = 3
+
+    [volume] = [t for t in _work(built).gated_tests if t.name == "volume"]
+
+    assert (volume.days_back, volume.days_back_source) == (3, "test")

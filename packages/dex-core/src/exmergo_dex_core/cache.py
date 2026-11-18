@@ -37,7 +37,12 @@ from .project_definitions import DeclaredHistory
 # them among every column's own `null_fraction`. A pre-5 profile predates the
 # check and would read as "nothing found" rather than "never computed", so it
 # is treated as stale the same way a pre-4 one is.
-CACHE_SCHEMA_VERSION = 5
+#
+# 6 withholds values on the columns of the Elementary package's schema that hold
+# source rows (#1310): a pre-6 profile can carry a minimum, maximum or value
+# domain for `result_row`, `result_rows` or `dimension_value`, so it is stale and
+# is profiled again before it is served.
+CACHE_SCHEMA_VERSION = 6
 
 
 class PIICategory(str, Enum):

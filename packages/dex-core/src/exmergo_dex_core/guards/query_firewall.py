@@ -521,6 +521,7 @@ def inspect_query(
     root = assert_query_shape(sql, dialect=dialect)
 
     known = {d.identifier: d for d in cache.datasets}
+    _refuse_protected_relations(root, known)
     tables: set[str] = set()
     outputs = _query_outputs(root, {}, known, tables, dialect)
 
@@ -558,7 +559,7 @@ def inspect_query(
             "(name)" in label for label in offending
         ):
             message += (
-                " This cache predates value-shape profiling; re-profile the "
+                " This cache was written by an older profiler; re-profile the "
                 "table to refine name flags with value-shape evidence."
             )
         raise QueryRefusedError(message)
@@ -578,6 +579,37 @@ def inspect_query(
         capped_by_engine=capped,
         tables=sorted(tables),
         warnings=warnings,
+    )
+
+
+def _refuse_protected_relations(
+    root: exp.Expression, known: dict[str, Dataset]
+) -> None:
+    """Refuse a query naming a relation held whole, wherever it names it.
+
+    Checked over every table the statement names rather than along the value
+    paths, which skip what a measuring aggregate reads (``SUM((SELECT COUNT(*)
+    FROM t))``): a held relation is refused for being read at all (#1310).
+    """
+
+    for table in root.find_all(exp.Table):
+        name = ".".join(
+            part.name for part in table.parts if isinstance(part, exp.Identifier)
+        )
+        if not name:
+            continue
+        for identifier in match_identifier(name, list(known)):
+            if elementary_values.protected_relation(identifier):
+                _refuse_protected(identifier)
+
+
+def _refuse_protected(identifier: str) -> None:
+    raise QueryRefusedError(
+        f"'{identifier}' is in the Elementary package's schema and is "
+        "none of the package's models, so it can hold a test's whole result "
+        "(Elementary writes one there with tests_use_temp_tables): no query "
+        "reads it, not even a count. Query the package's own models instead, "
+        "such as elementary_test_results, by their aggregate columns"
     )
 
 
@@ -876,19 +908,27 @@ def _select_outputs(
         sources = _ScopedSources(sources, outer=correlated)
 
     outputs: _Outputs = {}
+
+    def add(name: str, taint: set[_Taint]) -> None:
+        # Two outputs may share a name (`SELECT a AS x, b AS x`, or one column
+        # in two sources under `*`): the name carries both, never the last.
+        outputs[name] = outputs.get(name, set()) | taint
+
     for projection in select.expressions:
         if isinstance(projection, exp.Star):
             for alias, source in sources.items():
-                outputs.update(_expand_star(source, alias))
+                for name, taint in _expand_star(source, alias).items():
+                    add(name, taint)
             continue
         if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
             alias = projection.table.lower()
             if alias not in sources:
                 raise QueryRefusedError(f"unknown table or alias '{projection.table}'")
-            outputs.update(_expand_star(sources[alias], alias))
+            for name, taint in _expand_star(sources[alias], alias).items():
+                add(name, taint)
             continue
         name = (projection.alias_or_name or projection.sql()).lower()
-        outputs[name] = _expr_taint(projection, sources, known, tables, dialect)
+        add(name, _expr_taint(projection, sources, known, tables, dialect))
     return outputs
 
 
@@ -1081,13 +1121,7 @@ def _resolve_dataset(
         )
     dataset = known[matches[0]]
     if elementary_values.protected_relation(dataset.identifier):
-        raise QueryRefusedError(
-            f"'{dataset.identifier}' is in the Elementary package's schema and is "
-            "none of the package's models, so it can hold a test's whole result "
-            "(Elementary writes one there with tests_use_temp_tables): no query "
-            "reads it, not even a count. Query the package's own models instead, "
-            "such as elementary_test_results, by their aggregate columns"
-        )
+        _refuse_protected(dataset.identifier)
     if not dataset.columns:
         raise QueryRefusedError(
             f"'{dataset.identifier}' is inventoried but not profiled; run "
