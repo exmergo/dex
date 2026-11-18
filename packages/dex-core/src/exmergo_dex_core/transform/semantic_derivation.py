@@ -413,6 +413,25 @@ def derive(
             "MetricFlow does not allow '__' in a semantic model name"
         )
 
+    # An element name is one per kind in MetricFlow's eyes: a primary entity named
+    # for a column that is also emitted as a dimension or a measure (a mart whose
+    # grain is one time column) fails the parse. The entity takes a distinct name
+    # with the same `expr`; a foreign key reads the entity by `expr`, so nothing
+    # that joins to it changes.
+    taken = {e["name"] for e in entities if e["type"] != "primary"}
+    taken.update(d["name"] for d in dimensions)
+    taken.update(m["name"] for m in measures)
+    for entity in entities:
+        if entity["type"] != "primary" or entity["name"] not in taken:
+            continue
+        renamed = f"{semantic_model_name}_{entity['expr']}"
+        notes.append(
+            f"{entity['expr']}: entity '{entity['name']}' is also a "
+            f"dimension or measure, which MetricFlow does not allow, so the entity "
+            f"is named '{renamed}' with `expr: {entity['expr']}`"
+        )
+        entity["name"] = renamed
+
     body: dict[str, Any] = {"name": semantic_model_name}
     description = with_population(
         declared.get("description"), declared.get("population")

@@ -48,6 +48,30 @@ def test_a_single_column_grain_is_the_primary_entity():
     assert found.blocked is None
 
 
+def test_a_time_column_grain_names_the_entity_apart_from_the_dimension():
+    found = sd.derive(
+        "fct_world_output_daily",
+        {
+            "description": "One row per day.",
+            "grain": ["output_day"],
+            "columns": {"output_day": {"role": "time"}},
+        },
+        column_types={"output_day": ("date", None)},
+        on_ref={},
+    )
+
+    assert found.blocked is None
+    assert found.body["entities"] == [
+        {
+            "name": "fct_world_output_daily_output_day",
+            "type": "primary",
+            "expr": "output_day",
+        }
+    ]
+    assert [d["name"] for d in found.body["dimensions"]] == ["output_day"]
+    assert any("output_day" in n and "entity" in n for n in found.notes)
+
+
 def test_a_composite_grain_names_the_limitation_and_guesses_no_primary_entity():
     declared = _declared(status={"role": "dimension"})
     declared["grain"] = ["order_id", "line_number"]
