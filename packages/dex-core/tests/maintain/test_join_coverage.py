@@ -1262,3 +1262,224 @@ def test_the_build_completion_reads_the_accounted_join_as_asserted(
     assert check.kind == "join_coverage"
     assert check.finding == "join_orphans"
     assert check.join == (f"inner join {W}.handles AS h on m.member_id = h.member_id")
+
+
+# --- key columns read from SQL, spelled the way the relation stores them (#1366) --
+
+
+class _FoldingWarehouse:
+    """A warehouse that folds an unquoted name (upper on Snowflake, lower on
+    Postgres and Redshift) and resolves a quoted one exactly, the way those
+    connectors do, so a probe quoting a name no relation holds is refused with
+    Snowflake's 000904. The rows live in DuckDB, which matches names regardless
+    of case, so each stored name is renamed to a physical one there and the
+    probe runs once every name has resolved."""
+
+    def __init__(self, dialect: str, tables: dict[str, dict[str, list]]):
+        duckdb = pytest.importorskip("duckdb")
+        self.dialect = dialect
+        self.tables = tables
+        self.metadata_reads: list[str] = []
+        self.physical: dict[str, str] = {}
+        self.conn = duckdb.connect()
+        self.conn.execute("ATTACH ':memory:' AS db")
+        self.conn.execute("CREATE SCHEMA db.s")
+        for identifier, columns in tables.items():
+            names = list(columns)
+            for name in names:
+                self.physical.setdefault(name, f"col_{len(self.physical)}")
+            ddl = ", ".join(f"{self.physical[n]} VARCHAR" for n in names)
+            self.conn.execute(f"CREATE TABLE {identifier} ({ddl})")
+            for row in zip(*columns.values(), strict=True):
+                marks = ", ".join("?" for _ in names)
+                self.conn.execute(f"INSERT INTO {identifier} VALUES ({marks})", row)
+
+    def _fold(self, name: str) -> str:
+        return name.upper() if self.dialect == "snowflake" else name.lower()
+
+    def table_metadata(self, identifier: str):
+        from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+
+        self.metadata_reads.append(identifier)
+        columns = self.tables[identifier]
+        return (
+            ObjectMeta(identifier, "table", "s", identifier, None, None, len(columns)),
+            [
+                ColumnMeta(name, "VARCHAR", True, ordinal)
+                for ordinal, name in enumerate(columns, start=1)
+            ],
+        )
+
+    def run_query(self, sql: str, *, max_rows: int, timeout_seconds: float):
+        import sqlglot
+        from sqlglot import exp
+
+        from exmergo_dex_core.adapters.base import QueryResult
+        from exmergo_dex_core.errors import WarehouseQueryError
+
+        tree = sqlglot.parse_one(sql, read=self.dialect)
+        aliases = {self._fold(a.alias) for a in tree.find_all(exp.Alias)}
+        for column in list(tree.find_all(exp.Column)):
+            ident = column.this
+            name = ident.name if ident.quoted else self._fold(ident.name)
+            if name in self.physical:
+                column.set("this", exp.to_identifier(self.physical[name]))
+            elif name not in aliases:
+                raise WarehouseQueryError(
+                    f"000904 (42000): SQL compilation error: invalid identifier "
+                    f"'\"{ident.name}\"'"
+                )
+        cursor = self.conn.execute(tree.sql(dialect="duckdb"))
+        names = [d[0] for d in cursor.description]
+        row = list(cursor.fetchone())
+        return QueryResult(names, ["BIGINT"] * len(names), [row], truncated=False)
+
+
+def _coverage(adapter: _FoldingWarehouse, from_col: str, to_col: str):
+    candidate = verify_mod.JoinCandidate(
+        from_relation="db.s.orders",
+        from_columns=(from_col,),
+        to_relation="db.s.customers",
+        to_columns=(to_col,),
+        side="left",
+        label="left join customers",
+    )
+    return verify_mod.join_coverage(
+        adapter,
+        verify_mod.JoinContractPlan(candidates={"m": [candidate]}),
+        {},
+        list(adapter.tables),
+        handshake=lambda _estimate, _count: None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "written"),
+    [
+        ("snowflake", "customer_id"),
+        ("snowflake", "CUSTOMER_ID"),
+        ("snowflake", "Customer_Id"),
+        ("postgres", "CUSTOMER_ID"),
+        ("postgres", "customer_id"),
+        ("redshift", "CUSTOMER_ID"),
+        ("redshift", "customer_id"),
+    ],
+)
+def test_a_key_written_in_either_case_is_probed_as_the_relation_stores_it(
+    dialect, written
+):
+    # An unquoted key the warehouse folded (upper on Snowflake, lower on
+    # Postgres and Redshift) is probed under the folded name, so a join that
+    # matches nothing reports join_no_match rather than probe_refused (#1366).
+    stored = written.upper() if dialect == "snowflake" else written.lower()
+    adapter = _FoldingWarehouse(
+        dialect,
+        {
+            "db.s.orders": {stored: ["a", "b"]},
+            "db.s.customers": {stored: ["x", "y"]},
+        },
+    )
+    result = _coverage(adapter, written, written)
+    (record,) = result.records
+    assert record["status"] == "contradicted", record
+    assert [f.code for f in result.findings] == ["join_no_match"]
+    # A name already spelled the way the connector folds it reads no metadata.
+    assert bool(adapter.metadata_reads) == (written != stored)
+
+
+def test_a_quoted_mixed_case_key_keeps_its_exact_spelling():
+    # A column the SQL quoted keeps its case: the relation holds "CustId" and,
+    # beside it, the CUSTID an unquoted custid would fold to; the probe reads
+    # the one the SQL named (#1366).
+    adapter = _FoldingWarehouse(
+        "snowflake",
+        {
+            "db.s.orders": {"CustId": ["a", "b"], "CUSTID": ["x", "y"]},
+            "db.s.customers": {"CustId": ["a", "b"]},
+        },
+    )
+    result = _coverage(adapter, "CustId", "CustId")
+    (record,) = result.records
+    assert record["status"] == "satisfied", record
+    assert result.findings == []
+
+
+def test_a_key_the_relation_does_not_hold_is_still_refused_with_the_reason():
+    adapter = _FoldingWarehouse(
+        "snowflake",
+        {
+            "db.s.orders": {"CUSTOMER_ID": ["a"]},
+            "db.s.customers": {"CUSTOMER_ID": ["a"]},
+        },
+    )
+    result = _coverage(adapter, "client_id", "customer_id")
+    (record,) = result.records
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "probe_refused"
+
+
+def test_a_respelled_key_is_reported_as_the_sql_wrote_it():
+    # The probe reads CUSTOMER_ID, but the finding, its data and its detail name
+    # the customer_id the model wrote, as the record beside it does (#1366).
+    adapter = _FoldingWarehouse(
+        "snowflake",
+        {
+            "db.s.orders": {"CUSTOMER_ID": ["a", "b"]},
+            "db.s.customers": {"CUSTOMER_ID": ["x", "y"]},
+        },
+    )
+    result = _coverage(adapter, "customer_id", "customer_id")
+    (finding,) = result.findings
+    (record,) = result.records
+    assert finding.code == "join_no_match"
+    assert finding.column == "customer_id"
+    assert finding.data["from_columns"] == record["from_columns"] == ["customer_id"]
+    assert finding.data["to_columns"] == record["to_columns"] == ["customer_id"]
+    assert "(db.s.orders.customer_id) to (db.s.customers.customer_id)" in (
+        finding.detail
+    )
+
+
+@pytest.mark.parametrize("dialect", ["databricks", "trino"])
+def test_a_key_that_already_resolved_keeps_its_finding_fingerprint(dialect):
+    # Databricks and Trino resolve an upper-case key against the lower-case
+    # column regardless of quoting, so the probe already worked before #1366;
+    # respelling it for the probe must not rename the finding, or a baseline
+    # taken before would report it as introduced.
+    from exmergo_dex_core.transform.finding_attribution import fingerprint
+
+    adapter = _FoldingWarehouse(
+        dialect,
+        {
+            "db.s.orders": {"customer_id": ["a", "b"]},
+            "db.s.customers": {"customer_id": ["x", "y"]},
+        },
+    )
+    result = _coverage(adapter, "CUSTOMER_ID", "CUSTOMER_ID")
+    (finding,) = result.findings
+    assert finding.column == "CUSTOMER_ID"
+    assert finding.data["from_columns"] == ["CUSTOMER_ID"]
+    assert fingerprint(finding) == (
+        "join_contract|join_no_match|m|CUSTOMER_ID|left join customers"
+    )
+
+
+def test_an_unreadable_relation_is_a_note_and_keeps_the_sql_spelling():
+    class _Unreadable(_FoldingWarehouse):
+        def table_metadata(self, identifier: str):
+            raise RuntimeError("no metadata")
+
+    adapter = _Unreadable(
+        "snowflake",
+        {
+            "db.s.orders": {"CUSTOMER_ID": ["a"]},
+            "db.s.customers": {"CUSTOMER_ID": ["a"]},
+        },
+    )
+    result = _coverage(adapter, "customer_id", "customer_id")
+    (record,) = result.records
+    assert record["reason_code"] == "probe_refused"
+    assert (
+        "m: the join keys on db.s.orders were probed as the SQL spells them: "
+        "the relation's columns could not be read (RuntimeError)"
+    ) in result.notes
