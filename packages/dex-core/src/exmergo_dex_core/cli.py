@@ -627,25 +627,19 @@ ranks what matters, profiles it, and infers how the tables join.
 """
 
 
-class _ArgumentRefusal(SystemExit):
-    """argparse refused the argv. Still a SystemExit(2), so a caller of
-    ``parse_args`` sees what argparse always raised, but it keeps the message so
-    ``main`` can print the refusal as an envelope (#1404)."""
-
-    def __init__(self, message: str) -> None:
-        super().__init__(2)
-        self.message = message
-
-
 class _Parser(argparse.ArgumentParser):
     """Subparsers are built with the parser's own class, so every verb uses this
-    ``error``."""
+    ``error``. It still raises SystemExit(2), what argparse always raised, so a
+    caller of ``parse_args`` sees no change; the refusal text rides on the cause
+    so ``main`` can print it as an envelope (#1404). Not a class of its own: a
+    SystemExit subclass in the package would be a refusal that cannot be caught
+    as DexError."""
 
     def error(self, message: str) -> NoReturn:
         self.print_usage(sys.stderr)
         text = f"{self.prog}: error: {message}"
         print(text, file=sys.stderr)
-        raise _ArgumentRefusal(text)
+        raise SystemExit(2) from argparse.ArgumentError(None, text)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -2076,9 +2070,9 @@ def main(argv: list[str] | None = None) -> int:
             tip = _bare_subcommand_suggestion(token) if token else None
             if tip:
                 print(f"dex: {tip}", file=sys.stderr)
-            if isinstance(exc, _ArgumentRefusal):
+            if isinstance(exc.__cause__, argparse.ArgumentError):
                 # Every outcome prints one envelope, an argument refusal too (#1404).
-                refusal = env.error(exc.message, reason=env.Reason.REQUEST)
+                refusal = env.error(str(exc.__cause__), reason=env.Reason.REQUEST)
                 if tip:
                     refusal.errors.append(tip)
                 # No parsed args, so the mode and cap come from what main would
