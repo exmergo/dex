@@ -364,10 +364,13 @@ def warehouse_refusal(
     it can rely on.
     """
 
-    first = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
-    # Masked before the cap: a cap that cut through a quoted value would leave
-    # it without the closing quote the mask reads its end from (#1070).
-    detail = mask_values(first) or "the server gave no message"
+    # Masked before the first line is taken and before the cap: a quoted value
+    # that holds a line break would otherwise be cut at the break (#1412), and a
+    # cap that cut through a value would leave it without the closing quote the
+    # mask reads its end from (#1070).
+    masked = mask_values(message)
+    first = next((ln.strip() for ln in masked.splitlines() if ln.strip()), "")
+    detail = first or "the server gave no message"
     if len(detail) > _SERVER_DETAIL_CAP:
         detail = detail[:_SERVER_DETAIL_CAP].rstrip() + "..."
     return WarehouseQueryError(f"{detail} [{code}]" if code else detail, stage=stage)

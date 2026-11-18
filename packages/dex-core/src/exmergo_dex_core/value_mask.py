@@ -118,6 +118,24 @@ _CONVERSION_MARKER = re.compile(
 )
 _ANY_QUOTED = re.compile(_QUOTED)
 
+# A quoted value that holds a line break is complete on no single line, so the
+# line-at-a-time match above would miss both parts (#1412). Such a value opens
+# like any other, finds no closing quote before the line ends, and closes at the
+# first closing quote on a later line. Its line breaks are folded into
+# ``_FOLDED_BREAK`` before matching, so the value reads as one line, and
+# unfolded after, so a message that is not masked comes back as written.
+_CLOSES = r"(?=$|[\s,;:.)\]])"
+_SPANS_LINES = re.compile(
+    rf"(?<!\w)(?:'(?:(?!'{_CLOSES})[^\n])*\n.*?'{_CLOSES}"
+    rf"|\"(?:(?!\"{_CLOSES})[^\n])*\n.*?\"{_CLOSES})",
+    re.DOTALL,
+)
+_FOLDED_BREAK = "\x00"
+
+
+def _fold_breaks(match: re.Match[str]) -> str:
+    return match.group(0).replace("\n", _FOLDED_BREAK)
+
 
 def _mask_group(match: re.Match[str]) -> str:
     start, end = match.span("value")
@@ -135,6 +153,9 @@ def mask_values(text: str) -> str:
 
     if not text:
         return text
+    folded = _FOLDED_BREAK not in text
+    if folded:
+        text = _SPANS_LINES.sub(_fold_breaks, text)
     lines = text.split("\n")
     masked: list[str] = []
     for line in lines:
@@ -143,4 +164,5 @@ def mask_values(text: str) -> str:
         if _CONVERSION_MARKER.search(line):
             line = _ANY_QUOTED.sub(VALUE_WITHHELD, line)
         masked.append(line)
-    return "\n".join(masked)
+    result = "\n".join(masked)
+    return result.replace(_FOLDED_BREAK, "\n") if folded else result
