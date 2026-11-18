@@ -33,11 +33,24 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from ..semantic_deployment import LocateRefused, ObjectKind
+from ..semantic_deployment import (
+    FULL,
+    LIMITED,
+    REFUSED,
+    Coverage,
+    DeployedRead,
+    LocateRefused,
+    ObjectKind,
+    judge,
+    read_text,
+)
 from ..semantic_deployment import locate as _locate
 from .model import LogicalTable, Member, SemanticView
 
 __all__ = [
+    "FULL",
+    "LIMITED",
+    "REFUSED",
     "AccountRead",
     "Coverage",
     "DeployedRead",
@@ -56,10 +69,6 @@ SCOPE_BASE_TABLES = (
     ", repeated for the schema holding the view's base tables where it is "
     "another (the scope is also the cost boundary a query is priced within)"
 )
-
-FULL = "full"
-LIMITED = "limited"
-REFUSED = "refused"
 
 
 @dataclass(frozen=True)
@@ -84,47 +93,6 @@ class Difference:
             f"{self.element} has a different {self.field} there "
             f"(repository {self.repository!r}, deployed {self.deployed!r})"
         )
-
-
-@dataclass
-class Coverage:
-    """How much of a deployed view this role could read back."""
-
-    view: str
-    deployed_as: str | None
-    status: str
-    reasons: list[str] = field(default_factory=list)
-    #: Under ``snowflake_account``: the configured repository file describing
-    #: this view, which was not checked against it (#1357).
-    repository_file: str | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        """The payload form."""
-        found: dict[str, Any] = {
-            "view": self.view,
-            "deployed_as": self.deployed_as,
-            "coverage": self.status,
-        }
-        if self.reasons:
-            found["reasons"] = list(self.reasons)
-        if self.repository_file is not None:
-            found["repository_file"] = self.repository_file
-        return found
-
-
-@dataclass
-class DeployedRead:
-    """One deployed view read back: its text, its validated form, its coverage."""
-
-    name: str
-    deployed_as: str
-    text: str | None
-    view: SemanticView | None
-    coverage: Coverage
-    diagnostics: list[str] = field(default_factory=list)
-    #: Elements whose expression qualifies a read with a table that has no such
-    #: member: what a role that cannot see a private member reads back.
-    unresolved: list[str] = field(default_factory=list)
 
 
 # --- locating ---------------------------------------------------------------------
@@ -168,48 +136,34 @@ def read_deployed(
 
     from .loader import validate_view_contents
 
-    try:
-        text = reader(deployed_as)
-    except Exception as exc:  # a permission refusal is an answer, not a crash
-        reason = _first_line(str(exc)) or type(exc).__name__
-        return DeployedRead(
-            name=name,
-            deployed_as=deployed_as,
-            text=None,
-            view=None,
-            coverage=Coverage(name, deployed_as, REFUSED, [reason]),
-        )
-    loaded = validate_view_contents({f"{deployed_as}.yaml": text})
+    text, refused = read_text(name, deployed_as, reader)
+    if refused is not None:
+        return DeployedRead(name, deployed_as, None, None, refused)
+    loaded = validate_view_contents({f"{deployed_as}.yaml": text or ""})
     view = loaded.views[0] if loaded.views else None
     diagnostics = [d.render() for d in loaded.errors]
-    coverage = Coverage(name, deployed_as, FULL)
-    if view is None:
-        coverage.status = REFUSED
-        coverage.reasons = diagnostics or ["the read-back did not validate as a view"]
-    elif repository is not None:
-        hidden = _hidden_privates(repository, view)
-        if hidden:
-            coverage.status = LIMITED
-            coverage.reasons = [
-                "this role reads no private member back (it needs REFERENCES or "
-                f"OWNERSHIP on the view): {', '.join(hidden)} could not be read"
-            ]
-    if view is not None and diagnostics:
-        # The view validated, and the reader refused some of its elements: the
-        # catalog carries the rest, so the read is partial and says what is
-        # missing rather than reading as complete.
-        coverage.status = LIMITED
-        coverage.reasons = [*coverage.reasons, *diagnostics]
+    hidden = (
+        _hidden_privates(repository, view)
+        if view is not None and repository is not None
+        else []
+    )
+    limits = (
+        [
+            "this role reads no private member back (it needs REFERENCES or "
+            f"OWNERSHIP on the view): {', '.join(hidden)} could not be read"
+        ]
+        if hidden
+        else []
+    )
+    # A view that validated with some of its elements refused is partial: the
+    # catalog carries the rest, and the coverage says what is missing.
+    coverage = judge(name, deployed_as, view, diagnostics, limits)
     unresolved = sorted(
         {d.element for d in loaded.diagnostics if d.rule == "unresolved_member"}
     )
     return DeployedRead(
         name, deployed_as, text, view, coverage, diagnostics, unresolved
     )
-
-
-def _first_line(message: str) -> str:
-    return message.strip().splitlines()[0] if message.strip() else ""
 
 
 def _hidden_privates(repository: SemanticView, deployed: SemanticView) -> list[str]:

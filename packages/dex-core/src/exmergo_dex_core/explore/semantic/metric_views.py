@@ -8,7 +8,9 @@ gaps, and the governed query.
 **The catalog needs no workspace.** ``explore semantic list`` reads the
 repository's Metric View YAML statically, and the declaration channel carries
 each join and each ``rely.at_most_one_match`` key to ``explore
-relationships|map|profile --use-project``.
+relationships|map|profile --use-project``. ``list --deployed`` is the explicit
+opt-in to reading the views deployed from those files instead
+(:mod:`...metric_views.deployed`), with each view's coverage named.
 
 **Dex renders, Databricks executes, through dex's connector (#1362).** A governed
 query is a ``SELECT ... MEASURE(...) FROM <deployed view> GROUP BY ALL``
@@ -25,9 +27,9 @@ because the safety contract is the order:
    measure returns the values of (``MIN``, ``MAX``, ``ANY_VALUE``,
    ``COLLECT_LIST``, ...);
 4. the deployed view, found by its file's stem among the Metric Views the source
-   allowlist holds, with a warehouse-free Unity Catalog read; the comparison of
-   the deployed definition with the file is #1363's, and every result says it was
-   not made;
+   allowlist holds and read back with ``tables.get`` (both Unity Catalog REST
+   reads, no warehouse); everything the query relies on is held to the
+   repository's file, and a difference refuses (#1363);
 5. the base tables the request reaches through the view, which must lie inside
    the scoped inventory, since they are what the statement is priced by;
 6. the render, against the deployed view's own name;
@@ -101,6 +103,9 @@ class LocalMetricViewLayer:
     deployment = "local"
     execution = EXECUTION_DEX
     catalog_gaps = METRIC_VIEW_CATALOG_GAPS
+    #: ``explore semantic list --deployed`` reads the views deployed from these
+    #: files, on request (#1363).
+    reads_deployed = True
     descriptor = BackendDescriptor(
         name=name,
         vendor=vendor,
@@ -136,8 +141,11 @@ class LocalMetricViewLayer:
 
     # ---- discovery ---------------------------------------------------------
 
-    def list_definitions(self) -> SemanticCatalog:
-        """The catalog `explore semantic list` renders."""
+    def list_definitions(self, *, deployed: bool = False) -> SemanticCatalog:
+        """The catalog `explore semantic list` renders: the repository's files,
+        or, with ``deployed``, the views deployed from them."""
+        if deployed:
+            return self._deployed_catalog()
         return SemanticCatalog.from_view(self._catalog_view(), self)
 
     def declared_relationships(self) -> list[Any]:
@@ -169,6 +177,75 @@ class LocalMetricViewLayer:
             except ProjectError as exc:
                 raise SemanticBackendError(str(exc)) from exc
         return self._view
+
+    def _deployed_catalog(self) -> SemanticCatalog:
+        """The views deployed from the configured files, read back.
+
+        Each configured view is located among the Metric Views the source
+        allowlist holds and read back from Unity Catalog; one that is not
+        deployed, or that this identity cannot read, is named in ``coverage``
+        with the reason, never silently left out. A read-back is named after
+        the file it was deployed from, so its tokens line up with the
+        repository's.
+        """
+
+        self._supported_connector(
+            "`explore semantic list --deployed`",
+            advice="List the repository's files without --deployed, which needs "
+            "no connection",
+        )
+        governed = self._governed_sql()
+        try:
+            return self._read_deployed_catalog(governed)
+        finally:
+            governed.release()
+
+    def _read_deployed_catalog(self, governed: GovernedSql) -> SemanticCatalog:
+        from ...metric_views import catalog as catalog_mod
+        from ...metric_views.deployed import (
+            FULL,
+            REFUSED,
+            Coverage,
+            LocateRefused,
+            locate,
+            read_deployed,
+        )
+        from ...metric_views.loader import LoadResult
+
+        adapter = governed.adapter("explore semantic list")
+        listed = adapter.list_metric_views()
+        views: list[Any] = []
+        coverage: list[Coverage] = []
+        for view in self._loaded().views:
+            try:
+                where = locate(listed, view.name)
+            except LocateRefused as exc:
+                coverage.append(Coverage(view.name, None, REFUSED, [str(exc)]))
+                continue
+            read = read_deployed(view.name, where, adapter.read_metric_view_yaml)
+            coverage.append(read.coverage)
+            if read.view is not None:
+                views.append(read.view)
+        deployed = LoadResult(views=views)
+        resolved = catalog_mod.resolution(deployed, self._connector())
+        notes = [
+            "read from the Metric Views deployed in Unity Catalog (each view's "
+            "`view_definition`, read with tables.get), not the repository's "
+            "files; each is named after the file it was deployed from"
+        ]
+        if any(c.status != FULL for c in coverage):
+            notes.append(
+                "coverage is not full for every view: see `coverage`. A limited "
+                "view is missing what dex's reader refused in its read-back, and "
+                "a refused one is not in this catalog at all"
+            )
+        view = catalog_mod.semantic_catalog(deployed, resolved, notes=notes)
+        return SemanticCatalog.from_view(
+            view,
+            self,
+            source="deployed",
+            coverage=[c.as_dict() for c in coverage],
+        )
 
     # ---- query -------------------------------------------------------------
 
@@ -403,37 +480,62 @@ class LocalMetricViewLayer:
         return fold_identifier(self._connector(), column)
 
     def _deployed(self, plan: Any, command: str) -> tuple[str, list[str]]:
-        """Locate the deployed view, before any spend: its name, and notes for
-        the result."""
+        """Locate the deployed view and hold it to the repository, before any
+        spend: its name, and notes for the result."""
 
-        from ...semantic_deployment import LocateRefused, ObjectKind, locate
+        from ...metric_views.deployed import (
+            LIMITED,
+            REFUSED,
+            LocateRefused,
+            compare,
+            locate,
+            read_deployed,
+            relied_on,
+        )
 
         adapter = self._governed_sql().adapter(command)
         view = plan.view
-        kind = ObjectKind(
-            noun="metric view",
-            scope="<catalog>.<schema>",
-            deploy=(
-                "deploy the reviewed file with `CREATE VIEW <catalog>.<schema>."
-                f"{view.name} WITH METRICS LANGUAGE YAML AS $$ ... $$` into a "
-                "schema the allowlist names, then query again"
-            ),
-            narrow=(
-                ", repeated for the schema holding the view's source and join "
-                "tables where it is another (the scope is also the cost boundary "
-                "a query is priced within)"
-            ),
-        )
         try:
-            where = locate(adapter.list_metric_views(), view.name, kind)
+            where = locate(adapter.list_metric_views(), view.name)
         except LocateRefused as exc:
             raise SemanticQueryRefusedError(str(exc)) from exc
+        read = read_deployed(view.name, where, adapter.read_metric_view_yaml)
+        if read.coverage.status == REFUSED or read.view is None:
+            raise SemanticQueryRefusedError(
+                f"refused: the metric view deployed as {where} could not be read "
+                "back, so dex cannot hold it to the repository's definition: "
+                + "; ".join(read.coverage.reasons)
+            )
+        reliance = relied_on(
+            view,
+            [item.member for item in plan.members],
+            [item.member for item in plan.fields if item.grain is not None],
+        )
+        if reliance is None:
+            raise SemanticQueryRefusedError(
+                f"refused: dex could not read what this query relies on in view "
+                f"'{view.name}' (an expression it reaches does not parse), so it "
+                "cannot hold the deployment to the repository's definition"
+            )
+        differences = compare(view, read.view, reliance, unresolved=read.unresolved)
+        if differences:
+            listed = "; ".join(d.render() for d in differences[:5])
+            more = f" (and {len(differences) - 5} more)" if len(differences) > 5 else ""
+            raise SemanticQueryRefusedError(
+                f"refused: the metric view deployed as {where} differs from the "
+                f"repository's {view.file} on what this query reads: {listed}{more}. "
+                "A governed query answers with the reviewed definition or not at "
+                "all: redeploy the reviewed file, or update the repository to "
+                "match what is deployed and review it"
+            )
         notes = [
             f"executed against the metric view deployed as {where}, found by the "
             f"stem of {view.file} among the Metric Views the source allowlist "
-            "holds. Its deployed definition was not compared with the file (that "
-            "check is #1363), so the answer is the deployment's"
+            "holds; its deployed definition was read back from Unity Catalog and "
+            "matches the file on everything this query reads"
         ]
+        if read.coverage.status == LIMITED:
+            notes.extend(read.coverage.reasons)
         if view.filter:
             notes.append(
                 f"view '{view.name}' declares a `filter`, which Databricks applies "
@@ -527,7 +629,7 @@ class LocalMetricViewLayer:
             self._catalog_view()  # raises, naming every file the reader refused
         return loaded
 
-    def _supported_connector(self, what: str) -> str:
+    def _supported_connector(self, what: str, *, advice: str | None = None) -> str:
         connector = self._connector() or ""
         if connector == _CONNECTOR:
             return connector
@@ -535,9 +637,13 @@ class LocalMetricViewLayer:
             f"refused: {what} runs on the Databricks connector, and this "
             f"repository's connector is {connector or 'not set'}: a Metric View "
             "is a Unity Catalog object, queried with MEASURE() on a Databricks SQL "
-            "warehouse. Read the layer with `explore semantic list`, then query "
-            "the relations it names with `explore query`, which runs under the "
-            "firewall and the cost guard"
+            "warehouse. "
+            + (
+                advice
+                or "Read the layer with `explore semantic list`, then query the "
+                "relations it names with `explore query`, which runs under the "
+                "firewall and the cost guard"
+            )
         )
 
     def _connector(self) -> str | None:

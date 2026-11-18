@@ -313,6 +313,28 @@ class DatabricksAdapter:
         self._load_inventory()
         return sorted(self._metric_views)
 
+    def read_metric_view_yaml(self, identifier: str) -> str:
+        """One deployed Metric View's definition, as Unity Catalog's
+        ``tables.get`` returns it in ``view_definition`` (#1363).
+
+        Free REST metadata, like the listing that found it: no SQL warehouse is
+        woken, so a governed query refused for a stale deployment is refused
+        before anything is priced or run. An identity that can browse the view
+        and is not shown its definition gets no text back, which is raised
+        rather than read as an empty view, so the caller names it as coverage.
+        """
+
+        table = self._workspace.tables.get(identifier, include_browse=True)
+        text = getattr(table, "view_definition", None)
+        if text is None or not str(text).strip():
+            raise DatabricksConnectionError(
+                f"Unity Catalog returned no view_definition for {identifier}: this "
+                "identity can list the metric view and is not shown its "
+                "definition (browsing a view does not show it), so dex cannot "
+                "read it back"
+            )
+        return str(text)
+
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
         entry = self._entry(identifier)
         return self._object_meta(entry), self._column_metas(entry["identifier"])

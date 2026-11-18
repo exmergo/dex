@@ -575,8 +575,10 @@ it as `execution` (`dex` or `vendor`).
   deployed view by its file's stem, and executes it under the cost guard. Tokens
   are `view.field` and `view.measure`; a grain suffix (`orders.order_date__month`)
   buckets a field formatted `date` or `date_time`; `--where` is a Databricks
-  predicate over the view's fields. The deployed definition is not yet compared
-  with the file (#1363).
+  predicate over the view's fields. The deployed view is read back from Unity
+  Catalog and held to the file first: a difference in anything the query relies
+  on refuses, naming the member and the field (#1363). `list --deployed` reads
+  the deployed views instead, with `source: deployed` and per-view `coverage`.
 - `semantic.vendor: snowflake` reads the Snowflake Semantic View YAML files
   named in `semantic.snowflake.files` statically (needs the `[semantic-views]`
   extra; no Snowflake connection, nothing deployed), each validated by Dex's own

@@ -242,8 +242,12 @@ anywhere else:
   measure, a view declaring `parameters` or a `materialization`, and a measure in
   `--where` are refused by name. On any other connector, use `explore profile` and
   `explore query` on the relations the catalog names.
-- **The answer is the deployment's.** The deployed view is found by its file's
-  stem and not yet compared with the file (#1363); relay the note that says so.
+- **The answer is the reviewed file's, or none.** The deployed view is read back
+  and held to the file on everything the query relies on (#1363). A refusal for
+  a difference names the member and the field: relay it, and the fix is to
+  redeploy the reviewed file or bring the file in line and review it, never to
+  query around it. A view that cannot be read back is refused with its coverage
+  reason. `list --deployed` shows the deployed copy, with each view's coverage.
 - **A `rely` key is a claim Databricks never checks.** A wrong one returns wrong
   numbers silently, so `explore profile --use-project` and `maintain grain`
   measure it; a duplicate there is a finding to report.

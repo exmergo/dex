@@ -8,7 +8,9 @@ behind the real adapter and cost gate through dex's one adapter funnel.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
+import yaml
 from fakes.databricks import (
     FakeDatabricks,
     FakeDatabricksConnection,
@@ -118,7 +120,11 @@ class Workspace:
     """The fake workspace: base tables, the Metric Views deployed on them, and
     what each SELECT returns.
 
-    ``deployed`` names each Metric View by ``catalog.schema.name``.
+    ``deployed`` names each Metric View by ``catalog.schema.name``; each one's
+    ``view_definition`` is :data:`ORDERS` unless ``definitions`` gives it
+    another body (a mapping, dumped as Unity Catalog would hand it back, or
+    the text itself), or None for one this identity is not shown. ``refused``
+    names those whose read-back raises (#1363).
     """
 
     def __init__(
@@ -126,6 +132,8 @@ class Workspace:
         deployed: tuple[str, ...] = ("shop.metrics.orders",),
         *,
         running: bool = False,
+        definitions: dict[str, Any] | None = None,
+        refused: dict[str, str] | None = None,
     ):
         self.rows: list[dict] = [{"orders.order_status": "F", "orders.order_count": 7}]
         tables = [
@@ -154,10 +162,24 @@ class Workspace:
                 bytes=1_000,
             ),
         ]
+        definitions = definitions or {}
         for fq in deployed:
             catalog, schema, name = fq.split(".")
+            body = definitions.get(fq, ORDERS)
             tables.append(
-                FakeDatabricksTable(catalog, schema, name, [], kind="metric_view")
+                FakeDatabricksTable(
+                    catalog,
+                    schema,
+                    name,
+                    [],
+                    kind="metric_view",
+                    view_definition=(
+                        yaml.safe_dump(body, sort_keys=False)
+                        if isinstance(body, dict)
+                        else body
+                    ),
+                    get_error=(refused or {}).get(fq),
+                )
             )
         self.workspace = FakeWorkspaceClient(
             tables=tables,

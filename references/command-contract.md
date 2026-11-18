@@ -2112,8 +2112,15 @@ renders `SELECT ... MEASURE(<measure>) ... FROM <deployed view> GROUP BY ALL`
 from the catalog, finds the deployed view by its file's stem with a
 warehouse-free Unity Catalog listing, prices the statement from the base tables
 the request reaches, and executes it through its own connector under
-`STATEMENT_TIMEOUT`; `values` runs the PII gate first. The deployed definition
-is not yet compared with the file (#1363), and every result says so.
+`STATEMENT_TIMEOUT`; `values` runs the PII gate first. Before anything is
+priced, the deployed view is read back with Unity Catalog's `tables.get`
+(`view_definition`, no warehouse) and everything the query relies on (the
+`source`, the `filter`, each member and every member it reads, a grained field's
+`format`, and the joins those reach) is held to the file; a difference, or a
+deployment that cannot be read back, refuses (#1363). `list --deployed` reads
+the views deployed from the files instead, with `source: deployed` and per-view
+`coverage` (`full`, `limited`, `refused`); a plain `list` never contacts
+Databricks.
 `semantic databricks define|update|plan` authors the files through a stored plan,
 never deploying them, and a declared dbt mart derives a view of its own (see
 `transform plan` above).
