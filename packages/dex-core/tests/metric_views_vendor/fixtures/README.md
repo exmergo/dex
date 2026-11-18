@@ -12,3 +12,6 @@ export, fixture B imports.
 The Ossie side is deliberately not named `*.ossie.yaml`. Those files are dex's own
 Ossie corpus, and the converter's documents name key columns that are not
 declared fields, which dex's Ossie reader refuses.
+
+`governed_goldens.yaml` is dex's own: the SQL a governed Metric View query renders
+(#1362) for each recorded request, compared exactly by `test_query_render.py`.

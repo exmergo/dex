@@ -4,8 +4,9 @@
 connection. `explore relationships|map|profile --use-project` carry each join and
 each `rely` key at confidence 1.0 on a real DuckDB warehouse. `maintain snapshot`
 fingerprints the layer, `maintain semantic` reports a changed view, and `maintain
-grain` measures a `rely` key. A query and a values read are refused by name, the
-values read after the PII gate.
+grain` measures a `rely` key. On any connector but Databricks a query and a
+values read are refused by name, the values read after the PII gate; the governed
+path itself is `test_query.py` (#1362).
 """
 
 from __future__ import annotations
@@ -101,13 +102,14 @@ def test_the_narrowing_flags_answer(layer, capsys, no_network):
     assert searched["data"]["metrics"], "the field's comment names fulfilment"
 
 
-def test_a_query_is_refused_by_name(layer, capsys, no_network):
-    """Naming #964."""
+def test_a_query_on_another_connector_is_refused_by_name(layer, capsys, no_network):
+    """A Metric View is a Unity Catalog object, queried on Databricks only."""
     rc, envelope = _run(capsys, layer, "explore", "semantic", "query", "orders.revenue")
 
     assert rc != 0
     assert envelope["status"] == "error"
-    assert "#964" in " ".join(envelope["errors"])
+    assert "Databricks connector" in " ".join(envelope["errors"])
+    assert "duckdb" in " ".join(envelope["errors"])
 
 
 def test_values_of_a_personal_field_are_refused_as_pii_first(layer, capsys, no_network):
@@ -116,17 +118,18 @@ def test_values_of_a_personal_field_are_refused_as_pii_first(layer, capsys, no_n
 
     assert rc != 0
     assert envelope["reason"] == "guard", envelope
-    assert "#964" not in " ".join(envelope["errors"])
+    assert "PII" in " ".join(envelope["errors"])
+    assert "Databricks connector" not in " ".join(envelope["errors"])
 
 
-def test_values_of_any_other_field_are_refused_for_want_of_a_runtime(
+def test_values_of_any_other_field_are_refused_on_another_connector(
     layer, capsys, no_network
 ):
-    """Naming #964."""
+    """After the gate, the connector check."""
     rc, envelope = _run(capsys, layer, "explore", "semantic", "values", "people.tier")
 
     assert rc != 0
-    assert "#964" in " ".join(envelope["errors"])
+    assert "Databricks connector" in " ".join(envelope["errors"])
 
 
 def test_an_unreadable_layer_says_which_file(tmp_path, capsys, no_network):

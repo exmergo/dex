@@ -303,6 +303,38 @@ class DatabricksAdapter:
         objects.sort(key=lambda o: o.identifier)
         return objects
 
+    def list_metric_views(self) -> list[str]:
+        """Every Metric View the source allowlist's scopes hold, as
+        ``catalog.schema.name``. Free: the same Unity Catalog REST listing as
+        :meth:`list_objects`, which leaves Metric Views out because none of them
+        is a relation to profile (#1259). No warehouse is involved, so a governed
+        query that cannot find its view is refused before one is woken."""
+
+        self._load_inventory()
+        return sorted(self._metric_views)
+
+    def read_metric_view_yaml(self, identifier: str) -> str:
+        """One deployed Metric View's definition, as Unity Catalog's
+        ``tables.get`` returns it in ``view_definition`` (#1363).
+
+        Free REST metadata, like the listing that found it: no SQL warehouse is
+        woken, so a governed query refused for a stale deployment is refused
+        before anything is priced or run. An identity that can browse the view
+        and is not shown its definition gets no text back, which is raised
+        rather than read as an empty view, so the caller names it as coverage.
+        """
+
+        table = self._workspace.tables.get(identifier, include_browse=True)
+        text = getattr(table, "view_definition", None)
+        if text is None or not str(text).strip():
+            raise DatabricksConnectionError(
+                f"Unity Catalog returned no view_definition for {identifier}: this "
+                "identity can list the metric view and is not shown its "
+                "definition (browsing a view does not show it), so dex cannot "
+                "read it back"
+            )
+        return str(text)
+
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
         entry = self._entry(identifier)
         return self._object_meta(entry), self._column_metas(entry["identifier"])
@@ -340,6 +372,9 @@ class DatabricksAdapter:
 
         self._objects: dict[str, dict] = {}
         self._columns: dict[str, list[ColumnMeta]] = {}
+        # Metric Views the scoped listing holds, kept apart from `_objects`: a
+        # governed Metric View query finds the deployed view here (#1362).
+        self._metric_views: set[str] = set()
         self._inventory_loaded = False
         self._resolved_scopes: list[tuple[str, str | None]] | None = None
         self._schemas_by_catalog: dict[str, set[str]] = {}
@@ -397,7 +432,9 @@ class DatabricksAdapter:
             # Databricks refuses a plain SELECT of its measure columns
             # (METRIC_VIEW_MISSING_MEASURE_FUNCTION), so a profile or a grain
             # probe over it would fail the whole command (#1259). Its YAML is
-            # read from the repository under `semantic.vendor: databricks`.
+            # read from the repository under `semantic.vendor: databricks`, and a
+            # governed query finds it through `list_metric_views` (#1362).
+            self._metric_views.add(identifier)
             return
         columns = self._column_metas_from(getattr(table, "columns", None))
         if columns is not None:
@@ -846,6 +883,30 @@ class DatabricksAdapter:
 
         checked = assert_select_only(sql, dialect=self.dialect)
         return self._statement_estimate(checked) + self._startup_floor()
+
+    def relations_estimate(self, identifiers: Sequence[str]) -> float:
+        """The floor estimate for a statement over these base tables: their
+        summed known sizes over the scan rate (the per-statement floor where none
+        is known yet), plus the startup floor when the warehouse is not running.
+
+        For a statement over a Metric View, which Databricks keeps no size for
+        and ``DESCRIBE DETAIL`` does not describe: the layer names the view's
+        source and the join sources the request reaches (#1362). A size an
+        in-budget ``DESCRIBE DETAIL`` learned earlier in the command sharpens it,
+        as it sharpens :meth:`query_estimate`."""
+
+        self._load_inventory()
+        total_bytes = 0
+        known = 0
+        for identifier in dict.fromkeys(i.lower() for i in identifiers):
+            entry = self._objects.get(identifier)
+            if entry and entry["byte_size"] is not None:
+                total_bytes += entry["byte_size"]
+                known += 1
+        seconds = (
+            self._statement_seconds(total_bytes) if known else _MIN_STATEMENT_SECONDS
+        )
+        return seconds + self._startup_floor()
 
     def _statement_estimate(self, sql: str) -> float:
         total_bytes = 0

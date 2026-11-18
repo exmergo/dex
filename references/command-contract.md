@@ -563,7 +563,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      unapplied. A recorded verdict carries inputs_built_by (invocation_id,
                                      generated_at, cold): the latest build among the model's upstream
                                      models, one run, recorded with it; null where no build
-                                     attempted them (#1114).
+                                     attempted them (#1114). baseline_never_built (model_built_at,
+                                     rebuilt_after, row_count) is set where an input changed after
+                                     the model's last build, so the verdict was computed against a
+                                     baseline no build wrote (#1387).
                                      --expect <json> | --expect-file <f> states an intended change
                                      (#1157): added and removed ("none", "any" or {"where": <row
                                      predicate over output columns, which may test a column with
@@ -2115,7 +2118,20 @@ MEASURE(b)` a `ratio` and any other composition `derived`, with the view's
 `--for-dimension` answers. Entities and time grains are declared `unavailable`;
 each join's key pairs and arity, and each `rely.at_most_one_match` key on the
 joined table, reach `explore` through the declaration channel at confidence 1.0.
-`query` and `values` refuse by name until #964, `values` after the PII gate.
+`query` and `values` run governed on the Databricks connector (#1362): dex
+renders `SELECT ... MEASURE(<measure>) ... FROM <deployed view> GROUP BY ALL`
+from the catalog, finds the deployed view by its file's stem with a
+warehouse-free Unity Catalog listing, prices the statement from the base tables
+the request reaches, and executes it through its own connector under
+`STATEMENT_TIMEOUT`; `values` runs the PII gate first. Before anything is
+priced, the deployed view is read back with Unity Catalog's `tables.get`
+(`view_definition`, no warehouse) and everything the query relies on (the
+`source`, the `filter`, each member and every member it reads, a grained field's
+`format`, and the joins those reach) is held to the file; a difference, or a
+deployment that cannot be read back, refuses (#1363). `list --deployed` reads
+the views deployed from the files instead, with `source: deployed` and per-view
+`coverage` (`full`, `limited`, `refused`); a plain `list` never contacts
+Databricks.
 `semantic databricks define|update|plan` authors the files through a stored plan,
 never deploying them, and a declared dbt mart derives a view of its own (see
 `transform plan` above).

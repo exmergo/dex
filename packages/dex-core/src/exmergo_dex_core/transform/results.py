@@ -627,6 +627,11 @@ class RefactorComparisonResult(Result):
     # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
     # so `cold` does not mean every input was built cold. None with no build.
     inputs_built_by: dict[str, Any] | None = None
+    # Set where an input changed after the compared model's last build (#1387):
+    # `model_built_at`, and `rebuilt_after` (upstream models a later run
+    # rebuilt) and/or `row_count` (`last_build`, `baseline`). The verdict was
+    # then computed against a baseline no build wrote. Absent otherwise.
+    baseline_never_built: dict[str, Any] | None = None
     # How the difference matches a stated expected change (#1157): the clauses,
     # the counts split into matching and unexpected, the failed clauses, and up
     # to five unexpected keys per class, firewall-cleared. Absent with no
@@ -654,6 +659,11 @@ class RefactorComparisonResult(Result):
             "target": self.target,
             "status": self.status,
             "reason_code": self.reason_code,
+            **(
+                {"baseline_never_built": self.baseline_never_built}
+                if self.baseline_never_built
+                else {}
+            ),
             "detail": self.detail,
             "compared_at": self.compared_at,
             "baseline_compiled": self.baseline_compiled,

@@ -611,7 +611,20 @@ def _compare(
         accepted_type_changes=accepted_type_changes,
         expectation=expectation,
     )
+    unbuilt = None
+    if verdict.status != "not_checked":
+        with contextlib.suppress(Exception):
+            unbuilt = baseline_never_built(
+                project,
+                chosen,
+                {Path(edit.path).stem for edit in _touched(stored)},
+                adapter,
+                verdict.multiset.left_rows if verdict.multiset else None,
+            )
+    if unbuilt is not None:
+        warnings.append(_unbuilt_warning(chosen, unbuilt))
     result = _result(identity, verdict, warnings, profiled)
+    result.baseline_never_built = unbuilt
     return command_args.stamp_spend(result, adapter)
 
 
@@ -1077,6 +1090,109 @@ def inputs_built_by(project: Path, model: str) -> dict[str, Any] | None:
         "generated_at": latest.generated_at,
         "cold": latest.cold,
     }
+
+
+def baseline_never_built(
+    project: Path,
+    model: str,
+    touched: set[str],
+    adapter: Any,
+    baseline_rows: int | None,
+) -> dict[str, Any] | None:
+    """Evidence that an input changed after the compared model's last build (#1387).
+
+    The baseline is the model's current SQL re-run on today's inputs. When an
+    input moved after the build that wrote the model's dev relation, that
+    baseline is a state no build wrote and nothing served, and a verdict against
+    it can blame the change for what the new inputs did. Two signals:
+
+    - ``rebuilt_after``: untouched upstream models a later run rebuilt, read
+      from the run results, free on every connector.
+    - ``row_count``: the built relation's row count against the baseline's, which
+      also sees a source reloaded outside dbt. Only where ``table_metadata``
+      counts exactly (an adapter offering ``table_columns``, DuckDB): an
+      estimate would differ with nothing changed.
+
+    Run results keep each node's latest attempt only, so a model the latest
+    runs did not attempt counts as built before all of them, and its
+    ``model_built_at`` is ``None``. ``None`` with no evidence, for a model the
+    manifest does not hold, and for one whose latest attempt failed. A view reads
+    today's inputs whenever it is read, so it is never judged.
+    """
+
+    upstream = _upstream(project, model)
+    if upstream is None:
+        return None
+    graph, seen, runs = upstream
+    nodes = graph["nodes"]
+    own = next(
+        (
+            uid
+            for uid, node in nodes.items()
+            if uid.startswith("model.") and model in graph["names"](node)
+        ),
+        None,
+    )
+    if own is None:
+        return None
+    node, run = nodes[own], runs.nodes.get(own)
+    if (node.get("config") or {}).get("materialized") in ("view", "ephemeral"):
+        return None
+    if run is not None and run.status != BUILT_STATUS:
+        return None
+    # A model the latest runs did not attempt was built before all of them.
+    built_at = (run.generated_at if run else None) or ""
+    rebuilt = sorted(
+        str(nodes[uid].get("name"))
+        for uid in seen
+        if uid in runs.nodes
+        and runs.nodes[uid].status == BUILT_STATUS
+        and (runs.nodes[uid].generated_at or "") > built_at
+        and not graph["names"](nodes[uid]) & touched
+        and ((nodes[uid].get("config") or {}).get("materialized") != "ephemeral")
+    )
+    evidence: dict[str, Any] = {}
+    if rebuilt:
+        evidence["rebuilt_after"] = rebuilt
+    relation = node.get("relation_name")
+    if (
+        baseline_rows is not None
+        and isinstance(relation, str)
+        and getattr(adapter, "table_columns", None) is not None
+    ):
+        from ..dbt_project import strip_relation_quoting
+
+        meta, _ = adapter.table_metadata(strip_relation_quoting(relation))
+        if meta.row_count is not None and meta.row_count != baseline_rows:
+            evidence["row_count"] = {
+                "last_build": meta.row_count,
+                "baseline": baseline_rows,
+            }
+    if not evidence:
+        return None
+    return {"model_built_at": run.generated_at if run else None, **evidence}
+
+
+def _unbuilt_warning(model: str, unbuilt: Mapping[str, Any]) -> str:
+    """The sentence that goes with ``baseline_never_built``."""
+
+    seen = []
+    if unbuilt.get("rebuilt_after"):
+        seen.append("rebuilt since: " + ", ".join(unbuilt["rebuilt_after"]))
+    if unbuilt.get("row_count"):
+        counts = unbuilt["row_count"]
+        seen.append(
+            f"the baseline returns {counts['baseline']} row(s) where the last "
+            f"build wrote {counts['last_build']}"
+        )
+    return (
+        f"an input of {model} changed after its last build "
+        f"({unbuilt.get('model_built_at') or 'before the latest run'}; "
+        f"{'; '.join(seen)}), so the verdict is "
+        "computed against a baseline that was never built or served: the current "
+        "SQL on today's inputs. Read a difference with that in mind before "
+        "calling it a defect of the change"
+    )
 
 
 def _built_parents(
