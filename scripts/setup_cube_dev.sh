@@ -128,6 +128,10 @@ if [[ $EXECUTE == 1 ]]; then
             PORT_DEFAULT=4011
             PG_CONTAINER="${DEX_CUBE_PG_CONTAINER:-dex-pg}"
             if docker inspect "$PG_CONTAINER" >/dev/null 2>&1; then
+                if [[ "$(docker inspect -f '{{.State.Running}}' "$PG_CONTAINER")" != "true" ]]; then
+                    echo "$PG_CONTAINER exists but is not running; start it (scripts/setup_postgres_dev.sh) and re-run" >&2
+                    exit 1
+                fi
                 # The dogfood database (scripts/setup_postgres_dev.sh) publishes
                 # on 127.0.0.1 only, which a container cannot reach through the
                 # host gateway on native Linux. Join it on a private network
@@ -137,9 +141,10 @@ if [[ $EXECUTE == 1 ]]; then
                 if ! docker network connect dex-cube "$PG_CONTAINER" 2>/dev/null; then
                     # Already a member is fine; anything else (the container
                     # went away) would leave Cube with an address it cannot reach.
-                    attached=$(docker inspect "$PG_CONTAINER" \
-                        --format '{{json .NetworkSettings.Networks}}' 2>/dev/null || true)
-                    if [[ "$attached" != *'"dex-cube"'* ]]; then
+                    pg_id=$(docker inspect -f '{{.Id}}' "$PG_CONTAINER")
+                    members=$(docker network inspect dex-cube \
+                        -f '{{range $id, $c := .Containers}}{{$id}} {{end}}' 2>/dev/null || true)
+                    if [[ " $members " != *" $pg_id "* ]]; then
                         echo "could not attach $PG_CONTAINER to the dex-cube network" >&2
                         exit 1
                     fi

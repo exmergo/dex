@@ -219,13 +219,16 @@ def to_cube_query(
 
     # What an --order-by token may name, as written -> the member Cube orders by.
     # A bucketed time dimension is ordered by the dimension itself.
+    # Every exact grouped name first, bucketed ones included, and only then the
+    # generated aliases, so a member spelled exactly like an alias keeps its own
+    # sort key whatever order the group-by named them in.
     own = {token: token for token in (*measures, *dimensions)}
     for entry in times:
-        name = entry["dimension"]
-        # A grouped member spelled exactly like a bucket alias keeps its own
-        # sort key: the alias is only added where nothing already holds it.
-        own.setdefault(name, name)
-        own.setdefault(f"{name}__{entry['granularity']}", name)
+        own.setdefault(entry["dimension"], entry["dimension"])
+    for entry in times:
+        own.setdefault(
+            f"{entry['dimension']}__{entry['granularity']}", entry["dimension"]
+        )
     order: list[list[str]] = []
     for raw in q.order_by:
         descending = raw.startswith("-")
@@ -569,6 +572,14 @@ def _compare(token: str, member: Member, found: Any, stale: Any) -> None:
     # without any cannot be compared and is not passed as though it matched.
     if member.sql is not None and entry.get("sql") is None:
         raise stale(token, "has no SQL in the server's /v1/meta to compare")
+    # The other direction, for a measure: a `count` the repository defines with
+    # no SQL counts rows, and one served over a column counts that column's
+    # non-NULL values, so SQL the repository does not declare is a different
+    # measure, not an omission.
+    if kind == MEASURE and member.sql is None and entry.get("sql") is not None:
+        raise stale(
+            token, "is served with SQL the repository's member does not declare"
+        )
     if member.type == "time":
         served_grains = sorted(
             g.get("name")

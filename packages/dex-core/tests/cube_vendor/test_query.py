@@ -1244,3 +1244,48 @@ def test_a_grouped_member_named_like_a_bucket_keeps_its_own_sort_key():
     request = to_cube_query(q, members, max_rows=50)
 
     assert request.query["order"] == [["orders.period__month", "asc"]]
+
+
+def test_a_bucketed_member_named_like_another_s_bucket_keeps_its_sort_key():
+    """Two time dimensions, `period` and `period__month`, grouped in that order
+    with --grain month: ordering by `period__month` sorts by that member."""
+
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import Target, to_cube_query
+    from exmergo_dex_core.explore.semantic.model import SemanticQuery
+
+    measure = Member(name="count", kind="measure", type="count")
+    first = Member(name="period", kind="dimension", type="time")
+    second = Member(name="period__month", kind="dimension", type="time")
+    members = {
+        "orders.count": Target("orders.count", "measure", measure, "orders"),
+        "orders.period": Target("orders.period", "dimension", first, "orders"),
+        "orders.period__month": Target(
+            "orders.period__month", "dimension", second, "orders"
+        ),
+    }
+    q = SemanticQuery(
+        metrics=["orders.count"],
+        group_by=["orders.period", "orders.period__month"],
+        grain="month",
+        order_by=["orders.period__month"],
+    )
+
+    request = to_cube_query(q, members, max_rows=50)
+
+    assert request.query["order"] == [["orders.period__month", "asc"]]
+
+
+def test_a_count_served_over_a_column_the_repository_does_not_name_is_stale():
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    member = Member(name="count", kind="measure", type="count")
+    members = {"orders.count": Target("orders.count", "measure", member, "orders")}
+    served = {"name": "orders.count", "type": "number", "aggType": "count"}
+    meta = {"cubes": [{"name": "orders", "dimensions": [], "measures": [served]}]}
+
+    check_renderer(meta, ["orders.count"], members, where="x")
+    served["sql"] = "`customer_id`"
+    with pytest.raises(StaleRendererError, match="does not declare"):
+        check_renderer(meta, ["orders.count"], members, where="x")

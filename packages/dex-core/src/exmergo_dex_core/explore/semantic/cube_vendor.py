@@ -289,11 +289,16 @@ class CubeVendorLayer:
         # The data source first: it needs neither a dialect nor the SQL, so no
         # path that leaves the tables unchecked leaves it unchecked too.
         configured = getattr(self._source, "data_source", None) or "default"
-        served = (
-            plan.get("dataSource")
-            or (body.get("dataSource") if isinstance(body, dict) else None)
-            or "default"
+        served = plan.get("dataSource") or (
+            body.get("dataSource") if isinstance(body, dict) else None
         )
+        if not served:
+            # Cube names the data source on every plan; one that names none
+            # cannot be held to the configured one, and is not taken as it.
+            raise CubeRefusalError(
+                "refused: the Cube Core's plan names no data source, so dex "
+                "cannot hold it to semantic.cube.data_source"
+            )
         if served != configured:
             raise CubeRefusalError(
                 f"refused: the Cube Core planned this query on data source "

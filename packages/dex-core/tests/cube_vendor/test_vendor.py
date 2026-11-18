@@ -298,10 +298,13 @@ def test_a_load_whose_body_outlasts_the_deadline_is_stopped(monkeypatch):
     )
     monkeypatch.setenv("CUBEJS_API_SECRET", "s")
 
+    pulled = []
+
     def stream(seconds_per_chunk):
         class Body(httpx.SyncByteStream):
             def __iter__(self):
                 for piece in (b'{"data": [', b'{"a": "1"}', b"]}"):
+                    pulled.append(piece)
                     clock["now"] += seconds_per_chunk
                     yield piece
 
@@ -313,11 +316,17 @@ def test_a_load_whose_body_outlasts_the_deadline_is_stopped(monkeypatch):
 
         return httpx.Client(transport=httpx.MockTransport(handler))
 
-    slow = CubeTransport(None, execution="vendor", client=client(40.0))
+    # 50 seconds a chunk: the second arrives at 100, past the 90-second
+    # deadline, and the read stops there without asking for the third. A
+    # read that stalls instead is bounded by its own timeout, which is never
+    # more than the time the deadline had left when the request started.
+    slow = CubeTransport(None, execution="vendor", client=client(50.0))
     with pytest.raises(CubeTransportError, match="still running the query"):
         slow.load({"measures": ["orders.count"]})
+    assert len(pulled) == 2
 
     clock["now"] = 0.0
+    pulled.clear()
     quick = CubeTransport(None, execution="vendor", client=client(1.0))
     assert quick.load({"measures": ["orders.count"]})["data"] == [{"a": "1"}]
 
@@ -357,7 +366,7 @@ def test_the_data_source_is_checked_even_when_the_tables_cannot_be(
 
 def test_an_empty_plan_is_disclosed_not_a_crash(shop, monkeypatch, capsys):
     cube = _server(monkeypatch, shop)
-    cube.render = lambda query: {"sql": {"sql": []}}
+    cube.render = lambda query: {"sql": {"sql": [], "dataSource": "default"}}
 
     envelope = _run(capsys, shop, *_argv("by_status"), "--api")
 
@@ -365,16 +374,38 @@ def test_an_empty_plan_is_disclosed_not_a_crash(shop, monkeypatch, capsys):
     assert any("its plan carried no SQL" in n for n in envelope["data"]["notes"])
 
 
+def test_a_plan_naming_no_data_source_is_refused(shop, monkeypatch, capsys):
+    cube = _server(monkeypatch, shop)
+    cube.render = lambda query: {"sql": {"sql": []}}
+
+    envelope = _run(capsys, shop, *_argv("by_status"), "--api")
+
+    assert envelope["status"] == "error"
+    assert "names no data source" in envelope["errors"][0]
+    assert not [c for c in cube.calls if c.url.path.endswith("/v1/load")]
+
+
 def test_an_unchecked_plan_is_said_on_that_result_only(shop, monkeypatch, capsys):
+    """One layer, two requests: a note the first earned is not on the second."""
+
+    from exmergo_dex_core.explore.semantic import SemanticQuery
+
     cube = _server(monkeypatch, shop)
     plan = _plan(cube, preAggregations=[{"preAggregationId": "orders.rollup"}])
     cube.render = lambda query: plan
-    first = _run(capsys, shop, *_argv("by_status"), "--api")
+    layer = resolve_semantic_layer(DexEngine.from_repo(shop), api=True)
+    spec = QUERIES["by_status"]
+    query = SemanticQuery(
+        metrics=spec["metrics"],
+        group_by=spec.get("group_by", []),
+        order_by=spec.get("order_by", []),
+    )
+    first = layer.query(query)
     cube.render = None
-    second = _run(capsys, shop, *_argv("by_status"), "--api")
+    second = layer.query(query)
 
-    assert any("pre-aggregation" in n for n in first["data"]["notes"])
-    assert not any("pre-aggregation" in n for n in second["data"]["notes"])
+    assert any("pre-aggregation" in n for n in first.notes)
+    assert not any("pre-aggregation" in n for n in second.notes)
 
 
 def test_continue_wait_is_polled_until_the_rows_arrive(shop, monkeypatch, capsys):
