@@ -584,8 +584,13 @@ it as `execution` (`dex` or `vendor`).
   single-aggregate measure is a measure and a metric named `view.measure`, and a
   joined field carries no `column` (its joined table's column reaches the PII
   gate). Joins and `rely.at_most_one_match` keys reach `--use-project`. `query`
-  and `values` refuse by name until #964; profile the relations the catalog names
-  instead.
+  and `values` run governed on the Databricks connector only (#1362): dex renders
+  `SELECT ... MEASURE(<measure>) ... FROM <deployed view> GROUP BY ALL`, finds the
+  deployed view by its file's stem, and executes it under the cost guard. Tokens
+  are `view.field` and `view.measure`; a grain suffix (`orders.order_date__month`)
+  buckets a field formatted `date` or `date_time`; `--where` is a Databricks
+  predicate over the view's fields. The deployed definition is not yet compared
+  with the file (#1363).
 - `semantic.vendor: snowflake` reads the Snowflake Semantic View YAML files
   named in `semantic.snowflake.files` statically (needs the `[semantic-views]`
   extra; no Snowflake connection, nothing deployed), each validated by Dex's own

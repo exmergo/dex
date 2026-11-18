@@ -33,7 +33,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from ..errors import DexError
+from ..semantic_deployment import LocateRefused, ObjectKind
+from ..semantic_deployment import locate as _locate
 from .model import LogicalTable, Member, SemanticView
 
 __all__ = [
@@ -59,10 +60,6 @@ SCOPE_BASE_TABLES = (
 FULL = "full"
 LIMITED = "limited"
 REFUSED = "refused"
-
-
-class LocateRefused(DexError):  # noqa: N818  (a refusal, not an error)
-    """The view cannot be located on the account, said by name."""
 
 
 @dataclass(frozen=True)
@@ -133,6 +130,19 @@ class DeployedRead:
 # --- locating ---------------------------------------------------------------------
 
 
+#: How a Semantic View is named in a locate refusal (#964 lifted the rest).
+_SEMANTIC_VIEW = ObjectKind(
+    noun="semantic view",
+    scope="<database>.<schema>",
+    deploy=(
+        "deploy the reviewed file (after "
+        "`SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(..., TRUE)` verifies it) into a "
+        "schema the allowlist names, then query again"
+    ),
+    narrow=SCOPE_BASE_TABLES,
+)
+
+
 def locate(listed: Iterable[str], name: str) -> str:
     """The one allowlisted ``DB.SCHEMA.NAME`` deployed as ``name``.
 
@@ -140,25 +150,7 @@ def locate(listed: Iterable[str], name: str) -> str:
     them. Matched ignoring case, since an unquoted name is stored upper-cased.
     """
 
-    matches = sorted(
-        {fq for fq in listed if fq.rsplit(".", 1)[-1].lower() == name.lower()}
-    )
-    if not matches:
-        raise LocateRefused(
-            f"refused: semantic view '{name}' is defined only in the repository: no "
-            "schema in the source allowlist holds a semantic view of that name. "
-            "dex never deploys one; deploy the reviewed file (after "
-            "`SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(..., TRUE)` verifies it) into a "
-            "schema the allowlist names, then query again"
-        )
-    if len(matches) > 1:
-        raise LocateRefused(
-            f"refused: semantic view '{name}' is deployed in more than one "
-            f"allowlisted schema ({', '.join(matches)}), so dex cannot tell which "
-            "one the repository's file describes. Narrow the command with "
-            f"`--scope <database>.<schema>`{SCOPE_BASE_TABLES}"
-        )
-    return matches[0]
+    return _locate(listed, name, _SEMANTIC_VIEW)
 
 
 def read_deployed(

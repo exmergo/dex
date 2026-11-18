@@ -22,6 +22,7 @@ cannot be parsed, and the caller decides what that means.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import sqlglot
@@ -36,6 +37,7 @@ __all__ = [
     "SourceRelation",
     "aggregate",
     "column_refs",
+    "filter_predicate",
     "is_query",
     "join_pairs",
     "measure_refs",
@@ -44,6 +46,8 @@ __all__ = [
     "query_columns",
     "ratio_sides",
     "source_relation",
+    "source_tables",
+    "value_reads",
 ]
 
 DIALECT = "databricks"
@@ -500,3 +504,198 @@ def over_own_columns(sql: str, owners: tuple[tuple[str, ...], ...]) -> str | Non
         return node
 
     return tree.transform(strip).sql(dialect=DIALECT)
+
+
+# --- a governed query (#1362) ------------------------------------------------------
+
+#: The functions that return one of their input values (or a list or a sample of
+#: them) rather than a number computed from them, as sqlglot names each in the
+#: Databricks dialect: ``collect_list`` reads as ``array_agg``, ``max_by`` as
+#: ``arg_max``, ``percentile_approx`` as ``approx_quantile``, ``string_agg`` and
+#: ``listagg`` as ``group_concat``. A measure built on one returns a column's
+#: values as surely as grouping by the column, so the PII gate screens what it
+#: reads.
+VALUE_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "min",
+        "max",
+        "median",
+        "mode",
+        "any_value",
+        "anyvalue",
+        "first",
+        "last",
+        "first_value",
+        "firstvalue",
+        "last_value",
+        "lastvalue",
+        "array_agg",
+        "arrayagg",
+        "collect_list",
+        "collect_set",
+        "array_unique_agg",
+        "arrayuniqueagg",
+        "array_union_agg",
+        "arrayunionagg",
+        "arg_max",
+        "argmax",
+        "arg_min",
+        "argmin",
+        "max_by",
+        "min_by",
+        "quantile",
+        "percentile",
+        "percentile_cont",
+        "percentilecont",
+        "percentile_disc",
+        "percentiledisc",
+        "approx_quantile",
+        "approxquantile",
+        "percentile_approx",
+        "approx_percentile",
+        "approx_top_k",
+        "approxtopk",
+        "group_concat",
+        "groupconcat",
+        "string_agg",
+        "listagg",
+        "histogram_numeric",
+    }
+)
+
+
+def value_reads(sql: str) -> list[ColumnRef] | None:
+    """The columns ``sql`` reads inside a function that returns one of its input
+    values (:data:`VALUE_FUNCTIONS`), or ``None`` where it does not parse.
+
+    A ``MEASURE()`` call inside one reads another measure, which the caller walks
+    on its own; its argument is not a column.
+    """
+
+    tree = _parse(sql)
+    if tree is None:
+        return None
+    found: list[ColumnRef] = []
+    for node in tree.walk():
+        if not isinstance(node, exp.Func) or _is_measure_call(node):
+            continue
+        names = {(node.sql_name() or "").lower(), type(node).__name__.lower()}
+        if isinstance(node, exp.Anonymous):
+            # A function sqlglot has no node for keeps its own name.
+            names.add(str(node.name or "").lower())
+        if not names & VALUE_FUNCTIONS:
+            continue
+        refs = column_refs(node.sql(dialect=DIALECT))
+        if refs is None:
+            return None
+        found.extend(refs)
+    return list(dict.fromkeys(found))
+
+
+#: What a ``--where`` predicate may not hold: a query, an aggregate (a measure's
+#: work), a window, a placeholder or parameter bound after the gate, or a star.
+_FILTER_FORBIDDEN = (
+    exp.Select,
+    exp.Subquery,
+    exp.AggFunc,
+    exp.Window,
+    exp.Placeholder,
+    exp.Parameter,
+    exp.Star,
+)
+
+
+def filter_predicate(clause: str, resolve: Callable[[list[str]], str]) -> str | None:
+    """A ``--where`` clause re-rendered over the view's field names, or ``None``
+    where it cannot be read: it does not parse, is not a predicate, reads no
+    column, or holds what :data:`_FILTER_FORBIDDEN` lists.
+
+    ``resolve`` takes each column's parts as written (``["status"]``, or
+    ``["orders", "status"]`` with the view in front) and returns the field's
+    name; it raises to refuse a name a filter may not read. Each field is
+    rendered quoted, so a name the dialect reserves still reads as the field.
+    A ``MEASURE()`` call is the caller's to refuse by name before this runs.
+    """
+
+    if not clause or "{" in clause or "}" in clause or ";" in clause:
+        return None
+    tree = _parse(clause)
+    if tree is None or isinstance(tree, exp.Query | exp.Command):
+        return None
+    if tree.find(*_FILTER_FORBIDDEN) is not None:
+        return None
+    if any(isinstance(node, exp.Dot) for node in tree.walk()):
+        return None
+    columns = list(tree.find_all(exp.Column))
+    if not columns:
+        return None
+    for column in columns:
+        parts = [p for p in (column.catalog, column.db, column.table) if p]
+        if len(parts) > 1:
+            return None
+        name = resolve([*parts, column.name])
+        column.replace(exp.column(exp.to_identifier(name, quoted=True)))
+    return tree.sql(dialect=DIALECT)
+
+
+def source_tables(source: str) -> list[str] | None:
+    """Every table a ``source`` reads, as written without backticks, or ``None``
+    where it cannot be read.
+
+    A table name is itself. A query is every table it names, a table in a
+    subquery or a join included, and a name a ``WITH`` in scope defines excluded:
+    what Databricks scans to answer the view, which is what a statement over it
+    is priced by. A one-part name is a CTE only where a ``WITH`` enclosing it
+    defines one of that name; a CTE in a subquery is not visible outside it, so
+    a table of the same name there is still read.
+    """
+
+    if _TABLE_NAME.match(source) and not _QUERY.match(source):
+        return [source.replace("`", "").strip()]
+    if not _QUERY.match(source):
+        return None
+    tree = _parse(source)
+    if tree is None:
+        return None
+    found: list[str] = []
+    for table in tree.find_all(exp.Table):
+        parts = [p for p in (table.catalog, table.db, table.name) if p]
+        if not parts or (len(parts) == 1 and _cte_in_scope(table, parts[0])):
+            continue
+        name = ".".join(parts)
+        if name not in found:
+            found.append(name)
+    return found or None
+
+
+def _cte_in_scope(table: exp.Table, name: str) -> bool:
+    """Whether a ``WITH`` lexically enclosing ``table`` defines ``name``.
+
+    Walked outward from the reference: a query's ``WITH`` is visible to the
+    query's body and every subquery in it, and within one ``WITH`` a CTE sees
+    those listed before it (and itself, where the ``WITH`` is recursive).
+    """
+
+    lowered = name.lower()
+    child: exp.Expression = table
+    node = table.parent
+    while node is not None:
+        if isinstance(node, exp.With):
+            ctes = list(node.expressions)
+            index = next((i for i, c in enumerate(ctes) if c is child), len(ctes))
+            visible = ctes[: index + 1] if node.args.get("recursive") else ctes[:index]
+            if any(cte.alias_or_name.lower() == lowered for cte in visible):
+                return True
+        else:
+            for value in node.args.values():
+                if (
+                    isinstance(value, exp.With)
+                    and value is not child
+                    and any(
+                        cte.alias_or_name.lower() == lowered
+                        for cte in value.expressions
+                    )
+                ):
+                    return True
+        child, node = node, node.parent
+    return False

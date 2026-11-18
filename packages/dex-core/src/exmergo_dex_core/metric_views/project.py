@@ -128,6 +128,12 @@ class MetricViewSemanticLayer:
 
         return self._load()
 
+    def resolution(self) -> Resolution:
+        """This command's one resolution of the validated files: relations,
+        columns and join pairs, as the catalog computed them."""
+
+        return self._resolution()
+
     # --- the declaration channel ----------------------------------------------
 
     def declared_definitions(self) -> ProjectDefinitions:
