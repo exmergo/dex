@@ -317,7 +317,11 @@ class CubeTransport:
                 if timeout <= 0:
                     break
             try:
-                response = self._send(httpx, method, url, token, kwargs, timeout)
+                response = self._send(
+                    httpx, method, url, token, kwargs, timeout, deadline
+                )
+            except _DeadlineExceededError:
+                break
             except httpx.HTTPError as exc:
                 raise CubeTransportError(
                     f"could not reach the Cube server at {self.base_url}: "
@@ -374,15 +378,23 @@ class CubeTransport:
         token: str,
         kwargs: dict,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> Any:
         headers = {"Authorization": token, "Content-Type": "application/json"}
+        if deadline is None:
+            if self._client is not None:
+                return self._client.request(method, url, headers=headers, **kwargs)
+            with httpx.Client(timeout=self._timeout, follow_redirects=False) as client:
+                return client.request(method, url, headers=headers, **kwargs)
+        # A load is read as a stream and held to its deadline chunk by chunk:
+        # HTTPX's timeout bounds the wait for each chunk, not the whole body, so
+        # a server that keeps dripping bytes would otherwise run past it.
         if self._client is not None:
-            if timeout is not None:
-                kwargs = {**kwargs, "timeout": timeout}
-            return self._client.request(method, url, headers=headers, **kwargs)
-        limit = self._timeout if timeout is None else timeout
-        with httpx.Client(timeout=limit, follow_redirects=False) as client:
-            return client.request(method, url, headers=headers, **kwargs)
+            return _read_by(
+                self._client, method, url, headers, kwargs, timeout, deadline
+            )
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            return _read_by(client, method, url, headers, kwargs, timeout, deadline)
 
     @staticmethod
     def _scrub(text: str, secret: str, token: str, *, values: bool = False) -> str:
@@ -399,3 +411,38 @@ class CubeTransport:
 
     def __repr__(self) -> str:  # never a credential, which is not held here
         return f"CubeTransport({self.base_url!r}, {self.execution!r})"
+
+
+class _DeadlineExceededError(Exception):
+    """A load's body was still arriving when its deadline passed."""
+
+
+class _Read:
+    """A response read whole under a deadline: its status and its JSON."""
+
+    def __init__(self, status_code: int, content: bytes) -> None:
+        self.status_code = status_code
+        self._content = content
+
+    def json(self) -> Any:
+        return json.loads(self._content)
+
+
+def _read_by(
+    client: Any,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    kwargs: dict,
+    timeout: float | None,
+    deadline: float,
+) -> _Read:
+    chunks: list[bytes] = []
+    with client.stream(
+        method, url, headers=headers, timeout=timeout, **kwargs
+    ) as response:
+        for chunk in response.iter_bytes():
+            if time.monotonic() > deadline:
+                raise _DeadlineExceededError
+            chunks.append(chunk)
+        return _Read(response.status_code, b"".join(chunks))

@@ -287,6 +287,41 @@ def test_a_quoted_value_spanning_lines_is_masked(shop, monkeypatch, capsys):
     assert "second line" not in dumped
 
 
+def test_a_load_whose_body_outlasts_the_deadline_is_stopped(monkeypatch):
+    """HTTPX bounds the wait for each chunk, not the whole body: a server that
+    keeps dripping bytes is stopped at the deadline, while a body that arrives
+    in time is kept."""
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        "exmergo_dex_core.cube.transport.time.monotonic", lambda: clock["now"]
+    )
+    monkeypatch.setenv("CUBEJS_API_SECRET", "s")
+
+    def stream(seconds_per_chunk):
+        class Body(httpx.SyncByteStream):
+            def __iter__(self):
+                for piece in (b'{"data": [', b'{"a": "1"}', b"]}"):
+                    clock["now"] += seconds_per_chunk
+                    yield piece
+
+        return Body()
+
+    def client(seconds_per_chunk):
+        def handler(request):
+            return httpx.Response(200, stream=stream(seconds_per_chunk))
+
+        return httpx.Client(transport=httpx.MockTransport(handler))
+
+    slow = CubeTransport(None, execution="vendor", client=client(40.0))
+    with pytest.raises(CubeTransportError, match="still running the query"):
+        slow.load({"measures": ["orders.count"]})
+
+    clock["now"] = 0.0
+    quick = CubeTransport(None, execution="vendor", client=client(1.0))
+    assert quick.load({"measures": ["orders.count"]})["data"] == [{"a": "1"}]
+
+
 def _plan(cube, **changes):
     plan = json.loads(json.dumps(cube.recordings["by_status"]["response"]))
     plan["sql"].update(changes)
