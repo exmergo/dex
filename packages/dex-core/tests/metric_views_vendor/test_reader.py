@@ -150,6 +150,79 @@ class TestMetricViewSemanticSource(
         return source(self.root, orders=ORDERS), "orders", dimensions, measures
 
 
+class TestWorkspaceMetricViewSource(SemanticSourceFactoryContract):
+    """Under `semantic.deployment: databricks_workspace` (#1364) the files are
+    optional: a source with none builds, reads nothing, and says why."""
+
+    @pytest.fixture(autouse=True)
+    def _root(self, tmp_path: Path) -> None:
+        self.root = tmp_path
+
+    def build_source(self, context: SemanticSourceContext):
+        return MetricViewSemanticLayer.from_context(context)
+
+    def empty_source_context(self) -> SemanticSourceContext:
+        """No file at all: the catalog is Unity Catalog's."""
+        return SemanticSourceContext(
+            repo_root=str(self.root),
+            connector="databricks",
+            options={"files": []},
+            deployment="databricks_workspace",
+        )
+
+    def absent_document_context(self) -> SemanticSourceContext:
+        return self.empty_source_context()
+
+    def test_with_no_file_every_channel_says_why(self) -> None:
+        built = self.build_source(self.empty_source_context())
+
+        for notes in (
+            built.semantic_catalog().notes,
+            built.declared_definitions().notes,
+            built.semantic_layer().notes,
+        ):
+            assert any("databricks_workspace" in note for note in notes)
+
+    def test_local_still_refuses_no_file(self) -> None:
+        context = SemanticSourceContext(
+            repo_root=str(self.root), connector="databricks", options={"files": []}
+        )
+        with pytest.raises(Exception, match=r"semantic\.databricks\.files"):
+            self.build_source(context)
+
+
+class TestWorkspaceMetricViewBackend(SemanticBackendContract):
+    """The `databricks_workspace` layer, held to the backend contract over a
+    seeded Unity Catalog read (no engine, no connection)."""
+
+    def make_backend(self):
+        import yaml
+
+        from exmergo_dex_core.explore.semantic.metric_views_workspace import (
+            WorkspaceMetricViewLayer,
+        )
+
+        return WorkspaceMetricViewLayer(
+            reader=(
+                lambda: ["shop.metrics.orders"],
+                lambda _fq: yaml.safe_dump(ORDERS, sort_keys=False),
+            )
+        )
+
+    def test_it_says_where_its_definitions_came_from(self) -> None:
+        payload = self.make_backend().list_definitions().to_data()
+
+        assert payload["source"] == "account"
+        assert payload["coverage"] == [
+            {"view": "orders", "deployed_as": "shop.metrics.orders", "coverage": "full"}
+        ]
+        assert (payload["deployment"], payload["execution"]) == (
+            "databricks_workspace",
+            "dex",
+        )
+        assert "orders.revenue" in {m["name"] for m in payload["metrics"]}
+
+
 class TestMetricViewBackend(SemanticBackendContract):
     """The `explore semantic` layer, held to the backend contract."""
 

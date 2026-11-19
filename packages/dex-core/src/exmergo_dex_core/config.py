@@ -641,11 +641,17 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # by default and per command by `--local` / `--api`. The files stay required
     # under both, since authoring and drift read them.
     "cube": ("local", "cube_cloud"),
-    # Databricks Unity Catalog Metric Views: the Metric View YAML bodies committed
-    # here, read statically. A governed query finds the view deployed from a file
-    # by its stem and runs on it (#1362); dex never writes a deployed view, and
-    # reading one back to hold it to the file is #1363.
-    "databricks": ("local",),
+    # Databricks Unity Catalog Metric Views. `local` is the Metric View YAML
+    # bodies committed here, read statically: a governed query finds the view
+    # deployed from a file by its stem (#1362), reads it back from Unity Catalog
+    # and holds it to the file before it runs (#1363), and `list --deployed`
+    # reads the deployed views on request. `databricks_workspace` (#1364) reads
+    # the catalog from Unity Catalog alone, every Metric View the source
+    # allowlist holds, with no file needed: the Databricks counterpart of
+    # `snowflake_account`, read by `explore` only. Dex still renders and executes
+    # the query, and every result says its definition was not checked against a
+    # file. dex never writes a deployed view.
+    "databricks": ("local", "databricks_workspace"),
     # Snowflake Semantic Views. `local` is the Semantic View YAML documents
     # committed here, read statically; a governed query reads back the view it
     # runs on and holds it to the file, and `list --deployed` reads the views
@@ -663,7 +669,7 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
 #: when configured, keep serving `maintain`, `transform`, `--use-project` and
 #: `--local`, as a local dbt project does beside `dbt_cloud`.
 SEMANTIC_DEPLOYMENTS_READING_NO_FILES: frozenset[tuple[str, str]] = frozenset(
-    {("snowflake", "snowflake_account")}
+    {("snowflake", "snowflake_account"), ("databricks", "databricks_workspace")}
 )
 
 #: The factory that builds a vendor's own semantic source, for the vendors whose
@@ -714,6 +720,7 @@ _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "cloud": "dbt_cloud",
     "snowflake_account": "snowflake_account",
     "cube_cloud": "cube_cloud",
+    "databricks_workspace": "databricks_workspace",
 }
 
 
@@ -1169,7 +1176,10 @@ class SemanticConfig(BaseModel):
     transformation tiers, and Cube is the repository's one semantic layer.
 
     ``databricks.files`` is the Metric View equivalent (see
-    :class:`DatabricksSemanticConfig`), on the same terms.
+    :class:`DatabricksSemanticConfig`), on the same terms. Databricks has a
+    second deployment, ``databricks_workspace`` (#1364), on the terms of
+    Snowflake's ``snowflake_account`` below: the catalog is the Metric Views the
+    source allowlist holds in Unity Catalog, and ``files`` is optional.
 
     ``snowflake.files`` is the Semantic View equivalent. Snowflake has a second
     deployment, ``snowflake_account`` (#1357): ``explore semantic`` reads the

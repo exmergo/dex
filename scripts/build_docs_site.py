@@ -274,9 +274,9 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         "semantic-layers/databricks-metric-views",
         PageMeta(
             "Databricks Metric View compatibility",
-            "How dex reads and validates Databricks Metric View YAML with no "
-            "workspace connection: the ported 1.1 rules, the catalog mapping and "
-            "what it declines to claim.",
+            "How dex reads Metric View YAML from the repository or Unity Catalog "
+            "alone, queries the deployed view with MEASURE(), and what it "
+            "declines to claim.",
             "Databricks Metric Views",
         ),
     ),

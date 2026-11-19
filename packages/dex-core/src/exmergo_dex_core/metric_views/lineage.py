@@ -36,6 +36,7 @@ __all__ = [
     "ColumnRef",
     "SourceRelation",
     "aggregate",
+    "canonical",
     "column_refs",
     "filter_predicate",
     "is_query",
@@ -98,6 +99,22 @@ def _parse(sql: str) -> exp.Expression | None:
         return sqlglot.parse_one(sql, read=DIALECT)
     except (ParseError, TokenError, ValueError):
         return None
+
+
+def canonical(sql: str | None) -> str | None:
+    """An expression as parsed Databricks SQL with unquoted identifiers folded,
+    or its whitespace-collapsed, lower-cased text where it does not parse: the
+    form two spellings of one expression share, so whitespace, keyword case and
+    an unquoted name's case are never a difference (#1363)."""
+
+    if sql is None:
+        return None
+    from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+
+    tree = _parse(sql)
+    if tree is None:
+        return " ".join(sql.split()).lower()
+    return normalize_identifiers(tree, dialect=DIALECT).sql(dialect=DIALECT)
 
 
 def _parts(node: exp.Expression) -> list[str] | None:
