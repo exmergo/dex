@@ -293,7 +293,7 @@ def discover_projects(repo_root: Path | str = ".") -> list[Path]:
         # reached through one is invisible to the walk above, while the scan
         # before this one listed directory entries directly and found it.
         # Check each eligible symlink's own marker here, without following
-        # the link into its subtree.
+    # the link into its subtree.
         for name in dirnames:
             link = Path(dirpath) / name
             if link.is_symlink() and link.is_dir() and (link / PROJECT_FILE).is_file():
