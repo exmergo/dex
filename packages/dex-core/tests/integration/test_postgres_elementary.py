@@ -247,3 +247,47 @@ def test_the_per_test_sampling_switch_is_ignored_before_0_20(
     assert "ERROR=2" in log, f"both tests are meant to fail:\n{log}"
     was, now = change[(target.elementary_schema, "test_result_rows", "BASE TABLE")]
     assert now - was == sampled
+
+
+def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    target: PostgresTarget,
+):
+    """At 0.16.4 variant a, declaring a model with a single-column grain warns that
+    Elementary ignores disable_test_samples; at 0.26.1 and on variant b, none (#1381).
+    """
+
+    # Variant a at 0.16.4: Elementary's materialization runs tests and ignores flag
+    project_016 = elementary_project(
+        tmp_path / "a_016", "a", elementary_installs("0.16.4"), postgres=target
+    )
+    _dbt(project_016, "build")
+    engine_016 = _engine(project_016)
+    result_016 = engine_016.declare(
+        ["stg_orders"], declarations=[{"model": "stg_orders", "grain": ["id"]}]
+    )
+    assert any("ignores disable_test_samples" in w for w in result_016.warnings)
+    assert any("0.16.4" in w for w in result_016.warnings)
+
+    # Variant a at 0.26.1: Elementary honors disable_test_samples, so no warning
+    project_026 = elementary_project(
+        tmp_path / "a_026", "a", elementary_installs(CURRENT_VERSION), postgres=target
+    )
+    _dbt(project_026, "build")
+    engine_026 = _engine(project_026)
+    result_026 = engine_026.declare(
+        ["stg_orders"], declarations=[{"model": "stg_orders", "grain": ["id"]}]
+    )
+    assert not any("disable_test_samples" in w for w in result_026.warnings)
+
+    # Variant b at 0.16.4: dbt's materialization runs tests, so no warning
+    project_b = elementary_project(
+        tmp_path / "b_016", "b", elementary_installs("0.16.4"), postgres=target
+    )
+    _dbt(project_b, "build")
+    engine_b = _engine(project_b)
+    result_b = engine_b.declare(
+        ["stg_orders"], declarations=[{"model": "stg_orders", "grain": ["id"]}]
+    )
+    assert not any("disable_test_samples" in w for w in result_b.warnings)

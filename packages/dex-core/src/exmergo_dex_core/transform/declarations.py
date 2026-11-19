@@ -34,6 +34,8 @@ Three rules hold throughout:
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
@@ -269,6 +271,259 @@ def _version_sql_path(
     return item.file
 
 
+_SEMVER_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?"
+    r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?"
+    r"(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def _is_below_0_20(release: str | None) -> bool | None:
+    """Whether Elementary release ``release`` is strictly below 0.20.0.
+
+    Returns ``None`` when ``release`` is absent or cannot be parsed as a
+    supported version format.
+    """
+    if not release:
+        return None
+    match = _SEMVER_RE.match(release.strip())
+    if not match:
+        return None
+    major = int(match.group("major"))
+    minor = int(match.group("minor"))
+    patch = int(match.group("patch") or 0)
+    prerelease = match.group("prerelease") is not None
+
+    triplet = (major, minor, patch)
+    return triplet < (0, 20, 0) or (triplet == (0, 20, 0) and prerelease)
+
+
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
+_SQL_LINE_COMMENT = re.compile(r"-{2}.*$", re.MULTILINE)
+_SQL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_MATERIALIZATION_RE = re.compile(
+    r"\{%[-+]?\s*materialization\s+([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*[-+]?%\}"
+    r"(.*?)"
+    r"\{%[-+]?\s*endmaterialization\s*[-+]?%\}",
+    re.DOTALL,
+)
+_MACRO_RE = re.compile(
+    r"\{%[-+]?\s*macro\s+([a-zA-Z0-9_]+)\s*(?:\([^)]*\))?\s*[-+]?%\}"
+    r"(.*?)"
+    r"\{%[-+]?\s*endmacro\s*[-+]?%\}",
+    re.DOTALL,
+)
+
+
+def _proposed_macros(
+    view: DbtProjectView,
+    files: Mapping[str, str],
+    project_name: str,
+) -> dict[str, dict[str, Any]]:
+    """Root project macros and materializations parsed from proposed ``files``."""
+    from ..dbt_project import jinja_calls
+    from . import elementary
+
+    macros: dict[str, dict[str, Any]] = {}
+    for path, content in files.items():
+        if not path.endswith(".sql"):
+            continue
+        if not any(path.startswith(mp + "/") for mp in view.macro_paths):
+            continue
+        clean = _JINJA_COMMENT.sub("", content)
+        clean = _SQL_BLOCK_COMMENT.sub("", clean)
+        clean = _SQL_LINE_COMMENT.sub("", clean)
+
+        for match in _MATERIALIZATION_RE.finditer(clean):
+            mat_type, adapter, body = match.group(1), match.group(2), match.group(3)
+            macro_name = f"materialization_{mat_type}_{adapter}"
+            uid = f"macro.{project_name}.{macro_name}"
+            deps: list[str] = []
+            for call in jinja_calls(body):
+                callee = call.callee
+                if callee.startswith(f"{elementary.PACKAGE}."):
+                    suffix = callee[len(elementary.PACKAGE) + 1 :]
+                    deps.append(f"macro.{elementary.PACKAGE}.{suffix}")
+                elif "." not in callee and callee not in (
+                    "return",
+                    "config",
+                    "adapter",
+                ):
+                    deps.append(f"macro.{project_name}.{callee}")
+            macros[uid] = {
+                "unique_id": uid,
+                "name": macro_name,
+                "package_name": project_name,
+                "depends_on": {"macros": deps},
+            }
+
+        for match in _MACRO_RE.finditer(clean):
+            name, body = match.group(1), match.group(2)
+            uid = f"macro.{project_name}.{name}"
+            deps = []
+            for call in jinja_calls(body):
+                callee = call.callee
+                if callee.startswith(f"{elementary.PACKAGE}."):
+                    suffix = callee[len(elementary.PACKAGE) + 1 :]
+                    deps.append(f"macro.{elementary.PACKAGE}.{suffix}")
+                elif "." not in callee and callee not in (
+                    "return",
+                    "config",
+                    "adapter",
+                ):
+                    deps.append(f"macro.{project_name}.{callee}")
+            macros[uid] = {
+                "unique_id": uid,
+                "name": name,
+                "package_name": project_name,
+                "depends_on": {"macros": deps},
+            }
+    return macros
+
+
+def _elementary_sampling_warning(
+    view: DbtProjectView,
+    files: Mapping[str, str],
+) -> str | None:
+    """A warning if Elementary's test materialization runs and ignores sampling.
+
+    ``None`` when Elementary is not installed, when dbt's materialization is
+    confirmed, or when the installed package is 0.20.0 or later.
+    """
+    from . import elementary
+    from .package_overrides import _installed
+
+    root = Path(view.root)
+    installed_packages: set[str] = set()
+    release: str | None = None
+    with contextlib.suppress(Exception):
+        for name, directory, _ in _installed(root):
+            installed_packages.add(name)
+            if name == elementary.PACKAGE:
+                own_yml = directory / "dbt_project.yml"
+                if own_yml.is_file():
+                    with contextlib.suppress(Exception):
+                        own = yaml.safe_load(own_yml.read_text(encoding="utf-8"))
+                        if isinstance(own, dict) and own.get("version") is not None:
+                            release = str(own["version"])
+
+    project_yml_text = files.get("dbt_project.yml")
+    if project_yml_text is None:
+        with contextlib.suppress(Exception):
+            project_yml_text = (root / "dbt_project.yml").read_text(encoding="utf-8")
+
+    project_name = view.project_name
+    if not project_name:
+        with contextlib.suppress(Exception):
+            cfg = yaml.safe_load(project_yml_text or "")
+            if isinstance(cfg, dict) and cfg.get("name"):
+                project_name = str(cfg["name"])
+    if not project_name:
+        project_name = "root"
+
+    proposed = _proposed_macros(view, files, project_name)
+
+    manifest = view.manifest
+    if manifest is None:
+        from ..dbt_project import manifest_file
+
+        with contextlib.suppress(Exception):
+            compiled = manifest_file(view.root)
+            if compiled.is_file():
+                manifest = json.loads(compiled.read_text(encoding="utf-8"))
+
+    materialization = None
+    if manifest and isinstance(manifest, Mapping):
+        with contextlib.suppress(Exception):
+            manifest_to_resolve = manifest
+            if proposed:
+                manifest_to_resolve = dict(manifest)
+                macros_dict = dict(manifest_to_resolve.get("macros") or {})
+                macros_dict.update(proposed)
+                manifest_to_resolve["macros"] = macros_dict
+            runtime = elementary.resolve(
+                manifest_to_resolve,
+                project_yml_text,
+                release=release,
+                installed_packages=installed_packages or None,
+            )
+            if runtime.installed:
+                materialization = runtime.materialization
+                if runtime.release:
+                    release = runtime.release
+
+    if materialization is None:
+        if elementary.PACKAGE not in installed_packages:
+            return None
+        project = elementary._project_config(project_yml_text)
+        models_cfg = project.get("models")
+        enabled = True
+        if isinstance(models_cfg, Mapping):
+            elem_cfg = models_cfg.get(elementary.PACKAGE)
+            if isinstance(elem_cfg, Mapping):
+                val = elem_cfg.get("+enabled", elem_cfg.get("enabled", True))
+                if val is False:
+                    enabled = False
+        if not enabled:
+            return None
+
+        elem_mat = f"macro.{elementary.PACKAGE}.materialization_test_default"
+        synthetic_manifest = {
+            "metadata": {"adapter_type": "default", "project_name": project_name},
+            "nodes": {
+                f"model.{elementary.PACKAGE}.dummy": {
+                    "unique_id": f"model.{elementary.PACKAGE}.dummy",
+                    "package_name": elementary.PACKAGE,
+                    "resource_type": "model",
+                }
+            },
+            "disabled": {},
+            "macros": {
+                "macro.dbt.materialization_test_default": {
+                    "unique_id": "macro.dbt.materialization_test_default",
+                    "name": "materialization_test_default",
+                    "package_name": "dbt",
+                },
+                elem_mat: {
+                    "unique_id": elem_mat,
+                    "name": "materialization_test_default",
+                    "package_name": elementary.PACKAGE,
+                    "depends_on": {
+                        "macros": [f"macro.{elementary.PACKAGE}.materialize_test"]
+                    },
+                },
+                **proposed,
+            },
+        }
+        with contextlib.suppress(Exception):
+            runtime = elementary.resolve(
+                synthetic_manifest,
+                project_yml_text,
+                release=release,
+                installed_packages=installed_packages,
+            )
+            if runtime.installed:
+                materialization = runtime.materialization
+
+    if materialization != "elementary":
+        return None
+
+    below = _is_below_0_20(release)
+    if below is True and release is not None:
+        return (
+            f"installed Elementary release {release} ignores "
+            "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+            "set test_sample_row_count: 0 for the project"
+        )
+    if below is None:
+        return (
+            "could not tell the installed Elementary release; releases below 0.20.0 "
+            "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
+            "set test_sample_row_count: 0 for the project"
+        )
+    return None
+
+
 # --- the whole pass -------------------------------------------------------------
 
 
@@ -305,6 +560,7 @@ def apply_declarations(
             _check(declaration, files, view, cache=cache, pii_overrides=pii_overrides)
         )
 
+    flagged_tests: list[bool] = []
     rendered: dict[str, str] = {}
     for declaration in declarations:
         sql_path = model_sql_path(files, view.model_paths, declaration.model)
@@ -312,7 +568,12 @@ def apply_declarations(
         if path is None:
             path = _default_schema_path(sql_path or "", declaration.model)
         try:
-            files[path] = render(files.get(path), declaration, notes=warnings)
+            files[path] = render(
+                files.get(path),
+                declaration,
+                notes=warnings,
+                flagged_tests=flagged_tests,
+            )
         except RewriteError as exc:
             raise DeclarationError(
                 f"dex could not write the declaration of '{declaration.model}' into "
@@ -339,6 +600,12 @@ def apply_declarations(
             merged.append(
                 PlanEdit(path=path, kind=EditKind.SCHEMA_YML, new_content=content)
             )
+
+    if any(flagged_tests):
+        warn = _elementary_sampling_warning(view, files)
+        if warn is not None and warn not in warnings:
+            warnings.append(warn)
+
     return merged, warnings
 
 
@@ -983,7 +1250,11 @@ def _partial_intent(
 
 
 def render(
-    content: str | None, declaration: Declaration, *, notes: list[str] | None = None
+    content: str | None,
+    declaration: Declaration,
+    *,
+    notes: list[str] | None = None,
+    flagged_tests: list[bool] | None = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -997,7 +1268,14 @@ def render(
     model = declaration.model
     base, version = mv.split_label(model)
     if version is not None and content is not None:
-        return _render_version(content, declaration, base, version, notes)
+        return _render_version(
+            content,
+            declaration,
+            base,
+            version,
+            notes,
+            flagged_tests=flagged_tests,
+        )
     text = _with_entry(content, model)
     entry = lambda root: _model_entry(root, model)  # noqa: E731
     text = _restyle_flow_entry(text, entry)
@@ -1016,7 +1294,9 @@ def render(
         if column["dex"]:
             text = _set_dex(text, locate, column["dex"])
         if column["tests"]:
-            text = _add_tests(text, locate, column["tests"])
+            text, flagged = _add_tests(text, locate, column["tests"])
+            if flagged and flagged_tests is not None:
+                flagged_tests.append(True)
     return text
 
 
@@ -1026,6 +1306,7 @@ def _render_version(
     base: str,
     version: str,
     notes: list[str] | None,
+    flagged_tests: list[bool] | None = None,
 ) -> str:
     """Render a declaration into one item of ``base``'s ``versions:`` list.
 
@@ -1067,7 +1348,9 @@ def _render_version(
         if column["dex"]:
             text = _set_dex(text, locate, column["dex"])
         if column["tests"]:
-            text = _add_tests(text, locate, column["tests"])
+            text, flagged = _add_tests(text, locate, column["tests"])
+            if flagged and flagged_tests is not None:
+                flagged_tests.append(True)
     return text
 
 
@@ -1586,12 +1869,36 @@ def _merge_population(existing: Mapping[str, Any], merged: dict[str, Any]) -> di
     return merged
 
 
-def _add_tests(text: str, locate, specs: list[Any]) -> str:
+def _has_sampling_flag(spec: Any) -> bool:
+    if isinstance(spec, Mapping):
+        for body in spec.values():
+            if isinstance(body, Mapping):
+                cfg = body.get("config")
+                if isinstance(cfg, Mapping):
+                    meta = cfg.get("meta")
+                    if (
+                        isinstance(meta, Mapping)
+                        and meta.get("disable_test_samples") is True
+                    ):
+                        return True
+                meta = body.get("meta")
+                if (
+                    isinstance(meta, Mapping)
+                    and meta.get("disable_test_samples") is True
+                ):
+                    return True
+    return False
+
+
+def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     """Add the tests ``specs`` names to the located column, keeping its own.
 
     A test the column already lists, by name, is left exactly as the author wrote
     it. An existing list keeps its key (``tests`` or ``data_tests``); a column with
     no list takes the spelling the file already uses.
+
+    Returns the updated text and whether any test with ``disable_test_samples``
+    was newly inserted.
     """
 
     node = locate(_compose(text))
@@ -1601,23 +1908,29 @@ def _add_tests(text: str, locate, specs: list[Any]) -> str:
         if found is not None:
             break
     if found is None:
-        return _set_key(text, locate, prevailing_test_key(text), specs)
+        updated = _set_key(text, locate, prevailing_test_key(text), specs)
+        inserted_flagged = any(_has_sampling_flag(s) for s in specs)
+        return updated, inserted_flagged
 
     _key, listed = found
     present = {_test_name(item) for item in _sequence(listed)}
     todo = [spec for spec in specs if _spec_name(spec) not in present]
     if not todo:
-        return text
+        return text, False
     if not isinstance(listed, yaml.SequenceNode):
         raise RewriteError("a column's test list is not a list")
 
+    inserted_flagged = any(_has_sampling_flag(s) for s in todo)
     if listed.flow_style:
         end = listed.end_mark.index
         if text[end - 1] != "]":
             raise RewriteError("a column's test list is not closed")
         items = ", ".join(_flow(spec) for spec in todo)
         joiner = ", " if listed.value else ""
-        return splice(text, [(end - 1, end - 1, joiner + items)])
+        return (
+            splice(text, [(end - 1, end - 1, joiner + items)]),
+            inserted_flagged,
+        )
 
     first = listed.value[0]
     line_start = text.rfind("\n", 0, first.start_mark.index) + 1
@@ -1634,7 +1947,7 @@ def _add_tests(text: str, locate, specs: list[Any]) -> str:
     at = before_trailing_blanks(text, end)
     rendered = "".join(_render_item(spec, dash_indent) for spec in todo)
     prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"
-    return splice(text, [(at, at, prefix + rendered)])
+    return splice(text, [(at, at, prefix + rendered)]), inserted_flagged
 
 
 def _test_name(item: Any) -> str:
