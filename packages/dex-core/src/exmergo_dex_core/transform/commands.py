@@ -26,7 +26,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -524,13 +524,17 @@ def _skip_unchanged(
     from ..dbt_project import load as load_project
     from . import declarations as declarations_mod
 
+    view = load_project(engine.project_dir())
+    files = view.files
+    texts = {path: source.content for path, source in files.items()}
+    # The declarations resolver, so a version label (`dim_teams.v2`) keeps that
+    # version's file and not the bare name's.
     declared = {
-        name
+        path
         for d in declarations_mod.parse_declarations(declarations)
-        for name in (d.model, d.model.split(".")[0])
+        if (path := declarations_mod.model_sql_path(texts, view.model_paths, d.model))
     }
 
-    files = load_project(engine.project_dir()).files
     kept: list[PlanEdit] = []
     skipped: list[str] = []
     for edit in edits:
@@ -538,10 +542,7 @@ def _skip_unchanged(
             edit.op is EditOp.UPSERT
             and edit.path in files
             and files[edit.path].content == edit.new_content
-            and not (
-                edit.kind is EditKind.MODEL_SQL
-                and PurePosixPath(edit.path).stem in declared
-            )
+            and not (edit.kind is EditKind.MODEL_SQL and edit.path in declared)
         ):
             skipped.append(edit.path)
         else:

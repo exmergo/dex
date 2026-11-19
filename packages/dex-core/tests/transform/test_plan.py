@@ -513,6 +513,82 @@ def test_an_unchanged_model_resent_with_a_declaration_is_kept(
     )
 
 
+_VERSIONED_YML = """\
+version: 2
+models:
+  - name: dim_teams
+    latest_version: 1
+    columns:
+      - name: team_id
+      - name: team_label
+    versions:
+      - v: 1
+        defined_in: dim_teams
+      - v: 2
+"""
+_DIM_V1 = "select team_id, team_label from {{ ref('stg_teams') }}\n"
+_DIM_V2 = "select team_id, upper(team_label) as team_label from {{ ref('stg_teams') }}"
+
+
+def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`dim_teams.v2` is built from `dim_teams_v2.sql`: that file stays in the
+    plan, and the unchanged `dim_teams.sql` (version 1) is still skipped."""
+
+    marts = dbt_project_dir / "models" / "marts"
+    marts.mkdir()
+    (dbt_project_dir / "models" / "staging" / "stg_teams.sql").write_text(
+        "select 1 as team_id, 'a' as team_label\n", encoding="utf-8"
+    )
+    (marts / "dim_teams.sql").write_text(_DIM_V1, encoding="utf-8")
+    (marts / "dim_teams_v2.sql").write_text(_DIM_V2, encoding="utf-8")
+    (marts / "_marts.yml").write_text(_VERSIONED_YML, encoding="utf-8")
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/marts/dim_teams.sql",
+                        "kind": "model_sql",
+                        "content": _DIM_V1,
+                    },
+                    {
+                        "path": "models/marts/dim_teams_v2.sql",
+                        "kind": "model_sql",
+                        "content": _DIM_V2,
+                    },
+                ],
+                "declarations": [
+                    {"model": "dim_teams.v2", "description": "One row per team."}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare v2",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope["errors"]
+    paths = envelope["data"]["paths"]
+    assert "models/marts/dim_teams_v2.sql" in paths
+    assert "models/marts/dim_teams.sql" not in paths
+    assert (
+        "1 edit matches the tree and was skipped: models/marts/dim_teams.sql"
+        in envelope["warnings"]
+    )
+
+
 def test_an_edit_differing_only_in_line_endings_is_skipped(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
