@@ -543,3 +543,67 @@ def test_an_elementary_test_that_checked_nothing_asserts_no_model(
     assert assurance.asserted.names == ["fct"]
     assert not FCT_TESTS - ELEMENTARY_FCT_TESTS & set(listed)
     assert any("unchecked_tests" in line for line in result.warnings)
+
+
+# --- explore ranking leaves the package's tables out (#1311) ---------------------
+
+
+@requires_elementary
+@pytest.mark.parametrize("include", [True, False], ids=["included", "default"])
+def test_explore_map_on_the_fixture_ranks_no_elementary_table(
+    tmp_path: Path, installed_elementary: Path, include: bool
+):
+    """#1311's acceptance on the real package. Variant e builds the package's
+    models into ``main_elementary`` and a project model, ``elementary_runs``, that
+    reads one of them. With ``include_elementary`` the package's tables rank and
+    are profiled like any other, and crowd a project table out of the map (the
+    arm built to break it); by default none of them ranks, ``notes`` says so, and
+    every table the project owns, the one reading the package included, ranks."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    project = elementary_project(tmp_path, "e", installed_elementary)
+    _engine(project).build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+    built = duckdb_census(warehouse)
+    package_tables = {name for schema, name, _ in built if schema == ELEMENTARY_SCHEMA}
+    own_tables = {name for schema, name, _ in built if schema == "main"}
+    assert {"dbt_run_results", "elementary_test_results"} <= package_tables
+    assert {"raw_orders", "fct", "elementary_runs"} <= own_tables
+
+    explore_root = tmp_path / "explore"
+    explore_root.mkdir()
+    engine = DexEngine(
+        connector="duckdb",
+        path=str(warehouse),
+        config=DexConfig(connector="duckdb"),
+        store=FilesystemStore(explore_root),
+        repo_root=explore_root,
+    )
+    result = engine.map(include_elementary=include, full=True)
+
+    def schema_of(identifier: str) -> str:
+        return identifier.split(".")[-2]
+
+    described = {o.identifier for o in result.objects}
+    described_package = {i for i in described if schema_of(i) == ELEMENTARY_SCHEMA}
+    described_own = {i.split(".")[-1] for i in described if schema_of(i) == "main"}
+    if include:
+        # The package's thirty-odd tables fill the 25-object payload and push
+        # out a table the project owns: the defect #1311 removes.
+        assert described_package
+        assert own_tables - described_own
+        assert result.excluded.count == 0
+        return
+    assert described_own == own_tables
+    assert not described_package
+    assert all(schema_of(o.identifier) != ELEMENTARY_SCHEMA for o in result.top_objects)
+    assert result.excluded.reason == "elementary"
+    assert result.excluded.count == len(package_tables)
+    assert [g.namespace.split(".")[-1] for g in result.excluded.by_namespace] == [
+        ELEMENTARY_SCHEMA
+    ]
+    assert any("Elementary" in n and ELEMENTARY_SCHEMA in n for n in result.notes)
+    assert result.profiled_count == len(own_tables)
