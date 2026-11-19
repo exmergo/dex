@@ -1510,7 +1510,18 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
     merged = {**existing, **dex} if isinstance(existing, dict) else dict(dex)
     if isinstance(existing, dict):
         merged = _merge_population(existing, merged)
+    return _set_meta(text, locate, DEX_META_KEY, merged)
 
+
+def _set_meta(text: str, locate, key: str, value: Any) -> str:
+    """Write ``key: value`` under the located entry's ``config.meta``, creating
+    ``config`` and ``meta`` where they are missing and restyling either from
+    flow to block style. Every other key under ``config.meta`` is untouched, so
+    the ``dex`` namespace and a PII stamp (#1100) are written side by side."""
+
+    text = _restyle_flow_entry(text, locate)
+    root = _compose(text)
+    node = locate(root)
     config = _child(node, "config")
     if (
         config is not None
@@ -1526,7 +1537,7 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         node = locate(root)
         config = _child(node, "config")
     if config is None:
-        return _set_key(text, locate, "config", {"meta": {DEX_META_KEY: merged}})
+        return _set_key(text, locate, "config", {"meta": {key: value}})
 
     def config_node(r: Any) -> Any:
         found = _child(locate(r), "config")
@@ -1550,15 +1561,15 @@ def _set_dex(text: str, locate, dex: dict[str, Any]) -> str:
         # `config` is null or empty after the restyles (an only `meta: {}`
         # pair is dropped): writing it fresh keeps nothing that was there,
         # and `_set_key` could not write into a null anyway.
-        return _set_key(text, locate, "config", {"meta": {DEX_META_KEY: merged}})
+        return _set_key(text, locate, "config", {"meta": {key: value}})
     if meta is None:
-        return _set_key(text, config_node, "meta", {DEX_META_KEY: merged})
+        return _set_key(text, config_node, "meta", {key: value})
 
     def meta_node(r: Any) -> Any:
         found = _child(config_node(r), "meta")
         return found[1] if found else None
 
-    return _set_key(text, meta_node, DEX_META_KEY, merged)
+    return _set_key(text, meta_node, key, value)
 
 
 def _merge_population(existing: Mapping[str, Any], merged: dict[str, Any]) -> dict:

@@ -32,6 +32,7 @@ from ..cache import (
     KeyEvidence,
     PIICategory,
     PIIFlag,
+    ShapeRefinement,
     ValueCount,
     ValueDomain,
 )
@@ -252,6 +253,28 @@ _NONPERSON_NAME_QUALIFIERS = frozenset(
         "country",
         "region",
         "continent",
+        # Organizations (#647): a team, lab or university is named, but it is
+        # not a person. `developer`, `owner`, `author`, `vendor`, `provider`,
+        # `supplier`, `merchant` and `publisher` stay flagged, since each names
+        # an individual (a sole trader, a physician, a self-publisher) as often
+        # as an organization; such a column clears on value evidence (an
+        # organization suffix) or a reviewed pii_overrides entry, never on its
+        # name.
+        "team",
+        "org",
+        "organization",
+        "organisation",
+        "lab",
+        "manufacturer",
+        "retailer",
+        "store",
+        "league",
+        "agency",
+        "institution",
+        "university",
+        "school",
+        "bank",
+        "carrier",
     }
 )
 
@@ -311,6 +334,9 @@ _PERSON_FRACTION_ABSENT = 0.05
 _UPPER_VOCAB_FRACTION = 0.9
 _UPPER_VOCAB_MAX_DISTINCT = 32
 _LABEL_AVG_TOKENS = 3.5
+# An organization column (#647): person shape absent and most values ending in
+# a legal-entity or organization suffix ("Acme Inc", "Stability AI").
+_ORG_SUFFIX_FRACTION = 0.5
 
 # A closed enumeration: distinct count small in absolute terms AND as a
 # fraction of non-null rows, so a genuinely small table of distinct people
@@ -1674,7 +1700,11 @@ def _refine_confidence(
     missing evidence.
     """
 
-    if pii is None or aggregate is None:
+    if pii is None:
+        return pii
+    if aggregate is None:
+        if generic and pii.category is PIICategory.NAME:
+            return pii.model_copy(update={"refinement": ShapeRefinement.NO_EVIDENCE})
         return pii
     confidence = pii.confidence
     # A near-unique column strengthens identity-like categories (emails, ids).
@@ -1691,29 +1721,33 @@ def _refine_confidence(
         and pii.category in {PIICategory.LOCATION, PIICategory.ADDRESS}
     ):
         confidence = max(0.1, confidence - 0.3)
+    refinement = None
     if generic and pii.category is PIICategory.NAME:
-        confidence = _shape_verdict(confidence, aggregate, row_count)
-    return PIIFlag(category=pii.category, confidence=round(confidence, 4))
+        confidence, refinement = _shape_verdict(confidence, aggregate, row_count)
+    return PIIFlag(
+        category=pii.category, confidence=round(confidence, 4), refinement=refinement
+    )
 
 
 def _shape_verdict(
     confidence: float, aggregate: ColumnAggregate, row_count: int | None = None
-) -> float:
-    """Map value-shape evidence to a generic-name confidence.
+) -> tuple[float, ShapeRefinement]:
+    """Map value-shape evidence to a generic-name confidence and its verdict.
 
     Fail closed: whenever the evidence is missing or ambiguous the name-derived
     confidence stands unchanged, which keeps the column blocked. Only the
     provably non-person shapes de-rate, and a person-shaped distribution
-    corroborates up to the exact-token level.
+    corroborates up to the exact-token level. The verdict names the rule that
+    decided (#647), so a flag that held says why it held.
     """
 
     person = aggregate.person_shape_fraction
     if person is None:
-        return confidence
+        return confidence, ShapeRefinement.NO_EVIDENCE
     if person >= _PERSON_FRACTION_RAISE:
-        return _SHAPE_PERSON_CONFIDENCE
+        return _SHAPE_PERSON_CONFIDENCE, ShapeRefinement.PERSON_SHAPE
     if person > _PERSON_FRACTION_ABSENT:
-        return confidence
+        return confidence, ShapeRefinement.PARTIAL_PERSON_SHAPE
     upper = aggregate.upper_vocab_fraction
     if (
         upper is not None
@@ -1721,13 +1755,16 @@ def _shape_verdict(
         and aggregate.distinct_count is not None
         and aggregate.distinct_count <= _UPPER_VOCAB_MAX_DISTINCT
     ):
-        return _SHAPE_REFERENCE_CONFIDENCE
+        return _SHAPE_REFERENCE_CONFIDENCE, ShapeRefinement.REFERENCE_VOCABULARY
     tokens = aggregate.avg_token_count
     if tokens is not None and tokens >= _LABEL_AVG_TOKENS:
-        return _SHAPE_REFERENCE_CONFIDENCE
+        return _SHAPE_REFERENCE_CONFIDENCE, ShapeRefinement.LABEL_TEXT
     if _is_closed_enumeration(aggregate, row_count):
-        return _SHAPE_REFERENCE_CONFIDENCE
-    return confidence
+        return _SHAPE_REFERENCE_CONFIDENCE, ShapeRefinement.ENUMERATION
+    org = aggregate.org_suffix_fraction
+    if org is not None and org >= _ORG_SUFFIX_FRACTION:
+        return _SHAPE_REFERENCE_CONFIDENCE, ShapeRefinement.ORGANIZATION
+    return confidence, ShapeRefinement.UNSETTLED
 
 
 def _is_closed_enumeration(aggregate: ColumnAggregate, row_count: int | None) -> bool:

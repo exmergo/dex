@@ -452,6 +452,7 @@ def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
                 "su_1": 0.8,
                 "sp_1": 0.1,
                 "st_1": 2.5,
+                "so_1": 0.25,
             }
         ],
         seconds=0.5,
@@ -464,13 +465,14 @@ def test_shape_stats_ride_the_scan_pass(fake_pg_connection):
     sql = fake_pg_connection.data_statements[0].sql
     assert '("email"::text COLLATE "C") ~ \'' in sql
     assert '"email" ~' not in sql
-    for alias in ("su_1", "sp_1", "st_1"):
+    for alias in ("su_1", "sp_1", "st_1", "so_1"):
         assert f" AS {alias}" in sql
     assert assert_select_only(sql, dialect="postgres") == sql
     by_name = {a.name: a for a in aggregates}
     assert by_name["email"].upper_vocab_fraction == pytest.approx(0.8)
     assert by_name["email"].person_shape_fraction == pytest.approx(0.1)
     assert by_name["email"].avg_token_count == pytest.approx(2.5)
+    assert by_name["email"].org_suffix_fraction == pytest.approx(0.25)
     # id was not requested: its shape fields stay None.
     assert by_name["id"].upper_vocab_fraction is None
     assert by_name["id"].person_shape_fraction is None
