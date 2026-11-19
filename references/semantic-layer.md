@@ -960,7 +960,7 @@ semantic:
       - models/warehouse/customers.yaml
 ```
 
-The `[slayer]` extra pins one exact SLayer release (`motley-slayer==1.8.2`), and
+The `[slayer]` extra pins one exact SLayer release (`motley-slayer==1.8.4`), and
 selecting the vendor without it refuses by name with `reason: prerequisite`.
 
 ### What a model file is checked against
@@ -971,7 +971,7 @@ that, and before any of it reaches a catalog:
 
 - **the format version.** `SlayerModel` migrates an older `version` while parsing
   and reads a newer one best-effort. dex checks first and refuses anything but the
-  pinned release's current format (15 at 1.8.2), naming both numbers. A file with
+  pinned release's current format (15 at 1.8.4), naming both numbers. A file with
   no `version` is stale, because SLayer's storage reads it as version 1.
 - **the path.** A file has to sit where SLayer keeps it,
   `models/<data_source>/<name>.yaml`, with its `name` and `data_source` agreeing.
