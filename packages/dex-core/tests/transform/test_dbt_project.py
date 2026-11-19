@@ -18,6 +18,7 @@ from exmergo_dex_core.dbt_project import (
     EditOp,
     content_hash,
     definitions,
+    discover_projects,
     find_project,
     jinja_calls,
     jinja_regions,
@@ -89,6 +90,63 @@ def test_find_project_missing_is_an_error(tmp_path: Path):
     empty.mkdir()
     with pytest.raises(DbtProjectError):
         find_project(empty)
+
+
+def _write_project(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "dbt_project.yml").write_text(
+        "name: dex_test\nversion: '1.0'\nprofile: dex_test\n", encoding="utf-8"
+    )
+    return path
+
+
+def test_find_project_refuses_shallow_project_over_deeper_one(tmp_path: Path):
+    # Issue #589: an example project one level down used to win silently over
+    # the real project two levels down, because discovery never looked deeper.
+    _write_project(tmp_path / "examples")
+    _write_project(tmp_path / "transform" / "dbt")
+    with pytest.raises(DbtProjectError) as excinfo:
+        find_project(tmp_path)
+    message = str(excinfo.value)
+    assert "multiple dbt projects" in message
+    assert "examples" in message
+    assert "transform/dbt" in message
+    assert "dbt_project_dir" in message
+
+
+def test_find_project_finds_only_deep_project(tmp_path: Path):
+    deep = _write_project(tmp_path / "transform" / "dbt")
+    assert find_project(tmp_path) == deep
+
+
+def test_discover_projects_skips_tooling_directories(tmp_path: Path):
+    # Directories dbt and Python tooling create hold copies of other projects
+    # (dependency packages, build output, virtual environments); they are not
+    # projects of this repository.
+    for rel in ("dbt_packages/dep", "target", ".venv/v", "node_modules/pkg"):
+        _write_project(tmp_path / rel)
+    assert discover_projects(tmp_path) == []
+    with pytest.raises(DbtProjectError, match="no dbt project found"):
+        find_project(tmp_path)
+
+
+def test_discover_projects_does_not_descend_into_a_project(tmp_path: Path):
+    # A project owns its subtree: a project nested inside another one does not
+    # make the outer one ambiguous.
+    outer = _write_project(tmp_path / "examples")
+    _write_project(tmp_path / "examples" / "nested" / "demo")
+    assert discover_projects(tmp_path) == [outer]
+    assert find_project(tmp_path) == outer
+
+
+def test_discover_projects_is_bounded_in_depth(tmp_path: Path):
+    deep = _write_project(tmp_path / "a" / "b" / "c" / "d")
+    assert discover_projects(tmp_path) == [deep]
+    # A project five levels down is past the search bound, so on its own it is
+    # not discovered at all.
+    beyond = tmp_path / "beyond"
+    _write_project(beyond / "a" / "b" / "c" / "d" / "e")
+    assert discover_projects(beyond) == []
 
 
 def test_resolve_target_returns_only_name_and_type(dbt_project_dir: Path):
