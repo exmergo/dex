@@ -3066,6 +3066,22 @@ def map(
         relationship_set,
         observed_namespaces=observed_namespaces,
     )
+    # A package table a prior run cached outside this run's scope (an include
+    # run over a wider --scope) is carried forward below with the rank it had
+    # then; recognise it too, so it is left out like one this run listed. Only
+    # namespaces this run did not observe: an absent object in an observed one
+    # is gone, and `_compose_datasets` drops it.
+    if not include_elementary and reusable is not None:
+        listed = {m.identifier.lower() for m in metas}
+        out_of_scope_cached = [
+            d.identifier
+            for d in reusable.datasets
+            if d.identifier.lower() not in listed
+            and d.identifier.rpartition(".")[0].lower() not in observed_namespaces
+        ]
+        if out_of_scope_cached:
+            elementary = elementary_mod.recognise(metas, cached=out_of_scope_cached)
+            left_out = elementary.lowered
     # A join to a table ranking leaves out (one an earlier include run or a
     # hand-run profile cached) must not count toward connectivity: its degree
     # would set the scale every rankable object is normalised against.
@@ -3087,6 +3103,11 @@ def map(
         reusable,
         observed_namespaces=observed_namespaces,
     )
+    # A left-out table has no rank, including one carried forward from outside
+    # this run's scope with the rank an earlier include run gave it.
+    for ds in datasets:
+        if ds.identifier.lower() in left_out:
+            ds.rank_score = None
     failed_reasons = {
         ident: "warehouse_refused" if values_free else (err.detail or str(err))
         for ident, err in profile_errors

@@ -2406,7 +2406,9 @@ namespace, never the production one being explored. A recognised table is not
 scored, not profiled by `map` (`--full` included), and not described in
 `data.objects` or `data.top_objects`, even where an earlier `explore profile`
 cached it; `map` keeps it in the cache as an inventory entry with no
-`rank_score`. `data.excluded` names them: `count`, `reason` (`elementary`, or
+`rank_score`. A profile an earlier `--include-elementary` run cached outside this
+run's scope is carried forward as any out-of-scope profile is, recognised by the
+same signature, and left out the same way, its rank cleared. `data.excluded` names them: `count`, `reason` (`elementary`, or
 `null` when nothing was left out), `by_namespace`, and `objects` sorted by name,
 each list capped at 25 with the rest counted in `elided_namespaces` and
 `elided`. It is always present on `map` and on a ranked `inventory`, and apart

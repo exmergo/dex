@@ -599,9 +599,7 @@ def test_explore_map_on_the_fixture_ranks_no_elementary_table(
         return
     assert described_own == own_tables
     assert not described_package
-    assert not {o.identifier for o in result.top_objects} & {
-        i for i in described if schema_of(i) == ELEMENTARY_SCHEMA
-    }
+    assert all(schema_of(o.identifier) != ELEMENTARY_SCHEMA for o in result.top_objects)
     assert result.excluded.reason == "elementary"
     assert result.excluded.count == len(package_tables)
     assert [g.namespace.split(".")[-1] for g in result.excluded.by_namespace] == [

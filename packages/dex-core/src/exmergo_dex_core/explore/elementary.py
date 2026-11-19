@@ -120,14 +120,6 @@ MAX_OBJECTS = MAX_SKIPPED_OBJECTS
 MAX_NAMESPACES = MAX_SKIPPED_NAMESPACES
 
 
-def _namespace(meta: ObjectMeta) -> str:
-    """Everything before the identifier's last dot: the split ``data.skipped``
-    and the map's scope bookkeeping use, so two databases sharing a schema name
-    stay apart."""
-
-    return meta.identifier.rpartition(".")[0] or meta.identifier
-
-
 @dataclass(frozen=True)
 class ElementaryTables:
     """The objects recognised as Elementary's, and the namespaces holding them.
@@ -166,37 +158,56 @@ class ElementaryTables:
         )
 
 
-def recognise(metas: Iterable[ObjectMeta]) -> ElementaryTables:
+def recognise(
+    metas: Iterable[ObjectMeta], cached: Iterable[str] = ()
+) -> ElementaryTables:
     """The objects in ``metas`` that are Elementary's, by the table signature.
+
+    ``cached`` adds identifiers the warehouse listing did not return but the
+    exploration cache still holds, such as profiles ``explore map`` carries
+    forward from outside a narrower ``--scope``. They are read by the same rule,
+    their name being the identifier's last part, so a package table cached by an
+    earlier ``--include-elementary`` run is recognised however a later run is
+    scoped.
 
     Pure and free: names only, no connection, no column read.
     """
 
-    by_namespace: dict[str, list[ObjectMeta]] = {}
-    for meta in metas:
-        by_namespace.setdefault(_namespace(meta), []).append(meta)
+    members: list[tuple[str, str]] = [(m.identifier, m.name) for m in metas]
+    members += [(i, i.rpartition(".")[2]) for i in cached]
+    by_namespace: dict[str, list[tuple[str, str]]] = {}
+    for identifier, name in members:
+        namespace = identifier.rpartition(".")[0] or identifier
+        by_namespace.setdefault(namespace, []).append((identifier, name))
 
     identifiers: list[str] = []
     namespaces: dict[str, int] = {}
-    for namespace, members in by_namespace.items():
-        names = {m.name.lower() for m in members}
-        known = names & TABLE_NAMES
+    for namespace, group in by_namespace.items():
+        known = {name.lower() for _, name in group} & TABLE_NAMES
         if len(known) < MIN_SIGNATURE or not known & ANCHORS:
             continue
         matched = [
-            m.identifier
-            for m in members
-            if m.name.lower() in TABLE_NAMES or _TEMP_TABLE.search(m.name)
+            identifier
+            for identifier, name in group
+            if name.lower() in TABLE_NAMES or _TEMP_TABLE.search(name)
         ]
         identifiers.extend(matched)
         namespaces[namespace] = len(matched)
     return ElementaryTables(identifiers=tuple(identifiers), namespaces=namespaces)
 
 
+#: How many namespaces the note names before counting the rest, the same cap
+#: ``data.excluded.by_namespace`` keeps.
+MAX_NOTE_NAMESPACES = MAX_NAMESPACES
+
+
 def note(found: ElementaryTables, *, command: str) -> str:
     """The sentence ``notes`` carries when ranking left Elementary's tables out."""
 
-    where = ", ".join(sorted(found.namespaces))
+    names = sorted(found.namespaces)
+    where = ", ".join(names[:MAX_NOTE_NAMESPACES])
+    if len(names) > MAX_NOTE_NAMESPACES:
+        where += f", and {len(names) - MAX_NOTE_NAMESPACES} more namespace(s)"
     count = len(found.identifiers)
     return (
         f"left {count} table(s) of the Elementary dbt package out of the ranking "

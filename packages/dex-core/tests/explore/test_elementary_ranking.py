@@ -440,3 +440,46 @@ def test_joins_among_the_package_s_tables_do_not_weigh_on_the_project_s_rank(
         return {o["identifier"]: o["rank_score"] for o in data["objects"]}
 
     assert scores(after) == scores(fresh)
+
+
+def test_a_package_table_cached_outside_this_run_s_scope_stays_left_out(
+    elementary_warehouse: Path, tmp_path: Path, capsys
+):
+    """An include run caches the package's profiles with a rank. A later default
+    map over another warehouse (on DuckDB, another file: the same thing a
+    narrower `--scope` is on a metered connector) carries them forward from
+    outside its scope, and must leave them out as if it had listed them."""
+
+    duckdb = pytest.importorskip("duckdb")
+    other = tmp_path / "project.duckdb"
+    con = duckdb.connect(str(other))
+    con.execute("create table main.accounts as select i as id from range(30) t(i)")
+    con.close()
+    repo = tmp_path / "repo"
+    included = _map(elementary_warehouse, repo, capsys, "--include-elementary")
+    assert set(_ids(included["objects"])) >= _ELEMENTARY
+
+    scoped = _map(other, repo, capsys)
+
+    assert scoped["out_of_scope_carried_count"] >= len(_ELEMENTARY)
+    assert not set(_ids(scoped["objects"])) & _ELEMENTARY
+    assert not set(_ids(scoped["top_objects"])) & _ELEMENTARY
+    assert "project.main.accounts" in _ids(scoped["objects"])
+    assert set(scoped["excluded"]["objects"]) == _ELEMENTARY
+    assert scoped["excluded"]["count"] == len(_ELEMENTARY)
+    cache = json.loads((repo / ".dex" / "cache.json").read_text())
+    by_id = {d["identifier"]: d for d in cache["datasets"]}
+    # Kept, profiles and all, so `explore profile` and `explore query` still
+    # read them; only the rank is gone.
+    assert all(by_id[i]["columns"] for i in _ELEMENTARY)
+    assert all(by_id[i].get("rank_score") is None for i in _ELEMENTARY)
+
+
+def test_the_note_names_at_most_25_namespaces_and_counts_the_rest():
+    metas = _metas(*(f"ns{n:03d}.{name}" for n in range(30) for name in SIGNATURE))
+
+    note = elementary.note(elementary.recognise(metas), command="explore map")
+
+    assert "ns024" in note
+    assert "ns025" not in note
+    assert "and 5 more namespace(s)" in note
