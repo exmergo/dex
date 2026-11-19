@@ -3108,6 +3108,19 @@ def map(
     for ds in datasets:
         if ds.identifier.lower() in left_out:
             ds.rank_score = None
+    # `_compose_datasets` carries only profiled entries forward from outside the
+    # scope, so the package's inventory-only tables would leave the cache here,
+    # and the next out-of-scope run would hold too few names to recognise a
+    # profiled one beside them. Keep the recognised ones: they are the evidence.
+    if left_out and reusable is not None:
+        present = {ds.identifier.lower() for ds in datasets}
+        for previous in reusable.datasets:
+            key = previous.identifier.lower()
+            if key in left_out and key not in present:
+                kept = previous.model_copy(deep=True)
+                kept.rank_score = None
+                datasets.append(kept)
+                present.add(key)
     failed_reasons = {
         ident: "warehouse_refused" if values_free else (err.detail or str(err))
         for ident, err in profile_errors
