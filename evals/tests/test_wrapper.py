@@ -121,6 +121,7 @@ def test_missing_uv_refuses_with_one_error_envelope(skill, monkeypatch, capsys):
         "ceiling": None,
         "estimate_quality": None,
         "unit": None,
+        "unpriced": None,
     }
     assert envelope["data"] == {}
 
@@ -426,6 +427,7 @@ def test_warm_reports_what_it_installed_in_one_ok_envelope(monkeypatch, capsys):
         "ceiling": None,
         "estimate_quality": None,
         "unit": None,
+        "unpriced": None,
     }
     assert envelope["data"]["connector"] == "duckdb"
     assert envelope["data"]["extras"] == ["duckdb", "cluster"]

@@ -2276,6 +2276,46 @@ def compile_estimate(
     return total, per_node, notes
 
 
+def unpriced_elementary_work(
+    project_dir: Path | str, artifact_directory: Path | str | None = None
+) -> Any:
+    """What the Elementary package runs in this build that the estimate misses.
+
+    Read from the pricing compile's own artifacts: its manifest, parsed for the
+    build's target, and its ``run_results.json``, the build's selection
+    (#1309). Returns an :class:`~.elementary.UnpricedWork`, empty where the
+    package is not installed, is disabled for the target, or the artifacts
+    cannot be read, since a reading that fails here must not cost the build
+    its estimate.
+    """
+
+    from . import elementary
+
+    project = Path(project_dir)
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else resolve_build_artifact_dir(project)
+    )
+    paths = artifact_paths(directory)
+    try:
+        manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+        selected = {
+            str(r["unique_id"])
+            for r in json.loads(paths.run_results.read_text(encoding="utf-8")).get(
+                "results", []
+            )
+            if r.get("unique_id")
+        }
+    except (OSError, ValueError, AttributeError):
+        return elementary.UnpricedWork()
+    runtime = elementary.read(project, manifest)
+    project_yml: str | None = None
+    with contextlib.suppress(OSError, UnicodeError):
+        project_yml = (project / "dbt_project.yml").read_text(encoding="utf-8")
+    return elementary.unpriced_work(runtime, manifest, project_yml, selected=selected)
+
+
 def _count(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 

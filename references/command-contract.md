@@ -1490,7 +1490,25 @@ default, or a filter or operator after it is refused. A key naming a location
   result when it runs. Its `per_table_bytes` line is kept, since it is still
   what the job can bill at most, and `data.upper_bounds` maps each such line to
   the column it bounds; a note, and the over-ceiling refusal, say how much of
-  the estimate those lines are. dbt runs with cwd pinned to the project dir
+  the estimate those lines are. Where the Elementary package runs work no
+  compiled node shows (#1309), the estimate is a floor and says so, keyed off
+  what the package does for the target and never off whether it is installed:
+  `cost.unpriced` names the kinds by code on the ask, the over-ceiling refusal
+  and the finished build (`elementary_hooks` where its `on-run-start` and
+  `on-run-end` hooks run; `elementary_monitoring_tests` where the package is
+  enabled and the build selects its anomaly, `schema_changes` and other tests
+  that check it, each with the `days_back` window it reads; and
+  `elementary_test_extras` where dbt picks Elementary's test materialization,
+  which can count each selected test's failed rows and query a sample of them),
+  `data.unpriced` holds the record (`work`, `hooks`, `monitoring_tests` with
+  `days_back` and `days_back_source`, `monitoring_test_count`,
+  `materialized_test_count`), and one warning per kind says what was left out.
+  A project without the package gets none of it and `cost.unpriced: null`. One
+  that disables the package for the target gets no monitoring test or test
+  extra, and its hooks are named only where they still run: dbt disables them
+  with the package's models, and a release before 0.20.0 whose hooks stay
+  declared runs them without checking. A free connector prices nothing and
+  claims nothing. dbt runs with cwd pinned to the project dir
   (relative `profiles.yml` paths resolve there, never against the caller's
   shell). When
   `packages.yml` (or a `dependencies.yml` with packages) is declared and
@@ -2650,13 +2668,20 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
     "ceiling": null,
     "paradigm": "bytes_scanned | compute_time | db_load | hosted | free_local | null",
     "estimate_quality": "exact | approximate | unknown | null",
-    "unit": "bytes | seconds | null"
+    "unit": "bytes | seconds | null",
+    "unpriced": ["<code>", "..."] | null
   },
   "warnings": [],
   "diffs": [],
   "errors": []
 }
 ```
+
+`cost.unpriced` names work the command runs that `estimate` leaves out, so any
+entry makes the estimate a floor. It is `null` wherever nothing is claimed, which
+is every command but a `transform build` on a billed connector that runs the
+Elementary package's hooks or tests (#1309); a free connector's build prices
+nothing and claims nothing.
 
 In values-free mode `data.result_mode` is `"values_free"` on every envelope, and
 an error envelope adds `data.code`, a stable code that quotes no value (see
