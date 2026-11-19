@@ -474,9 +474,10 @@ def _plan(
     *,
     declaration: dict | None = None,
     sql_path: str = "models/marts/fct_orders.sql",
+    sql: str = MART_SQL,
 ) -> tuple[int, dict]:
     body = {
-        "edits": [{"path": sql_path, "kind": "model_sql", "content": MART_SQL}],
+        "edits": [{"path": sql_path, "kind": "model_sql", "content": sql}],
         "declarations": [declaration or MART],
     }
     return _run(
@@ -1133,3 +1134,82 @@ def test_a_derivation_that_fails_validation_does_not_reserve_its_name(
     assert second["status"] in ("proposed", "unvalidated"), json.dumps(second)[:800]
     assert "already derived" not in second.get("reason", "")
     assert calls["count"] >= 2
+
+
+DAILY_MART = {
+    "model": "fct_world_output_daily",
+    "description": "One row per day.",
+    "grain": ["output_day"],
+    "columns": {
+        "output_day": {"role": "time"},
+        "output_total": {
+            "role": "measure",
+            "aggregation": "sum",
+            "additivity": "additive",
+        },
+    },
+}
+
+
+def test_a_time_column_grain_names_its_entity_apart_from_the_dimension():
+    found = sd.derive(
+        "fct_world_output_daily",
+        DAILY_MART,
+        column_types={"output_day": ("date", None)},
+        on_ref={},
+    )
+
+    assert found.status == "proposed"
+    assert found.body["entities"] == [
+        {
+            "name": "world_output_daily_output_day",
+            "type": "primary",
+            "expr": "output_day",
+        }
+    ]
+    assert [d["name"] for d in found.body["dimensions"]] == ["output_day"]
+
+
+# dbt validates the semantic manifest only when the project has a metric.
+METRIC_LAYER = (
+    LAYER
+    + "    defaults:\n"
+    + "      agg_time_dimension: signed_up_on\n"
+    + "    dimensions:\n"
+    + "      - name: signed_up_on\n"
+    + "        type: time\n"
+    + "        expr: current_date\n"
+    + "        type_params:\n"
+    + "          time_granularity: day\n"
+    + "    measures:\n"
+    + "      - name: customer_count\n"
+    + "        agg: count\n"
+    + "        expr: id\n"
+    + "metrics:\n"
+    + "  - name: customers\n"
+    + "    label: Customers\n"
+    + "    type: simple\n"
+    + "    type_params:\n"
+    + "      measure: customer_count\n"
+)
+
+
+def test_dbt_parses_a_mart_whose_grain_is_a_single_time_column(
+    dbt_project_dir: Path, tmp_path: Path, capsys, real_dbt
+):
+    """The entity and the time dimension may not share a name (#1416)."""
+    _add_time_spine(dbt_project_dir)
+    _add_layer(dbt_project_dir, METRIC_LAYER)
+
+    rc, envelope = _plan(
+        tmp_path,
+        capsys,
+        declaration=DAILY_MART,
+        sql_path="models/marts/fct_world_output_daily.sql",
+        sql="select cast('2024-01-01' as date) as output_day, 10.0 as output_total\n",
+    )
+
+    assert rc == 0, envelope
+    model = envelope["data"]["semantic_proposal"]["models"]["fct_world_output_daily"]
+    assert model["status"] == "included", model
+    assert model["validation"]["parse"]["result"] == "passed", model

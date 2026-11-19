@@ -1,0 +1,1 @@
+**A mart whose grain is a single time column now derives a semantic model dbt parses.** The primary entity took the column's name, the same as the time dimension, so dbt rejected the model in any project that defines a metric. The entity is now named `<model>_<column>` with `expr: <column>`.

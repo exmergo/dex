@@ -336,6 +336,18 @@ def derive(
             carried.extend(_carried_column(name, fields, described=True))
             time_columns.append(name)
 
+    # MetricFlow wants one element type per name, so a grain column that is also
+    # a dimension (a time column grain) names its entity after the model too (#1416).
+    if primary in {d["name"] for d in dimensions}:
+        stem = _LAYER_PREFIX.sub("", model).lower()
+        primary = re.sub(r"_+", "_", f"{stem}_{grain[0]}")
+        entities[0]["name"] = primary
+        notes.append(
+            f"{grain[0]}: the primary entity is named '{primary}' because the "
+            "column is also a dimension, and MetricFlow does not allow one name "
+            "for both"
+        )
+
     agg_time = time_columns[0] if time_columns else None
     if len(time_columns) > 1:
         notes.append(
