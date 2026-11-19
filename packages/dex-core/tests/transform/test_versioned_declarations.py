@@ -27,6 +27,7 @@ from exmergo_dex_core.maintain.snapshot import (
 )
 from exmergo_dex_core.transform import declarations as d
 from exmergo_dex_core.transform import declare as declare_mod
+from exmergo_dex_core.transform.claims import claim_id
 from exmergo_dex_core.transform.drafting import read_declared
 
 YML = """\
@@ -233,7 +234,21 @@ def test_a_reference_to_a_version_writes_a_versioned_ref():
     assert test == {
         "relationships": {
             "arguments": {"to": "ref('dim_teams', v=2)", "field": "team_id"},
-            "config": {"meta": {"disable_test_samples": True}},
+            "config": {
+                "meta": {
+                    "disable_test_samples": True,
+                    # The version label is part of the claim: v2's reference is
+                    # its own fact, not the shared entry's.
+                    "dex": {
+                        "claim": claim_id(
+                            "fct_games",
+                            "references",
+                            ["team_id"],
+                            {"references": "dim_teams.v2.team_id"},
+                        )
+                    },
+                }
+            },
         }
     }
 

@@ -101,6 +101,59 @@ one, and a key it leaves out is kept. `population` merges one level further, so
 adding a `parent` keeps the `rule` and `filters` declared earlier. Every byte outside the keys above, comments
 included, stays where it was.
 
+### The claim each test checks
+
+Each test a declaration renders names the declared fact it checks, the
+**claim**, at `config.meta.dex.claim`, beside the Elementary flag:
+
+```yaml
+- unique:
+    config:
+      meta:
+        disable_test_samples: true
+        dex:
+          claim: 20bd854de99db020
+```
+
+A test's name and dbt's `unique_id` are built from the model, the column, the
+test and its arguments, so they change when any of those do. The claim id does
+not. Use it to name the fact a test checks across runs: one incident while a
+test keeps failing, and the last run in which a claim was checked and passed.
+
+| Declared | Claim | Test |
+|---|---|---|
+| a single-column `grain` | `grain`, the column, `check: unique` | `unique` |
+| a single-column `grain` | `grain`, the column, `check: not_null` | `not_null` |
+| `null_rule: never` | `null_rule`, the column | `not_null` |
+| `references` | `references`, the column, the parent it names | `relationships` |
+
+- **How the id is made.** It is the first 16 hex characters of a SHA-256 over
+  the claim: the model's label (`dim_teams.v2` for a version), the declared
+  field, its columns and its parameters, with names folded to lower case. It is
+  never made from the test's name. Two facts on one column get two ids,
+  including the two tests of one grain, since either can fail alone. A grain
+  column also declared `null_rule: never` has one `not_null`, which carries the
+  null rule's claim.
+- **After the first render, the file holds the id.** A test the column already
+  lists by name is left as written. Renaming the test (`name:`), declaring the
+  same fact again or editing the rest of the declaration leaves its claim alone,
+  and a plan shows no diff on it. Read the id from the file, not by recomputing
+  it. A model renamed with `transform rename` keeps its tests' ids, since the
+  rename does not touch them. A fact that changes (a `references` to another
+  parent) gets no new id, because the test already listed under that name is
+  kept as written.
+- **Tests Dex rendered before claims.** A test that is exactly what Dex
+  rendered earlier (the flag, the same arguments, nothing else) gets its claim
+  the next time the declaration renders, and that one key is the only change. A
+  bare `not_null` or `unique` could have been written by a person, so it stays
+  bare (#1350), as does a test with any other config or a claim already.
+- **Tests that check no declared fact carry no claim.** The scaffold's tests
+  and the `not_null` or `unique` that `maintain reconcile` adds are not
+  declarations. `maintain reconcile` still treats a claimed `not_null` as Dex's
+  own, and removes it when the column starts accepting NULLs.
+- Neither dbt nor Elementary reads a `dex` key in a test's `meta`. Elementary
+  copies a test's `meta` into its `dbt_tests` table, so the claim is also there.
+
 ### A versioned model
 
 A model with native dbt versions has one YAML entry with a `versions:` list.
