@@ -530,11 +530,15 @@ _DIM_V1 = "select team_id, team_label from {{ ref('stg_teams') }}\n"
 _DIM_V2 = "select team_id, upper(team_label) as team_label from {{ ref('stg_teams') }}"
 
 
-def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
-    dbt_project_dir: Path, tmp_path: Path, capsys
-):
-    """`dim_teams.v2` is built from `dim_teams_v2.sql`: that file stays in the
-    plan, and the unchanged `dim_teams.sql` (version 1) is still skipped."""
+def _plan_versioned(
+    dbt_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    edits: list[dict],
+    declarations: list[dict],
+) -> dict:
+    """Plan ``edits`` and ``declarations`` over a project whose `dim_teams` has
+    version 1 in `dim_teams.sql` (the latest) and version 2 in `dim_teams_v2.sql`."""
 
     marts = dbt_project_dir / "models" / "marts"
     marts.mkdir()
@@ -546,26 +550,7 @@ def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
     (marts / "_marts.yml").write_text(_VERSIONED_YML, encoding="utf-8")
     payload = tmp_path / "edits.json"
     payload.write_text(
-        json.dumps(
-            {
-                "edits": [
-                    {
-                        "path": "models/marts/dim_teams.sql",
-                        "kind": "model_sql",
-                        "content": _DIM_V1,
-                    },
-                    {
-                        "path": "models/marts/dim_teams_v2.sql",
-                        "kind": "model_sql",
-                        "content": _DIM_V2,
-                    },
-                ],
-                "declarations": [
-                    {"model": "dim_teams.v2", "description": "One row per team."}
-                ],
-            }
-        ),
-        encoding="utf-8",
+        json.dumps({"edits": edits, "declarations": declarations}), encoding="utf-8"
     )
     rc, envelope = _run(
         [
@@ -573,13 +558,35 @@ def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
             str(tmp_path),
             "transform",
             "plan",
-            "declare v2",
+            "declare",
             "--edits-file",
             str(payload),
         ],
         capsys,
     )
     assert rc == 0, envelope["errors"]
+    return envelope
+
+
+_RESENT_VERSIONS = [
+    {"path": "models/marts/dim_teams.sql", "kind": "model_sql", "content": _DIM_V1},
+    {"path": "models/marts/dim_teams_v2.sql", "kind": "model_sql", "content": _DIM_V2},
+]
+
+
+def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`dim_teams.v2` is built from `dim_teams_v2.sql`: that file stays in the
+    plan, and the unchanged `dim_teams.sql` (version 1) is still skipped."""
+
+    envelope = _plan_versioned(
+        dbt_project_dir,
+        tmp_path,
+        capsys,
+        _RESENT_VERSIONS,
+        [{"model": "dim_teams.v2", "description": "One row per team."}],
+    )
     paths = envelope["data"]["paths"]
     assert "models/marts/dim_teams_v2.sql" in paths
     assert "models/marts/dim_teams.sql" not in paths
@@ -587,6 +594,32 @@ def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
         "1 edit matches the tree and was skipped: models/marts/dim_teams.sql"
         in envelope["warnings"]
     )
+
+
+def test_a_bare_name_declared_with_a_promotion_keeps_the_new_latest_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The plan promotes version 2, so the bare `dim_teams` it declares is
+    `dim_teams_v2.sql` as the plan leaves the tree, not version 1 as it was."""
+
+    promoted = _VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    envelope = _plan_versioned(
+        dbt_project_dir,
+        tmp_path,
+        capsys,
+        [
+            *_RESENT_VERSIONS,
+            {
+                "path": "models/marts/_marts.yml",
+                "kind": "schema_yml",
+                "content": promoted,
+            },
+        ],
+        [{"model": "dim_teams", "description": "One row per team."}],
+    )
+    paths = envelope["data"]["paths"]
+    assert "models/marts/dim_teams_v2.sql" in paths
+    assert "models/marts/dim_teams.sql" not in paths
 
 
 def test_an_edit_differing_only_in_line_endings_is_skipped(

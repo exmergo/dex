@@ -526,9 +526,11 @@ def _skip_unchanged(
 
     view = load_project(engine.project_dir())
     files = view.files
-    texts = {path: source.content for path, source in files.items()}
-    # The declarations resolver, so a version label (`dim_teams.v2`) keeps that
-    # version's file and not the bare name's.
+    # The declarations resolver over the tree as the plan leaves it, the files
+    # `apply_declarations` resolved against: a version label (`dim_teams.v2`)
+    # keeps that version's file, and a bare name the default version's after
+    # any `latest_version` or `defined_in` change this plan makes.
+    texts = declarations_mod.post_change_files(view, edits)
     declared = {
         path
         for d in declarations_mod.parse_declarations(declarations)
