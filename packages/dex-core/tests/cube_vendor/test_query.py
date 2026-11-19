@@ -1013,14 +1013,6 @@ def test_a_query_cube_cannot_plan_is_a_resolution_error(shop, cube, capsys):
     assert envelope["errors"][0].startswith("could not resolve the metric query")
 
 
-def test_hosted_execution_is_not_offered(shop, cube, capsys):
-    envelope = _query(capsys, shop, "by_status", "--api")
-
-    assert envelope["status"] == "error"
-    assert "no hosted execution" in envelope["errors"][0]
-    assert cube.calls == []
-
-
 def test_the_secret_and_the_token_never_reach_an_envelope(
     shop, cube, capsys, monkeypatch
 ):
@@ -1167,3 +1159,133 @@ def test_a_changed_member_a_calculated_measure_reads_is_stale(
     assert envelope["reason"] == "guard", envelope
     assert "orders.revenue has different SQL there" in envelope["errors"][0]
     assert cube.paths == ["/cubejs-api/v1/meta"]
+
+
+def test_a_member_named_like_a_grain_bucket_is_not_cut_in_two():
+    """A member whose own name ends in `__<grain>` is that member, not the
+    bucket of a time dimension sharing its head (the PII gate screens the token
+    the query sends)."""
+
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import Target, split_time
+
+    time = Member(name="period", kind="dimension", type="time")
+    literal = Member(name="period__month", kind="dimension", type="string")
+    members = {
+        "orders.period": Target("orders.period", "dimension", time, "orders"),
+        "orders.period__month": Target(
+            "orders.period__month", "dimension", literal, "orders"
+        ),
+    }
+
+    assert split_time("orders.period__month", members) == (
+        "orders.period__month",
+        None,
+    )
+    del members["orders.period__month"]
+    assert split_time("orders.period__month", members) == ("orders.period", "month")
+
+
+def test_a_dimension_served_without_sql_is_stale():
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    member = Member(name="status", kind="dimension", type="string", sql="status")
+    members = {"orders.status": Target("orders.status", "dimension", member, "orders")}
+    served = {"name": "orders.status", "type": "string"}
+    meta = {"cubes": [{"name": "orders", "dimensions": [served], "measures": []}]}
+
+    with pytest.raises(StaleRendererError, match="no SQL"):
+        check_renderer(meta, ["orders.status"], members, where="x")
+    served["sql"] = "`status`"
+    check_renderer(meta, ["orders.status"], members, where="x")
+
+
+def test_a_measure_served_without_sql_is_stale():
+    """Cube serves a measure's SQL too (`/v1/meta?extended`, Core and Cloud), so
+    one served without it is not passed as though it matched."""
+
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    member = Member(name="revenue", kind="measure", type="sum", sql="total")
+    members = {"orders.revenue": Target("orders.revenue", "measure", member, "orders")}
+    served = {"name": "orders.revenue", "type": "number", "aggType": "sum"}
+    meta = {"cubes": [{"name": "orders", "dimensions": [], "measures": [served]}]}
+
+    with pytest.raises(StaleRendererError, match="no SQL"):
+        check_renderer(meta, ["orders.revenue"], members, where="x")
+    served["sql"] = "`total`"
+    check_renderer(meta, ["orders.revenue"], members, where="x")
+
+
+def test_a_grouped_member_named_like_a_bucket_keeps_its_own_sort_key():
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import Target, to_cube_query
+    from exmergo_dex_core.explore.semantic.model import SemanticQuery
+
+    measure = Member(name="count", kind="measure", type="count")
+    time = Member(name="period", kind="dimension", type="time")
+    literal = Member(name="period__month", kind="dimension", type="string")
+    members = {
+        "orders.count": Target("orders.count", "measure", measure, "orders"),
+        "orders.period": Target("orders.period", "dimension", time, "orders"),
+        "orders.period__month": Target(
+            "orders.period__month", "dimension", literal, "orders"
+        ),
+    }
+    q = SemanticQuery(
+        metrics=["orders.count"],
+        group_by=["orders.period__month", "orders.period"],
+        grain="month",
+        order_by=["orders.period__month"],
+    )
+
+    request = to_cube_query(q, members, max_rows=50)
+
+    assert request.query["order"] == [["orders.period__month", "asc"]]
+
+
+def test_a_bucketed_member_named_like_another_s_bucket_keeps_its_sort_key():
+    """Two time dimensions, `period` and `period__month`, grouped in that order
+    with --grain month: ordering by `period__month` sorts by that member."""
+
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import Target, to_cube_query
+    from exmergo_dex_core.explore.semantic.model import SemanticQuery
+
+    measure = Member(name="count", kind="measure", type="count")
+    first = Member(name="period", kind="dimension", type="time")
+    second = Member(name="period__month", kind="dimension", type="time")
+    members = {
+        "orders.count": Target("orders.count", "measure", measure, "orders"),
+        "orders.period": Target("orders.period", "dimension", first, "orders"),
+        "orders.period__month": Target(
+            "orders.period__month", "dimension", second, "orders"
+        ),
+    }
+    q = SemanticQuery(
+        metrics=["orders.count"],
+        group_by=["orders.period", "orders.period__month"],
+        grain="month",
+        order_by=["orders.period__month"],
+    )
+
+    request = to_cube_query(q, members, max_rows=50)
+
+    assert request.query["order"] == [["orders.period__month", "asc"]]
+
+
+def test_a_count_served_over_a_column_the_repository_does_not_name_is_stale():
+    from exmergo_dex_core.cube.model import Member
+    from exmergo_dex_core.cube.query import StaleRendererError, Target, check_renderer
+
+    member = Member(name="count", kind="measure", type="count")
+    members = {"orders.count": Target("orders.count", "measure", member, "orders")}
+    served = {"name": "orders.count", "type": "number", "aggType": "count"}
+    meta = {"cubes": [{"name": "orders", "dimensions": [], "measures": [served]}]}
+
+    check_renderer(meta, ["orders.count"], members, where="x")
+    served["sql"] = "`customer_id`"
+    with pytest.raises(StaleRendererError, match="does not declare"):
+        check_renderer(meta, ["orders.count"], members, where="x")

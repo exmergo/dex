@@ -632,11 +632,15 @@ SEMANTIC_DEPLOYMENTS: dict[str, tuple[str, ...]] = {
     # repository, and a server is a second copy of them that nobody reviews in a
     # pull request. `local` is those files and nothing else.
     "slayer": ("local",),
-    # Cube's YAML model files committed here, rendered for a governed query by
-    # the Cube server at `semantic.cube.url` (a Cube Core on this machine by
-    # default) and executed by dex. Cube Cloud is a deployment of the same files
-    # (#914), not read yet.
-    "cube": ("local",),
+    # Cube's YAML model files committed here. `local` is a Cube Core the user
+    # runs (on this machine by default); `cube_cloud` (#914) is the same files
+    # deployed to Cube Cloud, whose catalog `explore semantic` reads from the
+    # deployment's compiled `/v1/meta`. Every Cube deployment serves the same
+    # REST API, so who executes is a separate axis: dex (render over `/v1/sql`,
+    # run through dex's connector) or Cube (`/v1/load`), chosen per deployment
+    # by default and per command by `--local` / `--api`. The files stay required
+    # under both, since authoring and drift read them.
+    "cube": ("local", "cube_cloud"),
     # Databricks Unity Catalog Metric Views. `local` is the Metric View YAML
     # bodies committed here, read statically: a governed query finds the view
     # deployed from a file by its stem (#1362), reads it back from Unity Catalog
@@ -715,6 +719,7 @@ _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
     "api": "dbt_cloud",
     "cloud": "dbt_cloud",
     "snowflake_account": "snowflake_account",
+    "cube_cloud": "cube_cloud",
     "databricks_workspace": "databricks_workspace",
 }
 
@@ -723,10 +728,25 @@ _SEMANTIC_DEPLOYMENT_SPELLINGS: dict[str, str] = {
 #: keyed by the field they override. Declared once so the connection that reads
 #: them and ``dex config get``, which reports a setting the environment is
 #: overriding, cannot disagree about which variable wins.
-SEMANTIC_ENVIRONMENT: dict[str, str] = {
-    "host": "DBT_SL_HOST",
-    "environment_id": "DBT_SL_ENV_ID",
+#:
+#: Per vendor, because each vendor's hosted coordinates live in a different
+#: place: dbt Cloud's on ``semantic`` itself, Cube's in ``semantic.cube``. Keys
+#: are dotted paths under ``semantic.``. Cube's URL is ``DEX_CUBE_URL`` and not
+#: ``CUBE_API_URL``, which the ``cube`` CLI already reads as the Cube Cloud
+#: console's API base, a different endpoint from a deployment's REST API.
+SEMANTIC_ENVIRONMENT_BY_VENDOR: dict[str, dict[str, str]] = {
+    "dbt": {
+        "host": "DBT_SL_HOST",
+        "environment_id": "DBT_SL_ENV_ID",
+    },
+    "cube": {
+        "cube.url": "DEX_CUBE_URL",
+    },
 }
+
+#: dbt Cloud's row of :data:`SEMANTIC_ENVIRONMENT_BY_VENDOR`, under its released
+#: name.
+SEMANTIC_ENVIRONMENT: dict[str, str] = SEMANTIC_ENVIRONMENT_BY_VENDOR["dbt"]
 
 
 def canonical_semantic_deployment(value: str) -> str:
@@ -914,8 +934,10 @@ class CubeSemanticConfig(BaseModel):
     refused by name.
 
     ``url`` is the non-secret base of a Cube REST API, read by ``explore
-    semantic query|values``, which ask a Cube server to render SQL and execute
-    it themselves (``http://localhost:4000/cubejs-api`` when unset). It may name
+    semantic``: a Cube Core under ``deployment: local``
+    (``http://localhost:4000/cubejs-api`` when unset), or a Cube Cloud
+    deployment's REST API under ``deployment: cube_cloud``, where it has no
+    default. ``DEX_CUBE_URL`` in the environment beats it at run time. It may name
     no credential: a token in a committed URL is a token in git, and the secret a
     Cube server needs is read from the environment. ``data_source`` is the Cube
     data source dex treats as the warehouse it is connected to (Cube's own
@@ -1176,6 +1198,13 @@ class SemanticConfig(BaseModel):
     dbt plus the hosted one. Setting both is fine while they agree and refused
     when they contradict, because a config dex accepts and then ignores is worse
     than one it refuses.
+
+    Cube has a second deployment, ``cube_cloud`` (#914): the same files deployed
+    to Cube Cloud. ``explore semantic`` reads its catalog from the deployment's
+    compiled ``/v1/meta``, and Cube executes the query (``/v1/load``) unless
+    ``--local`` asks Cube Cloud to render it for dex to execute. Under ``local``
+    dex executes unless ``--api`` asks the Cube Core to. ``cube.url`` is the
+    hosted coordinate; the token is ``CUBE_API_TOKEN``, from the environment.
 
     ``host`` and ``environment_id`` are the non-secret hosted coordinates, copied
     from the dbt Cloud Semantic Layer panel (or ``DBT_SL_HOST`` / ``DBT_SL_ENV_ID``

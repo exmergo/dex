@@ -56,8 +56,8 @@ def _run(capsys, root: Path, *argv: str) -> tuple[int, dict]:
     return rc, json.loads(capsys.readouterr().out)
 
 
-def test_cube_is_a_vendor_with_one_local_deployment_and_its_own_source():
-    assert SEMANTIC_DEPLOYMENTS["cube"] == ("local",)
+def test_cube_is_a_vendor_with_a_local_and_a_cloud_deployment_and_its_own_source():
+    assert SEMANTIC_DEPLOYMENTS["cube"] == ("local", "cube_cloud")
     assert SEMANTIC_SOURCE_FACTORIES["cube"] == (
         "exmergo_dex_core.cube.project:build_semantic_layer"
     )
@@ -145,12 +145,16 @@ def test_a_password_in_the_url_never_reaches_an_envelope(tmp_path, capsys, argv)
             "semantic.cube.data_source is only valid for semantic.vendor: cube",
         ),
         (
+            {"vendor": "cube", "deployment": "cube_cloud"},
+            "semantic.vendor: cube needs semantic.cube.files",
+        ),
+        (
             {
                 "vendor": "cube",
-                "deployment": "cube_cloud",
+                "deployment": "dbt_cloud",
                 "cube": {"files": ["a.yml"]},
             },
-            "semantic.deployment must be one of local for vendor 'cube'",
+            "semantic.deployment must be one of local, cube_cloud for vendor 'cube'",
         ),
         (
             {
@@ -184,6 +188,41 @@ def test_config_get_reports_the_cube_settings(tmp_path, capsys):
         settings["semantic.cube.url"]["value"] == "https://cube.example.com/cubejs-api"
     )
     assert settings["semantic.cube.data_source"]["source"] == "file"
+
+
+def test_config_get_reports_dex_cube_url_beating_the_file(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setenv("DEX_CUBE_URL", "https://d.aws-us-east-1.cubecloudapp.dev/x")
+    rc, envelope = _run(
+        capsys, _repo(tmp_path, ISSUE_BLOCK), "config", "get", "semantic.cube.url"
+    )
+
+    assert rc == 0, envelope
+    (row,) = envelope["data"]["settings"]
+    assert row["source"] == "environment"
+    assert row["variable"] == "DEX_CUBE_URL"
+    assert row["value"] == "https://d.aws-us-east-1.cubecloudapp.dev/x"
+
+
+def test_dbt_cloud_s_variables_do_not_override_a_cube_layer(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setenv("DBT_SL_HOST", "x.cloud.getdbt.com")
+    rc, envelope = _run(capsys, _repo(tmp_path, ISSUE_BLOCK), "config", "get")
+
+    assert rc == 0, envelope
+    assert not [
+        row for row in envelope["data"]["settings"] if row["source"] == "environment"
+    ]
+
+
+def test_cube_cloud_loads_with_its_url(tmp_path):
+    text = ISSUE_BLOCK.replace("  cube:\n", "  deployment: cube_cloud\n  cube:\n")
+    config = load_config(_repo(tmp_path, text))
+
+    assert config.semantic.deployment == "cube_cloud"
+    assert config.semantic.cube.files == FILES
 
 
 def test_config_validate_refuses_a_bad_file_at_its_line(tmp_path, capsys):
