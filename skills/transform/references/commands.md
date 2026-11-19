@@ -14,7 +14,9 @@ An edit whose content is identical to the file already on disk is left out
 of the plan, its diffs, `data.paths`, the comparison offer and `transform
 compare`'s seed and snapshot check, and one warning names them ("N edits match
 the tree and were skipped: ..."), so resending a whole feature raises nothing for
-the files it did not change. A payload with nothing else is refused (#1415).
+the files it did not change. A model file the payload's `declarations` name is
+kept, so resending a model's SQL beside its declaration still puts the model in
+the plan. A payload whose every edit matches skips nothing (#1415).
 
 Model SQL with Jinja `for`/`if` control flow is compiled by dbt in a throwaway
 copy containing all edits, then checked as a single read-only SELECT. dbt and a

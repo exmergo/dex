@@ -26,7 +26,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -342,7 +342,7 @@ def plan(
             "skeleton"
         )
 
-    edits, unchanged_notes = _skip_unchanged(engine, edits)
+    edits, unchanged_notes = _skip_unchanged(engine, edits, declarations)
 
     from . import model_versions as versions_mod
 
@@ -498,7 +498,7 @@ def plan(
 
 
 def _skip_unchanged(
-    engine: DexEngine, edits: list[PlanEdit]
+    engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
 ) -> tuple[list[PlanEdit], list[str]]:
     """Leave out the edits whose content is already the file on disk (#1415).
 
@@ -512,11 +512,23 @@ def _skip_unchanged(
     file as the project view reads it (text, universal newlines), the same test
     `write_edits` makes before writing nothing. Only a file the view holds is
     compared, so nothing outside the project is read. A delete is never a no-op.
+
+    A model the payload declares keeps its file even when it matches: resending
+    the SQL beside a declaration (an assumption settling an ask) is how a plan
+    says the model is in scope, and `--for-plan` verification and obligations are
+    keyed on the model files a plan carries, not on its YAML.
     """
 
     if not _has_dbt_project(engine):
         return edits, []
     from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+
+    declared = {
+        name
+        for d in declarations_mod.parse_declarations(declarations)
+        for name in (d.model, d.model.split(".")[0])
+    }
 
     files = load_project(engine.project_dir()).files
     kept: list[PlanEdit] = []
@@ -526,17 +538,19 @@ def _skip_unchanged(
             edit.op is EditOp.UPSERT
             and edit.path in files
             and files[edit.path].content == edit.new_content
+            and not (
+                edit.kind is EditKind.MODEL_SQL
+                and PurePosixPath(edit.path).stem in declared
+            )
         ):
             skipped.append(edit.path)
         else:
             kept.append(edit)
-    if not skipped:
+    # A payload that matches the tree throughout (scaffolding a table again) plans
+    # as it always did: there is no changed file whose comparison it could block.
+    if not skipped or not kept:
         return edits, []
     listed = ", ".join(skipped)
-    if not kept:
-        raise ValueError(
-            "every edit matches the tree, so this plan would change nothing: " + listed
-        )
     one = len(skipped) == 1
     return kept, [
         f"{len(skipped)} edit{'' if one else 's'} "

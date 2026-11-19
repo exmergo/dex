@@ -455,6 +455,64 @@ def test_an_edit_matching_the_tree_is_left_out_of_the_plan(
     )
 
 
+def test_an_unchanged_model_resent_with_a_declaration_is_kept(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Resending a model's SQL beside its declaration keeps the model in the
+    plan, where `--for-plan` verification looks for it; an unchanged file the
+    payload does not declare is still skipped."""
+
+    (dbt_project_dir / "models" / "staging" / "stg_other.sql").write_text(
+        "select 2 as id\n", encoding="utf-8"
+    )
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/staging/stg_customers.sql",
+                        "kind": "model_sql",
+                        "content": _ON_DISK,
+                    },
+                    {
+                        "path": "models/staging/stg_other.sql",
+                        "kind": "model_sql",
+                        "content": "select 2 as id\n",
+                    },
+                ],
+                "declarations": [
+                    {
+                        "model": "stg_customers",
+                        "description": "One row per customer.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    paths = envelope["data"]["paths"]
+    assert "models/staging/stg_customers.sql" in paths
+    assert "models/staging/stg_other.sql" not in paths
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/stg_other.sql"
+        in envelope["warnings"]
+    )
+
+
 def test_an_edit_differing_only_in_line_endings_is_skipped(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
@@ -487,9 +545,12 @@ def test_an_edit_differing_only_in_line_endings_is_skipped(
     )
 
 
-def test_a_plan_whose_every_edit_matches_the_tree_is_refused(
+def test_a_plan_whose_every_edit_matches_the_tree_plans_as_before(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
+    """Nothing is skipped when nothing would be left, so planning the same
+    content again (a re-scaffold) still stores a plan."""
+
     rc, envelope = _plan_payload(
         tmp_path,
         capsys,
@@ -501,12 +562,9 @@ def test_a_plan_whose_every_edit_matches_the_tree_is_refused(
             }
         ],
     )
-    assert rc == 1
-    assert envelope["status"] == "error"
-    assert "would change nothing" in envelope["errors"][0]
-    assert not (tmp_path / ".dex" / "plans").is_dir() or not any(
-        (tmp_path / ".dex" / "plans").iterdir()
-    )
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/staging/stg_customers.sql"]
+    assert not any("matches the tree" in w for w in envelope["warnings"])
 
 
 # --- project config kinds (project_yml / profiles_yml) ------------------------

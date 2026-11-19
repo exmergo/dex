@@ -1301,9 +1301,11 @@ default, or a filter or operator after it is refused. A key naming a location
   warning counts and names the skipped files ("N edits match the tree and were
   skipped: ..."). A payload builder can resend a whole feature without its
   unchanged files raising obligations. A payload whose every edit matches the
-  tree is refused, since the plan would change nothing. Identical is apply's own
+  tree skips nothing and plans as before. Identical is apply's own
   no-op test (the file read as text), so a CRLF checkout resending LF content is
-  skipped too. A delete is never skipped.
+  skipped too. A delete is never skipped, and neither is a model file the
+  payload's `declarations` name: resending a model's SQL beside its declaration
+  keeps the model in the plan, where a `--for-plan` build verifies it.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it
