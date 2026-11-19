@@ -2010,9 +2010,9 @@ def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
         if index is None:
             continue
         item = listed[1].value[index]
-        if _carries_anchor(root, item):
-            # An anchored body shared with another test would take this claim
-            # too; the test stays as written rather than claim two checks.
+        if _carries_anchor(root, listed[1]):
+            # An aliased list or item would give this claim to another column or
+            # test; the test stays as written rather than claim two facts.
             continue
         [(_name_node, body)] = item.value
         if listed[1].flow_style or item.flow_style:

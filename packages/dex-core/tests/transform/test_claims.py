@@ -321,3 +321,26 @@ def test_a_test_whose_yaml_another_test_aliases_is_left_as_written():
 
     assert _claims(out, "order_id") == [None, None]
     assert out.split("    columns:\n")[1] == shared.split("    columns:\n")[1]
+
+
+def test_a_test_list_two_columns_share_is_left_as_written():
+    # The list is aliased, so a claim written for one column reaches the other.
+    shared = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        data_tests: &keys\n"
+        "          - unique:\n"
+        "              config:\n"
+        "                meta:\n"
+        "                  disable_test_samples: true\n"
+        "      - name: order_key\n"
+        "        data_tests: *keys\n"
+    )
+
+    out = _render(shared, {"model": "fct_orders", "grain": ["order_id"]})
+
+    assert claim_of(_tests(out, "order_id")[0]) is None
+    assert claim_of(_tests(out, "order_key")[0]) is None
