@@ -173,7 +173,7 @@ def test_cube_values_refuse_a_pii_dimension_before_asking_cube(
     assert server.paths == ["/cubejs-api/v1/meta", "/cubejs-api/v1/sql"]
 
 
-def test_the_engine_resolves_the_cube_layer_and_has_no_hosted_override(tmp_path):
+def test_the_engine_resolves_the_cube_layer_and_its_vendor_execution(tmp_path):
     engine = DexEngine.from_repo(repo(tmp_path, *ORDERS_LAYER))
 
     layer = resolve_semantic_layer(engine, local=True)
@@ -185,8 +185,11 @@ def test_the_engine_resolves_the_cube_layer_and_has_no_hosted_override(tmp_path)
         ("customers", "customer_key"),
     }
     assert composite == []
-    with pytest.raises(Exception, match="no hosted"):
-        resolve_semantic_layer(engine, api=True)
+    # `--api` (#914): the Cube Core executes, and the catalog stays the files.
+    vendor = resolve_semantic_layer(engine, api=True)
+    assert vendor.descriptor.execution == "vendor"
+    assert vendor.descriptor.deployment == "local"
+    assert vendor.declared_keys()[0] == keys
 
 
 # --- on a real warehouse ------------------------------------------------------------

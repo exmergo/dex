@@ -1,5 +1,11 @@
 """The local Cube layer: the Cube model files in this repository, queried.
 
+This is ``execution: dex`` on either Cube deployment: the default on a Cube Core
+(``deployment: local``), and ``--local`` on Cube Cloud (``deployment:
+cube_cloud``, #914), where Cube Cloud renders and every check below still holds
+the deployment to the repository's files. Cube executing (``--api``, and Cube
+Cloud's default) is :mod:`.cube_vendor`.
+
 The reading is the semantic source's job and reaches this layer through the
 engine's semantic-source seam. What this layer adds is provenance, the declared
 gaps, and the governed metric query.
@@ -120,16 +126,35 @@ class LocalCubeLayer:
         catalog_gaps=CUBE_CATALOG_GAPS,
     )
 
-    def __init__(self, source: Any, engine: Any = None) -> None:
+    def __init__(
+        self,
+        source: Any,
+        engine: Any = None,
+        *,
+        deployment: str = "local",
+        token: Any = None,
+        allowed_hosts: tuple[str, ...] = (),
+    ) -> None:
         self._source = source
         # The dex engine, which the governed spine opens the connection through.
         # Optional: reading the catalog needs no engine.
         self._dex = engine
         self._view: Any = None
         self._governed: GovernedSql | None = None
+        # `--local` on `deployment: cube_cloud` (#914): Cube Cloud renders, dex
+        # executes, and the catalog and every check stay the repository's files.
+        # Only where the render comes from, and the token it takes, change.
+        self._token = token
+        self._allowed_hosts = tuple(allowed_hosts)
+        if deployment != self.deployment:
+            self.name = deployment
+            self.deployment = deployment
+            self.descriptor = replace(
+                self.descriptor, name=deployment, deployment=deployment
+            )
 
     @classmethod
-    def from_engine(cls, engine: Any) -> LocalCubeLayer:
+    def from_engine(cls, engine: Any, deployment: str = "local") -> LocalCubeLayer:
         """Build through the engine's semantic-source seam, never a project."""
 
         if engine.repo_root is None:
@@ -138,7 +163,14 @@ class LocalCubeLayer:
                 "are git-reviewable files, so build the engine with "
                 "DexEngine.from_repo(repo_root)"
             )
-        return cls(engine.semantic_catalog_source(), engine)
+        source = getattr(engine, "semantic_source", None)
+        return cls(
+            engine.semantic_catalog_source(),
+            engine,
+            deployment=deployment,
+            token=getattr(source, "token", None),
+            allowed_hosts=tuple(getattr(source, "allowed_hosts", ()) or ()),
+        )
 
     # ---- discovery ---------------------------------------------------------
 
@@ -475,7 +507,12 @@ class LocalCubeLayer:
         from ...cube.transport import CubeTransport, CubeTransportError
 
         try:
-            return CubeTransport(getattr(self._source, "url", None))
+            return CubeTransport(
+                getattr(self._source, "url", None),
+                deployment=self.deployment,
+                token=self._token,
+                allowed_hosts=self._allowed_hosts,
+            )
         except CubeTransportError as exc:
             raise SemanticQueryRefusedError(str(exc)) from exc
 

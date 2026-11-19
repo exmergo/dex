@@ -50,6 +50,14 @@ name: Integration
 #   ClickHouse Cloud job uses the protected clickhouse-cloud-integration
 #   environment, refuses on the UTC-day CHC threshold before any SQL connection
 #   wakes the service, and shares the same parameterized data fixture.
+#   Cube: the `cube` job needs no setup: render-only Cube Core containers (dex
+#   executes, #913) and executing ones (`--api`, #914) started by
+#   scripts/setup_cube_dev.sh, over the Postgres service container and an
+#   in-memory DuckDB. A separate narrow `cube_cloud` job asks a Cube Cloud
+#   deployment serving the same model (scripts/setup_cube_cloud_ci.sh) under the
+#   protected cube-cloud-integration environment, with a one-hour token minted
+#   per run from the deployment's API secret; the deployment's warehouse is an
+#   in-memory DuckDB it builds itself, so it reaches nothing.
 #   Trino: no setup for the exhaustive suite. It runs against a container pair
 #   started by scripts/setup_trino_dev.sh (Trino plus the Postgres database its
 #   keyless Iceberg catalog keeps table pointers in): free, keyless, and
@@ -72,6 +80,8 @@ on:
       - "scripts/trino*"
       - "scripts/trino/**"
       - "scripts/cube/**"
+      - "scripts/cube_cloud/**"
+      - "scripts/setup_cube_cloud_ci.sh"
       - "scripts/setup_trino_iceberg_ci.sh"
       - ".github/workflows/integration.yml"
   schedule:
@@ -439,10 +449,12 @@ jobs:
   cube:
     # No repository gate and no environment: a governed Cube query (#913) is
     # rendered by Cube Core and executed by dex, and both the renderer and the
-    # warehouse are containers this job starts. The Cube containers are
-    # render-only (scripts/setup_cube_dev.sh): they know the warehouse's type
-    # and hold no credential for it, so every number this job checks was
-    # executed by dex. Their API secret is random per run and stays in a file.
+    # warehouse are containers this job starts. The render containers know the
+    # warehouse's type and hold no credential for it, so every number they
+    # answer was executed by dex. The executing containers (`--api`, #914) run
+    # the same questions themselves, over the Postgres service as its read-only
+    # role and an in-memory DuckDB built from scripts/cube/shop.sql. Their API
+    # secret is random per run and stays in a file.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -485,11 +497,13 @@ jobs:
             -c "CREATE DATABASE dex_dogfood"
           PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
             -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
-      - name: Start render-only Cube Core for DuckDB and Postgres
+      - name: Start render-only and executing Cube Core for DuckDB and Postgres
         working-directory: .
         run: |
           scripts/setup_cube_dev.sh --db duckdb
           scripts/setup_cube_dev.sh --db postgres
+          scripts/setup_cube_dev.sh --execute --db duckdb
+          scripts/setup_cube_dev.sh --execute --db postgres
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
@@ -504,6 +518,51 @@ jobs:
         run: |
           source ~/.cache/dex-dogfood/cube.env
           uv run pytest tests/integration -q -m cube
+
+  cube_cloud:
+    # A Cube Cloud deployment (#914) serving scripts/cube/model over an
+    # in-memory DuckDB it builds from scripts/cube/shop.sql, asked both ways:
+    # Cube Cloud executes (`--api`), and Cube Cloud renders for dex to execute
+    # (`--local`) on a DuckDB file built from the same statements. The protected
+    # environment carries the deployment's URL and its API secret; a one-hour
+    # token is minted from the secret in the one step whose tests use it.
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: cube-cloud-integration
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_CUBE_CLOUD_URL: ${{ vars.DEX_TEST_CUBE_CLOUD_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require the protected Cloud configuration
+        run: |
+          test -n "$DEX_TEST_CUBE_CLOUD_URL" || {
+            echo "::error::DEX_TEST_CUBE_CLOUD_URL is missing; run scripts/setup_cube_cloud_ci.sh"
+            exit 1
+          }
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Sync (duckdb + cube + semantic-api + dev extras)
+        run: uv sync --extra duckdb --extra cube --extra semantic-api --extra dev
+      - name: Narrow Cube Cloud integration suite
+        env:
+          CUBE_CLOUD_API_SECRET: ${{ secrets.CUBE_CLOUD_API_SECRET }}
+        run: |
+          # Without it the suite skips itself green; refuse instead.
+          if [ -z "$CUBE_CLOUD_API_SECRET" ]; then
+            echo "::error::CUBE_CLOUD_API_SECRET is missing from the cube-cloud-integration environment; re-run scripts/setup_cube_cloud_ci.sh"
+            exit 1
+          fi
+          CUBE_API_TOKEN="$(python3 ../../scripts/cube_cloud/mint_token.py)"
+          echo "::add-mask::$CUBE_API_TOKEN"
+          unset CUBE_CLOUD_API_SECRET
+          export CUBE_API_TOKEN
+          uv run pytest tests/integration/test_cube_cloud.py -q --tb=line -m cube_cloud
 
   clickhouse:
     # No repository gate and no environment: the target is a container this job

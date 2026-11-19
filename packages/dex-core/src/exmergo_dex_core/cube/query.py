@@ -134,6 +134,8 @@ def split_time(token: str, members: Mapping[str, Target]) -> tuple[str, str | No
     a member whose own name holds ``__`` is never cut in two.
     """
 
+    if token in members:
+        return token, None
     if "__" in token:
         head, tail = token.rsplit("__", 1)
         target = members.get(head)
@@ -217,11 +219,16 @@ def to_cube_query(
 
     # What an --order-by token may name, as written -> the member Cube orders by.
     # A bucketed time dimension is ordered by the dimension itself.
+    # Every exact grouped name first, bucketed ones included, and only then the
+    # generated aliases, so a member spelled exactly like an alias keeps its own
+    # sort key whatever order the group-by named them in.
     own = {token: token for token in (*measures, *dimensions)}
     for entry in times:
-        name = entry["dimension"]
-        own[name] = name
-        own[f"{name}__{entry['granularity']}"] = name
+        own.setdefault(entry["dimension"], entry["dimension"])
+    for entry in times:
+        own.setdefault(
+            f"{entry['dimension']}__{entry['granularity']}", entry["dimension"]
+        )
     order: list[list[str]] = []
     for raw in q.order_by:
         descending = raw.startswith("-")
@@ -560,6 +567,19 @@ def _compare(token: str, member: Member, found: Any, stale: Any) -> None:
         and _norm(entry.get("sql")) != _norm(member.sql)
     ):
         raise stale(token, "has different SQL there")
+    # Cube serves every member's SQL in `/v1/meta` (a `count` with none has
+    # none), so a member the repository defines with SQL and the server serves
+    # without any cannot be compared and is not passed as though it matched.
+    if member.sql is not None and entry.get("sql") is None:
+        raise stale(token, "has no SQL in the server's /v1/meta to compare")
+    # The other direction, for a measure: a `count` the repository defines with
+    # no SQL counts rows, and one served over a column counts that column's
+    # non-NULL values, so SQL the repository does not declare is a different
+    # measure, not an omission.
+    if kind == MEASURE and member.sql is None and entry.get("sql") is not None:
+        raise stale(
+            token, "is served with SQL the repository's member does not declare"
+        )
     if member.type == "time":
         served_grains = sorted(
             g.get("name")

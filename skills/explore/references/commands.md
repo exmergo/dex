@@ -171,7 +171,7 @@ with `references: <model>.<column>` is a declared join whose `declared_by` reads
 which is the usual case since a declared `references` renders one, it is one edge
 with both sources in `declaration_sources`.
 
-## `explore map [--detail] [--verify] [--use-project] [--full]`
+## `explore map [--detail] [--verify] [--use-project] [--full] [--include-elementary]`
 
 Writes or updates the `.dex/` cache and returns the map. Alongside the counts:
 
@@ -203,6 +203,21 @@ skipped this run keep their prior profiles (`carried_forward_count`), each
 stamped with its own `profiled_at`, so staleness is visible. Fresh cached
 profiles are reused the same way `profile` reuses them (`cache_hit_count`,
 `--refresh`).
+
+The Elementary dbt package's own tables (`dbt_run_results`,
+`data_monitoring_metrics`, `elementary_test_results` and the rest of its models)
+are left out of ranking, here and in `explore inventory --rank` (#1311). They are
+recognised from the warehouse by their signature: a namespace holding at least
+three of the package's table names, one of them a name only the package uses. In
+it, only the objects named like the package's models, or like the
+`<name>__tmp_<timestamp>` tables it leaves on BigQuery, are left out, so a project
+that builds the package into its own schema keeps its own tables ranked. They are
+not scored, not profiled (`--full` included) and not described in `data.objects`,
+and `data.excluded` names them (`count`, `reason: elementary`, `by_namespace`,
+`objects`, capped at 25 with the rest counted), apart from `data.skipped`. A note
+says so. When the question is about the package's data itself, read them as any
+other table (`explore profile`, `explore query`), or pass `--include-elementary`
+to rank them with the rest.
 
 ## `explore diagram [--full]`
 
@@ -562,6 +577,21 @@ it as `execution` (`dex` or `vendor`).
   grouping is `--group-by orders.ordered_at__month`; `--where` is Cube's JSON
   filter (`'{"member": "orders.status", "operator": "equals", "values":
   ["paid"]}'`).
+  `--api` has the Cube server execute over `/v1/load` instead,
+  `execution: vendor`, on any warehouse Cube supports: no `--confirm`, a
+  `cost guard unavailable` warning on every result, and the same PII gate before
+  anything is sent; a Cube Core is still held to the files first.
+  `scripts/setup_cube_dev.sh --execute` starts a Core that can execute.
+- `semantic.deployment: cube_cloud` (with `vendor: cube`) is the same files on
+  Cube Cloud. Cube Cloud executes by default, and `list` reads the deployment's
+  compiled `/v1/meta` (JS, Jinja and `extends` answered; no `relation` or
+  `column`, declared in `unavailable`; primary keys and private members absent),
+  with `definition_source: cube_cloud` and a warning that it was not checked
+  against the files. `--local` has Cube Cloud render and Dex execute, catalog
+  and checks from the files. `semantic.cube.url` (or `DEX_CUBE_URL`) is the
+  deployment's REST API base, with no default; the token is `CUBE_API_TOKEN`
+  from the environment, sent only to `*.cubecloudapp.dev` / `*.cubecloud.dev`
+  over https or a host named in `DEX_CUBE_ALLOWED_HOSTS`.
 - `semantic.vendor: databricks` reads the Databricks Metric View YAML files
   named in `semantic.databricks.files` statically (needs the `[metric-views]`
   extra; no workspace connection, nothing deployed), each validated by Dex's own

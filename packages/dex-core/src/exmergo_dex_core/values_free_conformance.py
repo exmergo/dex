@@ -641,6 +641,22 @@ def _coverage_fields() -> frozenset[str]:
     return _COMMON | frozenset(paths)
 
 
+#: ``data.skipped`` on ``map``: the rank cutoff's leftovers, names and counts.
+_SKIPPED = (
+    ".count",
+    ".by_namespace",
+    ".by_namespace[]",
+    ".by_namespace[].namespace",
+    ".by_namespace[].count",
+    ".objects",
+    ".objects[]",
+    ".elided",
+    ".elided_namespaces",
+)
+#: ``data.excluded`` on ``map`` and a ranked ``inventory`` (#1311): the same
+#: shape, plus the reason the objects were left out.
+_EXCLUDED = (*_SKIPPED, ".reason")
+
 #: Every key path a result in the mode may carry, per command. A path is the
 #: envelope ``data`` key chain with list positions written ``[]``. Reviewed: none
 #: of these holds a value read from a table (``cells`` holds the aggregates an
@@ -770,18 +786,9 @@ KNOWN_FIELDS: dict[str, frozenset[str]] = {
             "updated_at",
         }
     )
-    | _under(
-        "skipped",
-        ".count",
-        ".by_namespace",
-        ".by_namespace[]",
-        ".by_namespace[].namespace",
-        ".by_namespace[].count",
-        ".objects",
-        ".objects[]",
-        ".elided",
-        ".elided_namespaces",
-    )
+    | _under("skipped", *_SKIPPED)
+    # Ranking's left-out objects (#1311): identifiers and counts, never a value.
+    | _under("excluded", *_EXCLUDED)
     | _under("top_objects", "[]", "[].identifier", "[].rank_score")
     | _under(
         "objects",
@@ -829,6 +836,7 @@ KNOWN_FIELDS: dict[str, frozenset[str]] = {
     | _under("conflicts", *_CONFLICTS[1:]),
     "inventory": _COMMON
     | frozenset({"object_count", "ranked", "elided_object_count"})
+    | _under("excluded", *_EXCLUDED)
     | _under(
         "objects",
         "[]",

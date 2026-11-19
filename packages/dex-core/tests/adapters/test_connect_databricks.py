@@ -572,6 +572,7 @@ def test_shape_stats_ride_the_aggregate_batch(fake_databricks):
             "su_1": 0.8,
             "sp_1": 0.1,
             "st_1": 2.5,
+            "so_1": 0.25,
         }
     ]
     adapter = make_adapter(fake_databricks, ceiling=100_000.0)
@@ -584,12 +585,13 @@ def test_shape_stats_ride_the_aggregate_batch(fake_databricks):
     }
     sql = data_statements(fake_databricks)[0].sql
     assert "`email` RLIKE '" in sql
-    for alias in ("su_1", "sp_1", "st_1"):
+    for alias in ("su_1", "sp_1", "st_1", "so_1"):
         assert f" AS {alias}" in sql
     assert assert_select_only(sql, dialect="databricks") == sql
     assert aggs["email"].upper_vocab_fraction == pytest.approx(0.8)
     assert aggs["email"].person_shape_fraction == pytest.approx(0.1)
     assert aggs["email"].avg_token_count == pytest.approx(2.5)
+    assert aggs["email"].org_suffix_fraction == pytest.approx(0.25)
     # id was not requested: its shape fields stay None.
     assert aggs["id"].upper_vocab_fraction is None
     assert aggs["id"].person_shape_fraction is None

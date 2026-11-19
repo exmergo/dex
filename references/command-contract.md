@@ -152,6 +152,9 @@ dex config unset <key> [<key>...] -> removes settings with the same in-place edi
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
   [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
                                      it; both no-ops without --rank
+  [--include-elementary]             a ranked call leaves the Elementary dbt package's own tables out
+                                     (#1311), named in data.excluded with a note; this ranks them
+                                     with the rest. An unranked call lists every object
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings.
   [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
                                      payload, columns trails; by default columns is summarized to the
@@ -182,6 +185,9 @@ dex explore map [--detail]        -> write/update the .dex cache, and return the
                                      cap binds in every mode and every elision is
                                      counted in notes; --detail widens the selection,
                                      never the caps. No column value ever appears
+  [--include-elementary]             the Elementary dbt package's own tables are left out
+                                     of ranking and profiling (#1311), named in
+                                     data.excluded with a note; this ranks them
 dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
                                      free and connectionless (a store read, no warehouse);
                                      declared joins solid (a relationships test or a shared
@@ -481,7 +487,15 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      unknown with no plan) and what blocked each, the failing nodes,
                                      which deliverables anything checked (assurance.failed_checks
                                      lists each failed check's kind: a data_test by name, or a
-                                     contradicted record by kind, finding and join), what verification
+                                     contradicted record by kind, finding and join;
+                                     assurance.unchecked_tests lists, at most five with the rest
+                                     counted under elided, each passing test whose pass is not
+                                     counted, which makes no model asserted: an Elementary test
+                                     compiled to its no-results query, package_disabled or
+                                     compiled_to_no_results, or one judging the run against stored
+                                     history dex did not measure, whenever the package is enabled,
+                                     history_unmeasured, #1308),
+                                     what verification
                                      ran and suppressed, the declared obligations by status, and where the
                                      full evidence is, so a truncated read still has the answer.
                                      With --verify and a plan carrying a toggle (#1113),
@@ -566,7 +580,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      attempted them (#1114). baseline_never_built (model_built_at,
                                      rebuilt_after, row_count) is set where an input changed after
                                      the model's last build, so the verdict was computed against a
-                                     baseline no build wrote (#1387).
+                                     baseline no build wrote (#1387). A seed or snapshot the plan
+                                     changes makes it inputs_unsynchronized only where the proposed
+                                     model reads it, through any model upstream; the detail names it
+                                     and says to plan it on its own (#1429).
                                      --expect <json> | --expect-file <f> states an intended change
                                      (#1157): added and removed ("none", "any" or {"where": <row
                                      predicate over output columns, which may test a column with
@@ -1228,7 +1245,11 @@ diff, and a diff goes into git and stays there. So a seed's header is checked
 both against the PII detector `explore` profiles warehouse columns with and
 against the flags already in the `.dex/` cache. A column at or above the
 blocking threshold is refused, and the refusal names the `pii_overrides` entry
-that would clear it, never a value ([`pii-policy.md`](pii-policy.md)). The
+that would clear it, never a value ([`pii-policy.md`](pii-policy.md)). On a seed
+file the plan creates, a column whose strongest flag is exactly at the threshold
+and comes from its header name alone warns with that entry instead, since the
+plan authored it; a column a profile flagged, a rewrite of an existing seed, and
+any stronger flag still refuse. The
 standing limit is worth knowing: dex detects PII from names and types and never
 from values, everywhere, so a seed column named `code` full of email addresses
 passes this gate.
@@ -1295,6 +1316,14 @@ default, or a filter or operator after it is refused. A key naming a location
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests under `data_tests:` and PII flags in model and column `config.meta`)
   generated from the `.dex/` cache.
+- `transform plan` stamps a model it **creates** with the PII metadata of each
+  flagged input column it carries through (`config.meta.contains_pii` and
+  `pii_category`, with or without a declaration), and reports every judged
+  column under `data.pii_metadata` (#1100): a measuring aggregate is
+  `measured`, a constant standing in for a flagged column `redacted`, a hash or
+  other expression `unresolved` with a warning, a hand-written mark `kept` (or a
+  `disagreement`), and a model that already exists `not_written`. The rule and
+  the precedence: [`pii-policy.md`](pii-policy.md#pii-metadata-on-authored-models).
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it
@@ -2375,7 +2404,36 @@ largest first, each namespace being everything before an identifier's last dot),
 and `objects` in rank order, highest first, each list capped at 25 with the rest
 counted in `elided_namespaces` and `elided`. It is always present, so `count: 0`
 on a `--full` run is the positive statement that nothing was skipped, and it
-changes neither which objects are profiled nor the estimate. Objects skipped on a
+changes neither which objects are profiled nor the estimate.
+
+**Elementary's tables are left out of ranking (#1311).** A project that installs
+the `elementary-data/elementary` dbt package gets a schema of metadata tables
+the package writes on every run (`dbt_run_results`, `data_monitoring_metrics`,
+`elementary_test_results`), large enough to outrank the project's own tables on
+size. `explore inventory --rank` and `explore map` recognise them from the
+warehouse alone, by their signature: a namespace holding at least three of the
+package's table names (its models at releases 0.15.2 to 0.26.1), one of them a
+name only the package uses (`elementary_test_results`,
+`data_monitoring_metrics`, `schema_columns_snapshot`, ...). In such a namespace,
+each object named like one of the package's models, or like the
+`<name>__tmp_<timestamp>` tables it leaves behind on BigQuery, is the package's;
+nothing else in the namespace is, so a project that builds the package into its
+own schema keeps its own tables ranked. The project's `+schema` is not read:
+exploration starts bare, and a manifest parsed for the dev target names the dev
+namespace, never the production one being explored. A recognised table is not
+scored, not profiled by `map` (`--full` included), and not described in
+`data.objects` or `data.top_objects`, even where an earlier `explore profile`
+cached it; `map` keeps it in the cache as an inventory entry with no
+`rank_score`. A profile an earlier `--include-elementary` run cached outside this
+run's scope is carried forward as any out-of-scope profile is, recognised by the
+same signature, and left out the same way, its rank cleared. `data.excluded` names them: `count`, `reason` (`elementary`, or
+`null` when nothing was left out), `by_namespace`, and `objects` sorted by name,
+each list capped at 25 with the rest counted in `elided_namespaces` and
+`elided`. It is always present on `map` and on a ranked `inventory`, and apart
+from `data.skipped`, which is the rank cutoff's. A note names the namespaces and
+the way back. The tables stay readable: an unranked `explore inventory` lists
+them, `explore profile` and `explore query` read them as any other, and
+`--include-elementary` ranks them with the rest. Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`. A selected object whose cached profile is
 still fresh (same connector, schema unchanged, profiled within
