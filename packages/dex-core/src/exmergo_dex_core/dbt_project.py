@@ -265,7 +265,11 @@ def discover_projects(repo_root: Path | str = ".") -> list[Path]:
     The deeper search skips the directories in :data:`_DEEP_SEARCH_SKIP`, and
     never descends into a directory that is itself a project: anything under
     it belongs to that project, so a project nested inside another one does
-    not make the outer one ambiguous. Shared by ``find_project`` and
+    not make the outer one ambiguous. A project reached through a directory
+symlink counts too: ``os.walk`` never descends into one, so the symlink's
+own marker is checked directly, without following the link into its
+subtree. A marker that is a dangling symlink is not a project: only a
+regular file counts. Shared by ``find_project`` and
     ``transform init``'s already-exists refusal, so the two can never
     disagree."""
 
@@ -281,10 +285,20 @@ def discover_projects(repo_root: Path | str = ".") -> list[Path]:
             dirnames[:] = []
         else:
             dirnames[:] = [d for d in dirnames if d not in _DEEP_SEARCH_SKIP]
-        if PROJECT_FILE in filenames:
+        if PROJECT_FILE in filenames and (Path(dirpath) / PROJECT_FILE).is_file():
             found.append(Path(dirpath))
             # A project owns its subtree: do not descend into it.
             dirnames[:] = []
+            continue
+            # os.walk never descends into a symlinked directory, so a project
+        # reached through one is invisible to the walk above, while the scan
+        # before this one listed directory entries directly and found it.
+        # Check each eligible symlink's own marker here, without following
+        # the link into its subtree.
+        for name in dirnames:
+            link = Path(dirpath) / name
+            if link.is_symlink() and link.is_dir() and (link / PROJECT_FILE).is_file():
+                found.append(link)
     return sorted(found)
 
 
