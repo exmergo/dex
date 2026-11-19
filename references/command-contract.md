@@ -152,6 +152,9 @@ dex config unset <key> [<key>...] -> removes settings with the same in-place edi
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
   [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
                                      it; both no-ops without --rank
+  [--include-elementary]             a ranked call leaves the Elementary dbt package's own tables out
+                                     (#1311), named in data.excluded with a note; this ranks them
+                                     with the rest. An unranked call lists every object
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings.
   [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
                                      payload, columns trails; by default columns is summarized to the
@@ -182,6 +185,9 @@ dex explore map [--detail]        -> write/update the .dex cache, and return the
                                      cap binds in every mode and every elision is
                                      counted in notes; --detail widens the selection,
                                      never the caps. No column value ever appears
+  [--include-elementary]             the Elementary dbt package's own tables are left out
+                                     of ranking and profiling (#1311), named in
+                                     data.excluded with a note; this ranks them
 dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
                                      free and connectionless (a store read, no warehouse);
                                      declared joins solid (a relationships test or a shared
@@ -2380,7 +2386,34 @@ largest first, each namespace being everything before an identifier's last dot),
 and `objects` in rank order, highest first, each list capped at 25 with the rest
 counted in `elided_namespaces` and `elided`. It is always present, so `count: 0`
 on a `--full` run is the positive statement that nothing was skipped, and it
-changes neither which objects are profiled nor the estimate. Objects skipped on a
+changes neither which objects are profiled nor the estimate.
+
+**Elementary's tables are left out of ranking (#1311).** A project that installs
+the `elementary-data/elementary` dbt package gets a schema of metadata tables
+the package writes on every run (`dbt_run_results`, `data_monitoring_metrics`,
+`elementary_test_results`), large enough to outrank the project's own tables on
+size. `explore inventory --rank` and `explore map` recognise them from the
+warehouse alone, by their signature: a namespace holding at least three of the
+package's table names (its models at releases 0.15.2 to 0.26.1), one of them a
+name only the package uses (`elementary_test_results`,
+`data_monitoring_metrics`, `schema_columns_snapshot`, ...). In such a namespace,
+each object named like one of the package's models, or like the
+`<name>__tmp_<timestamp>` tables it leaves behind on BigQuery, is the package's;
+nothing else in the namespace is, so a project that builds the package into its
+own schema keeps its own tables ranked. The project's `+schema` is not read:
+exploration starts bare, and a manifest parsed for the dev target names the dev
+namespace, never the production one being explored. A recognised table is not
+scored, not profiled by `map` (`--full` included), and not described in
+`data.objects` or `data.top_objects`, even where an earlier `explore profile`
+cached it; `map` keeps it in the cache as an inventory entry with no
+`rank_score`. `data.excluded` names them: `count`, `reason` (`elementary`, or
+`null` when nothing was left out), `by_namespace`, and `objects` sorted by name,
+each list capped at 25 with the rest counted in `elided_namespaces` and
+`elided`. It is always present on `map` and on a ranked `inventory`, and apart
+from `data.skipped`, which is the rank cutoff's. A note names the namespaces and
+the way back. The tables stay readable: an unranked `explore inventory` lists
+them, `explore profile` and `explore query` read them as any other, and
+`--include-elementary` ranks them with the rest. Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`. A selected object whose cached profile is
 still fresh (same connector, schema unchanged, profiled within

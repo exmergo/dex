@@ -1086,6 +1086,7 @@ class DexEngine:
         rank: bool = False,
         limit: int | None = None,
         show_all: bool = False,
+        include_elementary: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> InventoryResult:
         from .explore import commands as explore
@@ -1098,6 +1099,7 @@ class DexEngine:
             rank=rank,
             limit=limit,
             show_all=show_all,
+            include_elementary=include_elementary,
             result_mode=mode,
         )
 
@@ -1162,6 +1164,7 @@ class DexEngine:
         refresh: bool = False,
         use_project: bool = False,
         use_hosted_semantic_layer: bool = False,
+        include_elementary: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> MapResult:
         from .explore import commands as explore
@@ -1178,6 +1181,7 @@ class DexEngine:
             refresh=refresh,
             use_project=use_project,
             use_hosted_semantic_layer=use_hosted_semantic_layer,
+            include_elementary=include_elementary,
             result_mode=mode,
         )
 

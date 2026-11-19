@@ -608,7 +608,12 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
     ("connect", "test"): {"method": "connect_test", "args": {}},
     ("explore", "inventory"): {
         "method": "inventory",
-        "args": {"rank": "rank", "limit": "limit", "all": "show_all"},
+        "args": {
+            "rank": "rank",
+            "limit": "limit",
+            "all": "show_all",
+            "include_elementary": "include_elementary",
+        },
     },
     ("explore", "profile"): {
         "method": "profile",
@@ -643,6 +648,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "refresh": "refresh",
             "use_project": "use_project",
             "use_hosted_semantic_layer": "use_hosted_semantic_layer",
+            "include_elementary": "include_elementary",
         },
     },
     ("explore", "diagram"): {"method": "diagram", "args": {"full": "full"}},
