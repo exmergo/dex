@@ -149,6 +149,34 @@ def test_discover_projects_is_bounded_in_depth(tmp_path: Path):
     assert discover_projects(beyond) == []
 
 
+def test_discover_projects_finds_symlinked_project_directory(
+    tmp_path: Path, tmp_path_factory: pytest.TempPathFactory, symlinks
+):
+    # CodeRabbit on #1438: os.walk never descends into a symlinked directory,
+    # so the deeper search missed a project reached through one, where the
+    # scan before it (iterdir) found it. The linked project lives outside the
+    # searched root, so the only way it is found is through the symlink itself.
+    target = _write_project(tmp_path_factory.mktemp("linked") / "project")
+    _write_project(tmp_path / "examples")
+    (tmp_path / "production").symlink_to(target, target_is_directory=True)
+    assert discover_projects(tmp_path) == [
+        tmp_path / "examples",
+        tmp_path / "production",
+    ]
+    with pytest.raises(DbtProjectError, match="multiple dbt projects"):
+        find_project(tmp_path)
+
+def test_discover_projects_ignores_dangling_project_marker(tmp_path: Path, symlinks):
+    # CodeRabbit on #1438: os.walk lists a dangling dbt_project.yml symlink in
+    # filenames, so the deeper search counted its directory as a project and
+    # reported false ambiguity, where the scan before it (is_file) did not.
+    _write_project(tmp_path / "analytics")
+    broken = tmp_path / "examples"
+    broken.mkdir()
+    (broken / "dbt_project.yml").symlink_to(tmp_path / "missing.yml")
+    assert discover_projects(tmp_path) == [tmp_path / "analytics"]
+    assert find_project(tmp_path) == tmp_path / "analytics"
+
 def test_resolve_target_returns_only_name_and_type(dbt_project_dir: Path):
     info = resolve_target(dbt_project_dir, None)
     assert info.name == "dev"
