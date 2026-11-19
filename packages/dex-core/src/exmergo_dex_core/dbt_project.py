@@ -133,6 +133,8 @@ def stale_semantic_files(project: Path | str) -> list[str]:
     except (OSError, yaml.YAMLError):
         return []
     model_paths = raw.get("model-paths", ["models"]) if isinstance(raw, dict) else []
+    if not isinstance(model_paths, list):
+        return []
     stale: list[str] = []
     for configured in model_paths:
         for path in sorted((root / str(configured)).rglob("*")):

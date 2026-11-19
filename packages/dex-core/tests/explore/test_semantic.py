@@ -926,6 +926,12 @@ def test_stale_semantic_files_names_only_newer_semantic_yaml(tmp_path: Path):
     assert dbt_project_module.stale_semantic_files(project) == []
 
 
+def test_stale_semantic_files_reads_a_null_model_paths_as_unreadable(tmp_path: Path):
+    project = _applied_after_parse(tmp_path)
+    (project / "dbt_project.yml").write_text("name: proj\nmodel-paths:\n")
+    assert dbt_project_module.stale_semantic_files(project) == []
+
+
 def test_local_list_warns_when_the_manifest_is_older_than_the_yaml(
     tmp_path: Path, monkeypatch
 ):
