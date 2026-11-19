@@ -478,7 +478,11 @@ not (`transform rename`, `transform remove`) refuses a payload carrying it rathe
 than dropping it. dex renders each declaration into the model's existing YAML entry
 with the splice primitives above, writing dbt's own constructs where they exist
 (`description`, `unique`/`not_null`/`relationships` tests) and `config.meta.dex` for
-the rest, and creates an entry beside the model's SQL only when there is none. A
+the rest, and creates an entry beside the model's SQL only when there is none.
+The same splice writes the PII stamps of a model the plan creates
+(`config.meta.contains_pii` and `pii_category`, with or without a declaration),
+reported under `data.pii_metadata`; the rule is in
+[`pii-policy.md`](pii-policy.md#pii-metadata-on-authored-models). A
 malformed declaration is refused with the fix named; missing intent is a warning,
 never a refusal. A plan carrying declarations or `schema_yml` edits is parsed by
 dbt before it is stored, and the plan, apply and build envelopes report the declared

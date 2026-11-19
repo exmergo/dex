@@ -32,7 +32,7 @@ import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_core import to_jsonable_python
 
-from .config import CONFIG_FILE, SEMANTIC_ENVIRONMENT, DexConfig
+from .config import CONFIG_FILE, SEMANTIC_ENVIRONMENT_BY_VENDOR, DexConfig
 from .diffs import file_diff
 from .envelope import redact, secret_like
 from .errors import ConfigurationError, RequestError
@@ -407,7 +407,8 @@ class ConfigDocument:
         self._collect(
             DexConfig, config.model_dump(mode="json"), self._mapping(), "", rows
         )
-        for name, variable in SEMANTIC_ENVIRONMENT.items():
+        vendor = getattr(getattr(config, "semantic", None), "vendor", None) or "dbt"
+        for name, variable in SEMANTIC_ENVIRONMENT_BY_VENDOR.get(vendor, {}).items():
             found = environ.get(variable)
             if not found:
                 continue

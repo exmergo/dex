@@ -481,7 +481,15 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      unknown with no plan) and what blocked each, the failing nodes,
                                      which deliverables anything checked (assurance.failed_checks
                                      lists each failed check's kind: a data_test by name, or a
-                                     contradicted record by kind, finding and join), what verification
+                                     contradicted record by kind, finding and join;
+                                     assurance.unchecked_tests lists, at most five with the rest
+                                     counted under elided, each passing test whose pass is not
+                                     counted, which makes no model asserted: an Elementary test
+                                     compiled to its no-results query, package_disabled or
+                                     compiled_to_no_results, or one judging the run against stored
+                                     history dex did not measure, whenever the package is enabled,
+                                     history_unmeasured, #1308),
+                                     what verification
                                      ran and suppressed, the declared obligations by status, and where the
                                      full evidence is, so a truncated read still has the answer.
                                      With --verify and a plan carrying a toggle (#1113),
@@ -566,7 +574,10 @@ dex transform compare [plan-id]   -> whether a stored, unapplied plan keeps one 
                                      attempted them (#1114). baseline_never_built (model_built_at,
                                      rebuilt_after, row_count) is set where an input changed after
                                      the model's last build, so the verdict was computed against a
-                                     baseline no build wrote (#1387).
+                                     baseline no build wrote (#1387). A seed or snapshot the plan
+                                     changes makes it inputs_unsynchronized only where the proposed
+                                     model reads it, through any model upstream; the detail names it
+                                     and says to plan it on its own (#1429).
                                      --expect <json> | --expect-file <f> states an intended change
                                      (#1157): added and removed ("none", "any" or {"where": <row
                                      predicate over output columns, which may test a column with
@@ -1228,7 +1239,11 @@ diff, and a diff goes into git and stays there. So a seed's header is checked
 both against the PII detector `explore` profiles warehouse columns with and
 against the flags already in the `.dex/` cache. A column at or above the
 blocking threshold is refused, and the refusal names the `pii_overrides` entry
-that would clear it, never a value ([`pii-policy.md`](pii-policy.md)). The
+that would clear it, never a value ([`pii-policy.md`](pii-policy.md)). On a seed
+file the plan creates, a column whose strongest flag is exactly at the threshold
+and comes from its header name alone warns with that entry instead, since the
+plan authored it; a column a profile flagged, a rewrite of an existing seed, and
+any stronger flag still refuse. The
 standing limit is worth knowing: dex detects PII from names and types and never
 from values, everywhere, so a seed column named `code` full of email addresses
 passes this gate.
@@ -1306,6 +1321,14 @@ default, or a filter or operator after it is refused. A key naming a location
   skipped too. A delete is never skipped, and neither is a model file the
   payload's `declarations` name: resending a model's SQL beside its declaration
   keeps the model in the plan, where a `--for-plan` build verifies it.
+- `transform plan` stamps a model it **creates** with the PII metadata of each
+  flagged input column it carries through (`config.meta.contains_pii` and
+  `pii_category`, with or without a declaration), and reports every judged
+  column under `data.pii_metadata` (#1100): a measuring aggregate is
+  `measured`, a constant standing in for a flagged column `redacted`, a hash or
+  other expression `unresolved` with a warning, a hand-written mark `kept` (or a
+  `disagreement`), and a model that already exists `not_written`. The rule and
+  the precedence: [`pii-policy.md`](pii-policy.md#pii-metadata-on-authored-models).
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

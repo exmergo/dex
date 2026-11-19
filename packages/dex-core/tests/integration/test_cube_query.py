@@ -1,4 +1,4 @@
-"""Live runs of a governed Cube metric query (#913): a real Cube Core renders.
+"""Live runs of a Cube metric query: a real Cube Core renders (#913) or executes (#914).
 
 The unit tests (``tests/cube_vendor``) replay what Cube rendered; these ask a
 running Cube Core for it, so a planner change, a model the server refuses, or a
@@ -11,9 +11,16 @@ suite owns. Postgres runs over the ``app`` schema ``scripts/postgres_seed.sql``
 seeds, read as ``dex_ro``. Both run every query case and are held to the same
 question asked in hand-written SQL.
 
+``--api`` (#914) asks the *executing* containers ``scripts/setup_cube_dev.sh
+--execute`` starts the same questions: Cube runs them on the same rows (DuckDB
+in memory from ``scripts/cube/shop.sql``, Postgres as ``dex_ro``), and every
+answer is held to the same hand-written SQL, and carries the cost-guard warning.
+
 Needs ``CUBEJS_API_SECRET`` and ``DEX_TEST_CUBE_URL_DUCKDB`` /
 ``DEX_TEST_CUBE_URL_POSTGRES`` (``source ~/.cache/dex-dogfood/cube.env``), plus
-``DEX_TEST_PG_DSN`` for Postgres, and the ``[semantic-api]`` extra for httpx.
+``DEX_TEST_PG_DSN`` for Postgres, and the ``[semantic-api]`` extra for httpx. The
+``cube_execute`` tests need ``DEX_TEST_CUBE_EXEC_URL_DUCKDB`` /
+``DEX_TEST_CUBE_EXEC_URL_POSTGRES`` too.
 """
 
 from __future__ import annotations
@@ -115,12 +122,17 @@ IDIOMS = {
 }
 
 
-def _check_every_case(capsys, root: Path, connector: str, by_hand, confirm: list[str]):
+def _check_every_case(
+    capsys, root: Path, connector: str, by_hand, confirm: list[str], *, api=False
+):
+    execution = "vendor" if api else "dex"
+    flags = [*confirm, *(["--api"] if api else [])]
     for case, sql in BY_HAND.items():
-        rc, envelope = _run(capsys, root, *_argv(case), *confirm)
+        rc, envelope = _run(capsys, root, *_argv(case), *flags)
         data = assert_ok(rc, envelope)["data"]
-        assert (data["vendor"], data["execution"]) == ("cube", "dex"), case
-        assert not any("cost guard" in w for w in envelope["warnings"]), case
+        assert (data["vendor"], data["execution"]) == ("cube", execution), case
+        guarded = [w for w in envelope["warnings"] if "cost guard" in w]
+        assert len(guarded) == (1 if api else 0), case
         want = _rounded(by_hand(sql.format(**IDIOMS[connector])))
         got = _rounded(data["cells"])
         if case.startswith("by_") and case != "by_status":
@@ -133,8 +145,9 @@ def _check_every_case(capsys, root: Path, connector: str, by_hand, confirm: list
         argv = ["explore", "semantic", "values", dimension]
         for metric in metrics:
             argv += ["--metric", metric]
-        rc, envelope = _run(capsys, root, *argv, *confirm)
+        rc, envelope = _run(capsys, root, *argv, *flags)
         data = assert_ok(rc, envelope)["data"]
+        assert data["execution"] == execution, case
         assert data["scoped_to"] == metrics, case
         assert data["cells"], case
 
@@ -242,3 +255,83 @@ def test_a_live_cube_enforces_dex_scopes_and_refuses_load():
         timeout=10.0,
     )
     assert load.status_code == 403
+
+
+# --- --api: an executing Cube Core runs the query (#914) -----------------------------
+
+
+def _duckdb_by_hand(path: Path):
+    import duckdb
+
+    def by_hand(sql: str):
+        conn = duckdb.connect(str(path), read_only=True)
+        try:
+            return conn.execute(sql).fetchall()
+        finally:
+            conn.close()
+
+    return by_hand
+
+
+@pytest.mark.cube_execute
+def test_duckdb_api_answers_every_case_executed_by_a_live_cube(tmp_path, capsys):
+    """The executing container built its in-memory DuckDB from shop.sql; dex's
+    file is built from the same statements, so the hand-written answer and
+    Cube's are over one set of rows."""
+
+    root = _repo(
+        tmp_path,
+        "duckdb",
+        os.environ["DEX_TEST_CUBE_EXEC_URL_DUCKDB"],
+        {"duckdb": {"path": str(tmp_path / "shop.duckdb")}},
+    )
+    write_shop(tmp_path / "shop.duckdb")
+
+    _check_every_case(
+        capsys, root, "duckdb", _duckdb_by_hand(tmp_path / "shop.duckdb"), [], api=True
+    )
+
+
+@pytest.mark.cube_execute
+@pytest.mark.postgres
+def test_postgres_api_answers_every_case_executed_by_a_live_cube(
+    tmp_path, capsys, pg_dsn, monkeypatch
+):
+    """Cube runs the query, so there is no estimate to confirm: the first call
+    answers, with the cost guard said to be unavailable."""
+
+    import psycopg
+
+    monkeypatch.setenv("DATABASE_URL", pg_dsn)
+    root = _repo(
+        tmp_path,
+        "postgres",
+        os.environ["DEX_TEST_CUBE_EXEC_URL_POSTGRES"],
+        {"postgres": {"schemas": ["app"]}, "budget": integration_budget(None)},
+    )
+
+    def by_hand(sql: str):
+        with psycopg.connect(pg_dsn) as conn:
+            return conn.execute(sql).fetchall()
+
+    _check_every_case(capsys, root, "postgres", by_hand, [], api=True)
+
+
+@pytest.mark.cube_execute
+def test_a_live_executing_cube_refuses_a_load_token_a_render():
+    """A load token claims meta and data, so the executing server refuses it
+    /v1/sql, as the render server refuses a render token /v1/load."""
+
+    import httpx
+
+    from exmergo_dex_core.cube.transport import LOAD_SCOPES, mint_token
+
+    url = os.environ["DEX_TEST_CUBE_EXEC_URL_DUCKDB"]
+    token = mint_token(os.environ["CUBEJS_API_SECRET"], scopes=LOAD_SCOPES)
+    query = {"query": {"measures": ["orders.count"]}}
+    headers = {"Authorization": token}
+
+    load = httpx.post(f"{url}/v1/load", headers=headers, json=query, timeout=30.0)
+    assert load.status_code == 200, load.text
+    sql = httpx.post(f"{url}/v1/sql", headers=headers, json=query, timeout=30.0)
+    assert sql.status_code == 403

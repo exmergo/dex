@@ -955,3 +955,151 @@ def test_model_scoped_unit_test_completion_requires_all_scoped_tests():
     assert "orders.atomic" in completion.deliverables.built.names
     assert "customers.atomic" in completion.deliverables.missing.names
     assert completion.outcome == "partial"
+
+
+# --- a pass that checked nothing (#1308) -----------------------------------------
+
+
+def _elementary_nodes() -> tuple[list[BuildNode], dict[str, list[str]]]:
+    """``only_anomaly`` has one Elementary test; ``with_builtin`` has the same
+    test beside a dbt ``not_null``; ``failing_anomaly`` has one that failed."""
+
+    tests = {
+        "test.dex_test.volume_only.1": ("volume_only", "pass", "only_anomaly"),
+        "test.dex_test.volume_with.2": ("volume_with", "pass", "with_builtin"),
+        "test.dex_test.not_null_with.3": ("not_null_with", "pass", "with_builtin"),
+        "test.dex_test.volume_failing.4": ("volume_failing", "fail", "failing_anomaly"),
+    }
+    nodes = [
+        BuildNode(unique_id=_uid(name), name=name, status="success")
+        for name in ("only_anomaly", "with_builtin", "failing_anomaly")
+    ] + [
+        BuildNode(unique_id=uid, name=name, resource_type="test", status=status)
+        for uid, (name, status, _) in tests.items()
+    ]
+    graph = {uid: [_uid(model)] for uid, (_, _, model) in tests.items()}
+    return nodes, graph
+
+
+def test_a_model_whose_only_test_checked_nothing_is_build_only():
+    nodes, graph = _elementary_nodes()
+    unchecked = {
+        "test.dex_test.volume_only.1": "package_disabled",
+        "test.dex_test.volume_with.2": "package_disabled",
+        "test.dex_test.volume_failing.4": "history_unmeasured",
+    }
+    completion = summarize_completion(
+        _evidence(nodes, required=["only_anomaly", "with_builtin", "failing_anomaly"]),
+        None,
+        graph=graph,
+        unchecked_tests=unchecked,
+    )
+    assurance = completion.assurance
+    assert assurance.build_only.names == ["only_anomaly"]
+    # The dbt test still checks its model, and is not listed.
+    assert assurance.asserted.names == ["with_builtin"]
+    # A failure read something, so it stands as one.
+    assert assurance.failed_checks.names == ["failing_anomaly"]
+    assert [t.model_dump() for t in assurance.unchecked_tests] == [
+        {
+            "test": "volume_only",
+            "models": ["only_anomaly"],
+            "reason_code": "package_disabled",
+        },
+        {
+            "test": "volume_with",
+            "models": ["with_builtin"],
+            "reason_code": "package_disabled",
+        },
+    ]
+
+
+def test_without_unchecked_tests_the_key_is_absent():
+    nodes, graph = _elementary_nodes()
+    completion = summarize_completion(
+        _evidence(nodes, required=["only_anomaly"]), None, graph=graph
+    )
+    assert "unchecked_tests" not in completion.data()["assurance"]
+    assert "only_anomaly" in completion.assurance.asserted.names
+
+
+def test_unchecked_tests_beyond_the_cap_are_counted():
+    nodes = [BuildNode(unique_id=_uid("m"), name="m", status="success")]
+    graph: dict[str, list[str]] = {}
+    unchecked: dict[str, str] = {}
+    for i in range(9):
+        uid = f"test.dex_test.anomaly_{i}.{i}"
+        nodes.append(
+            BuildNode(
+                unique_id=uid, name=f"anomaly_{i}", resource_type="test", status="pass"
+            )
+        )
+        graph[uid] = [_uid("m")]
+        unchecked[uid] = "history_unmeasured"
+    completion = summarize_completion(
+        _evidence(nodes, required=["m"]), None, graph=graph, unchecked_tests=unchecked
+    )
+    assert len(completion.assurance.unchecked_tests) == 5
+    assert completion.elided["assurance.unchecked_tests"] == 4
+    assert completion.assurance.build_only.names == ["m"]
+
+
+def test_with_a_plan_only_tests_on_a_deliverable_are_listed():
+    nodes, graph = _elementary_nodes()
+    unchecked = {
+        "test.dex_test.volume_only.1": "history_unmeasured",
+        "test.dex_test.volume_with.2": "history_unmeasured",
+    }
+    completion = summarize_completion(
+        _evidence(nodes, required=["only_anomaly"]),
+        None,
+        graph=graph,
+        unchecked_tests=unchecked,
+    )
+    assert [t.test for t in completion.assurance.unchecked_tests] == ["volume_only"]
+    assert completion.assurance.build_only.names == ["only_anomaly"]
+
+
+def test_a_versioned_deliverable_named_by_its_file_stem_keeps_its_tests_listed():
+    """A plan requires ``dim_customers_v2`` (the file stem), the node's label
+    is ``dim_customers.v2``, and the test names its model by the label."""
+
+    uid = "model.dex_test.dim_customers.v2"
+    test = "test.dex_test.volume_dim.1"
+    nodes = [
+        BuildNode(unique_id=uid, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=test, name="volume_dim", resource_type="test", status="pass"
+        ),
+    ]
+    completion = summarize_completion(
+        _evidence(nodes, required=["dim_customers_v2"]),
+        None,
+        graph={test: [uid]},
+        unchecked_tests={test: "history_unmeasured"},
+    )
+    assert [t.test for t in completion.assurance.unchecked_tests] == ["volume_dim"]
+
+
+def test_the_warning_counts_the_unchecked_tests_the_cap_cut(monkeypatch):
+    from exmergo_dex_core.transform import commands
+
+    nodes = [BuildNode(unique_id=_uid("m"), name="m", status="success")]
+    graph: dict[str, list[str]] = {}
+    unchecked: dict[str, str] = {}
+    for i in range(9):
+        uid = f"test.dex_test.anomaly_{i}.{i}"
+        nodes.append(
+            BuildNode(
+                unique_id=uid, name=f"anomaly_{i}", resource_type="test", status="pass"
+            )
+        )
+        graph[uid] = [_uid("m")]
+        unchecked[uid] = "history_unmeasured"
+    monkeypatch.setattr(commands, "_unchecked_tests", lambda inputs: unchecked)
+    result = BuildResult(
+        success=True, summary={"success": True}, evidence=_evidence(nodes)
+    )
+    commands._attach_completion(result, None, {"graph": graph})
+    assert len(result.completion.assurance.unchecked_tests) == 5
+    assert any(line.startswith("9 passing Elementary") for line in result.warnings)
