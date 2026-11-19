@@ -298,3 +298,73 @@ def test_a_json_value_containing_the_column_clause_is_masked_whole():
     assert SENTINEL not in masked
     assert "tail" not in masked
     assert masked.endswith(f"{VALUE_WITHHELD} when casting from source column j")
+
+
+# A value that holds a line break is complete on no single line (#1412).
+_FIRST, _SECOND = "zq_first_part", "zq_second_part"
+
+
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_a_value_that_spans_a_line_break_is_masked_whole(quote):
+    masked = mask_values(
+        f"Conversion Error: Could not convert string {quote}{_FIRST}\n"
+        f"{_SECOND}{quote} to INT32 when casting from source column account_id"
+    )
+    assert _FIRST not in masked
+    assert _SECOND not in masked
+    assert masked == (
+        f"Conversion Error: Could not convert string {VALUE_WITHHELD} to INT32 "
+        "when casting from source column account_id"
+    )
+
+
+def test_a_value_that_spans_a_line_break_is_masked_by_the_conversion_marker():
+    """An unlisted shape still loses a value that runs onto the next line."""
+
+    masked = mask_values(
+        f"Conversion Error: unable to parse '{_FIRST}\n{_SECOND}' as a number"
+    )
+    assert masked == f"Conversion Error: unable to parse {VALUE_WITHHELD} as a number"
+
+
+def test_masking_a_value_that_spans_a_line_break_is_idempotent():
+    once = mask_values(f"Could not convert string '{_FIRST}\n{_SECOND}' to INT32")
+    assert mask_values(once) == once
+
+
+def test_the_lines_after_a_masked_value_keep_their_quoted_names():
+    message = (
+        f"Could not convert string '{SENTINEL}' to INT32\n"
+        "HINT: check the column 'account_id'"
+    )
+    assert mask_values(message) == (
+        f"Could not convert string {VALUE_WITHHELD} to INT32\n"
+        "HINT: check the column 'account_id'"
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Parsing Error: The metric 'dnf\ncount' does not exist",
+        "Catalog Error: Table with name 'a\nb' does not exist!",
+    ],
+)
+def test_a_name_that_spans_a_line_break_outside_a_conversion_failure_is_kept(message):
+    assert mask_values(message) == message
+
+
+def test_warehouse_refusal_masks_a_value_that_spans_a_line_break():
+    refusal = warehouse_refusal(
+        f"Could not convert string '{_FIRST}\n{_SECOND}' to INT32\nLINE 1: select 1"
+    )
+    assert _FIRST not in refusal.detail
+    assert _SECOND not in refusal.detail
+    assert refusal.detail == f"Could not convert string {VALUE_WITHHELD} to INT32"
+
+
+def test_failure_text_masks_a_value_that_spans_a_line_break():
+    exc = RuntimeError(f"Could not convert string '{_FIRST}\n{_SECOND}' to INT32")
+    assert failure_text(exc) == (
+        f"RuntimeError: Could not convert string {VALUE_WITHHELD} to INT32"
+    )
