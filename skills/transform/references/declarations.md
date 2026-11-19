@@ -132,21 +132,26 @@ test keeps failing, and the last run in which a claim was checked and passed.
   field, its columns and its parameters, with names folded to lower case. It is
   never made from the test's name. Two facts on one column get two ids,
   including the two tests of one grain, since either can fail alone. A grain
-  column also declared `null_rule: never` has one `not_null`, which carries the
-  null rule's claim.
+  column also declared `null_rule: never` has one `not_null`. It carries the
+  claim of the fact rendered first: the null rule's when both are declared
+  together, and the grain's when the null rule is declared after it.
 - **After the first render, the file holds the id.** A test the column already
   lists by name is left as written. Renaming the test (`name:`), declaring the
   same fact again or editing the rest of the declaration leaves its claim alone,
   and a plan shows no diff on it. Read the id from the file, not by recomputing
   it. A model renamed with `transform rename` keeps its tests' ids, since the
-  rename does not touch them. A fact that changes (a `references` to another
+  rename does not touch them. A new model that later takes the old name and
+  declares the same facts derives the same ids, so a history kept across a
+  rename should key on the claim and the tested node, not the claim alone. A fact that changes (a `references` to another
   parent) gets no new id, because the test already listed under that name is
   kept as written.
 - **Tests Dex rendered before claims.** A test that is exactly what Dex
   rendered earlier (the flag, the same arguments, nothing else) gets its claim
   the next time the declaration renders, and that one key is the only change. A
   bare `not_null` or `unique` could have been written by a person, so it stays
-  bare (#1350), as does a test with any other config or a claim already.
+  bare (#1350), as does a test with any other config or a claim already, a test
+  whose YAML is an anchor another test aliases, and a version's inherited test,
+  which only a declaration of the shared entry claims.
 - **Tests that check no declared fact carry no claim.** The scaffold's tests
   and the `not_null` or `unique` that `maintain reconcile` adds are not
   declarations. `maintain reconcile` still treats a claimed `not_null` as Dex's

@@ -299,3 +299,25 @@ def test_a_plan_that_re_renders_an_entry_shows_no_diff_on_an_unchanged_claim(
         if line[:1] in "+-" and line[:3] not in ("+++", "---")
     ]
     assert changed and not any("claim" in line for line in changed)
+
+
+def test_a_test_whose_yaml_another_test_aliases_is_left_as_written():
+    # A claim written into a shared anchor would land on both tests.
+    shared = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: order_id\n"
+        "        data_tests:\n"
+        "          - unique: &rendered\n"
+        "              config:\n"
+        "                meta:\n"
+        "                  disable_test_samples: true\n"
+        "          - not_null: *rendered\n"
+    )
+
+    out = _render(shared, {"model": "fct_orders", "grain": ["order_id"]})
+
+    assert _claims(out, "order_id") == [None, None]
+    assert out.split("    columns:\n")[1] == shared.split("    columns:\n")[1]

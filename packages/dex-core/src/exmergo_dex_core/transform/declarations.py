@@ -1985,7 +1985,9 @@ def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
     carries no claim, is Dex's own earlier render of the same fact, and gains
     that spec's ``config.meta.dex.claim`` and nothing else (#1448). A bare test,
     a test with other arguments or config, and a test that already carries any
-    claim are someone's, or a fact since changed, and stay as written (#1350).
+    claim are someone's, or a fact since changed, and stay as written (#1350),
+    and so does a test whose YAML is aliased elsewhere, which a claim written
+    into it would reach through the alias.
     """
 
     for spec in specs:
@@ -2008,6 +2010,10 @@ def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
         if index is None:
             continue
         item = listed[1].value[index]
+        if _carries_anchor(root, item):
+            # An anchored body shared with another test would take this claim
+            # too; the test stays as written rather than claim two checks.
+            continue
         [(_name_node, body)] = item.value
         if listed[1].flow_style or item.flow_style:
             # The whole item is Dex's render on one span; restated with the claim.
