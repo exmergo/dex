@@ -179,6 +179,39 @@ def test_discover_projects_ignores_dangling_project_marker(tmp_path: Path, symli
     assert find_project(tmp_path) == tmp_path / "analytics"
 
 
+def test_discover_projects_deduplicates_a_symlinked_alias(tmp_path: Path, symlinks):
+    # CodeRabbit on #1438: a symlink alias of a project (production ->
+    # transform/dbt) made the same directory two candidates, so find_project
+    # refused a layout the scan before this PR resolved to one candidate.
+    # Two paths to one directory are one project.
+    real = _write_project(tmp_path / "transform" / "dbt")
+    (tmp_path / "production").symlink_to(real, target_is_directory=True)
+    found = discover_projects(tmp_path)
+    assert len(found) == 1
+    assert found[0].resolve() == real.resolve()
+    assert find_project(tmp_path).resolve() == real.resolve()
+
+
+def test_discover_projects_reports_a_root_project_with_a_deeper_one(
+    tmp_path: Path,
+):
+    # CodeRabbit on #1438: a project at the repository root used to hide the
+    # projects below it, the same shallow-hides-deeper shape as #589 at depth
+    # zero. The root is reported together with the deeper project.
+    _write_project(tmp_path)
+    deep = _write_project(tmp_path / "transform" / "dbt")
+    assert discover_projects(tmp_path) == [tmp_path, deep]
+    with pytest.raises(DbtProjectError, match="multiple dbt projects"):
+        find_project(tmp_path)
+
+
+def test_discover_projects_returns_only_the_root_project(tmp_path: Path):
+    # A repository whose only project is at the root behaves as before.
+    root = _write_project(tmp_path)
+    assert discover_projects(tmp_path) == [root]
+    assert find_project(tmp_path) == root
+
+
 def test_resolve_target_returns_only_name_and_type(dbt_project_dir: Path):
     info = resolve_target(dbt_project_dir, None)
     assert info.name == "dev"
