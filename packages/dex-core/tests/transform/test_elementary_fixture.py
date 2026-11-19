@@ -495,3 +495,51 @@ def test_the_resolver_reads_variant_d_as_enabled_where_the_project_enables_it(
     assert (record.enabled, record.hooks) == (True, "run")
     assert all(record.uploads.values())
     assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- a pass that checked nothing (#1308) -----------------------------------------
+
+#: ``fct``'s two Elementary tests, and a second model whose only test is one.
+ELEMENTARY_FCT_TESTS = {
+    "elementary_volume_anomalies_fct_ordered_at",
+    "elementary_schema_changes_fct_",
+}
+ONLY_VOLUME = "elementary_volume_anomalies_only_volume_ordered_at"
+
+
+@requires_elementary
+@pytest.mark.parametrize(
+    ("variant", "code"), [("d", "package_disabled"), ("a", "history_unmeasured")]
+)
+def test_an_elementary_test_that_checked_nothing_asserts_no_model(
+    tmp_path: Path, installed_elementary: Path, variant: str, code: str
+):
+    """Variant d disables the package's models on dev, so its tests compile to
+    the no-results query; variant a enables them on a dev target with no
+    history. Either way the Elementary tests pass and are listed unchecked, a
+    model whose only test is one is ``build_only``, and ``fct``, which has dbt's
+    own tests too, is still ``asserted`` with none of those listed."""
+
+    project = elementary_project(tmp_path, variant, installed_elementary)
+    (project / "models" / "only_volume.sql").write_text(
+        "select * from {{ ref('fct') }}\n", encoding="utf-8"
+    )
+    (project / "models" / "only_volume.yml").write_text(
+        "version: 2\nmodels:\n  - name: only_volume\n    data_tests:\n"
+        "      - elementary.volume_anomalies:\n"
+        "          timestamp_column: ordered_at\n",
+        encoding="utf-8",
+    )
+    result = _engine(project).build(target="dev")
+
+    assurance = result.completion.assurance
+    listed = {t.test: (t.models, t.reason_code) for t in assurance.unchecked_tests}
+    assert listed == {
+        **{name: (["fct"], code) for name in ELEMENTARY_FCT_TESTS},
+        ONLY_VOLUME: (["only_volume"], code),
+    }
+    # With the package enabled its own models crowd the capped build_only
+    # names, so only_volume is told apart by not being asserted.
+    assert assurance.asserted.names == ["fct"]
+    assert not FCT_TESTS - ELEMENTARY_FCT_TESTS & set(listed)
+    assert any("unchecked_tests" in line for line in result.warnings)

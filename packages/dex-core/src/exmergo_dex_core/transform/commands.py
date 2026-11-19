@@ -7751,12 +7751,50 @@ def _attach_completion(
             incremental_replay=_incremental_replay_inputs(result, inputs),
             repair=inputs.get("repair"),
             population_accepted=inputs.get("population_accepted"),
+            unchecked_tests=_unchecked_tests(inputs),
         )
+        # The list may be capped, or cut whole by the budget: the count is
+        # what was listed plus what the cut took.
+        unchecked = len(
+            result.completion.assurance.unchecked_tests or []
+        ) + result.completion.elided.get("assurance.unchecked_tests", 0)
+        if unchecked:
+            # A pointer line, like verification's, so a caller reading the
+            # warnings alone learns that a passing test vouched for nothing.
+            result.warnings.append(
+                f"{unchecked} passing Elementary test(s) are not counted toward "
+                "any model's assurance (compiled to the package's no-results "
+                "query, or judged against history dex did not measure); they are "
+                "under data.completion.assurance.unchecked_tests with a "
+                "reason_code, any past the list's cap counted in "
+                "data.completion.elided"
+            )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
+    """The tests whose pass checked nothing in this build, with why (#1308).
+
+    Read from the build's own manifest, which holds each test's compiled SQL,
+    and from what the installed Elementary package does for the target that
+    manifest was parsed for. A project without the package has none. Best
+    effort: an unreadable manifest leaves every test counted as it was.
+    """
+
+    manifest = inputs.get("manifest")
+    project = inputs.get("project")
+    if not isinstance(manifest, dict) or project is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        runtime = elementary_mod.read(project, manifest)
+        return dict(elementary_mod.unchecked_tests(manifest, runtime)) or None
+    return None
 
 
 def _incremental_replay_inputs(
