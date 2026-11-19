@@ -116,6 +116,42 @@ def semantic_manifest_file(project: Path | str) -> Path:
     return readable_artifact(project, "semantic_manifest.json")
 
 
+def stale_semantic_files(project: Path | str) -> list[str]:
+    """Semantic YAML files written after the semantic manifest a reader would use.
+
+    ``transform apply`` writes the YAML and leaves the compiled manifest alone, so
+    until ``dbt parse`` runs, a local read answers from the old layer (#1269,
+    #1417). Only files newer than the manifest are parsed, to see whether their
+    top level declares ``semantic_models`` or ``metrics``. Empty with no manifest,
+    which has its own message.
+    """
+
+    root = Path(project)
+    try:
+        compiled = semantic_manifest_file(root).stat().st_mtime
+        raw = yaml.safe_load((root / PROJECT_FILE).read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return []
+    model_paths = raw.get("model-paths", ["models"]) if isinstance(raw, dict) else []
+    stale: list[str] = []
+    for configured in model_paths:
+        for path in sorted((root / str(configured)).rglob("*")):
+            if path.suffix not in (".yml", ".yaml"):
+                continue
+            try:
+                if path.stat().st_mtime <= compiled or not path.is_file():
+                    continue
+                parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, yaml.YAMLError):
+                continue
+            if (
+                isinstance(parsed, dict)
+                and {"semantic_models", "metrics"} & parsed.keys()
+            ):
+                stale.append(path.relative_to(root).as_posix())
+    return stale
+
+
 # The ref()/source() call shapes as they appear in model SQL, schema YAML test
 # arguments, and semantic-model `model:` fields. Shared by every reader that
 # traces a dbt-level name, so they can never disagree on what counts as a ref.

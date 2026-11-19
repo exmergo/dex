@@ -242,7 +242,10 @@ dex explore semantic query <m,m>  -> one governed metric query, capped and row-m
   [--order-by <c>] [--grain <g>]     connector, PII gate, read-only assertion, relation pre-check and cost
   [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
                                      server-side where dex's cost guard is structurally unavailable and every
-                                     result says so
+                                     result says so. A local list, values or query read from a compiled
+                                     semantic manifest older than a semantic YAML file warns with the file and
+                                     `dbt parse`, and so does its refusal of an unknown metric or dimension or
+                                     a query that fails to resolve
 dex init [<name>]                -> complete project setup: new dbt-backed Dex project,
                                      complete DuckDB demo, existing dbt adoption, or
                                      exploration without dbt. .dex/ stays at repo root;

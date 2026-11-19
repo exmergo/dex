@@ -10,6 +10,7 @@ and the honest hosted cost posture.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import ClassVar
 
@@ -882,6 +883,121 @@ def test_local_list_reads_manifest(tmp_path: Path):
     assert "order__status" in orders.dimensions
     assert "metric_time" in orders.dimensions
     assert any(e.name == "order" for e in catalog.entities)
+
+
+def _applied_after_parse(tmp_path: Path) -> Path:
+    """The manifest of `_write_manifest`, then a semantic YAML written after it, as
+    `transform apply` leaves a project until the next `dbt parse` (#1269, #1417)."""
+
+    project = _write_manifest(tmp_path)
+    (project / "dbt_project.yml").write_text("name: proj\nmodel-paths: [models]\n")
+    (project / "models").mkdir()
+    semantic = project / "models" / "orders.yml"
+    semantic.write_text(
+        "metrics:\n  - name: revenue\n    type: simple\n"
+        "    type_params:\n      measure: order_count\n"
+    )
+    (project / "models" / "docs.yml").write_text("models:\n  - name: orders\n")
+    manifest = project / "target" / "semantic_manifest.json"
+    os.utime(manifest, (1_000, 1_000))
+    return project
+
+
+def test_stale_semantic_files_names_only_newer_semantic_yaml(tmp_path: Path):
+    project = _applied_after_parse(tmp_path)
+    assert dbt_project_module.stale_semantic_files(project) == ["models/orders.yml"]
+
+    # Read as YAML, so a quoted or indented top-level key counts too.
+    (project / "models" / "quoted.yml").write_text('"metrics":\n  - name: margin\n')
+    (project / "models" / "indented.yml").write_text(
+        "  semantic_models:\n    - name: x\n"
+    )
+    assert dbt_project_module.stale_semantic_files(project) == [
+        "models/indented.yml",
+        "models/orders.yml",
+        "models/quoted.yml",
+    ]
+    for name in ("quoted.yml", "indented.yml"):
+        (project / "models" / name).unlink()
+
+    manifest = project / "target" / "semantic_manifest.json"
+    manifest.touch()
+    os.utime(project / "models" / "orders.yml", (500, 500))
+    assert dbt_project_module.stale_semantic_files(project) == []
+
+
+def test_local_list_warns_when_the_manifest_is_older_than_the_yaml(
+    tmp_path: Path, monkeypatch
+):
+    backend = _local(_applied_after_parse(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    envelope = to_envelope(semantic_commands.semantic_list(_engine()))
+
+    assert [m["name"] for m in envelope.data["metrics"]] == ["orders"]
+    assert len(envelope.warnings) == 1
+    assert "models/orders.yml" in envelope.warnings[0]
+    assert "`dbt parse`" in envelope.warnings[0]
+
+
+def test_local_list_of_an_applied_metric_names_the_stale_manifest(
+    tmp_path: Path, monkeypatch
+):
+    backend = _local(_applied_after_parse(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    with pytest.raises(sem.SemanticBackendError) as raised:
+        semantic_commands.semantic_list(_engine(), metrics=["revenue"])
+    assert "no such metric in this semantic layer: revenue" in str(raised.value)
+    assert "older than models/orders.yml" in str(raised.value)
+
+
+def test_local_query_of_an_applied_metric_names_the_stale_manifest(tmp_path: Path):
+    backend = _local(_applied_after_parse(tmp_path))
+
+    def unknown(_q):
+        raise ValueError("The given input does not exactly match any known metrics.")
+
+    backend._render = unknown
+    with pytest.raises(sem.SemanticBackendError) as raised:
+        backend.query(SemanticQuery(metrics=["revenue"]))
+    assert "does not exactly match any known metrics" in str(raised.value)
+    assert "older than models/orders.yml" in str(raised.value)
+    assert "`dbt parse`" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("ask", "refusal"),
+    [
+        (lambda b: b.values("order__status", ["revenue"]), "no such metric"),
+        (lambda b: b.values("order__is_big", []), "no such dimension"),
+        (
+            lambda b: semantic_commands.semantic_list(
+                _engine(), for_dimensions=["order__is_big"]
+            ),
+            "no such dimension",
+        ),
+    ],
+    ids=["values-metric", "values-dimension", "list-for-dimension"],
+)
+def test_local_refusals_of_an_applied_name_name_the_stale_manifest(
+    tmp_path: Path, monkeypatch, ask, refusal
+):
+    backend = _local(_applied_after_parse(tmp_path))
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    with pytest.raises(sem.SemanticBackendError) as raised:
+        ask(backend)
+    assert refusal in str(raised.value)
+    assert "older than models/orders.yml" in str(raised.value)
+
+
+def test_local_list_says_nothing_when_the_manifest_is_current(
+    tmp_path: Path, monkeypatch
+):
+    project = _applied_after_parse(tmp_path)
+    (project / "target" / "semantic_manifest.json").touch()
+    os.utime(project / "models" / "orders.yml", (500, 500))
+    backend = _local(project)
+    monkeypatch.setattr(sem, "resolve_backend", lambda *a, **k: backend)
+    assert to_envelope(semantic_commands.semantic_list(_engine())).warnings == []
 
 
 def _described_manifest(tmp_path: Path) -> Path:
