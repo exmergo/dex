@@ -267,7 +267,10 @@ def test_the_pii_stamp_lands_under_config_meta_and_tests_under_data_tests():
         "contains_pii": True,
         "pii_category": "email",
     }
-    assert columns["id"]["data_tests"] == ["unique", "not_null"]
+    assert columns["id"]["data_tests"] == [
+        {"unique": {"config": {"meta": {"disable_test_samples": True}}}},
+        {"not_null": {"config": {"meta": {"disable_test_samples": True}}}},
+    ]
     assert not any("tests" in c for c in entry["columns"])
 
 
@@ -704,3 +707,65 @@ def test_a_model_reading_another_relation_is_not_repointed(dbt_project_dir: Path
         scaffold_edits(["lake.app.orders"], store, dbt_project_dir)
     edits = scaffold_edits(["memory.app.orders"], store, dbt_project_dir)
     assert any(e.path.endswith("stg_orders.sql") for e in edits)
+
+
+def test_scaffolded_tests_carry_disable_test_samples_and_reconcile_removes_not_null():
+    """A scaffolded test tells Elementary to keep no sample of failing rows (#1351).
+
+    The scaffold emits the unsampled test mapping, and ColumnTests parses
+    the resulting flow mapping so downstream drift reconciliation can surgically
+    remove not_null when nulls appear while preserving sibling tests.
+    """
+
+    from exmergo_dex_core.cache import ColumnProfile, Dataset
+    from exmergo_dex_core.transform.rewrite import (
+        _unsampled,
+        column_tests,
+        column_tests_span,
+    )
+    from exmergo_dex_core.transform.scaffold import model_edits
+
+    dataset = Dataset(
+        identifier="db.main.orders",
+        columns=[
+            ColumnProfile(name="order_id", data_type="INTEGER", nullable=False),
+            ColumnProfile(name="customer_id", data_type="INTEGER", nullable=False),
+            ColumnProfile(name="status", data_type="VARCHAR", nullable=True),
+        ],
+        candidate_keys=[["order_id"]],
+    )
+    yaml_edit = next(e for e in model_edits(dataset) if e.path.endswith(".yml"))
+    content = yaml_edit.new_content
+    parsed = yaml.safe_load(content)["models"][0]
+    columns = {c["name"]: c for c in parsed["columns"]}
+
+    assert columns["order_id"]["data_tests"] == [
+        _unsampled("unique"),
+        _unsampled("not_null"),
+    ]
+    assert columns["customer_id"]["data_tests"] == [_unsampled("not_null")]
+    assert "data_tests" not in columns["status"]
+
+    order_key_tests = column_tests(content, "stg_orders", "order_id")
+    assert order_key_tests is not None
+    assert order_key_tests.values == ["unique", "not_null"]
+
+    # When nulls appear on order_id, reconcile removes not_null and preserves unique
+    span = column_tests_span(content, order_key_tests, ["unique"], key="data_tests")
+    assert span is not None
+    start, end, repl = span
+    reconciled = content[:start] + repl + content[end:]
+    reconciled_parsed = yaml.safe_load(reconciled)["models"][0]
+    reconciled_cols = {c["name"]: c for c in reconciled_parsed["columns"]}
+    assert reconciled_cols["order_id"]["data_tests"] == [_unsampled("unique")]
+
+    # When nulls appear on customer_id, its sole not_null test list is removed entirely
+    customer_tests = column_tests(content, "stg_orders", "customer_id")
+    assert customer_tests is not None
+    span = column_tests_span(content, customer_tests, [], key="data_tests")
+    assert span is not None
+    start, end, repl = span
+    reconciled_cust = content[:start] + repl + content[end:]
+    reconciled_cust_parsed = yaml.safe_load(reconciled_cust)["models"][0]
+    reconciled_cust_cols = {c["name"]: c for c in reconciled_cust_parsed["columns"]}
+    assert "data_tests" not in reconciled_cust_cols["customer_id"]

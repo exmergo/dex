@@ -1615,8 +1615,15 @@ def test_the_grain_estimate_prices_every_scan_the_grain_run_executes():
 def test_pii_flag_cannot_carry_an_example_value():
     # Structural guarantee: the flag type has no field for a sample value, so PII
     # can be recorded as (column, category, confidence) but never surfaced.
-    assert set(PIIFlag.model_fields) == {"category", "confidence"}
+    assert set(PIIFlag.model_fields) == {"category", "confidence", "refinement"}
     assert "value" not in ColumnProfile.model_fields
+    # The one field added since (#647) is a closed vocabulary naming the shape
+    # rule that decided, so it cannot hold free text either.
+    from exmergo_dex_core.cache import ShapeRefinement
+
+    assert PIIFlag.model_fields["refinement"].annotation == ShapeRefinement | None
+    with pytest.raises(ValueError):
+        PIIFlag(category="name", confidence=0.6, refinement="Ada Lovelace")
 
 
 def test_pii_flag_lives_on_the_column_profile():

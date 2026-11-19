@@ -188,12 +188,29 @@ class Deliverables(BaseModel):
     note: str | None = None
 
 
+class UncheckedTest(BaseModel):
+    """A test that passed without checking the rows it reads (#1308).
+
+    ``reason_code`` is ``package_disabled`` (an Elementary test that compiled
+    to the package's no-results query because its models are disabled for the
+    target), ``compiled_to_no_results`` (the same query with the package
+    enabled) or ``history_unmeasured`` (an Elementary test that judges this
+    run against history earlier runs stored, which dex does not measure).
+    """
+
+    test: str
+    models: list[str] = Field(default_factory=list)
+    reason_code: str
+
+
 class Assurance(BaseModel):
     """Whether anything checked the rows of what was built.
 
     ``asserted`` is a deliverable a passing test reads, or one a verification
     record judged ``satisfied``. ``build_only`` built and nothing checked it:
-    the build says dbt ran its SQL, not that its answer is right.
+    the build says dbt ran its SQL, not that its answer is right. A test under
+    ``unchecked_tests`` passed having checked nothing, so it makes no
+    deliverable ``asserted`` (#1308).
     """
 
     basis: Literal["required", "built_models"] = "built_models"
@@ -202,6 +219,9 @@ class Assurance(BaseModel):
     #: failure is under ``checks`` with its kind (#1162).
     failed_checks: FailedChecks = Field(default_factory=FailedChecks)
     build_only: NameList = Field(default_factory=NameList)
+    #: Each passing test that checked nothing, with why. Present only when
+    #: there is one, so the block is unchanged for a project without them.
+    unchecked_tests: list[UncheckedTest] | None = None
 
 
 class Blocker(BaseModel):
@@ -750,26 +770,44 @@ def _checked(
     evidence: BuildEvidence,
     graph: Mapping[str, list[str]],
     verification: Mapping[str, Any] | None,
-) -> tuple[set[str], set[str], dict[str, list[FailedCheck]]]:
+    unchecked: Mapping[str, str] | None = None,
+) -> tuple[set[str], set[str], dict[str, list[FailedCheck]], list[UncheckedTest]]:
     """Models whose built rows something in this run checked: those every
-    check passed on, those a check failed on, and each model's failed checks
-    with their kind.
+    check passed on, those a check failed on, each model's failed checks
+    with their kind, and the passing tests that checked nothing.
 
     Data tests and verification records read the built relation. A unit test
     reads fixtures, so it vouches for the SQL and not for the rows, and is not
-    counted here.
+    counted here. A test ``unchecked`` names (by unique id, with its reason
+    code) passed without reading the rows, so its pass counts for no model; a
+    failure of it still counts, since a failing test read something (#1308).
     """
 
+    unchecked = unchecked or {}
     label_of = {n.unique_id: n.name for n in evidence.nodes}
     passed: set[str] = set()
     failed: set[str] = set()
     failures: dict[str, list[FailedCheck]] = {}
+    empty: list[UncheckedTest] = []
     for node in evidence.nodes:
         if not node.unique_id.startswith("test."):
             continue
         status = node.status.lower()
         failing = status in FAILED_STATUSES or status == "warn"
         if not failing and status not in _PASSING_TEST:
+            continue
+        if not failing and node.unique_id in unchecked:
+            empty.append(
+                UncheckedTest(
+                    test=node.name,
+                    models=[
+                        label_of.get(parent) or parent.split(".")[2]
+                        for parent in graph.get(node.unique_id, [])
+                        if parent.startswith("model.")
+                    ],
+                    reason_code=unchecked[node.unique_id],
+                )
+            )
             continue
         for parent in graph.get(node.unique_id, []):
             if not parent.startswith("model."):
@@ -801,7 +839,32 @@ def _checked(
                             join=_bounded(join) if isinstance(join, str) else None,
                         )
                     )
-    return passed - failed, failed, failures
+    return passed - failed, failed, failures, empty
+
+
+def _covered(
+    tests: list[UncheckedTest], evidence: BuildEvidence, covered: list[str]
+) -> list[UncheckedTest]:
+    """The unchecked tests on a model the assurance covers.
+
+    Over the same models the rest of the assurance is: a test on a model
+    outside it vouches for nothing this block reports. A test names its models
+    by label (``dim_customers.v2``) and a deliverable may be the file stem
+    (``dim_customers_v2``), so each label is matched by every name its node
+    answers to.
+    """
+
+    wanted = set(covered)
+    answers = {
+        n.name: node_answers(n)
+        for n in evidence.nodes
+        if n.unique_id.startswith("model.") or n.resource_type == "model"
+    }
+    return [
+        t
+        for t in tests
+        if any(answers.get(model, {model}) & wanted for model in t.models)
+    ]
 
 
 def _bounded(text: str, limit: int = _MESSAGE) -> str:
@@ -920,6 +983,7 @@ def summarize_completion(
     incremental_replay: Mapping[str, Mapping[str, Any]] | None = None,
     repair: Mapping[str, Any] | None = None,
     population_accepted: Mapping[str, Any] | None = None,
+    unchecked_tests: Mapping[str, str] | None = None,
     budget: int = COMPLETION_BUDGET_BYTES,
 ) -> BuildCompletion:
     """Reduce a build's evidence to the bounded block that leads its payload.
@@ -944,6 +1008,11 @@ def summarize_completion(
     population changes it accepted (#1230). ``outcome`` is
     ``built_unverified`` where the evidence reads ``validated`` and any reason
     under ``unverified`` stands; the evidence's own outcome is unchanged.
+
+    ``unchecked_tests`` maps the unique id of each test whose pass checked
+    nothing to its reason code (:func:`~.elementary.unchecked_tests`, #1308):
+    such a pass makes no deliverable ``asserted``, and each that reads a model
+    the assurance covers is listed under ``assurance.unchecked_tests``.
     """
 
     from .scope_gate import accepted_key
@@ -951,7 +1020,9 @@ def summarize_completion(
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
     blockers = _blockers(evidence, causes, prerequisites or ())
-    asserted, failed_checks, failures = _checked(evidence, graph, verification)
+    asserted, failed_checks, failures, empty = _checked(
+        evidence, graph, verification, unchecked_tests
+    )
     failed_names = list(dict.fromkeys(n for n in built_names if n in failed_checks))
     statuses = Counter(n.status.lower() for n in evidence.nodes)
     completion = BuildCompletion(
@@ -975,6 +1046,7 @@ def summarize_completion(
             build_only=_names(
                 n for n in built_names if n not in asserted and n not in failed_checks
             ),
+            unchecked_tests=_covered(empty, evidence, built_names) or None,
         ),
         verification=_verification(
             verification, findings_dropped, verification_offered
@@ -1541,6 +1613,13 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
         _NAMES,
         "assurance.failed_checks.checks",
     )
+    if completion.assurance.unchecked_tests is not None:
+        cap_list(
+            completion.assurance,
+            "unchecked_tests",
+            _NAMES,
+            "assurance.unchecked_tests",
+        )
     completion.elided = dict(elided)
     if completion.size() <= budget:
         return
@@ -1596,6 +1675,13 @@ def _fit(completion: BuildCompletion, budget: int) -> None:
             keep,
             "assurance.failed_checks.checks",
         )
+        if completion.assurance.unchecked_tests is not None:
+            cap_list(
+                completion.assurance,
+                "unchecked_tests",
+                keep,
+                "assurance.unchecked_tests",
+            )
         # The first blocked deliverable is the last thing to go: it is the
         # answer to "is the change done", which is what the block is for.
         cap_list(
