@@ -1028,6 +1028,7 @@ def test_shape_stats_ride_the_aggregate_batch(fake_bq_client):
             "su_1": 0.8,
             "sp_1": 0.1,
             "st_1": 2.5,
+            "so_1": 0.25,
         }
     ]
     adapter = make_adapter(fake_bq_client)
@@ -1040,12 +1041,13 @@ def test_shape_stats_ride_the_aggregate_batch(fake_bq_client):
     }
     sql = next(c.sql for c in fake_bq_client.query_calls if not c.dry_run)
     assert "REGEXP_CONTAINS(`email`, r'" in sql
-    for alias in ("su_1", "sp_1", "st_1"):
+    for alias in ("su_1", "sp_1", "st_1", "so_1"):
         assert f" AS {alias}" in sql
     assert assert_select_only(sql, dialect="bigquery") == sql
     assert aggs["email"].upper_vocab_fraction == pytest.approx(0.8)
     assert aggs["email"].person_shape_fraction == pytest.approx(0.1)
     assert aggs["email"].avg_token_count == pytest.approx(2.5)
+    assert aggs["email"].org_suffix_fraction == pytest.approx(0.25)
     # id was not requested: its shape fields stay None.
     assert aggs["id"].upper_vocab_fraction is None
     assert aggs["id"].person_shape_fraction is None
@@ -1959,8 +1961,13 @@ def test_an_external_table_with_a_composite_grain_scaffolds_the_right_tests(
     yaml_text = _model_yaml(dataset)
     # A composite key means not_null on each member and no column-level unique,
     # which is the test suite a lakehouse staging model should ship with.
-    assert "tests: [unique, not_null]" not in yaml_text
-    assert yaml_text.count("tests: [not_null]") == 3
+    assert "unique" not in yaml_text
+    assert (
+        yaml_text.count(
+            "data_tests: [{not_null: {config: {meta: {disable_test_samples: true}}}}]"
+        )
+        == 3
+    )
 
 
 # --- a warehouse that changes mid-command, and the dev target ----------------------

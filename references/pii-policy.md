@@ -31,10 +31,10 @@ confidence against the blocking threshold.
 | Surface | Gate | Effect |
 |---|---|---|
 | min and max suppression | presence, any confidence | the extremes are never computed, so no raw value leaves the engine |
-| dbt `meta` stamping | presence, any confidence | the flag is stamped into model and column `config.meta` |
+| dbt `meta` stamping | presence, any confidence | the flag is stamped into model and column `config.meta`, on a scaffolded model, a reconciled column and a model `transform plan` creates (see [PII metadata on authored models](#pii-metadata-on-authored-models)) |
 | cluster feature selection | presence, any confidence | flagged columns are excluded; naming one is opt-in and mean only |
 | the query firewall | threshold | at or above, projection is refused; below, it runs with a warning |
-| the seed header gate | threshold | a seed column at or above the threshold is refused |
+| the seed header gate | threshold | a seed column at or above the threshold is refused, except that on a seed file the plan creates, a flag exactly at the threshold that only the header name raised warns and names the override |
 | declaration population reporting | presence, any confidence | a flagged filter withholds its values and the entire free-text population rule |
 | the semantic request gate | presence, any confidence | a flagged dimension refuses the whole command |
 | warehouse error text | none: every column | the value a conversion failure quotes is masked (see [Warehouse error text](#warehouse-error-text)) |
@@ -49,6 +49,18 @@ because dbt deprecated a top-level `meta` and dbt Fusion rejects it. The key nam
 are unchanged from earlier releases, because tools outside dex read them. Readers
 accept a stamp in either location, preferring `config.meta`, so a project
 scaffolded by an older dex keeps working without a rewrite.
+
+## The refinement verdict
+
+A generic `*_name` flag is the one flag value-shape evidence may move, and the
+profile reports which rule decided it as `refinement` beside its category and
+confidence: `person_shape` (raised to 0.75), `reference_vocabulary`,
+`label_text`, `enumeration` or `organization` (each de-rated to 0.3), and
+`partial_person_shape`, `unsettled` or `no_evidence` (each leaving the name's
+0.6 standing). A flag from any other pattern carries no `refinement`. The
+query firewall's refusal names the verdict of a generic name flag that still
+blocks, so a reader learns why it held. The rules themselves are in
+[`methodology.md`](methodology.md).
 
 ## The threshold
 
@@ -92,6 +104,32 @@ information for the user, not an error to fix.
 
 Unnested JSON and array outputs inherit the source column's flags.
 
+### Elementary's schema
+
+The Elementary dbt package writes source values into its own schema, in columns
+whose names give no sign of it (#1310). The firewall holds them whatever the
+cache flagged, and a `pii_overrides` entry does not clear them, since they are
+held for where their values come from:
+
+- `result_row` (`test_result_rows`) and `result_rows` (`elementary_test_results`
+  and the `alerts_*` views): a test's failing rows, serialized. Held at the
+  blocking threshold; a measuring aggregate over them runs.
+- `dimension_value` (`data_monitoring_metrics`, `metrics_anomaly_score`): the raw
+  values of whichever column each row's `dimension` names. It carries the flags
+  of the columns the SELECT that reads the table bounds its rows to, with a
+  top-level `dimension = '<column>'` or `dimension IN (...)` over string literals,
+  each name taking the flags of every profiled column of that name. With no such
+  bound, or a name no profiled column carries, it is held: rows a removed
+  monitoring test wrote stay in the table.
+- A relation in a schema named `elementary` or `*_elementary` that is none of the
+  package's models (a test's whole result, written there with
+  `tests_use_temp_tables`) is refused as a whole, a count included.
+
+`explore profile` records no minimum, maximum or value domain for any of these.
+The models are recognised by name in any schema; the schema rule reads the
+schema's name, so a project that gives the package another schema name gets the
+column rules only.
+
 ## Protected values and transformation columns
 
 A refusal to return protected values to an agent does not instruct it to remove,
@@ -109,7 +147,52 @@ Only a human may clear a PII flag.
 
 Permission belongs to the command and operation being performed. A supported
 model pass-through does not authorize exporting the field as a seed: the seed
-header gate still applies because seed values enter the repository. If a
+header gate still applies because seed values enter the repository. The one
+relaxation is for a seed file the plan creates, whose columns were authored in
+that same plan: a column whose strongest flag is exactly at the threshold and
+comes from its header name alone (a name pattern such as `*_note`, read as free
+text at 0.5) warns and names the `pii_overrides` entry instead of refusing. A
+column a profile already flagged is a warehouse column being exported and still
+refuses, as do a rewrite of an existing seed and any stronger flag (an email, a
+person-name token, a generic name at 0.6).
+
+## PII metadata on authored models
+
+A model `transform plan` creates carries the PII stamps of the inputs it passes
+through, as a scaffolded model always has, so a column reads as sensitive in dbt
+metadata however dex authored the model. The plan reports each column it judged
+under `data.pii_metadata.models.<model>.columns.<column>`, with its `status`,
+the input it came `from`, the `evidence` (`profile`, or `upstream_metadata`
+where only the upstream model's own stamp says so), and never a value.
+
+| An output column that | Status | Stamped |
+|---|---|---|
+| carries a flagged column unchanged, or under another name | `stamped` | yes |
+| carries it through a function that keeps the value (a cast, `lower`/`upper`/`trim`, `coalesce`, `min`/`max`, `any_value`, `lag`) | `stamped` | yes |
+| measures it (`count`, `count(distinct ...)`, `sum`, `avg` and the other measuring aggregates) | `measured` | no |
+| is a constant or a typed NULL standing in for a flagged column of its name | `redacted` | no |
+| computes anything else from it (a hash, a concatenation, a `CASE`) | `unresolved` | no, and a warning names both fixes |
+| reads an input no profile and no stamp covers | `unchecked` (`unprofiled_input`) | no |
+| reads an input whose own stamp says `contains_pii: false` | `cleared_upstream` | no |
+
+The stamp is written the way scaffold writes it: `contains_pii: true` and
+`pii_category` on the column, and `contains_pii: true` on the model, under
+`config.meta`. Where the plan writes no YAML for the model, a minimal entry is
+written beside its SQL holding only the stamped columns; where the plan or the
+project already holds the model's entry, the stamp is spliced into it, and every
+other key, comment and model in that file is left as it was.
+
+What a person wrote wins. A PII mark already on the output column is `kept`; a
+mark saying it is not PII is kept too and reported as a `disagreement`, never
+overwritten. A `pii_overrides` entry naming the output column reports it as
+`overridden` and stamps nothing, and an override on the input clears the flag
+before the stamper sees it. A model entry that keeps its metadata under a
+top-level `meta` is reported `not_written` (`top_level_meta`), since a
+`config.meta` beside it is a dbt parse error.
+
+A model that already exists is reported and never written: each flagged column
+it carries without a stamp is `not_written` (`existing_model`) with a warning.
+Nothing here clears a flag, drops or redacts an output column, or reads a value. If a
 transformation itself is prohibited or unsupported, report that limitation
 accurately and leave the guard in place. Never bypass a privacy or dev-target
 guard or infer permission from another command's success.

@@ -184,7 +184,14 @@ _EXECUTION_DEPLOYMENTS: dict[str, dict[str, str]] = {
 # who executes and leave the configured deployment alone: Cube renders over
 # `/v1/sql` and dex executes, or Cube executes over `/v1/load` (#914).
 _INDEPENDENT_EXECUTIONS: dict[str, tuple[str, ...]] = {
-    "cube": (EXECUTION_DEX,),
+    "cube": (EXECUTION_DEX, EXECUTION_VENDOR),
+}
+
+# Who executes on each such deployment when neither flag is given: dex on a Cube
+# Core the user runs, Cube on Cube Cloud, as dbt Cloud executes for itself.
+_DEFAULT_EXECUTIONS: dict[tuple[str, str], str] = {
+    ("cube", "local"): EXECUTION_DEX,
+    ("cube", "cube_cloud"): EXECUTION_VENDOR,
 }
 
 
@@ -218,6 +225,21 @@ def _local_cube(engine: Any) -> SemanticLayer:
     from .cube import LocalCubeLayer
 
     return LocalCubeLayer.from_engine(engine)
+
+
+def _cube_cloud_render(engine: Any) -> SemanticLayer:
+    from .cube import LocalCubeLayer
+
+    return LocalCubeLayer.from_engine(engine, deployment="cube_cloud")
+
+
+def _cube_vendor(deployment: str) -> Callable[[Any], SemanticLayer]:
+    def build(engine: Any) -> SemanticLayer:
+        from .cube_vendor import CubeVendorLayer
+
+        return CubeVendorLayer.from_engine(engine, deployment=deployment)
+
+    return build
 
 
 def _local_metric_views(engine: Any) -> SemanticLayer:
@@ -265,6 +287,14 @@ _BACKENDS: dict[tuple[str, str], Callable[[Any], SemanticLayer]] = {
     ("snowflake", "snowflake_account"): _account_semantic_views,
 }
 
+# The vendors whose deployment and execution are independent, keyed by all three.
+_EXECUTION_BACKENDS: dict[tuple[str, str, str], Callable[[Any], SemanticLayer]] = {
+    ("cube", "local", EXECUTION_DEX): _local_cube,
+    ("cube", "local", EXECUTION_VENDOR): _cube_vendor("local"),
+    ("cube", "cube_cloud", EXECUTION_DEX): _cube_cloud_render,
+    ("cube", "cube_cloud", EXECUTION_VENDOR): _cube_vendor("cube_cloud"),
+}
+
 # Deployments dex executes itself, so a hosted semantic source (a dbt Cloud
 # token) has no meaning for them and is refused rather than ignored. Keyed by
 # the pair for the same reason the table above is.
@@ -289,10 +319,9 @@ _SOURCE_REFUSALS: dict[tuple[str, str], str] = {
         "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
     ),
     ("cube", "local"): (
-        "a semantic source supplies a hosted dbt Cloud token and has no "
-        "meaning for Cube model files, which are files in this repository. "
-        "Drop the source, or select a hosted dbt semantic layer with "
-        "semantic.vendor: dbt and semantic.deployment: dbt_cloud"
+        "a semantic source supplies a hosted token and has no meaning for a Cube "
+        "Core, which verifies tokens dex mints from CUBEJS_API_SECRET. Drop the "
+        "source, or set semantic.deployment: cube_cloud to send it to Cube Cloud"
     ),
     ("databricks", "local"): (
         "a semantic source supplies a hosted dbt Cloud token and has no "
@@ -344,17 +373,29 @@ def resolve_semantic_layer(
     configured = getattr(semantic, "deployment", None) or getattr(
         semantic, "backend", None
     )
-    if (api or local) and vendor in _INDEPENDENT_EXECUTIONS:
-        execution = EXECUTION_VENDOR if api else EXECUTION_DEX
+    if vendor in _INDEPENDENT_EXECUTIONS:
+        deployment = canonical_semantic_deployment(configured or "local")
+        if api or local:
+            execution = EXECUTION_VENDOR if api else EXECUTION_DEX
+        else:
+            execution = _DEFAULT_EXECUTIONS.get((vendor, deployment), EXECUTION_DEX)
         if execution not in _INDEPENDENT_EXECUTIONS[vendor]:
             raise SemanticBackendError(
-                f"semantic vendor '{vendor}' has no hosted execution (--api) in "
-                "this release: dex asks a Cube server to render SQL over /v1/sql "
-                "and executes it itself under the cost guard, and does not yet "
-                "have Cube execute a query over /v1/load. Drop --api"
+                f"semantic vendor '{vendor}' has no "
+                f"{'hosted' if api else 'local'} execution in this release"
             )
-        deployment = canonical_semantic_deployment(configured or "local")
-    elif api or local:
+        build = _EXECUTION_BACKENDS.get((vendor, deployment, execution))
+        if build is None:
+            raise SemanticBackendError(
+                f"vendor '{vendor}' has no deployment '{deployment}'; use one of "
+                f"{', '.join(SEMANTIC_DEPLOYMENTS[vendor])} (or pass --local / --api)"
+            )
+        if getattr(engine, "semantic_source", None) is not None:
+            refusal = _SOURCE_REFUSALS.get((vendor, deployment))
+            if refusal is not None:
+                raise SemanticBackendError(refusal)
+        return build(engine)
+    if api or local:
         execution = EXECUTION_VENDOR if api else EXECUTION_DEX
         try:
             deployment = _EXECUTION_DEPLOYMENTS[vendor][execution]
@@ -408,6 +449,11 @@ def resolve_hosted_semantic_layer(engine: Any) -> SemanticLayer:
         or "local"
     )
     if configured != "local":
+        return resolve_semantic_layer(engine)
+    # A vendor whose local deployment already reads its repository's files has
+    # no hosted catalog to fold in: Cube's `--api` on a Core is the same files.
+    vendor = (getattr(semantic, "vendor", None) or "dbt").strip().lower()
+    if vendor in _INDEPENDENT_EXECUTIONS:
         return resolve_semantic_layer(engine)
     return resolve_semantic_layer(engine, api=True)
 

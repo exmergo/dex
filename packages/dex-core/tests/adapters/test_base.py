@@ -3,6 +3,8 @@ reaches the same way, tested once here rather than six times over."""
 
 from __future__ import annotations
 
+import pytest
+
 from exmergo_dex_core.adapters.base import (
     affordable_combinations,
     key_shape_expressions,
@@ -142,6 +144,57 @@ def test_every_fraction_builder_keeps_its_decimal_literals_by_default():
         "AVG(CASE WHEN regexp_like(\"c\", '^[A-Z]+([ -][A-Z]+)*$') THEN 1.0 "
         'WHEN "c" IS NOT NULL THEN 0.0 END) AS su_0'
     )
+
+
+def test_shape_stats_read_back_through_one_helper():
+    """Every adapter reads the shape statistics through one helper, so a new
+    statistic (#647's organization suffix) reaches every connector at once."""
+
+    from exmergo_dex_core.adapters.base import shape_aggregate_kwargs
+
+    row = {"su_3": 0.1, "sp_3": 0.0, "st_3": 1.5, "so_3": 0.75}
+    assert shape_aggregate_kwargs(row, 3, True) == {
+        "upper_vocab_fraction": 0.1,
+        "person_shape_fraction": 0.0,
+        "avg_token_count": 1.5,
+        "org_suffix_fraction": 0.75,
+    }
+    assert set(shape_aggregate_kwargs(row, 3, False).values()) == {None}
+
+
+def test_an_organization_suffix_is_not_counted_as_person_shape():
+    """'Bell Labs' is two capitalized words: the person-shape fraction excludes a
+    value ending in an organization suffix, and the suffix rides as `so_`."""
+
+    person, org = shape_stat_expressions('"c"', 0, _regexp)[1::2]
+    assert 'AND NOT (regexp_like("c", \'^(.*[ ,])?(Inc|' in person
+    assert person.endswith("AS sp_0")
+    assert org.endswith("AS so_0")
+
+
+@pytest.mark.parametrize(
+    ("value", "matches"),
+    [
+        ("Acme Inc", True),
+        ("Acme Inc.", True),
+        ("Hooli, LLC", True),
+        ("Stability AI", True),
+        ("Bell Labs", True),
+        ("Globex Corporation", True),
+        ("AI", True),
+        ("Grace Hopper", False),
+        ("OpenAI", False),
+        ("Kain", False),
+        ("Collabs", False),
+        ("Ai Weiwei", False),
+    ],
+)
+def test_the_organization_suffix_pattern(value: str, matches: bool):
+    import re
+
+    from exmergo_dex_core.adapters.base import ORG_SUFFIX_PATTERN
+
+    assert bool(re.fullmatch(ORG_SUFFIX_PATTERN, value)) is matches
 
 
 def test_double_literals_reach_every_fraction():

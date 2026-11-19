@@ -8,6 +8,7 @@ Elementary package from the dbt hub, so they run only with
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -495,3 +496,170 @@ def test_the_resolver_reads_variant_d_as_enabled_where_the_project_enables_it(
     assert (record.enabled, record.hooks) == (True, "run")
     assert all(record.uploads.values())
     assert not (tmp_path / "prod.duckdb").exists()
+
+
+#: The work a build's estimate leaves out on each variant (#1309): the hooks and
+#: the monitoring tests where the package runs, the per-test extras only where
+#: its materialization handles the tests.
+UNPRICED = {
+    "a": ["elementary_hooks", "elementary_monitoring_tests", "elementary_test_extras"],
+    "b": ["elementary_hooks", "elementary_monitoring_tests"],
+    "d": [],
+}
+
+
+@requires_elementary
+@pytest.mark.parametrize("variant", sorted(UNPRICED))
+def test_build_cost_names_what_each_variant_does_not_price(
+    tmp_path: Path, installed_elementary: Path, variant: str
+):
+    from exmergo_dex_core.transform.elementary import read, unpriced_work
+
+    project = elementary_project(tmp_path, variant, installed_elementary)
+    manifest = _parsed(project, "dev")
+    text = (project / "dbt_project.yml").read_text("utf-8")
+    work = unpriced_work(read(project, manifest), manifest, text)
+
+    assert work.codes == UNPRICED[variant]
+    assert len(work.warnings()) == len(UNPRICED[variant])
+    if variant != "d":
+        # The fixture's one anomaly test, at the package's default window.
+        anomaly = [t for t in work.gated_tests if t.days_back is not None]
+        assert [(t.days_back, t.days_back_source) for t in anomaly] == [(14, "default")]
+
+
+@requires_elementary
+def test_build_cost_names_nothing_for_a_project_without_the_package(
+    tmp_path: Path, installed_elementary: Path
+):
+    from exmergo_dex_core.transform.elementary import read, unpriced_work
+
+    project = elementary_project(tmp_path, "b", installed_elementary)
+    for name in ("packages.yml", "package-lock.yml"):
+        (project / name).unlink()
+    shutil.rmtree(project / "dbt_packages")
+    (project / "models" / "schema.yml").write_text(
+        "version: 2\nmodels:\n  - name: fct\n    columns:\n      - name: id\n"
+        "        data_tests: [unique, not_null]\n",
+        encoding="utf-8",
+    )
+    project_yml = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+    project_yml["models"].pop("elementary")
+    (project / "dbt_project.yml").write_text(yaml.safe_dump(project_yml), "utf-8")
+    manifest = _parsed(project, "dev")
+
+    record = read(project, manifest)
+    assert not record.installed
+    assert unpriced_work(record, manifest).codes == []
+
+
+# --- a pass that checked nothing (#1308) -----------------------------------------
+
+#: ``fct``'s two Elementary tests, and a second model whose only test is one.
+ELEMENTARY_FCT_TESTS = {
+    "elementary_volume_anomalies_fct_ordered_at",
+    "elementary_schema_changes_fct_",
+}
+ONLY_VOLUME = "elementary_volume_anomalies_only_volume_ordered_at"
+
+
+@requires_elementary
+@pytest.mark.parametrize(
+    ("variant", "code"), [("d", "package_disabled"), ("a", "history_unmeasured")]
+)
+def test_an_elementary_test_that_checked_nothing_asserts_no_model(
+    tmp_path: Path, installed_elementary: Path, variant: str, code: str
+):
+    """Variant d disables the package's models on dev, so its tests compile to
+    the no-results query; variant a enables them on a dev target with no
+    history. Either way the Elementary tests pass and are listed unchecked, a
+    model whose only test is one is ``build_only``, and ``fct``, which has dbt's
+    own tests too, is still ``asserted`` with none of those listed."""
+
+    project = elementary_project(tmp_path, variant, installed_elementary)
+    (project / "models" / "only_volume.sql").write_text(
+        "select * from {{ ref('fct') }}\n", encoding="utf-8"
+    )
+    (project / "models" / "only_volume.yml").write_text(
+        "version: 2\nmodels:\n  - name: only_volume\n    data_tests:\n"
+        "      - elementary.volume_anomalies:\n"
+        "          timestamp_column: ordered_at\n",
+        encoding="utf-8",
+    )
+    result = _engine(project).build(target="dev")
+
+    assurance = result.completion.assurance
+    listed = {t.test: (t.models, t.reason_code) for t in assurance.unchecked_tests}
+    assert listed == {
+        **{name: (["fct"], code) for name in ELEMENTARY_FCT_TESTS},
+        ONLY_VOLUME: (["only_volume"], code),
+    }
+    # With the package enabled its own models crowd the capped build_only
+    # names, so only_volume is told apart by not being asserted.
+    assert assurance.asserted.names == ["fct"]
+    assert not FCT_TESTS - ELEMENTARY_FCT_TESTS & set(listed)
+    assert any("unchecked_tests" in line for line in result.warnings)
+
+
+# --- explore ranking leaves the package's tables out (#1311) ---------------------
+
+
+@requires_elementary
+@pytest.mark.parametrize("include", [True, False], ids=["included", "default"])
+def test_explore_map_on_the_fixture_ranks_no_elementary_table(
+    tmp_path: Path, installed_elementary: Path, include: bool
+):
+    """#1311's acceptance on the real package. Variant e builds the package's
+    models into ``main_elementary`` and a project model, ``elementary_runs``, that
+    reads one of them. With ``include_elementary`` the package's tables rank and
+    are profiled like any other, and crowd a project table out of the map (the
+    arm built to break it); by default none of them ranks, ``notes`` says so, and
+    every table the project owns, the one reading the package included, ranks."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    project = elementary_project(tmp_path, "e", installed_elementary)
+    _engine(project).build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+    built = duckdb_census(warehouse)
+    package_tables = {name for schema, name, _ in built if schema == ELEMENTARY_SCHEMA}
+    own_tables = {name for schema, name, _ in built if schema == "main"}
+    assert {"dbt_run_results", "elementary_test_results"} <= package_tables
+    assert {"raw_orders", "fct", "elementary_runs"} <= own_tables
+
+    explore_root = tmp_path / "explore"
+    explore_root.mkdir()
+    engine = DexEngine(
+        connector="duckdb",
+        path=str(warehouse),
+        config=DexConfig(connector="duckdb"),
+        store=FilesystemStore(explore_root),
+        repo_root=explore_root,
+    )
+    result = engine.map(include_elementary=include, full=True)
+
+    def schema_of(identifier: str) -> str:
+        return identifier.split(".")[-2]
+
+    described = {o.identifier for o in result.objects}
+    described_package = {i for i in described if schema_of(i) == ELEMENTARY_SCHEMA}
+    described_own = {i.split(".")[-1] for i in described if schema_of(i) == "main"}
+    if include:
+        # The package's thirty-odd tables fill the 25-object payload and push
+        # out a table the project owns: the defect #1311 removes.
+        assert described_package
+        assert own_tables - described_own
+        assert result.excluded.count == 0
+        return
+    assert described_own == own_tables
+    assert not described_package
+    assert all(schema_of(o.identifier) != ELEMENTARY_SCHEMA for o in result.top_objects)
+    assert result.excluded.reason == "elementary"
+    assert result.excluded.count == len(package_tables)
+    assert [g.namespace.split(".")[-1] for g in result.excluded.by_namespace] == [
+        ELEMENTARY_SCHEMA
+    ]
+    assert any("Elementary" in n and ELEMENTARY_SCHEMA in n for n in result.notes)
+    assert result.profiled_count == len(own_tables)

@@ -332,7 +332,9 @@ def plan(
 
     toggle_stated = _parse_toggle(engine, edits, toggle)
 
-    declared, declaration_notes, drafts = _declare(engine, edits, declarations)
+    declared, declaration_notes, drafts, pii_metadata = _declare(
+        engine, edits, declarations
+    )
     edits = declared
 
     if not edits:
@@ -482,6 +484,7 @@ def plan(
     result.warnings.extend(derivation_notes)
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
+    result.pii_metadata = pii_metadata
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -734,7 +737,7 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}
+        return edits, [], {}, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
@@ -768,7 +771,36 @@ def _declare(
     )
     drafts, draft_warnings = _draft(engine, view, edits, [d.model for d in parsed])
     warnings.extend(draft_warnings)
-    return edits, warnings, drafts
+    edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
+    return edits, warnings, drafts, pii_metadata
+
+
+def _stamp_pii(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], warnings: list[str]
+) -> tuple[list[PlanEdit], dict[str, Any] | None]:
+    """Carry each flagged input's PII stamp onto the models the plan creates
+    (#1100), and report what was stamped, kept or left for a person.
+
+    Runs after the declarations render, so a stamp lands in the same YAML entry
+    a declaration wrote, and reads the cache with ``pii_overrides`` applied.
+    """
+
+    from . import pii_stamps
+
+    if not any(e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT for e in edits):
+        return edits, None
+    inputs = _drafting_inputs(engine, view)
+    stamped, notes, report = pii_stamps.stamp(
+        edits,
+        view,
+        cache=inputs["cache"],
+        pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        dialect=inputs["dialect"],
+        vars=inputs["vars"],
+        manifest=None if inputs["manifest_stale"] else inputs["manifest"],
+    )
+    warnings.extend(notes)
+    return stamped, report
 
 
 def _draft(
@@ -6144,7 +6176,15 @@ def _build_project(
         ),
         impact=impact,
     )
+    unpriced = None
     if estimate is not None:
+        # The estimate prices compiled nodes, and the Elementary package runs
+        # work no node shows (#1309); read off the pricing compile's artifacts,
+        # so it answers for the build's own target and selection.
+        from .build import unpriced_elementary_work
+
+        unpriced = unpriced_elementary_work(checkout, artifacts_dir)
+        price_notes = [*price_notes, *unpriced.warnings()]
         command_args.billed_handshake(
             "transform build",
             adapter,
@@ -6152,6 +6192,7 @@ def _build_project(
             per_table=per_node or None,
             notes=price_notes or None,
             upper_bounds=upper_bounds or None,
+            unpriced=unpriced.as_dict() if unpriced.codes else None,
         )
     try:
         summary, cost = run_build(
@@ -6176,6 +6217,9 @@ def _build_project(
             full_refresh=full_refresh,
         )
         logged_id = summary.pop("logged_invocation_id", None)
+        if unpriced is not None and unpriced.codes:
+            cost.unpriced = unpriced.codes
+            summary["unpriced"] = unpriced.as_dict()
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
         # why the confirm ask carries no number. `billed_handshake` never ran on
@@ -7719,12 +7763,50 @@ def _attach_completion(
             incremental_replay=_incremental_replay_inputs(result, inputs),
             repair=inputs.get("repair"),
             population_accepted=inputs.get("population_accepted"),
+            unchecked_tests=_unchecked_tests(inputs),
         )
+        # The list may be capped, or cut whole by the budget: the count is
+        # what was listed plus what the cut took.
+        unchecked = len(
+            result.completion.assurance.unchecked_tests or []
+        ) + result.completion.elided.get("assurance.unchecked_tests", 0)
+        if unchecked:
+            # A pointer line, like verification's, so a caller reading the
+            # warnings alone learns that a passing test vouched for nothing.
+            result.warnings.append(
+                f"{unchecked} passing Elementary test(s) are not counted toward "
+                "any model's assurance (compiled to the package's no-results "
+                "query, or judged against history dex did not measure); they are "
+                "under data.completion.assurance.unchecked_tests with a "
+                "reason_code, any past the list's cap counted in "
+                "data.completion.elided"
+            )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
+    """The tests whose pass checked nothing in this build, with why (#1308).
+
+    Read from the build's own manifest, which holds each test's compiled SQL,
+    and from what the installed Elementary package does for the target that
+    manifest was parsed for. A project without the package has none. Best
+    effort: an unreadable manifest leaves every test counted as it was.
+    """
+
+    manifest = inputs.get("manifest")
+    project = inputs.get("project")
+    if not isinstance(manifest, dict) or project is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        runtime = elementary_mod.read(project, manifest)
+        return dict(elementary_mod.unchecked_tests(manifest, runtime)) or None
+    return None
 
 
 def _incremental_replay_inputs(
@@ -8038,7 +8120,9 @@ def _semantic_plan(
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
     # and before the parse below, so dbt reads the layer and the models together.
-    edits, declaration_notes, drafts = _declare(engine, edits, declarations)
+    edits, declaration_notes, drafts, pii_metadata = _declare(
+        engine, edits, declarations
+    )
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
     # caller's call about their own YAML, not about YAML dex wrote for them.
     derived = _derive_semantic(engine, view, edits)
@@ -8101,6 +8185,7 @@ def _semantic_plan(
     result.warnings.extend(derived.warnings)
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
+    result.pii_metadata = pii_metadata
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)
