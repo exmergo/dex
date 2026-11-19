@@ -1959,8 +1959,13 @@ def test_an_external_table_with_a_composite_grain_scaffolds_the_right_tests(
     yaml_text = _model_yaml(dataset)
     # A composite key means not_null on each member and no column-level unique,
     # which is the test suite a lakehouse staging model should ship with.
-    assert "tests: [unique, not_null]" not in yaml_text
-    assert yaml_text.count("tests: [not_null]") == 3
+    assert "unique" not in yaml_text
+    assert (
+        yaml_text.count(
+            "data_tests: [{not_null: {config: {meta: {disable_test_samples: true}}}}]"
+        )
+        == 3
+    )
 
 
 # --- a warehouse that changes mid-command, and the dev target ----------------------
