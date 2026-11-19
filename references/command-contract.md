@@ -245,7 +245,9 @@ dex explore semantic query <m,m>  -> one governed metric query, capped and row-m
                                      result says so. A local list, values or query read from a compiled
                                      semantic manifest older than a semantic YAML file warns with the file and
                                      `dbt parse`, and so does its refusal of an unknown metric or dimension or
-                                     a query that fails to resolve
+                                     a query that fails to resolve. The check sees only newer files that parse
+                                     and still declare semantic_models or metrics, so no warning does not prove
+                                     the manifest current
 dex init [<name>]                -> complete project setup: new dbt-backed Dex project,
                                      complete DuckDB demo, existing dbt adoption, or
                                      exploration without dbt. .dex/ stays at repo root;
