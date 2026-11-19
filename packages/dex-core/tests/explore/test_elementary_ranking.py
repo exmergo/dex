@@ -518,3 +518,39 @@ def test_the_signature_survives_successive_maps_outside_its_scope(
         assert target not in _ids(data["objects"])
         assert target not in _ids(data["top_objects"])
         assert set(data["excluded"]["objects"]) == _ELEMENTARY
+
+
+def test_an_include_run_outside_the_scope_keeps_the_signature_for_the_next(
+    elementary_warehouse: Path, tmp_path: Path, capsys
+):
+    """The same, with the out-of-scope map in between asking to include the
+    package: it must not drop the inventory-only entries a later default map
+    recognises the hand-made profile by."""
+
+    duckdb = pytest.importorskip("duckdb")
+    other = tmp_path / "project.duckdb"
+    con = duckdb.connect(str(other))
+    con.execute("create table main.accounts as select i as id from range(30) t(i)")
+    con.close()
+    repo = tmp_path / "repo"
+    _map(elementary_warehouse, repo, capsys)
+    target = "warehouse.main_elementary.dbt_run_results"
+    _run(
+        [
+            "explore",
+            "profile",
+            target,
+            "--path",
+            str(elementary_warehouse),
+            "--repo-root",
+            str(repo),
+        ],
+        capsys,
+    )
+
+    _map(other, repo, capsys, "--include-elementary")
+    data = _map(other, repo, capsys)
+
+    assert target not in _ids(data["objects"])
+    assert target not in _ids(data["top_objects"])
+    assert set(data["excluded"]["objects"]) == _ELEMENTARY

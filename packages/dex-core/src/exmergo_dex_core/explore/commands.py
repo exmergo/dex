@@ -3071,7 +3071,10 @@ def map(
     # then; recognise it too, so it is left out like one this run listed. Only
     # namespaces this run did not observe: an absent object in an observed one
     # is gone, and `_compose_datasets` drops it.
-    if not include_elementary and reusable is not None:
+    # Read on an include run too, for the cache's sake: the package's entries a
+    # run carries from outside its scope are kept below either way.
+    package_cached: frozenset[str] = frozenset()
+    if reusable is not None:
         listed = {m.identifier.lower() for m in metas}
         out_of_scope_cached = [
             d.identifier
@@ -3080,8 +3083,11 @@ def map(
             and d.identifier.rpartition(".")[0].lower() not in observed_namespaces
         ]
         if out_of_scope_cached:
-            elementary = elementary_mod.recognise(metas, cached=out_of_scope_cached)
-            left_out = elementary.lowered
+            signature = elementary_mod.recognise(metas, cached=out_of_scope_cached)
+            package_cached = signature.lowered
+            if not include_elementary:
+                elementary = signature
+                left_out = elementary.lowered
     # A join to a table ranking leaves out (one an earlier include run or a
     # hand-run profile cached) must not count toward connectivity: its degree
     # would set the scale every rankable object is normalised against.
@@ -3111,14 +3117,16 @@ def map(
     # `_compose_datasets` carries only profiled entries forward from outside the
     # scope, so the package's inventory-only tables would leave the cache here,
     # and the next out-of-scope run would hold too few names to recognise a
-    # profiled one beside them. Keep the recognised ones: they are the evidence.
-    if left_out and reusable is not None:
+    # profiled one beside them. Keep the recognised ones, on an include run too:
+    # they are the evidence a later default run reads.
+    if package_cached and reusable is not None:
         present = {ds.identifier.lower() for ds in datasets}
         for previous in reusable.datasets:
             key = previous.identifier.lower()
-            if key in left_out and key not in present:
+            if key in package_cached and key not in present:
                 kept = previous.model_copy(deep=True)
-                kept.rank_score = None
+                if key in left_out:
+                    kept.rank_score = None
                 datasets.append(kept)
                 present.add(key)
     failed_reasons = {
