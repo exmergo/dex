@@ -61,6 +61,7 @@ from ..semantic_declarations import Population as Population
 from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
+from .claims import CLAIM_KEY, claim_id, claim_of, without_claim
 from .package_overrides import (
     DocumentedOverride,
     documented_overrides,
@@ -1492,9 +1493,18 @@ def _plain(node: Any) -> dict[str, Any]:
 
 
 def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
-    """What each column receives: its description, its dex meta, and its tests."""
+    """What each column receives: its description, its dex meta, and its tests.
+
+    Each test carries the id of the claim it checks (#1448), derived from the
+    declared fact and never from the test's name: a ``null_rule: never``, a
+    ``references`` (with the parent it names), and a single-column grain, whose
+    ``unique`` and ``not_null`` are two claims since either can fail alone. A
+    grain column also declared ``null_rule: never`` has one ``not_null``, and it
+    carries the null rule's claim, the fact rendered first.
+    """
 
     out: dict[str, dict[str, Any]] = {}
+    model = declaration.model
 
     def slot(name: str) -> dict[str, Any]:
         return out.setdefault(name, {"description": None, "dex": {}, "tests": []})
@@ -1515,7 +1525,12 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
             if value is not None
         }
         if column.null_rule is not None and column.null_rule.strip().lower() == "never":
-            entry["tests"].append(_unsampled("not_null"))
+            entry["tests"].append(
+                _unsampled(
+                    "not_null",
+                    claim=claim_id(model, "null_rule", [name], {"null_rule": "never"}),
+                )
+            )
         if column.references is not None:
             parent, _, parent_column = column.references.rpartition(".")
             parent_base, parent_version = mv.split_label(parent)
@@ -1526,7 +1541,11 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
             )
             entry["tests"].append(
                 _unsampled(
-                    "relationships", arguments={"to": to, "field": parent_column}
+                    "relationships",
+                    claim=claim_id(
+                        model, "references", [name], {"references": column.references}
+                    ),
+                    arguments={"to": to, "field": parent_column},
                 )
             )
 
@@ -1535,7 +1554,10 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
         tests = slot(grain[0])["tests"]
         for name in ("unique", "not_null"):
             if name not in {_spec_name(spec) for spec in tests}:
-                tests.insert(0 if name == "unique" else 1, _unsampled(name))
+                claim = claim_id(model, "grain", grain, {"check": name})
+                tests.insert(
+                    0 if name == "unique" else 1, _unsampled(name, claim=claim)
+                )
     return out
 
 
@@ -1912,13 +1934,18 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
         inserted_flagged = any(_has_sampling_flag(s) for s in specs)
         return updated, inserted_flagged
 
+    if not isinstance(found[1], yaml.SequenceNode):
+        raise RewriteError("a column's test list is not a list")
+    text = _claim_earlier_renders(text, locate, specs)
+    node = locate(_compose(text))
+    found = _child(node, "data_tests") or _child(node, "tests")
+    if found is None:  # the claims above change no key, so this cannot happen
+        raise RewriteError("a column's test list moved while it was claimed")
     _key, listed = found
     present = {_test_name(item) for item in _sequence(listed)}
     todo = [spec for spec in specs if _spec_name(spec) not in present]
     if not todo:
         return text, False
-    if not isinstance(listed, yaml.SequenceNode):
-        raise RewriteError("a column's test list is not a list")
 
     inserted_flagged = any(_has_sampling_flag(s) for s in todo)
     if listed.flow_style:
@@ -1948,6 +1975,59 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     rendered = "".join(_render_item(spec, dash_indent) for spec in todo)
     prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"
     return splice(text, [(at, at, prefix + rendered)]), inserted_flagged
+
+
+def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
+    """``text`` with a claim id added to each test Dex rendered before claims.
+
+    A listed test is left as written (#1348), with one exception: a test that is
+    byte for byte what Dex renders for a spec, flag, arguments and all, but
+    carries no claim, is Dex's own earlier render of the same fact, and gains
+    that spec's ``config.meta.dex.claim`` and nothing else (#1448). A bare test,
+    a test with other arguments or config, and a test that already carries any
+    claim are someone's, or a fact since changed, and stay as written (#1350),
+    and so does a test whose YAML is aliased elsewhere, which a claim written
+    into it would reach through the alias.
+    """
+
+    for spec in specs:
+        claim = claim_of(spec)
+        if claim is None:
+            continue
+        unclaimed = without_claim(spec)
+        root = _compose(text)
+        listed = _child(locate(root), "data_tests") or _child(locate(root), "tests")
+        if listed is None:
+            return text
+        index = next(
+            (
+                i
+                for i, item in enumerate(_sequence(listed[1]))
+                if isinstance(item, yaml.MappingNode) and _plain(item) == unclaimed
+            ),
+            None,
+        )
+        if index is None:
+            continue
+        item = listed[1].value[index]
+        if _carries_anchor(root, listed[1]):
+            # An aliased list or item would give this claim to another column or
+            # test; the test stays as written rather than claim two facts.
+            continue
+        [(_name_node, body)] = item.value
+        if listed[1].flow_style or item.flow_style:
+            # The whole item is Dex's render on one span; restated with the claim.
+            text = splice(text, [(*_span(item), _flow(spec))])
+        elif isinstance(body, yaml.MappingNode) and body.flow_style:
+            text = splice(text, [(*_span(body), _flow(next(iter(spec.values()))))])
+        else:
+
+            def body_of(r: Any, index: int = index) -> Any:
+                tests = _child(locate(r), "data_tests") or _child(locate(r), "tests")
+                return tests[1].value[index].value[0][1] if tests else None
+
+            text = _set_meta(text, body_of, DEX_META_KEY, {CLAIM_KEY: claim})
+    return text
 
 
 def _test_name(item: Any) -> str:
