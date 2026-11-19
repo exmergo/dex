@@ -165,6 +165,7 @@ def test_discover_projects_finds_symlinked_project_directory(
     ]
     with pytest.raises(DbtProjectError, match="multiple dbt projects"):
         find_project(tmp_path)
+        
 
 def test_discover_projects_ignores_dangling_project_marker(tmp_path: Path, symlinks):
     # CodeRabbit on #1438: os.walk lists a dangling dbt_project.yml symlink in
@@ -176,6 +177,7 @@ def test_discover_projects_ignores_dangling_project_marker(tmp_path: Path, symli
     (broken / "dbt_project.yml").symlink_to(tmp_path / "missing.yml")
     assert discover_projects(tmp_path) == [tmp_path / "analytics"]
     assert find_project(tmp_path) == tmp_path / "analytics"
+    
 
 def test_resolve_target_returns_only_name_and_type(dbt_project_dir: Path):
     info = resolve_target(dbt_project_dir, None)
