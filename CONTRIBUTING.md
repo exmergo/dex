@@ -437,6 +437,58 @@ DEX_TEST_TRINO_URL=http://dex_ro@127.0.0.1:8085 \
     uv run pytest tests/integration -q -m trino_iceberg
 ```
 
+## Live Cube integration tests
+
+`tests/integration/test_cube_query.py` (marker `cube`) asks real Cube Core
+containers, started by `scripts/setup_cube_dev.sh`, for every query case and
+holds each answer to hand-written SQL. Render-only containers (one per
+warehouse type) hold no warehouse credential: Cube renders and Dex executes.
+Executing containers (`--execute`, marker `cube_execute`) run the same
+questions themselves for `--api`, over an in-memory DuckDB built from
+`scripts/cube/shop.sql` (the rows Dex's own DuckDB fixture holds) and over the
+Postgres dogfood database as `dex_ro`. No setup and no secret: the `cube` job
+runs it on every push to `main`.
+
+```
+scripts/setup_postgres_dev.sh            # for the Postgres cases
+scripts/setup_cube_dev.sh --db duckdb
+scripts/setup_cube_dev.sh --db postgres
+scripts/setup_cube_dev.sh --execute --db duckdb
+DEX_CUBE_PG_PORT=<published port> scripts/setup_cube_dev.sh --execute --db postgres
+source ~/.cache/dex-dogfood/cube.env
+DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:<port>/dex_dogfood \
+    uv run pytest tests/integration -q -m cube
+```
+
+Cube Core outside dev mode never reloads an edited model, so re-run the setup
+script after editing `scripts/cube/model`.
+
+### Narrow Cube Cloud tests
+
+`tests/integration/test_cube_cloud.py` (marker `cube_cloud`) asks a Cube Cloud
+deployment serving `scripts/cube/model` over `scripts/cube/shop.sql` both ways:
+Cube Cloud executes (`--api`, the deployment's default) and Cube Cloud renders
+for Dex to execute (`--local`) on a DuckDB file built from the same statements.
+The job runs under the protected `cube-cloud-integration` environment, which
+holds the deployment's REST API base (`DEX_TEST_CUBE_CLOUD_URL`) and its API
+secret (`CUBE_CLOUD_API_SECRET`). The job mints a one-hour token from the secret
+per run (`scripts/cube_cloud/mint_token.py`), since the tokens Cube Cloud issues
+itself last a day.
+
+`scripts/setup_cube_cloud_ci.sh --deployment <id>` deploys the fixture with the
+`cube` CLI (the deployment must be in CLI deploy mode, which
+`cube deployments update <id> --data '{"deployMode":"cli"}'` sets), rotates the deployment's
+`CUBEJS_API_SECRET`, checks a token signed with it, and writes the environment.
+`--keep-secret FILE` also keeps a 0600 copy for running the suite locally:
+
+```
+scripts/setup_cube_cloud_ci.sh --deployment <id> --keep-secret ~/.config/dex-dogfood/cube_cloud_secret
+CUBE_API_TOKEN="$(CUBE_CLOUD_API_SECRET="$(cat ~/.config/dex-dogfood/cube_cloud_secret)" \
+    python3 ../../scripts/cube_cloud/mint_token.py)" \
+    DEX_TEST_CUBE_CLOUD_URL=https://<deployment>.<region>.cubecloudapp.dev/cubejs-api \
+    uv run pytest tests/integration -q -m cube_cloud
+```
+
 ## Elementary fixture tests
 
 `tests/transform/elementary_fixture.py` builds a small dbt project with the

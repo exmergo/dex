@@ -31,11 +31,12 @@ cube changed.
 | `config validate`, `config get` on a `semantic.cube` block | none | always available |
 | reading the layer: `explore semantic list`, `--use-project`, `maintain` | `[cube]` (the dialect engine, which every connector extra already carries) | refused by name, `reason: prerequisite` |
 | authoring: `semantic cube define\|update\|plan`, and a derived cube | `[cube]`, the same extra | refused by name, `reason: prerequisite` |
-| querying: `explore semantic query\|values` | `[cube]` and `[semantic-api]` (httpx, to ask a Cube server to render) | refused by name, `reason: prerequisite` |
+| querying: `explore semantic query\|values`, and `list` under `deployment: cube_cloud` | `[cube]` and `[semantic-api]` (httpx, to ask a Cube server) | refused by name, `reason: prerequisite` |
 
 No Cube package is installed for any of it: no Node, no `cube_dbt`, no
-`apache-ossie-cube`. Only querying needs a running Cube server, and it uses that
-server as a renderer: see below.
+`apache-ossie-cube`. Only querying (and the Cube Cloud catalog) needs a running
+Cube server, which renders for Dex to execute or, with `--api`, executes itself:
+see below.
 
 ## Plain YAML is read; nothing else is guessed
 
@@ -266,9 +267,10 @@ Every Cube server, Core or Cloud, answers `POST /cubejs-api/v1/sql` with the SQL
 a query would run, without running it. Dex uses that the way it uses MetricFlow's
 `explain()` and SLayer's dry run: Cube renders, Dex checks the statement and
 executes it through its own connector, under the PII gate and the cost guard.
-`execution` is `dex` on every result. Dex calls `/v1/meta` and `/v1/sql` and
-nothing else: never `/v1/load`, and it never hands Cube a warehouse credential.
-The server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
+`execution` is `dex` on every such result. On this path Dex calls `/v1/meta` and
+`/v1/sql` and nothing else, and it never hands Cube a warehouse credential. The
+server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
+`--api` is the other path, where Cube executes (see "Cube executes" below).
 
 ### The order
 
@@ -288,7 +290,9 @@ The server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
    granularities, and, for a view member, the same cube member behind it. A
    Cube server outside dev mode does not reload an edited model file, so a
    server still serving yesterday's files is the normal state after an edit,
-   and it is refused naming the member.
+   and it is refused naming the member. A member the repository defines with
+   SQL and the server serves without any is refused too, since there is
+   nothing to compare it with.
 6. **Render** over `/v1/sql`, and the plan checks: one statement (a
    `compareDateRange` plans several), no pre-aggregation (Cube matches a
    rollup even one it never built, and the SQL then reads its table), no
@@ -350,9 +354,107 @@ module.exports = {
 On a server running this configuration, `/v1/load` is refused with a 403 to Dex's
 token while `/v1/meta` and `/v1/sql` remain accessible.
 
+### Cube executes: `--api` and `/v1/load`
+
+Every Cube server, Core or Cloud, also answers `POST /cubejs-api/v1/load`, which
+runs the query in the server under the server's own warehouse connection.
+`--api` asks for that. `execution` is `vendor`, and because Cube has no API that
+prices a query before it runs, Dex neither estimates nor caps it: every such
+result carries a `cost guard unavailable` warning and `cost.paradigm: hosted`,
+and no `--confirm` or `--budget` applies. What Dex still owns is the request and
+the rows:
+
+1. **`--where`** is read as on the render path, and a clause Dex cannot read is
+   refused before anything is sent.
+2. **PII gate**, before anything is sent: a member the Cube model marks
+   `meta: {pii: true}` is refused on that word, as is a view member exposing a
+   marked cube member; otherwise the `.dex/` cache decides, through the column
+   the repository's files resolve the member to (on Cube Cloud, where that
+   column is not proven to be the deployment's, the cache may refuse a member
+   but never clears one); the name heuristic is the floor, and a result says
+   when it alone spoke.
+3. **Grain and translation**, as on the render path.
+4. **On a Cube Core** (`deployment: local`): the data-source check, the
+   stale-renderer check against the repository's files, and the tables: the
+   Core is asked over `/v1/sql` for its plan (which runs nothing) and every
+   table the plan reads is held to the files' `sql_table`, as on the render
+   path, and so is the data source it was planned on. A Core serving another
+   model is refused before it runs anything.
+   Where the tables cannot be judged (Dex has no connector whose dialect reads
+   the plan, or Cube plans over a pre-aggregation), the result says so.
+   A `/v1/meta` that cannot be read refuses the query rather than screening
+   without the model's own PII marks.
+5. **`/v1/load`**, polled through Cube's "Continue wait" within a 90-second
+   deadline that counts every request and pause.
+6. **The rows**, named by the caller's tokens in the column order Cube's own SQL
+   uses. Cube returns every number as text; Dex decodes the ones its
+   annotation types `number`. A time bucket is Cube's ISO text in UTC. Capped
+   like every other semantic result.
+
+A warehouse error Cube relays from `/v1/load` can quote a value, so it is
+masked before it reaches an envelope, as on `explore query`.
+
+`--api` on a Cube Core needs a server that can reach the warehouse, which the
+render-only containers cannot.
+`scripts/setup_cube_dev.sh --execute --db duckdb|postgres|bigquery` starts one. The token it is sent claims `dex_scopes:
+[meta, data]` (Cube names `/v1/load`'s scope `data`), so a server running
+`scripts/cube/cube.js` refuses it `/v1/sql`, as it refuses a render token
+`/v1/load`.
+
+### Cube Cloud: `deployment: cube_cloud`
+
+```yaml
+semantic:
+  vendor: cube
+  deployment: cube_cloud
+  cube:
+    url: https://<deployment>.<region>.cubecloudapp.dev/cubejs-api
+    files:
+      - model/cubes/orders.yml
+```
+
+The same files, deployed to Cube Cloud. `semantic.cube.files` stays required:
+authoring and `maintain` read them, and `--local` holds the deployment to them.
+
+| | `--local` (`execution: dex`) | `--api` (`execution: vendor`) |
+|---|---|---|
+| `deployment: local` (Cube Core) | the default: Core renders, Dex executes | Core executes over `/v1/load` |
+| `deployment: cube_cloud` | Cloud renders over `/v1/sql`, Dex executes, the repository's files are the catalog and every check above holds | the default: Cloud executes over `/v1/load` |
+
+- **The catalog** under `cube_cloud` and vendor execution is the deployment's
+  compiled `/v1/meta?extended`. It answers JavaScript models, Jinja templates and
+  `extends`, which the static reader can only name, so nothing is listed under
+  `compiled_only`. It carries no `sql_table`, and a member's SQL arrives as Cube's compiled
+  template rather than a column, so `relation`,
+  each dimension's `column` and each measure's `column` and `expr` are declared
+  in `unavailable`. It lists what the deployment exposes: primary keys and
+  `public: false` members are not in it. Every result says, as a warning and as
+  `definition_source: cube_cloud`, that what Cloud serves was not checked
+  against the repository's files. `--local` is the checked path.
+- **The URL** is `semantic.cube.url`, with no default, or `DEX_CUBE_URL` in the
+  environment, which beats the file (`dex config get` reports it as
+  `source: environment`). `CUBE_API_URL` is not read: the `cube` CLI uses that
+  name for the Cube Cloud console's API, a different endpoint.
+- **The token** is `CUBE_API_TOKEN` from the environment, sent as it is, or a
+  host-supplied `connect.SemanticSource`, whose `token` callable is read once per
+  command and which reads nothing ambient (not `DEX_CUBE_URL`, not
+  `DEX_CUBE_ALLOWED_HOSTS`). Under `deployment: local` both are refused: a Core
+  verifies tokens Dex mints from `CUBEJS_API_SECRET`. A Cube Cloud deployment
+  verifies an HS256 JWT signed with its own `CUBEJS_API_SECRET` too, so a token
+  you sign with it works as one Cube Cloud issues (those last a day).
+- **The host** is admitted when it is a Cube Cloud domain (`*.cubecloudapp.dev`,
+  `*.cubecloud.dev`) over https, and refused before any token is read
+  otherwise, a loopback host included: the token is your Cube Cloud credential. A custom domain is admitted only by exact name in
+  `DEX_CUBE_ALLOWED_HOSTS`, which `.dex/config.yml` cannot widen.
+- **The release** is whatever Cube Cloud runs (its `latest` channel moves on its
+  own), and Cube's REST API does not report it. Dex's rules are ported from
+  v1.8.14. The stale-renderer check holds the model to the files on `--local`;
+  it cannot hold Cloud's planner to a release.
+
 ### What this release does not do
 
-- `--api` (Cube executes over `/v1/load`) and Cube Cloud are #914.
+- `--local` on Databricks, ClickHouse and Trino: Cube supports them, and `--api`
+  answers on them, but Dex has no reviewed golden for executing Cube's SQL there.
 - One data source per query.
 - Segments, `ungrouped`, `compareDateRange` and pre-aggregations are not sent or
   not accepted.

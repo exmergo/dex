@@ -65,8 +65,8 @@ from .base import (
     key_shape_aggregate_kwargs,
     key_shape_expressions,
     name_list,
+    shape_aggregate_kwargs,
     shape_stat_expressions,
-    shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
     temporal_units_for,
@@ -1053,13 +1053,7 @@ class RedshiftAdapter:
                     max_value=(
                         json_safe(values.get(f"mx_{i}")) if wants_min_max else None
                     ),
-                    upper_vocab_fraction=shape_stat_value(
-                        values, f"su_{i}", wants_shape
-                    ),
-                    person_shape_fraction=shape_stat_value(
-                        values, f"sp_{i}", wants_shape
-                    ),
-                    avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **shape_aggregate_kwargs(values, i, wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
                     **key_shape_aggregate_kwargs(values, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),

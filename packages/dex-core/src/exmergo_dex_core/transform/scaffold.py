@@ -34,6 +34,7 @@ from ..guards.pii_meta import stamp_lines
 from ..storage import ExploreStore, readable_cache
 from ..yaml_spans import uses_anchors_or_aliases
 from .plans import EditKind, PlanEdit
+from .rewrite import _unsampled
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
 
@@ -553,5 +554,9 @@ def _model_yaml(dataset: Dataset) -> str:
         elif column.nullable is False or column.null_fraction == 0.0:
             tests = ["not_null"]
         if tests:
-            lines.append(f"        data_tests: [{', '.join(tests)}]")
+            rendered = [
+                yaml.safe_dump(_unsampled(name), default_flow_style=True).strip()
+                for name in tests
+            ]
+            lines.append(f"        data_tests: [{', '.join(rendered)}]")
     return "\n".join(lines) + "\n"
