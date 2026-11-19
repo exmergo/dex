@@ -131,6 +131,8 @@ class _Side:
     #: Each upstream model read from the warehouse, by a digest of its compiled SQL.
     #: Filled only when the plan can change how an untouched parent compiles.
     parents: dict[str, str] = field(default_factory=dict)
+    #: The project path of every project seed and snapshot upstream of the model.
+    seeds: frozenset[str] = frozenset()
 
 
 def compare(
@@ -308,15 +310,6 @@ def _compare(
             "plan_stale",
             "changed since planning: " + ", ".join(stale),
         )
-    unsynchronized = [
-        edit.path for edit in stored.edits if edit.kind in _UNSYNCHRONIZING_KINDS
-    ]
-    if unsynchronized:
-        return not_checked(
-            "inputs_unsynchronized",
-            "this plan changes a seed or a snapshot, and the dev relation still "
-            "holds what the last build wrote: " + ", ".join(unsynchronized),
-        )
     blocked = _blocked_parents(
         project, chosen, {Path(edit.path).stem for edit in _touched(stored)}
     )
@@ -459,6 +452,23 @@ def _compare(
                 proposed = replace(proposed, parents=current)
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
+    # Per model (#1429): a seed or snapshot the plan changes blocks only a
+    # proposal that reads it, since dev still holds its old rows. The baseline
+    # reading those old rows is what it should read.
+    unsynchronized = sorted(
+        edit.path
+        for edit in stored.edits
+        if edit.kind in _UNSYNCHRONIZING_KINDS
+        and Path(edit.path).as_posix() in proposed.seeds
+    )
+    if unsynchronized:
+        return not_checked(
+            "inputs_unsynchronized",
+            f"this plan changes {', '.join(unsynchronized)}, which {chosen} reads, "
+            "and the dev relation still holds what the last build wrote. Plan "
+            "the seed or snapshot change on its own, apply and build it, then "
+            "plan the model edits again and compare them",
+        )
     moved = sorted(
         name
         for name in baseline.parents.keys() & proposed.parents.keys()
@@ -909,6 +919,7 @@ def _compile_side(
         digest=hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16],
         grain=[str(column) for column in grain] if isinstance(grain, list) else [],
         parents=_built_parents(manifest, node) if through_ancestors else {},
+        seeds=_upstream_seeds(manifest, node),
     )
 
 
@@ -1218,6 +1229,40 @@ def _built_parents(
             compiled.encode("utf-8")
         ).hexdigest()[:16]
     return found
+
+
+def _upstream_seeds(
+    manifest: Mapping[str, Any], node: Mapping[str, Any]
+) -> frozenset[str]:
+    """The file of every project seed and snapshot upstream of ``node``.
+
+    The walk goes through any node, a package's included, but only the project's
+    own seeds and snapshots are collected: a package records its paths relative
+    to the package, where they can match a project file they are not. A manifest
+    that names no project keeps every one, so a stale read is refused rather
+    than compared.
+    """
+
+    nodes = manifest.get("nodes", {})
+    project = (manifest.get("metadata") or {}).get("project_name")
+    found: set[str] = set()
+    pending = list((node.get("depends_on") or {}).get("nodes") or [])
+    seen: set[str] = set()
+    while pending:
+        unique_id = pending.pop()
+        if unique_id in seen or unique_id not in nodes:
+            continue
+        seen.add(unique_id)
+        parent = nodes[unique_id] or {}
+        pending.extend((parent.get("depends_on") or {}).get("nodes") or [])
+        path = parent.get("original_file_path")
+        if (
+            unique_id.startswith(("seed.", "snapshot."))
+            and (project is None or parent.get("package_name") == project)
+            and isinstance(path, str)
+        ):
+            found.add(Path(path).as_posix())
+    return frozenset(found)
 
 
 def _compile_detail(message: str) -> str:
