@@ -59,7 +59,11 @@ class Instance:
     word, which of a kind's tests on one model this is (a filter's
     ``includes`` or ``excludes`` list, a parent's ``missing`` or
     ``unexpected`` direction), so a reader of ``data.generated_tests`` can tell
-    two claims apart without decoding them (#1454).
+    two claims apart without decoding them (#1454). ``withheld`` is the reason
+    an instance never renders, whatever the switch says: the fact is one only
+    ``maintain verify`` can judge, as a question, so a test that failed a run on
+    it would fail correct data (#1455: a ``percent`` column). It is still listed
+    under ``data.generated_tests``, ``not_rendered`` with that reason.
     """
 
     column: str | None
@@ -68,6 +72,7 @@ class Instance:
     params: Mapping[str, Any] = field(default_factory=dict)
     arguments: Mapping[str, Any] = field(default_factory=dict)
     variant: str | None = None
+    withheld: str | None = None
 
 
 @dataclass(frozen=True)
@@ -162,6 +167,11 @@ DIALECT_UNSUPPORTED = "dialect_unsupported"
 #: output a column it reads (a filter on a column it aggregates away, a grain or
 #: parent key column it drops), so the test could only error.
 COLUMN_NOT_OUTPUT = "column_not_output"
+#: The reason a declared fact renders no test because ``maintain verify``'s
+#: check of it is a heuristic, not arithmetic (#1455: a ``percent`` column whose
+#: values all sit within 0 to 1 may be a fraction stored as a percent, or a
+#: column of genuinely small percentages), so it stays with ``maintain verify``.
+HEURISTIC_ONLY = "heuristic_only"
 
 
 def off_reason(setting: bool | list[str]) -> str:
@@ -354,6 +364,47 @@ register(
         SCHEDULED,
         _parent_population,
         macro=PARENT_POPULATION,
+        dialects=ALL_CONNECTORS,
+    )
+)
+
+UNIT_RANGE = "dex_unit_range"
+#: The declared units ``maintain verify`` checks, folded as it folds them.
+RANGE_UNITS: tuple[str, ...] = ("fraction", "percent")
+
+
+def _declared_units(declaration: Any) -> list[Instance]:
+    """One column test per column declared ``unit: fraction`` (#1455): it fails
+    on a non-NULL value below 0 or above 1, as ``maintain verify``'s
+    ``unit_out_of_range`` does. A column declared ``percent`` is listed and
+    withheld (:data:`HEURISTIC_ONLY`): verify flags a percent whose every value
+    sits within 0 to 1, which correct small percentages do too."""
+
+    out: list[Instance] = []
+    for name, column in (getattr(declaration, "columns", None) or {}).items():
+        unit = getattr(column, "unit", None)
+        if not isinstance(unit, str) or unit.strip().lower() not in RANGE_UNITS:
+            continue
+        folded = unit.strip().lower()
+        out.append(
+            Instance(
+                column=str(name),
+                field="unit",
+                columns=(str(name),),
+                params={"check": UNIT_RANGE, "unit": folded},
+                variant=folded,
+                withheld=HEURISTIC_ONLY if folded == "percent" else None,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        UNIT_RANGE,
+        EVERY_RUN,
+        _declared_units,
+        macro=UNIT_RANGE,
         dialects=ALL_CONNECTORS,
     )
 )

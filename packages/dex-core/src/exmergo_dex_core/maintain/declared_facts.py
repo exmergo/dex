@@ -612,6 +612,12 @@ def _probe(
             f"MIN({q}) AS dex_min_{index}, MAX({q}) AS dex_max_{index}, "
             f"COUNT({q}) AS dex_n_{index}"
         )
+        if unit == "fraction":
+            # The rows outside 0 to 1, the count dex_unit_range fails with
+            # (#1455), so the generated test and this check agree on a number.
+            parts.append(
+                f"COUNT(CASE WHEN {q} < 0 OR {q} > 1 THEN 1 END) AS dex_out_{index}"
+            )
         probe.units.append((index, column, unit, data_type))
 
     for index, rule in enumerate(model.filters):
@@ -1723,9 +1729,15 @@ def _judge_aggregate(
             )
             continue
         unit_checked = True
+        outside = row.get(f"dex_out_{index}")
         # A percent whose every value sits within 0 to 1 is the fraction it
-        # was probably computed as; a fraction outside it is arithmetic.
-        wrong = (low < 0 or high > 1) if unit == "fraction" else high <= 1 and low >= 0
+        # was probably computed as; a fraction outside it is arithmetic, decided
+        # by the exact count where the probe has one: a float extremum can round
+        # a high-precision decimal just past 1 down to 1.0 (#1455).
+        if unit == "fraction":
+            wrong = int(outside) > 0 if outside is not None else low < 0 or high > 1
+        else:
+            wrong = high <= 1 and low >= 0
         if not wrong:
             continue
         path = f"{probe.identifier}.{column}"
@@ -1734,7 +1746,16 @@ def _judge_aggregate(
             data_type or "DOUBLE", detect_pii(column, data_type or "DOUBLE")
         )
         result.findings.append(
-            _unit_finding(model, column, unit, low, high, non_null, safe)
+            _unit_finding(
+                model,
+                column,
+                unit,
+                low,
+                high,
+                non_null,
+                safe,
+                out_of_range=None if outside is None else int(outside),
+            )
         )
     if unit_checked:
         checked["unit"] += 1
@@ -1781,6 +1802,8 @@ def _unit_finding(
     high: float,
     non_null: int,
     show_values: bool,
+    *,
+    out_of_range: int | None = None,
 ) -> DriftFinding:
     if show_values:
         observed = f"its values run from {low:g} to {high:g}"
@@ -1789,10 +1812,15 @@ def _unit_finding(
             "its observed range is withheld because the column looks like personal data"
         )
     if unit == "fraction":
+        rows = (
+            ""
+            if out_of_range is None
+            else f" ({out_of_range} row{'' if out_of_range == 1 else 's'} outside it)"
+        )
         detail = (
-            f"'{model}.{column}' is declared a fraction (0 to 1), but {observed}; a "
-            "share computed as a percentage, or a ratio over the wrong denominator, "
-            "lands here"
+            f"'{model}.{column}' is declared a fraction (0 to 1), but {observed}"
+            f"{rows}; a share computed as a percentage, or a ratio over the wrong "
+            "denominator, lands here"
         )
     else:
         detail = (
@@ -1807,6 +1835,8 @@ def _unit_finding(
         "declared_unit": unit,
         "non_null_count": non_null,
     }
+    if out_of_range is not None:
+        data["out_of_range_rows"] = out_of_range
     if show_values:
         data.update({"min": low, "max": high})
     else:

@@ -1503,6 +1503,9 @@ def _generated(
                 and any(column.lower() not in outputs for column in reads)
             ):
                 renders, reason = False, gt.COLUMN_NOT_OUTPUT
+            if instance.withheld is not None:
+                # A fact only maintain verify judges, as a question (#1455).
+                renders, reason = False, instance.withheld
             out.append(
                 {
                     "model": model,

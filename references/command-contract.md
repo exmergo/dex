@@ -1388,7 +1388,16 @@ default, or a filter or operator after it is refused. A key naming a location
   them: a filter whose column the parent lacks is skipped (where verify lowers
   its finding to medium, the test fails with the same count). A model-level test
   whose grain or key columns the model provably does not output renders nothing,
-  `column_not_output`. The plan writes each
+  `column_not_output`. It renders `dex_unit_range` (#1455) under each column
+  declared `unit: fraction`, tagged `dex_every_run`, on every connector: it
+  fails with the count of non-NULL values below 0 or above 1, which equals
+  `unit_out_of_range`'s `out_of_range_rows` (a field the fraction finding now
+  carries), a NULL never counts, a column holding only NULLs passes where
+  `maintain verify` notes it unchecked, and a column that is not a number (text,
+  a boolean, a date or time) is checked by neither. A column declared
+  `unit: percent` renders nothing, `not_rendered` with `reason: heuristic_only`,
+  because `maintain verify`'s percent rule (every value within 0 to 1) is a
+  question correct small percentages also raise. The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a

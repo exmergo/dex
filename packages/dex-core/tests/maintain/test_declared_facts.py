@@ -310,6 +310,60 @@ def test_a_fraction_above_one_is_out_of_range_and_states_the_range(tmp_path: Pat
     assert finding.data["max"] == 100.0
     assert "from 10 to 100" in finding.detail
     assert "unit" not in result.suppressed
+    # Every row sits above one: the count dex_unit_range fails with (#1455).
+    assert finding.data["out_of_range_rows"] == 10
+    assert "(10 rows outside it)" in finding.detail
+
+
+def test_a_fraction_counts_only_the_rows_outside_the_range(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns={"share": {"unit": "fraction"}})},
+        "CREATE TABLE t AS SELECT * FROM (VALUES (0.5), (1.5), (-0.2), (NULL), "
+        "(1.0), (0.0)) v(share)",
+    )
+    [finding] = result.findings
+    assert finding.data["out_of_range_rows"] == 2
+    assert finding.data["non_null_count"] == 5
+
+
+def test_a_fraction_just_past_one_is_out_of_range_though_its_max_rounds_to_one(
+    tmp_path: Path,
+):
+    # MAX reads back as the float 1.0; the exact count still says one row.
+    result = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns={"share": {"unit": "fraction"}})},
+        "CREATE TABLE t AS SELECT * FROM (VALUES "
+        "(CAST('1.000000000000000001' AS DECIMAL(19,18))), "
+        "(CAST('1' AS DECIMAL(19,18))), (CAST('0.5' AS DECIMAL(19,18)))) v(share)",
+    )
+    [finding] = result.findings
+    assert finding.data["out_of_range_rows"] == 1
+
+
+def test_a_fraction_of_exactly_one_passes(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns={"share": {"unit": "fraction"}})},
+        "CREATE TABLE t AS SELECT * FROM (VALUES (CAST('1' AS DECIMAL(19,18))), "
+        "(CAST('0' AS DECIMAL(19,18)))) v(share)",
+    )
+    assert result.findings == []
+
+
+def test_a_percent_states_no_out_of_range_count(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {
+            "model.p.shares": _model(
+                "shares", columns={"small_percent": {"unit": "percent"}}
+            )
+        },
+        _SHARES,
+    )
+    [finding] = result.findings
+    assert "out_of_range_rows" not in finding.data
 
 
 def test_a_fraction_within_range_is_checked_and_clean(tmp_path: Path):

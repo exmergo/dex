@@ -501,7 +501,9 @@ def assert_generated_test_parity(
     # What the run spent, per command, for a job log (#1451): `-s` shows it.
     print(f"generated-test parity on {connector}: {report.spend}")
     assert report.disagreements == [], report.disagreements
-    assert sorted(report.agreed + report.unsupported) == sorted(r.label for r in ROWS)
+    assert sorted(report.agreed + report.unsupported + report.withheld) == sorted(
+        r.label for r in ROWS
+    )
     return report
 
 
