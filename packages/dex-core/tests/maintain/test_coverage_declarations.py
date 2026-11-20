@@ -1043,7 +1043,7 @@ def test_tests_rendered_with_claims_are_matched_by_claim() -> None:
         assert fact["matched_by"] == "claim", fact
     # The key on the grain column is checked by the grain's `unique`.
     assert _fact(out, "key", "order_id")["tests"] == ["unique"]
-    assert _fact(out, "grain")["tests"] == ["unique", "not_null"]
+    assert _fact(out, "grain")["tests"] == ["unique"]
     assert _fact(out, "null_rule", "placed_at")["tests"] == ["not_null"]
     assert out["stale_claims"] == []
     assert out["summary"]["stale_claims"] == 0
@@ -1147,4 +1147,40 @@ def test_a_renamed_column_keeps_its_coverage_and_lists_its_claim_apart() -> None
     assert fact["matched_by"] == "kind_and_column"
     assert out["stale_claims"] == [
         {"model": "orders", "test": "not_null", "column": "order_id", "claim": old}
+    ]
+
+
+def _grain_claim(check: str, columns=("order_id",)) -> str:
+    return claim_id("orders", "grain", list(columns), {"check": check})
+
+
+def test_a_grain_is_not_checked_by_its_claimed_not_null_alone() -> None:
+    # The rendered `unique` was deleted; the claimed `not_null` cannot show the
+    # grain unique, so the grain reads as main does, and the claim is not stale.
+    manifest = _manifest(
+        [_model("orders", dex={"grain": ["order_id"]})],
+        [_test("not_null", "orders", "order_id", claim=_grain_claim("not_null"))],
+    )
+    out = _run(manifest)
+    grain = _fact(out, "grain")
+    assert (grain["checked_by"], grain["tests"]) == ("dex_verify", [])
+    assert "matched_by" not in grain
+    assert out["stale_claims"] == []
+
+
+def test_a_grain_unique_with_a_stale_claim_still_checks_it_by_kind_and_column() -> None:
+    stale = _grain_claim("unique", ["legacy_id"])
+    manifest = _manifest(
+        [_model("orders", dex={"grain": ["order_id"]})],
+        [
+            _test("unique", "orders", "order_id", claim=stale),
+            _test("not_null", "orders", "order_id", claim=_grain_claim("not_null")),
+        ],
+    )
+    out = _run(manifest)
+    grain = _fact(out, "grain")
+    assert (grain["checked_by"], grain["tests"]) == ("both", ["unique"])
+    assert grain["matched_by"] == "kind_and_column"
+    assert out["stale_claims"] == [
+        {"model": "orders", "test": "unique", "column": "order_id", "claim": stale}
     ]

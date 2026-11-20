@@ -905,11 +905,11 @@ def _model_facts(
     def ids(field: str, columns: list[str], params: dict[str, str]) -> list[str]:
         return [claim_id(name, field, columns, params) for name in names]
 
+    # A grain is checked by its `unique`; the grain's `not_null` carries a
+    # claim too, which is never stale, but cannot show the grain unique.
+    grain_unique = ids("grain", grain_cols, {"check": "unique"}) if single_grain else []
     grain_claims = (
-        [
-            *ids("grain", grain_cols, {"check": "unique"}),
-            *ids("grain", grain_cols, {"check": "not_null"}),
-        ]
+        [*grain_unique, *ids("grain", grain_cols, {"check": "not_null"})]
         if single_grain
         else []
     )
@@ -943,7 +943,7 @@ def _model_facts(
     if grain_cols:
         if len(grain_cols) == 1:
             found, how = check(
-                grain_claims,
+                grain_unique,
                 ["unique"] if tests.on_column(uid, grain_cols[0], "unique") else [],
             )
             add("grain", grain_cols[0], found, ["grain_broken"], how)
@@ -999,9 +999,7 @@ def _model_facts(
         if role == "key":
             # A key on the single grain column is checked by the grain's unique.
             found, how = check(
-                ids("grain", grain_cols, {"check": "unique"})
-                if _bare(name) == single_grain
-                else [],
+                grain_unique if _bare(name) == single_grain else [],
                 ["unique"] if tests.on_column(uid, name, "unique") else [],
             )
             verify = ["grain_broken"] if _bare(name) == single_grain else []
