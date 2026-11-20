@@ -1896,6 +1896,10 @@ def coverage(
     run = coverage_runs.last_run(project_dir, manifest)
     notes.extend(run.notes)
     warnings.extend(run.warnings)
+    # Last freshness status (#1347): the same directories, sources.json.
+    fresh = coverage_runs.last_freshness_run(project_dir, manifest)
+    notes.extend(fresh.notes)
+    warnings.extend(fresh.warnings)
     # Recorded mutation results (#1284), from the store: no connection.
     loader = getattr(engine.store, "load_mutation_records", None)
     records: dict[str, dict[str, Any]] | None = None
@@ -1925,6 +1929,7 @@ def coverage(
         selector=selector,
         full=full,
         statuses=run.statuses,
+        freshness_statuses=fresh.statuses,
         records=records,
         referenced=referenced,
     )
@@ -1969,6 +1974,7 @@ def coverage(
                     selector=selector,
                     full=full,
                     statuses=run.statuses,
+                    freshness_statuses=fresh.statuses,
                     records=records,
                     referenced=referenced,
                 )
@@ -2013,6 +2019,7 @@ def coverage(
             "facts": declared["facts"],
         },
         last_run=run.run,
+        freshness_run=fresh.run,
         excluded=inventory.excluded,
         elided=elided,
         manifest=origin,

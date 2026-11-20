@@ -182,6 +182,7 @@ def inventory(
     selector: Iterable[str] | None = None,
     full: bool = False,
     statuses: dict[str, str] | None = None,
+    freshness_statuses: dict[str, str] | None = None,
     records: dict[str, dict[str, Any]] | None = None,
     now: datetime | None = None,
     referenced: dict[str, dict[str, dict[str, Any]]] | None = None,
@@ -190,6 +191,9 @@ def inventory(
 
     ``statuses`` is each test's status in the latest run results (#1285), by
     unique id; ``None`` means no run was read, and no test carries a status.
+    ``freshness_statuses`` is each source's freshness status in the latest
+    ``sources.json`` (#1347), by source unique id; ``None`` means no freshness
+    run was read, and no freshness check carries a status.
     ``records`` is the recorded mutation results by model unique id (#1284);
     ``None`` means the store keeps none, so no model carries a strength.
     ``referenced`` is what singular tests read, by resource unique id (#1282);
@@ -380,7 +384,10 @@ def inventory(
         policy = dbt_tests.freshness_policy(resource.node)
         if policy is not None:
             totals["freshness"] += 1
-            resource.tests.append({"kind": "freshness", "severity": policy})
+            record: dict[str, Any] = {"kind": "freshness", "severity": policy}
+            if freshness_statuses is not None:
+                record["last_run"] = freshness_statuses.get(unique_id, "not_run")
+            resource.tests.append(record)
 
     # Downstream: data tests on the resources that read this one, and tests
     # that read it without being attached to it (a relationships test points
