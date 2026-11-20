@@ -57,7 +57,7 @@ def _filters(declaration) -> list[gt.Instance]:
                 column=item.column,
                 field="population",
                 columns=(item.column,),
-                params={"excludes": ",".join(excluded)},
+                params={"excludes": excluded},
                 arguments={"excludes": excluded},
             )
         )
@@ -355,6 +355,51 @@ def test_a_new_filter_adds_a_second_test_of_the_same_kind(kinds):
         {"excludes": ["cancelled"]},
         {"excludes": ["cancelled", "void"]},
     ]
+
+
+def test_a_literal_value_keeps_its_case_in_the_claim(kinds):
+    first = _render(None, True)
+    payload = json.loads(json.dumps(DECLARATION))
+    payload["population"]["filters"][0]["excludes"] = ["CANCELLED"]
+
+    out = _render(first, True, payload)
+
+    # A value from the data is part of the fact, so its case makes a new claim.
+    assert [t[FILTER]["arguments"] for t in _column_tests(out, "status")] == [
+        {"excludes": ["cancelled"]},
+        {"excludes": ["CANCELLED"]},
+    ]
+
+
+def test_off_a_hand_written_equivalent_reads_listed_while_off(kinds):
+    hand = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_lines\n"
+        "    data_tests:\n"
+        f"      - {COMBO}:\n"
+        "          arguments:\n"
+        "            columns: [order_id, line_number]\n"
+    )
+    generated: list = []
+
+    _render(hand, False, generated=generated)
+
+    assert generated[0]["status"] == "listed_while_off"
+
+
+def test_a_renamed_model_s_tests_do_not_count_for_a_recreated_one(kinds):
+    payload = {"model": "fct_lines", "grain": ["order_id", "line_number"]}
+    first = _render(None, True, payload)
+    # The model renamed by hand, its claimed test kept as written, and a new
+    # model taking the old name in the same file.
+    renamed = first.replace("name: fct_lines", "name: fct_order_lines")
+    generated: list = []
+
+    out = _render(renamed, True, payload, generated=generated)
+
+    assert _names(_model_tests(out)) == [COMBO]
+    assert generated[0]["status"] == "added"
 
 
 def test_turning_the_switch_off_leaves_rendered_tests_in_place(kinds):

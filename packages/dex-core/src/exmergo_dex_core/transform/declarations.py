@@ -1304,19 +1304,21 @@ def render(
             text, Declaration(model=declaration.model), notes, flagged_tests, on
         )
     if generated is not None and planned:
-        before = _listed_claims(content)
-        after = _listed_claims(text)
         for g in planned:
             row = {
                 key: g[key] for key in ("model", "column", "test", "cadence", "claim")
             }
+            # Read at the test's own place, matched the way rendering matches,
+            # so a renamed model's tests elsewhere in the file and a hand-written
+            # equivalent are each told apart (#1449).
+            listed_before = _listed_at(content, g)
             if g["enabled"]:
                 row["status"] = (
                     "added"
-                    if g["claim"] in after and g["claim"] not in before
+                    if not listed_before and _listed_at(text, g)
                     else "already_listed"
                 )
-            elif g["claim"] in before:
+            elif listed_before:
                 row["status"] = "listed_while_off"
             else:
                 row["status"] = "not_rendered"
@@ -1421,34 +1423,50 @@ def _generated(
     return out
 
 
-def _listed_claims(content: str | None) -> set[str]:
-    """Every claim a test in ``content`` carries, wherever it is listed.
-
-    A claim id hashes its model, so one found anywhere in the file is that
-    model's: no entry needs locating.
-    """
+def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
+    """Whether ``content`` lists the generated ``test`` where it belongs: the
+    model's entry (or the version's item, for a label), then the column it sits
+    under, matched by :func:`_is_listed`."""
 
     if not content:
-        return set()
+        return False
     try:
         loaded = yaml.safe_load(content)
     except yaml.YAMLError:
-        return set()
-    found: set[str] = set()
-
-    def walk(value: Any) -> None:
-        if isinstance(value, Mapping):
-            claim = claim_of(value)
-            if claim is not None:
-                found.add(claim)
-            for sub in value.values():
-                walk(sub)
-        elif isinstance(value, list):
-            for sub in value:
-                walk(sub)
-
-    walk(loaded)
-    return found
+        return False
+    base, version = mv.split_label(test["model"])
+    entries = loaded.get("models") if isinstance(loaded, Mapping) else None
+    node: Any = next(
+        (
+            e
+            for e in entries or []
+            if isinstance(e, Mapping) and str(e.get("name", "")).lower() == base.lower()
+        ),
+        None,
+    )
+    if node is not None and version is not None:
+        node = next(
+            (
+                item
+                for item in node.get("versions") or []
+                if isinstance(item, Mapping) and str(item.get("v")) == str(version)
+            ),
+            None,
+        )
+    if node is not None and test["column"] is not None:
+        node = next(
+            (
+                c
+                for c in node.get("columns") or []
+                if isinstance(c, Mapping)
+                and str(c.get("name", "")).lower() == test["column"].lower()
+            ),
+            None,
+        )
+    if not isinstance(node, Mapping):
+        return False
+    listed = node.get("data_tests") or node.get("tests") or []
+    return isinstance(listed, list) and _is_listed(test["spec"], listed)
 
 
 def _render_version(

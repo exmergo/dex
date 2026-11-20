@@ -51,6 +51,9 @@ class Instance:
     test (``data_tests`` on the model entry). ``field``, ``columns`` and
     ``params`` are the claim it checks (``transform.claims.claim_id``), so two
     instances of one kind on one model (two population filters) get two claims.
+    A string in ``params`` is a name and is folded to lower case, as dbt
+    resolves names; a value from the data (a filter's values), whose case is
+    part of the fact, goes in a list, which is hashed as written.
     ``arguments`` are the generic test's arguments, written under
     ``arguments:`` as dbt 1.10 and later read them.
     """
