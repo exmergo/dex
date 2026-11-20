@@ -208,6 +208,11 @@ def test_an_output_column_matches_whatever_its_case():
         ),
         ("select a from x union all select a from y", None),
         ("with c(status) as (select raw_status from x) select * from c", None),
+        (
+            "with c(status) as (select raw_status from {{ ref('orders') }}) "
+            "select * from c",
+            None,
+        ),
     ],
 )
 def test_the_outputs_are_known_only_where_the_sql_proves_them(sql, expected):

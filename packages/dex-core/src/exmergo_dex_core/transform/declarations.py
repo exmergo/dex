@@ -290,7 +290,7 @@ def model_outputs(
     if not content:
         return None
     rest = _INERT_JINJA.sub("", content)
-    if "{{" in rest or "{%" in rest or _renames_cte_columns(rest):
+    if "{{" in rest or "{%" in rest or _renames_cte_columns(content):
         return None
     try:
         names = output_columns(content, path or "", through_ctes=True)
@@ -299,17 +299,23 @@ def model_outputs(
     return frozenset(names) if names is not None else None
 
 
-def _renames_cte_columns(sql: str) -> bool:
+def _renames_cte_columns(content: str) -> bool:
     """Whether a CTE names its columns (``with c(status) as (...)``), which a
-    projection read through ``select * from c`` would not see."""
+    projection read through ``select * from c`` would not see. Read from the
+    SQL :func:`output_columns` parses (Jinja blanked to placeholders), and
+    ``True`` where it does not parse, so the outputs stay unknown."""
 
     import sqlglot
     from sqlglot import exp
 
+    from ..references import blank_jinja
+
     try:
-        parsed = sqlglot.parse_one(sql, read="duckdb")
+        parsed = sqlglot.parse_one(blank_jinja(content), read="duckdb")
     except Exception:
-        return False
+        return True
+    if parsed is None:
+        return True
     return any(
         cte.args.get("alias") is not None and cte.args["alias"].columns
         for cte in parsed.find_all(exp.CTE)
