@@ -66,6 +66,12 @@ MACRO_ASSETS: dict[str, str] = {
         "with the count of rows beyond the first of each grain value, never a "
         "key value; a declaration plan adds it where the project lacks it"
     ),
+    "dex_population_filter": (
+        "the generic test a declared population filter renders (#1453): fails "
+        "with the count of rows whose column breaks the filter's includes or "
+        "excludes list, never a value; a declaration plan adds it where the "
+        "project lacks it"
+    ),
 }
 
 

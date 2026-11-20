@@ -276,6 +276,9 @@ def propose(
                 render_tests=render_tests,
                 generated=generated,
                 dialect=dialect,
+                outputs=declarations_mod.model_outputs(
+                    rendered, view.model_paths, model
+                ),
             )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
@@ -431,6 +434,7 @@ def _owes_generated_tests(
             render_tests=render_tests,
             generated=generated,
             dialect=dialect,
+            outputs=declarations_mod.model_outputs(files, view.model_paths, model),
         )
     except (RewriteError, DeclarationError):
         return False

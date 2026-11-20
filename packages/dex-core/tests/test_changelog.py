@@ -306,6 +306,40 @@ def test_a_release_regenerates_the_claude_directory_folder(release_repo):
 
 
 @needs_release_tools
+def test_a_v_prefixed_plugin_version_is_written_bare(release_repo):
+    """`prepare_release.sh 1.18.1 v1.18.1` wrote `v1.18.1` into every manifest;
+    the v is dropped now, as it always was from the engine version."""
+
+    result = _prepare(release_repo, "v9.9.9", "v9.9.9")
+
+    assert result.returncode == 0, result.stderr
+    for manifest in [*MANIFESTS, "claude/.claude-plugin/plugin.json"]:
+        loaded = json.loads((release_repo / manifest).read_text(encoding="utf-8"))
+        assert loaded["version"] == "9.9.9", manifest
+    checker = ROOT / "scripts" / "check_release_versions.py"
+    checked = subprocess.run(  # noqa: S603  (a fixed argv, no shell)
+        [sys.executable, str(checker), "--root", str(release_repo)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checked.returncode == 0, checked.stderr
+
+
+@needs_release_tools
+@pytest.mark.parametrize("plugin", ["9.9", "0.1.0a1", "9.9.9.1", "vv9.9.9"])
+def test_a_plugin_version_that_is_not_semver_changes_nothing(release_repo, plugin):
+    before = _tree(release_repo)
+
+    result = _prepare(release_repo, "9.9.9", plugin)
+
+    assert result.returncode == 1
+    assert "is not semver 2.0" in result.stderr
+    assert "nothing was changed" in result.stderr
+    assert _tree(release_repo) == before
+
+
+@needs_release_tools
 def test_a_rerun_for_a_prepared_version_changes_nothing(release_repo):
     assert _prepare(release_repo, "9.9.9", "9.9.9-rc.1").returncode == 0
     late = release_repo / "changelog.d" / "570.fixed.md"

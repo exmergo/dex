@@ -120,8 +120,8 @@ uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core expl
 
 ## The generated-test parity harness
 
-A test Dex generates from a declaration (`dex_unique_combination`, and the kinds
-after it) has two implementations of one fact: its SQL macro, which runs in the
+A test Dex generates from a declaration (`dex_unique_combination`,
+`dex_population_filter`, and the kinds after it) has two implementations of one fact: its SQL macro, which runs in the
 customer's `dbt build`, and the check `maintain verify` runs. The parity harness,
 `packages/dex-core/tests/transform/generated_parity.py`, holds them to one answer.
 Each row names a generated test, the `maintain verify` finding codes it must
@@ -133,8 +133,11 @@ including a dbt failure count that differs from the count the finding states.
 It runs on DuckDB in the offline suite (`tests/transform/test_generated_parity.py`)
 and on every warehouse in `integration.yml` through each connector's
 `test_generated_tests_agree_with_maintain_verify_live`. A new generated test
-adds a `ParityRow` to `ROWS`; its fixtures are literal SELECTs, written once for
-every dialect, with the connector's typed integer NULL passed in. A kind that
+adds a `ParityRow` to `ROWS` (several, each with its own `name`, where one test
+has several cases to hold, as `dex_population_filter` does for `includes`,
+`excludes`, a NULL and a typed comparison); its fixtures are literal SELECTs,
+written once for every dialect, with the connector's typed integer NULL passed
+in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 
@@ -1099,13 +1102,20 @@ commit:
    It pins the three skill wrappers to the engine version, bumps the four plugin
    manifests, writes the release's section of `CHANGELOG.md` dated today in UTC,
    and deletes the fragments it collected. It stages nothing; every change is
-   left in the working tree.
+   left in the working tree. Pass both versions bare: a leading `v` is dropped,
+   and a plugin version that is not semver is refused before anything is written.
 
 3. Review `git status` and `git diff`, and update any documentation the release
    changes: status and capability claims, install commands, version strings.
 4. Commit the changelog, the deleted fragments, the pins and the manifests
    together (`git commit -a` includes the deletions). The pull request edits
-   `CHANGELOG.md`, so it carries the `no-changelog` label.
+   `CHANGELOG.md`, so it carries the `no-changelog` label. Its **Release prep**
+   check (`.github/workflows/release-prep.yml`) holds the versions to their
+   shape with `scripts/check_release_versions.py` (bare PEP 440 engine pins, the
+   newest `CHANGELOG.md` section, bare semver manifests that agree with the
+   engine), and fails if the tree is not exactly what the script writes, such as
+   a `claude/` folder left behind by a skill edited after the script ran. Run
+   `python3 scripts/check_release_versions.py` to check before pushing.
 5. Once it is merged, tag the merged commit and push the tag. The release
    workflow refuses, before anything reaches PyPI, a tag whose wrapper pins do
    not match it or whose `CHANGELOG.md` has no section for it.

@@ -81,6 +81,7 @@ from .rewrite import (
     before_trailing_blanks,
     column_anchor,
     generated_spec,
+    output_columns,
     prevailing_test_key,
     splice,
     yaml_blocks,
@@ -253,6 +254,72 @@ def model_sql_path(
         if any(root == candidate or root in candidate.parents for root in roots):
             return path
     return None
+
+
+#: The Jinja a model's select list can hold without hiding a column: a
+#: ``ref()``, a ``source()`` or a ``config()``. Any other expression or block
+#: (a loop, ``dbt_utils.star``) may write columns no static read sees.
+_INERT_JINJA = re.compile(
+    r"\{\{-?\s*(?:ref|source|config)\s*\(.*?\)\s*-?\}\}"
+    r"|\{%-?\s*(?:config|do\s+config)\s*\(.*?\)\s*-?%\}"
+    r"|\{#.*?#\}",
+    re.DOTALL,
+)
+
+
+def model_outputs(
+    files: Mapping[str, str], model_paths: Iterable[str], model: str
+) -> frozenset[str] | None:
+    """The lowercased columns ``model``'s SQL provably outputs, or ``None``
+    when that is not known (no file, a star, a set operation, Jinja that could
+    write a column, SQL that does not parse, a CTE that renames its columns).
+    ``None`` never means *empty*: a generated column test renders unless its
+    column is provably absent (#1453).
+
+    A versioned model's bare name is ``None`` too: its tests go on the shared
+    entry every version inherits, and one version's file says nothing about
+    another's. A version label (``dim_teams.v2``) reads that version's file.
+    """
+
+    _base, version = mv.split_label(model)
+    model_paths = list(model_paths)
+    if version is None and _version_sql_path(files, model_paths, model) is not None:
+        return None
+    path = model_sql_path(files, model_paths, model)
+    content = files.get(path) if path else None
+    if not content:
+        return None
+    rest = _INERT_JINJA.sub("", content)
+    if "{{" in rest or "{%" in rest or _renames_cte_columns(content):
+        return None
+    try:
+        names = output_columns(content, path or "", through_ctes=True)
+    except Exception:
+        return None
+    return frozenset(names) if names is not None else None
+
+
+def _renames_cte_columns(content: str) -> bool:
+    """Whether a CTE names its columns (``with c(status) as (...)``), which a
+    projection read through ``select * from c`` would not see. Read from the
+    SQL :func:`output_columns` parses (Jinja blanked to placeholders), and
+    ``True`` where it does not parse, so the outputs stay unknown."""
+
+    import sqlglot
+    from sqlglot import exp
+
+    from ..references import blank_jinja
+
+    try:
+        parsed = sqlglot.parse_one(blank_jinja(content), read="duckdb")
+    except Exception:
+        return True
+    if parsed is None:
+        return True
+    return any(
+        cte.args.get("alias") is not None and cte.args["alias"].columns
+        for cte in parsed.find_all(exp.CTE)
+    )
 
 
 def _version_sql_path(
@@ -588,6 +655,7 @@ def apply_declarations(
                 render_tests=render_tests,
                 generated=generated,
                 dialect=dialect,
+                outputs=model_outputs(files, view.model_paths, declaration.model),
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -1273,6 +1341,7 @@ def render(
     render_tests: bool | list[str] = False,
     generated: list[dict[str, Any]] | None = None,
     dialect: str | None = None,
+    outputs: frozenset[str] | None = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1292,16 +1361,19 @@ def render(
     cadence tag and claim, and a ``status`` of ``added`` or ``already_listed``
     (on), ``not_rendered`` with the ``reason`` or ``listed_while_off`` (off). A
     kind turned on that does not support ``dialect`` (#1451) is
-    ``not_rendered`` with the reason ``dialect_unsupported``. A generated test
-    already in the YAML is never removed: the switch decides what renders, not
-    what stays.
+    ``not_rendered`` with the reason ``dialect_unsupported``. ``outputs`` are
+    the columns the model's SQL provably outputs (:func:`model_outputs`, or
+    ``None`` where unknown): a column test on a column outside them is
+    ``not_rendered`` with the reason ``column_not_output`` (#1453). A generated
+    test already in the YAML is never removed: the switch decides what renders,
+    not what stays.
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
     if not gt.kinds():
         # No kind registered: nothing to generate, so no entry to read back.
         return text
-    planned = _generated(_effective(text, declaration), render_tests, dialect)
+    planned = _generated(_effective(text, declaration), render_tests, dialect, outputs)
     on = [g for g in planned if g["enabled"]]
     if on:
         # Rendered on their own, after the facts: a bare declaration of the
@@ -1400,10 +1472,11 @@ def _generated(
     declaration: Declaration,
     render_tests: bool | list[str],
     dialect: str | None = None,
+    outputs: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Every generated test the declaration gives, each with its claim, its
     rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
-    ``dialect`` (#1451)."""
+    ``dialect`` (#1451), for a column the model outputs (#1453)."""
 
     out: list[dict[str, Any]] = []
     model = declaration.model
@@ -1415,6 +1488,14 @@ def _generated(
             claim = claim_id(
                 model, instance.field, instance.columns, dict(instance.params)
             )
+            renders, reason = on, None if on else off_reason
+            if (
+                on
+                and instance.column is not None
+                and outputs is not None
+                and instance.column.lower() not in outputs
+            ):
+                renders, reason = False, gt.COLUMN_NOT_OUTPUT
             out.append(
                 {
                     "model": model,
@@ -1422,8 +1503,8 @@ def _generated(
                     "test": kind.name,
                     "cadence": kind.cadence,
                     "claim": claim,
-                    "enabled": on,
-                    "off_reason": None if on else off_reason,
+                    "enabled": renders,
+                    "off_reason": reason,
                     "spec": generated_spec(
                         kind.name,
                         cadence=kind.cadence,

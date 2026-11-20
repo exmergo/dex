@@ -68,12 +68,20 @@ class ParityRow:
     count: Callable[[Mapping[str, Any]], int] | None = None
     #: Whether ``maintain verify``'s payload shows it measured the model at all,
     #: so a clean fixture's absent finding is a verdict and not a check that
-    #: never ran (a refused statement, an unreadable relation).
+    #: never ran (a refused statement, an unreadable relation). The payload is
+    #: verify's ``data`` with its envelope's ``warnings`` under ``_warnings``.
     measured: Callable[[Mapping[str, Any], str], bool] | None = None
+    #: The row's own name, where one test has several rows (#1453: an
+    #: ``includes`` list and an ``excludes`` list); the test's name otherwise.
+    name: str | None = None
+
+    @property
+    def label(self) -> str:
+        return self.name or self.test
 
     @property
     def slug(self) -> str:
-        return self.test.removeprefix("dex_")
+        return self.label.removeprefix("dex_")
 
     def model(self, side: str) -> str:
         return f"dex_parity_{self.slug}_{side}"
@@ -122,8 +130,108 @@ UNIQUE_COMBINATION = ParityRow(
     measured=_grain_measured,
 )
 
+
+def _statuses(*rows: tuple[str, str]) -> str:
+    """A SELECT over ``rows`` as (id, status). ``None`` writes a NULL status,
+    spelled ``nullif('x', 'x')``: a text NULL every dialect types from the
+    expression, with no cast to spell per warehouse. The first row names the
+    columns, so it is never NULL."""
+
+    def value(status: str | None) -> str:
+        return "nullif('x', 'x')" if status is None else status
+
+    (first_id, first), *rest = rows
+    lines = [f"select {first_id} as id, {value(first)} as status"]
+    lines += [f"union all select {i}, {value(v)}" for i, v in rest]
+    return "\n".join(lines) + "\n"
+
+
+def _population_measured(verify: Mapping[str, Any], model: str) -> bool:
+    """``maintain verify`` ran the population check over ``model``: the class
+    is not suppressed (it is, when no model's filter could be measured) and no
+    warning names this model's population, or its whole declared-facts
+    statement, as unmeasured (a column the relation lacks, a refused
+    statement). Another model's measured filter keeps the class unsuppressed,
+    so the per-model warnings are what tell this model apart."""
+
+    if "population" in (verify.get("suppressed") or {}):
+        return False
+    unmeasured = (
+        f"declared population on {model} ",
+        f"declared facts on {model} could not be measured",
+    )
+    return not any(
+        marker in str(line)
+        for line in verify.get("_warnings") or []
+        for marker in unmeasured
+    )
+
+
+def _contradicting_rows(finding: Mapping[str, Any]) -> int:
+    return int(finding["data"]["contradicting_rows"])
+
+
+def _population_row(name: str, filters: dict, violating: str, clean: str) -> ParityRow:
+    return ParityRow(
+        test=gt.POPULATION_FILTER,
+        name=name,
+        codes=frozenset({"population_contradicted"}),
+        declaration={
+            "description": "Parity fixture: one row per order.",
+            "population": {"filters": [{"column": "status", **filters}]},
+        },
+        violating=lambda _null: violating,
+        clean=lambda _null: clean,
+        count=_contradicting_rows,
+        measured=_population_measured,
+    )
+
+
+#: #1453: an ``includes`` list. One row holds a value outside it.
+POPULATION_INCLUDES = _population_row(
+    "dex_population_filter_includes",
+    {"includes": ["paid", "shipped"]},
+    _statuses(("1", "'paid'"), ("2", "'shipped'"), ("3", "'refunded'")),
+    _statuses(("1", "'paid'"), ("2", "'shipped'")),
+)
+
+#: #1453: a NULL is outside an ``includes`` list, on both sides.
+POPULATION_INCLUDES_NULL = _population_row(
+    "dex_population_filter_includes_null",
+    {"includes": ["paid", "shipped"]},
+    _statuses(("1", "'paid'"), ("2", "'shipped'"), ("3", None)),
+    _statuses(("1", "'paid'"), ("2", "'shipped'")),
+)
+
+#: #1453: an ``excludes`` list. Two rows hold the excluded value, so the count
+#: is compared too, and a NULL that breaks no ``excludes`` list sits in both
+#: fixtures: counted by either side, the clean fixture would fail. The list also
+#: holds a quote and a backslash, which each warehouse writes in its own literal
+#: syntax: a literal the warehouse cannot parse errors the test.
+POPULATION_EXCLUDES = _population_row(
+    "dex_population_filter_excludes",
+    {"excludes": ["cancelled", "it's", "a\\b"]},
+    _statuses(("1", "'paid'"), ("2", "'cancelled'"), ("3", "'cancelled'"), ("4", None)),
+    _statuses(("1", "'paid'"), ("2", "'shipped'"), ("4", None)),
+)
+
+#: #1453: text values against a number column, compared as text on both sides
+#: (the column cast to the warehouse's string type).
+POPULATION_NUMERIC = _population_row(
+    "dex_population_filter_numeric",
+    {"excludes": ["7"]},
+    _statuses(("1", "1"), ("2", "7"), ("3", "8")),
+    _statuses(("1", "1"), ("2", "8")),
+)
+
 #: Every row the harness runs, in the order the generated tests shipped.
-ROWS: tuple[ParityRow, ...] = (UNIQUE_COMBINATION,)
+ROWS: tuple[ParityRow, ...] = (
+    UNIQUE_COMBINATION,
+    POPULATION_INCLUDES,
+    POPULATION_INCLUDES_NULL,
+    POPULATION_EXCLUDES,
+    POPULATION_NUMERIC,
+)
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
 ALL_CODES: frozenset[str] = frozenset().union(*(row.codes for row in ROWS))
@@ -262,7 +370,7 @@ def run_parity(
         if gt.supports(kind, connector):
             if sorted(t["status"] for t in mine) != ["added", "added"]:
                 report.disagreements.append(
-                    f"{row.test}: the plan did not render the test on both "
+                    f"{row.label}: the plan did not render the test on both "
                     f"fixtures: {mine}"
                 )
                 continue
@@ -273,10 +381,10 @@ def run_parity(
         rendered = any(row.test in d.get("diff", "") for d in planned.get("diffs", []))
         if statuses != {("not_rendered", gt.DIALECT_UNSUPPORTED)} or rendered:
             report.disagreements.append(
-                f"{row.test}: {connector} is unsupported, yet the plan says {mine}"
+                f"{row.label}: {connector} is unsupported, yet the plan says {mine}"
             )
         else:
-            report.unsupported.append(row.test)
+            report.unsupported.append(row.label)
         report.models.extend(sorted(models))
 
     rc, applied = step("apply", [*root, "transform", "apply"])
@@ -316,13 +424,16 @@ def run_parity(
         "verify",
         [*root, "maintain", "verify", "--target", "dev", *selected, *_paid(budget)],
     )
-    verify_data = verified.get("data") or {}
+    verify_data = {
+        **(verified.get("data") or {}),
+        "_warnings": verified.get("warnings") or [],
+    }
     findings = verify_data.get("findings") or []
 
     for row in live:
         _judge(row, results, tests, findings, report, verify_data)
     for row in rows:
-        if row.test in report.unsupported:
+        if row.label in report.unsupported:
             _judge_unsupported(row, tests, findings, report, verify_data)
     return report
 
@@ -345,7 +456,7 @@ def _judge(
         ]
         test_failed = status == "fail"
         test_passed = status == "pass"
-        where = f"{row.test} on {model}"
+        where = f"{row.label} on {model}"
         if should_fail:
             if not test_failed:
                 report.disagreements.append(
@@ -380,8 +491,10 @@ def _judge(
                     f"{where}: maintain verify raised {[f['code'] for f in found]} "
                     "on the clean fixture"
                 )
-    if not any(d.startswith(row.test) for d in report.disagreements):
-        report.agreed.append(row.test)
+    if not any(
+        d.startswith((f"{row.label} ", f"{row.label}:")) for d in report.disagreements
+    ):
+        report.agreed.append(row.label)
 
 
 def _judge_unsupported(
@@ -398,18 +511,18 @@ def _judge_unsupported(
         model = row.model(side)
         if (model, row.test) in tests:
             report.disagreements.append(
-                f"{row.test}: a test built on {model} where the dialect is unsupported"
+                f"{row.label}: a test built on {model} where the dialect is unsupported"
             )
         found = any(
             f["identifier"] == model and f["code"] in row.codes for f in findings
         )
         if not owed and row.measured is not None and not row.measured(verify, model):
             report.disagreements.append(
-                f"{row.test}: maintain verify did not measure {model}"
+                f"{row.label}: maintain verify did not measure {model}"
             )
         if found is not owed:
             report.disagreements.append(
-                f"{row.test}: maintain verify {'missed' if owed else 'raised'} "
+                f"{row.label}: maintain verify {'missed' if owed else 'raised'} "
                 f"{sorted(row.codes)} on {model}"
             )
 

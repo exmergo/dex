@@ -442,6 +442,33 @@ def test_an_includes_list_counts_every_other_value_and_null(tmp_path: Path):
     assert "25 of them NULL" in finding.detail
 
 
+def test_a_filter_with_both_lists_judges_each_list_on_its_own(tmp_path: Path):
+    """#1453: a filter stating both ``includes`` and ``excludes`` is two rules.
+    It once probed ``IN (includes)`` as the excluded set, so every included
+    value read as a contradiction."""
+
+    result = _run(
+        tmp_path,
+        {
+            "model.p.orders": _model(
+                "orders",
+                dex=_population(
+                    includes=["paid", "shipped", "cancelled"], excludes=["cancelled"]
+                ),
+            )
+        },
+        _ORDERS,
+    )
+    by_list = {
+        "excludes" if "excludes" in f.data else "includes": f.data
+        for f in result.findings
+    }
+    assert _codes(result) == ["population_contradicted"] * 2
+    assert by_list["excludes"]["contradicting_rows"] == 25
+    assert by_list["includes"]["contradicting_rows"] == 25
+    assert by_list["includes"]["null_rows"] == 25
+
+
 def test_a_population_the_sql_implements_is_checked_and_clean(tmp_path: Path):
     result = _run(
         tmp_path,

@@ -304,8 +304,12 @@ def _read(node: dict[str, Any]):
             continue
         includes = _values(entry.get("includes"))
         excludes = _values(entry.get("excludes"))
-        if includes or excludes:
-            filters.append(PopulationRule(entry["column"], includes, excludes))
+        # A filter stating both lists is two rules, each judged on its own list
+        # (#1453): one probe per list, as the generated tests check them.
+        if includes:
+            filters.append(PopulationRule(entry["column"], includes=includes))
+        if excludes:
+            filters.append(PopulationRule(entry["column"], excludes=excludes))
 
     from ..project_definitions import read_population_parent
 
