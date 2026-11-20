@@ -4314,6 +4314,61 @@ def _null_checks(
     return checks, notes
 
 
+def _spell_key_columns(adapter, pairs: list) -> list[str]:
+    """Respell each relationship's key columns the way its relation stores them,
+    in place, so the probe's quoted names resolve (#1366). Only the probe reads
+    the respelling: what a finding or record names comes from the candidate, as
+    the SQL wrote it, so a finding's fingerprint does not move with it.
+
+    The columns come from the model's SQL, which is ordinarily lower case, and
+    the probe quotes what it is handed; Snowflake stores an unquoted name upper
+    case, so the quoted SQL spelling is an invalid identifier there (Postgres and
+    Redshift the other way round). A name already spelled the way the connector
+    folds it needs nothing and reads no metadata. Otherwise the relation's own
+    spelling wins: the name exactly (a column the SQL quoted keeps its case),
+    else the connector's fold of it. A column with neither, or a relation whose
+    columns cannot be read, keeps the SQL spelling and the probe reports what the
+    warehouse says, as before; an unreadable relation is a note, returned.
+    """
+
+    from ..adapters import fold_identifier
+    from ..guards.cost_guard import CostGuardError
+
+    dialect = getattr(adapter, "dialect", None)
+    live: dict[str, set[str]] = {}
+    unreadable: dict[str, str] = {}
+    notes: list[str] = []
+
+    def spell(model: str, identifier: str, column: str) -> str:
+        folded = fold_identifier(dialect, column)
+        if folded == column:
+            return column
+        if identifier not in live:
+            try:
+                _meta, columns = adapter.table_metadata(identifier)
+            except CostGuardError:
+                raise
+            except Exception as exc:  # an unreadable relation keeps the SQL spelling
+                unreadable[identifier] = type(exc).__name__
+                columns = []
+            live[identifier] = {c.name for c in columns}
+        if identifier in unreadable:
+            note = (
+                f"{model}: the join keys on {identifier} were probed as the SQL "
+                f"spells them: the relation's columns could not be read "
+                f"({unreadable[identifier]})"
+            )
+            if note not in notes:
+                notes.append(note)
+        names = live[identifier]
+        return folded if column not in names and folded in names else column
+
+    for model, _candidate, rel in pairs:
+        rel.from_columns = [spell(model, rel.from_dataset, c) for c in rel.from_columns]
+        rel.to_columns = [spell(model, rel.to_dataset, c) for c in rel.to_columns]
+    return notes
+
+
 def _split_unsafe(pairs: list[tuple], dialect: str) -> tuple[list[tuple], list[tuple]]:
     """The pairs a probe can measure on ``dialect``, and those it cannot: a key
     conversion that needs a safe cast where the dialect has none and cannot
@@ -4727,6 +4782,8 @@ def join_coverage(
     grouped = _grouped_sides(pairs)
     checks, check_notes = _null_checks(adapter, plan, live_identifiers)
     result.notes.extend(check_notes)
+    # Before pricing, so an EXPLAIN reads the names the probe will quote.
+    result.notes.extend(_spell_key_columns(adapter, pairs))
     estimate, probe_count = join_probe_cost(
         adapter, relationships, exprs, filters, grouped
     )
@@ -4933,8 +4990,10 @@ def _judge_coverage(
         return None
 
     orphan_fraction = round(unmatched_rows / eligible_rows, 4)
-    from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in rel.from_columns)
-    to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in rel.to_columns)
+    # The SQL's spelling, not the probe's (#1366): a finding's column is part of
+    # its fingerprint, and the record beside it names the candidate's.
+    from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in candidate.from_columns)
+    to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in candidate.to_columns)
     measured = (
         f"{unmatched_rows} of {eligible_rows} eligible {child} row(s) "
         f"({orphan_fraction:.0%}) and {eligible_keys - matched_keys} of "
@@ -4949,9 +5008,9 @@ def _judge_coverage(
         "join": candidate.label or None,
         "side": candidate.side,
         "from_relation": rel.from_dataset,
-        "from_columns": list(rel.from_columns),
+        "from_columns": list(candidate.from_columns),
         "to_relation": rel.to_dataset,
-        "to_columns": list(rel.to_columns),
+        "to_columns": list(candidate.to_columns),
         "orphan_fraction": orphan_fraction,
         **record["measured"],
         "coverage_rows": coverage_rows,
@@ -5039,7 +5098,9 @@ def _judge_coverage(
         axis="join_contract",
         code=code,
         identifier=model,
-        column=rel.from_columns[0] if len(rel.from_columns) == 1 else None,
+        column=(
+            candidate.from_columns[0] if len(candidate.from_columns) == 1 else None
+        ),
         severity=severity,
         detail=detail,
         data=data,
