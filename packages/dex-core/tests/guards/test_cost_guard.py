@@ -33,12 +33,16 @@ def test_unconfirmed_raises_with_the_cost_attached():
     assert cost.paradigm is Paradigm.BYTES_SCANNED
     assert cost.estimate == 5
     assert cost.ceiling == 10
+    # Issue #1520: the billed handshake is still required here, and the
+    # refusal's cost says so; only the free-local warning was dropped.
+    assert cost.handshake == "required"
 
 
 def test_free_local_confirmed_passes_without_a_budget():
     cost = preflight(0.0, None, paradigm=Paradigm.FREE_LOCAL, confirmed=True)
     assert cost.paradigm is Paradigm.FREE_LOCAL
     assert cost.ceiling is None
+    assert cost.handshake == "not_applicable"
 
 
 def test_free_local_unconfirmed_never_raises():
@@ -48,15 +52,18 @@ def test_free_local_unconfirmed_never_raises():
 
     cost = preflight(0.0, None, paradigm=Paradigm.FREE_LOCAL, confirmed=False)
     assert cost.paradigm is Paradigm.FREE_LOCAL
+    assert cost.handshake == "not_applicable"
 
     cost = preflight(0.0, 1.0, paradigm=Paradigm.FREE_LOCAL, confirmed=False)
     assert cost.paradigm is Paradigm.FREE_LOCAL
+    assert cost.handshake == "not_applicable"
 
 
 def test_billed_paradigm_within_ceiling_and_confirmed_passes():
     cost = preflight(5, 100, paradigm=Paradigm.BYTES_SCANNED, confirmed=True)
     assert cost.estimate == 5
     assert cost.ceiling == 100
+    assert cost.handshake == "confirmed"
 
 
 # --- CostGate ------------------------------------------------------------------
