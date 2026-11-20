@@ -647,9 +647,7 @@ def test_a_time_bucket_reads_the_same_under_api_and_local(
     assert buckets and all(b.endswith("+00:00") for b in buckets)
 
 
-def test_a_values_bucket_reads_the_same_under_api_and_local(
-    shop, monkeypatch, capsys
-):
+def test_a_values_bucket_reads_the_same_under_api_and_local(shop, monkeypatch, capsys):
     _server(monkeypatch, shop)
     dimension, _ = VALUES["values_month"]
     argv = ["explore", "semantic", "values", dimension]
