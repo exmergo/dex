@@ -818,7 +818,8 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      (#1346). A rendered test is matched to its fact by its claim
                                      id (tests[].claim), an unclaimed one by kind and column
                                      (matched_by); a claim no declared fact states is listed in
-                                     declarations.stale_claims and checks nothing (#1498).
+                                     declarations.stale_claims and still counts where its kind
+                                     and column match, so a rename keeps its coverage (#1498).
                                      Columns a singular test
                                      reads are columns.referenced_columns (roles: predicate, join,
                                      aggregation, grouping, projection; the tests that read them),

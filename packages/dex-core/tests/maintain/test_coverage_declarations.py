@@ -1040,8 +1040,9 @@ def test_tests_rendered_with_claims_are_matched_by_claim() -> None:
     tested = [f for f in out["facts"] if f["tests"]]
     assert {f["fact"] for f in tested} == {"grain", "references", "null_rule", "key"}
     for fact in tested:
-        if fact["fact"] != "key":  # a key role renders no test, so carries no claim
-            assert fact["matched_by"] == "claim", fact
+        assert fact["matched_by"] == "claim", fact
+    # The key on the grain column is checked by the grain's `unique`.
+    assert _fact(out, "key", "order_id")["tests"] == ["unique"]
     assert _fact(out, "grain")["tests"] == ["unique", "not_null"]
     assert _fact(out, "null_rule", "placed_at")["tests"] == ["not_null"]
     assert out["stale_claims"] == []
@@ -1059,9 +1060,11 @@ def test_a_hand_written_unique_on_the_grain_is_matched_by_kind_and_column() -> N
     assert grain["checked_by"] == "both"
 
 
-def test_a_claim_no_declared_fact_states_is_listed_apart_and_checks_nothing() -> None:
+def test_a_claim_no_declared_fact_states_is_listed_apart() -> None:
     # The grain moved from `legacy_id` to `order_id`; the old render's `unique`
-    # stayed, and a `unique` now on `order_id` carries the old claim too.
+    # stayed, and a `unique` now on `order_id` carries the old claim too. Both
+    # are listed apart; the one on the grain column still counts by kind and
+    # column, as it does for a test without a claim.
     old = claim_id("orders", "grain", ["legacy_id"], {"check": "unique"})
     manifest = _manifest(
         [_model("orders", dex={"grain": ["order_id"]})],
@@ -1072,9 +1075,9 @@ def test_a_claim_no_declared_fact_states_is_listed_apart_and_checks_nothing() ->
     )
     out = _run(manifest)
     grain = _fact(out, "grain")
-    assert grain["tests"] == []
-    assert grain["checked_by"] == "dex_verify"
-    assert "matched_by" not in grain
+    assert grain["tests"] == ["unique"]
+    assert grain["checked_by"] == "both"
+    assert grain["matched_by"] == "kind_and_column"
     assert out["stale_claims"] == [
         {"model": "orders", "test": "unique", "column": "legacy_id", "claim": old},
         {"model": "orders", "test": "unique", "column": "order_id", "claim": old},
@@ -1098,3 +1101,50 @@ def test_each_test_in_a_resources_tests_list_shows_its_claim() -> None:
     by_test = {t["test"]: t for t in orders["tests"]}
     assert by_test["unique"]["claim"] == claim
     assert "claim" not in by_test["not_null"]
+
+
+def test_a_renamed_model_keeps_its_coverage_and_lists_its_claims_apart() -> None:
+    # `transform rename` keeps each test's claim as written (#1448): `sales` was
+    # `orders`, so its tests carry the old model's claims.
+    def old(check: str) -> str:
+        return claim_id("orders", "grain", ["order_id"], {"check": check})
+
+    manifest = _manifest(
+        [
+            _model(
+                "sales",
+                dex={"grain": ["order_id"]},
+                columns={"order_id": {"role": "key"}},
+            )
+        ],
+        [
+            _test("unique", "sales", "order_id", claim=old("unique")),
+            _test("not_null", "sales", "order_id", claim=old("not_null")),
+        ],
+    )
+    out = _run(manifest)
+    grain = _fact(out, "grain")
+    assert (grain["checked_by"], grain["tests"]) == ("both", ["unique"])
+    assert grain["matched_by"] == "kind_and_column"
+    key = _fact(out, "key", "order_id")
+    assert (key["checked_by"], key["tests"]) == ("both", ["unique"])
+    assert [s["claim"] for s in out["stale_claims"]] == [
+        old("unique"),
+        old("not_null"),
+    ]
+
+
+def test_a_renamed_column_keeps_its_coverage_and_lists_its_claim_apart() -> None:
+    # `legacy_id` was renamed `order_id`; its `not_null` keeps the old claim.
+    old = claim_id("orders", "null_rule", ["legacy_id"], {"null_rule": "never"})
+    manifest = _manifest(
+        [_model("orders", columns={"order_id": {"null_rule": "never"}})],
+        [_test("not_null", "orders", "order_id", claim=old)],
+    )
+    out = _run(manifest)
+    fact = _fact(out, "null_rule", "order_id")
+    assert (fact["checked_by"], fact["tests"]) == ("dbt_test", ["not_null"])
+    assert fact["matched_by"] == "kind_and_column"
+    assert out["stale_claims"] == [
+        {"model": "orders", "test": "not_null", "column": "order_id", "claim": old}
+    ]

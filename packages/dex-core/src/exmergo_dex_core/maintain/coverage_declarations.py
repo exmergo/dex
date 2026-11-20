@@ -38,9 +38,10 @@ taken from both.
 
 A test Dex rendered carries the claim id of the fact it checks (#1448), and is
 matched to that fact by the claim, whatever its kind or column; the kind and
-column below match a test with no claim. A test whose claim names no fact the
-declaration states is a stale render: listed under ``stale_claims`` and never
-counted as a check (#1498).
+column below match any other test. A test whose claim names no fact the
+declaration states (a stale render, or a test of a renamed model or column,
+which keeps its claim) is listed under ``stale_claims``, and still counts where
+its kind and column match (#1498).
 
 Never a value: a population filter's ``includes``/``excludes`` and a rule's
 prose stay out of the payload in every mode, so the section is the same in
@@ -144,7 +145,7 @@ class _Tests:
             str, list[tuple[str, str | None, dict, list[str], str | None]]
         ] = defaultdict(list)
         #: The claim ids each model's declaration states, set as its facts are
-        #: read: a test carrying any other claim is stale and checks nothing.
+        #: read: a test carrying any other claim is stale, and is listed apart.
         self.claims: dict[str, set[str]] = {}
         for test in (manifest.get("nodes") or {}).values():
             if not isinstance(test, dict) or test.get("resource_type") != "test":
@@ -175,17 +176,6 @@ class _Tests:
             uid: node.get("package_name") for uid, node in self.parents.items()
         }
 
-    def _live(
-        self, model: str
-    ) -> list[tuple[str, str | None, dict, list[str], str | None]]:
-        """The model's tests a kind-and-column match may read: all but those
-        whose claim names a fact its declaration no longer states."""
-
-        known = self.claims.get(model, set())
-        return [
-            t for t in self.by_model.get(model, []) if t[4] is None or t[4] in known
-        ]
-
     def claimed(self, model: str, claims: list[str]) -> list[str]:
         """The tests on ``model`` that carry one of ``claims``, by name."""
 
@@ -212,12 +202,12 @@ class _Tests:
         key = _bare(column)
         return any(
             _base(name) == test and col == key
-            for name, col, _kwargs, _reads, _claim in self._live(model)
+            for name, col, _kwargs, _reads, _claim in self.by_model.get(model, [])
         )
 
     def combination(self, model: str, columns: list[str]) -> str | None:
         wanted = {_bare(c) for c in columns}
-        for name, _col, kwargs, _reads, _claim in self._live(model):
+        for name, _col, kwargs, _reads, _claim in self.by_model.get(model, []):
             if _base(name) != "unique_combination_of_columns":
                 continue
             combo = kwargs.get("combination_of_columns")
@@ -261,7 +251,7 @@ class _Tests:
         the declared ``field``."""
 
         key = _bare(column)
-        for name, col, kwargs, reads, _claim in self._live(model):
+        for name, col, kwargs, reads, _claim in self.by_model.get(model, []):
             if _base(name) != "relationships" or col != key:
                 continue
             tested_field = kwargs.get("field")
@@ -334,7 +324,8 @@ def declarations(
             declared_models += 1
             records.extend(model_facts)
     # A test whose claim names a fact no declaration states any more (#1498):
-    # a stale render, listed apart and never counted as a check.
+    # a stale render, or a test of a renamed model or column, which keeps its
+    # claim. Listed apart; it still counts where kind and column match.
     stale = [
         {
             "model": labels[uid],
@@ -428,8 +419,10 @@ def declarations(
     if stale_count:
         notes.append(
             f"{stale_count} test(s) carry a claim id that names no fact the "
-            "declaration states: listed in `stale_claims` and counted as no "
-            "check. Declare the fact again, or remove the test"
+            "declaration states, listed in `stale_claims`. One still counts "
+            "where its kind and column match a declared fact (a model or column "
+            "renamed keeps its tests' claims). To refresh one, remove the test, "
+            "then declare the fact again so Dex renders it with a current claim"
         )
         if not full and stale_count > FACT_CAP:
             stale = stale[:FACT_CAP]
@@ -939,7 +932,8 @@ def _model_facts(
 
     def check(claims: list[str], fallback: list[str]) -> tuple[list[str], str | None]:
         """The tests that check a fact: those carrying its claim, else those
-        matched by kind and column, which carry no claim or a live one."""
+        matched by kind and column, a stale claim's included (a renamed model
+        or column keeps its tests' claims, #1448)."""
 
         by_claim = tests.claimed(uid, claims)
         if by_claim:
@@ -1003,8 +997,12 @@ def _model_facts(
             )
             add("foreign_key", name, found, [], how)
         if role == "key":
+            # A key on the single grain column is checked by the grain's unique.
             found, how = check(
-                [], ["unique"] if tests.on_column(uid, name, "unique") else []
+                ids("grain", grain_cols, {"check": "unique"})
+                if _bare(name) == single_grain
+                else [],
+                ["unique"] if tests.on_column(uid, name, "unique") else [],
             )
             verify = ["grain_broken"] if _bare(name) == single_grain else []
             add("key", name, found, verify, how)
