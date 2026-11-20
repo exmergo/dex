@@ -434,7 +434,7 @@ agrees with that finding on every connector:
 - **A NULL is no value.** It never counts, and a column holding only NULLs
   passes, where `maintain verify` notes it as not checked.
 - **A column that is not a number is checked by neither.** Text, a boolean, a
-  date or a time: `maintain verify` names it in a note, and the test, reading
+  date, a UUID, JSON: `maintain verify` names it in a note, and the test, reading
   the column's type from the relation's metadata, compiles to a count of
   nothing. Where that read finds nothing (an ephemeral model), the column is
   compared as it is.

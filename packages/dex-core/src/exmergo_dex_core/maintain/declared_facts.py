@@ -1729,9 +1729,15 @@ def _judge_aggregate(
             )
             continue
         unit_checked = True
+        outside = row.get(f"dex_out_{index}")
         # A percent whose every value sits within 0 to 1 is the fraction it
-        # was probably computed as; a fraction outside it is arithmetic.
-        wrong = (low < 0 or high > 1) if unit == "fraction" else high <= 1 and low >= 0
+        # was probably computed as; a fraction outside it is arithmetic, decided
+        # by the exact count where the probe has one: a float extremum can round
+        # a high-precision decimal just past 1 down to 1.0 (#1455).
+        if unit == "fraction":
+            wrong = int(outside) > 0 if outside is not None else low < 0 or high > 1
+        else:
+            wrong = high <= 1 and low >= 0
         if not wrong:
             continue
         path = f"{probe.identifier}.{column}"
@@ -1739,7 +1745,6 @@ def _judge_aggregate(
         safe = cleared or is_min_max_safe(
             data_type or "DOUBLE", detect_pii(column, data_type or "DOUBLE")
         )
-        outside = row.get(f"dex_out_{index}")
         result.findings.append(
             _unit_finding(
                 model,

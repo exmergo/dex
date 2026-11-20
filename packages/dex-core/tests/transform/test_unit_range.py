@@ -369,3 +369,10 @@ def test_a_decimal_with_a_precision_is_checked(tmp_path: Path):
 
 def test_a_date_column_is_not_checked(tmp_path: Path):
     assert _failures(tmp_path, _shares("date '2026-01-01'"))[:2] == ("pass", 0)
+
+
+def test_a_uuid_column_is_not_compared(tmp_path: Path):
+    # Not a number as maintain verify reads one, so neither side checks it.
+    status, failures, sql = _failures(tmp_path, _shares("uuid()"))
+    assert (status, failures) == ("pass", 0)
+    assert "1 = 0" in sql

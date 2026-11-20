@@ -15,7 +15,7 @@
   a test that fails a run.
 
   The test reads the column's type from the relation's metadata. A column that
-  is not a number (text, a boolean, a date or a time) is not checked,
+  is not a number (text, a boolean, a date, a UUID, JSON) is not checked,
   because `maintain verify` does not check it either and a comparison with a
   number would error on some warehouses; where the metadata read finds nothing
   (an ephemeral model, a mutant `transform test --mutate` builds), the column
@@ -44,13 +44,22 @@
 {%- if execute -%}
     {%- for column in adapter.get_columns_in_relation(model)
         if column.name | lower == dex_name | lower -%}
-        {#- Not a number: text, a boolean, a date or time. dbt's own
-            `is_number()` reads only a handful of bare spellings (not
-            `DECIMAL(2,1)`, `FLOAT64` or `NUMBER(38,0)`), so the test names what
-            it skips rather than what it keeps, as `maintain verify` does. -#}
+        {#- A number is read as `maintain verify` reads one
+            (`explore/profile.py::is_numeric_type`): a numeric hint in the type,
+            and no boolean or temporal one. `NUMBER` is Snowflake's spelling in
+            dbt's metadata, where verify reads `FIXED`. dbt's own `is_number()`
+            is not used: it reads `DECIMAL(2,1)`, `FLOAT64` and `NUMBER(38,0)`
+            as no number. -#}
         {%- set dtype = column.dtype | upper -%}
-        {%- if column.is_string() or 'BOOL' in dtype or 'DATE' in dtype
-            or 'TIME' in dtype or 'INTERVAL' in dtype -%}
+        {%- set numeric = namespace(on=false) -%}
+        {%- for hint in ['INT', 'DECIMAL', 'NUMERIC', 'NUMBER', 'DOUBLE', 'FLOAT',
+            'REAL', 'HUGEINT', 'FIXED'] if hint in dtype -%}
+            {%- set numeric.on = true -%}
+        {%- endfor -%}
+        {%- for hint in ['BOOL', 'DATE', 'TIME', 'INTERVAL'] if hint in dtype -%}
+            {%- set numeric.on = false -%}
+        {%- endfor -%}
+        {%- if not numeric.on -%}
             {%- set checked.on = false -%}
         {%- endif -%}
     {%- endfor -%}
