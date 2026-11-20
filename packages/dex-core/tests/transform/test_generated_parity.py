@@ -23,6 +23,7 @@ from transform.generated_parity import (
     POPULATION_EXCLUDES,
     POPULATION_INCLUDES,
     POPULATION_INCLUDES_NULL,
+    RELATIONSHIPS_LEFT_JOIN,
     ROWS,
     UNIQUE_COMBINATION,
     run_parity,
@@ -375,3 +376,39 @@ def test_a_macro_that_ignores_the_filters_fails_the_harness(
         f"{PARENT_MISSING_FILTERED.label} on {clean}: the test should pass on the "
         "clean fixture, dbt says 'fail'"
     ) in report.disagreements
+
+
+def test_a_left_join_read_as_optional_despite_its_references_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys, monkeypatch: pytest.MonkeyPatch
+):
+    """#1459: the reading before the fix, a `references` with no
+    `foreign_key` role leaving the LEFT join optional, is a disagreement the
+    harness names: dbt's `relationships` fails and verify raises nothing."""
+
+    import dataclasses
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    real = verify_mod.join_policy
+
+    def optional(candidate, ctx):
+        policy = real(candidate, ctx)
+        if policy.required_by and "declares references" in policy.required_by:
+            return dataclasses.replace(policy, required_by=None)
+        return policy
+
+    monkeypatch.setattr(verify_mod, "join_policy", optional)
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(RELATIONSHIPS_LEFT_JOIN,),
+    )
+
+    violating = RELATIONSHIPS_LEFT_JOIN.model("violating")
+    assert report.agreed == []
+    assert report.disagreements == [
+        f"{RELATIONSHIPS_LEFT_JOIN.label} on {violating}: maintain verify raised "
+        f"none of {sorted(RELATIONSHIPS_LEFT_JOIN.codes)} on the violating fixture"
+    ]

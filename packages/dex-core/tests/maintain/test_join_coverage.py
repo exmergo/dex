@@ -368,6 +368,218 @@ def test_a_required_relationship_is_judged_against_the_contract_not_a_default(
     assert "foreign_key referencing subscriptions" in orphans["data"]["required_by"]
 
 
+# --- #1459: a `references` is the claim, on a LEFT join and whatever the role ---
+
+
+def _join_findings(data: dict, model: str) -> list[str]:
+    return [
+        f["code"]
+        for f in data["findings"]
+        if f["identifier"] == model and f["axis"] == "join_contract"
+    ]
+
+
+_LEFT_ACTIVITY = (
+    "select a.activity_id, a.subscription_id, s.created_at "
+    f"from {W}.activity a left join {W}.subscriptions s "
+    "on a.subscription_id = s.subscription_id"
+)
+
+
+def _left_activity(repo, orphan: str | None, columns: dict) -> dict:
+    """Forty activity rows LEFT-joining subscriptions, the first keyed
+    ``orphan`` (a value no subscription has, or NULL), with ``columns``
+    declared on the model."""
+
+    _subscriptions(repo)
+    first = "NULL" if orphan is None else f"'{orphan}'"
+    repo.sql(
+        "CREATE TABLE activity (activity_id INTEGER, subscription_id VARCHAR)",
+        f"INSERT INTO activity SELECT i, CASE WHEN i = 1 THEN {first} "
+        "ELSE 'sub_oak' END FROM range(1, 41) t(i)",
+    )
+    _build(repo, "fct_activity", _LEFT_ACTIVITY)
+    _write_artifacts(
+        repo.project_dir,
+        nodes={
+            "model.maintain_test.subscriptions": _source_model("subscriptions"),
+            "model.maintain_test.fct_activity": _node(
+                "fct_activity", _LEFT_ACTIVITY, columns=columns
+            ),
+        },
+        results=[],
+    )
+    return _verify(repo, "fct_activity")
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param({}, id="no-role"),
+        pytest.param({"role": "key"}, id="key"),
+        pytest.param({"role": "dimension"}, id="dimension"),
+    ],
+)
+def test_a_references_with_no_foreign_key_role_requires_the_left_join(
+    maintain_repo, _assume_the_project_compiles, declared: dict
+):
+    """The issue: a `references` renders a `relationships` test whatever the
+    column's role, and that test fails on one non-null orphan. `maintain
+    verify` now reads the same claim: the LEFT join is required, and the one
+    orphan in forty contradicts it at the contract threshold, naming the
+    declaration it rests on."""
+
+    data = _left_activity(
+        maintain_repo,
+        "unknown",
+        {
+            "subscription_id": {
+                **declared,
+                "references": "subscriptions.subscription_id",
+            }
+        },
+    )
+    orphans = _codes(data, "fct_activity")["join_orphans"]
+    assert orphans["severity"] == "high"
+    assert orphans["data"]["threshold_source"] == "contract"
+    assert orphans["data"]["threshold"] == 0
+    assert orphans["data"]["unmatched_rows"] == 1
+    assert orphans["data"]["required_by"] == (
+        "subscription_id declares references subscriptions.subscription_id"
+    )
+    (record,) = _records(data, "fct_activity")
+    assert record["status"] == "contradicted"
+    assert record["declared"]["required"] is True
+    assert "optional_unmatched" not in record
+
+
+def test_a_missing_reference_written_as_null_satisfies_the_left_join(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The same model with the orphan's key written as NULL: a NULL is a
+    missing reference, which `relationships` skips and the coverage probe
+    counts apart, so the required join is satisfied."""
+
+    data = _left_activity(
+        maintain_repo,
+        None,
+        {"subscription_id": {"references": "subscriptions.subscription_id"}},
+    )
+    assert not _join_findings(data, "fct_activity")
+    (record,) = _records(data, "fct_activity")
+    assert record["status"] == "satisfied"
+    assert record["declared"]["required"] is True
+    assert record["measured"]["null_key_rows"] == 1
+    assert record["measured"]["eligible_rows"] == 39
+    assert record["measured"]["unmatched_rows"] == 0
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        pytest.param({}, id="nothing-declared"),
+        pytest.param({"subscription_id": {"role": "foreign_key"}}, id="no-references"),
+        pytest.param({"subscription_id": {"role": "dimension"}}, id="dimension"),
+    ],
+)
+def test_a_left_join_whose_key_declares_no_references_is_unchanged(
+    maintain_repo, _assume_the_project_compiles, columns: dict
+):
+    """With no `references` on the key, the LEFT join keeps today's reading:
+    its unmatched rows are the optional relationship it writes."""
+
+    data = _left_activity(maintain_repo, "unknown", columns)
+    assert not _join_findings(data, "fct_activity")
+    (record,) = _records(data, "fct_activity")
+    assert record["status"] == "satisfied"
+    assert record["declared"]["required"] is False
+    assert record["optional_unmatched"] is True
+    assert record["threshold_source"] == "default"
+
+
+def test_a_references_to_another_relation_does_not_require_this_join(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A `references` names one parent: a join into another relation is not
+    the one it holds to the parent, so it keeps the LEFT join's reading."""
+
+    data = _left_activity(
+        maintain_repo,
+        "unknown",
+        {"subscription_id": {"references": "dim_subscriptions.subscription_id"}},
+    )
+    (record,) = _records(data, "fct_activity")
+    assert record["declared"]["required"] is False
+    assert record["status"] == "satisfied"
+
+
+def _versioned(version: int, latest: int | None = 2) -> dict:
+    node = {
+        "name": "subscriptions",
+        "resource_type": "model",
+        "version": version,
+        "relation_name": f'{W}."subscriptions_v{version}"',
+        "compiled_code": f'select * from {W}."raw_subscriptions"',
+    }
+    if latest is not None:
+        node["latest_version"] = latest
+    return node
+
+
+@pytest.mark.parametrize(
+    ("joined", "reference", "latest", "required"),
+    [
+        pytest.param(1, "subscriptions.v1.subscription_id", 2, True, id="label"),
+        pytest.param(2, "subscriptions.v1.subscription_id", 2, False, id="other"),
+        pytest.param(2, "subscriptions.subscription_id", 2, True, id="bare-latest"),
+        pytest.param(1, "subscriptions.subscription_id", 2, False, id="bare-old"),
+        pytest.param(1, "subscriptions.subscription_id", 1, True, id="latest-1"),
+        pytest.param(2, "subscriptions.subscription_id", None, True, id="no-latest"),
+    ],
+)
+def test_a_versioned_reference_names_the_version_ref_resolves_to(
+    maintain_repo, _assume_the_project_compiles, joined, reference, latest, required
+):
+    """`subscriptions.v1.subscription_id` renders `ref('subscriptions', v=1)`,
+    and a bare `subscriptions.subscription_id` the version an unversioned
+    `ref()` resolves to (its `latest_version`, else the highest): the join is
+    required only where it reads that version's relation."""
+
+    for v in (1, 2):
+        maintain_repo.sql(
+            f"CREATE TABLE subscriptions_v{v} (subscription_id VARCHAR)",
+            f"INSERT INTO subscriptions_v{v} VALUES ('sub_elm'), ('sub_oak')",
+        )
+    maintain_repo.sql(
+        "CREATE TABLE activity (activity_id INTEGER, subscription_id VARCHAR)",
+        "INSERT INTO activity SELECT i, CASE WHEN i = 1 THEN 'unknown' "
+        "ELSE 'sub_oak' END FROM range(1, 41) t(i)",
+    )
+    sql = (
+        "select a.activity_id, a.subscription_id "
+        f"from {W}.activity a left join {W}.subscriptions_v{joined} s "
+        "on a.subscription_id = s.subscription_id"
+    )
+    _build(maintain_repo, "fct_activity", sql)
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.subscriptions.v1": _versioned(1, latest),
+            "model.maintain_test.subscriptions.v2": _versioned(2, latest),
+            "model.maintain_test.fct_activity": _node(
+                "fct_activity",
+                sql,
+                columns={"subscription_id": {"references": reference}},
+            ),
+        },
+        results=[],
+    )
+    data = _verify(maintain_repo, "fct_activity")
+    (record,) = _records(data, "fct_activity")
+    assert record["declared"]["required"] is required
+    assert ("join_orphans" in _codes(data, "fct_activity")) is required
+
+
 def test_an_intentional_parent_filter_excludes_parents_rather_than_missing_them(
     maintain_repo, _assume_the_project_compiles
 ):
