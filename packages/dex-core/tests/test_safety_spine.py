@@ -4498,11 +4498,11 @@ def test_bigquery_a_reserve_for_an_unknown_row_count_bounds_what_profiling_bills
     # reserved. Now the aggregate's own COUNT(*) is captured, so all three can
     # run, and the reserve has to cover them. This is where a reserve narrower
     # than the probes it must pay for would show up as a bill above the quote.
+    bigquery = pytest.importorskip("google.cloud.bigquery")
+
     from fakes.bigquery import FakeBigQueryClient, FakeTable
 
     from exmergo_dex_core.explore import profile as profile_mod
-
-    bigquery = pytest.importorskip("google.cloud.bigquery")
 
     def rows(sql: str):
         # The three escalation statements are distinguishable by shape, and each
@@ -8072,6 +8072,8 @@ def test_hosted_semantic_pii_gate_still_binds_on_an_injected_token(monkeypatch):
     # the host's; it does not make the PII policy the host's. The gate has to refuse
     # the same dimension whether the token was discovered or handed over, or a host
     # would buy itself an unscreened path by supplying its own credential.
+    pytest.importorskip("httpx")
+
     from fakes.semantic import FakeHostedBackend
 
     from exmergo_dex_core import SemanticSource
