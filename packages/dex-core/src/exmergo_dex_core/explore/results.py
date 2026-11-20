@@ -25,6 +25,7 @@ from ..values_free import COLUMN_VALUE_FIELDS
 from .semantic import SemanticCatalog
 from .summary import (
     MAX_DECLARED_COLUMNS,
+    ExcludedObjects,
     MapObject,
     SkippedObjects,
     capped_declaration,
@@ -65,14 +66,21 @@ class InventoryResult(Result):
     objects: list[InventoryEntry] = Field(default_factory=list)
     ranked: bool = False
     elided_object_count: int = 0
+    # What a ranked call left out by default (#1311). Reported on a ranked call
+    # only, where `count: 0` says nothing was left out; an unranked call leaves
+    # nothing out and carries no such block.
+    excluded: ExcludedObjects | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "object_count": len(self.objects),
             "objects": [o.model_dump(mode="json") for o in self.objects],
             "ranked": self.ranked,
             "elided_object_count": self.elided_object_count,
         }
+        if self.excluded is not None:
+            payload["excluded"] = self.excluded.model_dump(mode="json")
+        return payload
 
 
 def _profile_dataset_payload(
@@ -319,6 +327,9 @@ class MapResult(Result):
     # Always reported: `count: 0` is the positive statement that nothing was
     # skipped, the same way an empty `notes` is.
     skipped: SkippedObjects = Field(default_factory=SkippedObjects)
+    # What ranking left out by default (#1311): Elementary's own tables. Always
+    # reported, `count: 0` when nothing was left out.
+    excluded: ExcludedObjects = Field(default_factory=ExcludedObjects)
     carried_forward_count: int = 0
     out_of_scope_carried_count: int = 0
     dropped_count: int = 0
@@ -349,6 +360,7 @@ class MapResult(Result):
             "cache_hit_count": self.cache_hit_count,
             "skipped_count": self.skipped_count,
             "skipped": self.skipped.model_dump(mode="json"),
+            "excluded": self.excluded.model_dump(mode="json"),
             "carried_forward_count": self.carried_forward_count,
             "out_of_scope_carried_count": self.out_of_scope_carried_count,
             "dropped_count": self.dropped_count,

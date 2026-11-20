@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import CH_MAX_SECONDS
+from .conftest import CH_MAX_SECONDS, assert_generated_test_parity
 from .test_clickhouse_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.clickhouse]
@@ -321,4 +321,23 @@ def _dev_client(ch_dev_password: str):
         port=parsed.port or 8123,
         username="dbt_dev",
         password=ch_dev_password,
+    )
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, dev_env
+):
+    """The generated-test parity harness (#1450, #1451) on ClickHouse: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    seed_repo(tmp_path, databases=["app"], budget=BUILD_BUDGET)
+    _init(tmp_path, capsys)
+    _point_profile_at(tmp_path, "dbt_dev")
+    # ClickHouse refuses a NULL cast to a type that is not Nullable.
+    assert_generated_test_parity(
+        run_cli,
+        capsys,
+        tmp_path,
+        connector="clickhouse",
+        budget=BUILD_BUDGET,
+        null_int="cast(null as Nullable(Int32))",
     )

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from .conftest import TRINO_MAX_SECONDS, trino_client
+from .conftest import TRINO_MAX_SECONDS, assert_generated_test_parity, trino_client
 from .test_trino_connect import run_cli, seed_repo
 
 pytestmark = [pytest.mark.integration, pytest.mark.trino]
@@ -245,3 +245,17 @@ def test_the_unpivot_macro_builds_live(tmp_path: Path, capsys, dev_env, trino_ur
     rows, keys = cursor.fetchall()[0]
     assert rows == 160
     assert keys == 2
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, dev_env, trino_url
+):
+    """The generated-test parity harness (#1450, #1451) on Trino: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    _drop_dev_schema(trino_url, "memory")
+    seed_repo(tmp_path, catalogs=["memory.app"], budget=BUILD_BUDGET)
+    _init(tmp_path, capsys)
+    assert_generated_test_parity(
+        run_cli, capsys, tmp_path, connector="trino", budget=BUILD_BUDGET
+    )
+    _drop_dev_schema(trino_url, "memory")

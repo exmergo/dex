@@ -88,6 +88,26 @@ class SkippedObjects(BaseModel):
     elided_namespaces: int = 0
 
 
+class ExcludedObjects(BaseModel):
+    """What ranking left out by default, and why (#1311).
+
+    ``reason`` names what the objects were recognised as (``elementary``, the
+    Elementary dbt package's own tables), and is ``None`` when nothing was left
+    out. An excluded object is not ranked, not profiled by ``explore map`` and not
+    described in its payload, and it is not in ``skipped``, which is the rank
+    cutoff's: the two answer different questions. ``by_namespace``, ``objects``
+    and the elision counts are capped and counted as ``skipped``'s are, and
+    ``objects`` is sorted by name, since an excluded object has no rank.
+    """
+
+    count: int = 0
+    reason: str | None = None
+    by_namespace: list[SkippedNamespace] = Field(default_factory=list)
+    objects: list[str] = Field(default_factory=list)
+    elided: int = 0
+    elided_namespaces: int = 0
+
+
 def summarize_skipped(
     ranked: list[str],
     *,
@@ -185,6 +205,7 @@ def summarize_map(
     max_columns: int = MAX_COLUMNS_PER_OBJECT,
     max_edges: int = MAX_EDGES,
     max_data_quality: int = MAX_DATA_QUALITY_PER_OBJECT,
+    excluded: frozenset[str] = frozenset(),
 ) -> MapView:
     """Reduce ``cache`` to the findings worth returning in one envelope.
 
@@ -197,9 +218,18 @@ def summarize_map(
     ``detail`` widens eligibility to objects that were inventoried but never
     profiled, and the selection to every column. It lifts none of the caps, which
     always bind.
+
+    ``excluded`` (lowered identifiers) are objects ranking left out by default
+    (#1311): never described here, even where an earlier ``explore profile``
+    left a profile in the cache, and counted in the result's ``excluded`` block
+    rather than in ``elided_object_count``.
     """
 
-    ranked = cache.ranked_datasets(profiled_only=not detail)
+    ranked = [
+        d
+        for d in cache.ranked_datasets(profiled_only=not detail)
+        if d.identifier.lower() not in excluded
+    ]
     kept = ranked[:max_objects]
     kept_lower = {d.identifier.lower() for d in kept}
 

@@ -34,6 +34,8 @@ Three rules hold throughout:
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
 from collections.abc import Iterable, Mapping
 from enum import Enum
@@ -42,6 +44,7 @@ from typing import Any
 
 import yaml
 
+from .. import generated_tests as gt
 from .. import model_versions as mv
 from ..dbt_project import DbtProjectView
 from ..guards.pii_meta import entry_meta
@@ -59,6 +62,7 @@ from ..semantic_declarations import Population as Population
 from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
+from .claims import CLAIM_KEY, claim_id, claim_of, without_claim
 from .package_overrides import (
     DocumentedOverride,
     documented_overrides,
@@ -76,6 +80,7 @@ from .rewrite import (
     _unsampled,
     before_trailing_blanks,
     column_anchor,
+    generated_spec,
     prevailing_test_key,
     splice,
     yaml_blocks,
@@ -269,6 +274,259 @@ def _version_sql_path(
     return item.file
 
 
+_SEMVER_RE = re.compile(
+    r"^v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?"
+    r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?"
+    r"(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def _is_below_0_20(release: str | None) -> bool | None:
+    """Whether Elementary release ``release`` is strictly below 0.20.0.
+
+    Returns ``None`` when ``release`` is absent or cannot be parsed as a
+    supported version format.
+    """
+    if not release:
+        return None
+    match = _SEMVER_RE.match(release.strip())
+    if not match:
+        return None
+    major = int(match.group("major"))
+    minor = int(match.group("minor"))
+    patch = int(match.group("patch") or 0)
+    prerelease = match.group("prerelease") is not None
+
+    triplet = (major, minor, patch)
+    return triplet < (0, 20, 0) or (triplet == (0, 20, 0) and prerelease)
+
+
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
+_SQL_LINE_COMMENT = re.compile(r"-{2}.*$", re.MULTILINE)
+_SQL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_MATERIALIZATION_RE = re.compile(
+    r"\{%[-+]?\s*materialization\s+([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*[-+]?%\}"
+    r"(.*?)"
+    r"\{%[-+]?\s*endmaterialization\s*[-+]?%\}",
+    re.DOTALL,
+)
+_MACRO_RE = re.compile(
+    r"\{%[-+]?\s*macro\s+([a-zA-Z0-9_]+)\s*(?:\([^)]*\))?\s*[-+]?%\}"
+    r"(.*?)"
+    r"\{%[-+]?\s*endmacro\s*[-+]?%\}",
+    re.DOTALL,
+)
+
+
+def _proposed_macros(
+    view: DbtProjectView,
+    files: Mapping[str, str],
+    project_name: str,
+) -> dict[str, dict[str, Any]]:
+    """Root project macros and materializations parsed from proposed ``files``."""
+    from ..dbt_project import jinja_calls
+    from . import elementary
+
+    macros: dict[str, dict[str, Any]] = {}
+    for path, content in files.items():
+        if not path.endswith(".sql"):
+            continue
+        if not any(path.startswith(mp + "/") for mp in view.macro_paths):
+            continue
+        clean = _JINJA_COMMENT.sub("", content)
+        clean = _SQL_BLOCK_COMMENT.sub("", clean)
+        clean = _SQL_LINE_COMMENT.sub("", clean)
+
+        for match in _MATERIALIZATION_RE.finditer(clean):
+            mat_type, adapter, body = match.group(1), match.group(2), match.group(3)
+            macro_name = f"materialization_{mat_type}_{adapter}"
+            uid = f"macro.{project_name}.{macro_name}"
+            deps: list[str] = []
+            for call in jinja_calls(body):
+                callee = call.callee
+                if callee.startswith(f"{elementary.PACKAGE}."):
+                    suffix = callee[len(elementary.PACKAGE) + 1 :]
+                    deps.append(f"macro.{elementary.PACKAGE}.{suffix}")
+                elif "." not in callee and callee not in (
+                    "return",
+                    "config",
+                    "adapter",
+                ):
+                    deps.append(f"macro.{project_name}.{callee}")
+            macros[uid] = {
+                "unique_id": uid,
+                "name": macro_name,
+                "package_name": project_name,
+                "depends_on": {"macros": deps},
+            }
+
+        for match in _MACRO_RE.finditer(clean):
+            name, body = match.group(1), match.group(2)
+            uid = f"macro.{project_name}.{name}"
+            deps = []
+            for call in jinja_calls(body):
+                callee = call.callee
+                if callee.startswith(f"{elementary.PACKAGE}."):
+                    suffix = callee[len(elementary.PACKAGE) + 1 :]
+                    deps.append(f"macro.{elementary.PACKAGE}.{suffix}")
+                elif "." not in callee and callee not in (
+                    "return",
+                    "config",
+                    "adapter",
+                ):
+                    deps.append(f"macro.{project_name}.{callee}")
+            macros[uid] = {
+                "unique_id": uid,
+                "name": name,
+                "package_name": project_name,
+                "depends_on": {"macros": deps},
+            }
+    return macros
+
+
+def _elementary_sampling_warning(
+    view: DbtProjectView,
+    files: Mapping[str, str],
+) -> str | None:
+    """A warning if Elementary's test materialization runs and ignores sampling.
+
+    ``None`` when Elementary is not installed, when dbt's materialization is
+    confirmed, or when the installed package is 0.20.0 or later.
+    """
+    from . import elementary
+    from .package_overrides import _installed
+
+    root = Path(view.root)
+    installed_packages: set[str] = set()
+    release: str | None = None
+    with contextlib.suppress(Exception):
+        for name, directory, _ in _installed(root):
+            installed_packages.add(name)
+            if name == elementary.PACKAGE:
+                own_yml = directory / "dbt_project.yml"
+                if own_yml.is_file():
+                    with contextlib.suppress(Exception):
+                        own = yaml.safe_load(own_yml.read_text(encoding="utf-8"))
+                        if isinstance(own, dict) and own.get("version") is not None:
+                            release = str(own["version"])
+
+    project_yml_text = files.get("dbt_project.yml")
+    if project_yml_text is None:
+        with contextlib.suppress(Exception):
+            project_yml_text = (root / "dbt_project.yml").read_text(encoding="utf-8")
+
+    project_name = view.project_name
+    if not project_name:
+        with contextlib.suppress(Exception):
+            cfg = yaml.safe_load(project_yml_text or "")
+            if isinstance(cfg, dict) and cfg.get("name"):
+                project_name = str(cfg["name"])
+    if not project_name:
+        project_name = "root"
+
+    proposed = _proposed_macros(view, files, project_name)
+
+    manifest = view.manifest
+    if manifest is None:
+        from ..dbt_project import manifest_file
+
+        with contextlib.suppress(Exception):
+            compiled = manifest_file(view.root)
+            if compiled.is_file():
+                manifest = json.loads(compiled.read_text(encoding="utf-8"))
+
+    materialization = None
+    if manifest and isinstance(manifest, Mapping):
+        with contextlib.suppress(Exception):
+            manifest_to_resolve = manifest
+            if proposed:
+                manifest_to_resolve = dict(manifest)
+                macros_dict = dict(manifest_to_resolve.get("macros") or {})
+                macros_dict.update(proposed)
+                manifest_to_resolve["macros"] = macros_dict
+            runtime = elementary.resolve(
+                manifest_to_resolve,
+                project_yml_text,
+                release=release,
+                installed_packages=installed_packages or None,
+            )
+            if runtime.installed:
+                materialization = runtime.materialization
+                if runtime.release:
+                    release = runtime.release
+
+    if materialization is None:
+        if elementary.PACKAGE not in installed_packages:
+            return None
+        project = elementary._project_config(project_yml_text)
+        models_cfg = project.get("models")
+        enabled = True
+        if isinstance(models_cfg, Mapping):
+            elem_cfg = models_cfg.get(elementary.PACKAGE)
+            if isinstance(elem_cfg, Mapping):
+                val = elem_cfg.get("+enabled", elem_cfg.get("enabled", True))
+                if val is False:
+                    enabled = False
+        if not enabled:
+            return None
+
+        elem_mat = f"macro.{elementary.PACKAGE}.materialization_test_default"
+        synthetic_manifest = {
+            "metadata": {"adapter_type": "default", "project_name": project_name},
+            "nodes": {
+                f"model.{elementary.PACKAGE}.dummy": {
+                    "unique_id": f"model.{elementary.PACKAGE}.dummy",
+                    "package_name": elementary.PACKAGE,
+                    "resource_type": "model",
+                }
+            },
+            "disabled": {},
+            "macros": {
+                "macro.dbt.materialization_test_default": {
+                    "unique_id": "macro.dbt.materialization_test_default",
+                    "name": "materialization_test_default",
+                    "package_name": "dbt",
+                },
+                elem_mat: {
+                    "unique_id": elem_mat,
+                    "name": "materialization_test_default",
+                    "package_name": elementary.PACKAGE,
+                    "depends_on": {
+                        "macros": [f"macro.{elementary.PACKAGE}.materialize_test"]
+                    },
+                },
+                **proposed,
+            },
+        }
+        with contextlib.suppress(Exception):
+            runtime = elementary.resolve(
+                synthetic_manifest,
+                project_yml_text,
+                release=release,
+                installed_packages=installed_packages,
+            )
+            if runtime.installed:
+                materialization = runtime.materialization
+
+    if materialization != "elementary":
+        return None
+
+    below = _is_below_0_20(release)
+    if below is True and release is not None:
+        return (
+            f"installed Elementary release {release} ignores "
+            "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+            "set test_sample_row_count: 0 for the project"
+        )
+    if below is None:
+        return (
+            "could not tell the installed Elementary release; releases below 0.20.0 "
+            "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
+            "set test_sample_row_count: 0 for the project"
+        )
+    return None
+
+
 # --- the whole pass -------------------------------------------------------------
 
 
@@ -279,12 +537,21 @@ def apply_declarations(
     *,
     cache: Any = None,
     pii_overrides: Any = None,
+    render_tests: bool | list[str] = False,
+    generated: list[dict[str, Any]] | None = None,
+    dialect: str | None = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Validate ``declarations`` and render them into the plan's edits.
 
     Returns the edits with each declaration folded in (one edit per path, merged
     into a ``schema_yml`` edit the payload already carries for that file) and the
     warnings for intent that was left unstated.
+
+    ``render_tests`` is ``declarations.render_tests`` (#1449), which decides
+    whether the generated tests render beside the built-ins; ``generated``
+    collects one row per generated test the declarations give, rendered or not
+    (see :func:`render`). ``dialect`` is the configured connector, which decides
+    whether a kind that names its dialects renders at all (#1451).
     """
 
     files = post_change_files(view, edits)
@@ -305,6 +572,7 @@ def apply_declarations(
             _check(declaration, files, view, cache=cache, pii_overrides=pii_overrides)
         )
 
+    flagged_tests: list[bool] = []
     rendered: dict[str, str] = {}
     for declaration in declarations:
         sql_path = model_sql_path(files, view.model_paths, declaration.model)
@@ -312,7 +580,15 @@ def apply_declarations(
         if path is None:
             path = _default_schema_path(sql_path or "", declaration.model)
         try:
-            files[path] = render(files.get(path), declaration, notes=warnings)
+            files[path] = render(
+                files.get(path),
+                declaration,
+                notes=warnings,
+                flagged_tests=flagged_tests,
+                render_tests=render_tests,
+                generated=generated,
+                dialect=dialect,
+            )
         except RewriteError as exc:
             raise DeclarationError(
                 f"dex could not write the declaration of '{declaration.model}' into "
@@ -339,6 +615,12 @@ def apply_declarations(
             merged.append(
                 PlanEdit(path=path, kind=EditKind.SCHEMA_YML, new_content=content)
             )
+
+    if any(flagged_tests):
+        warn = _elementary_sampling_warning(view, files)
+        if warn is not None and warn not in warnings:
+            warnings.append(warn)
+
     return merged, warnings
 
 
@@ -983,7 +1265,14 @@ def _partial_intent(
 
 
 def render(
-    content: str | None, declaration: Declaration, *, notes: list[str] | None = None
+    content: str | None,
+    declaration: Declaration,
+    *,
+    notes: list[str] | None = None,
+    flagged_tests: list[bool] | None = None,
+    render_tests: bool | list[str] = False,
+    generated: list[dict[str, Any]] | None = None,
+    dialect: str | None = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -992,12 +1281,77 @@ def render(
     have since moved. A version label (``dim_teams.v2``) renders into that item
     of the model's ``versions:`` list (#895); ``notes`` collects what a reviewer
     should be told about how (a column forked from the shared entry).
+
+    The built-in tests always render. The generated tests (#1449) render only
+    where ``render_tests`` turns their kind on. They are generated from the
+    declaration as the entry states it once this one is merged in, not from
+    the payload alone, so declaring a description again, or ``transform
+    declare`` on a model declared before the switch was on, renders the tests
+    the facts already declared imply. ``generated`` collects one row per
+    generated test that declaration gives: its model, column, test,
+    cadence tag and claim, and a ``status`` of ``added`` or ``already_listed``
+    (on), ``not_rendered`` with the ``reason`` or ``listed_while_off`` (off). A
+    kind turned on that does not support ``dialect`` (#1451) is
+    ``not_rendered`` with the reason ``dialect_unsupported``. A generated test
+    already in the YAML is never removed: the switch decides what renders, not
+    what stays.
     """
 
+    text = _render(content, declaration, notes, flagged_tests, [])
+    if not gt.kinds():
+        # No kind registered: nothing to generate, so no entry to read back.
+        return text
+    planned = _generated(_effective(text, declaration), render_tests, dialect)
+    on = [g for g in planned if g["enabled"]]
+    if on:
+        # Rendered on their own, after the facts: a bare declaration of the
+        # model writes no key, so this pass adds the generated tests only.
+        text = _render(
+            text, Declaration(model=declaration.model), notes, flagged_tests, on
+        )
+    if generated is not None and planned:
+        for g in planned:
+            row = {
+                key: g[key] for key in ("model", "column", "test", "cadence", "claim")
+            }
+            # Read at the test's own place, matched the way rendering matches,
+            # so a renamed model's tests elsewhere in the file and a hand-written
+            # equivalent are each told apart (#1449).
+            listed_before = _listed_at(content, g)
+            if g["enabled"]:
+                row["status"] = (
+                    "added"
+                    if not listed_before and _listed_at(text, g)
+                    else "already_listed"
+                )
+            elif listed_before:
+                row["status"] = "listed_while_off"
+            else:
+                row["status"] = "not_rendered"
+                row["reason"] = g["off_reason"]
+            generated.append(row)
+    return text
+
+
+def _render(
+    content: str | None,
+    declaration: Declaration,
+    notes: list[str] | None,
+    flagged_tests: list[bool] | None,
+    generated: list[dict[str, Any]],
+) -> str:
     model = declaration.model
     base, version = mv.split_label(model)
     if version is not None and content is not None:
-        return _render_version(content, declaration, base, version, notes)
+        return _render_version(
+            content,
+            declaration,
+            base,
+            version,
+            notes,
+            flagged_tests=flagged_tests,
+            generated=generated,
+        )
     text = _with_entry(content, model)
     entry = lambda root: _model_entry(root, model)  # noqa: E731
     text = _restyle_flow_entry(text, entry)
@@ -1008,7 +1362,7 @@ def render(
     if model_dex:
         text = _set_dex(text, entry, model_dex)
 
-    for name, column in _rendered_columns(declaration).items():
+    for name, column in _rendered_columns(declaration, generated).items():
         text = _ensure_column(text, model, name)
         locate = _column_locator(model, name)
         if column["description"] is not None:
@@ -1016,8 +1370,118 @@ def render(
         if column["dex"]:
             text = _set_dex(text, locate, column["dex"])
         if column["tests"]:
-            text = _add_tests(text, locate, column["tests"])
+            text, flagged = _add_tests(text, locate, column["tests"])
+            if flagged and flagged_tests is not None:
+                flagged_tests.append(True)
+    model_tests = [g["spec"] for g in generated if g["column"] is None]
+    if model_tests:
+        text, flagged = _add_tests(text, entry, model_tests)
+        if flagged and flagged_tests is not None:
+            flagged_tests.append(True)
     return text
+
+
+def _effective(text: str, declaration: Declaration) -> Declaration:
+    """The declaration ``text`` states for the model: what was declared before,
+    with ``declaration`` merged in. Falls back to ``declaration`` where the entry
+    holds something a declaration would refuse (a hand edit), so a fact written
+    by hand can only add tests, never stop the payload's own."""
+
+    from .drafting import read_declared
+
+    stated = read_declared({"schema.yml": text}, declaration.model)
+    try:
+        return Declaration.model_validate({**stated, "model": declaration.model})
+    except ValueError:
+        return declaration
+
+
+def _generated(
+    declaration: Declaration,
+    render_tests: bool | list[str],
+    dialect: str | None = None,
+) -> list[dict[str, Any]]:
+    """Every generated test the declaration gives, each with its claim, its
+    rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
+    ``dialect`` (#1451)."""
+
+    out: list[dict[str, Any]] = []
+    model = declaration.model
+    for kind in gt.kinds():
+        switched = gt.enabled(kind, render_tests)
+        on = switched and gt.supports(kind, dialect)
+        off_reason = gt.DIALECT_UNSUPPORTED if switched else gt.off_reason(render_tests)
+        for instance in kind.instances(declaration):
+            claim = claim_id(
+                model, instance.field, instance.columns, dict(instance.params)
+            )
+            out.append(
+                {
+                    "model": model,
+                    "column": instance.column,
+                    "test": kind.name,
+                    "cadence": kind.cadence,
+                    "claim": claim,
+                    "enabled": on,
+                    "off_reason": None if on else off_reason,
+                    "spec": generated_spec(
+                        kind.name,
+                        cadence=kind.cadence,
+                        claim=claim,
+                        arguments=instance.arguments,
+                    ),
+                }
+            )
+    return out
+
+
+def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
+    """Whether ``content`` lists the generated ``test`` where it belongs: the
+    model's entry (or the version's item, for a label), then the column it sits
+    under, matched by :func:`_is_listed`."""
+
+    if not content:
+        return False
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return False
+    base, version = mv.split_label(test["model"])
+    entries = loaded.get("models") if isinstance(loaded, Mapping) else None
+    node: Any = next(
+        (
+            e
+            for e in entries or []
+            if isinstance(e, Mapping) and str(e.get("name", "")).lower() == base.lower()
+        ),
+        None,
+    )
+    if node is not None and version is not None:
+        item = next(
+            (
+                item
+                for item in node.get("versions") or []
+                if isinstance(item, Mapping) and str(item.get("v")) == str(version)
+            ),
+            None,
+        )
+        # The version as dbt builds it: inherited columns (and their tests)
+        # included, its own overrides and exclusions applied.
+        node = mv.effective_entry(node, item) if item is not None else None
+    if node is not None and test["column"] is not None:
+        node = next(
+            (
+                c
+                for c in node.get("columns") or []
+                if isinstance(c, Mapping)
+                and str(c.get("name", "")).lower() == test["column"].lower()
+            ),
+            None,
+        )
+    if not isinstance(node, Mapping):
+        return False
+    listed = node.get("data_tests") or node.get("tests") or []
+    return isinstance(listed, list) and _is_listed(test["spec"], listed)
 
 
 def _render_version(
@@ -1026,6 +1490,8 @@ def _render_version(
     base: str,
     version: str,
     notes: list[str] | None,
+    flagged_tests: list[bool] | None = None,
+    generated: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render a declaration into one item of ``base``'s ``versions:`` list.
 
@@ -1050,7 +1516,8 @@ def _render_version(
     if model_dex:
         text = _set_dex(text, item, model_dex)
 
-    for name, column in _rendered_columns(declaration).items():
+    generated = generated or []
+    for name, column in _rendered_columns(declaration, generated).items():
         text, owned = _ensure_version_column(text, base, version, name, column)
         if not owned:
             continue
@@ -1067,7 +1534,14 @@ def _render_version(
         if column["dex"]:
             text = _set_dex(text, locate, column["dex"])
         if column["tests"]:
-            text = _add_tests(text, locate, column["tests"])
+            text, flagged = _add_tests(text, locate, column["tests"])
+            if flagged and flagged_tests is not None:
+                flagged_tests.append(True)
+    model_tests = [g["spec"] for g in generated if g["column"] is None]
+    if model_tests:
+        text, flagged = _add_tests(text, item, model_tests)
+        if flagged and flagged_tests is not None:
+            flagged_tests.append(True)
     return text
 
 
@@ -1106,12 +1580,8 @@ def _already_states(entry: Mapping[str, Any], column: dict[str, Any]) -> bool:
     if any(dex.get(key) != value for key, value in column["dex"].items()):
         return False
     tests = entry.get("data_tests") or entry.get("tests") or []
-    present = {
-        t if isinstance(t, str) else next(iter(t), "")
-        for t in tests
-        if isinstance(t, (str, dict))
-    }
-    return all(_spec_name(spec) in present for spec in column["tests"])
+    listed = [t for t in tests if isinstance(t, (str, dict))]
+    return all(_is_listed(spec, listed) for spec in column["tests"])
 
 
 def _exclude_from_version(text: str, base: str, version: str, name: str) -> str:
@@ -1208,10 +1678,24 @@ def _plain(node: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
-    """What each column receives: its description, its dex meta, and its tests."""
+def _rendered_columns(
+    declaration: Declaration, generated: Iterable[Mapping[str, Any]] = ()
+) -> dict[str, dict[str, Any]]:
+    """What each column receives: its description, its dex meta, and its tests.
+
+    ``generated`` are the generated tests the switch turned on (#1449); each one
+    that sits under a column follows that column's built-ins.
+
+    Each test carries the id of the claim it checks (#1448), derived from the
+    declared fact and never from the test's name: a ``null_rule: never``, a
+    ``references`` (with the parent it names), and a single-column grain, whose
+    ``unique`` and ``not_null`` are two claims since either can fail alone. A
+    grain column also declared ``null_rule: never`` has one ``not_null``, and it
+    carries the null rule's claim, the fact rendered first.
+    """
 
     out: dict[str, dict[str, Any]] = {}
+    model = declaration.model
 
     def slot(name: str) -> dict[str, Any]:
         return out.setdefault(name, {"description": None, "dex": {}, "tests": []})
@@ -1232,7 +1716,12 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
             if value is not None
         }
         if column.null_rule is not None and column.null_rule.strip().lower() == "never":
-            entry["tests"].append(_unsampled("not_null"))
+            entry["tests"].append(
+                _unsampled(
+                    "not_null",
+                    claim=claim_id(model, "null_rule", [name], {"null_rule": "never"}),
+                )
+            )
         if column.references is not None:
             parent, _, parent_column = column.references.rpartition(".")
             parent_base, parent_version = mv.split_label(parent)
@@ -1243,7 +1732,11 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
             )
             entry["tests"].append(
                 _unsampled(
-                    "relationships", arguments={"to": to, "field": parent_column}
+                    "relationships",
+                    claim=claim_id(
+                        model, "references", [name], {"references": column.references}
+                    ),
+                    arguments={"to": to, "field": parent_column},
                 )
             )
 
@@ -1252,7 +1745,13 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
         tests = slot(grain[0])["tests"]
         for name in ("unique", "not_null"):
             if name not in {_spec_name(spec) for spec in tests}:
-                tests.insert(0 if name == "unique" else 1, _unsampled(name))
+                claim = claim_id(model, "grain", grain, {"check": name})
+                tests.insert(
+                    0 if name == "unique" else 1, _unsampled(name, claim=claim)
+                )
+    for test in generated:
+        if test["column"] is not None:
+            slot(test["column"])["tests"].append(test["spec"])
     return out
 
 
@@ -1586,12 +2085,36 @@ def _merge_population(existing: Mapping[str, Any], merged: dict[str, Any]) -> di
     return merged
 
 
-def _add_tests(text: str, locate, specs: list[Any]) -> str:
+def _has_sampling_flag(spec: Any) -> bool:
+    if isinstance(spec, Mapping):
+        for body in spec.values():
+            if isinstance(body, Mapping):
+                cfg = body.get("config")
+                if isinstance(cfg, Mapping):
+                    meta = cfg.get("meta")
+                    if (
+                        isinstance(meta, Mapping)
+                        and meta.get("disable_test_samples") is True
+                    ):
+                        return True
+                meta = body.get("meta")
+                if (
+                    isinstance(meta, Mapping)
+                    and meta.get("disable_test_samples") is True
+                ):
+                    return True
+    return False
+
+
+def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     """Add the tests ``specs`` names to the located column, keeping its own.
 
     A test the column already lists, by name, is left exactly as the author wrote
     it. An existing list keeps its key (``tests`` or ``data_tests``); a column with
     no list takes the spelling the file already uses.
+
+    Returns the updated text and whether any test with ``disable_test_samples``
+    was newly inserted.
     """
 
     node = locate(_compose(text))
@@ -1601,23 +2124,34 @@ def _add_tests(text: str, locate, specs: list[Any]) -> str:
         if found is not None:
             break
     if found is None:
-        return _set_key(text, locate, prevailing_test_key(text), specs)
+        updated = _set_key(text, locate, prevailing_test_key(text), specs)
+        inserted_flagged = any(_has_sampling_flag(s) for s in specs)
+        return updated, inserted_flagged
 
-    _key, listed = found
-    present = {_test_name(item) for item in _sequence(listed)}
-    todo = [spec for spec in specs if _spec_name(spec) not in present]
-    if not todo:
-        return text
-    if not isinstance(listed, yaml.SequenceNode):
+    if not isinstance(found[1], yaml.SequenceNode):
         raise RewriteError("a column's test list is not a list")
+    text = _claim_earlier_renders(text, locate, specs)
+    node = locate(_compose(text))
+    found = _child(node, "data_tests") or _child(node, "tests")
+    if found is None:  # the claims above change no key, so this cannot happen
+        raise RewriteError("a column's test list moved while it was claimed")
+    _key, listed = found
+    present = [_node_value(item) for item in _sequence(listed)]
+    todo = [spec for spec in specs if not _is_listed(spec, present)]
+    if not todo:
+        return text, False
 
+    inserted_flagged = any(_has_sampling_flag(s) for s in todo)
     if listed.flow_style:
         end = listed.end_mark.index
         if text[end - 1] != "]":
             raise RewriteError("a column's test list is not closed")
         items = ", ".join(_flow(spec) for spec in todo)
         joiner = ", " if listed.value else ""
-        return splice(text, [(end - 1, end - 1, joiner + items)])
+        return (
+            splice(text, [(end - 1, end - 1, joiner + items)]),
+            inserted_flagged,
+        )
 
     first = listed.value[0]
     line_start = text.rfind("\n", 0, first.start_mark.index) + 1
@@ -1634,14 +2168,115 @@ def _add_tests(text: str, locate, specs: list[Any]) -> str:
     at = before_trailing_blanks(text, end)
     rendered = "".join(_render_item(spec, dash_indent) for spec in todo)
     prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"
-    return splice(text, [(at, at, prefix + rendered)])
+    return splice(text, [(at, at, prefix + rendered)]), inserted_flagged
 
 
-def _test_name(item: Any) -> str:
-    if isinstance(item, yaml.ScalarNode):
-        return item.value
-    names = [name for name, _body in _mapping(item)]
-    return names[0] if names else ""
+def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
+    """``text`` with a claim id added to each test Dex rendered before claims.
+
+    A listed test is left as written (#1348), with one exception: a test that is
+    byte for byte what Dex renders for a spec, flag, arguments and all, but
+    carries no claim, is Dex's own earlier render of the same fact, and gains
+    that spec's ``config.meta.dex.claim`` and nothing else (#1448). A bare test,
+    a test with other arguments or config, and a test that already carries any
+    claim are someone's, or a fact since changed, and stay as written (#1350),
+    and so does a test whose YAML is aliased elsewhere, which a claim written
+    into it would reach through the alias.
+    """
+
+    for spec in specs:
+        claim = claim_of(spec)
+        if claim is None:
+            continue
+        unclaimed = without_claim(spec)
+        root = _compose(text)
+        listed = _child(locate(root), "data_tests") or _child(locate(root), "tests")
+        if listed is None:
+            return text
+        index = next(
+            (
+                i
+                for i, item in enumerate(_sequence(listed[1]))
+                if isinstance(item, yaml.MappingNode) and _plain(item) == unclaimed
+            ),
+            None,
+        )
+        if index is None:
+            continue
+        item = listed[1].value[index]
+        if _carries_anchor(root, listed[1]):
+            # An aliased list or item would give this claim to another column or
+            # test; the test stays as written rather than claim two facts.
+            continue
+        [(_name_node, body)] = item.value
+        if listed[1].flow_style or item.flow_style:
+            # The whole item is Dex's render on one span; restated with the claim.
+            text = splice(text, [(*_span(item), _flow(spec))])
+        elif isinstance(body, yaml.MappingNode) and body.flow_style:
+            text = splice(text, [(*_span(body), _flow(next(iter(spec.values()))))])
+        else:
+
+            def body_of(r: Any, index: int = index) -> Any:
+                tests = _child(locate(r), "data_tests") or _child(locate(r), "tests")
+                return tests[1].value[index].value[0][1] if tests else None
+
+            text = _set_meta(text, body_of, DEX_META_KEY, {CLAIM_KEY: claim})
+    return text
+
+
+def _node_value(node: Any) -> Any:
+    return yaml.safe_load(yaml.serialize(node))
+
+
+def _is_listed(spec: Any, listed: list[Any]) -> bool:
+    """Whether a test list already holds ``spec``.
+
+    A built-in is matched by name, so a test the column lists under that name is
+    left exactly as written (#1348). A generated test (#1449) is matched by its
+    claim, wherever it was renamed, or by the same test with the same arguments,
+    which dbt would build into the same node: one kind can check two facts on
+    one model (two population filters), so its name alone says nothing.
+    """
+
+    name = _spec_name(spec)
+    if not gt.is_generated(spec):
+        return any(_listed_name(test) == name for test in listed)
+    claim = claim_of(spec)
+    arguments = _arguments_of(spec)
+    for test in listed:
+        if claim is not None and claim_of(test) == claim:
+            return True
+        if _listed_name(test) == name and _arguments_of(test) == arguments:
+            return True
+    return False
+
+
+def _listed_name(test: Any) -> str:
+    if isinstance(test, str):
+        return test
+    if isinstance(test, Mapping) and len(test) == 1:
+        return str(next(iter(test)))
+    return ""
+
+
+def _arguments_of(test: Any) -> dict[str, Any]:
+    """A test's arguments, under ``arguments:`` or at the top of its body (the
+    spelling before dbt 1.10), and nothing of its config, name or description."""
+
+    if not isinstance(test, Mapping) or len(test) != 1:
+        return {}
+    body = next(iter(test.values()))
+    if not isinstance(body, Mapping):
+        return {}
+    out = {
+        key: value
+        for key, value in body.items()
+        if key not in ("arguments", "config", "name", "description", "meta", "tags")
+    }
+    nested = body.get("arguments")
+    if isinstance(nested, Mapping):
+        out.update(nested)
+    return out
 
 
 def _spec_name(spec: Any) -> str:

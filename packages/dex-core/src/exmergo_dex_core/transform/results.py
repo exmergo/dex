@@ -92,6 +92,12 @@ class PlanResult(Result):
     # `not_written`), where its flag came from, and never a value. Absent when
     # no written model reads a flagged input.
     pii_metadata: dict[str, Any] | None = None
+    # The generated tests the plan's declarations give (#1449): what
+    # `declarations.render_tests` says, and per test its model, column, name,
+    # cadence tag and claim, and whether it rendered (`added`,
+    # `already_listed`) or not (`not_rendered` with a reason,
+    # `listed_while_off`). Absent when the declarations give none.
+    generated_tests: dict[str, Any] | None = None
     # The free pointer to `transform compare` on a plan that rewrites a model
     # that already exists (#856). Planning scans nothing for it. Absent when the
     # plan rewrites none.
@@ -149,6 +155,8 @@ class PlanResult(Result):
             payload["semantic_proposal"] = self.semantic_proposal
         if self.pii_metadata is not None:
             payload["pii_metadata"] = self.pii_metadata
+        if self.generated_tests is not None:
+            payload["generated_tests"] = self.generated_tests
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:

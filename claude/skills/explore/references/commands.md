@@ -171,7 +171,7 @@ with `references: <model>.<column>` is a declared join whose `declared_by` reads
 which is the usual case since a declared `references` renders one, it is one edge
 with both sources in `declaration_sources`.
 
-## `explore map [--detail] [--verify] [--use-project] [--full]`
+## `explore map [--detail] [--verify] [--use-project] [--full] [--include-elementary]`
 
 Writes or updates the `.dex/` cache and returns the map. Alongside the counts:
 
@@ -203,6 +203,21 @@ skipped this run keep their prior profiles (`carried_forward_count`), each
 stamped with its own `profiled_at`, so staleness is visible. Fresh cached
 profiles are reused the same way `profile` reuses them (`cache_hit_count`,
 `--refresh`).
+
+The Elementary dbt package's own tables (`dbt_run_results`,
+`data_monitoring_metrics`, `elementary_test_results` and the rest of its models)
+are left out of ranking, here and in `explore inventory --rank` (#1311). They are
+recognised from the warehouse by their signature: a namespace holding at least
+three of the package's table names, one of them a name only the package uses. In
+it, only the objects named like the package's models, or like the
+`<name>__tmp_<timestamp>` tables it leaves on BigQuery, are left out, so a project
+that builds the package into its own schema keeps its own tables ranked. They are
+not scored, not profiled (`--full` included) and not described in `data.objects`,
+and `data.excluded` names them (`count`, `reason: elementary`, `by_namespace`,
+`objects`, capped at 25 with the rest counted), apart from `data.skipped`. A note
+says so. When the question is about the package's data itself, read them as any
+other table (`explore profile`, `explore query`), or pass `--include-elementary`
+to rank them with the rest.
 
 ## `explore diagram [--full]`
 
@@ -403,6 +418,15 @@ nothing comes back as a note. The catalog is capped, with every cut counted in
 `elided` and named in `notes`; `elided` is always present, so all zeros and no
 cap notes means this is the whole layer. `--full` lifts the caps.
 
+The local backend reads the compiled `semantic_manifest.json`, which
+`transform apply` leaves alone. When a semantic YAML file is newer than it, every
+local `list`, `values` and `query` result warns with the file and `dbt parse`,
+and so does a refusal of an unknown metric or dimension or a query that fails to
+resolve, so a metric applied a moment ago is not mistaken for a typo. Run
+`dbt parse` and read again. The check sees only newer files that parse and still
+declare `semantic_models` or `metrics`, so no warning does not prove the manifest
+current.
+
 
 Example envelope for `explore semantic list --metric orders` (fields unset on an
 element are omitted rather than null):
@@ -562,6 +586,21 @@ it as `execution` (`dex` or `vendor`).
   grouping is `--group-by orders.ordered_at__month`; `--where` is Cube's JSON
   filter (`'{"member": "orders.status", "operator": "equals", "values":
   ["paid"]}'`).
+  `--api` has the Cube server execute over `/v1/load` instead,
+  `execution: vendor`, on any warehouse Cube supports: no `--confirm`, a
+  `cost guard unavailable` warning on every result, and the same PII gate before
+  anything is sent; a Cube Core is still held to the files first.
+  `scripts/setup_cube_dev.sh --execute` starts a Core that can execute.
+- `semantic.deployment: cube_cloud` (with `vendor: cube`) is the same files on
+  Cube Cloud. Cube Cloud executes by default, and `list` reads the deployment's
+  compiled `/v1/meta` (JS, Jinja and `extends` answered; no `relation` or
+  `column`, declared in `unavailable`; primary keys and private members absent),
+  with `definition_source: cube_cloud` and a warning that it was not checked
+  against the files. `--local` has Cube Cloud render and Dex execute, catalog
+  and checks from the files. `semantic.cube.url` (or `DEX_CUBE_URL`) is the
+  deployment's REST API base, with no default; the token is `CUBE_API_TOKEN`
+  from the environment, sent only to `*.cubecloudapp.dev` / `*.cubecloud.dev`
+  over https or a host named in `DEX_CUBE_ALLOWED_HOSTS`.
 - `semantic.vendor: databricks` reads the Databricks Metric View YAML files
   named in `semantic.databricks.files` statically (needs the `[metric-views]`
   extra; no workspace connection, nothing deployed), each validated by Dex's own
@@ -570,8 +609,25 @@ it as `execution` (`dex` or `vendor`).
   single-aggregate measure is a measure and a metric named `view.measure`, and a
   joined field carries no `column` (its joined table's column reaches the PII
   gate). Joins and `rely.at_most_one_match` keys reach `--use-project`. `query`
-  and `values` refuse by name until #964; profile the relations the catalog names
-  instead.
+  and `values` run governed on the Databricks connector only (#1362): dex renders
+  `SELECT ... MEASURE(<measure>) ... FROM <deployed view> GROUP BY ALL`, finds the
+  deployed view by its file's stem, and executes it under the cost guard. Tokens
+  are `view.field` and `view.measure`; a grain suffix (`orders.order_date__month`)
+  buckets a field formatted `date` or `date_time`; `--where` is a Databricks
+  predicate over the view's fields. The deployed view is read back from Unity
+  Catalog and held to the file first: a difference in anything the query relies
+  on refuses, naming the member and the field (#1363). `list --deployed` reads
+  the deployed views instead, with `source: deployed` and per-view `coverage`.
+  `semantic.deployment: databricks_workspace` (#1364) reads the catalog from
+  Unity Catalog alone (every Metric View the allowlist holds, `tables.list` then
+  `tables.get`, no warehouse, `source: account`, per-view `coverage`, no file
+  needed, each view named by its Unity Catalog name) and runs `query` and
+  `values` over it with nothing held to a file; every result carries
+  `definition_source: account` (on a query or values result) and a warning
+  saying so. A configured file describing a view is named in its `coverage` as
+  `repository_file`, and `--local` holds the view to it.
+  `explore relationships` and `explore map` with `--use-hosted-semantic-layer`
+  fold the deployed views' joins and `rely` keys in.
 - `semantic.vendor: snowflake` reads the Snowflake Semantic View YAML files
   named in `semantic.snowflake.files` statically (needs the `[semantic-views]`
   extra; no Snowflake connection, nothing deployed), each validated by Dex's own

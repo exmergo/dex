@@ -11,6 +11,7 @@ from tests.dbt_artifacts import dex_target
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
+from exmergo_dex_core.transform.claims import claim_id
 from exmergo_dex_core.transform.declarations import (
     DeclarationError,
     apply_declarations,
@@ -130,6 +131,13 @@ def test_a_model_declared_twice_in_one_payload_is_refused():
 UNSAMPLED = {"config": {"meta": {"disable_test_samples": True}}}
 
 
+def claimed(model: str, field: str, columns: list[str], **params: str) -> dict:
+    """``UNSAMPLED`` with the claim id of the fact the test checks (#1448)."""
+
+    claim = claim_id(model, field, columns, params)
+    return {"config": {"meta": {"disable_test_samples": True, "dex": {"claim": claim}}}}
+
+
 HAND_WRITTEN = """version: 2
 
 models:
@@ -157,8 +165,10 @@ def test_a_declaration_lands_in_the_existing_entry_and_nothing_else_moves():
     # Bytes dex does not own survive: the comments, the other model, the PII
     # stamp and the column's own test list under its own key.
     assert "  # orders, owned by the web team\n" in out
+    unique = claim_id("fct_orders", "grain", ["order_id"], {"check": "unique"})
     assert (
-        "tests: [not_null, {unique: {config: {meta: {disable_test_samples: true}}}}]"
+        "tests: [not_null, {unique: {config: {meta: {disable_test_samples: true, "
+        f"dex: {{claim: {unique}}}}}}}}}}}]"
         "   # keep me"
     ) in out
     assert _entry(out, "dim_customers") == {
@@ -187,11 +197,20 @@ def test_a_declaration_lands_in_the_existing_entry_and_nothing_else_moves():
     }
     # A new list follows the spelling the file already uses (`tests:` here).
     assert columns["customer_id"]["tests"] == [
-        {"not_null": UNSAMPLED},
+        {
+            "not_null": claimed(
+                "fct_orders", "null_rule", ["customer_id"], null_rule="never"
+            )
+        },
         {
             "relationships": {
                 "arguments": {"to": "ref('dim_customers')", "field": "customer_id"},
-                **UNSAMPLED,
+                **claimed(
+                    "fct_orders",
+                    "references",
+                    ["customer_id"],
+                    references="dim_customers.customer_id",
+                ),
             }
         },
     ]
@@ -206,7 +225,18 @@ def test_a_single_column_grain_is_tested_unique_and_not_null():
     assert entry["columns"] == [
         {
             "name": "order_id",
-            "data_tests": [{"unique": UNSAMPLED}, {"not_null": UNSAMPLED}],
+            "data_tests": [
+                {
+                    "unique": claimed(
+                        "fct_orders", "grain", ["order_id"], check="unique"
+                    )
+                },
+                {
+                    "not_null": claimed(
+                        "fct_orders", "grain", ["order_id"], check="not_null"
+                    )
+                },
+            ],
         }
     ]
 
@@ -224,7 +254,15 @@ def test_a_grain_column_never_null_is_tested_not_null_once():
 
     [column] = _entry(render(None, declaration))["columns"]
 
-    assert column["data_tests"] == [{"unique": UNSAMPLED}, {"not_null": UNSAMPLED}]
+    # One not_null, carrying the null rule's claim: the fact rendered first.
+    assert column["data_tests"] == [
+        {"unique": claimed("fct_orders", "grain", ["order_id"], check="unique")},
+        {
+            "not_null": claimed(
+                "fct_orders", "null_rule", ["order_id"], null_rule="never"
+            )
+        },
+    ]
 
 
 def test_a_grain_extends_a_block_style_test_list_in_place():
@@ -244,7 +282,10 @@ def test_a_grain_extends_a_block_style_test_list_in_place():
         "        dex:\n          grain:\n            - order_id\n    columns:\n"
         "      - name: order_id\n        tests:\n          - unique\n"
         "          - not_null:\n              config:\n                meta:\n"
-        "                  disable_test_samples: true\n      - name: amount\n"
+        "                  disable_test_samples: true\n                  dex:\n"
+        "                    claim: "
+        f"{claim_id('fct_orders', 'grain', ['order_id'], {'check': 'not_null'})}\n"
+        "      - name: amount\n"
     )
 
 
@@ -741,7 +782,10 @@ def test_plan_then_apply_declares_the_model_where_it_already_lives(
     assert entry["config"]["meta"]["dex"]["grain"] == ["id"]
     # The column's own `tests:` list keeps its key and gains `unique`.
     id_column = next(c for c in entry["columns"] if c["name"] == "id")
-    assert id_column["tests"] == ["not_null", {"unique": UNSAMPLED}]
+    assert id_column["tests"] == [
+        "not_null",
+        {"unique": claimed("stg_customers", "grain", ["id"], check="unique")},
+    ]
 
 
 def test_a_malformed_declaration_is_an_error_envelope_naming_the_fix(
@@ -1265,3 +1309,420 @@ def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owe
 
     files = {"snapshots/snap.sql": "{% snapshot snap %}select 1{% endsnapshot %}"}
     assert drafting._reads_snapshot_history(sql, files) is owed
+
+
+@pytest.mark.parametrize(
+    ("release", "materialization", "warns", "expected_msg"),
+    [
+        (
+            "0.16.4",
+            "elementary",
+            True,
+            (
+                "installed Elementary release 0.16.4 ignores "
+                "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+                "set test_sample_row_count: 0 for the project"
+            ),
+        ),
+        (
+            "0.20.0-rc.1",
+            "elementary",
+            True,
+            (
+                "installed Elementary release 0.20.0-rc.1 ignores "
+                "disable_test_samples; upgrade the package to 0.20.0 or later, or "
+                "set test_sample_row_count: 0 for the project"
+            ),
+        ),
+        (
+            "0.20.0",
+            "elementary",
+            False,
+            None,
+        ),
+        (
+            "0.26.1",
+            "elementary",
+            False,
+            None,
+        ),
+        (
+            "0.16.4",
+            "dbt",
+            False,
+            None,
+        ),
+        (
+            None,
+            "elementary",
+            True,
+            (
+                "could not tell the installed Elementary release; releases "
+                "below 0.20.0 ignore disable_test_samples; upgrade the package "
+                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            ),
+        ),
+        (
+            "unknown-build-42",
+            "elementary",
+            True,
+            (
+                "could not tell the installed Elementary release; releases "
+                "below 0.20.0 ignore disable_test_samples; upgrade the package "
+                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            ),
+        ),
+    ],
+)
+def test_elementary_sampling_warning_when_declaring_model(
+    tmp_path: Path, release, materialization, warns, expected_msg
+):
+    """When Elementary ignores disable_test_samples on rendered tests, warn (#1381)."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    install = "dbt_packages"
+    flag = "false" if materialization == "elementary" else "true"
+    _write(tmp_path, "dbt_project.yml", project_yml(flag=flag))
+    if release is not None:
+        _write(
+            tmp_path,
+            f"{install}/elementary/dbt_project.yml",
+            f'name: elementary\nversion: "{release}"\n',
+        )
+    else:
+        _write(
+            tmp_path,
+            f"{install}/elementary/dbt_project.yml",
+            "name: elementary\n",
+        )
+
+    m = manifest(elementary=True)
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=m,
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+
+    if warns:
+        assert any("disable_test_samples" in w for w in warnings)
+        assert expected_msg in warnings
+    else:
+        assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_elementary_sampling_warning_not_emitted_when_no_unsampled_tests_rendered(
+    tmp_path: Path,
+):
+    """No warning when declarations render no tests carrying the sampling flag."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    m = manifest(elementary=True)
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=m,
+    )
+
+    # Multi-column grain renders no unique or not_null test
+    parsed = parse_declarations(
+        [{"model": "fct_orders", "grain": ["order_id", "customer_id"]}]
+    )
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_no_warning_when_existing_plain_tests_are_preserved(tmp_path: Path):
+    """Preserving plain unique/not_null tests adds no flag, so emit no warning."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    schema_with_plain_tests = (
+        "version: 2\nmodels:\n  - name: fct_orders\n    columns:\n"
+        "      - name: order_id\n        data_tests: [unique, not_null]\n"
+    )
+    project_files = _project()
+    project_files["models/marts/fct_orders.yml"] = schema_with_plain_tests
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_warning_when_no_manifest_available(tmp_path: Path):
+    """Detect Elementary 0.16.4 from packages when manifest is absent."""
+    from tests.transform.test_elementary import _write, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=None,
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)
+
+    # Variant b: flag is true, so dbt materialization is confirmed even without manifest
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="true"))
+    _edits_b, warnings_b = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings_b)
+
+
+def test_malformed_manifest_does_not_abort_declarations(tmp_path: Path):
+    """A malformed manifest does not raise; declarations are safely rendered."""
+    from tests.transform.test_elementary import _write, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest={"nodes": ["invalid"]},
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    edits, _warnings = apply_declarations(parsed, view, [])
+    assert len(edits) > 0
+
+
+def test_warning_uses_proposed_project_config(tmp_path: Path):
+    """The check evaluates the configuration proposed by edits in the plan."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="true"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    # Plan includes an edit changing flag to false
+    proposed_edit = PlanEdit(
+        path="dbt_project.yml",
+        kind=EditKind.PROJECT_YML,
+        new_content=project_yml(flag="false"),
+    )
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [proposed_edit])
+    assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)
+
+
+def test_warning_when_plan_adds_root_materialization_shim(tmp_path: Path):
+    """A proposed root test materialization delegates to Elementary.
+
+    This triggers the warning when declaring single-column grain.
+    """
+    from tests.transform.elementary_fixture import SHIM_SQL
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="true"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        macro_paths=["macros"],
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    proposed_shim = PlanEdit(
+        path="macros/shim.sql",
+        kind=EditKind.MACRO_SQL,
+        new_content=SHIM_SQL,
+    )
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [proposed_shim])
+    assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)
+
+
+def test_no_warning_when_macro_contains_only_comment(tmp_path: Path):
+    """Jinja and SQL comments referencing materialization must not trigger warning."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="true"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    project_files["macros/notes.sql"] = (
+        "{# {% materialization test, default %} elementary #}\n"
+        "/* materialization test elementary */\n"
+    )
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        macro_paths=["macros"],
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_no_warning_on_description_containing_sampling_flag_text(tmp_path: Path):
+    """A description edit containing flag text must not trigger warning."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    schema_with_plain_tests = (
+        "version: 2\nmodels:\n  - name: fct_orders\n    columns:\n"
+        "      - name: order_id\n        data_tests: [unique, not_null]\n"
+    )
+    project_files = _project()
+    project_files["models/marts/fct_orders.yml"] = schema_with_plain_tests
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "description": "Mentions disable_test_samples: true in prose",
+            }
+        ]
+    )
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert not any("disable_test_samples" in w for w in warnings)
+
+
+def test_warning_when_description_with_flag_text_replaced_and_test_added(
+    tmp_path: Path,
+):
+    """Warning triggers when test is added even if flag count in file decreases."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    schema_with_flag_in_desc = (
+        "version: 2\nmodels:\n  - name: fct_orders\n"
+        "    description: 'disable_test_samples: true and disable_test_samples: true'\n"
+        "    columns:\n      - name: order_id\n"
+    )
+    project_files = _project()
+    project_files["models/marts/fct_orders.yml"] = schema_with_flag_in_desc
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=manifest(elementary=True),
+    )
+
+    parsed = parse_declarations(
+        [
+            {
+                "model": "fct_orders",
+                "grain": ["order_id"],
+                "description": "Clean description without flag phrase",
+            }
+        ]
+    )
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)

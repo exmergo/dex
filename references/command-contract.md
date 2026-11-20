@@ -46,7 +46,10 @@ logic.
   an interactive caller's clock, and resolving through the shared path is what
   keeps it from warming an environment the next command would contradict.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
-  else. Diagnostics go to stderr.
+  else. Diagnostics go to stderr. That includes an argv the parser refuses (a
+  missing argument, an unknown flag or command, a bad value): a `reason: request`
+  error envelope carrying the parser's message, exit 1, with the usage on stderr.
+  Only `--help` and a bare `dex` print their own text, and exit 0.
 - Every envelope carries a constant `connection` block. On success it names the
   resolved connector, its non-secret target coordinates, and the source of that
   resolution (`flag`, `.dex/config.yml`, `environment variable`,
@@ -152,6 +155,9 @@ dex config unset <key> [<key>...] -> removes settings with the same in-place edi
 dex explore inventory [--rank]    -> ranked object summary (counts, sizes; no rows). --rank caps at 30
   [--limit N] [--all]                objects by default (kept by rank); --limit widens it, --all lifts
                                      it; both no-ops without --rank
+  [--include-elementary]             a ranked call leaves the Elementary dbt package's own tables out
+                                     (#1311), named in data.excluded with a note; this ranks them
+                                     with the rest. An unranked call lists every object
 dex explore profile <objects>     -> column profiles + PII flags + candidate keys, grain, data-quality warnings.
   [--columns all]                    Verdict fields (grain, keys, data quality, row count) lead the
                                      payload, columns trails; by default columns is summarized to the
@@ -182,6 +188,9 @@ dex explore map [--detail]        -> write/update the .dex cache, and return the
                                      cap binds in every mode and every elision is
                                      counted in notes; --detail widens the selection,
                                      never the caps. No column value ever appears
+  [--include-elementary]             the Elementary dbt package's own tables are left out
+                                     of ranking and profiling (#1311), named in
+                                     data.excluded with a note; this ranks them
 dex explore diagram               -> the cached map as a Mermaid erDiagram, in `data.mermaid`;
                                      free and connectionless (a store read, no warehouse);
                                      declared joins solid (a relationships test or a shared
@@ -242,7 +251,12 @@ dex explore semantic query <m,m>  -> one governed metric query, capped and row-m
   [--order-by <c>] [--grain <g>]     connector, PII gate, read-only assertion, relation pre-check and cost
   [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
                                      server-side where dex's cost guard is structurally unavailable and every
-                                     result says so
+                                     result says so. A local list, values or query read from a compiled
+                                     semantic manifest older than a semantic YAML file warns with the file and
+                                     `dbt parse`, and so does its refusal of an unknown metric or dimension or
+                                     a query that fails to resolve. The check sees only newer files that parse
+                                     and still declare semantic_models or metrics, so no warning does not prove
+                                     the manifest current
 dex init [<name>]                -> complete project setup: new dbt-backed Dex project,
                                      complete DuckDB demo, existing dbt adoption, or
                                      exploration without dbt. .dex/ stays at repo root;
@@ -289,6 +303,13 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      or a declared population.parent removed or replaced is kind
                                      redriven (reason redriven, against applied or earlier_plan),
                                      declared only by an assumption at request or contract tier (#1228);
+                                     data.change_scope.removed_tests (#1420) lists each unit test,
+                                     data test (on a model or its versions, a snapshot, a seed or a
+                                     source table) and deleted singular test file the plan removes
+                                     (kind, name, model / models / snapshot / seed / source, version,
+                                     column, path) with a warning, even on a plan that rewrites no
+                                     model, and never refuses; an edited test, a moved one and one
+                                     carried to a model whose file the plan renames are not removed;
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref
@@ -1331,6 +1352,27 @@ default, or a filter or operator after it is refused. A key naming a location
   other expression `unresolved` with a warning, a hand-written mark `kept` (or a
   `disagreement`), and a model that already exists `not_written`. The rule and
   the precedence: [`pii-policy.md`](pii-policy.md#pii-metadata-on-authored-models).
+- A declaration renders the built-in tests (`unique`, `not_null`,
+  `relationships`) always, and Dex's **generated tests** only where
+  `declarations.render_tests` in `.dex/config.yml` turns them on (#1449): `false`
+  by default, `true` for every kind this release renders, or a list of test
+  names and cadences. Each generated test carries a dbt tag fixed per kind,
+  `dex_every_run` or `dex_scheduled`, so an orchestrator selects them with
+  `--select tag:dex_scheduled` or leaves them out with `--exclude`. The plan
+  lists each one under `data.generated_tests` (`model`, `column`, `test`,
+  `cadence`, `claim`, and a `status` of `added`, `already_listed`,
+  `not_rendered` with its `reason`, or `listed_while_off`). Turning the switch
+  off removes no test already written. A list entry this release does not render
+  is a non-fatal `unknown_test_kind` config problem. Each kind states the
+  connectors it supports (every one `maintain verify` runs its matching check
+  on); elsewhere it renders nothing and is `not_rendered` with
+  `reason: dialect_unsupported` (#1451). This release renders
+  `dex_unique_combination` for a declared grain of two or more columns (#1452),
+  on every connector: its `failures` count equals `grain_broken`'s
+  `duplicate_count`, a NULL grain value counts as a value, and the test returns
+  that count and never a key. The plan writes its generic test macro as a
+  `macro_sql` diff where the project defines none; a `macro_sql` file may hold
+  `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it
@@ -1497,7 +1539,25 @@ default, or a filter or operator after it is refused. A key naming a location
   result when it runs. Its `per_table_bytes` line is kept, since it is still
   what the job can bill at most, and `data.upper_bounds` maps each such line to
   the column it bounds; a note, and the over-ceiling refusal, say how much of
-  the estimate those lines are. dbt runs with cwd pinned to the project dir
+  the estimate those lines are. Where the Elementary package runs work no
+  compiled node shows (#1309), the estimate is a floor and says so, keyed off
+  what the package does for the target and never off whether it is installed:
+  `cost.unpriced` names the kinds by code on the ask, the over-ceiling refusal
+  and the finished build (`elementary_hooks` where its `on-run-start` and
+  `on-run-end` hooks run; `elementary_monitoring_tests` where the package is
+  enabled and the build selects its anomaly, `schema_changes` and other tests
+  that check it, each with the `days_back` window it reads; and
+  `elementary_test_extras` where dbt picks Elementary's test materialization,
+  which can count each selected test's failed rows and query a sample of them),
+  `data.unpriced` holds the record (`work`, `hooks`, `monitoring_tests` with
+  `days_back` and `days_back_source`, `monitoring_test_count`,
+  `materialized_test_count`), and one warning per kind says what was left out.
+  A project without the package gets none of it and `cost.unpriced: null`. One
+  that disables the package for the target gets no monitoring test or test
+  extra, and its hooks are named only where they still run: dbt disables them
+  with the package's models, and a release before 0.20.0 whose hooks stay
+  declared runs them without checking. A free connector prices nothing and
+  claims nothing. dbt runs with cwd pinned to the project dir
   (relative `profiles.yml` paths resolve there, never against the caller's
   shell). When
   `packages.yml` (or a `dependencies.yml` with packages) is declared and
@@ -2393,7 +2453,36 @@ largest first, each namespace being everything before an identifier's last dot),
 and `objects` in rank order, highest first, each list capped at 25 with the rest
 counted in `elided_namespaces` and `elided`. It is always present, so `count: 0`
 on a `--full` run is the positive statement that nothing was skipped, and it
-changes neither which objects are profiled nor the estimate. Objects skipped on a
+changes neither which objects are profiled nor the estimate.
+
+**Elementary's tables are left out of ranking (#1311).** A project that installs
+the `elementary-data/elementary` dbt package gets a schema of metadata tables
+the package writes on every run (`dbt_run_results`, `data_monitoring_metrics`,
+`elementary_test_results`), large enough to outrank the project's own tables on
+size. `explore inventory --rank` and `explore map` recognise them from the
+warehouse alone, by their signature: a namespace holding at least three of the
+package's table names (its models at releases 0.15.2 to 0.26.1), one of them a
+name only the package uses (`elementary_test_results`,
+`data_monitoring_metrics`, `schema_columns_snapshot`, ...). In such a namespace,
+each object named like one of the package's models, or like the
+`<name>__tmp_<timestamp>` tables it leaves behind on BigQuery, is the package's;
+nothing else in the namespace is, so a project that builds the package into its
+own schema keeps its own tables ranked. The project's `+schema` is not read:
+exploration starts bare, and a manifest parsed for the dev target names the dev
+namespace, never the production one being explored. A recognised table is not
+scored, not profiled by `map` (`--full` included), and not described in
+`data.objects` or `data.top_objects`, even where an earlier `explore profile`
+cached it; `map` keeps it in the cache as an inventory entry with no
+`rank_score`. A profile an earlier `--include-elementary` run cached outside this
+run's scope is carried forward as any out-of-scope profile is, recognised by the
+same signature, and left out the same way, its rank cleared. `data.excluded` names them: `count`, `reason` (`elementary`, or
+`null` when nothing was left out), `by_namespace`, and `objects` sorted by name,
+each list capped at 25 with the rest counted in `elided_namespaces` and
+`elided`. It is always present on `map` and on a ranked `inventory`, and apart
+from `data.skipped`, which is the rank cutoff's. A note names the namespaces and
+the way back. The tables stay readable: an unranked `explore inventory` lists
+them, `explore profile` and `explore query` read them as any other, and
+`--include-elementary` ranks them with the rest. Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`. A selected object whose cached profile is
 still fresh (same connector, schema unchanged, profiled within
@@ -2628,13 +2717,20 @@ Every command prints one object of this shape (`exmergo_dex_core.envelope`):
     "ceiling": null,
     "paradigm": "bytes_scanned | compute_time | db_load | hosted | free_local | null",
     "estimate_quality": "exact | approximate | unknown | null",
-    "unit": "bytes | seconds | null"
+    "unit": "bytes | seconds | null",
+    "unpriced": ["<code>", "..."] | null
   },
   "warnings": [],
   "diffs": [],
   "errors": []
 }
 ```
+
+`cost.unpriced` names work the command runs that `estimate` leaves out, so any
+entry makes the estimate a floor. It is `null` wherever nothing is claimed, which
+is every command but a `transform build` on a billed connector that runs the
+Elementary package's hooks or tests (#1309); a free connector's build prices
+nothing and claims nothing.
 
 In values-free mode `data.result_mode` is `"values_free"` on every envelope, and
 an error envelope adds `data.code`, a stable code that quotes no value (see

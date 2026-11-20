@@ -171,7 +171,7 @@ with `references: <model>.<column>` is a declared join whose `declared_by` reads
 which is the usual case since a declared `references` renders one, it is one edge
 with both sources in `declaration_sources`.
 
-## `explore map [--detail] [--verify] [--use-project] [--full]`
+## `explore map [--detail] [--verify] [--use-project] [--full] [--include-elementary]`
 
 Writes or updates the `.dex/` cache and returns the map. Alongside the counts:
 
@@ -203,6 +203,21 @@ skipped this run keep their prior profiles (`carried_forward_count`), each
 stamped with its own `profiled_at`, so staleness is visible. Fresh cached
 profiles are reused the same way `profile` reuses them (`cache_hit_count`,
 `--refresh`).
+
+The Elementary dbt package's own tables (`dbt_run_results`,
+`data_monitoring_metrics`, `elementary_test_results` and the rest of its models)
+are left out of ranking, here and in `explore inventory --rank` (#1311). They are
+recognised from the warehouse by their signature: a namespace holding at least
+three of the package's table names, one of them a name only the package uses. In
+it, only the objects named like the package's models, or like the
+`<name>__tmp_<timestamp>` tables it leaves on BigQuery, are left out, so a project
+that builds the package into its own schema keeps its own tables ranked. They are
+not scored, not profiled (`--full` included) and not described in `data.objects`,
+and `data.excluded` names them (`count`, `reason: elementary`, `by_namespace`,
+`objects`, capped at 25 with the rest counted), apart from `data.skipped`. A note
+says so. When the question is about the package's data itself, read them as any
+other table (`explore profile`, `explore query`), or pass `--include-elementary`
+to rank them with the rest.
 
 ## `explore diagram [--full]`
 
@@ -402,6 +417,15 @@ unknown metric or dimension is refused by name; a search term that matched
 nothing comes back as a note. The catalog is capped, with every cut counted in
 `elided` and named in `notes`; `elided` is always present, so all zeros and no
 cap notes means this is the whole layer. `--full` lifts the caps.
+
+The local backend reads the compiled `semantic_manifest.json`, which
+`transform apply` leaves alone. When a semantic YAML file is newer than it, every
+local `list`, `values` and `query` result warns with the file and `dbt parse`,
+and so does a refusal of an unknown metric or dimension or a query that fails to
+resolve, so a metric applied a moment ago is not mistaken for a typo. Run
+`dbt parse` and read again. The check sees only newer files that parse and still
+declare `semantic_models` or `metrics`, so no warning does not prove the manifest
+current.
 
 
 Example envelope for `explore semantic list --metric orders` (fields unset on an

@@ -2276,6 +2276,46 @@ def compile_estimate(
     return total, per_node, notes
 
 
+def unpriced_elementary_work(
+    project_dir: Path | str, artifact_directory: Path | str | None = None
+) -> Any:
+    """What the Elementary package runs in this build that the estimate misses.
+
+    Read from the pricing compile's own artifacts: its manifest, parsed for the
+    build's target, and its ``run_results.json``, the build's selection
+    (#1309). Returns an :class:`~.elementary.UnpricedWork`, empty where the
+    package is not installed, is disabled for the target, or the artifacts
+    cannot be read, since a reading that fails here must not cost the build
+    its estimate.
+    """
+
+    from . import elementary
+
+    project = Path(project_dir)
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else resolve_build_artifact_dir(project)
+    )
+    paths = artifact_paths(directory)
+    try:
+        manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+        selected = {
+            str(r["unique_id"])
+            for r in json.loads(paths.run_results.read_text(encoding="utf-8")).get(
+                "results", []
+            )
+            if r.get("unique_id")
+        }
+    except (OSError, ValueError, AttributeError):
+        return elementary.UnpricedWork()
+    runtime = elementary.read(project, manifest)
+    project_yml: str | None = None
+    with contextlib.suppress(OSError, UnicodeError):
+        project_yml = (project / "dbt_project.yml").read_text(encoding="utf-8")
+    return elementary.unpriced_work(runtime, manifest, project_yml, selected=selected)
+
+
 def _count(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 
@@ -2768,9 +2808,9 @@ def _failed_node(completed: subprocess.CompletedProcess) -> tuple[str, str] | No
         found = _NODE_FAILURE.search(clean)
         if found is None:
             continue
-        rest = [
-            part.strip() for part in clean[found.end() :].splitlines() if part.strip()
-        ]
+        # Masked before the split: a value can span a line break (#1412).
+        tail = mask_values(clean[found.end() :])
+        rest = [part.strip() for part in tail.splitlines() if part.strip()]
         reason = rest[0] if rest else found.group(0)
         return found.group(1).strip(), redact(mask_values(reason))[:300]
     return None
@@ -2822,7 +2862,12 @@ def _collect_messages(
         info = event.get("info", {})
         if info.get("level") not in {"error", "warn"} or not info.get("msg"):
             continue
-        msg = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
+        # A model that fails on a cast fails in the warehouse's words, which
+        # can quote the row's value; masked whole, before the message is split
+        # into lines (a value can span one, #1412) or capped (a cut could strand
+        # a value without its closing quote, #1070).
+        raw = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
+        msg = mask_values(raw)
         msg_lines = msg.splitlines()
         # A unit test's failure opens with blank lines before its diff, so the
         # first line with something on it is the one that names the failure.
@@ -2852,14 +2897,10 @@ def _collect_messages(
                     cause = " ".join([cause, *details])
                 sep = "" if first_line.endswith(":") else ":"
                 first_line = f"{first_line}{sep} {cause}"
-        # A model that fails on a cast fails in the warehouse's words, which
-        # can quote the row's value; masked before the cap so a cut cannot
-        # strand a value without its closing quote (#1070).
-        first_line = mask_values(first_line)
         if len(first_line) > _MESSAGE_MAX_CHARS:
             first_line = first_line[:_MESSAGE_MAX_CHARS] + _MESSAGE_CUT_NOTE
             trimmed = True
-        if first_line != msg:
+        if first_line != raw:
             trimmed = True
         if first_line in seen:
             trimmed = True
@@ -2884,7 +2925,8 @@ def _collect_messages(
     messages = primary + deprecations
 
     if not messages and completed.stderr:
-        messages.append(redact(mask_values(completed.stderr.strip().splitlines()[-1])))
+        last = mask_values(completed.stderr.strip()).splitlines()[-1]
+        messages.append(redact(last))
     if len(messages) > _MESSAGE_CAP:
         messages = messages[:_MESSAGE_CAP]
         trimmed = True

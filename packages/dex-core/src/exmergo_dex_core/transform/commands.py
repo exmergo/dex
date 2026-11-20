@@ -332,7 +332,7 @@ def plan(
 
     toggle_stated = _parse_toggle(engine, edits, toggle)
 
-    declared, declaration_notes, drafts, pii_metadata = _declare(
+    declared, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
         engine, edits, declarations
     )
     edits = declared
@@ -497,6 +497,7 @@ def plan(
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
+    result.generated_tests = generated_tests
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -806,7 +807,7 @@ def _keep_one_entry(
 
 def _declare(
     engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
-) -> tuple[list[PlanEdit], list[str], dict[str, Any]]:
+) -> tuple[list[PlanEdit], list[str], dict[str, Any], Any, dict[str, Any] | None]:
     """Render the payload's declarations into ``edits``, draft what the cache
     already knows about each model, and warn where intent is missing.
 
@@ -817,7 +818,9 @@ def _declare(
 
     The third value is ``data.declarations``: per model the plan creates, edits
     or declares, its ``drafted``, ``declared`` and ``missing`` parts (see
-    :mod:`.drafting`).
+    :mod:`.drafting`). The fifth is ``data.generated_tests`` (#1449): the
+    switch's setting and each generated test the declarations give, rendered or
+    not, or ``None`` where they give none.
     """
 
     from ..dbt_project import load as load_project
@@ -830,10 +833,12 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}, None
+        return edits, [], {}, None, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
+    generated: list[dict[str, Any]] = []
+    render_tests = engine.config.declarations.render_tests
     if parsed:
         cache = None
         if any(d.population and d.population.filters for d in parsed):
@@ -855,8 +860,12 @@ def _declare(
             edits,
             cache=cache,
             pii_overrides=pii_override_paths(engine.config.pii_overrides),
+            render_tests=render_tests,
+            generated=generated,
+            dialect=_dialect(engine),
         )
         warnings.extend(rendered_warnings)
+        edits = _with_generated_macros(view, edits, generated)
     warnings.extend(
         declarations_mod.undeclared_model_warnings(
             edits, view, (d.model for d in parsed)
@@ -865,7 +874,68 @@ def _declare(
     drafts, draft_warnings = _draft(engine, view, edits, [d.model for d in parsed])
     warnings.extend(draft_warnings)
     edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
-    return edits, warnings, drafts, pii_metadata
+    return (
+        edits,
+        warnings,
+        drafts,
+        pii_metadata,
+        _generated_report(render_tests, generated),
+    )
+
+
+def _dialect(engine: DexEngine) -> str | None:
+    """The connector a generated test would run on (#1451): the one this
+    command was given, else the committed one."""
+
+    return engine.connector or engine.config.connector
+
+
+def _with_generated_macros(
+    view: Any, edits: list[PlanEdit], generated: list[dict[str, Any]]
+) -> list[PlanEdit]:
+    """``edits`` plus a ``macro_sql`` edit for each shipped generic test a
+    rendered generated test needs and neither the project nor the plan defines
+    (#1452), so the plan dbt parses holds the test's definition and the diff
+    shows it. A project's own copy, however it differs, is left alone:
+    ``transform macro <name>`` reconciles it. A file already at the asset's
+    path gains only the definitions it lacks."""
+
+    from .. import generated_tests as gt
+    from . import scaffold as scaffold_mod
+
+    macros = {kind.name: kind.macro for kind in gt.kinds() if kind.macro}
+    needed = sorted(
+        {
+            macros[row["test"]]
+            for row in generated
+            if row["status"] in ("added", "already_listed") and row["test"] in macros
+        }
+    )
+    out = list(edits)
+    for name in needed:
+        if not scaffold_mod.defines_test(view, out, name):
+            out = scaffold_mod.with_shipped_test(view, out, name)
+    return out
+
+
+def _generated_report(
+    render_tests: bool | list[str], generated: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """``data.generated_tests`` (#1449): what ``declarations.render_tests``
+    says, and every generated test the plan's declarations give, each with its
+    cadence tag and claim and whether it rendered. ``None`` where they give
+    none, so a plan with nothing to say about generated tests carries no key."""
+
+    if not generated:
+        return None
+    counts: dict[str, int] = {}
+    for row in generated:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {
+        "render_tests": render_tests,
+        "counts": counts,
+        "tests": generated,
+    }
 
 
 def _stamp_pii(
@@ -1212,6 +1282,8 @@ def _offer_refactor_comparison(
             + " Keep this plan unapplied until it is compared: applying it "
             "discards the baseline. " + why[0].upper() + why[1:]
         )
+    from .expected_change import ACCEPTED_SHAPE
+
     offer: dict[str, Any] = {
         "plan_id": result.plan_id,
         "recommended_before_apply": recommended,
@@ -1228,9 +1300,8 @@ def _offer_refactor_comparison(
         "intended_change": (
             "if the plan is meant to change rows, compare with --expect, stating "
             "which rows may be added and removed, which columns may change, and "
-            "that the key holds: "
-            '{"added": "none"|"any"|{"where": "<predicate>"}, "removed": ..., '
-            '"changed_columns": [...], "key": "unchanged"}'
+            '"key": "unchanged" (or "any" when the key may stop being unique): '
+            + ACCEPTED_SHAPE
         ),
     }
     if mixed:
@@ -1470,7 +1541,8 @@ def _report_change_scope(
 ) -> None:
     """Say what the plan changes about each model it rewrites beyond what an
     assumption records (#1115): which populations move and which stay, and
-    which outputs are removed, retyped, re-aggregated or re-NULLed.
+    which outputs are removed, retyped, re-aggregated or re-NULLed; and which
+    unit tests, data tests and singular tests the plan removes (#1420).
 
     Static and free: both versions are rendered and read, nothing runs. The plan
     is already stored, so a defect here is a warning and never an error.
@@ -1494,15 +1566,17 @@ def _report_change_scope(
         ]
         earlier, against, parents = _redrive_baselines(engine, view, edits, result)
         rewrites.extend(earlier)
-        if not rewrites:
-            return
-        report = change_scope.analyze(
-            rewrites,
-            result.decisions or [],
-            get_dialect(engine.connector or engine.config.connector),
-            view.vars,
-            parents=parents,
-            against=against,
+        report = (
+            change_scope.analyze(
+                rewrites,
+                result.decisions or [],
+                get_dialect(engine.connector or engine.config.connector),
+                view.vars,
+                parents=parents,
+                against=against,
+            )
+            if rewrites
+            else None
         )
     except Exception as exc:
         result.warnings.append(
@@ -1510,6 +1584,18 @@ def _report_change_scope(
             f"({type(exc).__name__}); the plan itself is unaffected"
         )
         return
+    # Tests the plan removes (#1420), whether or not it rewrites a model; a
+    # defect here drops only this list, never the models' report.
+    try:
+        removed = change_scope.removed_tests(view, edits)
+    except Exception as exc:
+        removed = []
+        result.warnings.append(
+            "could not read which tests this plan removes "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+    if removed:
+        report = {**(report or {}), "removed_tests": removed}
     if report is None:
         return
     with contextlib.suppress(Exception):
@@ -2121,7 +2207,13 @@ def declare(
         return drafts.get(model), warnings
 
     outcome = declare_mod.propose(
-        view, selection.models, supplied, draft=draft_one, cap=cap
+        view,
+        selection.models,
+        supplied,
+        draft=draft_one,
+        cap=cap,
+        render_tests=engine.config.declarations.render_tests,
+        dialect=_dialect(engine),
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2174,6 +2266,7 @@ def declare(
         decisions=planned.decisions,
         declarations=planned.declarations,
         semantic_proposal=planned.semantic_proposal,
+        generated_tests=planned.generated_tests,
         notes=notes + planned.notes,
         **common,
     )
@@ -6270,7 +6363,15 @@ def _build_project(
         ),
         impact=impact,
     )
+    unpriced = None
     if estimate is not None:
+        # The estimate prices compiled nodes, and the Elementary package runs
+        # work no node shows (#1309); read off the pricing compile's artifacts,
+        # so it answers for the build's own target and selection.
+        from .build import unpriced_elementary_work
+
+        unpriced = unpriced_elementary_work(checkout, artifacts_dir)
+        price_notes = [*price_notes, *unpriced.warnings()]
         command_args.billed_handshake(
             "transform build",
             adapter,
@@ -6278,6 +6379,7 @@ def _build_project(
             per_table=per_node or None,
             notes=price_notes or None,
             upper_bounds=upper_bounds or None,
+            unpriced=unpriced.as_dict() if unpriced.codes else None,
         )
     try:
         summary, cost = run_build(
@@ -6302,6 +6404,9 @@ def _build_project(
             full_refresh=full_refresh,
         )
         logged_id = summary.pop("logged_invocation_id", None)
+        if unpriced is not None and unpriced.codes:
+            cost.unpriced = unpriced.codes
+            summary["unpriced"] = unpriced.as_dict()
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
         # why the confirm ask carries no number. `billed_handshake` never ran on
@@ -8202,7 +8307,7 @@ def _semantic_plan(
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
     # and before the parse below, so dbt reads the layer and the models together.
-    edits, declaration_notes, drafts, pii_metadata = _declare(
+    edits, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
         engine, edits, declarations
     )
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
@@ -8268,6 +8373,7 @@ def _semantic_plan(
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
+    result.generated_tests = generated_tests
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)

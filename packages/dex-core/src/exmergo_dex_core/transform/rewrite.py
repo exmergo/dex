@@ -51,6 +51,7 @@ from ..yaml_spans import (
     indent_of,
     sequence_item_span,
 )
+from .claims import CLAIM_KEY, without_claim
 
 
 class RewriteError(DexError):
@@ -1636,7 +1637,7 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
                 items.append((item.start_mark.index, item.end_mark.index))
                 # The unsampled test dex rendered is dex's to move; any other
                 # mapping is someone's configuration and stays hands-off.
-                if named and _construct(item) == _unsampled(named[0]):
+                if named and is_unsampled_render(_construct(item), named[0]):
                     spans[named[0]] = items[-1]
         return ColumnTests(
             key=key,
@@ -1662,7 +1663,7 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
     )
 
 
-def _unsampled(name: str, **body: Any) -> dict[str, Any]:
+def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str, Any]:
     """A rendered test that tells Elementary to keep no sample of its failing rows.
 
     A failing ``not_null``, ``unique`` or ``relationships`` test returns key
@@ -1672,9 +1673,39 @@ def _unsampled(name: str, **body: Any) -> dict[str, Any]:
     0.20.0) and does nothing where Elementary is not installed. It sits under
     ``config``: Elementary reads either spelling, and dbt 1.12 warns on a test's
     top-level ``meta`` (``PropertyMovedToConfigDeprecation``).
+
+    ``claim`` is the id of the declared fact the test checks (#1448), written
+    beside the flag as ``config.meta.dex.claim``. A test that checks no declared
+    fact (one the scaffold or ``maintain reconcile`` adds) carries none.
     """
 
-    return {name: {**body, "config": {"meta": {"disable_test_samples": True}}}}
+    meta: dict[str, Any] = {"disable_test_samples": True}
+    if claim is not None:
+        meta["dex"] = {CLAIM_KEY: claim}
+    return {name: {**body, "config": {"meta": meta}}}
+
+
+def generated_spec(
+    name: str, *, cadence: str, claim: str, arguments: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """A generated test as a declaration renders it (#1449).
+
+    The built-ins' shape (:func:`_unsampled`: the sampling flag and the claim)
+    plus the kind's cadence as a dbt tag, under ``config`` where dbt reads a
+    test's tags, so ``dbt build --select tag:dex_scheduled`` selects it. The
+    generic test's arguments go under ``arguments:``, dbt's spelling from 1.10.
+    """
+
+    [(_, rendered)] = _unsampled(name, claim=claim).items()
+    body: dict[str, Any] = {"arguments": dict(arguments)} if arguments else {}
+    return {name: {**body, "config": {"tags": [cadence], **rendered["config"]}}}
+
+
+def is_unsampled_render(test: Any, name: str) -> bool:
+    """Whether a parsed test entry is exactly the test Dex renders as ``name``,
+    with or without a claim id: the shape Dex may move, remove or claim."""
+
+    return without_claim(test) == _unsampled(name)
 
 
 def prevailing_test_key(content: str) -> str:

@@ -64,7 +64,8 @@ class ConfigProblem:
     """One thing wrong with the file, located by setting and line.
 
     ``kind`` is ``syntax``, ``invalid``, ``unknown_key``, ``caller_only_key``,
-    ``duplicate_key``, ``secret_like_key`` or ``project_not_found``.
+    ``duplicate_key``, ``secret_like_key``, ``project_not_found`` or
+    ``unknown_test_kind``.
     ``(kind, key, message)`` identifies a problem across edits, because an edit
     shifts every line below it.
     """
@@ -676,6 +677,7 @@ class ConfigDocument:
         self._unknown_keys(self._mapping(), DexConfig, "", found)
         self._credential_keys(self._mapping(), "", found)
         self._project_pin(self._mapping(), found)
+        self._render_test_kinds(self._mapping(), found)
         try:
             DexConfig.model_validate(self._mapping())
         except ValidationError as exc:
@@ -765,6 +767,33 @@ class ConfigDocument:
                     line=self._line_of("dbt_project_dir"),
                 )
             )
+
+    def _render_test_kinds(
+        self, mapping: dict[str, Any], found: list[ConfigProblem]
+    ) -> None:
+        # Not fatal, like an unknown key: a list written for a later release,
+        # which renders a kind this one does not, still loads here and turns
+        # nothing on for that name (#1449).
+        from .generated_tests import CADENCES, SETTING, kinds, unknown_entries
+
+        section = mapping.get("declarations")
+        setting = section.get("render_tests") if isinstance(section, dict) else None
+        unknown = unknown_entries(setting)
+        if not unknown:
+            return
+        known = [kind.name for kind in kinds()]
+        names = ", ".join(known) if known else "none yet"
+        found.extend(
+            ConfigProblem(
+                "unknown_test_kind",
+                SETTING,
+                f"names '{entry}', which this release renders no generated test "
+                f"for, so it turns nothing on (generated tests: {names}; "
+                f"cadences: {', '.join(CADENCES)})",
+                line=self._line_of(SETTING),
+            )
+            for entry in unknown
+        )
 
     def _invalid(self, error: Any) -> ConfigProblem:
         key = _dotted(error["loc"])

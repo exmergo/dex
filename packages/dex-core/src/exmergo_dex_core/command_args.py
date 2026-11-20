@@ -251,6 +251,7 @@ def billed_handshake(
     notes: list[str] | None = None,
     axes: list[str] | None = None,
     upper_bounds: dict[str, str] | None = None,
+    unpriced: dict[str, Any] | None = None,
 ) -> None:
     """The cost-before-spend handshake on billed connectors.
 
@@ -270,6 +271,11 @@ def billed_handshake(
     over-ceiling refusal carry them, because the refusal is the message an
     operator acts on, and without them a build refused on an estimate it would
     never bill reads as a genuinely expensive one.
+
+    ``unpriced`` is work the command runs that ``estimate`` leaves out
+    (#1309), its codes under ``work``. Every refusal here carries the codes in
+    ``cost.unpriced``, since a budget sized on a floor is too small, and the
+    cost ask carries the whole record as ``data.unpriced``.
     """
 
     gate = cost_gate(adapter)
@@ -285,6 +291,7 @@ def billed_handshake(
     try:
         gate.preflight_command(estimate)
     except SessionCeilingDecisionRequiredError as exc:
+        _mark_unpriced(exc, unpriced)
         # Before the plain confirmation clause below, which would otherwise
         # catch this subclass and answer it with the cost ask's payload: the two
         # asks are re-issued with different flags, so they cannot share a hint.
@@ -303,9 +310,11 @@ def billed_handshake(
         # the two apart is to reconstruct the split from the spend ledger
         # afterwards (issue #299). Re-raised rather than mutated so the
         # exception stays a plain immutable refusal, carrying the same cost.
+        _mark_unpriced(exc, unpriced)
         explained = [
             *([reserve["note"]] if reserve is not None else []),
             *upper_bound_notes(upper_bounds, per_table),
+            *_unpriced_notes(unpriced),
         ]
         if not explained:
             raise
@@ -318,6 +327,10 @@ def billed_handshake(
         # estimate-quality caveat) describes its own estimate; the bytes shape
         # is the default the bytes-scanned connectors settled on.
         data = _estimate_payload(command, adapter, estimate, per_table)
+        if _mark_unpriced(exc, unpriced):
+            # Keyed, so a host sizing a budget learns the estimate is a floor
+            # without parsing the notes that name the work.
+            data["unpriced"] = unpriced
         if gate.session_ceiling_pending(estimate):
             # The cost ask comes first, and a caller who reads it can answer
             # both in one re-run instead of confirming the cost and meeting the
@@ -370,6 +383,28 @@ def billed_handshake(
         raise
     if uptime is not None:
         uptime.admit()
+
+
+def _unpriced_notes(unpriced: dict[str, Any] | None) -> list[str]:
+    """The refusal's sentence for work the estimate leaves out (#1309)."""
+
+    if not unpriced or not unpriced.get("work"):
+        return []
+    return [
+        "the estimate is a floor: it leaves out "
+        + ", ".join(unpriced["work"])
+        + ", work no compiled node shows, so the build would cost more"
+    ]
+
+
+def _mark_unpriced(exc: Exception, unpriced: dict[str, Any] | None) -> bool:
+    """Name on a refusal's cost the work its estimate leaves out (#1309)."""
+
+    cost = getattr(exc, "cost", None)
+    if not unpriced or not unpriced.get("work") or cost is None:
+        return False
+    cost.unpriced = list(unpriced["work"])
+    return True
 
 
 def confirmation_request(

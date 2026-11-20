@@ -477,8 +477,9 @@ each with its `evidence`). It is authored beside the edits in the plan payload:
 not (`transform rename`, `transform remove`) refuses a payload carrying it rather
 than dropping it. dex renders each declaration into the model's existing YAML entry
 with the splice primitives above, writing dbt's own constructs where they exist
-(`description`, `unique`/`not_null`/`relationships` tests) and `config.meta.dex` for
-the rest, and creates an entry beside the model's SQL only when there is none.
+(`description`, `unique`/`not_null`/`relationships` tests, each naming the claim it
+checks at `config.meta.dex.claim`) and `config.meta.dex` for the rest, and creates an
+entry beside the model's SQL only when there is none.
 The same splice writes the PII stamps of a model the plan creates
 (`config.meta.contains_pii` and `pii_category`, with or without a declaration),
 reported under `data.pii_metadata`; the rule is in

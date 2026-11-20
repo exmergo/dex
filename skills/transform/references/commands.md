@@ -141,6 +141,21 @@ See the cost-controls reference for the shared budget mechanism.
   rewritten model, the unedited models below it in the `ref()` graph (`count`
   and up to 10 `models`): what the plan can move without editing, which a
   `--verify --for-plan` build measures under `data.completion.impact`.
+  `removed_tests` (#1420) lists each test the plan removes, on any plan that
+  removes one, whether or not it rewrites a model: a `unit_test` (by `name`,
+  with the `model` it targeted), a `singular_test` (a SQL file under the test
+  paths, deleted, with the `models` it `ref()`s) or a `data_test` (a generic
+  test by the name its YAML gives it, on a `model`, with its `version` under
+  `versions:`, a `snapshot`, a `seed` or a `source` table as
+  `source.table`, and its `column` where it has one), each with the `path` it
+  was read from, plus a warning naming them. Editing a unit test or a
+  singular test file is not a removal, nor is a test moved to another file,
+  nor a data test carried to a model the plan renames, which it reads only
+  from the plan's own edits: they delete a model file named for the old model
+  and create one named for the new, and the same test and column appear on
+  the new name. Anything else is listed, including a renamed versioned model
+  (its files are named for its versions) and any source, snapshot or seed. A YAML file that does
+  not parse is left out. Keep the test, or say the request asks to drop it.
   Advisory: nothing here refuses a plan.
 - `data.identifier_conversions` (#861): each conversion the plan adds to an
   identifier column, on a new model or an edited one. A conversion is a `cast`, a
@@ -237,6 +252,14 @@ See the cost-controls reference for the shared budget mechanism.
   passes one through, and the project holds a parent to resolve against. It names
   its precedent and its parent, judges only models the plan authors, and is the
   one check a project can decline (`conventions.resolved_keys: false`).
+- `data.generated_tests`: every generated test the plan's declarations give (a
+  test beyond the built-in `unique`, `not_null` and `relationships`), with its
+  cadence tag (`dex_every_run` or `dex_scheduled`), its claim and whether it
+  rendered. They render only where `declarations.render_tests` turns them on,
+  off by default. They come from the declaration as the entry states it after
+  the plan, so a model declared before the switch was on gets them from
+  `transform declare` without restating a fact. Absent when the declarations
+  give none. Details: `declarations.md`.
 - `data.semantic_proposal`: for a declared model under `transform.marts_paths`
   (default `[models/marts]`), the semantic definition its declaration states in
   the configured layer (`vendor`). MetricFlow: added to the plan
@@ -559,6 +582,16 @@ Runs `dbt build` against a dev target, with a cost preflight first.
   before they choose a budget. Inside committed `budget.ceiling` and
   `budget.session_ceiling`, a build is confirmed with `--confirm` alone and needs
   no number from anyone.
+- `cost.unpriced` says the estimate is a floor (#1309): where the Elementary
+  package runs its hooks (`elementary_hooks`), its monitoring tests
+  (`elementary_monitoring_tests`, each with the `days_back` window it reads) or
+  its test materialization's failed-row count and sample query
+  (`elementary_test_extras`), none of which a compiled node shows. `data.unpriced`
+  holds the record and a warning per kind names the work. Tell the user the
+  estimate is a floor before they choose a budget: `budget.ceiling` admits the
+  build against the estimate, and the profile's per-statement cap bounds each
+  query, but nothing bounds the run's total, so the unpriced work can bill
+  beyond the ceiling.
 - A refusal over the ceiling carries a calibration line from `.dex/spend.jsonl`.
   Builds over-estimate most on a partitioned or clustered warehouse.
 - dbt runs with its working directory pinned to the project dir, so relative
