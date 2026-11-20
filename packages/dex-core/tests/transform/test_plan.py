@@ -731,6 +731,8 @@ def test_a_declaration_that_changes_nothing_stores_no_plan(
     rc, envelope = _plan_declared(tmp_path, capsys, [])
     assert rc == 0, envelope
     assert envelope["data"]["plan_id"] is None
+    assert envelope["data"]["plan_path"] is None
+    assert "declarations" not in envelope["data"]
     assert envelope["diffs"] == []
     assert {p.name for p in (tmp_path / ".dex" / "plans").glob("*.json")} == stored
 

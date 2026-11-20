@@ -1317,8 +1317,8 @@ default, or a filter or operator after it is refused. A key naming a location
   skipped: ..."). A payload builder can resend a whole feature without its
   unchanged files raising obligations. A declaration whose rendered YAML is
   already the file is skipped the same way. A payload whose every edit matches
-  the tree, declarations included, stores no plan: `data.plan_id` is null and a
-  note says so, as on `transform declare`. Identical is apply's own
+  the tree, declarations included, stores no plan: `data.plan_id` and
+  `data.plan_path` are null and a note says so, as on `transform declare`. Identical is apply's own
   no-op test (the file read as text), so a CRLF checkout resending LF content is
   skipped too. A delete is never skipped, and neither is a model file the
   payload's `declarations` name: resending a model's SQL beside its declaration

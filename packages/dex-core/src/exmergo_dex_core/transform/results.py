@@ -129,7 +129,7 @@ class PlanResult(Result):
             "intent": self.intent,
             "edit_count": len(self.paths),
             "paths": self.paths,
-            "plan_path": self.plan_path,
+            "plan_path": self.plan_path or None,
         }
         if self.toggle is not None:
             payload["toggle"] = self.toggle
