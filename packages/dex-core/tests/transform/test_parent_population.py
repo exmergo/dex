@@ -146,6 +146,8 @@ def test_a_version_label_is_a_versioned_ref():
     assert ref_call("dim_customers.v1.5") == "ref('dim_customers', v=1.5)"
     # A version that is not a number is a string, not a Jinja variable.
     assert ref_call("dim_customers.vbeta") == "ref('dim_customers', v='beta')"
+    assert ref_call("dim_customers.v01") == "ref('dim_customers', v='01')"
+    assert ref_call("dim_customers.v0.5") == "ref('dim_customers', v=0.5)"
 
 
 def test_the_filters_ride_on_the_missing_direction_only():

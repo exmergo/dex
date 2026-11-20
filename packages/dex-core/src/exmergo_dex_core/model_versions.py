@@ -311,7 +311,13 @@ def ref_call(name: str) -> str:
         # dbt takes a number or any string as a version: a number is written
         # bare, anything else as a quoted string, which Jinja would otherwise
         # read as a variable (`v=beta`).
-        numeric = version.isascii() and version.replace(".", "", 1).isdigit()
+        # A leading zero (`01`) is no Jinja number either: quoted, it keeps
+        # the label as declared.
+        numeric = (
+            version.isascii()
+            and version.replace(".", "", 1).isdigit()
+            and not (len(version) > 1 and version[0] == "0" and version[1] != ".")
+        )
         literal = (
             version
             if numeric
