@@ -1357,8 +1357,16 @@ default, or a filter or operator after it is refused. A key naming a location
   `dex_unique_combination` for a declared grain of two or more columns (#1452),
   on every connector: its `failures` count equals `grain_broken`'s
   `duplicate_count`, a NULL grain value counts as a value, and the test returns
-  that count and never a key. The plan writes its generic test macro as a
-  `macro_sql` diff where the project defines none; a `macro_sql` file may hold
+  that count and never a key. It renders `dex_population_filter` (#1453) under
+  the column of each `population.filters` list, one test per `includes` or
+  `excludes` list, on every connector: its `failures` count equals
+  `population_contradicted`'s `contradicting_rows`, a NULL breaks an `includes`
+  list and never an `excludes` one, values compare as text where any value or
+  the column is text, and the test returns that count and never a value. A
+  filter on a column the model's SQL provably does not output renders nothing,
+  `not_rendered` with `reason: column_not_output`. `maintain verify` judges a
+  filter stating both lists as two rules, one per list. The plan writes each
+  kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an

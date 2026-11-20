@@ -165,8 +165,9 @@ test keeps failing, and the last run in which a claim was checked and passed.
 The three tests above are the **built-ins**. They always render. A **generated
 test** is one Dex writes for a declared fact the built-ins cannot check: a
 composite grain, a population filter, a parent's population. Each kind arrives
-with its own issue (#1452 onward); this release renders one,
-[`dex_unique_combination`](#dex_unique_combination-a-composite-grain). The switch
+with its own issue (#1452 onward); this release renders two,
+[`dex_unique_combination`](#dex_unique_combination-a-composite-grain) and
+[`dex_population_filter`](#dex_population_filter-a-population-filter). The switch
 and the tag below are what every kind follows. Generated tests run in the
 project's production runs. Dex does not run those and the project pays for them,
 so two rules hold:
@@ -241,8 +242,10 @@ generated test the plan's declarations give, rendered or not:
 
 `status` is `added` (rendered by this plan), `already_listed` (already in the
 YAML, so nothing changed), `not_rendered` (with `reason`: `render_tests_off`,
-`kind_not_enabled` where a list leaves its kind out, or `dialect_unsupported`
-where the kind is on but not proved on the configured connector), or
+`kind_not_enabled` where a list leaves its kind out, `dialect_unsupported`
+where the kind is on but not proved on the configured connector, or
+`column_not_output` for a column test whose column the model's SQL provably
+does not output), or
 `listed_while_off` (in the YAML although the setting leaves its kind off; it
 stays). The key is absent when the declarations give no generated test.
 
@@ -274,6 +277,58 @@ renders it adds `macros/dex_unique_combination.sql` (the
 neither the project nor the plan defines `{% test dex_unique_combination(`. A
 copy the project already has is left alone; `transform macro
 dex_unique_combination` diffs it against the shipped one.
+
+#### `dex_population_filter`: a population filter
+
+Each list a `population.filters` entry declares renders `dex_population_filter`
+under that filter's column, tagged `dex_every_run`, on every connector:
+
+```yaml
+columns:
+  - name: status
+    data_tests:
+      - dex_population_filter:
+          arguments:
+            excludes: [cancelled]
+          config:
+            tags: [dex_every_run]
+            meta:
+              disable_test_samples: true
+              dex:
+                claim: 6f0c2d1e9a4b7c35
+```
+
+One test per list: a filter stating both `includes` and `excludes` renders two,
+each its own claim, and so does a second filter. The values go into the claim
+as written, so `Paid` and `paid` are two claims. It fails when a row breaks the
+filter, and it agrees with `maintain verify`'s `population_contradicted`:
+
+- **`excludes`**: a row whose column holds an excluded value breaks it. A NULL
+  holds no value, so it never breaks an `excludes` list.
+- **`includes`**: a row whose column holds a value outside the list breaks it,
+  and a NULL counts as outside. The finding states those NULLs apart, as
+  `null_rows`, inside `contradicting_rows`.
+- **The same count.** dbt's `failures` is the number of rows that break the
+  filter, the finding's `contradicting_rows`.
+- **The same comparison.** Where any listed value is text, or the column is a
+  text column, both sides compare as text: the column cast to the warehouse's
+  string type and booleans written `true` and `false`. Otherwise the values are
+  compared as written. Only where every value is a number or a boolean does the
+  test read the column's type, from the relation's metadata; where that finds
+  nothing (an ephemeral model, a `transform test --mutate` mutant), it compares
+  as written.
+- **Counts only.** The test returns the count, never a value from the column.
+
+A filter on a column the model's SQL provably does not output (a rollup that
+groups the column away, whose filter `maintain verify` reports unchecked)
+renders no test and no column entry, and the plan lists it `not_rendered` with
+`reason: column_not_output`. Where Dex cannot tell (a `select *`, Jinja in the
+select list, a set operation), it renders the test.
+
+Its macro reaches the project as `dex_unique_combination`'s does:
+`macros/dex_population_filter.sql` (the
+[shipped macro](macros.md#dex_population_filter)) as a `macro_sql` diff where
+neither the project nor the plan defines the test.
 
 ### A versioned model
 
@@ -674,6 +729,9 @@ warehouse):
 | `history`, a measure disagreeing with the declared policy | `temporal_transition_count_mismatch`, `temporal_latest_transition_mismatch`, `temporal_first_attainment_mismatch`; entity counts, never values | high |
 | `history`, entities differing from its `population` | `temporal_population_missing`, `temporal_population_unexpected` | high |
 | `history.time.provenance` its column and the snapshot's strategy cannot satisfy | `temporal_provenance_contradicted` | medium |
+
+A `population.filters` entry stating both `includes` and `excludes` is judged as
+two rules, one per list, each with its own `population_contradicted`.
 
 `null_rule: never` needs no check of its own: it renders as a `not_null` test,
 which the build runs. A single-column `grain` renders as a `unique` test, so the

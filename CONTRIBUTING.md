@@ -120,8 +120,8 @@ uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core expl
 
 ## The generated-test parity harness
 
-A test Dex generates from a declaration (`dex_unique_combination`, and the kinds
-after it) has two implementations of one fact: its SQL macro, which runs in the
+A test Dex generates from a declaration (`dex_unique_combination`,
+`dex_population_filter`, and the kinds after it) has two implementations of one fact: its SQL macro, which runs in the
 customer's `dbt build`, and the check `maintain verify` runs. The parity harness,
 `packages/dex-core/tests/transform/generated_parity.py`, holds them to one answer.
 Each row names a generated test, the `maintain verify` finding codes it must
@@ -133,8 +133,11 @@ including a dbt failure count that differs from the count the finding states.
 It runs on DuckDB in the offline suite (`tests/transform/test_generated_parity.py`)
 and on every warehouse in `integration.yml` through each connector's
 `test_generated_tests_agree_with_maintain_verify_live`. A new generated test
-adds a `ParityRow` to `ROWS`; its fixtures are literal SELECTs, written once for
-every dialect, with the connector's typed integer NULL passed in. A kind that
+adds a `ParityRow` to `ROWS` (several, each with its own `name`, where one test
+has several cases to hold, as `dex_population_filter` does for `includes`,
+`excludes`, a NULL and a typed comparison); its fixtures are literal SELECTs,
+written once for every dialect, with the connector's typed integer NULL passed
+in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 

@@ -15,7 +15,14 @@ import json
 from pathlib import Path
 
 import pytest
-from transform.generated_parity import ROWS, UNIQUE_COMBINATION, run_parity
+from transform.generated_parity import (
+    POPULATION_EXCLUDES,
+    POPULATION_INCLUDES,
+    POPULATION_INCLUDES_NULL,
+    ROWS,
+    UNIQUE_COMBINATION,
+    run_parity,
+)
 
 from exmergo_dex_core import generated_tests as gt
 from exmergo_dex_core.cli import main
@@ -44,17 +51,25 @@ def _runner(capsys):
     return run
 
 
-def _planted(adapter: str, sql: str) -> dict:
+def _planted(
+    adapter: str,
+    sql: str,
+    test: str = "dex_unique_combination",
+    signature: str = "model, columns",
+) -> dict:
     """A per-dialect implementation of the test, as a project would override it."""
 
     return {
-        "path": f"macros/{adapter}__dex_unique_combination.sql",
+        "path": f"macros/{adapter}__{test}.sql",
         "kind": "macro_sql",
         "content": (
-            f"{{% macro {adapter}__dex_unique_combination(model, columns) %}}\n"
-            f"{sql}\n{{% endmacro %}}\n"
+            f"{{% macro {adapter}__{test}({signature}) %}}\n{sql}\n{{% endmacro %}}\n"
         ),
     }
+
+
+#: Only the composite-grain row, for the checks that plant its macro.
+GRAIN_ONLY = (UNIQUE_COMBINATION,)
 
 
 #: Passes on any model: no row, whatever the grain holds.
@@ -69,7 +84,7 @@ def test_every_row_agrees_with_maintain_verify_on_duckdb(
     report = run_parity(_runner(capsys), repo, dbt_project_dir, connector="duckdb")
 
     assert report.disagreements == [], report.disagreements
-    assert report.agreed == [row.test for row in ROWS]
+    assert report.agreed == [row.label for row in ROWS]
     assert report.unsupported == []
 
 
@@ -94,6 +109,7 @@ def test_a_macro_that_passes_a_duplicated_key_fails_the_harness(
         repo,
         dbt_project_dir,
         connector="duckdb",
+        rows=GRAIN_ONLY,
         extra_edits=[_planted("duckdb", PASSES_ANYWAY)],
     )
 
@@ -113,6 +129,7 @@ def test_a_broken_macro_for_another_dialect_leaves_duckdb_agreeing(
         repo,
         dbt_project_dir,
         connector="duckdb",
+        rows=GRAIN_ONLY,
         extra_edits=[_planted("bigquery", BROKEN), _planted("snowflake", BROKEN)],
     )
 
@@ -135,7 +152,9 @@ def test_a_dialect_the_test_does_not_support_renders_nothing_and_says_so(
     gt.unregister(shipped.name)
     gt.register(narrowed)
     try:
-        report = run_parity(_runner(capsys), repo, dbt_project_dir, connector="duckdb")
+        report = run_parity(
+            _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=GRAIN_ONLY
+        )
     finally:
         gt.unregister(shipped.name)
         gt.register(shipped)
@@ -166,6 +185,7 @@ def test_a_macro_that_counts_groups_not_rows_fails_on_the_count(
         repo,
         dbt_project_dir,
         connector="duckdb",
+        rows=GRAIN_ONLY,
         extra_edits=[_planted("duckdb", COUNTS_GROUPS)],
     )
 
@@ -173,4 +193,63 @@ def test_a_macro_that_counts_groups_not_rows_fails_on_the_count(
     assert report.disagreements == [
         f"dex_unique_combination on {violating}: dbt counts 2 failure(s), "
         "maintain verify counts 3"
+    ]
+
+
+# --- dex_population_filter (#1453) -------------------------------------------------
+
+POPULATION_SIGNATURE = "model, column_name, includes, excludes"
+
+#: Treats a NULL as inside an ``includes`` list, which maintain verify does not.
+NULL_IS_INSIDE = (
+    "select count(*) as dex_violating_rows from {{ model }}\n"
+    "where {{ column_name }} not in ("
+    "{% for v in (excludes or includes) %}'{{ v }}'{% if not loop.last %}, "
+    "{% endif %}{% endfor %})\n"
+    "having count(*) > 0"
+)
+
+
+def test_the_plan_writes_the_population_filter_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(POPULATION_EXCLUDES,),
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert (
+        "macros/dex_population_filter.sql" in report.envelopes["plan"]["data"]["paths"]
+    )
+    written = (dbt_project_dir / "macros" / "dex_population_filter.sql").read_text()
+    # Counts only: the test selects the violating count, never the column.
+    assert "select dex_violating_rows" in written
+
+
+def test_a_macro_that_lets_a_null_into_an_includes_list_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # Agrees on a value outside the list; disagrees on the NULL alone.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(POPULATION_INCLUDES, POPULATION_INCLUDES_NULL),
+        extra_edits=[
+            _planted(
+                "duckdb", NULL_IS_INSIDE, gt.POPULATION_FILTER, POPULATION_SIGNATURE
+            )
+        ],
+    )
+
+    violating = POPULATION_INCLUDES_NULL.model("violating")
+    assert report.agreed == [POPULATION_INCLUDES.label]
+    assert report.disagreements == [
+        f"{POPULATION_INCLUDES_NULL.label} on {violating}: the test should fail on "
+        "the violating fixture, dbt says 'pass'"
     ]

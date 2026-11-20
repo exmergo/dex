@@ -153,6 +153,10 @@ def supports(kind: GeneratedTestKind, dialect: str | None) -> bool:
 
 #: The reason a kind turned on renders nothing on the configured connector.
 DIALECT_UNSUPPORTED = "dialect_unsupported"
+#: The reason a column-level test renders nothing: the model's SQL provably
+#: does not output the column (a filter on a column it aggregates away), so the
+#: test could only error, and its column entry would be a ``column_missing``.
+COLUMN_NOT_OUTPUT = "column_not_output"
 
 
 def off_reason(setting: bool | list[str]) -> str:
@@ -227,6 +231,46 @@ register(
         EVERY_RUN,
         _composite_grain,
         macro=UNIQUE_COMBINATION,
+        dialects=ALL_CONNECTORS,
+    )
+)
+
+POPULATION_FILTER = "dex_population_filter"
+
+
+def _population_filters(declaration: Any) -> list[Instance]:
+    """One test per declared ``population.filters`` list (#1453), under the
+    filter's column. A filter stating both ``includes`` and ``excludes`` is two
+    claims, checked apart, as ``maintain verify`` reads it. A list's values are
+    the declaration's own committed text, so they go into the claim as written:
+    ``'Paid'`` and ``'paid'`` are two different facts."""
+
+    population = getattr(declaration, "population", None)
+    out: list[Instance] = []
+    for entry in getattr(population, "filters", None) or []:
+        column = str(entry.column)
+        for mode in ("includes", "excludes"):
+            values = list(getattr(entry, mode, None) or [])
+            if not values:
+                continue
+            out.append(
+                Instance(
+                    column=column,
+                    field="population",
+                    columns=(column,),
+                    params={"check": POPULATION_FILTER, mode: values},
+                    arguments={mode: values},
+                )
+            )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        POPULATION_FILTER,
+        EVERY_RUN,
+        _population_filters,
+        macro=POPULATION_FILTER,
         dialects=ALL_CONNECTORS,
     )
 )
