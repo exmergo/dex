@@ -398,7 +398,7 @@ the rows:
 6. **The rows**, named by the caller's tokens in the column order Cube's own SQL
    uses. Cube returns every number as text; Dex decodes the ones its
    annotation types `number`. A time bucket is spelled as under `--local` (see
-   "Time buckets" below). Capped like every other semantic result.
+   "Time buckets" above). Capped like every other semantic result.
 
 A warehouse error Cube relays from `/v1/load` can quote a value, so it is
 masked before it reaches an envelope, as on `explore query`.

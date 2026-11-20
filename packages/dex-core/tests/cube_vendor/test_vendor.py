@@ -647,6 +647,22 @@ def test_a_time_bucket_reads_the_same_under_api_and_local(
     assert buckets and all(b.endswith("+00:00") for b in buckets)
 
 
+def test_a_values_bucket_reads_the_same_under_api_and_local(
+    shop, monkeypatch, capsys
+):
+    _server(monkeypatch, shop)
+    dimension, _ = VALUES["values_month"]
+    argv = ["explore", "semantic", "values", dimension]
+    local = _run(capsys, shop, *argv, "--local")
+    api = _run(capsys, shop, *argv, "--api")
+
+    assert local["status"] == api["status"] == "ok", (local["errors"], api["errors"])
+    assert local["data"]["types"][0] == api["data"]["types"][0] == "timestamp"
+    buckets = [row[0] for row in local["data"]["cells"]]
+    assert buckets == [row[0] for row in api["data"]["cells"]]
+    assert buckets and all(b.endswith("+00:00") for b in buckets)
+
+
 @pytest.mark.parametrize(
     ("kind", "spell"),
     [
