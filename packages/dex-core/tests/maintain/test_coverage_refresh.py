@@ -81,7 +81,8 @@ def test_a_selector_keeps_the_order_it_was_written_in():
     [
         ({"language": "python"}, "python_model"),
         ({"config": {"sql_header": "set x = 1"}}, "sql_header"),
-        ({"version": 2}, "versioned_model"),
+        # A version is a model of its own, run by its label (#1374).
+        ({"version": 2}, None),
         ({"language": "sql", "config": {}}, None),
     ],
 )

@@ -844,8 +844,9 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      narrows, never widens; the rest named under refresh.elided),
                                      priced and confirmed once for the batch on a metered connector,
                                      a budget that runs out leaving the rest under refresh.not_run
-                                     (reason_code budget); Python, sql_header and versioned models
-                                     are refresh.skipped for free; a model with no SQL to plant a
+                                     (reason_code budget); Python and sql_header models are
+                                     refresh.skipped for free, and each version of a versioned
+                                     model is refreshed by its label; a model with no SQL to plant a
                                      defect in is recorded and reads untestable (reason
                                      no_mutable_sql) until it changes. Dev target only; refused in
                                      values-free mode. Report only: status ok whatever the coverage.
@@ -1107,6 +1108,16 @@ counted toward the cap: its boundary is untested by the run. `UNBOUNDED` and
 such a bound is refused, naming it. Each finding is written as the defect rather than as a diff,
 and carries `suggested_test`, because the reader's next action is to write a
 test.
+
+**A versioned model.** Each version is its own model, with its own SQL, tests and
+record, so a run measures one. `<model>.v<N>`, the label `transform declare`
+takes, names that version (#1374). The bare name measures the version an
+unversioned `ref('<model>')` resolves to (its `latest_version`, else the greatest
+version), with a warning, and `data.model` is always the label of the version
+measured. A version the model does not list, a label on a model with no versions,
+and a version's file stem (`<model>_v<N>`) are refused for free, the last naming
+the label. `--downstream` routes each mutant to the models that `ref()` the version
+measured, never to readers of another version.
 
 **Where a mutant lives.** In a throwaway copy of the project, and nowhere else.
 Each one is written with `materialized='ephemeral'`, so dbt inlines it into each

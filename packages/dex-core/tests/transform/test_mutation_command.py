@@ -1123,6 +1123,56 @@ def test_each_mutant_is_priced_as_its_own_statement():
     assert estimate == sum(per_table.values())
 
 
+@pytest.mark.parametrize("alias", ["fct_v2", "fct_final"])
+def test_a_mutant_is_spliced_into_the_cte_dbt_names_after_the_alias(alias):
+    """dbt names a model's CTE in a test after its alias: `<name>_v<N>` for a
+    version, or whatever the config sets. Looking the CTE up by the model's name
+    found nothing, so every mutant was priced at the baseline."""
+
+    from exmergo_dex_core.transform.commands import _price_mutations
+
+    class _Aliased(_PricingCopy):
+        def manifest(self):
+            manifest = super().manifest()
+            for test in manifest["nodes"].values():
+                test["compiled_code"] = test["compiled_code"].replace(
+                    "__dbt__cte__fct", f"__dbt__cte__{alias}"
+                )
+            return manifest
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1 and b > 2", dialect="duckdb")
+    )
+    _estimate, per_table, _prices, _notes = _price_mutations(
+        _TextPricedAdapter(),
+        _Aliased(None),
+        "models/fct.sql",
+        batch,
+        {"name": "fct", "alias": alias},
+        mutation,
+    )
+    dropped = next(m for m in batch.mutants if m.operator == "predicate_drop")
+    assert per_table[f"{dropped.id} predicate_drop"] != per_table["(baseline)"]
+
+
+def test_an_ephemeral_parent_is_matched_by_the_cte_dbt_names_after_its_alias():
+    from exmergo_dex_core.transform.commands import _parent_relations
+
+    manifest = {
+        "nodes": {
+            "model.p.stg.v2": {
+                "name": "stg",
+                "alias": "stg_v2",
+                "version": 2,
+                "config": {"materialized": "ephemeral"},
+            }
+        }
+    }
+    node = {"depends_on": {"nodes": ["model.p.stg.v2"]}}
+    [parent] = _parent_relations(manifest, node, mutation)
+    assert parent.rendered == "__dbt__cte__stg_v2"
+
+
 def test_the_comparisons_are_priced_into_the_same_batch_as_if_all_survive():
     from exmergo_dex_core.transform.commands import _EquivalenceCheck
 

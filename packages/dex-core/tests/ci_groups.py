@@ -53,6 +53,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "mutation-equivalence": (f"{_T}test_mutation_equivalence.py",),  # 168s
     "mutation-downstream": (f"{_T}test_mutation_downstream.py",),  # 192s
     "mutation-incremental": (f"{_T}test_mutation_incremental.py",),  # 103s
+    "mutation-versions": (f"{_T}test_mutation_versions.py",),
     "transform-build": (  # 148s
         f"{_T}test_build",
         f"{_T}test_previous_build",
