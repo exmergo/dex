@@ -202,6 +202,7 @@ def propose(
     *,
     draft: Callable[[str], tuple[dict[str, Any] | None, list[str]]],
     cap: int,
+    render_tests: bool | list[str] = False,
 ) -> Outcome:
     """Each model's proposal, or the reason it has none, up to ``cap`` proposals.
 
@@ -263,7 +264,9 @@ def propose(
                 declarations_mod._check(
                     declaration, rendered, view, cache=None, pii_overrides=None
                 )
-            text = declarations_mod.render(rendered.get(path), declaration)
+            text = declarations_mod.render(
+                rendered.get(path), declaration, render_tests=render_tests
+            )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
                 raise

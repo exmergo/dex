@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, ClassVar, Literal
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from .errors import ConfigurationError
 from .session_cap import SessionCeilingCap, ceiling_in_force, ceiling_source
@@ -574,6 +574,48 @@ class ConventionWarnings(BaseModel):
     """
 
     resolved_keys: bool = True
+
+
+class DeclarationsConfig(BaseModel):
+    """What a declaration renders into a model's YAML beyond the facts it states.
+
+    ``render_tests``: whether a declaration also renders Dex's generated tests
+    (#1449), the ones that check a declared fact dbt's ``unique``, ``not_null``
+    and ``relationships`` cannot (a composite grain, a population filter, ...).
+    Those three built-ins always render and are not governed here. Off by
+    default, because a generated test runs in the project's production runs,
+    which dex does not run and whose cost the project pays; each turns on by
+    default only once its false-positive rate has been measured on real
+    projects. ``true`` turns on every kind this release renders, a later
+    release's new kinds included. A list turns on the kinds it names, by test
+    name (``dex_unique_combination``) or by cadence tag (``dex_every_run``,
+    ``dex_scheduled``), so a project can start with the cheap ones or pin the
+    kinds it reviewed. A name this release does not render is reported by
+    ``config validate`` and turns nothing on. Turning the switch off renders no
+    new generated test and removes none already in the YAML.
+    """
+
+    render_tests: bool | list[str] = False
+
+    @field_validator("render_tests", mode="before")
+    @classmethod
+    def _check_render_tests(cls, value: Any) -> Any:
+        if isinstance(value, bool):
+            return value
+        if not isinstance(value, list) or not all(isinstance(e, str) for e in value):
+            raise ValueError(
+                "is true, false, or a list naming generated tests and cadences "
+                "(dex_every_run, dex_scheduled)"
+            )
+        if any(not entry.strip() for entry in value):
+            raise ValueError(
+                "lists an empty name; each entry names a generated test or a "
+                "cadence (dex_every_run, dex_scheduled)"
+            )
+        repeated = sorted({entry for entry in value if value.count(entry) > 1})
+        if repeated:
+            raise ValueError(f"lists {', '.join(repeated)} more than once")
+        return value
 
 
 class TransformConfig(BaseModel):
@@ -1561,6 +1603,9 @@ class DexConfig(BaseModel):
     # Where the project's marts live, which is where `transform plan` derives a
     # semantic model from a declaration (issue #499).
     transform: TransformConfig = Field(default_factory=TransformConfig)
+    # Whether a declaration renders Dex's generated tests beside the built-ins
+    # (issue #1449). Off by default: they run in the project's production runs.
+    declarations: DeclarationsConfig = Field(default_factory=DeclarationsConfig)
     query: QueryLimits = Field(default_factory=QueryLimits)
     # Opt-in tightening for a guarded build in a sandbox. Off by default, so an
     # interactive build behaves exactly as it did before this existed.
