@@ -236,6 +236,21 @@ def derive(
     primary: str | None = None
     if len(grain) == 1:
         primary = _entity_name(grain[0], model)
+        if _grain_column_is_dimension(grain[0], columns, column_types):
+            # The grain column is also a dimension, so the entity and the
+            # dimension would share one name and MetricFlow would read that
+            # element as both ENTITY and DIMENSION (#1416). The entity takes
+            # the model stem in front of the column and still reads the
+            # column through its expr; the dimension keeps the column's
+            # name, which is what agg_time_dimension points at.
+            stem = _LAYER_PREFIX.sub("", model).lower() or model.lower()
+            renamed = re.sub(r"_+", "_", f"{stem}_{grain[0]}".lower()).strip("_")
+            notes.append(
+                f"{grain[0]}: the grain column is also a dimension, so the "
+                f"primary entity is named '{renamed}' instead of '{primary}' "
+                f"and still reads the column through `expr: {grain[0]}`"
+            )
+            primary = renamed
         entities.append(
             _with_meta(
                 {"name": primary, "type": "primary", "expr": grain[0]},
@@ -574,6 +589,25 @@ def _described(
     if isinstance(description, str) and description.strip():
         element["description"] = description
     return element
+
+
+def _grain_column_is_dimension(
+    column: str,
+    columns: Mapping[str, dict[str, Any]],
+    column_types: Mapping[str, tuple[str | None, str | None]],
+) -> bool:
+    """Whether ``column`` is also emitted as a dimension of the derived model.
+
+    A grain column with role ``dimension`` always is; one with role ``time``
+    is unless its type says it is not a date or timestamp, in which case the
+    time loop drops it instead.
+    """
+    role = (columns.get(column) or {}).get("role")
+    if role == "dimension":
+        return True
+    if role == "time":
+        return column_types.get(column, (None, None))[0] != "other"
+    return False
 
 
 def _entity_name(column: str, model: str) -> str:

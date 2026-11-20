@@ -48,6 +48,73 @@ def test_a_single_column_grain_is_the_primary_entity():
     assert found.blocked is None
 
 
+def test_a_time_grain_column_gets_a_distinct_primary_entity_name():
+    """A mart whose single-column grain is a time column derives an entity
+    and a dimension that would otherwise share one name (#1416)."""
+    declared = {
+        "description": "One row per day.",
+        "grain": ["output_day"],
+        "columns": {
+            "output_day": {"role": "time"},
+            "units": {
+                "role": "measure",
+                "aggregation": "sum",
+                "additivity": "additive",
+            },
+        },
+    }
+    found = sd.derive(
+        "fct_world_output_daily",
+        declared,
+        column_types={"output_day": ("date", None)},
+        on_ref={},
+    )
+
+    assert found.blocked is None
+    assert found.body["entities"] == [
+        {
+            "name": "world_output_daily_output_day",
+            "type": "primary",
+            "expr": "output_day",
+        }
+    ]
+    assert found.body["dimensions"] == [
+        {
+            "name": "output_day",
+            "type": "time",
+            "type_params": {"time_granularity": "day"},
+        }
+    ]
+    assert found.body["defaults"] == {"agg_time_dimension": "output_day"}
+    assert any(
+        "primary entity is named 'world_output_daily_output_day'" in note
+        for note in found.notes
+    )
+
+
+def test_a_dimension_grain_column_gets_a_distinct_primary_entity_name():
+    """The same collision holds for a categorical dimension as the grain."""
+    declared = {
+        "description": "One row per region.",
+        "grain": ["region"],
+        "columns": {
+            "region": {"role": "dimension"},
+            "units": {
+                "role": "measure",
+                "aggregation": "sum",
+                "additivity": "additive",
+            },
+        },
+    }
+    found = sd.derive("fct_orders", declared, column_types={}, on_ref={})
+
+    assert found.blocked is None
+    assert found.body["entities"] == [
+        {"name": "orders_region", "type": "primary", "expr": "region"}
+    ]
+    assert found.body["dimensions"] == [{"name": "region", "type": "categorical"}]
+
+
 def test_a_composite_grain_names_the_limitation_and_guesses_no_primary_entity():
     declared = _declared(status={"role": "dimension"})
     declared["grain"] = ["order_id", "line_number"]
@@ -1008,6 +1075,58 @@ def test_a_double_underscore_mart_gets_proposal_passing_metricflow_validation(
     assert "ref('intercom__threads')" in model_data["content"]
     assert "name: intercom_threads" in model_data["content"]
     assert not any("regex" in w.lower() for w in envelope.get("warnings", []))
+
+
+def test_a_daily_mart_whose_grain_is_its_time_column_passes_metricflow_validation(
+    dbt_project_dir: Path, tmp_path: Path, capsys, real_dbt
+):
+    """End-to-end plan with a mart whose single-column grain is its time
+    column proposes a semantic model dbt parses (#1416)."""
+    daily_mart = {
+        "model": "fct_world_output_daily",
+        "description": "One row per day.",
+        "grain": ["output_day"],
+        "columns": {
+            "output_day": {"role": "time"},
+            "units": {
+                "role": "measure",
+                "aggregation": "sum",
+                "additivity": "additive",
+            },
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_world_output_daily.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as output_day, 10.0 as units\n"
+                ),
+            }
+        ],
+        "declarations": [daily_mart],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "daily world output mart",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+    assert rc == 0 and envelope["status"] == "ok", envelope
+    proposal = envelope["data"]["semantic_proposal"]
+    assert "fct_world_output_daily" in proposal["models"]
+    model_data = proposal["models"]["fct_world_output_daily"]
+    assert model_data["status"] == "proposed"
+    assert model_data["validation"]["parse"]["result"] == "passed"
+    assert "name: world_output_daily_output_day" in model_data["content"]
+    assert "expr: output_day" in model_data["content"]
 
 
 def test_two_marts_that_normalize_to_one_name_cannot_both_derive(
