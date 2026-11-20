@@ -1445,7 +1445,7 @@ def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
         None,
     )
     if node is not None and version is not None:
-        node = next(
+        item = next(
             (
                 item
                 for item in node.get("versions") or []
@@ -1453,6 +1453,9 @@ def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
             ),
             None,
         )
+        # The version as dbt builds it: inherited columns (and their tests)
+        # included, its own overrides and exclusions applied.
+        node = mv.effective_entry(node, item) if item is not None else None
     if node is not None and test["column"] is not None:
         node = next(
             (

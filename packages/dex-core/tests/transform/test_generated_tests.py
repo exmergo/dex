@@ -471,6 +471,35 @@ def test_a_fact_declared_earlier_gets_its_generated_test_when_declared_again(kin
     assert [(g["test"], g["status"]) for g in generated] == [(COMBO, "added")]
 
 
+def test_off_a_version_s_inherited_equivalent_reads_listed_while_off(kinds):
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_lines\n"
+        "    latest_version: 1\n"
+        "    columns:\n"
+        "      - name: status\n"
+        "        data_tests:\n"
+        f"          - {FILTER}:\n"
+        "              arguments:\n"
+        "                excludes: [cancelled]\n"
+        "    versions:\n"
+        "      - v: 1\n"
+    )
+    payload = {
+        "model": "fct_lines.v1",
+        "population": {
+            "rule": "x",
+            "filters": [{"column": "status", "excludes": ["cancelled"]}],
+        },
+    }
+    generated: list = []
+
+    _render(content, False, payload, generated=generated)
+
+    assert [g["status"] for g in generated] == ["listed_while_off"]
+
+
 # --- through the plan ---------------------------------------------------------
 
 MACROS = (
