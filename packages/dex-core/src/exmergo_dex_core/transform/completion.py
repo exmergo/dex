@@ -497,6 +497,19 @@ def _names(values: Iterable[str], limit: int = _NAMES) -> NameList:
     )
 
 
+def _package_name(unique_id: str) -> str:
+    """The package a dbt node belongs to, from its unique id.
+
+    A node's unique id is ``<resource>.<package>.<name>`` (``model.elementary.
+    data_monitoring_metrics``), so the second segment is the package; the
+    project's own nodes carry the project's name there. A malformed id has no
+    package.
+    """
+
+    parts = unique_id.split(".")
+    return parts[1] if len(parts) > 1 else ""
+
+
 def _status_kind(status: str) -> str:
     """``built``, ``failed``, ``skipped`` or ``unrecognized`` for one node.
 
@@ -978,6 +991,7 @@ def summarize_completion(
     prerequisites: list[dict[str, Any]] | None = None,
     cold: Mapping[str, Any] | None = None,
     prose_population: Iterable[str] = (),
+    project_name: str | None = None,
     identifier_conversions: Mapping[str, list[Mapping[str, Any]]] | None = None,
     change_scope: Mapping[str, list[Mapping[str, Any]]] | None = None,
     incremental_replay: Mapping[str, Mapping[str, Any]] | None = None,
@@ -1013,12 +1027,33 @@ def summarize_completion(
     nothing to its reason code (:func:`~.elementary.unchecked_tests`, #1308):
     such a pass makes no deliverable ``asserted``, and each that reads a model
     the assurance covers is listed under ``assurance.unchecked_tests``.
+
+    ``project_name`` is the project's own name as dbt records it (the
+    ``name:`` in ``dbt_project.yml``, read off the manifest's
+    ``metadata.project_name``). Where it is given, the project's own models
+    come first in ``assurance``'s name lists (``asserted``, ``build_only`` and
+    the failed checks), then package models, each group keeping the order the
+    build ran them in: on a plain build with a package enabled, the package's
+    models otherwise fill the capped list and the project's own unasserted
+    model is cut off (#1500). The count is unchanged; only the order moves.
+    Without it, the order is the build's own, as before.
     """
 
     from .scope_gate import accepted_key
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
+    if project_name:
+        # A name is the project's own when any built model of that name
+        # carries the project's package: a project override of a package model
+        # keeps the package model's name, and it is the project's to act on.
+        own = {
+            n.name
+            for n in evidence.nodes
+            if n.unique_id.startswith("model.")
+            and _package_name(n.unique_id) == project_name
+        }
+        built_names = sorted(built_names, key=lambda name: 0 if name in own else 1)
     blockers = _blockers(evidence, causes, prerequisites or ())
     asserted, failed_checks, failures, empty = _checked(
         evidence, graph, verification, unchecked_tests
