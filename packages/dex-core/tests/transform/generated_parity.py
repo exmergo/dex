@@ -29,7 +29,10 @@ under ``data.generated_tests``; the harness checks that instead (#1451).
 
 Adding a generated test (#1453 onward) adds a :class:`ParityRow` to
 :data:`ROWS`. ``freshness`` and continuity have no ``maintain verify`` check, so
-they are proved by their own acceptance pairs, not here.
+they are proved by their own acceptance pairs, not here. A dbt test a
+declaration renders unconditionally (``relationships`` from a ``references``,
+#1459) is a ``builtin`` row: no ``render_tests`` switch and no dialect list, the
+rest alike.
 """
 
 from __future__ import annotations
@@ -88,6 +91,10 @@ class ParityRow:
     #: ``not_rendered`` with this reason, no test builds, and ``maintain
     #: verify`` alone answers.
     withheld: str | None = None
+    #: A dbt test a declaration renders on every plan, on every dialect, with
+    #: no ``declarations.render_tests`` switch (#1459: ``relationships`` from a
+    #: ``references``), rather than one of Dex's generated kinds.
+    builtin: bool = False
 
     @property
     def label(self) -> str:
@@ -455,6 +462,90 @@ UNIT_PERCENT = ParityRow(
     withheld=gt.HEURISTIC_ONLY,
 )
 
+
+def _join_measured(verify: Mapping[str, Any], model: str) -> bool:
+    """``maintain verify`` measured ``model``'s join for coverage."""
+
+    return any(
+        record.get("model") == model
+        and record.get("status") in {"satisfied", "contradicted"}
+        for record in verify.get("join_coverage") or []
+    )
+
+
+def _orders(null_int: str, *rows: tuple[str, str | None]) -> str:
+    """A SELECT over ``rows`` as (order_id, customer_id), the first naming the
+    columns; a ``None`` customer is the connector's typed integer NULL."""
+
+    def ident(value: str | None) -> str:
+        return null_int if value is None else value
+
+    (first_id, first), *rest = rows
+    lines = [f"select {first_id} as order_id, {ident(first)} as customer_id"]
+    lines += [f"union all select {i}, {ident(c)}" for i, c in rest]
+    return "\n".join(lines) + "\n"
+
+
+def _left_join_orders(orders: str) -> Callable[[str], str]:
+    """The fixture model: ``orders`` LEFT-joining the declared parent, so the
+    join keeps an order whose customer the parent lacks."""
+
+    def render(_null: str) -> str:
+        return (
+            "select o.order_id, o.customer_id, c.segment\n"
+            f"from {{{{ ref('dex_parity_relationships_{orders}') }}}} o\n"
+            "left join {{ ref('dex_parity_relationships_parent') }} c\n"
+            "  on o.customer_id = c.customer_id\n"
+        )
+
+    return render
+
+
+#: #1459: a `references` with no `role` on a LEFT-joined key renders dbt's
+#: `relationships`, which fails on a non-null value the parent lacks, and
+#: `maintain verify` holds the join to the same claim. Customer 9 is no
+#: parent's, on two orders, so both count two rows; the clean model writes
+#: those two references as NULL, which both accept.
+RELATIONSHIPS_LEFT_JOIN = ParityRow(
+    test="relationships",
+    builtin=True,
+    codes=frozenset({"join_orphans", "join_zero_overlap", "join_no_match"}),
+    declaration={
+        "description": "Parity fixture: one row per order.",
+        "columns": {
+            "customer_id": {"references": "dex_parity_relationships_parent.customer_id"}
+        },
+    },
+    violating=_left_join_orders("orders_orphaned"),
+    clean=_left_join_orders("orders_unreferenced"),
+    count=lambda finding: int(finding["data"]["unmatched_rows"]),
+    measured=_join_measured,
+    fixtures={
+        "parent": lambda _null: (
+            "select 1 as customer_id, 'retail' as segment\n"
+            "union all select 2, 'retail'\nunion all select 3, 'wholesale'\n"
+        ),
+        "orders_orphaned": lambda null: _orders(
+            null,
+            ("10", "1"),
+            ("11", "2"),
+            ("12", "3"),
+            ("13", "9"),
+            ("14", "9"),
+            ("15", None),
+        ),
+        "orders_unreferenced": lambda null: _orders(
+            null,
+            ("10", "1"),
+            ("11", "2"),
+            ("12", "3"),
+            ("13", None),
+            ("14", None),
+            ("15", None),
+        ),
+    },
+)
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -468,6 +559,7 @@ ROWS: tuple[ParityRow, ...] = (
     PARENT_MISSING_UNAPPLIED,
     UNIT_FRACTION,
     UNIT_PERCENT,
+    RELATIONSHIPS_LEFT_JOIN,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
@@ -545,7 +637,7 @@ def switch_on(repo: Path, rows: tuple[ParityRow, ...] = ROWS) -> None:
     if config_path.is_file():
         config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     config.setdefault("declarations", {})["render_tests"] = sorted(
-        {row.test for row in rows}
+        {row.test for row in rows if not row.builtin}
     )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
@@ -612,6 +704,11 @@ def run_parity(
 
     live: list[ParityRow] = []
     for row in rows:
+        if row.builtin:
+            # dbt's own test, rendered on every dialect: the build's manifest
+            # is where it is found, as for any other row.
+            live.append(row)
+            continue
         kind = next(k for k in gt.kinds() if k.name == row.test)
         models = {row.model("violating"), row.model("clean")}
         claims = _claims(row, kind)

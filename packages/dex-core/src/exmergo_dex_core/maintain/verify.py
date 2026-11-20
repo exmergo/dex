@@ -3650,8 +3650,8 @@ class ModelJoinContext:
     column it reads, as far as the compiled SQL lets that be followed; a
     computed column has no entry. ``columns`` is each output column's declared
     ``config.meta.dex`` (lowered keys). ``parents`` maps every project node
-    name (lowered) to its relation, so a ``references`` can be lined up with
-    the relation a join reads. ``assumptions`` is the model's declared
+    name and version label (lowered) to its relation, so a ``references`` can
+    be lined up with the relation a join reads. ``assumptions`` is the model's declared
     ``assumptions`` entries and ``population_filters`` the columns its
     ``population.filters`` entries name (lowered), which say an INNER join's
     unmatched rows are the population the model means to drop (#1162).
@@ -3715,18 +3715,7 @@ def plan_join_contract(
 
     import sqlglot
 
-    parents: dict[str, str] = {}
-    for node in nodes.values():
-        if (
-            isinstance(node, dict)
-            and node.get("resource_type") in ("model", "seed", "snapshot")
-            and isinstance(node.get("name"), str)
-            and isinstance(node.get("relation_name"), str)
-            and node["relation_name"]
-        ):
-            parents.setdefault(
-                node["name"].lower(), strip_relation_quoting(node["relation_name"])
-            )
+    parents = _parent_relations(nodes)
 
     plan = JoinContractPlan()
     for uid, node in nodes.items():
@@ -3783,6 +3772,55 @@ def plan_join_contract(
                 projected=_final_output_map(tree),
             )
     return plan
+
+
+def _parent_relations(nodes: dict) -> dict[str, str]:
+    """Every model, seed and snapshot name (lowered) a ``references`` can name,
+    mapped to its relation, as ``ref()`` resolves it.
+
+    A version of a versioned model is also keyed by its label
+    (``dim_teams.v2``), which is how a declaration names it, and the bare name
+    is the version an unversioned ``ref('dim_teams')`` resolves to, its
+    ``latest_version``, not whichever version the manifest lists first (#1459).
+    """
+
+    from .. import model_versions as mv
+
+    parents: dict[str, str] = {}
+    latest: dict[str, str] = {}
+    versions: dict[str, dict[str, str]] = {}
+    for node in nodes.values():
+        if not (
+            isinstance(node, dict)
+            and node.get("resource_type") in ("model", "seed", "snapshot")
+            and isinstance(node.get("name"), str)
+            and isinstance(node.get("relation_name"), str)
+            and node["relation_name"]
+        ):
+            continue
+        name = node["name"].lower()
+        relation = strip_relation_quoting(node["relation_name"])
+        version = node.get("version")
+        if version is None or version == "":
+            parents.setdefault(name, relation)
+            continue
+        label = mv.version_text(version)
+        parents.setdefault(f"{name}.v{label.lower()}", relation)
+        versions.setdefault(name, {}).setdefault(label, relation)
+        latest_version = node.get("latest_version")
+        if latest_version is not None and mv.version_text(latest_version) == label:
+            latest[name] = relation
+    for name, by_label in versions.items():
+        if name in latest:
+            # The default version wins the bare name over an earlier version.
+            parents[name] = latest[name]
+            continue
+        # No latest_version recorded: dbt's own default (numeric order when
+        # every label is numeric, alphabetical otherwise).
+        default = mv.default_version({"versions": [{"v": v} for v in by_label]})
+        if default is not None:
+            parents[name] = by_label[default]
+    return parents
 
 
 def _model_population_intent(dex) -> tuple[list[dict], tuple[str, ...]]:
@@ -4089,10 +4127,14 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
 
     A join is required when the model declares a column it supplies
     ``null_rule: never`` on a LEFT join (an unmatched row would put a NULL
-    there), or declares the column carrying its driving key a ``foreign_key``
-    whose ``references`` names the joined relation (every key must exist in the
-    parent). NULL driving keys count against coverage only when the column
-    carrying them is declared ``null_rule: never``.
+    there), or declares on the column carrying its driving key a
+    ``references`` that names the joined relation, whatever the column's
+    ``role`` and on a LEFT join too: every non-null key must exist in the
+    parent, as the ``relationships`` test the reference renders holds it
+    (#1459). A version label (``dim_teams.v2``) names that version, and a bare
+    name the version ``ref()`` resolves to. NULL driving keys count against
+    coverage only when the column carrying them is declared ``null_rule:
+    never``: otherwise a NULL is a missing reference, which both checks accept.
 
     An INNER join that is not required drops its unmatched driving rows, which
     is a filter when the model means it: an ``assumptions`` entry whose
@@ -4139,11 +4181,18 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
         for col in driving:
             meta = ctx.columns.get(col) or {}
             target = meta.get("references")
-            if meta.get("role") != "foreign_key" or not isinstance(target, str):
+            if not isinstance(target, str) or not target.strip():
                 continue
-            parent = ctx.parents.get(target.rpartition(".")[0].lower())
+            # A `references` is the claim whatever the column's role: it is
+            # what renders the `relationships` test, which holds every non-null
+            # value to the parent on a LEFT join too (#1459).
+            parent = ctx.parents.get(target.strip().rpartition(".")[0].lower())
             if parent is not None and _same_relation(parent, candidate.to_relation):
-                required_by = f"{col} is declared a foreign_key referencing {target}"
+                required_by = (
+                    f"{col} is declared a foreign_key referencing {target}"
+                    if meta.get("role") == "foreign_key"
+                    else f"{col} declares references {target}"
+                )
                 break
     declared_optional = bool(derived) and all(
         _null_allowed(ctx.columns.get(c)) for c in derived
@@ -4718,9 +4767,11 @@ def join_coverage(
       declaration makes the join required, any unmatched row contradicts it
       (``threshold_source: contract``). Otherwise the default thresholds apply
       (``threshold_source: default``, stated in ``data``), and on a LEFT join
-      unmatched rows are the optional relationship a LEFT join writes: recorded
-      as evidence, with ``join_orphans`` withheld and ``join_zero_overlap``
-      ranked medium. On an INNER join whose unmatched rows the declaration
+      the declaration does not require (its driving key declares no
+      ``references`` to the joined relation) unmatched rows are the optional
+      relationship a LEFT join writes: recorded as evidence, with
+      ``join_orphans`` withheld and ``join_zero_overlap`` ranked medium
+      (#1459). On an INNER join whose unmatched rows the declaration
       accounts for (an ``assumptions`` entry or a ``population.filters`` entry
       naming the driving key column), the join is the model's filter: the
       record is ``satisfied``, keeps its counts and names that entry under
