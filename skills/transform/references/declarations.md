@@ -165,7 +165,8 @@ test keeps failing, and the last run in which a claim was checked and passed.
 The three tests above are the **built-ins**. They always render. A **generated
 test** is one Dex writes for a declared fact the built-ins cannot check: a
 composite grain, a population filter, a parent's population. Each kind arrives
-in its own release (#1452 onward), so this release renders none yet; the switch
+with its own issue (#1452 onward); this release renders one,
+[`dex_unique_combination`](#dex_unique_combination-a-composite-grain). The switch
 and the tag below are what every kind follows. Generated tests run in the
 project's production runs. Dex does not run those and the project pays for them,
 so two rules hold:
@@ -239,10 +240,40 @@ generated test the plan's declarations give, rendered or not:
 | `tests[]` | per test: `model`, `column` (`null` on the model entry), `test`, `cadence`, `claim`, `status` |
 
 `status` is `added` (rendered by this plan), `already_listed` (already in the
-YAML, so nothing changed), `not_rendered` (with `reason`: `render_tests_off`, or
-`kind_not_enabled` where a list leaves its kind out), or `listed_while_off` (in
-the YAML although the setting leaves its kind off; it stays). The key is absent
-when the declarations give no generated test.
+YAML, so nothing changed), `not_rendered` (with `reason`: `render_tests_off`,
+`kind_not_enabled` where a list leaves its kind out, or `dialect_unsupported`
+where the kind is on but not proved on the configured connector), or
+`listed_while_off` (in the YAML although the setting leaves its kind off; it
+stays). The key is absent when the declarations give no generated test.
+
+Each generated test states the connectors it supports: every connector
+`maintain verify` runs the matching check on. On any other connector it renders
+nothing, rather than a test whose answer nothing has held to `maintain verify`'s,
+and the plan says `dialect_unsupported`; `maintain verify` still checks the fact
+there.
+
+#### `dex_unique_combination`: a composite grain
+
+A declared `grain` of two or more columns (`grain: [order_id, line_number]`)
+renders `dex_unique_combination` on the model entry, tagged `dex_every_run`, on
+every connector. (A one-column grain renders dbt's `unique` and `not_null`
+instead.) It fails when two rows share the grain, and it agrees with
+`maintain verify`'s `grain_broken`:
+
+- **The same count.** dbt's `failures` is the number of rows beyond the first
+  of each grain value, which is `grain_broken`'s `duplicate_count`.
+- **NULL is a value.** Two rows `(1, NULL)` share the grain on both sides, as
+  `SELECT DISTINCT` and `GROUP BY` treat them.
+- **Counts only.** The test returns one row holding that count, never a key
+  value, so Elementary's sampling of failing rows has no key to keep even
+  where the per-test flag is ignored.
+
+The test needs its generic test macro in the project. The plan that first
+renders it adds `macros/dex_unique_combination.sql` (the
+[shipped macro](macros.md#dex_unique_combination)) as a `macro_sql` diff where
+neither the project nor the plan defines `{% test dex_unique_combination(`. A
+copy the project already has is left alone; `transform macro
+dex_unique_combination` diffs it against the shipped one.
 
 ### A versioned model
 

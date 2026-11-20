@@ -1345,7 +1345,16 @@ default, or a filter or operator after it is refused. A key naming a location
   `cadence`, `claim`, and a `status` of `added`, `already_listed`,
   `not_rendered` with its `reason`, or `listed_while_off`). Turning the switch
   off removes no test already written. A list entry this release does not render
-  is a non-fatal `unknown_test_kind` config problem.
+  is a non-fatal `unknown_test_kind` config problem. Each kind states the
+  connectors it supports (every one `maintain verify` runs its matching check
+  on); elsewhere it renders nothing and is `not_rendered` with
+  `reason: dialect_unsupported` (#1451). This release renders
+  `dex_unique_combination` for a declared grain of two or more columns (#1452),
+  on every connector: its `failures` count equals `grain_broken`'s
+  `duplicate_count`, a NULL grain value counts as a value, and the test returns
+  that count and never a key. The plan writes its generic test macro as a
+  `macro_sql` diff where the project defines none; a `macro_sql` file may hold
+  `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

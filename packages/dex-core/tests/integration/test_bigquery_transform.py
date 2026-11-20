@@ -15,6 +15,7 @@ import yaml
 from .conftest import (
     MAX_BYTES,
     assert_downstream_run,
+    assert_generated_test_parity,
     assert_ok,
     assert_unpivot_build,
     downstream_probe_edits,
@@ -455,3 +456,30 @@ def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
     before = {t.table_id for t in client.list_tables(dataset)}
     assert_downstream_run(run_cli, capsys, root, 4 * MAX_BYTES)
     assert {t.table_id for t in client.list_tables(dataset)} == before
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, bq_project: str, bq_scratch_dataset: str
+):
+    """The generated-test parity harness (#1450, #1451) on BigQuery: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    pytest.importorskip("dbt.adapters.bigquery")
+    _seed_transform_repo(tmp_path, bq_project, bq_scratch_dataset)
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+    report = assert_generated_test_parity(
+        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES
+    )
+
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=bq_project)
+    try:
+        for name in report.models:
+            client.delete_table(
+                f"{bq_project}.{bq_scratch_dataset}.{name}", not_found_ok=True
+            )
+    finally:
+        client.close()

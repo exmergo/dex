@@ -61,6 +61,11 @@ MACRO_ASSETS: dict[str, str] = {
         "or source; dry-run by default, refuses to run at all if any named "
         "relation is still a live model, seed, or snapshot"
     ),
+    "dex_unique_combination": (
+        "the generic test a declared composite grain renders (#1452): fails "
+        "with the count of rows beyond the first of each grain value, never a "
+        "key value; a declaration plan adds it where the project lacks it"
+    ),
 }
 
 
@@ -159,6 +164,31 @@ def macro_edit(name: str, macro_dir: str) -> PlanEdit:
         path=f"{macro_dir}/{name}.sql",
         kind=EditKind.MACRO_SQL,
         new_content=asset.read_text(encoding="utf-8"),
+    )
+
+
+def defines_test(view: DbtProjectView, edits: list[PlanEdit], name: str) -> bool:
+    """Whether the project or this plan already defines the generic test
+    ``name`` (``{% test name(`` anywhere under a macro or test path, or in a
+    macro or test edit the plan carries). Presence-based, as
+    :func:`missing_macro_warnings` is: a copy that differs from the shipped one
+    is the project's, and ``transform macro <name>`` reconciles it."""
+
+    pattern = re.compile(r"{%-?\s*test\s+" + re.escape(name) + r"\s*\(")
+    roots = [*view.macro_paths, *view.test_paths]
+    planned = {e.path for e in edits}
+    for source in view.files.values():
+        if source.path in planned:
+            continue
+        if any(source.path.startswith(f"{root}/") for root in roots) and (
+            pattern.search(source.content)
+        ):
+            return True
+    return any(
+        e.kind in (EditKind.MACRO_SQL, EditKind.TEST_SQL)
+        and e.new_content is not None
+        and pattern.search(e.new_content)
+        for e in edits
     )
 
 
