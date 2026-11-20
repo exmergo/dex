@@ -1292,6 +1292,9 @@ def render(
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
+    if not gt.kinds():
+        # No kind in this release: nothing to generate, so no entry to read back.
+        return text
     planned = _generated(_effective(text, declaration), render_tests)
     on = [g for g in planned if g["enabled"]]
     if on:
