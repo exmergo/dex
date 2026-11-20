@@ -2117,7 +2117,9 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     was newly inserted.
     """
 
-    node = locate(_compose(text))
+    root = _compose(text)
+    node = locate(root)
+    _refuse_shared_entry(text, root, node)
     found = None
     for key in ("data_tests", "tests"):
         found = _child(node, key)
@@ -2143,7 +2145,7 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
         return text, False
 
     inserted_flagged = any(_has_sampling_flag(s) for s in todo)
-    if _reached(root, listed) > 1:
+    if _paths(root, listed) > 1:
         # A list another column aliases: this column gets its own copy first,
         # then the tests are added to that copy alone (#1496).
         return _add_tests(_unshare_tests(text, key, listed), locate, specs)
@@ -2176,25 +2178,68 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     return splice(text, [(at, at, prefix + rendered)]), inserted_flagged
 
 
-def _reached(root: Any, target: Any) -> int:
-    """How many times ``target`` is reached from ``root``: more than once when
-    a YAML alias shares it, since PyYAML resolves an alias to the node itself."""
+def _paths(root: Any, target: Any) -> int:
+    """How many paths lead from ``root`` to ``target``: more than one when a
+    YAML alias or merge key shares it or a node above it, since PyYAML
+    resolves an alias to the anchored node itself."""
 
-    hits = 0
-    seen: set[int] = set()
+    memo: dict[int, int] = {}
+
+    def walk(current: Any, above: frozenset[int]) -> int:
+        if current is target:
+            return 1
+        if id(current) in memo:
+            return memo[id(current)]
+        if id(current) in above:  # a recursive alias: no path through it
+            return 0
+        below = above | {id(current)}
+        if isinstance(current, yaml.MappingNode):
+            children = [n for pair in current.value for n in pair]
+        elif isinstance(current, yaml.SequenceNode):
+            children = current.value
+        else:
+            children = []
+        memo[id(current)] = sum(walk(child, below) for child in children)
+        return memo[id(current)]
+
+    return walk(root, frozenset())
+
+
+def _refuse_shared_entry(text: str, root: Any, node: Any) -> None:
+    """Refuse a column whose entry, or an entry above it, is shared through a
+    YAML alias or merge key (`<<`): anything written into it would land on
+    every entry sharing it (#1496). The list a column holds is unshared
+    instead, by ``_unshare_tests``; a shared entry above it is not."""
+
+    if _paths(root, node) < 2:
+        return
+    collections: dict[int, Any] = {}
     stack = [root]
     while stack:
         current = stack.pop()
-        if current is target:
-            hits += 1
-        if id(current) in seen:
+        if (
+            isinstance(current, yaml.ScalarNode)
+            or current.start_mark.index in collections
+        ):
             continue
-        seen.add(id(current))
+        collections[current.start_mark.index] = current
         if isinstance(current, yaml.MappingNode):
             stack.extend(n for pair in current.value for n in pair)
-        elif isinstance(current, yaml.SequenceNode):
+        else:
             stack.extend(current.value)
-    return hits
+    names = sorted(
+        f"'&{t.value}'"
+        for t in yaml.scan(text)
+        if isinstance(t, yaml.AnchorToken)
+        and t.start_mark.index in collections
+        and _paths(collections[t.start_mark.index], node) > 0
+    )
+    via = " or ".join(names) if names else "a YAML alias"
+    raise RewriteError(
+        f"the column's entry is shared with others through {via} (an alias or a "
+        "merge key), so a test written into it would land on each of them; give "
+        "the column its own entry"
+    )
 
 
 def _unshare_tests(text: str, key: Any, listed: Any) -> str:

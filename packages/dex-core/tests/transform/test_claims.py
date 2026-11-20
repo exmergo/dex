@@ -17,6 +17,7 @@ from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.claims import claim_id, claim_of, without_claim
 from exmergo_dex_core.transform.declarations import parse_declarations, render
 from exmergo_dex_core.transform.rewrite import (
+    RewriteError,
     column_tests,
     column_tests_span,
     splice,
@@ -356,3 +357,46 @@ def test_a_test_added_to_a_list_columns_share_lands_on_the_declared_column_only(
     declared = _tests(out, column)
     assert [next(iter(test)) for test in declared] == ["unique", "not_null"]
     assert all(claim_of(test) for test in declared)
+
+
+MERGED_COLUMN = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    columns:\n"
+    "      - &base\n"
+    "        name: order_id\n"
+    "        data_tests:\n"
+    "          - unique\n"
+    "      - <<: *base\n"
+    "        name: order_key\n"
+)
+ALIASED_COLUMN = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    columns:\n"
+    "      - &col\n"
+    "        name: order_id\n"
+    "        data_tests:\n"
+    "          - unique\n"
+    "      - *col\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("content", "anchor"), [(MERGED_COLUMN, "&base"), (ALIASED_COLUMN, "&col")]
+)
+def test_a_column_shared_through_its_entry_is_refused(content: str, anchor: str):
+    # The list sits in an entry another column shares, through a merge key or
+    # an alias: no copy of the list alone keeps the test off that column (#1496).
+    with pytest.raises(RewriteError, match=f"'{anchor}'"):
+        _render(content, {"model": "fct_orders", "grain": ["order_id"]})
+
+
+def test_the_column_holding_the_merge_key_still_takes_its_tests():
+    out = _render(MERGED_COLUMN, {"model": "fct_orders", "grain": ["order_key"]})
+
+    assert _tests(out, "order_id") == _tests(MERGED_COLUMN, "order_id")
+    declared = _tests(out, "order_key")
+    assert [next(iter(test)) for test in declared] == ["unique", "not_null"]
