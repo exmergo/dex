@@ -295,6 +295,13 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      or a declared population.parent removed or replaced is kind
                                      redriven (reason redriven, against applied or earlier_plan),
                                      declared only by an assumption at request or contract tier (#1228);
+                                     data.change_scope.removed_tests (#1420) lists each unit test,
+                                     data test (on a model or its versions, a snapshot, a seed or a
+                                     source table) and deleted singular test file the plan removes
+                                     (kind, name, model / models / snapshot / seed / source, version,
+                                     column, path) with a warning, even on a plan that rewrites no
+                                     model, and never refuses; an edited test, a moved one and one
+                                     carried to a model whose file the plan renames are not removed;
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref
