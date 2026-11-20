@@ -70,7 +70,13 @@ def claim_of(test: Any) -> str | None:
 
     if not isinstance(test, Mapping) or len(test) != 1:
         return None
-    body = next(iter(test.values()))
+    return claim_in(next(iter(test.values())))
+
+
+def claim_in(body: Any) -> str | None:
+    """The claim id a test's body carries, or ``None``: the mapping under a
+    parsed test entry's name, or a test's node in the dbt manifest (#1498)."""
+
     if not isinstance(body, Mapping):
         return None
     config = body.get("config")

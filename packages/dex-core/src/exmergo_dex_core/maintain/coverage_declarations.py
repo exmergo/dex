@@ -36,6 +36,12 @@ A fact a dbt model and a native layer both declare on the same relation is
 listed once per source and counted once in the summary, with what checks it
 taken from both.
 
+A test Dex rendered carries the claim id of the fact it checks (#1448), and is
+matched to that fact by the claim, whatever its kind or column; the kind and
+column below match a test with no claim. A test whose claim names no fact the
+declaration states is a stale render: listed under ``stale_claims`` and never
+counted as a check (#1498).
+
 Never a value: a population filter's ``includes``/``excludes`` and a rule's
 prose stay out of the payload in every mode, so the section is the same in
 values-free mode.
@@ -73,6 +79,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import dbt_tests
 from ..guards.pii_meta import entry_meta
+from ..transform.claims import claim_id, claim_in
 
 if TYPE_CHECKING:
     from ..project_definitions import ModelDeclaration
@@ -132,10 +139,13 @@ class _Tests:
     """The enabled generic tests on each model, read once."""
 
     def __init__(self, manifest: dict[str, Any], labels: dict[str, str]) -> None:
-        # (model uid) -> list of (test name, column lowered, kwargs, reads)
-        self.by_model: dict[str, list[tuple[str, str | None, dict, list[str]]]] = (
-            defaultdict(list)
-        )
+        # (model uid) -> list of (test name, column lowered, kwargs, reads, claim)
+        self.by_model: dict[
+            str, list[tuple[str, str | None, dict, list[str], str | None]]
+        ] = defaultdict(list)
+        #: The claim ids each model's declaration states, set as its facts are
+        #: read: a test carrying any other claim is stale and checks nothing.
+        self.claims: dict[str, set[str]] = {}
         for test in (manifest.get("nodes") or {}).values():
             if not isinstance(test, dict) or test.get("resource_type") != "test":
                 continue
@@ -150,8 +160,9 @@ class _Tests:
             column = test.get("column_name") or kwargs.get("column_name")
             column_key = _bare(str(column)) if column else None
             reads = dbt_tests.test_reads(test)
+            claim = claim_in(test)
             for owner in dbt_tests.generic_test_targets(test):
-                self.by_model[owner].append((name, column_key, kwargs, reads))
+                self.by_model[owner].append((name, column_key, kwargs, reads, claim))
         self.labels = labels
         #: Each model's package, so a package-qualified `ref` resolves.
         self.parents: dict[str, dict] = {
@@ -164,16 +175,49 @@ class _Tests:
             uid: node.get("package_name") for uid, node in self.parents.items()
         }
 
+    def _live(
+        self, model: str
+    ) -> list[tuple[str, str | None, dict, list[str], str | None]]:
+        """The model's tests a kind-and-column match may read: all but those
+        whose claim names a fact its declaration no longer states."""
+
+        known = self.claims.get(model, set())
+        return [
+            t for t in self.by_model.get(model, []) if t[4] is None or t[4] in known
+        ]
+
+    def claimed(self, model: str, claims: list[str]) -> list[str]:
+        """The tests on ``model`` that carry one of ``claims``, by name."""
+
+        return list(
+            dict.fromkeys(
+                _base(name)
+                for name, _col, _kwargs, _reads, claim in self.by_model.get(model, [])
+                if claim is not None and claim in claims
+            )
+        )
+
+    def stale(self, model: str) -> list[tuple[str, str | None, str]]:
+        """(test, column, claim) of each test on ``model`` whose claim names no
+        fact its declaration states."""
+
+        known = self.claims.get(model, set())
+        return [
+            (name, col, claim)
+            for name, col, _kwargs, _reads, claim in self.by_model.get(model, [])
+            if claim is not None and claim not in known
+        ]
+
     def on_column(self, model: str, column: str, test: str) -> bool:
         key = _bare(column)
         return any(
             _base(name) == test and col == key
-            for name, col, _kwargs, _reads in self.by_model.get(model, [])
+            for name, col, _kwargs, _reads, _claim in self._live(model)
         )
 
     def combination(self, model: str, columns: list[str]) -> str | None:
         wanted = {_bare(c) for c in columns}
-        for name, _col, kwargs, _reads in self.by_model.get(model, []):
+        for name, _col, kwargs, _reads, _claim in self._live(model):
             if _base(name) != "unique_combination_of_columns":
                 continue
             combo = kwargs.get("combination_of_columns")
@@ -217,7 +261,7 @@ class _Tests:
         the declared ``field``."""
 
         key = _bare(column)
-        for name, col, kwargs, reads in self.by_model.get(model, []):
+        for name, col, kwargs, reads, _claim in self._live(model):
             if _base(name) != "relationships" or col != key:
                 continue
             tested_field = kwargs.get("field")
@@ -289,6 +333,18 @@ def declarations(
         if model_facts:
             declared_models += 1
             records.extend(model_facts)
+    # A test whose claim names a fact no declaration states any more (#1498):
+    # a stale render, listed apart and never counted as a check.
+    stale = [
+        {
+            "model": labels[uid],
+            "test": _base(name),
+            **({"column": column} if column else {}),
+            "claim": claim,
+        }
+        for uid in sorted(in_scope, key=lambda u: labels[u])
+        for name, column, claim in tests.stale(uid)
+    ]
     wanted = {name.lower() for name in selector} if selector else None
     native = [
         record
@@ -368,6 +424,19 @@ def declarations(
             f"{FACT_CAP}, unchecked ones first; the summary counts every one. "
             "Pass --full, or name models, to list them"
         )
+    stale_count = len(stale)
+    if stale_count:
+        notes.append(
+            f"{stale_count} test(s) carry a claim id that names no fact the "
+            "declaration states: listed in `stale_claims` and counted as no "
+            "check. Declare the fact again, or remove the test"
+        )
+        if not full and stale_count > FACT_CAP:
+            stale = stale[:FACT_CAP]
+            notes.append(
+                f"`stale_claims` lists the first {FACT_CAP}; pass --full to list "
+                "them all"
+            )
     if by_checker["dex_verify"] or by_checker["both"]:
         notes.append(
             "`dex_verify` means `maintain verify` (and `transform build --verify`) "
@@ -415,8 +484,10 @@ def declarations(
                 "by_checker": by_checker,
                 "by_source": by_source,
             },
+            "stale_claims": stale_count,
         },
         "facts": facts,
+        "stale_claims": stale,
         "elided": elided,
         "notes": notes,
     }
@@ -778,6 +849,23 @@ def _declared_model_facts(
     return facts
 
 
+def _declared_columns(node: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Each column of ``node`` with a ``dex`` declaration, and that declaration."""
+
+    out: list[tuple[str, dict[str, Any]]] = []
+    columns = node.get("columns")
+    for key, column in columns.items() if isinstance(columns, dict) else []:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("name") if isinstance(column.get("name"), str) else key
+        if not isinstance(name, str) or not name:
+            continue
+        dex = entry_meta(column).get("dex")
+        if isinstance(dex, dict):
+            out.append((name, dex))
+    return out
+
+
 def _model_facts(
     uid: str,
     node: dict[str, Any],
@@ -791,11 +879,18 @@ def _model_facts(
     relation = node.get("relation_name")
 
     def add(
-        kind: str, column: str | None, found: list[str], verify: list[str], **identity
+        kind: str,
+        column: str | None,
+        found: list[str],
+        verify: list[str],
+        matched_by: str | None = None,
+        **identity,
     ):
         facts.append(
             _record("dbt", label, kind, column, relation, found, verify, **identity)
         )
+        if matched_by is not None:
+            facts[-1]["matched_by"] = matched_by
 
     def prose(kind: str, column: str | None) -> None:
         facts.append(
@@ -809,10 +904,55 @@ def _model_facts(
         else []
     )
     single_grain = _bare(grain_cols[0]) if len(grain_cols) == 1 else None
+
+    # The claim ids each rendered test of this declaration carries (#1448), by
+    # the model's label or, for a declaration on every version, its bare name.
+    names = list(dict.fromkeys([label, str(node.get("name") or label)]))
+
+    def ids(field: str, columns: list[str], params: dict[str, str]) -> list[str]:
+        return [claim_id(name, field, columns, params) for name in names]
+
+    grain_claims = (
+        [
+            *ids("grain", grain_cols, {"check": "unique"}),
+            *ids("grain", grain_cols, {"check": "not_null"}),
+        ]
+        if single_grain
+        else []
+    )
+    claims_of: dict[str, dict[str, list[str]]] = {}
+    for name, dex in _declared_columns(node):
+        references = dex.get("references")
+        null_rule = dex.get("null_rule")
+        claims_of[name] = {
+            "references": ids("references", [name], {"references": references})
+            if isinstance(references, str) and "." in references
+            else [],
+            "null_rule": ids("null_rule", [name], {"null_rule": "never"})
+            if isinstance(null_rule, str) and null_rule.strip().lower() == "never"
+            else [],
+        }
+    tests.claims[uid] = {
+        *grain_claims,
+        *(c for kinds in claims_of.values() for ids_ in kinds.values() for c in ids_),
+    }
+
+    def check(claims: list[str], fallback: list[str]) -> tuple[list[str], str | None]:
+        """The tests that check a fact: those carrying its claim, else those
+        matched by kind and column, which carry no claim or a live one."""
+
+        by_claim = tests.claimed(uid, claims)
+        if by_claim:
+            return by_claim, "claim"
+        return fallback, "kind_and_column" if fallback else None
+
     if grain_cols:
         if len(grain_cols) == 1:
-            found = ["unique"] if tests.on_column(uid, grain_cols[0], "unique") else []
-            add("grain", grain_cols[0], found, ["grain_broken"])
+            found, how = check(
+                grain_claims,
+                ["unique"] if tests.on_column(uid, grain_cols[0], "unique") else [],
+            )
+            add("grain", grain_cols[0], found, ["grain_broken"], how)
         else:
             combo = tests.combination(uid, grain_cols)
             add(
@@ -820,6 +960,7 @@ def _model_facts(
                 ", ".join(grain_cols),
                 [combo] if combo else [],
                 ["grain_broken"],
+                "kind_and_column" if combo else None,
             )
 
     # The model reads these, so a declared reference to one of them is a join
@@ -831,24 +972,16 @@ def _model_facts(
     }
     reads |= {name.split(".", 1)[0] for name in reads}
 
-    columns = node.get("columns")
-    for key, column in columns.items() if isinstance(columns, dict) else []:
-        if not isinstance(column, dict):
-            continue
-        name = column.get("name") if isinstance(column.get("name"), str) else key
-        if not isinstance(name, str) or not name:
-            continue
-        dex = entry_meta(column).get("dex")
-        if not isinstance(dex, dict):
-            continue
+    for name, dex in _declared_columns(node):
         role = dex.get("role")
         references = dex.get("references")
         if isinstance(references, str) and "." in references:
             parent, _, field = references.rpartition(".")
-            found = (
+            found, how = check(
+                claims_of[name]["references"],
                 ["relationships"]
                 if tests.relationship(uid, name, parent, field or None)
-                else []
+                else [],
             )
             joins = parent.lower() in reads or parent.split(".", 1)[0].lower() in reads
             target_uid = tests._resolve(parent, near=uid)
@@ -858,23 +991,31 @@ def _model_facts(
                 name,
                 found,
                 ["join_no_match", "join_orphans"] if joins else [],
+                how,
                 target=_target_of(
                     (target_node or {}).get("relation_name"), parent.split(".")[-1]
                 ),
                 pairs=[(name, field or None)],
             )
         elif role == "foreign_key":
-            found = ["relationships"] if tests.relationship(uid, name, None) else []
-            add("foreign_key", name, found, [])
+            found, how = check(
+                [], ["relationships"] if tests.relationship(uid, name, None) else []
+            )
+            add("foreign_key", name, found, [], how)
         if role == "key":
-            found = ["unique"] if tests.on_column(uid, name, "unique") else []
+            found, how = check(
+                [], ["unique"] if tests.on_column(uid, name, "unique") else []
+            )
             verify = ["grain_broken"] if _bare(name) == single_grain else []
-            add("key", name, found, verify)
+            add("key", name, found, verify, how)
         null_rule = dex.get("null_rule")
         if isinstance(null_rule, str) and null_rule.strip():
             if null_rule.strip().lower() == "never":
-                found = ["not_null"] if tests.on_column(uid, name, "not_null") else []
-                add("null_rule", name, found, [], what="never")
+                found, how = check(
+                    claims_of[name]["null_rule"],
+                    ["not_null"] if tests.on_column(uid, name, "not_null") else [],
+                )
+                add("null_rule", name, found, [], how, what="never")
             else:
                 prose("null_rule", name)
         unit = dex.get("unit")

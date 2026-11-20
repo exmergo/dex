@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from exmergo_dex_core.maintain.coverage_declarations import FACT_CAP, declarations
+from exmergo_dex_core.transform.claims import claim_id
 
 PROJECT = "shop"
 
@@ -44,7 +45,11 @@ def _test(
     reads=None,
     enabled=True,
     namespace=None,
+    claim=None,
 ) -> dict:
+    config: dict[str, Any] = {"severity": "ERROR", "enabled": enabled}
+    if claim is not None:
+        config["meta"] = {"dex": {"claim": claim}}
     return {
         "resource_type": "test",
         "name": f"{test}_{on}_{column}",
@@ -56,7 +61,7 @@ def _test(
             "namespace": namespace,
             "kwargs": kwargs or {},
         },
-        "config": {"severity": "ERROR", "enabled": enabled},
+        "config": config,
         # A name, or a full unique id (a package's or a seed's), as dbt
         # resolves the test's `to` into its dependencies.
         "depends_on": {
@@ -991,3 +996,105 @@ def test_a_filter_entry_with_no_condition_states_no_fact() -> None:
     )
     out = _run(_manifest([model]))
     assert out["summary"]["facts"]["by_kind"]["population_filter"]["count"] == 1
+
+
+def _orders_declared() -> dict:
+    return _model(
+        "orders",
+        dex={"grain": ["order_id"]},
+        columns={
+            "order_id": {"role": "key"},
+            "customer_id": {"references": "customers.customer_id"},
+            "placed_at": {"null_rule": "never"},
+        },
+    )
+
+
+def test_tests_rendered_with_claims_are_matched_by_claim() -> None:
+    # Each test carries its fact's claim, on a column and under a name the
+    # kind-and-column match would not take: the claim alone matches it (#1498).
+    def grain(check: str) -> str:
+        return claim_id("orders", "grain", ["order_id"], {"check": check})
+
+    reference = claim_id(
+        "orders", "references", ["customer_id"], {"references": "customers.customer_id"}
+    )
+    never = claim_id("orders", "null_rule", ["placed_at"], {"null_rule": "never"})
+    manifest = _manifest(
+        [_orders_declared(), _model("customers")],
+        [
+            _test("unique", "orders", "ORDER_ID", claim=grain("unique")),
+            _test("not_null", "orders", "order_id", claim=grain("not_null")),
+            _test(
+                "relationships",
+                "orders",
+                "customer_id",
+                kwargs={"to": "ref('customers')", "field": "customer_id"},
+                reads=["orders", "customers"],
+                claim=reference,
+            ),
+            _test("not_null", "orders", "placed_at_renamed", claim=never),
+        ],
+    )
+    out = _run(manifest)
+    tested = [f for f in out["facts"] if f["tests"]]
+    assert {f["fact"] for f in tested} == {"grain", "references", "null_rule", "key"}
+    for fact in tested:
+        if fact["fact"] != "key":  # a key role renders no test, so carries no claim
+            assert fact["matched_by"] == "claim", fact
+    assert _fact(out, "grain")["tests"] == ["unique", "not_null"]
+    assert _fact(out, "null_rule", "placed_at")["tests"] == ["not_null"]
+    assert out["stale_claims"] == []
+    assert out["summary"]["stale_claims"] == 0
+
+
+def test_a_hand_written_unique_on_the_grain_is_matched_by_kind_and_column() -> None:
+    manifest = _manifest(
+        [_model("orders", dex={"grain": ["order_id"]})],
+        [_test("unique", "orders", "order_id")],
+    )
+    grain = _fact(_run(manifest), "grain")
+    assert grain["tests"] == ["unique"]
+    assert grain["matched_by"] == "kind_and_column"
+    assert grain["checked_by"] == "both"
+
+
+def test_a_claim_no_declared_fact_states_is_listed_apart_and_checks_nothing() -> None:
+    # The grain moved from `legacy_id` to `order_id`; the old render's `unique`
+    # stayed, and a `unique` now on `order_id` carries the old claim too.
+    old = claim_id("orders", "grain", ["legacy_id"], {"check": "unique"})
+    manifest = _manifest(
+        [_model("orders", dex={"grain": ["order_id"]})],
+        [
+            _test("unique", "orders", "legacy_id", claim=old),
+            _test("unique", "orders", "order_id", claim=old),
+        ],
+    )
+    out = _run(manifest)
+    grain = _fact(out, "grain")
+    assert grain["tests"] == []
+    assert grain["checked_by"] == "dex_verify"
+    assert "matched_by" not in grain
+    assert out["stale_claims"] == [
+        {"model": "orders", "test": "unique", "column": "legacy_id", "claim": old},
+        {"model": "orders", "test": "unique", "column": "order_id", "claim": old},
+    ]
+    assert out["summary"]["stale_claims"] == 2
+    assert any("stale_claims" in note for note in out["notes"])
+
+
+def test_each_test_in_a_resources_tests_list_shows_its_claim() -> None:
+    from exmergo_dex_core.maintain.coverage import inventory
+
+    claim = claim_id("orders", "grain", ["order_id"], {"check": "unique"})
+    manifest = _manifest(
+        [_model("orders", dex={"grain": ["order_id"]})],
+        [
+            _test("unique", "orders", "order_id", claim=claim),
+            _test("not_null", "orders", "order_id"),
+        ],
+    )
+    [orders] = inventory(manifest).sections["models"]
+    by_test = {t["test"]: t for t in orders["tests"]}
+    assert by_test["unique"]["claim"] == claim
+    assert "claim" not in by_test["not_null"]

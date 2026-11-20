@@ -2011,6 +2011,7 @@ def coverage(
         declarations={
             "summary": declared["summary"],
             "facts": declared["facts"],
+            "stale_claims": declared["stale_claims"],
         },
         last_run=run.run,
         excluded=inventory.excluded,
