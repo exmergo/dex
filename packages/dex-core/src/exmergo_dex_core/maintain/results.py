@@ -186,6 +186,11 @@ class VerifyResult(Result):
     #: artifacts supplies (#1197): satisfied, contradicted, not applicable or
     #: unchecked. ``None`` when the axis did not run (always, on dbt).
     foreign_key_coverage: list[dict] | None = None
+    #: The dbt runs build status was read from (#1524): each with its
+    #: ``invocation_id``, ``generated_at``, ``command``, ``artifact``,
+    #: ``cold``, ``invoked_by``, ``latest`` and the count of ``nodes`` judged
+    #: by it, plus the runs ``ignored`` and why. ``None`` when no run was read.
+    build_status_runs: dict | None = None
 
     def data(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -193,6 +198,8 @@ class VerifyResult(Result):
             "finding_count": len(self.findings),
             "suppressed": self.suppressed,
         }
+        if self.build_status_runs is not None:
+            payload["build_status_runs"] = self.build_status_runs
         if self.grain_coverage is not None:
             payload["grain_coverage"] = self.grain_coverage
         if self.join_coverage is not None:

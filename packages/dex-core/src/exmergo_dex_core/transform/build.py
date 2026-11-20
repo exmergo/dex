@@ -63,6 +63,7 @@ from .artifact_runtime import (
     sanitize_artifact_directory,
     shared_target_dir,
 )
+from .node_record import record_node_runs
 
 # Names that mean production no matter what the config says. The build target
 # must additionally be on the allowlist (dev or the configured dbt_target); this
@@ -367,9 +368,9 @@ def build(
         seed_argv = [_dbt_executable(), "seed", "--full-refresh", *flags]
         seed_argv += ["--select", " ".join(_exact_seed(node) for node in stale)]
         clear_run_results(artifacts)
-        seeded = _summarize(
-            project, target, run(seed_argv), artifact_directory=artifacts
-        )
+        seed_run = run(seed_argv)
+        record_node_runs(artifacts)
+        seeded = _summarize(project, target, seed_run, artifact_directory=artifacts)
         try:
             remember_seed_types(artifacts, seed_history_directory, target)
         except (OSError, ValueError) as exc:
@@ -388,6 +389,9 @@ def build(
         # results are the evidence; the refresh's are not.
         clear_run_results(artifacts)
     completed = run(argv)
+    # Before anything else reads or replaces it: the next build overwrites this
+    # run_results.json, and the record keeps what this one attempted (#1524).
+    record_node_runs(artifacts)
 
     summary = _summarize(
         project,

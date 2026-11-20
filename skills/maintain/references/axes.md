@@ -206,7 +206,19 @@ Needs no baseline. The classes of finding:
   (naming the one that actually failed, through a chain of skipped parents);
   nodes that warned rather than failed (`node_warned`, ranked low, because a
   project running relationship tests at `severity: warn` has warnings by design);
-  and models the project declares that built no relation.
+  and models the project declares that built no relation. Each node is judged
+  by the latest dated run that attempted it (#1524): every building
+  `run_results.json` in the project's target path and in Dex's artifact
+  directory, ordered by dbt's `generated_at`, plus the per-node record each
+  `transform build` keeps in `dex_node_runs.json` (statuses only), since Dex's
+  builds overwrite one file. Never the run results beside the newest manifest:
+  a `dbt parse` rewrites a manifest and runs nothing. A compile is never read, a
+  run no dbt log records is ignored with a warning, and a node the manifest no
+  longer has is not reported. Each finding names its run under `data.run`
+  (`invocation_id`, `generated_at`, `command`, `artifact`, `cold`, `source`,
+  `invoked_by`: `dex`, `outside_dex` or `unknown`, and `latest`), and `detail`
+  says so in words, marking a failure read from an earlier run than the latest.
+  `data.build_status_runs` lists the runs read and ignored.
 - **Row population**: `row_loss` where a model holds materially fewer rows than
   its **driving parent** (the relation in its FROM clause, followed through the
   CTE chain, as distinct from anything it joins) and nothing in its SQL accounts

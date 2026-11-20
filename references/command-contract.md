@@ -724,7 +724,15 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      separated by spaces ("a b"), none = every model. Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
                                      through transitively skipped parents), nodes that warned rather
-                                     than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
+                                     than failed, and models with no relation in the warehouse. Each
+                                     node is judged by the latest dated run that attempted it, across
+                                     the project's target path, Dex's artifact directory and the
+                                     per-node record each Dex build keeps (dex_node_runs.json), never
+                                     by the run results beside the newest manifest; each build finding
+                                     names its run (data.run: invocation_id, generated_at, command,
+                                     artifact, cold, source, invoked_by, latest) and
+                                     data.build_status_runs lists the runs read and ignored (#1524).
+                                     Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
                                      the compiled SQL through its CTE chain, naming each join beside
                                      its own key and stating both counts; a fan-out on a model whose

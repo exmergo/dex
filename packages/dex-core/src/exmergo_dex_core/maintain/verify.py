@@ -148,27 +148,214 @@ def _artifact(project_dir: Path, name: str) -> Path:
     return readable_artifact_dir(project_dir) / name
 
 
-def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
+def _manifest_document(project_dir: Path) -> dict | None:
     path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8")).get("nodes", {})
-
-
-def _run_results(project_dir: Path) -> list[dict] | None:
-    from ..transform.artifact_runtime import pinned_invocation_id
-
-    path = _artifact(project_dir, "run_results.json")
-    if not path.is_file():
-        return None
     document = json.loads(path.read_text(encoding="utf-8"))
-    # A build's own sweep reads only its own invocation's results; another
-    # run's passing tests must not vouch for this build's rows.
-    expected = pinned_invocation_id()
-    written = (document.get("metadata") or {}).get("invocation_id")
-    if expected is not None and written is not None and str(written) != expected:
-        return None
-    return document.get("results", [])
+    return document if isinstance(document, dict) else None
+
+
+def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
+    document = _manifest_document(project_dir)
+    return None if document is None else document.get("nodes", {})
+
+
+@dataclass
+class NodeResults:
+    """Each node's latest building attempt, and the run it was read from (#1524).
+
+    ``nodes`` maps a unique id to ``(result row, run)``, the run a
+    :class:`~..transform.artifact_runtime.BuildingRun`. ``runs`` are the runs
+    read, oldest first; ``ignored`` the runs left out, each with its reason.
+    ``pinned`` is set inside a build's own ``--verify`` sweep, which reads that
+    build's invocation and nothing else.
+
+    Who started a run is read from where its results sit: ``dex`` for Dex's own
+    artifact directory (or the build this sweep belongs to), ``outside_dex`` for
+    the project's target path while Dex writes its own directory, and
+    ``unknown`` for the project's target path when ``transform.artifacts`` is
+    ``shared``, where Dex's builds and anyone else's write the same file.
+    """
+
+    nodes: dict[str, tuple[dict, Any]] = field(default_factory=dict)
+    runs: list[Any] = field(default_factory=list)
+    ignored: list[tuple[Any, str]] = field(default_factory=list)
+    pinned: bool = False
+    artifact_policy: str = "isolated"
+    #: Every run Dex's node record holds, read or not, so a run in the shared
+    #: target path whose invocation the record names is known to be Dex's.
+    recorded: list[Any] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.runs)
+
+    @property
+    def newest(self) -> Any | None:
+        return self.runs[-1] if self.runs else None
+
+    def statuses(self) -> dict[str, str]:
+        return {uid: str(row.get("status")) for uid, (row, _) in self.nodes.items()}
+
+    def invoked_by(self, run: Any) -> str:
+        if self.pinned or run.artifact == "dex" or run.source == "dex_record":
+            return "dex"
+        # Under `transform.artifacts: shared` Dex writes the project's target
+        # path too; its node record says which invocations were its own.
+        if run.invocation_id and any(
+            other.source == "dex_record" and other.invocation_id == run.invocation_id
+            for other in self.recorded
+        ):
+            return "dex"
+        return "unknown" if self.artifact_policy == "shared" else "outside_dex"
+
+    def describe(self, run: Any) -> dict[str, Any]:
+        """One run's identity and who started it, never a result row."""
+
+        return {
+            **run.describe(),
+            "invoked_by": self.invoked_by(run),
+            "latest": run is self.newest,
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """``data.build_status_runs``: every run read and every run left out."""
+
+        attributed: dict[int, int] = {}
+        for _, run in self.nodes.values():
+            attributed[id(run)] = attributed.get(id(run), 0) + 1
+        return {
+            "runs": [
+                {**self.describe(run), "nodes": attributed.get(id(run), 0)}
+                for run in self.runs
+            ],
+            "ignored": [
+                {**run.describe(), "reason": reason} for run, reason in self.ignored
+            ],
+        }
+
+
+def _run_label(run: Any) -> str:
+    return (
+        f"dbt {run.command} run {run.invocation_id or '(no recorded id)'} at "
+        f"{run.generated_at or 'an unrecorded time'}"
+    )
+
+
+def node_results(
+    project_dir: Path,
+    *,
+    manifest: dict | None = None,
+    artifact_policy: str | None = None,
+) -> NodeResults:
+    """Each node's status from the latest dated run that attempted it (#1524).
+
+    Standalone, every building run on disk is read (Dex's directory and the
+    project's target path, with their ``cold/``), ordered by dbt's own
+    ``generated_at`` and overlaid oldest first, so a node a later run attempted
+    is judged by that run. The run results beside the newest *manifest* are not
+    the answer: a ``dbt parse`` rewrites a manifest and runs nothing, which
+    paired a fresh manifest with an older run's failures. A run no dbt log
+    beside it records came from somewhere else and is left out, as
+    ``maintain coverage`` leaves it out; a result for a node the manifest no
+    longer has is not attributed.
+
+    Inside a build's own ``--verify`` sweep the build's directory and
+    invocation are pinned, and only that invocation's results are read: another
+    run's passing tests must not vouch for this build's rows.
+    """
+
+    from ..transform.artifact_runtime import (
+        BuildingRun,
+        building_runs,
+        pinned_directory,
+        pinned_invocation_id,
+        run_is_logged,
+    )
+
+    policy = artifact_policy or "isolated"
+    directory = pinned_directory()
+    if directory is not None:
+        result = NodeResults(pinned=True, artifact_policy=policy)
+        path = directory / "run_results.json"
+        if not path.is_file():
+            return result
+        document = json.loads(path.read_text(encoding="utf-8"))
+        meta = document.get("metadata") or {}
+        expected = pinned_invocation_id()
+        written = meta.get("invocation_id")
+        if expected is not None and written is not None and str(written) != expected:
+            return result
+        args = document.get("args") or {}
+        run = BuildingRun(
+            directory=directory,
+            artifact="dex",
+            cold=False,
+            command=str(
+                (args if isinstance(args, dict) else {}).get("which") or "build"
+            ),
+            invocation_id=str(written) if written else expected,
+            generated_at=str(meta.get("generated_at") or ""),
+            mtime=path.stat().st_mtime,
+            document=document,
+        )
+        result.runs.append(run)
+        for row in document.get("results", []):
+            if isinstance(row, dict) and row.get("unique_id"):
+                result.nodes[str(row["unique_id"])] = (row, run)
+        return result
+
+    result = NodeResults(artifact_policy=policy)
+    for run in building_runs(project_dir, include_records=True):
+        if run.source == "dex_record":
+            result.recorded.append(run)
+        if run_is_logged(project_dir, run) is False:
+            result.ignored.append((run, "not_logged"))
+            result.warnings.append(
+                f"build status ignores the {_run_label(run)}: no dbt log beside "
+                "its run_results.json records that invocation, so it was written "
+                "somewhere else (copied artifacts, another checkout)"
+            )
+            continue
+        result.runs.append(run)
+        for row in run.document.get("results") or []:
+            if isinstance(row, dict) and row.get("unique_id"):
+                result.nodes[str(row["unique_id"])] = (row, run)
+
+    document = manifest if manifest is not None else _manifest_document(project_dir)
+    known = set((document or {}).get("nodes") or {}) | set(
+        (document or {}).get("unit_tests") or {}
+    )
+    if known:
+        gone = [uid for uid in result.nodes if uid not in known]
+        for uid in gone:
+            del result.nodes[uid]
+        if gone:
+            result.notes.append(
+                f"{len(gone)} build result(s) belong to nodes the manifest no "
+                "longer has, or has since disabled, and are not reported"
+            )
+
+    newest = result.newest
+    if (
+        newest is not None
+        and result.invoked_by(newest) != "dex"
+        and any(result.invoked_by(run) == "dex" for run in result.runs)
+    ):
+        who = (
+            "was not started by Dex"
+            if result.invoked_by(newest) == "outside_dex"
+            else "sits in the shared target path, so dex cannot tell who ran it"
+        )
+        result.notes.append(
+            f"the newest dbt run on disk, the {_run_label(newest)}, {who}; "
+            "each node's build status is read from the latest run that "
+            "attempted it, named on every build finding under data.run"
+        )
+    return result
 
 
 def read_manifest_target(project_dir: Path) -> str | None:
@@ -189,11 +376,19 @@ def read_manifest_target(project_dir: Path) -> str | None:
     return None
 
 
-def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[str]]:
-    """Nodes that failed, were skipped because a parent failed, or warned, from
-    the last run's ``run_results.json`` joined to the compiled manifest for
-    names and the dependency graph. Free: reads artifacts already on disk,
-    opens no connection.
+def build_status_findings(
+    project_dir: Path, *, results: NodeResults | None = None
+) -> tuple[list[DriftFinding], list[str]]:
+    """Nodes that failed, were skipped because a parent failed, or warned, each
+    judged by the latest dated run that attempted it (:func:`node_results`)
+    and joined to the compiled manifest for names and the dependency graph.
+    Free: reads artifacts already on disk, opens no connection.
+
+    Every finding names the run it was read from under ``data.run``
+    (``invocation_id``, ``generated_at``, ``command``, ``artifact``, ``cold``,
+    ``invoked_by`` and ``latest``), and its ``detail`` says the same in words,
+    so a failure an earlier run recorded and no later run attempted reads as
+    that, never as the current state (#1524).
 
     A skip is walked back through however many transitively-skipped parents
     it takes to name the node that actually failed, since a two-layer partial
@@ -207,25 +402,26 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
     in the raw node list to find out which ones warned.
     """
 
-    nodes = _manifest_nodes(project_dir) or {}
-    results = _run_results(project_dir)
+    manifest = _manifest_document(project_dir) or {}
+    nodes = manifest.get("nodes") or {}
+    unit_tests = manifest.get("unit_tests") or {}
     if results is None:
+        results = node_results(project_dir, manifest=manifest)
+    if not results.found:
         return (
             [],
             [
+                *results.warnings,
                 "no dbt run results found; run `dbt run` or `dbt build` for "
-                "build-status findings"
+                "build-status findings",
             ],
         )
 
     def name_of(uid: str) -> str:
-        return manifest_node_label(uid, nodes.get(uid))
+        node = nodes.get(uid) or unit_tests.get(uid)
+        return manifest_node_label(uid, node if isinstance(node, dict) else None)
 
-    status_by_uid = {
-        r["unique_id"]: str(r.get("status", "unknown"))
-        for r in results
-        if r.get("unique_id")
-    }
+    status_by_uid = results.statuses()
 
     def failed_ancestor(uid: str, seen: set[str]) -> str | None:
         if uid in seen:
@@ -242,44 +438,61 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                     return found
         return None
 
+    newest = results.newest
+
+    def provenance(run) -> tuple[dict, str]:
+        described = results.describe(run)
+        who = {
+            "dex": "started by Dex",
+            "outside_dex": "not started by Dex",
+            "unknown": "in the shared target path",
+        }[described["invoked_by"]]
+        said = f" (read from the {_run_label(run)}, {who}"
+        if run is not newest and newest is not None:
+            said += (
+                f"; an earlier run than the latest, the {_run_label(newest)}, "
+                "which did not attempt it"
+            )
+        return described, said + ")"
+
     findings: list[DriftFinding] = []
-    notes: list[str] = []
+    notes: list[str] = [*results.warnings, *results.notes]
     unrecognized: list[str] = []
-    for result in results:
-        uid = result.get("unique_id")
-        if not uid:
-            continue
+    for uid, (result, run) in results.nodes.items():
         status = str(result.get("status", "unknown"))
         kind = status_kind(status)
         name = name_of(uid)
         if status.lower() in _WARNING_STATUSES:
             message = _dbt_message(result, status)
+            run_data, said = provenance(run)
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="node_warned",
                     identifier=name,
                     severity="low",
-                    detail=f"'{name}' warned rather than failed: {message}",
-                    data={"status": status},
+                    detail=f"'{name}' warned rather than failed: {message}{said}",
+                    data={"status": status, "run": run_data},
                 )
             )
             continue
         if kind == "failed":
             message = _dbt_message(result, status)
+            run_data, said = provenance(run)
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="node_failed",
                     identifier=name,
                     severity="high",
-                    detail=f"'{name}' failed to build: {message}",
-                    data={"status": status},
+                    detail=f"'{name}' failed to build: {message}{said}",
+                    data={"status": status, "run": run_data},
                 )
             )
             continue
         if kind == "skipped":
             cause = failed_ancestor(uid, set())
+            run_data, said = provenance(run)
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -293,8 +506,13 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                         f"'{name}' was skipped because '{cause}' failed to build"
                         if cause
                         else f"'{name}' was skipped"
+                    )
+                    + said,
+                    data=(
+                        {"caused_by": cause, "run": run_data}
+                        if cause
+                        else {"run": run_data}
                     ),
-                    data={"caused_by": cause} if cause else {},
                 )
             )
             continue
@@ -2464,8 +2682,7 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
     from ..dbt_project import manifest_node_label
 
     nodes = _manifest_nodes(project_dir) or {}
-    results = _run_results(project_dir) or []
-    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    status = node_results(project_dir).statuses()
     proven: dict[str, dict] = {}
     unproven: set[str] = set()
     for unique_id in sorted(status):

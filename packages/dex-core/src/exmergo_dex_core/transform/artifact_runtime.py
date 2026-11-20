@@ -489,6 +489,13 @@ def pinned_invocation_id() -> str | None:
     return pinned.invocation_id if pinned is not None else None
 
 
+def pinned_directory() -> Path | None:
+    """The directory a pinned block's readers answer for, if any."""
+
+    pinned = _PINNED.get()
+    return pinned.directory if pinned is not None else None
+
+
 def readable_artifact(project_root: Path | str, name: str) -> Path:
     """The newer of ``name`` in Dex's directory and in the project's target path.
 
@@ -525,7 +532,225 @@ def readable_artifact_dir(project_root: Path | str) -> Path:
 #: dbt commands that attempt to build nodes. A ``compile``, ``parse`` or ``ls``
 #: writes ``run_results.json`` too (Dex prices a build with a compile), and its
 #: ``success`` says a node compiled, not that its relation was rebuilt.
-_BUILDING_COMMANDS = frozenset({"build", "run", "seed", "snapshot", "test"})
+BUILDING_COMMANDS = frozenset({"build", "run", "seed", "snapshot", "test"})
+_BUILDING_COMMANDS = BUILDING_COMMANDS
+
+
+@dataclass(frozen=True)
+class BuildingRun:
+    """One ``run_results.json`` a building dbt command left, and where it sits.
+
+    ``artifact`` is ``dex`` for Dex's isolated directory and ``project`` for the
+    project's own target path; ``cold`` marks the ``cold/`` directory a
+    ``--cold-deps`` build writes beside either. ``generated_at`` is dbt's own
+    stamp, empty where the run recorded none, and ``mtime`` the file's, which
+    orders runs only where the stamps tie.
+    """
+
+    directory: Path
+    artifact: Literal["dex", "project"]
+    cold: bool
+    command: str
+    invocation_id: str | None
+    generated_at: str
+    mtime: float
+    document: dict[str, Any]
+    #: ``run_results`` for a file dbt wrote; ``dex_record`` for a run rebuilt
+    #: from the node record Dex keeps after each of its own builds
+    #: (:mod:`.node_record`), which holds statuses only.
+    source: Literal["run_results", "dex_record"] = "run_results"
+
+    def describe(self) -> dict[str, Any]:
+        """The run's identity, for an envelope: no result row, no message."""
+
+        return {
+            "invocation_id": self.invocation_id,
+            "generated_at": self.generated_at or None,
+            "command": self.command,
+            "artifact": self.artifact,
+            "cold": self.cold,
+            "source": self.source,
+        }
+
+
+def building_runs(
+    project_root: Path | str, *, include_records: bool = False
+) -> list[BuildingRun]:
+    """Every run on disk that attempted to build nodes, oldest first (#1524).
+
+    Read from the project's target path and Dex's isolated directory, each with
+    the ``cold/`` directory beside it, and ordered by ``generated_at`` (the
+    file's mtime where a run recorded none, or two runs tie), never by which
+    directory's manifest is newer: a ``dbt parse`` rewrites a manifest without
+    running anything, so a manifest's age says nothing about the run results
+    beside it. A ``compile``, ``parse`` or ``ls`` is left out. Inside
+    :func:`pinned_artifacts` only the pinned directory and its ``cold/`` are
+    read.
+
+    ``include_records`` adds, per directory, the runs Dex's node record
+    (:mod:`.node_record`) still remembers and no file on disk holds any more:
+    Dex's builds share one directory, so each one's ``run_results.json``
+    replaces the last, and only the record keeps a node an earlier build
+    attempted.
+    """
+
+    from .node_record import recorded_runs
+
+    project = Path(project_root).absolute()
+    shared = shared_target_dir(project)
+    pinned = _PINNED.get()
+    roots: list[tuple[Path, Literal["dex", "project"]]]
+    if pinned is not None:
+        same = _same_path(pinned.directory, shared)
+        roots = [(pinned.directory, "project" if same else "dex")]
+    else:
+        roots = [(shared, "project")]
+        isolated = isolated_artifact_dir(project)
+        if isolated is not None:
+            roots.append((isolated, "dex"))
+    found: list[BuildingRun] = []
+    for root, artifact in roots:
+        for directory, cold in ((root, False), (root / "cold", True)):
+            on_disk = _file_run(directory, artifact, cold)
+            if on_disk is not None:
+                found.append(on_disk)
+            if not include_records:
+                continue
+            for record in recorded_runs(directory):
+                invocation = record["invocation_id"]
+                if on_disk is not None and invocation == on_disk.invocation_id:
+                    continue
+                found.append(
+                    BuildingRun(
+                        directory=directory,
+                        artifact=artifact,
+                        cold=cold,
+                        command=record["command"],
+                        invocation_id=invocation,
+                        generated_at=record["generated_at"],
+                        mtime=record["mtime"],
+                        document={
+                            "metadata": {
+                                "invocation_id": invocation,
+                                "generated_at": record["generated_at"] or None,
+                            },
+                            "results": record["results"],
+                        },
+                        source="dex_record",
+                    )
+                )
+    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
+    found.sort(key=lambda run: (run.generated_at, run.mtime))
+    return found
+
+
+def _file_run(
+    directory: Path, artifact: Literal["dex", "project"], cold: bool
+) -> BuildingRun | None:
+    """The ``run_results.json`` in ``directory``, if a building command wrote it."""
+
+    import json
+
+    path = directory / "run_results.json"
+    try:
+        mtime = path.stat().st_mtime
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    args = document.get("args")
+    which = str((args if isinstance(args, dict) else {}).get("which") or "build")
+    if which not in BUILDING_COMMANDS:
+        return None
+    raw_meta = document.get("metadata")
+    meta = raw_meta if isinstance(raw_meta, dict) else {}
+    invocation = meta.get("invocation_id")
+    return BuildingRun(
+        directory=directory,
+        artifact=artifact,
+        cold=cold,
+        command=which,
+        invocation_id=str(invocation) if invocation else None,
+        generated_at=str(meta.get("generated_at") or ""),
+        mtime=mtime,
+        document=document,
+    )
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a.absolute() == b.absolute()
+
+
+#: The header line dbt's text log writes at the start of each invocation:
+#: ``============================== 10:00:00.000 | <uuid> ===...``.
+_TEXT_HEADER = re.compile(r"=+ .*\| ([0-9a-f-]{36}) =+")
+_JSON_INVOCATION = re.compile(r'"invocation_id"\s*:\s*"([0-9a-f-]{36})"')
+
+
+def dbt_log_files(project_root: Path | str, directory: Path) -> list[Path]:
+    """The dbt logs that could record the invocation that wrote ``directory``.
+
+    A build Dex runs in the project writes the project's log (``logs/`` under
+    the project, or ``DBT_LOG_PATH``); one it runs detached, in a copy, writes
+    ``logs/`` beside its artifacts. dbt rotates its log, so an older invocation
+    can sit in ``dbt.log.1`` and on.
+    """
+
+    project = Path(project_root).absolute()
+    paths = [directory / "logs" / "dbt.log"]
+    configured = os.environ.get("DBT_LOG_PATH")
+    if configured:
+        base = Path(configured).expanduser()
+        paths.append((base if base.is_absolute() else project / base) / "dbt.log")
+    paths.append(project / "logs" / "dbt.log")
+    found: list[Path] = []
+    for path in paths:
+        if path.is_file():
+            found.append(path)
+        found.extend(sorted(path.parent.glob("dbt.log.*")))
+    return list(dict.fromkeys(found))
+
+
+def logged_invocations(path: Path) -> set[str]:
+    """Every invocation id one dbt log names, text or JSON format."""
+
+    found: set[str] = set()
+    try:
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if "invocation_id" in line:
+                    found.update(_JSON_INVOCATION.findall(line))
+                elif line.startswith("="):
+                    match = _TEXT_HEADER.search(line)
+                    if match:
+                        found.add(match.group(1))
+    except OSError:
+        return set()
+    return found
+
+
+def run_is_logged(project_root: Path | str, run: BuildingRun) -> bool | None:
+    """Whether a dbt log beside ``run`` names its invocation.
+
+    ``None`` where there is nothing to check against (no log, or a run that
+    recorded no invocation id): the run is then taken as read. ``False`` means
+    the logs exist and none names it, so the run results were written somewhere
+    else (copied artifacts, another checkout's target path).
+    """
+
+    if not run.invocation_id or run.source == "dex_record":
+        return None
+    logs = dbt_log_files(project_root, run.directory)
+    if not logs:
+        return None
+    logged: set[str] = set()
+    for path in logs:
+        logged |= logged_invocations(path)
+    return run.invocation_id in logged
 
 
 @dataclass(frozen=True)
@@ -572,44 +797,17 @@ def latest_node_runs(project_root: Path | str) -> LatestRuns:
     introduced is in it, the package model it disabled is not.
     """
 
-    import json
-
-    pinned = _PINNED.get()
-    if pinned is not None:
-        roots = [pinned.directory]
-    else:
-        isolated = isolated_artifact_dir(project_root)
-        roots = [shared_target_dir(project_root)] + ([isolated] if isolated else [])
-    found: list[tuple[str, float, Path, bool, dict[str, Any]]] = []
-    for root in roots:
-        for directory, cold in ((root, False), (root / "cold", True)):
-            path = directory / "run_results.json"
-            try:
-                mtime = path.stat().st_mtime
-                document = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if not isinstance(document, dict):
-                continue
-            which = str((document.get("args") or {}).get("which") or "build")
-            if which not in _BUILDING_COMMANDS:
-                continue
-            meta = document.get("metadata") or {}
-            stamp = str(meta.get("generated_at") or "")
-            found.append((stamp, mtime, directory, cold, document))
-    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
-    found.sort(key=lambda run: (run[0], run[1]))
+    found = building_runs(project_root)
     nodes: dict[str, NodeRun] = {}
-    for stamp, _, _, cold, document in found:
-        meta = document.get("metadata") or {}
-        for row in document.get("results") or []:
+    for run in found:
+        for row in run.document.get("results") or []:
             if not isinstance(row, dict) or not row.get("unique_id"):
                 continue
             nodes[str(row["unique_id"])] = NodeRun(
                 status=str(row.get("status") or "").lower(),
-                invocation_id=meta.get("invocation_id"),
-                generated_at=stamp or None,
-                cold=cold,
+                invocation_id=run.invocation_id,
+                generated_at=run.generated_at or None,
+                cold=run.cold,
                 message=(
                     str(row["message"]) if isinstance(row.get("message"), str) else None
                 ),
@@ -620,9 +818,9 @@ def latest_node_runs(project_root: Path | str) -> LatestRuns:
                 ),
             )
     manifest = None
-    for _, _, directory, _, _ in reversed(found):
-        if (directory / "manifest.json").is_file():
-            manifest = directory / "manifest.json"
+    for run in reversed(found):
+        if (run.directory / "manifest.json").is_file():
+            manifest = run.directory / "manifest.json"
             break
     if manifest is None:
         fallback = readable_artifact(project_root, "manifest.json")
