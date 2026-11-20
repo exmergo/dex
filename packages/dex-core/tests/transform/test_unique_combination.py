@@ -256,6 +256,55 @@ def test_a_project_that_defines_the_test_keeps_its_own_copy(
     assert planned["data"]["generated_tests"]["counts"] == {"added": 1}
 
 
+def test_a_file_already_at_the_macro_path_keeps_what_it_defines(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    override = (
+        "{% macro postgres__dex_unique_combination(model, columns) %}\n"
+        "select 0 as dex_duplicate_rows where false\n{% endmacro %}\n"
+    )
+    path = dbt_project_dir / "macros" / "dex_unique_combination.sql"
+    path.parent.mkdir()
+    path.write_text(override, encoding="utf-8")
+
+    planned = _plan(_repo(tmp_path, "true"), capsys)
+    assert planned["status"] == "ok", planned["errors"]
+    main(["--repo-root", str(tmp_path), "transform", "apply"])
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["status"] == "ok", applied
+
+    merged = path.read_text(encoding="utf-8")
+    assert merged.startswith(override)
+    assert "{% test dex_unique_combination(model, columns) %}" in merged
+    assert merged.count("macro default__dex_unique_combination(") == 1
+
+
+def test_a_commented_out_definition_is_no_definition(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    stale = dbt_project_dir / "macros" / "old_tests.sql"
+    stale.parent.mkdir()
+    stale.write_text(
+        "{# {% test dex_unique_combination(model, columns) %}\n"
+        "select 1 {% endtest %} #}\n"
+        "{% macro keep() %}1{% endmacro %}\n",
+        encoding="utf-8",
+    )
+    # The validator reads the file as the one macro it is.
+    validate_edit(
+        PlanEdit(
+            path="macros/old_tests.sql",
+            kind=EditKind.MACRO_SQL,
+            new_content=stale.read_text(encoding="utf-8"),
+        )
+    )
+
+    planned = _plan(_repo(tmp_path, "true"), capsys)
+
+    assert planned["status"] == "ok", planned["errors"]
+    assert "macros/dex_unique_combination.sql" in planned["data"]["paths"]
+
+
 def test_transform_macro_lists_and_scaffolds_it(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

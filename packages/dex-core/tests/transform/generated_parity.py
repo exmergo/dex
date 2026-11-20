@@ -66,6 +66,10 @@ class ParityRow:
     violating: Callable[[str], str]
     clean: Callable[[str], str]
     count: Callable[[Mapping[str, Any]], int] | None = None
+    #: Whether ``maintain verify``'s payload shows it measured the model at all,
+    #: so a clean fixture's absent finding is a verdict and not a check that
+    #: never ran (a refused statement, an unreadable relation).
+    measured: Callable[[Mapping[str, Any], str], bool] | None = None
 
     @property
     def slug(self) -> str:
@@ -85,9 +89,18 @@ def _rows(*rows: tuple[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-#: #1452: a composite grain. Two pairs of rows share it, one through a NULL in a
-#: grain column, which both sides count as a value (``SELECT DISTINCT`` and
-#: ``GROUP BY`` alike), so the violating model has two duplicate rows.
+def _grain_measured(verify: Mapping[str, Any], model: str) -> bool:
+    return any(
+        record.get("model") == model and record.get("status") in {"proven", "broken"}
+        for record in verify.get("grain_coverage") or []
+    )
+
+
+#: #1452: a composite grain. Three rows share one grain value and two share
+#: another through a NULL in a grain column, which both sides count as a value
+#: (``SELECT DISTINCT`` and ``GROUP BY`` alike). The violating model has three
+#: rows beyond the first of each value; a macro counting duplicate *groups*
+#: would say two, so the count comparison tells the two apart.
 UNIQUE_COMBINATION = ParityRow(
     test=gt.UNIQUE_COMBINATION,
     codes=frozenset({"grain_broken"}),
@@ -96,10 +109,17 @@ UNIQUE_COMBINATION = ParityRow(
         "grain": ["order_id", "line_number"],
     },
     violating=lambda null: _rows(
-        ("1", "1"), ("1", "1"), ("1", "2"), ("2", null), ("2", null), ("3", "1")
+        ("1", "1"),
+        ("1", "1"),
+        ("1", "1"),
+        ("1", "2"),
+        ("2", null),
+        ("2", null),
+        ("3", "1"),
     ),
     clean=lambda null: _rows(("1", "1"), ("1", "2"), ("2", null), ("3", "1")),
     count=lambda finding: int(finding["data"]["duplicate_count"]),
+    measured=_grain_measured,
 )
 
 #: Every row the harness runs, in the order the generated tests shipped.
@@ -296,13 +316,14 @@ def run_parity(
         "verify",
         [*root, "maintain", "verify", "--target", "dev", *selected, *_paid(budget)],
     )
-    findings = (verified.get("data") or {}).get("findings") or []
+    verify_data = verified.get("data") or {}
+    findings = verify_data.get("findings") or []
 
     for row in live:
-        _judge(row, results, tests, findings, report)
+        _judge(row, results, tests, findings, report, verify_data)
     for row in rows:
         if row.test in report.unsupported:
-            _judge_unsupported(row, tests, findings, report)
+            _judge_unsupported(row, tests, findings, report, verify_data)
     return report
 
 
@@ -312,6 +333,7 @@ def _judge(
     tests: Mapping[tuple[str, str], str],
     findings: list[Mapping[str, Any]],
     report: ParityReport,
+    verify: Mapping[str, Any],
 ) -> None:
     for side, should_fail in (("violating", True), ("clean", False)):
         model = row.model(side)
@@ -343,6 +365,11 @@ def _judge(
                         f"maintain verify counts {expected}"
                     )
         else:
+            if row.measured is not None and not row.measured(verify, model):
+                report.disagreements.append(
+                    f"{where}: maintain verify did not measure the clean fixture, "
+                    "so its absent finding is no verdict"
+                )
             if not test_passed:
                 report.disagreements.append(
                     f"{where}: the test should pass on the clean fixture, dbt "
@@ -362,6 +389,7 @@ def _judge_unsupported(
     tests: Mapping[tuple[str, str], str],
     findings: list[Mapping[str, Any]],
     report: ParityReport,
+    verify: Mapping[str, Any],
 ) -> None:
     """On an unsupported dialect no test exists, and ``maintain verify`` alone
     answers: still the finding on the violating fixture and none on the clean."""
@@ -375,6 +403,10 @@ def _judge_unsupported(
         found = any(
             f["identifier"] == model and f["code"] in row.codes for f in findings
         )
+        if not owed and row.measured is not None and not row.measured(verify, model):
+            report.disagreements.append(
+                f"{row.test}: maintain verify did not measure {model}"
+            )
         if found is not owed:
             report.disagreements.append(
                 f"{row.test}: maintain verify {'missed' if owed else 'raised'} "

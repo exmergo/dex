@@ -145,3 +145,32 @@ def test_a_dialect_the_test_does_not_support_renders_nothing_and_says_so(
     planned = report.envelopes["plan"]["data"]
     assert planned["generated_tests"]["counts"] == {"not_rendered": 2}
     assert "macros/dex_unique_combination.sql" not in planned["paths"]
+
+
+#: Counts duplicate groups rather than the rows beyond the first of each.
+COUNTS_GROUPS = (
+    "select count(*) as dex_duplicate_rows from (\n"
+    "  select 1 as g from {{ model }} group by {{ columns | join(', ') }}\n"
+    "  having count(*) > 1\n"
+    ") as dex_groups having count(*) > 0"
+)
+
+
+def test_a_macro_that_counts_groups_not_rows_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # It fails the violating fixture as it should, but says 2 where
+    # maintain verify counts 3: the verdicts agree, the numbers do not.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        extra_edits=[_planted("duckdb", COUNTS_GROUPS)],
+    )
+
+    violating = UNIQUE_COMBINATION.model("violating")
+    assert report.disagreements == [
+        f"dex_unique_combination on {violating}: dbt counts 2 failure(s), "
+        "maintain verify counts 3"
+    ]

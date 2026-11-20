@@ -804,7 +804,8 @@ def _with_generated_macros(
     rendered generated test needs and neither the project nor the plan defines
     (#1452), so the plan dbt parses holds the test's definition and the diff
     shows it. A project's own copy, however it differs, is left alone:
-    ``transform macro <name>`` reconciles it."""
+    ``transform macro <name>`` reconciles it. A file already at the asset's
+    path gains only the definitions it lacks."""
 
     from .. import generated_tests as gt
     from . import scaffold as scaffold_mod
@@ -819,9 +820,8 @@ def _with_generated_macros(
     )
     out = list(edits)
     for name in needed:
-        if scaffold_mod.defines_test(view, out, name):
-            continue
-        out.append(scaffold_mod.macro_edit(name, view.macro_paths[0]))
+        if not scaffold_mod.defines_test(view, out, name):
+            out = scaffold_mod.with_shipped_test(view, out, name)
     return out
 
 

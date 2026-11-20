@@ -438,8 +438,10 @@ def _assert_macro_file(path: str, content: str) -> None:
     """A macro file: macro definitions and, as dbt reads them from the macro
     paths too, generic test definitions (``{% test %}``), the way a package
     ships a test beside the dispatched macros that implement it. Each kind is
-    held to its own balance, and nothing loose may sit between them."""
+    held to its own balance, and nothing loose may sit between them. A block
+    inside a Jinja comment is not a definition, so comments go first."""
 
+    content = _JINJA_COMMENT.sub("", content)
     if not (_TEST_OPEN.search(content) or _TEST_CLOSE.search(content)):
         assert_definitions_only(
             path,
