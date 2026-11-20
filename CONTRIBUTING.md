@@ -137,7 +137,11 @@ adds a `ParityRow` to `ROWS` (several, each with its own `name`, where one test
 has several cases to hold, as `dex_population_filter` does for `includes`,
 `excludes`, a NULL and a typed comparison); its fixtures are literal SELECTs,
 written once for every dialect, with the connector's typed integer NULL passed
-in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast. A kind that
+in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast. A row
+whose fixtures read another model (`dex_parent_population`'s declared parent)
+lists it under `fixtures`, built in the same selection, and a test that renders
+several instances on one model (a parent's `missing` and `unexpected`
+directions) picks its own with `arguments`. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 

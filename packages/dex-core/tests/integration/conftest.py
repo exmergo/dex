@@ -483,6 +483,10 @@ def assert_generated_test_parity(
     fixtures, or the test declares the connector unsupported and renders
     nothing there. ``root`` holds a ``.dex/config.yml`` and the project
     ``transform init`` wrote; ``null_int`` is the connector's typed integer NULL.
+    ``budget`` covers one build of every row's fixture models and tests: a
+    connector priced by a per-node heuristic (Snowflake, Databricks, Redshift)
+    estimates more with every row, so a new row can need a larger one (#1454:
+    the parent rows took Snowflake's estimate past 600 seconds).
     Returns the report, so a caller can drop the fixture models it built."""
 
     from transform.generated_parity import ROWS, run_parity

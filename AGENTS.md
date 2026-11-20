@@ -655,12 +655,14 @@ writes a second entry for a model. The built-in tests it renders (`unique`, `not
 `true`, or a list of test names and cadences), each tagged `dex_every_run` or
 `dex_scheduled` so an orchestrator can select them, and listed with their tag,
 claim and status under `data.generated_tests` (#1449). A composite `grain`
-renders `dex_unique_combination` (#1452) and each `population.filters` list
-renders `dex_population_filter` under its column (#1453), each agreeing with
+renders `dex_unique_combination` (#1452), each `population.filters` list
+renders `dex_population_filter` under its column (#1453), and a
+`population.parent` renders `dex_parent_population` twice, its `missing` and
+`unexpected` directions, tagged `dex_scheduled` (#1454), each agreeing with
 `maintain verify`'s finding count for count, and the plan writes each one's
 macro as a `macro_sql` diff; a kind renders only on the connectors it states,
 and is `not_rendered` with `reason: dialect_unsupported` elsewhere (#1451), and
-a column test whose column the model provably does not output is `not_rendered`
+a test reading a column the model provably does not output is `not_rendered`
 with `reason: column_not_output`. A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry

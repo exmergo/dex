@@ -117,6 +117,16 @@ def test_each_filter_and_each_list_is_its_own_test_and_claim():
     assert len(claims) == 3
 
 
+def test_the_plan_report_names_each_list():
+    generated: list = []
+    _render(
+        _declared({"column": "status", "includes": ["a"], "excludes": ["b"]}),
+        True,
+        generated=generated,
+    )
+    assert [g["variant"] for g in generated] == ["includes", "excludes"]
+
+
 def test_the_values_keep_their_case_in_the_claim():
     upper = _render(_declared({"column": "status", "excludes": ["Paid"]}), True)
     lower = _render(_declared({"column": "status", "excludes": ["paid"]}), True)
