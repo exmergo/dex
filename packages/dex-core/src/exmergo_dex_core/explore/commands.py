@@ -5786,6 +5786,13 @@ def _split_fresh_stale(
     stale to every caller outside that mode, who would otherwise be served an
     incomplete profile as a complete one. A caller in the mode can reuse either
     kind, since it projects the values away before anything leaves.
+
+    A reused profile keeps its columns, keys, grain, notes and ``profiled_at``
+    (it is still a cache hit, not a re-scan), but its ``row_count`` and
+    ``byte_size`` are refreshed from the metadata call above, which this run
+    already paid for: without that, a volume change the warehouse already had
+    would be pinned stale by the next ``maintain snapshot`` and reported again
+    by ``maintain check`` (#985).
     """
 
     if (
@@ -5821,7 +5828,19 @@ def _split_fresh_stale(
         if _column_signature(columns) != _column_signature(prior_ds.columns):
             stale.append(identifier)
             continue
-        fresh[identifier] = prior_ds.model_copy(deep=True)
+        reused = prior_ds.model_copy(deep=True)
+        # The metadata call already fetched this run's inventory facts for
+        # free: a profile reused wholesale would otherwise keep the row count
+        # it was written with, and `maintain snapshot` would pin that stale
+        # count, so the next `maintain check` reports an expected volume
+        # change as `row_count_changed` again (#985). Refresh the counts the
+        # metadata actually carries; a None stays None rather than
+        # overwriting a measured count with "unknown".
+        if _meta.row_count is not None:
+            reused.row_count = _meta.row_count
+        if _meta.byte_size is not None:
+            reused.byte_size = _meta.byte_size
+        fresh[identifier] = reused
     return stale, fresh
 
 
