@@ -269,6 +269,58 @@ def test_a_unit_test_binds_to_the_version_it_tests():
     assert _record(inv, "models", "dim.v1")["tested"] is False
 
 
+def test_freshness_checks_carry_their_last_freshness_run():
+    fresh = {
+        "warn_after": {"count": 12, "period": "hour"},
+        "error_after": {"count": None, "period": None},
+    }
+    manifest = _manifest(
+        sources={
+            f"source.{PROJECT}.raw.orders": _source(
+                "orders", columns=["id"], freshness=fresh
+            ),
+            f"source.{PROJECT}.raw.events": _source(
+                "events", columns=["id"], freshness=fresh
+            ),
+        },
+    )
+    inv = coverage_mod.inventory(
+        manifest,
+        freshness_statuses={f"source.{PROJECT}.raw.orders": "error"},
+    )
+    orders = _record(inv, "sources", "raw.orders")
+    events = _record(inv, "sources", "raw.events")
+    assert {
+        "kind": "freshness",
+        "severity": "warn",
+        "last_run": "error",
+    } in orders["tests"]
+    assert {
+        "kind": "freshness",
+        "severity": "warn",
+        "last_run": "not_run",
+    } in events["tests"]
+
+
+def test_freshness_checks_carry_no_last_run_without_a_freshness_run():
+    fresh = {
+        "warn_after": {"count": 12, "period": "hour"},
+        "error_after": {"count": None, "period": None},
+    }
+    manifest = _manifest(
+        sources={
+            f"source.{PROJECT}.raw.orders": _source(
+                "orders", columns=["id"], freshness=fresh
+            ),
+        },
+    )
+    inv = coverage_mod.inventory(manifest)
+    orders = _record(inv, "sources", "raw.orders")
+    (entry,) = [t for t in orders["tests"] if t["kind"] == "freshness"]
+    assert "last_run" not in entry
+    assert "by_last_run" not in inv.summary["tests"]
+
+
 def test_source_tests_and_freshness_attach_through_their_dependency():
     fresh = {
         "warn_after": {"count": 12, "period": "hour"},

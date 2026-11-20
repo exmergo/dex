@@ -57,6 +57,16 @@ _STATUS_MAP = {
     "skipped": "skipped",
 }
 
+#: The statuses a source freshness result is reported with. A freshness check
+#: has no ``fail`` or ``skipped``: dbt reports it ``pass``, ``warn``, ``error``
+#: or ``runtime error``.
+_FRESHNESS_STATUS_MAP = {
+    "pass": "pass",
+    "warn": "warn",
+    "error": "error",
+    "runtime error": "error",
+}
+
 #: The header line dbt's text log writes at the start of each invocation:
 #: ``============================== 10:00:00.000 | <uuid> ===...``.
 _TEXT_HEADER = re.compile(r"=+ .*\| ([0-9a-f-]{36}) =+")
@@ -69,6 +79,25 @@ class LastRun:
 
     #: Test and unit test unique id to ``pass``, ``fail``, ``warn``, ``error`` or
     #: ``skipped``. A test absent here did not run in that invocation.
+    statuses: dict[str, str] = field(default_factory=dict)
+    #: ``invocation_id``, ``generated_at``, ``age_seconds``, ``command``,
+    #: ``artifact`` (``dex`` or ``project``) and ``cold``; ``None`` with no run.
+    run: dict[str, Any] | None = None
+    notes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class LastFreshnessRun:
+    """Each source's freshness status in the newest freshness run (#1347).
+
+    ``sources.json`` is what ``dbt source freshness`` writes, where
+    ``run_results.json`` carries no source freshness status, so a source's
+    freshness check had no ``last_run`` even when it ran and failed.
+    """
+
+    #: Source unique id to ``pass``, ``warn`` or ``error``. A source absent
+    #: here did not run in that invocation.
     statuses: dict[str, str] = field(default_factory=dict)
     #: ``invocation_id``, ``generated_at``, ``age_seconds``, ``command``,
     #: ``artifact`` (``dex`` or ``project``) and ``cold``; ``None`` with no run.
@@ -97,7 +126,19 @@ class _Candidate:
     cold: bool
 
 
-def _candidates(project_dir: Path) -> list[_Candidate]:
+def _candidates(
+    project_dir: Path,
+    *,
+    filename: str = "run_results.json",
+    commands: frozenset[str] | None = _BUILDING_COMMANDS,
+) -> list[_Candidate]:
+    """The readable ``filename`` documents in the artifact directories.
+
+    ``commands`` is the set of dbt commands whose document counts, or
+    ``None`` where the file is written by one command only (``sources.json``
+    is only ever a source freshness run).
+    """
+
     roots: list[tuple[Path, str]] = [(shared_target_dir(project_dir), "project")]
     isolated = isolated_artifact_dir(project_dir)
     if isolated is not None:
@@ -105,7 +146,7 @@ def _candidates(project_dir: Path) -> list[_Candidate]:
     found: list[_Candidate] = []
     for root, artifact in roots:
         for directory, cold in ((root, False), (root / "cold", True)):
-            path = directory / "run_results.json"
+            path = directory / filename
             try:
                 mtime = path.stat().st_mtime
                 document = json.loads(path.read_text(encoding="utf-8"))
@@ -113,9 +154,10 @@ def _candidates(project_dir: Path) -> list[_Candidate]:
                 continue
             if not isinstance(document, dict):
                 continue
-            which = str((document.get("args") or {}).get("which") or "build")
-            if which not in _BUILDING_COMMANDS:
-                continue
+            if commands is not None:
+                which = str((document.get("args") or {}).get("which") or "build")
+                if which not in commands:
+                    continue
             meta = document.get("metadata") or {}
             found.append(
                 _Candidate(
@@ -294,6 +336,128 @@ def last_run(
     if unrecognized:
         result.notes.append(
             f"{unrecognized} test result(s) carried a status dex does not "
+            "recognize and are reported not_run"
+        )
+    return result
+
+
+def _current_sources(manifest: dict[str, Any]) -> set[str]:
+    """Enabled source ids in the manifest the caller inventories."""
+
+    ids: set[str] = set()
+    for unique_id, node in (manifest.get("sources") or {}).items():
+        if not isinstance(node, dict) or node.get("resource_type") != "source":
+            continue
+        if (node.get("config") or {}).get("enabled") is False:
+            continue
+        ids.add(str(unique_id))
+    return ids
+
+
+def last_freshness_run(
+    project_dir: Path, manifest: dict[str, Any], *, now: datetime | None = None
+) -> LastFreshnessRun:
+    """The newest freshness run's status for each source ``manifest`` still has.
+
+    Reads the newest ``sources.json`` in the same artifact directories the
+    run-results reader uses. Only ``sources.json`` is read, and only a row's
+    id and status: no ``max_loaded_at``, no message.
+    """
+
+    project_dir = Path(project_dir).absolute()
+    found = _candidates(project_dir, filename="sources.json", commands=None)
+    if not found:
+        return LastFreshnessRun(
+            notes=[
+                "no sources.json from a dbt source freshness run was found in "
+                "the project's target path or Dex's artifact directory, so every "
+                "freshness check is not_run: nothing records that it ever ran"
+            ]
+        )
+    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
+    newest = max(found, key=lambda run: (run.generated_at, run.mtime))
+    meta = newest.document.get("metadata") or {}
+    invocation = str(meta["invocation_id"]) if meta.get("invocation_id") else None
+    run: dict[str, Any] = {
+        "invocation_id": invocation,
+        "generated_at": newest.generated_at or None,
+        "command": str(
+            (newest.document.get("args") or {}).get("which") or "source freshness"
+        ),
+        "artifact": newest.artifact,
+        "cold": newest.cold,
+    }
+    when = _parse_time(newest.generated_at)
+    if when is not None:
+        moment = now or datetime.now(UTC)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        run["age_seconds"] = max(0, int((moment - when).total_seconds()))
+
+    result = LastFreshnessRun(run=run)
+    where = (
+        "Dex's artifact directory"
+        if newest.artifact == "dex"
+        else ("the project's target path")
+    )
+    if newest.cold:
+        where += " (a --cold-deps build)"
+
+    logs = _log_files(project_dir, newest.directory)
+    if invocation and logs:
+        logged: set[str] = set()
+        for path in logs:
+            logged |= _logged_invocations(path)
+        if invocation not in logged:
+            result.warnings.append(
+                f"the sources.json in {where} names invocation {invocation}, "
+                "which no dbt log beside it records, so it was written somewhere "
+                "else (copied artifacts, another checkout) and no freshness "
+                "status is taken from it: every freshness check is reported "
+                "not_run"
+            )
+            return result
+    elif invocation and not logs:
+        result.notes.append(
+            "no dbt log was found to confirm the invocation that wrote "
+            "sources.json; its statuses are attributed as read"
+        )
+
+    current = _current_sources(manifest)
+    dropped = 0
+    unrecognized = 0
+    for row in newest.document.get("results") or []:
+        if not isinstance(row, dict) or not row.get("unique_id"):
+            continue
+        unique_id = str(row["unique_id"])
+        if not unique_id.startswith("source."):
+            continue
+        if unique_id not in current:
+            dropped += 1
+            continue
+        status = _FRESHNESS_STATUS_MAP.get(str(row.get("status") or "").strip().lower())
+        if status is None:
+            unrecognized += 1
+            continue
+        result.statuses[unique_id] = status
+
+    age = run.get("age_seconds")
+    result.notes.append(
+        f"source freshness statuses are read from one dbt {run['command']} "
+        f"invocation ({invocation or 'with no recorded id'}) in {where}, "
+        f"generated at {run['generated_at'] or 'an unrecorded time'}"
+        + (f", {age} second(s) before this read" if age is not None else "")
+        + "; it describes that run only. A source it did not check is not_run"
+    )
+    if dropped:
+        result.notes.append(
+            f"{dropped} freshness result(s) in that run belong to sources the "
+            "project no longer has, or has since disabled, and are not "
+            "attributed"
+        )
+    if unrecognized:
+        result.notes.append(
+            f"{unrecognized} freshness result(s) carried a status dex does not "
             "recognize and are reported not_run"
         )
     return result

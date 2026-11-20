@@ -299,3 +299,177 @@ def test_target_path_from_environment(
 
     assert found.statuses == {NOT_NULL: "pass"}
     assert os.fspath(elsewhere) not in json.dumps(found.run)
+
+
+# --- source freshness, from sources.json (#1347) -----------------------------
+
+SRC_ORDERS = "source.shop.raw.orders"
+SRC_CUSTOMERS = "source.shop.raw.customers"
+
+
+def _fresh_manifest(*extra_sources: str) -> dict:
+    sources = {
+        uid: {"resource_type": "source", "config": {"enabled": True}}
+        for uid in (SRC_ORDERS, SRC_CUSTOMERS, *extra_sources)
+    }
+    return {"sources": sources}
+
+
+def _write_sources(
+    directory: Path,
+    rows: dict[str, str],
+    *,
+    invocation: str = INV_A,
+    generated_at: str = "2026-11-15T11:00:00.000000Z",
+) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    document = {
+        "metadata": {
+            "dbt_schema_version": "https://schemas.getdbt.com/dbt/sources/v3.json",
+            "dbt_version": "1.12.0",
+            "generated_at": generated_at,
+            "invocation_id": invocation,
+        },
+        "results": [
+            {
+                "unique_id": uid,
+                "status": status,
+                "max_loaded_at": "2026-11-15T10:59:00.000000Z",
+                "message": "freshness check on raw.orders took 1.2s",
+            }
+            for uid, status in rows.items()
+        ],
+        "elapsed_time": 1.5,
+        "args": {"which": "source freshness"},
+    }
+    (directory / "sources.json").write_text(json.dumps(document))
+
+
+def test_reads_a_dex_freshness_run(project: Path) -> None:
+    _write_sources(
+        _dex_dir(project),
+        {SRC_ORDERS: "pass", SRC_CUSTOMERS: "runtime error"},
+    )
+    _write_log(project, INV_A)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "pass", SRC_CUSTOMERS: "error"}
+    assert found.run == {
+        "invocation_id": INV_A,
+        "generated_at": "2026-11-15T11:00:00.000000Z",
+        "command": "source freshness",
+        "artifact": "dex",
+        "cold": False,
+        "age_seconds": 3600,
+    }
+    assert found.warnings == []
+
+
+def test_reads_a_plain_dbt_freshness_run_in_target(project: Path) -> None:
+    _write_sources(project / "target", {SRC_ORDERS: "warn"})
+    _write_log(project, INV_A, text=True)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "warn"}
+    assert found.run is not None and found.run["artifact"] == "project"
+
+
+def test_the_newer_freshness_run_wins(project: Path) -> None:
+    _write_sources(
+        project / "target",
+        {SRC_ORDERS: "error"},
+        invocation=INV_A,
+        generated_at="2026-11-15T09:00:00Z",
+    )
+    _write_sources(
+        _dex_dir(project),
+        {SRC_ORDERS: "pass"},
+        invocation=INV_B,
+        generated_at="2026-11-15T10:00:00Z",
+    )
+    _write_log(project, INV_A, INV_B)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "pass"}
+    assert found.run is not None
+    assert found.run["invocation_id"] == INV_B
+    assert found.run["age_seconds"] == 7200
+
+
+def test_a_freshness_mismatched_invocation_is_not_attributed(project: Path) -> None:
+    _write_sources(_dex_dir(project), {SRC_ORDERS: "pass"}, invocation=INV_A)
+    _write_log(project, INV_B)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {}
+    assert found.run is not None and found.run["invocation_id"] == INV_A
+    assert any(INV_A in warning for warning in found.warnings)
+
+
+def test_no_sources_json_is_a_note(project: Path) -> None:
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {}
+    assert found.run is None
+    assert found.warnings == []
+    assert found.notes and "not_run" in found.notes[0]
+
+
+def test_a_result_for_a_removed_source_is_dropped(project: Path) -> None:
+    gone = "source.shop.raw.legacy"
+    disabled = "source.shop.raw.archived"
+    manifest = _fresh_manifest(disabled)
+    manifest["sources"][disabled]["config"]["enabled"] = False
+    _write_sources(
+        _dex_dir(project), {gone: "error", disabled: "error", SRC_ORDERS: "pass"}
+    )
+    _write_log(project, INV_A)
+    found = coverage_runs.last_freshness_run(project, manifest, now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "pass"}
+    assert any("2 freshness result(s)" in note for note in found.notes)
+
+
+def test_freshness_runtime_error_spelling_and_unknown_statuses(
+    project: Path,
+) -> None:
+    _write_sources(
+        _dex_dir(project), {SRC_ORDERS: "runtime error", SRC_CUSTOMERS: "no-op"}
+    )
+    _write_log(project, INV_A)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "error"}
+    assert any("does not recognize" in note for note in found.notes)
+
+
+def test_nothing_from_a_freshness_row_but_id_and_status(project: Path) -> None:
+    _write_sources(_dex_dir(project), {SRC_ORDERS: "error"})
+    _write_log(project, INV_A)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    rendered = json.dumps(
+        {"s": found.statuses, "r": found.run, "n": found.notes, "w": found.warnings}
+    )
+    for leaked in (
+        "max_loaded_at",
+        "freshness check on raw.orders",
+        "2026-11-15T10:59",
+    ):
+        assert leaked not in rendered
+    # Worded as one dated run, never as the current state.
+    assert "recent" not in rendered and "current" not in rendered
+
+
+def test_a_cold_deps_freshness_run_is_read(project: Path) -> None:
+    _write_sources(
+        _dex_dir(project) / "cold",
+        {SRC_ORDERS: "error"},
+        generated_at="2026-11-15T11:30:00Z",
+    )
+    _write_sources(_dex_dir(project), {SRC_ORDERS: "pass"})
+    _write_log(project, INV_A)
+    found = coverage_runs.last_freshness_run(project, _fresh_manifest(), now=NOW)
+
+    assert found.statuses == {SRC_ORDERS: "error"}
+    assert found.run is not None and found.run["cold"] is True

@@ -242,6 +242,12 @@ class CoverageResult(Result):
     #: invocation, when dbt wrote it and how old it is. ``None`` where no run
     #: was found, which a note says; every test then reads ``not_run``.
     last_run: dict[str, Any] | None = None
+    #: The latest freshness run each source freshness status was read from
+    #: (#1347): its invocation, when dbt wrote it and how old it is. ``None``
+    #: where no run was found, which a note says; every freshness check then
+    #: reads ``not_run``. It describes the freshness run only, never the
+    #: test run ``last_run`` describes.
+    freshness_run: dict[str, Any] | None = None
     #: What checks each declared fact (#1283): a summary and one record per
     #: fact, ``checked_by`` a dbt test, ``maintain verify``, both or nothing.
     declarations: dict[str, Any] | None = None
@@ -268,6 +274,7 @@ class CoverageResult(Result):
             payload["manifest"] = self.manifest
         if self.summary is not None:
             payload["last_run"] = self.last_run
+            payload["freshness_run"] = self.freshness_run
         payload.update(self.sections)
         if self.declarations is not None:
             payload["declarations"] = self.declarations
