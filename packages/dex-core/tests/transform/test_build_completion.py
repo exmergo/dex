@@ -1081,6 +1081,60 @@ def test_a_versioned_deliverable_named_by_its_file_stem_keeps_its_tests_listed()
     assert [t.test for t in completion.assurance.unchecked_tests] == ["volume_dim"]
 
 
+def test_a_versioned_deliverable_named_by_its_file_stem_is_asserted():
+    """A plan requires ``dim_customers_v2`` (the file stem), the node's label
+    is ``dim_customers.v2``, and a passing test names its model by the label:
+    the deliverable is ``asserted``, not ``build_only`` (#1499)."""
+
+    uid = "model.dex_test.dim_customers.v2"
+    test = "test.dex_test.not_null_dim_customers_id.1"
+    nodes = [
+        BuildNode(unique_id=uid, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=test,
+            name="not_null_dim_customers_id",
+            resource_type="test",
+            status="pass",
+        ),
+    ]
+    completion = summarize_completion(
+        _evidence(nodes, required=["dim_customers_v2"]),
+        None,
+        graph={test: [uid]},
+    )
+    assert completion.assurance.basis == "required"
+    assert completion.assurance.asserted.names == ["dim_customers_v2"]
+    assert completion.assurance.build_only.count == 0
+
+
+def test_a_versioned_deliverable_named_by_its_file_stem_reports_its_failed_check():
+    """The same mismatch on the failing side: a failing test on the versioned
+    model puts the deliverable under ``failed_checks`` with its check, not
+    under ``build_only`` (#1499)."""
+
+    uid = "model.dex_test.dim_customers.v2"
+    test = "test.dex_test.not_null_dim_customers_id.1"
+    nodes = [
+        BuildNode(unique_id=uid, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=test,
+            name="not_null_dim_customers_id",
+            resource_type="test",
+            status="fail",
+        ),
+    ]
+    completion = summarize_completion(
+        _evidence(nodes, required=["dim_customers_v2"]),
+        None,
+        graph={test: [uid]},
+    )
+    assert completion.assurance.failed_checks.names == ["dim_customers_v2"]
+    assert [c.name for c in completion.assurance.failed_checks.checks] == [
+        "not_null_dim_customers_id"
+    ]
+    assert completion.assurance.build_only.count == 0
+
+
 def test_the_warning_counts_the_unchecked_tests_the_cap_cut(monkeypatch):
     from exmergo_dex_core.transform import commands
 

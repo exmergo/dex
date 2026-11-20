@@ -867,6 +867,24 @@ def _covered(
     ]
 
 
+def _answered(names: set[str], evidence: BuildEvidence) -> set[str]:
+    """Every name a set of model labels answers to.
+
+    A check names its model by label (``dim_customers.v2``) and a deliverable
+    may be the file stem (``dim_customers_v2``), so a set of labels is matched
+    against deliverable names through every name the node answers to (#1499),
+    the way :func:`_covered` does for the unchecked tests (#1308).
+    """
+
+    answered = set(names)
+    for node in evidence.nodes:
+        if node.name in names and (
+            node.unique_id.startswith("model.") or node.resource_type == "model"
+        ):
+            answered.update(node_answers(node))
+    return answered
+
+
 def _bounded(text: str, limit: int = _MESSAGE) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
@@ -1023,7 +1041,17 @@ def summarize_completion(
     asserted, failed_checks, failures, empty = _checked(
         evidence, graph, verification, unchecked_tests
     )
-    failed_names = list(dict.fromkeys(n for n in built_names if n in failed_checks))
+    # A check names its model by label and a deliverable may be the file
+    # stem: match both through every name the node answers to (#1499). The
+    # names listed stay the deliverable names, whichever name the plan uses.
+    asserted_names = _answered(asserted, evidence)
+    failed_names = list(
+        dict.fromkeys(n for n in built_names if n in _answered(failed_checks, evidence))
+    )
+    failures_by_name: dict[str, list[FailedCheck]] = {}
+    for label, checks in failures.items():
+        for name in _answered({label}, evidence):
+            failures_by_name.setdefault(name, checks)
     statuses = Counter(n.status.lower() for n in evidence.nodes)
     completion = BuildCompletion(
         outcome=evidence.outcome.value,
@@ -1038,13 +1066,15 @@ def summarize_completion(
         blockers=blockers,
         assurance=Assurance(
             basis="required" if deliverables.coverage == "known" else "built_models",
-            asserted=_names(n for n in built_names if n in asserted),
+            asserted=_names(n for n in built_names if n in asserted_names),
             failed_checks=FailedChecks(
                 **_names(failed_names).model_dump(),
-                checks=_one_per_model_first(failed_names, failures),
+                checks=_one_per_model_first(failed_names, failures_by_name),
             ),
             build_only=_names(
-                n for n in built_names if n not in asserted and n not in failed_checks
+                n
+                for n in built_names
+                if n not in asserted_names and n not in failed_names
             ),
             unchecked_tests=_covered(empty, evidence, built_names) or None,
         ),
