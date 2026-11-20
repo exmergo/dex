@@ -1099,13 +1099,20 @@ commit:
    It pins the three skill wrappers to the engine version, bumps the four plugin
    manifests, writes the release's section of `CHANGELOG.md` dated today in UTC,
    and deletes the fragments it collected. It stages nothing; every change is
-   left in the working tree.
+   left in the working tree. Pass both versions bare: a leading `v` is dropped,
+   and a plugin version that is not semver is refused before anything is written.
 
 3. Review `git status` and `git diff`, and update any documentation the release
    changes: status and capability claims, install commands, version strings.
 4. Commit the changelog, the deleted fragments, the pins and the manifests
    together (`git commit -a` includes the deletions). The pull request edits
-   `CHANGELOG.md`, so it carries the `no-changelog` label.
+   `CHANGELOG.md`, so it carries the `no-changelog` label. Its **Release prep**
+   check (`.github/workflows/release-prep.yml`) holds the versions to their
+   shape with `scripts/check_release_versions.py` (bare PEP 440 engine pins, the
+   newest `CHANGELOG.md` section, bare semver manifests that agree with the
+   engine), and fails if the tree is not exactly what the script writes, such as
+   a `claude/` folder left behind by a skill edited after the script ran. Run
+   `python3 scripts/check_release_versions.py` to check before pushing.
 5. Once it is merged, tag the merged commit and push the tag. The release
    workflow refuses, before anything reaches PyPI, a tag whose wrapper pins do
    not match it or whose `CHANGELOG.md` has no section for it.
