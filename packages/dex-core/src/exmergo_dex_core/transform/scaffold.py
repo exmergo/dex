@@ -161,7 +161,7 @@ def macro_edit(name: str, macro_dir: str) -> PlanEdit:
         / f"{name}.sql"
     )
     return PlanEdit(
-        path=f"{macro_dir}/{name}.sql",
+        path=f"{macro_dir.rstrip('/')}/{name}.sql",
         kind=EditKind.MACRO_SQL,
         new_content=asset.read_text(encoding="utf-8"),
     )
@@ -169,24 +169,34 @@ def macro_edit(name: str, macro_dir: str) -> PlanEdit:
 
 def defines_test(view: DbtProjectView, edits: list[PlanEdit], name: str) -> bool:
     """Whether the project or this plan already defines the generic test
-    ``name`` (``{% test name(`` anywhere under a macro or test path, or in a
-    macro or test edit the plan carries). Presence-based, as
+    ``name`` (``{% test name(`` under a macro or test path, or in a macro or
+    test edit the plan carries, outside Jinja comments). Presence-based, as
     :func:`missing_macro_warnings` is: a copy that differs from the shipped one
     is the project's, and ``transform macro <name>`` reconciles it."""
 
-    roots = [*view.macro_paths, *view.test_paths]
+    return _defined(view, edits, "test", name)
+
+
+def _defined(
+    view: DbtProjectView, edits: list[PlanEdit], keyword: str, name: str
+) -> bool:
+    """Whether any file dbt reads definitions from, as this plan leaves the
+    project, defines ``{% keyword name(``: the project's macro and test files
+    the plan does not rewrite, then the plan's own macro and test edits."""
+
+    roots = [root.rstrip("/") for root in (*view.macro_paths, *view.test_paths)]
     planned = {e.path for e in edits}
     for source in view.files.values():
         if source.path in planned:
             continue
         if any(source.path.startswith(f"{root}/") for root in roots) and (
-            _defines(source.content, "test", name)
+            _defines(source.content, keyword, name)
         ):
             return True
     return any(
         e.kind in (EditKind.MACRO_SQL, EditKind.TEST_SQL)
         and e.new_content is not None
-        and _defines(e.new_content, "test", name)
+        and _defines(e.new_content, keyword, name)
         for e in edits
     )
 
@@ -213,12 +223,23 @@ def with_shipped_test(
 ) -> list[PlanEdit]:
     """``edits`` with the shipped generic test ``name`` written into the project.
 
-    Where the macro asset's path is free, it is one new file. Where a file is
-    already there (one holding a project's ``postgres__<name>`` override, say),
-    the definitions it lacks are appended to it, so nothing it defines is lost
-    and nothing is defined twice."""
+    Each definition the asset holds (the test, its ``default__`` macro) is
+    written only where no file dbt reads already defines it, since dbt refuses
+    one name defined twice. A free asset path gets the asset as shipped when
+    every definition is missing, and only the missing ones otherwise. A file
+    already at the path (one holding a ``postgres__<name>`` override, say)
+    keeps every byte and gains the missing definitions after them."""
 
     edit = macro_edit(name, view.macro_paths[0])
+    asset = edit.new_content or ""
+    blocks = list(_DEFINITION.finditer(asset))
+    missing = [
+        match.group(0)
+        for match in blocks
+        if not _defined(view, edits, match.group(1), match.group(2))
+    ]
+    if not missing:
+        return list(edits)
     planned = next((e for e in edits if e.path == edit.path), None)
     if planned is not None:
         existing = planned.new_content
@@ -226,21 +247,15 @@ def with_shipped_test(
         source = view.files.get(edit.path)
         existing = source.content if source is not None else None
     if existing is None:
-        return [*edits, edit]
-    missing = [
-        match.group(0)
-        for match in _DEFINITION.finditer(edit.new_content or "")
-        if not _defines(existing, match.group(1), match.group(2))
-    ]
-    if not missing:
-        return list(edits)
-    merged = existing.rstrip("\n") + "\n\n" + "\n\n".join(missing) + "\n"
+        content = asset if len(missing) == len(blocks) else "\n\n".join(missing) + "\n"
+    else:
+        content = existing.rstrip("\n") + "\n\n" + "\n\n".join(missing) + "\n"
     if planned is not None:
         return [
-            e.model_copy(update={"new_content": merged}) if e is planned else e
+            e.model_copy(update={"new_content": content}) if e is planned else e
             for e in edits
         ]
-    return [*edits, edit.model_copy(update={"new_content": merged})]
+    return [*edits, edit.model_copy(update={"new_content": content})]
 
 
 def missing_macro_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[str]:

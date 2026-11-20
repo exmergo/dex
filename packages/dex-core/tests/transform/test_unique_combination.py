@@ -279,6 +279,56 @@ def test_a_file_already_at_the_macro_path_keeps_what_it_defines(
     assert merged.count("macro default__dex_unique_combination(") == 1
 
 
+def test_a_default_defined_in_another_file_is_not_written_twice(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    elsewhere = dbt_project_dir / "macros" / "overrides.sql"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text(
+        "{% macro default__dex_unique_combination(model, columns) %}\n"
+        "select 0 as dex_duplicate_rows where false\n{% endmacro %}\n",
+        encoding="utf-8",
+    )
+
+    planned = _plan(_repo(tmp_path, "true"), capsys)
+
+    # dbt parsed the plan, so no name is defined twice.
+    assert planned["status"] == "ok", planned["errors"]
+    main(["--repo-root", str(tmp_path), "transform", "apply"])
+    capsys.readouterr()
+    written = (dbt_project_dir / "macros" / "dex_unique_combination.sql").read_text()
+    assert "{% test dex_unique_combination(model, columns) %}" in written
+    assert "default__dex_unique_combination" not in written
+
+
+def test_a_macro_path_written_with_a_trailing_slash_finds_its_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    project_yml = dbt_project_dir / "dbt_project.yml"
+    project_yml.write_text(
+        project_yml.read_text(encoding="utf-8") + 'macro-paths: ["macros/"]\n',
+        encoding="utf-8",
+    )
+    path = dbt_project_dir / "macros" / "dex_unique_combination.sql"
+    path.parent.mkdir()
+    path.write_text(
+        "{% macro postgres__dex_unique_combination(model, columns) %}\n"
+        "select 0 as dex_duplicate_rows where false\n{% endmacro %}\n",
+        encoding="utf-8",
+    )
+
+    planned = _plan(_repo(tmp_path, "true"), capsys)
+    assert planned["status"] == "ok", planned["errors"]
+    assert "macros/dex_unique_combination.sql" in planned["data"]["paths"]
+    main(["--repo-root", str(tmp_path), "transform", "apply"])
+    applied = json.loads(capsys.readouterr().out)
+
+    assert applied["status"] == "ok", applied
+    merged = path.read_text(encoding="utf-8")
+    assert merged.startswith("{% macro postgres__dex_unique_combination(")
+    assert "{% test dex_unique_combination(model, columns) %}" in merged
+
+
 def test_a_commented_out_definition_is_no_definition(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
