@@ -302,12 +302,22 @@ def split_label(name: str) -> tuple[str, str | None]:
 
 def ref_call(name: str) -> str:
     """The ``ref()`` a test argument names ``name`` with: ``ref('dim_teams',
-    v=2)`` for a version label, ``ref('dim_teams')`` otherwise. dbt renders a
+    v=2)`` for a version label (``v='beta'`` for one that is not a number),
+    ``ref('dim_teams')`` otherwise. dbt renders a
     generic test's arguments as Jinja, so the string resolves as a ref."""
 
     base, version = split_label(name)
     if version is not None:
-        return f"ref('{base}', v={version})"
+        # dbt takes a number or any string as a version: a number is written
+        # bare, anything else as a quoted string, which Jinja would otherwise
+        # read as a variable (`v=beta`).
+        numeric = version.isascii() and version.replace(".", "", 1).isdigit()
+        literal = (
+            version
+            if numeric
+            else "'" + version.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        )
+        return f"ref('{base}', v={literal})"
     return f"ref('{name}')"
 
 

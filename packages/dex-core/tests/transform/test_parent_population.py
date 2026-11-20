@@ -143,6 +143,9 @@ def test_a_version_label_is_a_versioned_ref():
     [missing, _] = _model_tests(_render(payload, True))
     assert missing[NAME]["arguments"]["parent"] == "ref('dim_customers', v=2)"
     assert ref_call("dim_customers") == "ref('dim_customers')"
+    assert ref_call("dim_customers.v1.5") == "ref('dim_customers', v=1.5)"
+    # A version that is not a number is a string, not a Jinja variable.
+    assert ref_call("dim_customers.vbeta") == "ref('dim_customers', v='beta')"
 
 
 def test_the_filters_ride_on_the_missing_direction_only():
@@ -356,9 +359,6 @@ def test_transform_macro_lists_it(dbt_project_dir: Path, tmp_path: Path, capsys)
 # --- what it compiles to, against DuckDB --------------------------------------------
 
 
-duckdb = pytest.importorskip("duckdb")
-
-
 def _run(
     tmp_path: Path,
     parent: str,
@@ -375,6 +375,8 @@ def _run(
     import subprocess
     import sys
 
+    # Only these tests run SQL; the rendering tests above need no DuckDB.
+    pytest.importorskip("duckdb")
     project = tmp_path / "proj"
     (project / "models").mkdir(parents=True)
     (project / "macros").mkdir()
