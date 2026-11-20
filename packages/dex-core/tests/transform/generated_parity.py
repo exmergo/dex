@@ -149,14 +149,21 @@ def _statuses(*rows: tuple[str, str]) -> str:
 def _population_measured(verify: Mapping[str, Any], model: str) -> bool:
     """``maintain verify`` ran the population check over ``model``: the class
     is not suppressed (it is, when no model's filter could be measured) and no
-    warning names this model's population as unchecked (a column the relation
-    lacks)."""
+    warning names this model's population, or its whole declared-facts
+    statement, as unmeasured (a column the relation lacks, a refused
+    statement). Another model's measured filter keeps the class unsuppressed,
+    so the per-model warnings are what tell this model apart."""
 
     if "population" in (verify.get("suppressed") or {}):
         return False
+    unmeasured = (
+        f"declared population on {model} ",
+        f"declared facts on {model} could not be measured",
+    )
     return not any(
-        f"declared population on {model} " in str(line)
+        marker in str(line)
         for line in verify.get("_warnings") or []
+        for marker in unmeasured
     )
 
 
@@ -198,10 +205,12 @@ POPULATION_INCLUDES_NULL = _population_row(
 
 #: #1453: an ``excludes`` list. Two rows hold the excluded value, so the count
 #: is compared too, and a NULL that breaks no ``excludes`` list sits in both
-#: fixtures: counted by either side, the clean fixture would fail.
+#: fixtures: counted by either side, the clean fixture would fail. The list also
+#: holds a quote and a backslash, which each warehouse writes in its own literal
+#: syntax: a literal the warehouse cannot parse errors the test.
 POPULATION_EXCLUDES = _population_row(
     "dex_population_filter_excludes",
-    {"excludes": ["cancelled"]},
+    {"excludes": ["cancelled", "it's", "a\\b"]},
     _statuses(("1", "'paid'"), ("2", "'cancelled'"), ("3", "'cancelled'"), ("4", None)),
     _statuses(("1", "'paid'"), ("2", "'shipped'"), ("4", None)),
 )

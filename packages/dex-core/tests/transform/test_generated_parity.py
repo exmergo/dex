@@ -253,3 +253,22 @@ def test_a_macro_that_lets_a_null_into_an_includes_list_fails_the_harness(
         f"{POPULATION_INCLUDES_NULL.label} on {violating}: the test should fail on "
         "the violating fixture, dbt says 'pass'"
     ]
+
+
+def test_a_refused_clean_probe_is_not_read_as_measured():
+    # The violating fixture's filter was measured, so the population class is
+    # not suppressed; the clean fixture's statement was refused, which only a
+    # per-model warning says. An absent finding there is no verdict.
+    clean = POPULATION_EXCLUDES.model("clean")
+    measured = POPULATION_EXCLUDES.measured
+    assert measured is not None
+    verify = {
+        "suppressed": {},
+        "_warnings": [
+            f"the declared facts on {clean} could not be measured: the warehouse "
+            "refused the statement (Timeout)"
+        ],
+    }
+    assert measured(verify, clean) is False
+    assert measured(verify, POPULATION_EXCLUDES.model("violating")) is True
+    assert measured({"suppressed": {"population": "x"}}, clean) is False

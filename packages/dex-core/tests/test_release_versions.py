@@ -104,7 +104,9 @@ def test_a_v_prefixed_plugin_version_is_refused(checker, tmp_path):
     assert "'v1.18.1' is not a semver 2.0 version" in problems[0]
 
 
-@pytest.mark.parametrize("plugin", ["1.18", "1.18.1.0", "0.1.0a1", "01.18.1", ""])
+@pytest.mark.parametrize(
+    "plugin", ["1.18", "1.18.1.0", "0.1.0a1", "01.18.1", "", "1.18.1\n"]
+)
 def test_a_plugin_version_that_is_not_semver_is_refused(checker, tmp_path, plugin):
     problems = checker.check(_write(tmp_path, plugin=plugin))
     assert any("is not a semver 2.0 version" in p for p in problems), problems

@@ -35,7 +35,11 @@ connector, and a project overrides one warehouse with its own
 `<adapter>__dex_population_filter(model, column_name, includes, excludes)` macro.
 The cast a text comparison makes is dispatched apart, as
 `dex_population_filter_text(column_name)`: ClickHouse cannot cast a NULL to its
-non-Nullable `String`, so its variant is `toString`.
+non-Nullable `String`, so its variant is `toString`. So is each text literal,
+`dex_population_filter_literal(text)`, written as `maintain verify` writes it:
+a quote doubled on DuckDB, Postgres and Trino, and a backslash escaped on
+BigQuery, Snowflake, Databricks, Redshift and ClickHouse, where it starts an
+escape sequence.
 
 ## `unpivot_json_object`
 

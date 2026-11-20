@@ -28,6 +28,7 @@ on:
       - gemini-extension.json
       - claude/**
       - skills/*/scripts/run.py
+      - packages/dex-core/pyproject.toml
       - scripts/prepare_release.sh
       - scripts/check_release_versions.py
       - .github/workflows/release-prep.yml

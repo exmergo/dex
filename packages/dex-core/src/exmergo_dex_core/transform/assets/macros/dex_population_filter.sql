@@ -31,7 +31,12 @@
   `<adapter>__dex_population_filter(model, column_name, includes, excludes)`
   macro in the project. The text comparison's cast is dispatched on its own,
   `dex_population_filter_text(column_name)`: ClickHouse refuses to cast a NULL
-  to its non-Nullable `String`, so it uses `toString`, which keeps a NULL.
+  to its non-Nullable `String`, so it uses `toString`, which keeps a NULL. So is
+  a text literal, `dex_population_filter_literal(text)`, written as
+  `maintain verify` writes it on each warehouse: a quote doubled where a
+  backslash is an ordinary character (DuckDB, Postgres, Trino), and a backslash
+  escaped where it starts an escape sequence (BigQuery, Snowflake, Databricks,
+  Redshift, ClickHouse).
 -#}
 
 {% test dex_population_filter(model, column_name, includes=none, excludes=none) %}
@@ -51,9 +56,11 @@
 {%- for value in values if value is string -%}
     {%- set as_text.on = true -%}
 {%- endfor -%}
+{#- The metadata names a column unquoted; a `quote: true` column arrives quoted. -#}
+{%- set dex_name = column_name | replace('"', '') | replace('`', '') -%}
 {%- if not as_text.on and execute -%}
     {%- for column in adapter.get_columns_in_relation(model)
-        if column.name | lower == column_name | lower and column.is_string() -%}
+        if column.name | lower == dex_name | lower and column.is_string() -%}
         {%- set as_text.on = true -%}
     {%- endfor -%}
 {%- endif -%}
@@ -65,7 +72,7 @@
         {%- else -%}
             {%- set text = value | string -%}
         {%- endif -%}
-        {%- do literals.append("'" ~ text | replace("'", "''") ~ "'") -%}
+        {%- do literals.append(adapter.dispatch('dex_population_filter_literal')(text)) -%}
     {%- elif value is boolean -%}
         {%- do literals.append('TRUE' if value else 'FALSE') -%}
     {%- else -%}
@@ -92,3 +99,19 @@ where dex_violating_rows > 0
 {% macro default__dex_population_filter_text(column_name) %}cast({{ column_name }} as {{ dbt.type_string() }}){% endmacro %}
 
 {% macro clickhouse__dex_population_filter_text(column_name) %}toString({{ column_name }}){% endmacro %}
+
+{% macro default__dex_population_filter_literal(text) %}'{{ text | replace("'", "''") }}'{% endmacro %}
+
+{% macro dex_population_filter_backslashed(text) %}'{{ text | replace('\\', '\\\\') | replace("'", "\\'") }}'{% endmacro %}
+
+{% macro bigquery__dex_population_filter_literal(text) %}{{ dex_population_filter_backslashed(text) }}{% endmacro %}
+
+{% macro snowflake__dex_population_filter_literal(text) %}{{ dex_population_filter_backslashed(text) }}{% endmacro %}
+
+{% macro databricks__dex_population_filter_literal(text) %}{{ dex_population_filter_backslashed(text) }}{% endmacro %}
+
+{% macro spark__dex_population_filter_literal(text) %}{{ dex_population_filter_backslashed(text) }}{% endmacro %}
+
+{% macro redshift__dex_population_filter_literal(text) %}{{ dex_population_filter_backslashed(text) }}{% endmacro %}
+
+{% macro clickhouse__dex_population_filter_literal(text) %}'{{ text | replace('\\', '\\\\') | replace("'", "''") }}'{% endmacro %}

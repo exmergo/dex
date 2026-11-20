@@ -272,22 +272,48 @@ def model_outputs(
 ) -> frozenset[str] | None:
     """The lowercased columns ``model``'s SQL provably outputs, or ``None``
     when that is not known (no file, a star, a set operation, Jinja that could
-    write a column, SQL that does not parse). ``None`` never means *empty*: a
-    generated column test renders unless its column is provably absent (#1453).
+    write a column, SQL that does not parse, a CTE that renames its columns).
+    ``None`` never means *empty*: a generated column test renders unless its
+    column is provably absent (#1453).
+
+    A versioned model's bare name is ``None`` too: its tests go on the shared
+    entry every version inherits, and one version's file says nothing about
+    another's. A version label (``dim_teams.v2``) reads that version's file.
     """
 
+    _base, version = mv.split_label(model)
+    model_paths = list(model_paths)
+    if version is None and _version_sql_path(files, model_paths, model) is not None:
+        return None
     path = model_sql_path(files, model_paths, model)
     content = files.get(path) if path else None
     if not content:
         return None
     rest = _INERT_JINJA.sub("", content)
-    if "{{" in rest or "{%" in rest:
+    if "{{" in rest or "{%" in rest or _renames_cte_columns(rest):
         return None
     try:
         names = output_columns(content, path or "", through_ctes=True)
     except Exception:
         return None
     return frozenset(names) if names is not None else None
+
+
+def _renames_cte_columns(sql: str) -> bool:
+    """Whether a CTE names its columns (``with c(status) as (...)``), which a
+    projection read through ``select * from c`` would not see."""
+
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        parsed = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:
+        return False
+    return any(
+        cte.args.get("alias") is not None and cte.args["alias"].columns
+        for cte in parsed.find_all(exp.CTE)
+    )
 
 
 def _version_sql_path(

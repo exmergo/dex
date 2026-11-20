@@ -207,6 +207,7 @@ def test_an_output_column_matches_whatever_its_case():
             None,
         ),
         ("select a from x union all select a from y", None),
+        ("with c(status) as (select raw_status from x) select * from c", None),
     ],
 )
 def test_the_outputs_are_known_only_where_the_sql_proves_them(sql, expected):
@@ -331,7 +332,9 @@ def test_transform_macro_lists_it(dbt_project_dir: Path, tmp_path: Path, capsys)
 duckdb = pytest.importorskip("duckdb")
 
 
-def _failures(tmp_path: Path, select: str, arguments: dict) -> tuple[str, int, str]:
+def _failures(
+    tmp_path: Path, select: str, arguments: dict, *, quote: bool = False
+) -> tuple[str, int, str]:
     """Build ``select`` as a view, run the shipped test on its ``status`` with
     ``arguments``, and return dbt's status, failure count and compiled SQL."""
 
@@ -361,6 +364,7 @@ def _failures(tmp_path: Path, select: str, arguments: dict) -> tuple[str, int, s
                         "columns": [
                             {
                                 "name": "status",
+                                **({"quote": True} if quote else {}),
                                 "data_tests": [{NAME: {"arguments": arguments}}],
                             }
                         ],
@@ -437,3 +441,42 @@ def test_a_boolean_value_is_a_boolean_literal(tmp_path: Path):
 def test_a_quote_in_a_value_is_escaped(tmp_path: Path):
     select = "select 'o''brien' as status union all select 'x'"
     assert _failures(tmp_path, select, {"excludes": ["o'brien"]})[:2] == ("fail", 1)
+
+
+def test_a_quoted_column_is_still_found_in_the_metadata(tmp_path: Path):
+    # `quote: true` hands the test `"status"`; the metadata names `status`. A
+    # missed lookup would compare the number 7 with a text column as written.
+    select = "select '7' as status union all select 'x' union all select null"
+    status, failures, sql = _failures(tmp_path, select, {"includes": [7]}, quote=True)
+    assert (status, failures) == ("fail", 2)
+    assert "'7'" in sql
+
+
+def test_a_backslash_is_an_ordinary_character_on_duckdb(tmp_path: Path):
+    select = "select 'a\\b' as status union all select 'x'"
+    assert _failures(tmp_path, select, {"excludes": ["a\\b"]})[:2] == ("fail", 1)
+
+
+def test_the_warehouses_that_escape_a_backslash_get_their_own_literal():
+    asset = _asset()
+    for adapter in ("bigquery", "snowflake", "databricks", "spark", "redshift"):
+        assert (
+            f"{{% macro {adapter}__dex_population_filter_literal(text) %}}"
+            "{{ dex_population_filter_backslashed(text) }}"
+        ) in asset
+    assert "clickhouse__dex_population_filter_literal(text) %}" in asset
+
+
+def test_a_versioned_models_bare_name_has_no_known_outputs():
+    # The shared entry's tests run on every version; one version's file
+    # cannot say another lacks the column.
+    files = {
+        "models/marts/dim_t_v1.sql": "select id from x",
+        "models/marts/dim_t_v2.sql": "select id, status from x",
+        "models/marts/dim_t.yml": (
+            "version: 2\nmodels:\n  - name: dim_t\n    latest_version: 1\n"
+            "    versions:\n      - v: 1\n      - v: 2\n"
+        ),
+    }
+    assert model_outputs(files, ["models"], "dim_t") is None
+    assert model_outputs(files, ["models"], "dim_t.v2") == frozenset({"id", "status"})

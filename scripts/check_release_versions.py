@@ -161,7 +161,7 @@ def check(root: Path) -> list[str]:
     engine = _one(engine_found, "engine version pins", problems)
     release: tuple[int, ...] | None = None
     if engine is not None:
-        match = PEP440.match(engine)
+        match = PEP440.fullmatch(engine)
         if match is None:
             problems.append(
                 f"engine version {engine!r} is not a canonical PEP 440 version "
@@ -172,7 +172,7 @@ def check(root: Path) -> list[str]:
 
     plugin = _one(plugin_found, "plugin manifest versions", problems)
     if plugin is not None:
-        match = SEMVER.match(plugin)
+        match = SEMVER.fullmatch(plugin)
         if match is None:
             problems.append(
                 f"plugin version {plugin!r} is not a semver 2.0 version "
