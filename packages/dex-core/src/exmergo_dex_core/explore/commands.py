@@ -4823,10 +4823,19 @@ def _apply_declared_grain(
         status = "proven"
     elif len(resolved) == 1 and live[resolved[0].lower()].is_unique is False:
         status = "contradicted"
-        dataset.data_quality.append(
-            f"{resolved[0]} is the model's declared grain but profiling found "
-            "duplicates"
-        )
+        # The same column may also be declared unique, in which case the
+        # project-claims pass already said so ("declared unique in ... but
+        # profiling found duplicates"); one contradiction note, not two (#998).
+        # The persisted note is the unique one: it is the one the cache
+        # carries, so commands reading the cache still see the contradiction.
+        if not any(
+            note.startswith(f"{resolved[0]} is declared unique in ")
+            for note in dataset.data_quality
+        ):
+            dataset.data_quality.append(
+                f"{resolved[0]} is the model's declared grain but profiling found "
+                "duplicates"
+            )
     else:
         status = "unmeasured"
     if [c.lower() for c in dataset.grain or []] != [c.lower() for c in resolved]:
