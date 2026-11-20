@@ -1363,8 +1363,9 @@ def render(
     kind turned on that does not support ``dialect`` (#1451) is
     ``not_rendered`` with the reason ``dialect_unsupported``. ``outputs`` are
     the columns the model's SQL provably outputs (:func:`model_outputs`, or
-    ``None`` where unknown): a column test on a column outside them is
-    ``not_rendered`` with the reason ``column_not_output`` (#1453). A generated
+    ``None`` where unknown): a test reading a column outside them (the column
+    it sits under, or a model-level test's grain or parent key) is
+    ``not_rendered`` with the reason ``column_not_output`` (#1453, #1454). A generated
     test already in the YAML is never removed: the switch decides what renders,
     not what stays.
     """
@@ -1386,6 +1387,8 @@ def render(
             row = {
                 key: g[key] for key in ("model", "column", "test", "cadence", "claim")
             }
+            if g.get("variant") is not None:
+                row["variant"] = g["variant"]
             # Read at the test's own place, matched the way rendering matches,
             # so a renamed model's tests elsewhere in the file and a hand-written
             # equivalent are each told apart (#1449).
@@ -1476,7 +1479,7 @@ def _generated(
 ) -> list[dict[str, Any]]:
     """Every generated test the declaration gives, each with its claim, its
     rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
-    ``dialect`` (#1451), for a column the model outputs (#1453)."""
+    ``dialect`` (#1451), for columns the model outputs (#1453, #1454)."""
 
     out: list[dict[str, Any]] = []
     model = declaration.model
@@ -1489,11 +1492,15 @@ def _generated(
                 model, instance.field, instance.columns, dict(instance.params)
             )
             renders, reason = on, None if on else off_reason
+            # The model's columns the test reads: the one it sits under, or a
+            # model-level test's columns (a grain, a parent key; #1454).
+            reads = (
+                (instance.column,) if instance.column is not None else instance.columns
+            )
             if (
                 on
-                and instance.column is not None
                 and outputs is not None
-                and instance.column.lower() not in outputs
+                and any(column.lower() not in outputs for column in reads)
             ):
                 renders, reason = False, gt.COLUMN_NOT_OUTPUT
             out.append(
@@ -1503,6 +1510,7 @@ def _generated(
                     "test": kind.name,
                     "cadence": kind.cadence,
                     "claim": claim,
+                    "variant": instance.variant,
                     "enabled": renders,
                     "off_reason": reason,
                     "spec": generated_spec(
@@ -1805,12 +1813,7 @@ def _rendered_columns(
             )
         if column.references is not None:
             parent, _, parent_column = column.references.rpartition(".")
-            parent_base, parent_version = mv.split_label(parent)
-            to = (
-                f"ref('{parent_base}', v={parent_version})"
-                if parent_version is not None
-                else f"ref('{parent}')"
-            )
+            to = mv.ref_call(parent)
             entry["tests"].append(
                 _unsampled(
                     "relationships",

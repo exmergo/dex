@@ -72,6 +72,12 @@ MACRO_ASSETS: dict[str, str] = {
         "excludes list, never a value; a declaration plan adds it where the "
         "project lacks it"
     ),
+    "dex_parent_population": (
+        "the generic test a declared parent population renders (#1454), once per "
+        "direction: fails with the count of eligible parent keys the model lacks "
+        "(missing) or of model keys the parent lacks (unexpected), never a key; "
+        "a declaration plan adds it where the project lacks it"
+    ),
 }
 
 

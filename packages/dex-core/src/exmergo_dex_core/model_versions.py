@@ -300,6 +300,17 @@ def split_label(name: str) -> tuple[str, str | None]:
     return name, None
 
 
+def ref_call(name: str) -> str:
+    """The ``ref()`` a test argument names ``name`` with: ``ref('dim_teams',
+    v=2)`` for a version label, ``ref('dim_teams')`` otherwise. dbt renders a
+    generic test's arguments as Jinja, so the string resolves as a ref."""
+
+    base, version = split_label(name)
+    if version is not None:
+        return f"ref('{base}', v={version})"
+    return f"ref('{name}')"
+
+
 def resolve(name: str, vmap: Mapping[str, VersionedModel]) -> list[str] | None:
     """The version labels ``name`` selects, or ``None`` when it names no version.
 

@@ -74,6 +74,14 @@ class ParityRow:
     #: The row's own name, where one test has several rows (#1453: an
     #: ``includes`` list and an ``excludes`` list); the test's name otherwise.
     name: str | None = None
+    #: Undeclared models the row's fixtures read (#1454: the declared parent),
+    #: by suffix: each is built as ``dex_parity_<slug>_<suffix>`` in the same
+    #: selection, and the declaration names it so.
+    fixtures: Mapping[str, Callable[[str], str]] = field(default_factory=dict)
+    #: Arguments that pick this row's test out of several of one name on one
+    #: model (#1454: a parent's ``missing`` and ``unexpected`` directions),
+    #: matched against the rendered spec and the manifest's test kwargs.
+    arguments: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -85,6 +93,12 @@ class ParityRow:
 
     def model(self, side: str) -> str:
         return f"dex_parity_{self.slug}_{side}"
+
+    def picks(self, arguments: Mapping[str, Any] | None) -> bool:
+        """Whether a test with ``arguments`` is this row's test."""
+
+        arguments = arguments or {}
+        return all(arguments.get(k) == v for k, v in self.arguments.items())
 
 
 def _rows(*rows: tuple[str, str]) -> str:
@@ -224,6 +238,148 @@ POPULATION_NUMERIC = _population_row(
     _statuses(("1", "1"), ("2", "8")),
 )
 
+
+def _customers(null_int: str, *rows: tuple[str, str | None]) -> str:
+    """A SELECT over ``rows`` as (customer_id, status), the first naming the
+    columns. A ``None`` status is a text NULL, as :func:`_statuses` writes it;
+    a ``None`` id is the connector's typed integer NULL."""
+
+    def status(value: str | None) -> str:
+        return "nullif('x', 'x')" if value is None else f"'{value}'"
+
+    def ident(value: str | None) -> str:
+        return null_int if value is None else value
+
+    (first_id, first), *rest = rows
+    lines = [f"select {ident(first_id)} as customer_id, {status(first)} as status"]
+    lines += [f"union all select {ident(i)}, {status(v)}" for i, v in rest]
+    return "\n".join(lines) + "\n"
+
+
+def _parent_measured(verify: Mapping[str, Any], model: str) -> bool:
+    """``maintain verify`` judged ``model``'s declared parent."""
+
+    return any(
+        record.get("model") == model
+        and record.get("status") in {"satisfied", "contradicted"}
+        for record in verify.get("parent_population") or []
+    )
+
+
+def _parent_row(
+    name: str,
+    direction: str,
+    parent: Callable[[str], str],
+    violating: Callable[[str], str],
+    clean: Callable[[str], str],
+    filters: list[dict] | None = None,
+) -> ParityRow:
+    """A ``dex_parent_population`` row: the parent is a fixture the row
+    builds, and both the violating and the clean model declare it."""
+
+    slug = name.removeprefix("dex_")
+    population: dict[str, Any] = {
+        "parent": {
+            "model": f"dex_parity_{slug}_parent",
+            "key": {"customer_id": "customer_id"},
+        }
+    }
+    if filters:
+        population["filters"] = filters
+    code, measure = {
+        "missing": ("parent_population_missing", "missing_parents"),
+        "unexpected": ("parent_population_unexpected", "unexpected_keys"),
+    }[direction]
+    return ParityRow(
+        test=gt.PARENT_POPULATION,
+        name=name,
+        codes=frozenset({code}),
+        declaration={
+            "description": "Parity fixture: one row per customer.",
+            "population": population,
+        },
+        violating=violating,
+        clean=clean,
+        count=lambda finding: int(finding["data"][measure]),
+        measured=_parent_measured,
+        fixtures={"parent": parent},
+        arguments={"direction": direction},
+    )
+
+
+def _parent(null: str) -> str:
+    """The declared parent: 3 is churned, and 4's status is NULL."""
+
+    return _customers(
+        null, ("1", "active"), ("2", "active"), ("3", "churned"), ("4", None)
+    )
+
+
+#: #1454: a parent key the model lacks. Two are missing, so the count is
+#: compared too.
+PARENT_MISSING = _parent_row(
+    "dex_parent_population_missing",
+    "missing",
+    _parent,
+    lambda null: _customers(null, ("1", "active"), ("2", "active")),
+    lambda null: _customers(
+        null, ("1", "active"), ("2", "active"), ("3", "churned"), ("4", None)
+    ),
+)
+
+#: #1454: keys the parent lacks; 5 twice is one distinct key, so the count is
+#: two, and a NULL key in both fixtures is no key on either side.
+PARENT_UNEXPECTED = _parent_row(
+    "dex_parent_population_unexpected",
+    "unexpected",
+    _parent,
+    lambda null: _customers(
+        null,
+        ("1", "active"),
+        ("2", "active"),
+        ("3", "churned"),
+        ("4", None),
+        ("5", "active"),
+        ("5", "active"),
+        ("6", "active"),
+        (None, "active"),
+    ),
+    lambda null: _customers(
+        null,
+        ("1", "active"),
+        ("2", "active"),
+        ("3", "churned"),
+        ("4", None),
+        (None, "active"),
+    ),
+)
+
+#: #1454: a declared ``excludes`` filter scopes the eligible parents. 3 is
+#: churned and not owed; 4's NULL status is no excluded value, so 4 is owed.
+PARENT_MISSING_FILTERED = _parent_row(
+    "dex_parent_population_missing_filtered",
+    "missing",
+    _parent,
+    lambda null: _customers(null, ("1", "active"), ("2", "active")),
+    lambda null: _customers(null, ("1", "active"), ("2", "active"), ("4", None)),
+    filters=[{"column": "status", "excludes": ["churned"]}],
+)
+
+#: #1454: a filter on a column the parent does not have is skipped on both
+#: sides (maintain verify lowers its finding to medium; the test fails), so
+#: the count is the parents the filter cannot rule out.
+PARENT_MISSING_UNAPPLIED = _parent_row(
+    "dex_parent_population_missing_unapplied",
+    "missing",
+    lambda _null: (
+        "select 1 as customer_id, 'web' as channel\n"
+        "union all select 2, 'web'\nunion all select 3, 'store'\n"
+    ),
+    lambda null: _customers(null, ("1", "active"), ("2", "active")),
+    lambda null: _customers(null, ("1", "active"), ("2", "active"), ("3", "paid")),
+    filters=[{"column": "status", "includes": ["active", "paid"]}],
+)
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -231,6 +387,10 @@ ROWS: tuple[ParityRow, ...] = (
     POPULATION_INCLUDES_NULL,
     POPULATION_EXCLUDES,
     POPULATION_NUMERIC,
+    PARENT_MISSING,
+    PARENT_UNEXPECTED,
+    PARENT_MISSING_FILTERED,
+    PARENT_MISSING_UNAPPLIED,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
@@ -276,6 +436,14 @@ def payload(
     edits: list[dict] = list(extra_edits or [])
     declarations: list[dict] = []
     for row in rows:
+        for suffix, render in row.fixtures.items():
+            edits.append(
+                {
+                    "path": f"{FOLDER}/{row.model(suffix)}.sql",
+                    "kind": "model_sql",
+                    "content": render(null_int),
+                }
+            )
         for side, render in (("violating", row.violating), ("clean", row.clean)):
             name = row.model(side)
             edits.append(
@@ -366,7 +534,14 @@ def run_parity(
     for row in rows:
         kind = next(k for k in gt.kinds() if k.name == row.test)
         models = {row.model("violating"), row.model("clean")}
-        mine = [t for t in listed if t["test"] == row.test and t["model"] in models]
+        claims = _claims(row, kind)
+        mine = [
+            t
+            for t in listed
+            if t["test"] == row.test
+            and t["model"] in models
+            and (claims is None or t["claim"] in claims)
+        ]
         if gt.supports(kind, connector):
             if sorted(t["status"] for t in mine) != ["added", "added"]:
                 report.disagreements.append(
@@ -391,7 +566,11 @@ def run_parity(
     if rc != 0:
         report.disagreements.append(f"apply failed: {applied.get('errors')}")
         return report
-    selected = [row.model(side) for row in rows for side in ("violating", "clean")]
+    selected = [
+        row.model(side)
+        for row in rows
+        for side in (*row.fixtures, "violating", "clean")
+    ]
     report.models = sorted(set(report.models) | set(selected))
 
     _rc, built = step(
@@ -411,7 +590,7 @@ def run_parity(
     model_status = {
         n["name"]: n["status"] for n in (built.get("data") or {}).get("nodes", [])
     }
-    for name in selected:
+    for name in dict.fromkeys(selected):
         if model_status.get(name) != "success":
             report.disagreements.append(
                 f"{name} did not build ({model_status.get(name)}): "
@@ -441,14 +620,14 @@ def run_parity(
 def _judge(
     row: ParityRow,
     results: Mapping[str, Mapping[str, Any]],
-    tests: Mapping[tuple[str, str], str],
+    tests: list[tuple[str, str, dict[str, Any], str]],
     findings: list[Mapping[str, Any]],
     report: ParityReport,
     verify: Mapping[str, Any],
 ) -> None:
     for side, should_fail in (("violating", True), ("clean", False)):
         model = row.model(side)
-        uid = tests.get((model, row.test))
+        uid = _test_uid(tests, model, row)
         result = results.get(uid or "", {})
         status = result.get("status")
         found = [
@@ -499,7 +678,7 @@ def _judge(
 
 def _judge_unsupported(
     row: ParityRow,
-    tests: Mapping[tuple[str, str], str],
+    tests: list[tuple[str, str, dict[str, Any], str]],
     findings: list[Mapping[str, Any]],
     report: ParityReport,
     verify: Mapping[str, Any],
@@ -509,7 +688,7 @@ def _judge_unsupported(
 
     for side, owed in (("violating", True), ("clean", False)):
         model = row.model(side)
-        if (model, row.test) in tests:
+        if _test_uid(tests, model, row) is not None:
             report.disagreements.append(
                 f"{row.label}: a test built on {model} where the dialect is unsupported"
             )
@@ -527,24 +706,60 @@ def _judge_unsupported(
             )
 
 
+def _claims(row: ParityRow, kind: gt.GeneratedTestKind) -> set[str] | None:
+    """The claims of ``row``'s own test on its two fixtures, where its
+    ``arguments`` pick one of several instances of the kind on one model, so
+    the plan's ``data.generated_tests`` rows (which name a claim, not the
+    arguments) are told apart. ``None`` where every instance is the row's."""
+
+    if not row.arguments:
+        return None
+    from exmergo_dex_core.transform.claims import claim_id
+    from exmergo_dex_core.transform.declarations import parse_declarations
+
+    out: set[str] = set()
+    for side in ("violating", "clean"):
+        model = row.model(side)
+        [declaration] = parse_declarations([{"model": model, **row.declaration}])
+        for instance in kind.instances(declaration):
+            if row.picks(instance.arguments):
+                out.add(
+                    claim_id(
+                        model, instance.field, instance.columns, dict(instance.params)
+                    )
+                )
+    return out
+
+
+def _test_uid(
+    tests: list[tuple[str, str, dict[str, Any], str]], model: str, row: ParityRow
+) -> str | None:
+    """The unique id of ``row``'s test on ``model``, or ``None``."""
+
+    for attached, name, kwargs, uid in tests:
+        if attached == model and name == row.test and row.picks(kwargs):
+            return uid
+    return None
+
+
 def _artifacts(
     project: Path,
-) -> tuple[dict[str, dict[str, Any]], dict[tuple[str, str], str]]:
+) -> tuple[dict[str, dict[str, Any]], list[tuple[str, str, dict[str, Any], str]]]:
     """The newest run results under the project's target path, by unique id,
-    and each generic test's unique id by (attached model, test name)."""
+    and each generic test as (attached model, test name, kwargs, unique id)."""
 
     candidates = sorted(
         (project / "target").rglob("run_results.json"),
         key=lambda path: path.stat().st_mtime,
     )
     if not candidates:
-        return {}, {}
+        return {}, []
     folder = candidates[-1].parent
     results = {
         r["unique_id"]: r
         for r in json.loads(candidates[-1].read_text(encoding="utf-8"))["results"]
     }
-    tests: dict[tuple[str, str], str] = {}
+    tests: list[tuple[str, str, dict[str, Any], str]] = []
     manifest = folder / "manifest.json"
     if manifest.is_file():
         for uid, node in json.loads(manifest.read_text(encoding="utf-8"))[
@@ -553,5 +768,12 @@ def _artifacts(
             meta = node.get("test_metadata") or {}
             attached = node.get("attached_node") or ""
             if node.get("resource_type") == "test" and meta.get("name"):
-                tests[(attached.rsplit(".", 1)[-1], str(meta["name"]))] = uid
+                tests.append(
+                    (
+                        attached.rsplit(".", 1)[-1],
+                        str(meta["name"]),
+                        dict(meta.get("kwargs") or {}),
+                        uid,
+                    )
+                )
     return results, tests

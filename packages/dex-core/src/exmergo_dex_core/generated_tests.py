@@ -55,7 +55,11 @@ class Instance:
     resolves names; a value from the data (a filter's values), whose case is
     part of the fact, goes in a list, which is hashed as written.
     ``arguments`` are the generic test's arguments, written under
-    ``arguments:`` as dbt 1.10 and later read them.
+    ``arguments:`` as dbt 1.10 and later read them. ``variant`` names, in a
+    word, which of a kind's tests on one model this is (a filter's
+    ``includes`` or ``excludes`` list, a parent's ``missing`` or
+    ``unexpected`` direction), so a reader of ``data.generated_tests`` can tell
+    two claims apart without decoding them (#1454).
     """
 
     column: str | None
@@ -63,6 +67,7 @@ class Instance:
     columns: tuple[str, ...]
     params: Mapping[str, Any] = field(default_factory=dict)
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    variant: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,9 +158,9 @@ def supports(kind: GeneratedTestKind, dialect: str | None) -> bool:
 
 #: The reason a kind turned on renders nothing on the configured connector.
 DIALECT_UNSUPPORTED = "dialect_unsupported"
-#: The reason a column-level test renders nothing: the model's SQL provably
-#: does not output the column (a filter on a column it aggregates away), so the
-#: test could only error, and its column entry would be a ``column_missing``.
+#: The reason a test renders nothing because the model's SQL provably does not
+#: output a column it reads (a filter on a column it aggregates away, a grain or
+#: parent key column it drops), so the test could only error.
 COLUMN_NOT_OUTPUT = "column_not_output"
 
 
@@ -260,6 +265,7 @@ def _population_filters(declaration: Any) -> list[Instance]:
                     columns=(column,),
                     params={"check": POPULATION_FILTER, mode: values},
                     arguments={mode: values},
+                    variant=mode,
                 )
             )
     return out
@@ -271,6 +277,83 @@ register(
         EVERY_RUN,
         _population_filters,
         macro=POPULATION_FILTER,
+        dialects=ALL_CONNECTORS,
+    )
+)
+
+PARENT_POPULATION = "dex_parent_population"
+#: The two claims a declared ``population.parent`` makes, each its own test.
+PARENT_DIRECTIONS: tuple[str, ...] = ("missing", "unexpected")
+
+
+def _parent_population(declaration: Any) -> list[Instance]:
+    """Two model-level tests per declared ``population.parent`` (#1454), one
+    per claim it makes: no eligible parent key is ``missing`` from the model,
+    and no output key is ``unexpected`` (absent from the parent). Two tests
+    rather than one summed count, so each failure count is the count of one
+    ``maintain verify`` finding and each direction keeps its own history.
+
+    The declaration's ``population.filters`` ride along: ``maintain verify``
+    scopes the eligible parent keys with each filter whose column the parent
+    has, and the test does the same."""
+
+    population = getattr(declaration, "population", None)
+    parent = getattr(population, "parent", None)
+    if parent is None:
+        return []
+    from .model_versions import ref_call
+
+    key = {str(out): str(column) for out, column in parent.key.items()}
+    filters: list[dict[str, Any]] = []
+    for entry in getattr(population, "filters", None) or []:
+        rule: dict[str, Any] = {"column": str(entry.column)}
+        for mode in ("includes", "excludes"):
+            values = list(getattr(entry, mode, None) or [])
+            if values:
+                rule[mode] = values
+        if len(rule) > 1:
+            filters.append(rule)
+    out: list[Instance] = []
+    for direction in PARENT_DIRECTIONS:
+        # Fresh containers per test: a mapping two tests share would be
+        # written as a YAML anchor and alias, which no reviewer expects.
+        arguments: dict[str, Any] = {
+            "parent": ref_call(str(parent.model)),
+            "key": dict(key),
+            "direction": direction,
+        }
+        params: dict[str, Any] = {
+            "check": PARENT_POPULATION,
+            "direction": direction,
+            "parent": str(parent.model),
+            # The parent columns, in key order: names, folded as claim_id
+            # folds a string (a list is hashed as written).
+            "parent_key": [column.lower() for column in key.values()],
+        }
+        if filters and direction == "missing":
+            # Only the missing direction reads the filters: an unexpected key
+            # is one the whole parent lacks, as maintain verify counts it.
+            arguments["filters"] = [dict(rule) for rule in filters]
+            params["filters"] = [dict(rule) for rule in filters]
+        out.append(
+            Instance(
+                column=None,
+                field="population",
+                columns=tuple(key),
+                params=params,
+                arguments=arguments,
+                variant=direction,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        PARENT_POPULATION,
+        SCHEDULED,
+        _parent_population,
+        macro=PARENT_POPULATION,
         dialects=ALL_CONNECTORS,
     )
 )

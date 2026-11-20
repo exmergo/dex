@@ -1347,7 +1347,8 @@ default, or a filter or operator after it is refused. A key naming a location
   `dex_every_run` or `dex_scheduled`, so an orchestrator selects them with
   `--select tag:dex_scheduled` or leaves them out with `--exclude`. The plan
   lists each one under `data.generated_tests` (`model`, `column`, `test`,
-  `cadence`, `claim`, and a `status` of `added`, `already_listed`,
+  `cadence`, `claim`, a `variant` where one kind renders several tests on one
+  model, and a `status` of `added`, `already_listed`,
   `not_rendered` with its `reason`, or `listed_while_off`). Turning the switch
   off removes no test already written. A list entry this release does not render
   is a non-fatal `unknown_test_kind` config problem. Each kind states the
@@ -1365,7 +1366,18 @@ default, or a filter or operator after it is refused. A key naming a location
   the column is text, and the test returns that count and never a value. A
   filter on a column the model's SQL provably does not output renders nothing,
   `not_rendered` with `reason: column_not_output`. `maintain verify` judges a
-  filter stating both lists as two rules, one per list. The plan writes each
+  filter stating both lists as two rules, one per list. It renders
+  `dex_parent_population` (#1454) on the model entry twice per declared
+  `population.parent`, one test per `direction`, tagged `dex_scheduled`, on
+  every connector: `missing` fails with `parent_population_missing`'s
+  `missing_parents` and `unexpected` with `parent_population_unexpected`'s
+  `unexpected_keys`, both counting distinct non-NULL keys. The parent is an
+  argument written as a `ref()`, and the declaration's `population.filters`
+  scope the eligible parents of the `missing` test as `maintain verify` scopes
+  them: a filter whose column the parent lacks is skipped (where verify lowers
+  its finding to medium, the test fails with the same count). A model-level test
+  whose grain or key columns the model provably does not output renders nothing,
+  `column_not_output`. The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a

@@ -16,6 +16,10 @@ from pathlib import Path
 
 import pytest
 from transform.generated_parity import (
+    PARENT_MISSING,
+    PARENT_MISSING_FILTERED,
+    PARENT_MISSING_UNAPPLIED,
+    PARENT_UNEXPECTED,
     POPULATION_EXCLUDES,
     POPULATION_INCLUDES,
     POPULATION_INCLUDES_NULL,
@@ -272,3 +276,102 @@ def test_a_refused_clean_probe_is_not_read_as_measured():
     assert measured(verify, clean) is False
     assert measured(verify, POPULATION_EXCLUDES.model("violating")) is True
     assert measured({"suppressed": {"population": "x"}}, clean) is False
+
+
+# --- dex_parent_population (#1454) -------------------------------------------------
+
+PARENT_ROWS = (
+    PARENT_MISSING,
+    PARENT_UNEXPECTED,
+    PARENT_MISSING_FILTERED,
+    PARENT_MISSING_UNAPPLIED,
+)
+PARENT_SIGNATURE = "model, parent, key, direction, filters"
+
+#: Counts the model's rows the parent lacks, not its distinct keys: a key the
+#: model holds twice is counted twice, where maintain verify counts it once.
+COUNTS_ROWS = (
+    "{% set k = (key.keys() | list)[0] %}{% set pk = (key.values() | list)[0] %}\n"
+    "select count(*) as dex_violating_keys from {{ model }} m\n"
+    "where m.{{ k }} is not null and m.{{ k }} not in "
+    "(select {{ pk }} from {{ parent }} where {{ pk }} is not null)\n"
+    "{% if direction == 'missing' %}and 1 = 0{% endif %}\n"
+    "having count(*) > 0"
+)
+
+#: Ignores the declaration's filters: every parent key is owed.
+IGNORES_FILTERS = (
+    "{% set k = (key.keys() | list)[0] %}{% set pk = (key.values() | list)[0] %}\n"
+    "select count(*) as dex_violating_keys from (select distinct {{ pk }} as k "
+    "from {{ parent }} where {{ pk }} is not null) p\n"
+    "where p.k not in (select {{ k }} from {{ model }} where {{ k }} is not null)\n"
+    "{% if direction == 'unexpected' %}and 1 = 0{% endif %}\n"
+    "having count(*) > 0"
+)
+
+
+def test_the_parent_rows_agree_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=PARENT_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in PARENT_ROWS]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_parent_population.sql" in plan["paths"]
+    mine = [
+        t for t in plan["generated_tests"]["tests"] if t["test"] == gt.PARENT_POPULATION
+    ]
+    # Two directions on each of eight declared fixtures.
+    assert len(mine) == 16
+    assert {t["cadence"] for t in mine} == {gt.SCHEDULED}
+    written = (dbt_project_dir / "macros" / "dex_parent_population.sql").read_text()
+    # Counts only: the test selects the violating count, never a key.
+    assert "select dex_violating_keys" in written
+
+
+def test_a_macro_that_counts_rows_not_keys_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(PARENT_UNEXPECTED,),
+        extra_edits=[
+            _planted("duckdb", COUNTS_ROWS, gt.PARENT_POPULATION, PARENT_SIGNATURE)
+        ],
+    )
+
+    violating = PARENT_UNEXPECTED.model("violating")
+    assert report.disagreements == [
+        f"{PARENT_UNEXPECTED.label} on {violating}: dbt counts 3 failure(s), "
+        "maintain verify counts 2"
+    ]
+
+
+def test_a_macro_that_ignores_the_filters_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # Without the filter the churned parent is owed, so the clean fixture,
+    # which leaves it out as the declaration says, fails.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(PARENT_MISSING, PARENT_MISSING_FILTERED),
+        extra_edits=[
+            _planted("duckdb", IGNORES_FILTERS, gt.PARENT_POPULATION, PARENT_SIGNATURE)
+        ],
+    )
+
+    clean = PARENT_MISSING_FILTERED.model("clean")
+    assert report.agreed == [PARENT_MISSING.label]
+    assert (
+        f"{PARENT_MISSING_FILTERED.label} on {clean}: the test should pass on the "
+        "clean fixture, dbt says 'fail'"
+    ) in report.disagreements
