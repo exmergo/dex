@@ -654,11 +654,10 @@ def test_an_edit_differing_only_in_line_endings_is_skipped(
     )
 
 
-def test_a_plan_whose_every_edit_matches_the_tree_plans_as_before(
+def test_a_plan_whose_every_edit_matches_the_tree_stores_no_plan(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
-    """Nothing is skipped when nothing would be left, so planning the same
-    content again (a re-scaffold) still stores a plan."""
+    """Nothing is left to plan, so nothing is stored and `plan_id` is null."""
 
     rc, envelope = _plan_payload(
         tmp_path,
@@ -672,8 +671,93 @@ def test_a_plan_whose_every_edit_matches_the_tree_plans_as_before(
         ],
     )
     assert rc == 0, envelope
-    assert envelope["data"]["paths"] == ["models/staging/stg_customers.sql"]
-    assert not any("matches the tree" in w for w in envelope["warnings"])
+    assert envelope["data"]["plan_id"] is None
+    assert envelope["data"]["paths"] == []
+    assert envelope["diffs"] == []
+    assert not (tmp_path / ".dex" / "plans").exists() or not any(
+        (tmp_path / ".dex" / "plans").glob("*.json")
+    )
+
+
+_DECLARATION = {"model": "stg_customers", "description": "One row per customer."}
+
+
+def _plan_declared(tmp_path: Path, capsys, edits: list[dict]) -> tuple[int, dict]:
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps({"edits": edits, "declarations": [_DECLARATION]}),
+        encoding="utf-8",
+    )
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def _declared_on_disk(tmp_path: Path, capsys) -> set[str]:
+    """Plan and apply `_DECLARATION`, and return the plan ids then stored."""
+
+    rc, envelope = _plan_declared(tmp_path, capsys, [])
+    assert rc == 0, envelope
+    rc, applied = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, applied
+    return {p.name for p in (tmp_path / ".dex" / "plans").glob("*.json")}
+
+
+def test_a_declaration_that_changes_nothing_stores_no_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """A declaration whose rendered YAML is already the file is a no-op, the
+    answer `transform declare` gives: `plan_id` null and no plan stored."""
+
+    stored = _declared_on_disk(tmp_path, capsys)
+    rc, envelope = _plan_declared(tmp_path, capsys, [])
+    assert rc == 0, envelope
+    assert envelope["data"]["plan_id"] is None
+    assert envelope["diffs"] == []
+    assert {p.name for p in (tmp_path / ".dex" / "plans").glob("*.json")} == stored
+
+
+def test_an_unchanged_declaration_beside_a_real_edit_plans_only_the_edit(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _declared_on_disk(tmp_path, capsys)
+    rc, envelope = _plan_declared(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            }
+        ],
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["plan_id"]
+    assert envelope["data"]["paths"] == ["models/staging/stg_orders.sql"]
+    assert [d["path"] for d in envelope["diffs"]] == ["models/staging/stg_orders.sql"]
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/schema.yml"
+        in envelope["warnings"]
+    )
 
 
 # --- project config kinds (project_yml / profiles_yml) ------------------------

@@ -123,7 +123,9 @@ class PlanResult(Result):
         was produced.
         """
         payload: dict[str, Any] = {
-            "plan_id": self.plan_id,
+            # Null, not empty, when nothing was stored (a payload that changes
+            # nothing), as on `transform declare`.
+            "plan_id": self.plan_id or None,
             "intent": self.intent,
             "edit_count": len(self.paths),
             "paths": self.paths,

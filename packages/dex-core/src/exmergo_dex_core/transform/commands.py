@@ -345,6 +345,15 @@ def plan(
         )
 
     edits, unchanged_notes = _skip_unchanged(engine, edits, declarations)
+    if not edits:
+        # Every edit, a rendered declaration included, is already the tree:
+        # nothing would change, so no plan is stored and `plan_id` is null, as
+        # `transform declare` answers the same no-op.
+        return PlanResult(
+            intent=intent,
+            notes=["every edit matches the tree, so no plan was stored"],
+            warnings=unchanged_notes + scaffold_notes + declaration_notes,
+        )
 
     from . import model_versions as versions_mod
 
@@ -515,6 +524,9 @@ def _skip_unchanged(
     file as the project view reads it (text, universal newlines), the same test
     `write_edits` makes before writing nothing. Only a file the view holds is
     compared, so nothing outside the project is read. A delete is never a no-op.
+    A declaration is an edit here too, its rendered YAML, so one that changes
+    nothing is skipped like a resent file; when nothing changes at all, every
+    edit is skipped and :func:`plan` stores no plan.
 
     A model the payload declares keeps its file even when it matches: resending
     the SQL beside a declaration (an assumption settling an ask) is how a plan
@@ -540,21 +552,34 @@ def _skip_unchanged(
         if (path := declarations_mod.model_sql_path(texts, view.model_paths, d.model))
     }
 
-    kept: list[PlanEdit] = []
-    skipped: list[str] = []
-    for edit in edits:
-        if (
+    def matches(edit: PlanEdit) -> bool:
+        return (
             edit.op is EditOp.UPSERT
             and edit.path in files
             and files[edit.path].content == edit.new_content
-            and not (edit.kind is EditKind.MODEL_SQL and edit.path in declared)
+        )
+
+    # Nothing changes the tree (a declaration whose rendered YAML is already
+    # the file, a table scaffolded again): nothing is left to plan, and the
+    # declared-model keep below has no change to carry the model in with.
+    if all(matches(edit) for edit in edits):
+        listed = ", ".join(edit.path for edit in edits)
+        one = len(edits) == 1
+        return [], [
+            f"{len(edits)} edit{'' if one else 's'} "
+            f"{'matches' if one else 'match'} the tree and "
+            f"{'was' if one else 'were'} skipped: {listed}"
+        ]
+    kept: list[PlanEdit] = []
+    skipped: list[str] = []
+    for edit in edits:
+        if matches(edit) and not (
+            edit.kind is EditKind.MODEL_SQL and edit.path in declared
         ):
             skipped.append(edit.path)
         else:
             kept.append(edit)
-    # A payload that matches the tree throughout (scaffolding a table again) plans
-    # as it always did: there is no changed file whose comparison it could block.
-    if not skipped or not kept:
+    if not skipped:
         return edits, []
     listed = ", ".join(skipped)
     one = len(skipped) == 1
@@ -1651,7 +1676,8 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             attribute_rows=getattr(args, "attribute_rows", None),
             toggle=toggle,
         )
-        return to_envelope(result, hints=plan_hint(result))
+        hints = plan_hint(result) if result.plan_id else None
+        return to_envelope(result, hints=hints)
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:

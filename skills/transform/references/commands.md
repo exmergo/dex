@@ -16,7 +16,9 @@ compare`'s seed and snapshot check, and one warning names them ("N edits match
 the tree and were skipped: ..."), so resending a whole feature raises nothing for
 the files it did not change. A model file the payload's `declarations` name is
 kept, so resending a model's SQL beside its declaration still puts the model in
-the plan. A payload whose every edit matches skips nothing (#1415).
+the plan. A declaration whose rendered YAML is already the file is skipped the
+same way, and a payload whose every edit matches stores no plan and returns
+`plan_id: null`, as `transform declare` does (#1415).
 
 Model SQL with Jinja `for`/`if` control flow is compiled by dbt in a throwaway
 copy containing all edits, then checked as a single read-only SELECT. dbt and a
