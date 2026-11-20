@@ -2160,15 +2160,25 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
             inserted_flagged,
         )
 
-    first = listed.value[0]
-    line_start = text.rfind("\n", 0, first.start_mark.index) + 1
-    line = text[line_start : first.start_mark.index]
-    if line.strip() != "-":
+    # The list's own dashes, from the token stream: an item that is an alias
+    # carries the marks of its anchor, which can sit in another column (#1496).
+    column = listed.start_mark.column
+    dashes = [
+        t.start_mark.index
+        for t in yaml.scan(text)
+        if isinstance(t, yaml.BlockEntryToken)
+        and listed.start_mark.index <= t.start_mark.index < listed.end_mark.index
+        and t.start_mark.column == column
+    ]
+    if not dashes:
+        raise RewriteError("a column's test list does not start its items with '-'")
+    line_start = text.rfind("\n", 0, dashes[0]) + 1
+    dash_indent = text[line_start : dashes[0]]
+    if dash_indent.strip():
         raise RewriteError(
             "a column's test list does not start its items on their own lines"
         )
-    dash_indent = line[: len(line) - len(line.lstrip(" "))]
-    last_key_line = text.rfind("\n", 0, listed.value[-1].start_mark.index) + 1
+    last_key_line = text.rfind("\n", 0, dashes[-1]) + 1
     from ..yaml_spans import block_end
 
     end = block_end(text, last_key_line, len(dash_indent))

@@ -400,3 +400,30 @@ def test_the_column_holding_the_merge_key_still_takes_its_tests():
     assert _tests(out, "order_id") == _tests(MERGED_COLUMN, "order_id")
     declared = _tests(out, "order_key")
     assert [next(iter(test)) for test in declared] == ["unique", "not_null"]
+
+
+def test_a_test_list_ending_in_an_alias_takes_the_new_tests_itself():
+    # The alias carries the marks of its anchor in another column, so the
+    # insert point comes from the list's own dashes (#1496).
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "    - name: x\n"
+        "      data_tests:\n"
+        "        - &t {accepted_values: {values: [a]}}\n"
+        "    - name: order_id\n"
+        "      data_tests:\n"
+        "        - *t\n"
+    )
+
+    out = _render(content, {"model": "fct_orders", "grain": ["order_id"]})
+
+    assert _tests(out, "x") == _tests(content, "x")
+    declared = _tests(out, "order_id")
+    assert [next(iter(test)) for test in declared] == [
+        "accepted_values",
+        "unique",
+        "not_null",
+    ]
