@@ -78,6 +78,11 @@ MACRO_ASSETS: dict[str, str] = {
         "(missing) or of model keys the parent lacks (unexpected), never a key; "
         "a declaration plan adds it where the project lacks it"
     ),
+    "dex_unit_range": (
+        "the generic test a column declared a fraction renders (#1455): fails "
+        "with the count of rows whose value sits below 0 or above 1, never a "
+        "value; a declaration plan adds it where the project lacks it"
+    ),
 }
 
 

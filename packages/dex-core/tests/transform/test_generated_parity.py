@@ -25,6 +25,8 @@ from transform.generated_parity import (
     POPULATION_INCLUDES_NULL,
     ROWS,
     UNIQUE_COMBINATION,
+    UNIT_FRACTION,
+    UNIT_PERCENT,
     run_parity,
 )
 
@@ -88,8 +90,9 @@ def test_every_row_agrees_with_maintain_verify_on_duckdb(
     report = run_parity(_runner(capsys), repo, dbt_project_dir, connector="duckdb")
 
     assert report.disagreements == [], report.disagreements
-    assert report.agreed == [row.label for row in ROWS]
+    assert report.agreed == [row.label for row in ROWS if row.withheld is None]
     assert report.unsupported == []
+    assert report.withheld == [UNIT_PERCENT.label]
 
 
 def test_the_plan_writes_the_shipped_macro_beside_the_rendered_test(
@@ -375,3 +378,64 @@ def test_a_macro_that_ignores_the_filters_fails_the_harness(
         f"{PARENT_MISSING_FILTERED.label} on {clean}: the test should pass on the "
         "clean fixture, dbt says 'fail'"
     ) in report.disagreements
+
+
+# --- dex_unit_range (#1455) ----------------------------------------------------------
+
+UNIT_ROWS = (UNIT_FRACTION, UNIT_PERCENT)
+
+#: Checks only the upper bound: a negative share passes.
+ONLY_ABOVE_ONE = (
+    "select count(*) as dex_violating_rows from {{ model }} "
+    "where {{ column_name }} > 1 having count(*) > 0"
+)
+
+
+def test_the_unit_rows_agree_and_a_percent_renders_nothing(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=UNIT_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [UNIT_FRACTION.label]
+    assert report.withheld == [UNIT_PERCENT.label]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_unit_range.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["status"], t.get("reason"))
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.UNIT_RANGE
+    )
+    assert rows == sorted(
+        [
+            (UNIT_FRACTION.model("violating"), "added", None),
+            (UNIT_FRACTION.model("clean"), "added", None),
+            (UNIT_PERCENT.model("violating"), "not_rendered", gt.HEURISTIC_ONLY),
+            (UNIT_PERCENT.model("clean"), "not_rendered", gt.HEURISTIC_ONLY),
+        ]
+    )
+    written = (dbt_project_dir / "macros" / "dex_unit_range.sql").read_text()
+    assert "select dex_violating_rows" in written
+
+
+def test_a_macro_missing_the_lower_bound_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(UNIT_FRACTION,),
+        extra_edits=[
+            _planted("duckdb", ONLY_ABOVE_ONE, gt.UNIT_RANGE, "model, column_name")
+        ],
+    )
+
+    violating = UNIT_FRACTION.model("violating")
+    assert report.disagreements == [
+        f"{UNIT_FRACTION.label} on {violating}: dbt counts 1 failure(s), "
+        "maintain verify counts 2"
+    ]

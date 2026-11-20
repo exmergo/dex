@@ -82,6 +82,12 @@ class ParityRow:
     #: model (#1454: a parent's ``missing`` and ``unexpected`` directions),
     #: matched against the rendered spec and the manifest's test kwargs.
     arguments: Mapping[str, Any] = field(default_factory=dict)
+    #: The reason the plan renders no test for this row on any connector
+    #: (#1455: a ``percent`` column is ``heuristic_only``). Such a row is judged
+    #: as an unsupported dialect is: the plan lists both fixtures
+    #: ``not_rendered`` with this reason, no test builds, and ``maintain
+    #: verify`` alone answers.
+    withheld: str | None = None
 
     @property
     def label(self) -> str:
@@ -380,6 +386,75 @@ PARENT_MISSING_UNAPPLIED = _parent_row(
     filters=[{"column": "status", "includes": ["active", "paid"]}],
 )
 
+
+def _shares(null_int: str, *values: str | None) -> str:
+    """A SELECT over ``values`` as (id, share). A ``None`` share is the
+    connector's typed NULL, never in the first row, which names the columns.
+    Every value is written with a decimal point, so no warehouse has to find a
+    supertype for an integer and a decimal in one UNION."""
+
+    first, *rest = values
+    assert first is not None
+    lines = [f"select 1 as id, {first} as share"]
+    lines += [
+        f"union all select {i}, {null_int if v is None else v}"
+        for i, v in enumerate(rest, start=2)
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _unit_measured(verify: Mapping[str, Any], model: str) -> bool:
+    """``maintain verify`` measured ``model``'s declared unit: the class is not
+    suppressed and nothing it says names this model's unit, or its whole
+    declared-facts statement, as unchecked (an all-NULL or text column, a
+    column the relation lacks, a refused statement)."""
+
+    if "unit" in (verify.get("suppressed") or {}):
+        return False
+    unmeasured = (
+        f"declared unit of {model}.",
+        f"declared unit on {model} ",
+        f"declared facts on {model} could not be measured",
+    )
+    said = [*(verify.get("_warnings") or []), *(verify.get("notes") or [])]
+    return not any(marker in str(line) for line in said for marker in unmeasured)
+
+
+#: #1455: a column declared a fraction. Two values sit outside 0 to 1, one on
+#: each side, so the count is compared too; the bounds 0 and 1 and a NULL sit in
+#: both fixtures, and either side counting one would fail the clean fixture.
+UNIT_FRACTION = ParityRow(
+    test=gt.UNIT_RANGE,
+    name="dex_unit_range_fraction",
+    codes=frozenset({"unit_out_of_range"}),
+    declaration={
+        "description": "Parity fixture: one row per order.",
+        "columns": {"share": {"unit": "fraction"}},
+    },
+    violating=lambda null: _shares(null, "0.5", "1.5", "-0.2", "0.0", "1.0", None),
+    clean=lambda null: _shares(null, "0.5", "0.0", "1.0", None),
+    count=lambda finding: int(finding["data"]["out_of_range_rows"]),
+    measured=_unit_measured,
+)
+
+#: #1455: a column declared a percent renders no test (``heuristic_only``):
+#: ``maintain verify`` flags one whose every value sits within 0 to 1 as a
+#: question, which correct small percentages answer too. The plan says so on
+#: both fixtures and ``maintain verify`` alone flags the 0-to-1 one.
+UNIT_PERCENT = ParityRow(
+    test=gt.UNIT_RANGE,
+    name="dex_unit_range_percent",
+    codes=frozenset({"unit_out_of_range"}),
+    declaration={
+        "description": "Parity fixture: one row per order.",
+        "columns": {"share": {"unit": "percent"}},
+    },
+    violating=lambda null: _shares(null, "0.05", "0.12", "1.0", None),
+    clean=lambda null: _shares(null, "5.0", "12.0", "100.0", None),
+    measured=_unit_measured,
+    withheld=gt.HEURISTIC_ONLY,
+)
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -391,6 +466,8 @@ ROWS: tuple[ParityRow, ...] = (
     PARENT_UNEXPECTED,
     PARENT_MISSING_FILTERED,
     PARENT_MISSING_UNAPPLIED,
+    UNIT_FRACTION,
+    UNIT_PERCENT,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
@@ -401,12 +478,15 @@ ALL_CODES: frozenset[str] = frozenset().union(*(row.codes for row in ROWS))
 class ParityReport:
     """What one connector's run established. ``disagreements`` is empty when
     every row agreed; ``unsupported`` names the rows whose test declares the
-    connector unsupported and rendered nothing there, as it must."""
+    connector unsupported and rendered nothing there, as it must, and
+    ``withheld`` the rows whose fact renders no test on any connector (#1455),
+    each held to ``maintain verify`` alone."""
 
     connector: str | None
     disagreements: list[str] = field(default_factory=list)
     agreed: list[str] = field(default_factory=list)
     unsupported: list[str] = field(default_factory=list)
+    withheld: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
     envelopes: dict[str, Any] = field(default_factory=dict)
     #: Per command: seconds on the wall clock and the envelope's ``cost``, so a
@@ -542,7 +622,7 @@ def run_parity(
             and t["model"] in models
             and (claims is None or t["claim"] in claims)
         ]
-        if gt.supports(kind, connector):
+        if row.withheld is None and gt.supports(kind, connector):
             if sorted(t["status"] for t in mine) != ["added", "added"]:
                 report.disagreements.append(
                     f"{row.label}: the plan did not render the test on both "
@@ -551,13 +631,22 @@ def run_parity(
                 continue
             live.append(row)
             continue
-        # #1451: a dialect the test does not support renders nothing there.
+        # #1451: a dialect the test does not support renders nothing there;
+        # #1455: nor does a fact only maintain verify judges, on any dialect.
+        reason = gt.DIALECT_UNSUPPORTED if row.withheld is None else row.withheld
         statuses = {(t["status"], t.get("reason")) for t in mine}
-        rendered = any(row.test in d.get("diff", "") for d in planned.get("diffs", []))
-        if statuses != {("not_rendered", gt.DIALECT_UNSUPPORTED)} or rendered:
+        # A withheld row shares its kind with rows that render it, so the
+        # diffs cannot tell; the manifest check in _judge_unsupported does.
+        rendered = row.withheld is None and any(
+            row.test in d.get("diff", "") for d in planned.get("diffs", [])
+        )
+        if statuses != {("not_rendered", reason)} or len(mine) != 2 or rendered:
             report.disagreements.append(
-                f"{row.label}: {connector} is unsupported, yet the plan says {mine}"
+                f"{row.label}: the plan should render nothing ({reason}), yet it "
+                f"says {mine}"
             )
+        elif row.withheld is not None:
+            report.withheld.append(row.label)
         else:
             report.unsupported.append(row.label)
         report.models.extend(sorted(models))
@@ -596,7 +685,7 @@ def run_parity(
                 f"{name} did not build ({model_status.get(name)}): "
                 f"{built.get('errors')}"
             )
-    if not live and not report.unsupported:
+    if not live and not report.unsupported and not report.withheld:
         return report
 
     _rc, verified = step(
@@ -612,7 +701,7 @@ def run_parity(
     for row in live:
         _judge(row, results, tests, findings, report, verify_data)
     for row in rows:
-        if row.label in report.unsupported:
+        if row.label in report.unsupported or row.label in report.withheld:
             _judge_unsupported(row, tests, findings, report, verify_data)
     return report
 

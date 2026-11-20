@@ -141,7 +141,11 @@ in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast.
 whose fixtures read another model (`dex_parent_population`'s declared parent)
 lists it under `fixtures`, built in the same selection, and a test that renders
 several instances on one model (a parent's `missing` and `unexpected`
-directions) picks its own with `arguments`. A kind that
+directions) picks its own with `arguments`. A fact that renders no test on any
+connector, only `maintain verify`'s check (`dex_unit_range`'s `percent` row,
+`heuristic_only`), sets `withheld`: the harness then checks that the plan lists
+both fixtures `not_rendered` with that reason, that no test builds, and that
+`maintain verify` alone flags the violating fixture and not the clean one. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 

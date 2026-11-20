@@ -612,6 +612,12 @@ def _probe(
             f"MIN({q}) AS dex_min_{index}, MAX({q}) AS dex_max_{index}, "
             f"COUNT({q}) AS dex_n_{index}"
         )
+        if unit == "fraction":
+            # The rows outside 0 to 1, the count dex_unit_range fails with
+            # (#1455), so the generated test and this check agree on a number.
+            parts.append(
+                f"COUNT(CASE WHEN {q} < 0 OR {q} > 1 THEN 1 END) AS dex_out_{index}"
+            )
         probe.units.append((index, column, unit, data_type))
 
     for index, rule in enumerate(model.filters):
@@ -1733,8 +1739,18 @@ def _judge_aggregate(
         safe = cleared or is_min_max_safe(
             data_type or "DOUBLE", detect_pii(column, data_type or "DOUBLE")
         )
+        outside = row.get(f"dex_out_{index}")
         result.findings.append(
-            _unit_finding(model, column, unit, low, high, non_null, safe)
+            _unit_finding(
+                model,
+                column,
+                unit,
+                low,
+                high,
+                non_null,
+                safe,
+                out_of_range=None if outside is None else int(outside),
+            )
         )
     if unit_checked:
         checked["unit"] += 1
@@ -1781,6 +1797,8 @@ def _unit_finding(
     high: float,
     non_null: int,
     show_values: bool,
+    *,
+    out_of_range: int | None = None,
 ) -> DriftFinding:
     if show_values:
         observed = f"its values run from {low:g} to {high:g}"
@@ -1789,10 +1807,15 @@ def _unit_finding(
             "its observed range is withheld because the column looks like personal data"
         )
     if unit == "fraction":
+        rows = (
+            ""
+            if out_of_range is None
+            else f" ({out_of_range} row{'' if out_of_range == 1 else 's'} outside it)"
+        )
         detail = (
-            f"'{model}.{column}' is declared a fraction (0 to 1), but {observed}; a "
-            "share computed as a percentage, or a ratio over the wrong denominator, "
-            "lands here"
+            f"'{model}.{column}' is declared a fraction (0 to 1), but {observed}"
+            f"{rows}; a share computed as a percentage, or a ratio over the wrong "
+            "denominator, lands here"
         )
     else:
         detail = (
@@ -1807,6 +1830,8 @@ def _unit_finding(
         "declared_unit": unit,
         "non_null_count": non_null,
     }
+    if out_of_range is not None:
+        data["out_of_range_rows"] = out_of_range
     if show_values:
         data.update({"min": low, "max": high})
     else:
