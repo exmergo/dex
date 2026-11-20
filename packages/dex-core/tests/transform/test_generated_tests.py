@@ -411,6 +411,21 @@ def test_a_versioned_model_takes_its_generated_test_on_the_version(kinds):
     )
 
 
+def test_a_fact_declared_earlier_gets_its_generated_test_when_declared_again(kinds):
+    # Declared with the switch off, then a description alone with it on: the
+    # composite grain the entry already states gets its test.
+    first = _render(None, False, {"model": "fct_lines", "grain": ["a", "b"]})
+    assert COMBO not in first
+    generated: list = []
+
+    out = _render(
+        first, True, {"model": "fct_lines", "description": "x"}, generated=generated
+    )
+
+    assert _names(_model_tests(out)) == [COMBO]
+    assert [(g["test"], g["status"]) for g in generated] == [(COMBO, "added")]
+
+
 # --- through the plan ---------------------------------------------------------
 
 MACROS = (
@@ -514,6 +529,45 @@ def test_a_plan_whose_declarations_give_no_generated_test_carries_no_key(
 
     assert planned["status"] == "ok", planned["errors"]
     assert "generated_tests" not in planned["data"]
+
+
+def test_transform_declare_renders_the_tests_earlier_declarations_owe(
+    dbt_project_dir: Path, tmp_path: Path, capsys, kinds
+):
+    sql = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    sql.write_text("select 1 as id, 2 as region_id\n", encoding="utf-8")
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id, region_id]\n",
+        encoding="utf-8",
+    )
+
+    def declare() -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+            capsys,
+        )
+
+    _switch(tmp_path, "false")
+    assert declare()["data"]["plan_id"] is None
+
+    _switch(tmp_path, "true")
+    proposed = declare()
+
+    assert proposed["status"] == "ok", proposed["errors"]
+    [proposal] = proposed["data"]["proposed"]
+    [owed] = proposal["fields"]["generated_tests"]["value"]
+    assert owed["test"] == COMBO and owed["cadence"] == gt.EVERY_RUN
+    assert proposed["data"]["generated_tests"]["counts"] == {"added": 1}
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    # Once listed, there is nothing left to propose.
+    assert declare()["data"]["plan_id"] is None
 
 
 # --- dbt selects them by tag --------------------------------------------------

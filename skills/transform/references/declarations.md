@@ -209,6 +209,13 @@ so two rules hold:
   `dbt build --select tag:dex_scheduled` on its own schedule. The built-ins
   carry no cadence tag, so they run with every build.
 
+A generated test checks the declaration as the entry states it once the plan's
+declaration is merged in, not only the facts the payload restates. Declaring a
+description alone renders the generated tests for a grain declared earlier, and
+on a project that turns the switch on after declaring its models,
+`transform declare` proposes the tests their declared facts imply (under the
+proposal's `fields.generated_tests`), with no fact restated.
+
 A generated test sits on the model entry (`data_tests:` beside `columns:`, or
 in the version's own item for a version label) or under the column it checks.
 Its claim tells two tests of one kind apart, so a model with two population

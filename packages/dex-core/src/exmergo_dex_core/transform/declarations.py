@@ -1279,17 +1279,27 @@ def render(
     should be told about how (a column forked from the shared entry).
 
     The built-in tests always render. The generated tests (#1449) render only
-    where ``render_tests`` turns their kind on, and ``generated`` collects one
-    row per generated test the declaration gives: its model, column, test,
+    where ``render_tests`` turns their kind on. They are generated from the
+    declaration as the entry states it once this one is merged in, not from
+    the payload alone, so declaring a description again, or ``transform
+    declare`` on a model declared before the switch was on, renders the tests
+    the facts already declared imply. ``generated`` collects one row per
+    generated test that declaration gives: its model, column, test,
     cadence tag and claim, and a ``status`` of ``added`` or ``already_listed``
     (on), ``not_rendered`` with the ``reason`` or ``listed_while_off`` (off). A
     generated test already in the YAML is never removed: the switch decides
     what renders, not what stays.
     """
 
-    planned = _generated(declaration, render_tests)
+    text = _render(content, declaration, notes, flagged_tests, [])
+    planned = _generated(_effective(text, declaration), render_tests)
     on = [g for g in planned if g["enabled"]]
-    text = _render(content, declaration, notes, flagged_tests, on)
+    if on:
+        # Rendered on their own, after the facts: a bare declaration of the
+        # model writes no key, so this pass adds the generated tests only.
+        text = _render(
+            text, Declaration(model=declaration.model), notes, flagged_tests, on
+        )
     if generated is not None and planned:
         before = _listed_claims(content)
         after = _listed_claims(text)
@@ -1358,6 +1368,21 @@ def _render(
         if flagged and flagged_tests is not None:
             flagged_tests.append(True)
     return text
+
+
+def _effective(text: str, declaration: Declaration) -> Declaration:
+    """The declaration ``text`` states for the model: what was declared before,
+    with ``declaration`` merged in. Falls back to ``declaration`` where the entry
+    holds something a declaration would refuse (a hand edit), so a fact written
+    by hand can only add tests, never stop the payload's own."""
+
+    from .drafting import read_declared
+
+    stated = read_declared({"schema.yml": text}, declaration.model)
+    try:
+        return Declaration.model_validate({**stated, "model": declaration.model})
+    except ValueError:
+        return declaration
 
 
 def _generated(
