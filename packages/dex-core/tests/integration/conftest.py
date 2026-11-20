@@ -469,6 +469,38 @@ def assert_unpivot_build(built: dict) -> None:
     assert all(s in {"success", "pass"} for s in statuses.values()), statuses
 
 
+def assert_generated_test_parity(
+    run_cli,
+    capsys,
+    root: Path,
+    *,
+    connector: str,
+    budget: float | None,
+    null_int: str = "cast(null as integer)",
+):
+    """The parity harness (#1450, #1451) on one live warehouse: every row's
+    generated test and ``maintain verify`` agree on its violating and clean
+    fixtures, or the test declares the connector unsupported and renders
+    nothing there. ``root`` holds a ``.dex/config.yml`` and the project
+    ``transform init`` wrote; ``null_int`` is the connector's typed integer NULL.
+    Returns the report, so a caller can drop the fixture models it built."""
+
+    from transform.generated_parity import ROWS, run_parity
+
+    report = run_parity(
+        lambda argv: run_cli(argv, capsys),
+        root,
+        connector=connector,
+        budget=budget,
+        null_int=null_int,
+    )
+    # What the run spent, per command, for a job log (#1451): `-s` shows it.
+    print(f"generated-test parity on {connector}: {report.spend}")
+    assert report.disagreements == [], report.disagreements
+    assert sorted(report.agreed + report.unsupported) == sorted(r.test for r in ROWS)
+    return report
+
+
 #: The downstream probe (#648): an intermediate model with one row its filter
 #: drops, a mart that counts it, and a singular test on the mart only. The
 #: model's own `not_null`/`unique` cannot see the filter go; the mart's count can.

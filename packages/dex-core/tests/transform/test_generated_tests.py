@@ -3,8 +3,9 @@
 A generated test is one Dex renders from a declaration beyond the three
 built-ins (``unique``, ``not_null``, ``relationships``). ``declarations.render_tests``
 turns them on, off by default, and each carries a fixed cadence tag,
-``dex_every_run`` or ``dex_scheduled``, as a dbt tag. No kind ships in this
-release (#1452 onward add them), so these tests register fixture kinds.
+``dex_every_run`` or ``dex_scheduled``, as a dbt tag. These tests set the
+shipped kinds aside (#1452 onward add them; see ``test_unique_combination.py``)
+and register fixture kinds, so they test the switch and not any one kind.
 """
 
 from __future__ import annotations
@@ -64,6 +65,21 @@ def _filters(declaration) -> list[gt.Instance]:
     return out
 
 
+@pytest.fixture(autouse=True)
+def without_shipped_kinds() -> Iterator[None]:
+    """The shipped catalog set aside for each test, and put back after it."""
+
+    shipped = gt.kinds()
+    for kind in shipped:
+        gt.unregister(kind.name)
+    try:
+        yield
+    finally:
+        for kind in shipped:
+            gt.unregister(kind.name)
+            gt.register(kind)
+
+
 @pytest.fixture
 def kinds() -> Iterator[None]:
     gt.register(gt.GeneratedTestKind(COMBO, gt.EVERY_RUN, _combination))
@@ -120,8 +136,8 @@ def _names(tests: list) -> list[str]:
 # --- the catalog --------------------------------------------------------------
 
 
-def test_no_generated_test_ships_before_its_own_issue():
-    # #1452 onward register them; this release has the switch and the tags.
+def test_with_the_shipped_kinds_set_aside_the_catalog_is_empty():
+    # The fixture kinds below are the only ones these tests see.
     assert gt.kinds() == ()
 
 

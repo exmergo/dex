@@ -203,6 +203,7 @@ def propose(
     draft: Callable[[str], tuple[dict[str, Any] | None, list[str]]],
     cap: int,
     render_tests: bool | list[str] = False,
+    dialect: str | None = None,
 ) -> Outcome:
     """Each model's proposal, or the reason it has none, up to ``cap`` proposals.
 
@@ -245,7 +246,7 @@ def propose(
         if (
             not fields
             and not supplied_fields
-            and not _owes_generated_tests(model, rendered, view, render_tests)
+            and not _owes_generated_tests(model, rendered, view, render_tests, dialect)
         ):
             # Whether anything would have been proposed had nothing been declared
             # yet: that separates a model already complete from one dex has no
@@ -274,6 +275,7 @@ def propose(
                 declaration,
                 render_tests=render_tests,
                 generated=generated,
+                dialect=dialect,
             )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
@@ -409,6 +411,7 @@ def _owes_generated_tests(
     files: Mapping[str, str],
     view: Any,
     render_tests: bool | list[str],
+    dialect: str | None = None,
 ) -> bool:
     """Whether the model's declared facts imply a generated test its YAML does
     not list yet, with ``render_tests`` turning it on (#1449): a model declared
@@ -427,6 +430,7 @@ def _owes_generated_tests(
             Declaration(model=model),
             render_tests=render_tests,
             generated=generated,
+            dialect=dialect,
         )
     except (RewriteError, DeclarationError):
         return False

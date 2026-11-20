@@ -654,7 +654,10 @@ writes a second entry for a model. The built-in tests it renders (`unique`, `not
 `declarations.render_tests` in `.dex/config.yml` turns them on (off by default;
 `true`, or a list of test names and cadences), each tagged `dex_every_run` or
 `dex_scheduled` so an orchestrator can select them, and listed with their tag,
-claim and status under `data.generated_tests` (#1449). A version of a native dbt versioned model is
+claim and status under `data.generated_tests` (#1449). A composite `grain`
+renders `dex_unique_combination` (#1452), whose macro the plan writes as a
+`macro_sql` diff; a kind renders only on the connectors it states, and is
+`not_rendered` with `reason: dialect_unsupported` elsewhere (#1451). A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry
 every version inherits, and a version's file stem is refused naming the label.

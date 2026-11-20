@@ -769,8 +769,10 @@ def _declare(
             pii_overrides=pii_override_paths(engine.config.pii_overrides),
             render_tests=render_tests,
             generated=generated,
+            dialect=_dialect(engine),
         )
         warnings.extend(rendered_warnings)
+        edits = _with_generated_macros(view, edits, generated)
     warnings.extend(
         declarations_mod.undeclared_model_warnings(
             edits, view, (d.model for d in parsed)
@@ -786,6 +788,41 @@ def _declare(
         pii_metadata,
         _generated_report(render_tests, generated),
     )
+
+
+def _dialect(engine: DexEngine) -> str | None:
+    """The connector a generated test would run on (#1451): the one this
+    command was given, else the committed one."""
+
+    return engine.connector or engine.config.connector
+
+
+def _with_generated_macros(
+    view: Any, edits: list[PlanEdit], generated: list[dict[str, Any]]
+) -> list[PlanEdit]:
+    """``edits`` plus a ``macro_sql`` edit for each shipped generic test a
+    rendered generated test needs and neither the project nor the plan defines
+    (#1452), so the plan dbt parses holds the test's definition and the diff
+    shows it. A project's own copy, however it differs, is left alone:
+    ``transform macro <name>`` reconciles it. A file already at the asset's
+    path gains only the definitions it lacks."""
+
+    from .. import generated_tests as gt
+    from . import scaffold as scaffold_mod
+
+    macros = {kind.name: kind.macro for kind in gt.kinds() if kind.macro}
+    needed = sorted(
+        {
+            macros[row["test"]]
+            for row in generated
+            if row["status"] in ("added", "already_listed") and row["test"] in macros
+        }
+    )
+    out = list(edits)
+    for name in needed:
+        if not scaffold_mod.defines_test(view, out, name):
+            out = scaffold_mod.with_shipped_test(view, out, name)
+    return out
 
 
 def _generated_report(
@@ -2081,6 +2118,7 @@ def declare(
         draft=draft_one,
         cap=cap,
         render_tests=engine.config.declarations.render_tests,
+        dialect=_dialect(engine),
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []

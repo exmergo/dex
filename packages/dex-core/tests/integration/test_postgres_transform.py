@@ -14,6 +14,7 @@ import yaml
 
 from .conftest import (
     assert_downstream_run,
+    assert_generated_test_parity,
     assert_ok,
     assert_unpivot_build,
     downstream_probe_edits,
@@ -438,3 +439,39 @@ def test_a_cast_key_is_measured_through_a_guard_live(pg_dsn):
         ci = plan_probe(conn, "pg_temp.dex_ci_codes")
         assert ci["input_rows"] == 2
         assert ci["failed_rows"] == 1
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, dev_dsn
+):
+    """The generated-test parity harness (#1450, #1451) on Postgres: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    seed_repo(tmp_path, schemas=["app"], budget=300)
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "postgres",
+        ],
+        capsys,
+    )
+    assert_ok(rc, envelope)
+    report = assert_generated_test_parity(
+        run_cli, capsys, tmp_path, connector="postgres", budget=300
+    )
+
+    import psycopg
+    from psycopg import sql
+
+    with psycopg.connect(dev_dsn, autocommit=True) as con:
+        # dbt's default materialization: the fixtures are views.
+        for name in report.models:
+            con.execute(
+                sql.SQL("drop view if exists {} cascade").format(
+                    sql.Identifier("dbt_dev", name)
+                )
+            )

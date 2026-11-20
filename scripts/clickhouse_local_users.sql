@@ -4,6 +4,9 @@ DROP USER IF EXISTS dbt_dev;
 
 CREATE USER dex_ro IDENTIFIED WITH plaintext_password BY 'dex_ro';
 GRANT SELECT ON app.* TO dex_ro;
+-- Read, never write, the dev database: `maintain verify --target dev` and
+-- `transform build --verify` judge the models dbt_dev built there, as dex_ro.
+GRANT SELECT ON dbt_dev.* TO dex_ro;
 GRANT SELECT ON system.tables TO dex_ro;
 GRANT SELECT ON system.columns TO dex_ro;
 GRANT SELECT ON system.databases TO dex_ro;

@@ -539,6 +539,7 @@ def apply_declarations(
     pii_overrides: Any = None,
     render_tests: bool | list[str] = False,
     generated: list[dict[str, Any]] | None = None,
+    dialect: str | None = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Validate ``declarations`` and render them into the plan's edits.
 
@@ -549,7 +550,8 @@ def apply_declarations(
     ``render_tests`` is ``declarations.render_tests`` (#1449), which decides
     whether the generated tests render beside the built-ins; ``generated``
     collects one row per generated test the declarations give, rendered or not
-    (see :func:`render`).
+    (see :func:`render`). ``dialect`` is the configured connector, which decides
+    whether a kind that names its dialects renders at all (#1451).
     """
 
     files = post_change_files(view, edits)
@@ -585,6 +587,7 @@ def apply_declarations(
                 flagged_tests=flagged_tests,
                 render_tests=render_tests,
                 generated=generated,
+                dialect=dialect,
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -1269,6 +1272,7 @@ def render(
     flagged_tests: list[bool] | None = None,
     render_tests: bool | list[str] = False,
     generated: list[dict[str, Any]] | None = None,
+    dialect: str | None = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1287,15 +1291,17 @@ def render(
     generated test that declaration gives: its model, column, test,
     cadence tag and claim, and a ``status`` of ``added`` or ``already_listed``
     (on), ``not_rendered`` with the ``reason`` or ``listed_while_off`` (off). A
-    generated test already in the YAML is never removed: the switch decides
-    what renders, not what stays.
+    kind turned on that does not support ``dialect`` (#1451) is
+    ``not_rendered`` with the reason ``dialect_unsupported``. A generated test
+    already in the YAML is never removed: the switch decides what renders, not
+    what stays.
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
     if not gt.kinds():
-        # No kind in this release: nothing to generate, so no entry to read back.
+        # No kind registered: nothing to generate, so no entry to read back.
         return text
-    planned = _generated(_effective(text, declaration), render_tests)
+    planned = _generated(_effective(text, declaration), render_tests, dialect)
     on = [g for g in planned if g["enabled"]]
     if on:
         # Rendered on their own, after the facts: a bare declaration of the
@@ -1322,7 +1328,7 @@ def render(
                 row["status"] = "listed_while_off"
             else:
                 row["status"] = "not_rendered"
-                row["reason"] = gt.off_reason(render_tests)
+                row["reason"] = g["off_reason"]
             generated.append(row)
     return text
 
@@ -1391,15 +1397,20 @@ def _effective(text: str, declaration: Declaration) -> Declaration:
 
 
 def _generated(
-    declaration: Declaration, render_tests: bool | list[str]
+    declaration: Declaration,
+    render_tests: bool | list[str],
+    dialect: str | None = None,
 ) -> list[dict[str, Any]]:
     """Every generated test the declaration gives, each with its claim, its
-    rendered spec, and whether ``render_tests`` turns its kind on (#1449)."""
+    rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
+    ``dialect`` (#1451)."""
 
     out: list[dict[str, Any]] = []
     model = declaration.model
     for kind in gt.kinds():
-        on = gt.enabled(kind, render_tests)
+        switched = gt.enabled(kind, render_tests)
+        on = switched and gt.supports(kind, dialect)
+        off_reason = gt.DIALECT_UNSUPPORTED if switched else gt.off_reason(render_tests)
         for instance in kind.instances(declaration):
             claim = claim_id(
                 model, instance.field, instance.columns, dict(instance.params)
@@ -1412,6 +1423,7 @@ def _generated(
                     "cadence": kind.cadence,
                     "claim": claim,
                     "enabled": on,
+                    "off_reason": None if on else off_reason,
                     "spec": generated_spec(
                         kind.name,
                         cadence=kind.cadence,

@@ -17,6 +17,7 @@ import yaml
 from .conftest import (
     SF_MAX_SECONDS,
     assert_downstream_run,
+    assert_generated_test_parity,
     assert_ok,
     assert_unpivot_build,
     downstream_probe_edits,
@@ -588,3 +589,19 @@ def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
         assert objects() == before
     finally:
         conn.close()
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, sf_scratch_database, sf_warehouse, sf_connection_name
+):
+    """The generated-test parity harness (#1450, #1451) on Snowflake: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    seed_repo(tmp_path, sf_scratch_database, sf_warehouse, sf_connection_name)
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+    # The scratch database is transient; its tables go with it.
+    assert_generated_test_parity(
+        run_cli, capsys, tmp_path, connector="snowflake", budget=SF_MAX_SECONDS * 10
+    )

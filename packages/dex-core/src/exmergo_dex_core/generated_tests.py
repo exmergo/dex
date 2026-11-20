@@ -75,6 +75,16 @@ class GeneratedTestKind:
     #: The instances one declaration gives this kind; empty where it declares
     #: nothing this kind checks.
     instances: Callable[[Any], Iterable[Instance]]
+    #: The shipped macro asset (``transform/assets/macros/<macro>.sql``) that
+    #: defines the generic test, written into the project's macro paths by the
+    #: plan that first renders the test where the project defines none.
+    macro: str | None = None
+    #: The connectors the test's macro is proved on (#1451): every connector
+    #: ``maintain verify`` runs the matching check on. A connector not listed
+    #: renders no test, and the plan reports it ``dialect_unsupported``, rather
+    #: than rendering one whose answer nothing has held to ``maintain verify``'s.
+    #: ``None`` means every connector.
+    dialects: frozenset[str] | None = None
 
 
 _KINDS: dict[str, GeneratedTestKind] = {}
@@ -133,6 +143,18 @@ def enabled(kind: GeneratedTestKind, setting: bool | list[str]) -> bool:
     return kind.name in setting or kind.cadence in setting
 
 
+def supports(kind: GeneratedTestKind, dialect: str | None) -> bool:
+    """Whether ``kind`` renders on ``dialect`` (a connector name). An unknown
+    dialect (``None``: no connector configured) is not refused here: the plan
+    cannot tell which warehouse will run the test, so it renders as before."""
+
+    return kind.dialects is None or dialect is None or dialect in kind.dialects
+
+
+#: The reason a kind turned on renders nothing on the configured connector.
+DIALECT_UNSUPPORTED = "dialect_unsupported"
+
+
 def off_reason(setting: bool | list[str]) -> str:
     """Why a kind ``setting`` leaves off is off: the switch is off, or the list
     does not name it."""
@@ -158,3 +180,53 @@ def is_generated(test: Any) -> bool:
     if isinstance(tags, str):
         tags = [tags]
     return isinstance(tags, list) and any(tag in CADENCES for tag in tags)
+
+
+# --- the kinds this release renders ---------------------------------------------
+
+#: Every connector Dex builds on. ``maintain verify``'s grain check is one
+#: aggregate statement it runs on each of them, so a test agreeing with it is
+#: owed on each (#1451).
+ALL_CONNECTORS: frozenset[str] = frozenset(
+    {
+        "bigquery",
+        "clickhouse",
+        "databricks",
+        "duckdb",
+        "postgres",
+        "redshift",
+        "snowflake",
+        "trino",
+    }
+)
+
+UNIQUE_COMBINATION = "dex_unique_combination"
+
+
+def _composite_grain(declaration: Any) -> list[Instance]:
+    """A declared ``grain`` of two or more columns (#1452). A one-column grain
+    already renders dbt's ``unique`` and ``not_null``."""
+
+    grain = [str(column) for column in (getattr(declaration, "grain", None) or [])]
+    if len(grain) < 2:
+        return []
+    return [
+        Instance(
+            column=None,
+            field="grain",
+            columns=tuple(grain),
+            params={"check": UNIQUE_COMBINATION},
+            arguments={"columns": grain},
+        )
+    ]
+
+
+register(
+    GeneratedTestKind(
+        UNIQUE_COMBINATION,
+        EVERY_RUN,
+        _composite_grain,
+        macro=UNIQUE_COMBINATION,
+        dialects=ALL_CONNECTORS,
+    )
+)

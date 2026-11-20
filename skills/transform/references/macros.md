@@ -11,6 +11,17 @@ customized or stale), and applying that plan overwrites deliberately.
 The override `transform init --layered-schemas` scaffolds, so each layer folder
 builds into its own `<layer>_<target name>` schema.
 
+## `dex_unique_combination`
+
+The generic test a declared composite grain renders
+([declarations](declarations.md#dex_unique_combination-a-composite-grain)), where
+`declarations.render_tests` turns it on. A declaration plan adds it for you; this
+command scaffolds or diffs it on its own. It fails with the count of rows beyond
+the first of each grain value, and never selects a key. The SQL goes through
+dbt's dispatch, `default__dex_unique_combination` holds on every connector, and
+a project overrides one warehouse with its own
+`<adapter>__dex_unique_combination(model, columns)` macro.
+
 ## `unpivot_json_object`
 
 Turns a JSON object column with dynamic keys (the NoSQL-sourced shape: a
