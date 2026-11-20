@@ -168,6 +168,17 @@ def test_the_next_step_names_the_comparison_before_apply(accounts):
     assert compare_at < hint.index(f"transform apply {planned.plan_id}")
 
 
+def test_the_offer_names_the_expect_key_value_not_holds(accounts):
+    # The procedure says `"key": "unchanged"`, and the malformed-expect errors
+    # already spell the whole accepted shape (#1388); the offer's own wording
+    # still said "that the key holds", which is not a value --expect accepts
+    # (#1421).
+    planned = _extraction(_engine(accounts), _INNER_INT)
+    intended = planned.data()["refactor_comparison_offer"]["intended_change"]
+    assert '"key": "unchanged"' in intended
+    assert "that the key holds" not in intended
+
+
 def test_the_inner_join_extraction_is_different_and_recorded(accounts):
     engine = _engine(accounts)
     planned = _extraction(engine, _INNER_INT)
