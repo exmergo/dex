@@ -332,7 +332,7 @@ def plan(
 
     toggle_stated = _parse_toggle(engine, edits, toggle)
 
-    declared, declaration_notes, drafts, pii_metadata = _declare(
+    declared, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
         engine, edits, declarations
     )
     edits = declared
@@ -485,6 +485,7 @@ def plan(
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
+    result.generated_tests = generated_tests
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -713,7 +714,7 @@ def _keep_one_entry(
 
 def _declare(
     engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
-) -> tuple[list[PlanEdit], list[str], dict[str, Any]]:
+) -> tuple[list[PlanEdit], list[str], dict[str, Any], Any, dict[str, Any] | None]:
     """Render the payload's declarations into ``edits``, draft what the cache
     already knows about each model, and warn where intent is missing.
 
@@ -724,7 +725,9 @@ def _declare(
 
     The third value is ``data.declarations``: per model the plan creates, edits
     or declares, its ``drafted``, ``declared`` and ``missing`` parts (see
-    :mod:`.drafting`).
+    :mod:`.drafting`). The fifth is ``data.generated_tests`` (#1449): the
+    switch's setting and each generated test the declarations give, rendered or
+    not, or ``None`` where they give none.
     """
 
     from ..dbt_project import load as load_project
@@ -737,10 +740,12 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}, None
+        return edits, [], {}, None, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
+    generated: list[dict[str, Any]] = []
+    render_tests = engine.config.declarations.render_tests
     if parsed:
         cache = None
         if any(d.population and d.population.filters for d in parsed):
@@ -762,6 +767,8 @@ def _declare(
             edits,
             cache=cache,
             pii_overrides=pii_override_paths(engine.config.pii_overrides),
+            render_tests=render_tests,
+            generated=generated,
         )
         warnings.extend(rendered_warnings)
     warnings.extend(
@@ -772,7 +779,33 @@ def _declare(
     drafts, draft_warnings = _draft(engine, view, edits, [d.model for d in parsed])
     warnings.extend(draft_warnings)
     edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
-    return edits, warnings, drafts, pii_metadata
+    return (
+        edits,
+        warnings,
+        drafts,
+        pii_metadata,
+        _generated_report(render_tests, generated),
+    )
+
+
+def _generated_report(
+    render_tests: bool | list[str], generated: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """``data.generated_tests`` (#1449): what ``declarations.render_tests``
+    says, and every generated test the plan's declarations give, each with its
+    cadence tag and claim and whether it rendered. ``None`` where they give
+    none, so a plan with nothing to say about generated tests carries no key."""
+
+    if not generated:
+        return None
+    counts: dict[str, int] = {}
+    for row in generated:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {
+        "render_tests": render_tests,
+        "counts": counts,
+        "tests": generated,
+    }
 
 
 def _stamp_pii(
@@ -2042,7 +2075,12 @@ def declare(
         return drafts.get(model), warnings
 
     outcome = declare_mod.propose(
-        view, selection.models, supplied, draft=draft_one, cap=cap
+        view,
+        selection.models,
+        supplied,
+        draft=draft_one,
+        cap=cap,
+        render_tests=engine.config.declarations.render_tests,
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2095,6 +2133,7 @@ def declare(
         decisions=planned.decisions,
         declarations=planned.declarations,
         semantic_proposal=planned.semantic_proposal,
+        generated_tests=planned.generated_tests,
         notes=notes + planned.notes,
         **common,
     )
@@ -8135,7 +8174,7 @@ def _semantic_plan(
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
     # and before the parse below, so dbt reads the layer and the models together.
-    edits, declaration_notes, drafts, pii_metadata = _declare(
+    edits, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
         engine, edits, declarations
     )
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
@@ -8201,6 +8240,7 @@ def _semantic_plan(
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
+    result.generated_tests = generated_tests
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)

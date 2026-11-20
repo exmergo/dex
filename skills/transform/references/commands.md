@@ -240,6 +240,14 @@ See the cost-controls reference for the shared budget mechanism.
   passes one through, and the project holds a parent to resolve against. It names
   its precedent and its parent, judges only models the plan authors, and is the
   one check a project can decline (`conventions.resolved_keys: false`).
+- `data.generated_tests`: every generated test the plan's declarations give (a
+  test beyond the built-in `unique`, `not_null` and `relationships`), with its
+  cadence tag (`dex_every_run` or `dex_scheduled`), its claim and whether it
+  rendered. They render only where `declarations.render_tests` turns them on,
+  off by default. They come from the declaration as the entry states it after
+  the plan, so a model declared before the switch was on gets them from
+  `transform declare` without restating a fact. Absent when the declarations
+  give none. Details: `declarations.md`.
 - `data.semantic_proposal`: for a declared model under `transform.marts_paths`
   (default `[models/marts]`), the semantic definition its declaration states in
   the configured layer (`vendor`). MetricFlow: added to the plan

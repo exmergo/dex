@@ -649,7 +649,12 @@ and optionally the `column` it governs, which `data.identifier_conversions` read
 The engine renders each declaration into the model's existing YAML entry, wherever
 it lives (dbt's own `description` and tests where dbt has a construct,
 `config.meta.dex` for the rest), as a `schema_yml` edit in the same plan, and never
-writes a second entry for a model. A version of a native dbt versioned model is
+writes a second entry for a model. The built-in tests it renders (`unique`, `not_null`,
+`relationships`) always render; Dex's generated tests render only where
+`declarations.render_tests` in `.dex/config.yml` turns them on (off by default;
+`true`, or a list of test names and cadences), each tagged `dex_every_run` or
+`dex_scheduled` so an orchestrator can select them, and listed with their tag,
+claim and status under `data.generated_tests` (#1449). A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry
 every version inherits, and a version's file stem is refused naming the label.

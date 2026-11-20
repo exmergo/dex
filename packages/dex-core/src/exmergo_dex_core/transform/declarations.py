@@ -44,6 +44,7 @@ from typing import Any
 
 import yaml
 
+from .. import generated_tests as gt
 from .. import model_versions as mv
 from ..dbt_project import DbtProjectView
 from ..guards.pii_meta import entry_meta
@@ -79,6 +80,7 @@ from .rewrite import (
     _unsampled,
     before_trailing_blanks,
     column_anchor,
+    generated_spec,
     prevailing_test_key,
     splice,
     yaml_blocks,
@@ -535,12 +537,19 @@ def apply_declarations(
     *,
     cache: Any = None,
     pii_overrides: Any = None,
+    render_tests: bool | list[str] = False,
+    generated: list[dict[str, Any]] | None = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Validate ``declarations`` and render them into the plan's edits.
 
     Returns the edits with each declaration folded in (one edit per path, merged
     into a ``schema_yml`` edit the payload already carries for that file) and the
     warnings for intent that was left unstated.
+
+    ``render_tests`` is ``declarations.render_tests`` (#1449), which decides
+    whether the generated tests render beside the built-ins; ``generated``
+    collects one row per generated test the declarations give, rendered or not
+    (see :func:`render`).
     """
 
     files = post_change_files(view, edits)
@@ -574,6 +583,8 @@ def apply_declarations(
                 declaration,
                 notes=warnings,
                 flagged_tests=flagged_tests,
+                render_tests=render_tests,
+                generated=generated,
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -1256,6 +1267,8 @@ def render(
     *,
     notes: list[str] | None = None,
     flagged_tests: list[bool] | None = None,
+    render_tests: bool | list[str] = False,
+    generated: list[dict[str, Any]] | None = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1264,8 +1277,63 @@ def render(
     have since moved. A version label (``dim_teams.v2``) renders into that item
     of the model's ``versions:`` list (#895); ``notes`` collects what a reviewer
     should be told about how (a column forked from the shared entry).
+
+    The built-in tests always render. The generated tests (#1449) render only
+    where ``render_tests`` turns their kind on. They are generated from the
+    declaration as the entry states it once this one is merged in, not from
+    the payload alone, so declaring a description again, or ``transform
+    declare`` on a model declared before the switch was on, renders the tests
+    the facts already declared imply. ``generated`` collects one row per
+    generated test that declaration gives: its model, column, test,
+    cadence tag and claim, and a ``status`` of ``added`` or ``already_listed``
+    (on), ``not_rendered`` with the ``reason`` or ``listed_while_off`` (off). A
+    generated test already in the YAML is never removed: the switch decides
+    what renders, not what stays.
     """
 
+    text = _render(content, declaration, notes, flagged_tests, [])
+    if not gt.kinds():
+        # No kind in this release: nothing to generate, so no entry to read back.
+        return text
+    planned = _generated(_effective(text, declaration), render_tests)
+    on = [g for g in planned if g["enabled"]]
+    if on:
+        # Rendered on their own, after the facts: a bare declaration of the
+        # model writes no key, so this pass adds the generated tests only.
+        text = _render(
+            text, Declaration(model=declaration.model), notes, flagged_tests, on
+        )
+    if generated is not None and planned:
+        for g in planned:
+            row = {
+                key: g[key] for key in ("model", "column", "test", "cadence", "claim")
+            }
+            # Read at the test's own place, matched the way rendering matches,
+            # so a renamed model's tests elsewhere in the file and a hand-written
+            # equivalent are each told apart (#1449).
+            listed_before = _listed_at(content, g)
+            if g["enabled"]:
+                row["status"] = (
+                    "added"
+                    if not listed_before and _listed_at(text, g)
+                    else "already_listed"
+                )
+            elif listed_before:
+                row["status"] = "listed_while_off"
+            else:
+                row["status"] = "not_rendered"
+                row["reason"] = gt.off_reason(render_tests)
+            generated.append(row)
+    return text
+
+
+def _render(
+    content: str | None,
+    declaration: Declaration,
+    notes: list[str] | None,
+    flagged_tests: list[bool] | None,
+    generated: list[dict[str, Any]],
+) -> str:
     model = declaration.model
     base, version = mv.split_label(model)
     if version is not None and content is not None:
@@ -1276,6 +1344,7 @@ def render(
             version,
             notes,
             flagged_tests=flagged_tests,
+            generated=generated,
         )
     text = _with_entry(content, model)
     entry = lambda root: _model_entry(root, model)  # noqa: E731
@@ -1287,7 +1356,7 @@ def render(
     if model_dex:
         text = _set_dex(text, entry, model_dex)
 
-    for name, column in _rendered_columns(declaration).items():
+    for name, column in _rendered_columns(declaration, generated).items():
         text = _ensure_column(text, model, name)
         locate = _column_locator(model, name)
         if column["description"] is not None:
@@ -1298,7 +1367,109 @@ def render(
             text, flagged = _add_tests(text, locate, column["tests"])
             if flagged and flagged_tests is not None:
                 flagged_tests.append(True)
+    model_tests = [g["spec"] for g in generated if g["column"] is None]
+    if model_tests:
+        text, flagged = _add_tests(text, entry, model_tests)
+        if flagged and flagged_tests is not None:
+            flagged_tests.append(True)
     return text
+
+
+def _effective(text: str, declaration: Declaration) -> Declaration:
+    """The declaration ``text`` states for the model: what was declared before,
+    with ``declaration`` merged in. Falls back to ``declaration`` where the entry
+    holds something a declaration would refuse (a hand edit), so a fact written
+    by hand can only add tests, never stop the payload's own."""
+
+    from .drafting import read_declared
+
+    stated = read_declared({"schema.yml": text}, declaration.model)
+    try:
+        return Declaration.model_validate({**stated, "model": declaration.model})
+    except ValueError:
+        return declaration
+
+
+def _generated(
+    declaration: Declaration, render_tests: bool | list[str]
+) -> list[dict[str, Any]]:
+    """Every generated test the declaration gives, each with its claim, its
+    rendered spec, and whether ``render_tests`` turns its kind on (#1449)."""
+
+    out: list[dict[str, Any]] = []
+    model = declaration.model
+    for kind in gt.kinds():
+        on = gt.enabled(kind, render_tests)
+        for instance in kind.instances(declaration):
+            claim = claim_id(
+                model, instance.field, instance.columns, dict(instance.params)
+            )
+            out.append(
+                {
+                    "model": model,
+                    "column": instance.column,
+                    "test": kind.name,
+                    "cadence": kind.cadence,
+                    "claim": claim,
+                    "enabled": on,
+                    "spec": generated_spec(
+                        kind.name,
+                        cadence=kind.cadence,
+                        claim=claim,
+                        arguments=instance.arguments,
+                    ),
+                }
+            )
+    return out
+
+
+def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
+    """Whether ``content`` lists the generated ``test`` where it belongs: the
+    model's entry (or the version's item, for a label), then the column it sits
+    under, matched by :func:`_is_listed`."""
+
+    if not content:
+        return False
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return False
+    base, version = mv.split_label(test["model"])
+    entries = loaded.get("models") if isinstance(loaded, Mapping) else None
+    node: Any = next(
+        (
+            e
+            for e in entries or []
+            if isinstance(e, Mapping) and str(e.get("name", "")).lower() == base.lower()
+        ),
+        None,
+    )
+    if node is not None and version is not None:
+        item = next(
+            (
+                item
+                for item in node.get("versions") or []
+                if isinstance(item, Mapping) and str(item.get("v")) == str(version)
+            ),
+            None,
+        )
+        # The version as dbt builds it: inherited columns (and their tests)
+        # included, its own overrides and exclusions applied.
+        node = mv.effective_entry(node, item) if item is not None else None
+    if node is not None and test["column"] is not None:
+        node = next(
+            (
+                c
+                for c in node.get("columns") or []
+                if isinstance(c, Mapping)
+                and str(c.get("name", "")).lower() == test["column"].lower()
+            ),
+            None,
+        )
+    if not isinstance(node, Mapping):
+        return False
+    listed = node.get("data_tests") or node.get("tests") or []
+    return isinstance(listed, list) and _is_listed(test["spec"], listed)
 
 
 def _render_version(
@@ -1308,6 +1479,7 @@ def _render_version(
     version: str,
     notes: list[str] | None,
     flagged_tests: list[bool] | None = None,
+    generated: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render a declaration into one item of ``base``'s ``versions:`` list.
 
@@ -1332,7 +1504,8 @@ def _render_version(
     if model_dex:
         text = _set_dex(text, item, model_dex)
 
-    for name, column in _rendered_columns(declaration).items():
+    generated = generated or []
+    for name, column in _rendered_columns(declaration, generated).items():
         text, owned = _ensure_version_column(text, base, version, name, column)
         if not owned:
             continue
@@ -1352,6 +1525,11 @@ def _render_version(
             text, flagged = _add_tests(text, locate, column["tests"])
             if flagged and flagged_tests is not None:
                 flagged_tests.append(True)
+    model_tests = [g["spec"] for g in generated if g["column"] is None]
+    if model_tests:
+        text, flagged = _add_tests(text, item, model_tests)
+        if flagged and flagged_tests is not None:
+            flagged_tests.append(True)
     return text
 
 
@@ -1390,12 +1568,8 @@ def _already_states(entry: Mapping[str, Any], column: dict[str, Any]) -> bool:
     if any(dex.get(key) != value for key, value in column["dex"].items()):
         return False
     tests = entry.get("data_tests") or entry.get("tests") or []
-    present = {
-        t if isinstance(t, str) else next(iter(t), "")
-        for t in tests
-        if isinstance(t, (str, dict))
-    }
-    return all(_spec_name(spec) in present for spec in column["tests"])
+    listed = [t for t in tests if isinstance(t, (str, dict))]
+    return all(_is_listed(spec, listed) for spec in column["tests"])
 
 
 def _exclude_from_version(text: str, base: str, version: str, name: str) -> str:
@@ -1492,8 +1666,13 @@ def _plain(node: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
+def _rendered_columns(
+    declaration: Declaration, generated: Iterable[Mapping[str, Any]] = ()
+) -> dict[str, dict[str, Any]]:
     """What each column receives: its description, its dex meta, and its tests.
+
+    ``generated`` are the generated tests the switch turned on (#1449); each one
+    that sits under a column follows that column's built-ins.
 
     Each test carries the id of the claim it checks (#1448), derived from the
     declared fact and never from the test's name: a ``null_rule: never``, a
@@ -1558,6 +1737,9 @@ def _rendered_columns(declaration: Declaration) -> dict[str, dict[str, Any]]:
                 tests.insert(
                     0 if name == "unique" else 1, _unsampled(name, claim=claim)
                 )
+    for test in generated:
+        if test["column"] is not None:
+            slot(test["column"])["tests"].append(test["spec"])
     return out
 
 
@@ -1942,8 +2124,8 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     if found is None:  # the claims above change no key, so this cannot happen
         raise RewriteError("a column's test list moved while it was claimed")
     _key, listed = found
-    present = {_test_name(item) for item in _sequence(listed)}
-    todo = [spec for spec in specs if _spec_name(spec) not in present]
+    present = [_node_value(item) for item in _sequence(listed)]
+    todo = [spec for spec in specs if not _is_listed(spec, present)]
     if not todo:
         return text, False
 
@@ -2030,11 +2212,59 @@ def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
     return text
 
 
-def _test_name(item: Any) -> str:
-    if isinstance(item, yaml.ScalarNode):
-        return item.value
-    names = [name for name, _body in _mapping(item)]
-    return names[0] if names else ""
+def _node_value(node: Any) -> Any:
+    return yaml.safe_load(yaml.serialize(node))
+
+
+def _is_listed(spec: Any, listed: list[Any]) -> bool:
+    """Whether a test list already holds ``spec``.
+
+    A built-in is matched by name, so a test the column lists under that name is
+    left exactly as written (#1348). A generated test (#1449) is matched by its
+    claim, wherever it was renamed, or by the same test with the same arguments,
+    which dbt would build into the same node: one kind can check two facts on
+    one model (two population filters), so its name alone says nothing.
+    """
+
+    name = _spec_name(spec)
+    if not gt.is_generated(spec):
+        return any(_listed_name(test) == name for test in listed)
+    claim = claim_of(spec)
+    arguments = _arguments_of(spec)
+    for test in listed:
+        if claim is not None and claim_of(test) == claim:
+            return True
+        if _listed_name(test) == name and _arguments_of(test) == arguments:
+            return True
+    return False
+
+
+def _listed_name(test: Any) -> str:
+    if isinstance(test, str):
+        return test
+    if isinstance(test, Mapping) and len(test) == 1:
+        return str(next(iter(test)))
+    return ""
+
+
+def _arguments_of(test: Any) -> dict[str, Any]:
+    """A test's arguments, under ``arguments:`` or at the top of its body (the
+    spelling before dbt 1.10), and nothing of its config, name or description."""
+
+    if not isinstance(test, Mapping) or len(test) != 1:
+        return {}
+    body = next(iter(test.values()))
+    if not isinstance(body, Mapping):
+        return {}
+    out = {
+        key: value
+        for key, value in body.items()
+        if key not in ("arguments", "config", "name", "description", "meta", "tags")
+    }
+    nested = body.get("arguments")
+    if isinstance(nested, Mapping):
+        out.update(nested)
+    return out
 
 
 def _spec_name(spec: Any) -> str:

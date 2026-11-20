@@ -202,6 +202,7 @@ def propose(
     *,
     draft: Callable[[str], tuple[dict[str, Any] | None, list[str]]],
     cap: int,
+    render_tests: bool | list[str] = False,
 ) -> Outcome:
     """Each model's proposal, or the reason it has none, up to ``cap`` proposals.
 
@@ -241,7 +242,11 @@ def propose(
             payload, supplied_fields = _merge(payload, given)
         else:
             supplied_fields = []
-        if not fields and not supplied_fields:
+        if (
+            not fields
+            and not supplied_fields
+            and not _owes_generated_tests(model, rendered, view, render_tests)
+        ):
             # Whether anything would have been proposed had nothing been declared
             # yet: that separates a model already complete from one dex has no
             # measured fact for.
@@ -263,7 +268,13 @@ def propose(
                 declarations_mod._check(
                     declaration, rendered, view, cache=None, pii_overrides=None
                 )
-            text = declarations_mod.render(rendered.get(path), declaration)
+            generated: list[dict[str, Any]] = []
+            text = declarations_mod.render(
+                rendered.get(path),
+                declaration,
+                render_tests=render_tests,
+                generated=generated,
+            )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
                 raise
@@ -279,6 +290,21 @@ def propose(
             outcome.skipped.append(_why_nothing(model, entry, complete=True))
             continue
         rendered[path] = text
+        added = [
+            {k: row[k] for k in ("test", "column", "cadence", "claim")}
+            for row in generated
+            if row["status"] == "added"
+        ]
+        if added:
+            # Not a measured fact: the tests the declared facts imply, which
+            # `declarations.render_tests` turns on (#1449).
+            fields = {
+                **fields,
+                "generated_tests": {
+                    "value": added,
+                    "evidence": "declared facts; declarations.render_tests",
+                },
+            }
         outcome.proposals.append(
             Proposal(
                 model=model,
@@ -376,6 +402,35 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
         and packaged.enabled
         and (packaged.columns is None or column.lower() in packaged.columns)
     )
+
+
+def _owes_generated_tests(
+    model: str,
+    files: Mapping[str, str],
+    view: Any,
+    render_tests: bool | list[str],
+) -> bool:
+    """Whether the model's declared facts imply a generated test its YAML does
+    not list yet, with ``render_tests`` turning it on (#1449): a model declared
+    before the switch was on, which has no fact left to propose."""
+
+    if render_tests is False or render_tests == []:
+        return False
+    sql_path = declarations_mod.model_sql_path(files, view.model_paths, model)
+    path = declarations_mod.schema_path(files, model)
+    if path is None or sql_path is None:
+        return False
+    generated: list[dict[str, Any]] = []
+    try:
+        declarations_mod.render(
+            files.get(path),
+            Declaration(model=model),
+            render_tests=render_tests,
+            generated=generated,
+        )
+    except (RewriteError, DeclarationError):
+        return False
+    return any(row["status"] == "added" for row in generated)
 
 
 def _merge(

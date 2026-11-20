@@ -1331,6 +1331,18 @@ default, or a filter or operator after it is refused. A key naming a location
   other expression `unresolved` with a warning, a hand-written mark `kept` (or a
   `disagreement`), and a model that already exists `not_written`. The rule and
   the precedence: [`pii-policy.md`](pii-policy.md#pii-metadata-on-authored-models).
+- A declaration renders the built-in tests (`unique`, `not_null`,
+  `relationships`) always, and Dex's **generated tests** only where
+  `declarations.render_tests` in `.dex/config.yml` turns them on (#1449): `false`
+  by default, `true` for every kind this release renders, or a list of test
+  names and cadences. Each generated test carries a dbt tag fixed per kind,
+  `dex_every_run` or `dex_scheduled`, so an orchestrator selects them with
+  `--select tag:dex_scheduled` or leaves them out with `--exclude`. The plan
+  lists each one under `data.generated_tests` (`model`, `column`, `test`,
+  `cadence`, `claim`, and a `status` of `added`, `already_listed`,
+  `not_rendered` with its `reason`, or `listed_while_off`). Turning the switch
+  off removes no test already written. A list entry this release does not render
+  is a non-fatal `unknown_test_kind` config problem.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it
