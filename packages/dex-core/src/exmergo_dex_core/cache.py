@@ -632,7 +632,11 @@ class DexCache(BaseModel):
     provenance: CacheProvenance = Field(default_factory=CacheProvenance)
 
     def ranked_datasets(
-        self, *, profiled_only: bool = True, connected_only: bool = False
+        self,
+        *,
+        profiled_only: bool = True,
+        connected_only: bool = False,
+        relationships: list[Relationship] | None = None,
     ) -> list[Dataset]:
         """The datasets worth reporting, best first.
 
@@ -646,14 +650,18 @@ class DexCache(BaseModel):
         nothing about the model. A findings payload does not: an isolated object
         that carries four PII flags and an empty-table warning is exactly a
         finding, and dropping it would leave the envelope's own
-        ``pii_column_count`` contradicting the objects beside it.
+        ``pii_column_count`` contradicting the objects beside it. ``relationships``
+        names the edges connectivity is read over, for a caller that draws only
+        some of the cache's (a diagram leaving endpoints out, #1494); the cache's
+        own by default.
 
         Order is rank first and identifier second, never cache order, so the same
         cache reports byte-identically however its datasets happen to be stored.
         """
 
-        connected = {r.from_dataset.lower() for r in self.relationships}
-        connected |= {r.to_dataset.lower() for r in self.relationships}
+        edges = self.relationships if relationships is None else relationships
+        connected = {r.from_dataset.lower() for r in edges}
+        connected |= {r.to_dataset.lower() for r in edges}
         candidates = [
             d
             for d in self.datasets

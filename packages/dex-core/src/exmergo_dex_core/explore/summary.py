@@ -95,9 +95,11 @@ class ExcludedObjects(BaseModel):
     Elementary dbt package's own tables), and is ``None`` when nothing was left
     out. An excluded object is not ranked, not profiled by ``explore map`` and not
     described in its payload, and it is not in ``skipped``, which is the rank
-    cutoff's: the two answer different questions. ``by_namespace``, ``objects``
-    and the elision counts are capped and counted as ``skipped``'s are, and
-    ``objects`` is sorted by name, since an excluded object has no rank.
+    cutoff's: the two answer different questions. ``explore diagram`` and
+    ``explore relationships`` report the same block for the tables they leave out
+    (#1494). ``by_namespace``, ``objects`` and the elision counts are capped and
+    counted as ``skipped``'s are, and ``objects`` is sorted by name, since an
+    excluded object has no rank.
     """
 
     count: int = 0

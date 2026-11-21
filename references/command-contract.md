@@ -181,6 +181,10 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)
+  [--include-elementary]             the Elementary dbt package's own tables are left out of
+                                     profiling and inference (#1494): not priced, no join among
+                                     them inferred, named in data.excluded with a note; this
+                                     profiles them with the rest
 dex explore map [--detail]        -> write/update the .dex cache, and return the map:
                                      per top-ranked object its grain, key, notable
                                      columns, PII flags and data-quality findings,
@@ -200,6 +204,10 @@ dex explore diagram               -> the cached map as a Mermaid erDiagram, in `
                                      joined objects with their grain/key/join/PII columns
                                      (--full for every eligible object and column); every
                                      elision is counted in notes; dex writes no file
+  [--include-elementary]             the Elementary dbt package's own tables are left out
+                                     (#1494), recognised over the cache's identifiers, so the
+                                     command stays free; named in data.excluded with a note;
+                                     this draws them
 dex explore query "<SELECT ...>"  -> firewall-approved SELECTs, capped and row-major
   [more...] | --sql-file <path>      (variadic: one call answers several questions; a file takes
   [--across <ds,ds>]                 one statement per line or semicolon-separated statements;
@@ -2596,7 +2604,35 @@ each list capped at 25 with the rest counted in `elided_namespaces` and
 from `data.skipped`, which is the rank cutoff's. A note names the namespaces and
 the way back. The tables stay readable: an unranked `explore inventory` lists
 them, `explore profile` and `explore query` read them as any other, and
-`--include-elementary` ranks them with the rest. Objects skipped on a
+`--include-elementary` ranks them with the rest. `explore diagram` and
+`explore relationships` apply the same rule (#1494), by the same signature.
+The diagram reads it over the cache's identifiers, names only, so it stays free:
+a cache an `--include-elementary` map filled with the package's profiles, or a
+hand-run `explore profile` added one beside the inventory entries `map` keeps
+for them, still draws none of them, `--full` included. A left-out object is never
+counted as an elided entity; an edge onto one is dropped as any edge whose
+endpoint is not drawn, counted in `elided_edge_count`, and connects nothing, so a
+project table whose only join is onto one is isolated and drawn only with
+`--full`. The signature has to be in the cache to read: a cache only
+`explore relationships` has written holds no entry for the tables it left out (a
+`map` keeps their inventory entries, and no later write drops them), so a lone
+package table profiled by hand into it is below the signature and `--full` draws
+it, with nothing excluded, until an `explore map` writes the rest.
+Relationship inference leaves them out before anything is priced or profiled:
+none is profiled, a metered connector's estimate prices none, and no join among
+them (their shared `unique_id` columns) is inferred; a profile of one the cache
+already holds is left as it is, read by nothing, and the joins among them an
+earlier `--include-elementary` run cached are dropped from the cache, as on
+`map`, where this run listed their namespace. Carried forward from outside a
+narrower `--scope` instead, the tables are recognised among the carried profiles,
+as `map` recognises them, and the joins stay in the cache and out of
+`data.relationships`; `carried_relationship_count` counts only the carried joins
+the list reports, so it agrees with `inferred_count`, which is derived from the
+list. Only the package's own tables are left out, so a project
+table sharing their schema is still drawn and profiled. Each command reports `data.excluded` in the shape `map`
+does, always present, with a note naming the namespaces and `--include-elementary`
+as the way back: on `diagram` it draws them, on `relationships` it profiles them
+and infers joins among them. Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`. A selected object whose cached profile is
 still fresh (same connector, schema unchanged, profiled within
