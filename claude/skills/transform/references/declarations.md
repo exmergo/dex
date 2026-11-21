@@ -575,13 +575,15 @@ models:
 
 | Reason | When |
 |---|---|
-| `covered_by_builtin` | The parent declares that one column as its `grain` (which renders `unique`), or the column already lists `unique`. A composite grain holding the column does not cover it. |
+| `covered_by_builtin` | The parent declares that one column as its `grain` (which renders `unique`), or the column already lists an enabled `unique` with no `where`. A composite grain holding the column, or a `unique` filtered by `where` (dbt applies it first), does not cover it. |
 | `parent_undeclared` | The parent has no YAML entry under `models:` (a model nobody documented, a seed, a snapshot). Dex does not create an entry to hold a test: declare the parent, or write its entry, and plan again. |
 | `parent_in_package` | The parent is an installed package's model, or a project override of one its package documents. Dex never edits a package's YAML. |
 | `column_not_output` | The parent's SQL provably no longer outputs the column (a `references` a later edit left behind). |
 
 A version label (`dim_teams.v2.team_id`) renders into that version's item; a
-bare versioned name renders on the shared entry every version inherits. A test
+bare versioned name (`dim_teams.team_id`) is the version an unversioned `ref()`
+reads, its `latest_version`, and renders into that item alone, never on the
+shared entry every version would inherit. A test
 whose `references` later goes away is never removed (nothing generated is).
 
 Its macro reaches the project as the others' do: `macros/dex_referenced_key.sql`

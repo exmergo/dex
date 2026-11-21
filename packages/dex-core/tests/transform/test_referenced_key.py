@@ -244,6 +244,31 @@ def test_a_hand_written_unique_test_on_the_column_covers_it():
     assert [r["reason"] for r in rows] == [gt.COVERED_BY_BUILTIN]
 
 
+@pytest.mark.parametrize(
+    "unique",
+    [
+        "- unique:\n            config:\n              where: is_current\n",
+        "- unique:\n            config:\n              enabled: false\n",
+    ],
+)
+def test_a_filtered_or_disabled_unique_test_does_not_cover_it(unique):
+    # dbt applies `where` first, so a key repeated outside it goes unseen.
+    files, rows = _apply(
+        [_references()],
+        files=_project(
+            **{
+                PARENT_YML: (
+                    "version: 2\nmodels:\n  - name: dim_customers\n    columns:\n"
+                    "      - name: customer_id\n        data_tests:\n          "
+                    + unique
+                )
+            }
+        ),
+    )
+    assert len(_tests(files[PARENT_YML], "dim_customers", "customer_id")) == 1
+    assert [r["status"] for r in rows] == ["added"]
+
+
 def test_a_parent_with_no_yaml_entry_renders_nothing_and_no_entry_is_made():
     project = _project()
     del project[PARENT_YML]
@@ -361,6 +386,36 @@ def test_a_version_label_renders_into_that_version_s_item():
     [entry] = yaml.safe_load(files["models/marts/dim_teams.yml"])["models"]
     v1, v2 = entry["versions"]
     assert NAME not in json.dumps(v1)
+    assert NAME in json.dumps(v2)
+    assert [(r["model"], r["status"]) for r in rows] == [("dim_teams.v2", "added")]
+
+
+def test_a_bare_versioned_name_renders_on_its_default_version_only():
+    # An unversioned ref() reads latest_version; on the shared entry the test
+    # would also run on v1, which the child never joins.
+    project = _project(
+        **{
+            "models/marts/dim_teams_v1.sql": "select 7 as team_id\n",
+            "models/marts/dim_teams_v2.sql": "select 7 as team_id, 'x' as name\n",
+            "models/marts/dim_teams.yml": (
+                "version: 2\nmodels:\n  - name: dim_teams\n    latest_version: 2\n"
+                "    versions:\n      - v: 1\n      - v: 2\n"
+            ),
+        }
+    )
+    files, rows = _apply(
+        [
+            {
+                "model": "fct_orders",
+                "columns": {"customer_id": {"references": "dim_teams.team_id"}},
+            }
+        ],
+        files=project,
+    )
+    [entry] = yaml.safe_load(files["models/marts/dim_teams.yml"])["models"]
+    v1, v2 = entry["versions"]
+    assert NAME not in json.dumps(v1)
+    assert NAME not in json.dumps(entry.get("columns") or [])
     assert NAME in json.dumps(v2)
     assert [(r["model"], r["status"]) for r in rows] == [("dim_teams.v2", "added")]
 

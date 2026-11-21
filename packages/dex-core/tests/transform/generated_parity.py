@@ -1075,16 +1075,12 @@ def run_parity(
                 os.environ.pop("DBT_INDIRECT_SELECTION", None)
             else:
                 os.environ["DBT_INDIRECT_SELECTION"] = previous
-        model_status.update(
-            {
-                n["name"]: n["status"]
-                for n in (rebuilt.get("data") or {}).get("nodes", [])
-                if n["name"] in skipped
-            }
-        )
-        built = (
-            rebuilt if any(model_status.get(n) != "success" for n in skipped) else built
-        )
+        # Every model is judged by the rebuild, which built them all: a model
+        # the first pass built and this one failed is not success.
+        model_status = {
+            n["name"]: n["status"] for n in (rebuilt.get("data") or {}).get("nodes", [])
+        }
+        built = rebuilt
     for name in dict.fromkeys(selected):
         if model_status.get(name) != "success":
             report.disagreements.append(

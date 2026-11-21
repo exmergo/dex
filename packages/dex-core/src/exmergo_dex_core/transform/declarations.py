@@ -1504,11 +1504,30 @@ def _unique_tested(files: Mapping[str, str], model: str) -> frozenset[str]:
             if not isinstance(column, dict) or not isinstance(column.get("name"), str):
                 continue
             listed = column.get("data_tests") or column.get("tests") or []
-            if isinstance(listed, list) and any(
-                _listed_name(test) == "unique" for test in listed
-            ):
+            if isinstance(listed, list) and any(_whole_unique(test) for test in listed):
                 out.add(column["name"].lower())
     return frozenset(out)
+
+
+def _whole_unique(test: Any) -> bool:
+    """Whether ``test`` is dbt's ``unique`` over every row of the column: one
+    with a ``where`` (which dbt applies first, so a key repeated outside it
+    goes unseen) or disabled covers nothing."""
+
+    if _listed_name(test) != "unique":
+        return False
+    if not isinstance(test, Mapping):
+        return True
+    body = next(iter(test.values()))
+    if not isinstance(body, Mapping):
+        return True
+    config = body.get("config")
+    for scope in (config if isinstance(config, Mapping) else {}, body):
+        if scope.get("where") not in (None, ""):
+            return False
+        if scope.get("enabled") is False:
+            return False
+    return True
 
 
 def _parent_unwritable(
@@ -1569,6 +1588,13 @@ def render_referenced_keys(
     # parent (folded) -> (its spelling, {column folded: (spelling, children)})
     parents: dict[str, tuple[str, dict[str, tuple[str, list[str]]]]] = {}
     for child, column, parent, parent_column in _project_references(files):
+        # A bare name of a versioned model is the version an unversioned
+        # ref() reads, so its test goes on that version alone: on the shared
+        # entry every version would inherit it, one the child never joins.
+        if mv.split_label(parent)[1] is None:
+            versioned = mv.lookup(vmap, parent)
+            if versioned is not None and versioned.default_label is not None:
+                parent = str(versioned.default_label)
         if child.lower() not in wanted and parent.lower() not in wanted:
             continue
         spelled, columns = parents.setdefault(parent.lower(), (parent, {}))
