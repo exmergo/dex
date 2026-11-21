@@ -365,6 +365,12 @@ def inventory(
     with the rest. An unranked call lists every object, theirs included.
     """
 
+    if limit is not None and limit < 1:
+        raise ValueError(
+            f"--limit {limit} is below 1; --limit widens the ranked list to "
+            "N objects, so it must be at least 1"
+        )
+
     mode = engine.resolve_result_mode(result_mode)
     adapter = engine._adapter("explore inventory")
     metas = inventory_mod.inventory(adapter)
