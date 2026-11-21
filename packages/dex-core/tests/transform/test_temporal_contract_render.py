@@ -1013,3 +1013,47 @@ def test_a_declared_name_in_another_case_resolves_to_the_column(tmp_path):
     )
     result = _compare(tmp_path, FIRST_TRUE, [(1, 1, D1, D1)], history)
     assert result == {"transition_count": (1, 1)}
+
+
+def test_a_column_the_relation_lacks_errors_the_test_rather_than_passing(tmp_path):
+    # A measure column the model does not have (named NULL, the worst case:
+    # written bare it would compare as NULL and pass).
+    history = _history(measures={"first_target_at": "null"})
+    with pytest.raises(AssertionError, match="error"):
+        _compare(tmp_path, FIRST_TRUE, [(1, 0, "NULL", D1)], history)
+
+
+def test_a_snapshot_s_own_name_is_a_project_config_level(tmp_path):
+    files = {
+        "snapshots/hosts.yml": yaml.safe_dump(
+            {"snapshots": [{"name": SNAPSHOT, "relation": "ref('hosts')"}]}
+        ),
+        "dbt_project.yml": (
+            f"name: p\nprofile: p\nsnapshots:\n  p:\n    {SNAPSHOT}:\n"
+            "      +hard_deletes: new_record\n"
+        ),
+    }
+    assert _config(tmp_path, files)["hard_deletes"] == "new_record"
+
+
+def test_a_config_call_in_a_jinja_comment_is_not_read(tmp_path):
+    sql = SNAP_SQL.replace("CONFIG", ", hard_deletes='new_record'").replace(
+        "{% endsnapshot %}",
+        "{# {{ config(hard_deletes='invalidate') }} #}\n{% endsnapshot %}",
+    )
+    files = {"snapshots/hosts_snapshot.sql": sql, "models/hosts.sql": "select 1\n"}
+    assert _config(tmp_path, files)["hard_deletes"] == "new_record"
+
+
+def test_a_positional_config_mapping_is_read(tmp_path):
+    sql = SNAP_SQL.replace("CONFIG", "").replace(
+        "{% endsnapshot %}",
+        "{{ config({'hard_deletes': 'new_record'}) }}\n{% endsnapshot %}",
+    )
+    files = {"snapshots/hosts_snapshot.sql": sql, "models/hosts.sql": "select 1\n"}
+    assert _config(tmp_path, files)["hard_deletes"] == "new_record"
+    unread = SNAP_SQL.replace("CONFIG", "").replace(
+        "{% endsnapshot %}", "{{ config(var('cfg')) }}\n{% endsnapshot %}"
+    )
+    files["snapshots/hosts_snapshot.sql"] = unread
+    assert "_unread" in _config(tmp_path, files)

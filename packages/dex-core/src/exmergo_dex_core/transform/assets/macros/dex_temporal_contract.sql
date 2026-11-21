@@ -85,8 +85,9 @@
 {%- endif -%}
 {#- Each declared name resolved to its physical spelling and quoted, as
     maintain verify matches a declared name against the live columns, case
-    folded, and quotes the column it finds. A name the metadata does not hold
-    (no metadata at parse time, an ephemeral model) is written as declared. -#}
+    folded, and quotes the column it finds. A name the relation was read
+    without is an error; with no metadata at all (parse time, an ephemeral
+    model) a plain identifier is written as declared, anything else quoted. -#}
 {%- set snapshot_columns = {} -%}
 {%- set model_columns = {} -%}
 {%- if execute -%}
@@ -263,11 +264,34 @@ from (
 where dex_mismatched_entities > 0
 {% endmacro %}
 
-{#- ``name`` as the column ``columns`` (folded name -> column) holds,
-    quoted, or as written where it holds none. -#}
+{#- ``name`` as the column ``columns`` (folded name -> column) holds, quoted;
+    an error where ``columns`` was read and lacks it; quoted as declared where
+    nothing was read. -#}
 {% macro dex_temporal_contract_resolved(name, columns) -%}
     {%- set found = columns.get(name | replace('"', '') | replace('`', '') | lower) -%}
-    {{- adapter.quote(found.name) if found is not none else name -}}
+    {%- if found is not none -%}
+        {{- adapter.quote(found.name) -}}
+    {%- elif columns -%}
+        {#- The relation's columns were read and this one is not among them:
+            refuse, so a dropped column errors the test rather than being
+            read as an expression (a column named NULL would compare as NULL). -#}
+        {{- exceptions.raise_compiler_error(
+            "dex_temporal_contract: the history names column '" ~ name ~ "', "
+            ~ "which the relation does not have"
+        ) -}}
+    {%- else -%}
+        {#- No metadata (parse time, an ephemeral model): a plain identifier as
+            declared, so a case-folding warehouse folds it as it folds the
+            column; anything else (a SQL literal such as NULL, a name that is
+            no plain identifier) quoted, so it can only be read as a column. -#}
+        {%- set bare = name | replace('"', '') | replace('`', '') -%}
+        {%- if modules.re.match('^[A-Za-z_][A-Za-z0-9_]*$', bare)
+              and bare | lower not in ('null', 'true', 'false') -%}
+            {{- bare -}}
+        {%- else -%}
+            {{- adapter.quote(bare) -}}
+        {%- endif -%}
+    {%- endif -%}
 {%- endmacro %}
 
 {% macro default__dex_temporal_contract_text(column_name) %}cast({{ column_name }} as {{ dbt.type_string() }}){% endmacro %}

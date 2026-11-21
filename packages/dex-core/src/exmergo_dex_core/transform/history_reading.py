@@ -31,6 +31,7 @@ from .. import model_versions as mv
 _KEYS = ("hard_deletes", "snapshot_meta_column_names", "invalidate_hard_deletes")
 _CONFIG = re.compile(r"\{\{-?\s*config\s*\(", re.DOTALL)
 _LITERAL_NAMES = {"true": True, "false": False, "none": None}
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
 
 
 def history_reader(view: Any, files: Mapping[str, str]) -> Callable[[str, Any], Any]:
@@ -192,7 +193,9 @@ def snapshot_config(files: Mapping[str, str], view: Any, name: str) -> dict[str,
                     if isinstance(config, Mapping) and key in config
                 }
     layers = [
-        _project_config(files, view, sql_path or yaml_path, sql=sql_path is not None),
+        _project_config(
+            files, view, sql_path or yaml_path, name, sql=sql_path is not None
+        ),
         properties,
         *inline,
     ]
@@ -239,6 +242,9 @@ def _config_calls(body: str) -> list[dict[str, Any]]:
     to an expression maps to :data:`_UNREAD`; a call whose arguments do not
     parse leaves every key it names unread."""
 
+    # A call inside a Jinja comment is no config (#1535 review): blank the
+    # comments, keeping offsets, before scanning.
+    body = _JINJA_COMMENT.sub(lambda m: " " * len(m.group(0)), body)
     out: list[dict[str, Any]] = []
     for found in _CONFIG.finditer(body):
         depth, end = 1, None
@@ -257,6 +263,18 @@ def _config_calls(body: str) -> list[dict[str, Any]]:
             out.append(_unread_if_named(arguments))
             continue
         layer: dict[str, Any] = {}
+        for positional in getattr(call, "args", []):
+            # dbt applies a positional mapping as config: `config({...})`.
+            try:
+                mapping = _literal(positional)
+            except ValueError:
+                mapping = None
+            if not isinstance(mapping, Mapping):
+                layer.update(dict.fromkeys(_KEYS, _UNREAD))
+                continue
+            for key in _KEYS:
+                if key in mapping:
+                    layer[key] = _settled(mapping[key])
         for keyword in getattr(call, "keywords", []):
             if keyword.arg is None:
                 # `**something`: any key may come from it.
@@ -294,6 +312,7 @@ def _project_config(
     files: Mapping[str, str],
     view: Any,
     where: PurePosixPath | None,
+    name: str,
     *,
     sql: bool,
 ) -> dict[str, Any]:
@@ -301,7 +320,7 @@ def _project_config(
     defined at ``where``, walked along its fqn as dbt resolves it, the deeper
     level winning: the project, each folder, and, for a SQL snapshot, the
     file's stem (dbt puts it in the fqn; a YAML-defined snapshot's fqn has no
-    file level)."""
+    file level), then the snapshot's own name, the fqn's last level."""
 
     try:
         parsed = yaml.safe_load(files.get("dbt_project.yml") or "")
@@ -333,6 +352,7 @@ def _project_config(
             break
     if sql:
         parts.append(where.stem)
+    parts.append(name)
     for part in parts:
         level = level.get(part)
         if not isinstance(level, Mapping):
