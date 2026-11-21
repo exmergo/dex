@@ -792,7 +792,7 @@ class DbtProject:
         suffix = {_EditKind.MODEL_SQL: "sql", _EditKind.SCHEMA_YML: "yml"}.get(kind)
         if suffix is None:
             return None
-        node = model if model.startswith("stg_") else f"stg_{model}"
+        node = model if model.startswith("stg_") else f"stg_{model.lower()}"
         # Findings can name a built staging relation rather than its source.
         # Do not turn stg_orders into a second, nonexistent stg_stg_orders.
         convention = f"models/staging/{node}.{suffix}"
