@@ -837,6 +837,19 @@ def _check(
             )
         if column.freshness is not None:
             _check_freshness(model, name, column, files)
+        elif (
+            column.role is not None
+            and column.role is not Role.TIME
+            and _yaml_column_dex(files, model, name).get("freshness")
+        ):
+            # The merge keeps the freshness the YAML already states, so a new
+            # role would leave it on a column that is no longer the time.
+            raise DeclarationError(
+                f"'{model}.{name}' already declares freshness, which belongs on "
+                f"the column with role `time`, and this declaration makes its role "
+                f"`{column.role.value}`; keep `role: time` on it, or remove its "
+                "freshness from the model's YAML first"
+            )
 
     if declaration.population is not None:
         _check_filters(model, declaration.population, cache, pii_overrides)
@@ -1324,6 +1337,15 @@ def _check_freshness(
 def _yaml_column_role(files: Mapping[str, str], model: str, column: str) -> str | None:
     """The role the model's YAML already declares for ``column``, if any."""
 
+    role = _yaml_column_dex(files, model, column).get("role")
+    return role if isinstance(role, str) else None
+
+
+def _yaml_column_dex(
+    files: Mapping[str, str], model: str, column: str
+) -> dict[str, Any]:
+    """The ``config.meta.dex`` the model's YAML already states for ``column``."""
+
     for _label, entry in _entries(files, {model}):
         for item in entry.get("columns") or []:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -1331,9 +1353,9 @@ def _yaml_column_role(files: Mapping[str, str], model: str, column: str) -> str 
             if item["name"].lower() != column.lower():
                 continue
             column_dex = entry_meta(item).get(DEX_META_KEY)
-            if isinstance(column_dex, dict) and isinstance(column_dex.get("role"), str):
-                return column_dex["role"]
-    return None
+            if isinstance(column_dex, dict):
+                return column_dex
+    return {}
 
 
 def _declared_column_roles(files: Mapping[str, str], model: str) -> set[str]:
@@ -1900,22 +1922,28 @@ def _stale_freshness_tests(
     node = _listed_entry(content, model)
     if node is None:
         return []
-    current: dict[str, set[str | None]] = {}
+    current: dict[str, list[Any]] = {}
     for g in planned:
         if g["test"] == gt.FRESHNESS and g["column"] is not None:
-            current.setdefault(str(g["column"]).lower(), set()).add(claim_of(g["spec"]))
+            current.setdefault(str(g["column"]).lower(), []).append(g["spec"])
     out: list[dict[str, Any]] = []
     for column in node.get("columns") or []:
         if not isinstance(column, Mapping) or not isinstance(column.get("name"), str):
             continue
-        claims = current.get(column["name"].lower())
-        if claims is None:
+        specs = current.get(column["name"].lower())
+        if specs is None:
             continue
+        claims = {claim_of(spec) for spec in specs}
         listed = column.get("data_tests") or column.get("tests") or []
         for item in listed if isinstance(listed, list) else []:
             if _listed_name(item) != gt.FRESHNESS or not gt.is_generated(item):
                 continue
-            if claim_of(item) in claims:
+            # Matched as rendering matches a listed test: by claim, else by
+            # arguments, so a basis-only change (same lag, a test that behaves
+            # the same) keeps the listed test rather than calling it stale.
+            if claim_of(item) in claims or any(
+                _arguments_of(item) == _arguments_of(spec) for spec in specs
+            ):
                 continue
             out.append(
                 {

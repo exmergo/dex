@@ -265,7 +265,21 @@ def test_a_freshness_is_checked_by_verify_and_by_its_generated_test() -> None:
             _model("tested", columns={"loaded_at": fresh}),
             _model("untested", columns={"loaded_at": fresh}),
         ],
-        [_test("dex_freshness", "tested", "loaded_at")],
+        [
+            _test(
+                "dex_freshness",
+                "tested",
+                "loaded_at",
+                kwargs={"max_lag_seconds": 21600},
+            ),
+            # Left at an older, looser lag: permits what the declaration forbids.
+            _test(
+                "dex_freshness",
+                "untested",
+                "loaded_at",
+                kwargs={"max_lag_seconds": 86400},
+            ),
+        ],
     )
     out = _run(manifest)
     tested = _fact(out, "freshness", "loaded_at", model="tested")

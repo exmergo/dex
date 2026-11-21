@@ -1175,7 +1175,9 @@ A model's time column may say how fresh its data should be (#1460):
   and neither depends on the machine running them. A timestamp with no time zone
   is read as UTC, as dbt's source freshness reads one; a date is read as its UTC
   midnight, so give a date column a lag of a day or more. A newest value ahead of
-  the clock passes, and its record says `ahead_of_clock`.
+  the clock passes, and its record says `ahead_of_clock`. On Redshift the clock
+  is `getdate()`, which reads the session's time zone: UTC unless a user or
+  session sets another, so keep the dbt and Dex sessions on UTC there.
 - **No rows is not fresh.** An empty model, or a column NULL on every row, is
   `freshness_exceeded` with `reason: no_rows` or `all_null`.
 - **Why a declaration field and not dbt's `freshness`.** dbt's `freshness`
@@ -1189,7 +1191,11 @@ and `data.verification.freshness` on `transform build --verify`): the column,
 `max_lag`, `max_lag_seconds`, `basis`, the `rows` and `lag_seconds` measured, and
 a `status` of `satisfied`, `contradicted` (with `finding: freshness_exceeded`) or
 `unchecked` with a `reason_code` (`not_temporal` for a column that is no date or
-timestamp, `column_missing`, `probe_refused`, `scan_offered`). The check is one
+timestamp, `column_missing`, `lag_unreadable` where the column holds values but
+the warehouse returns no lag for them, `probe_refused`, `scan_offered`). The lag
+is the clock minus the newest value, so on a column that looks like personal
+data the verdict stands and the lag is withheld (`lag_withheld: true`), as a
+unit's range is, unless a person cleared the column in `pii_overrides`. The check is one
 statement per model, a `MAX` and a `COUNT` per declared column, priced with the
 other declared facts on a metered connector. With `declarations.render_tests` on
 it also renders [`dex_freshness`](#dex_freshness-a-time-columns-freshness).

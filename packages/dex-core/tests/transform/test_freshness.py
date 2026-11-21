@@ -221,6 +221,18 @@ def test_a_changed_lag_reports_the_old_test_stale_and_keeps_it():
     assert any("no longer declares" in note for note in notes)
 
 
+def test_a_basis_only_change_keeps_the_listed_test_and_reports_nothing_stale():
+    # The same lag is the same test (the basis is no argument), so the listed
+    # test is kept, as rendering keeps it, and is not called stale.
+    once = _render(FRESH, True)
+    generated: list = []
+    twice = _render(
+        _declared(basis="business"), True, content=once, generated=generated
+    )
+    assert len(_tests(twice)) == 1
+    assert [g["status"] for g in generated] == ["already_listed"]
+
+
 def test_an_unchanged_freshness_reports_nothing_stale():
     once = _render(FRESH, True)
     generated: list = []
@@ -316,6 +328,21 @@ def test_a_freshness_off_the_time_column_is_refused_naming_the_fix(
     message = " ".join(str(e) for e in planned["errors"])
     assert "role `time`" in message
     assert "fct_orders.loaded_at" in message
+
+
+def test_a_new_role_on_a_column_that_keeps_its_freshness_is_refused(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    repo = _repo(tmp_path, "false")
+    planned = _plan(repo, capsys, FRESH)
+    assert planned["status"] == "ok", planned["errors"]
+    main(["--repo-root", str(repo), "transform", "apply", planned["data"]["plan_id"]])
+    capsys.readouterr()
+
+    moved = {"model": "fct_orders", "columns": {"loaded_at": {"role": "dimension"}}}
+    refused = _plan(repo, capsys, moved)
+    assert refused["status"] == "error"
+    assert "already declares freshness" in " ".join(map(str, refused["errors"]))
 
 
 def test_transform_macro_lists_it(dbt_project_dir: Path, tmp_path: Path, capsys):

@@ -1274,7 +1274,13 @@ def findings(
             )
         if probe.freshness is not None:
             freshness_mod.run_probe(
-                adapter, probe, result, checked, prepared, timeout_seconds
+                adapter,
+                probe,
+                result,
+                checked,
+                prepared,
+                timeout_seconds,
+                pii_overrides,
             )
         if probe.cumulative is not None:
             try:

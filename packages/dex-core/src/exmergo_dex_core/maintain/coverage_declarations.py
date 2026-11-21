@@ -174,6 +174,28 @@ class _Tests:
             for name, col, _kwargs, _reads in self.by_model.get(model, [])
         )
 
+    def freshness(self, model: str, column: str, declared: dict) -> bool:
+        """Whether a ``dex_freshness`` on ``column`` holds the declared lag
+        (#1460): a test left at an older, looser lag permits data the
+        declaration forbids, so it does not check it."""
+
+        from ..semantic_declarations import lag_seconds
+
+        try:
+            seconds = lag_seconds(str(declared.get("max_lag")))
+        except ValueError:
+            return False
+        key = _bare(column)
+        for name, col, kwargs, _reads in self.by_model.get(model, []):
+            if _base(name) != "dex_freshness" or col != key:
+                continue
+            try:
+                if int(kwargs.get("max_lag_seconds")) == seconds:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
     def combination(self, model: str, columns: list[str]) -> str | None:
         wanted = {_bare(c) for c in columns}
         for name, _col, kwargs, _reads in self.by_model.get(model, []):
@@ -901,9 +923,7 @@ def _model_facts(
             )
         freshness = dex.get("freshness")
         if isinstance(freshness, dict) and freshness.get("max_lag"):
-            found = (
-                ["dex_freshness"] if tests.on_column(uid, name, "dex_freshness") else []
-            )
+            found = ["dex_freshness"] if tests.freshness(uid, name, freshness) else []
             add(
                 "freshness",
                 name,

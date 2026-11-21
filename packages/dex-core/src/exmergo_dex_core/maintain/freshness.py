@@ -45,6 +45,7 @@ CODE = "freshness_exceeded"
 #: Why a declared freshness was not measured, as a record's ``reason_code``.
 NOT_TEMPORAL = "not_temporal"
 COLUMN_MISSING = "column_missing"
+LAG_UNREADABLE = "lag_unreadable"
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,8 @@ def now_sql(dialect: str) -> str:
         "clickhouse": "toInt64(toUnixTimestamp(now()))",
         "trino": "CAST(FLOOR(TO_UNIXTIME(CURRENT_TIMESTAMP)) AS BIGINT)",
         "postgres": "CAST(FLOOR(EXTRACT(EPOCH FROM CURRENT_TIMESTAMP)) AS BIGINT)",
-        # Redshift's clock, as dbt-redshift reads it (`current_timestamp()`).
+        # Redshift's clock, as dbt-redshift reads it (`current_timestamp()`):
+        # the session's time zone, UTC unless a user or session sets another.
         "redshift": "CAST(FLOOR(EXTRACT(EPOCH FROM GETDATE())) AS BIGINT)",
     }.get(dialect, "CAST(FLOOR(EPOCH(CURRENT_TIMESTAMP)) AS BIGINT)")
 
@@ -200,8 +202,8 @@ class Written:
     """One model's freshness statement and which rule each alias measures."""
 
     sql: str
-    #: (alias index, rule, the relation's spelling of the column)
-    rules: list[tuple[int, FreshnessRule, str]]
+    #: (alias index, rule, the relation's spelling of the column, its type)
+    rules: list[tuple[int, FreshnessRule, str, str | None]]
 
 
 def write_probe(
@@ -217,7 +219,7 @@ def write_probe(
 
     model = probe.model
     parts = ["COUNT(*) AS dex_rows"]
-    rules: list[tuple[int, FreshnessRule, str]] = []
+    rules: list[tuple[int, FreshnessRule, str, str | None]] = []
     for index, rule in enumerate(model.freshness):
         if live is None:
             spelled, data_type = rule.column, model_type(model, rule.column)
@@ -254,7 +256,7 @@ def write_probe(
             f"COUNT({q}) AS dex_fresh_n_{index}, "
             f"{lag_sql(dialect, q, kind)} AS dex_fresh_lag_{index}"
         )
-        rules.append((index, rule, spelled))
+        rules.append((index, rule, spelled, data_type))
     if not rules:
         return
     sql = f"SELECT {', '.join(parts)} FROM {_relation(dialect, probe.identifier)}"  # noqa: S608
@@ -301,7 +303,7 @@ def run_probe(
         prepared.dropped["freshness"].append(
             f"{model}: the warehouse refused the check ({detail})"
         )
-        for _index, rule, _spelled in written.rules:
+        for _index, rule, _spelled, _type in written.rules:
             result.freshness.append(
                 record(
                     model,
@@ -315,26 +317,71 @@ def run_probe(
     row = dict(zip(answer.columns, answer.cells[0], strict=True))
     row = {str(k).lower(): v for k, v in row.items()}
     rows = _int(row.get("dex_rows")) or 0
-    for index, rule, _spelled in written.rules:
+    for index, rule, spelled, data_type in written.rules:
         values = _int(row.get(f"dex_fresh_n_{index}")) or 0
         lag = _int(row.get(f"dex_fresh_lag_{index}"))
-        checked["freshness"] += 1
+        # The lag is the clock minus the newest value, so it discloses that
+        # value: a column that looks like personal data keeps its verdict and
+        # withholds the number, as the unit check withholds a range.
+        shown = _lag_shown(probe.identifier, spelled, data_type, pii_overrides)
         if rows == 0 or values == 0:
+            checked["freshness"] += 1
             reason = "no_rows" if rows == 0 else "all_null"
             result.freshness.append(
                 record(model, rule, "contradicted", reason_code=reason, rows=rows)
             )
             result.findings.append(finding(model, rule, None, reason, rows))
             continue
-        if lag is not None and lag > rule.max_lag_seconds:
-            result.freshness.append(
-                record(model, rule, "contradicted", lag_seconds=lag, rows=rows)
+        if lag is None:
+            # Values, but no lag a warehouse could compute (an infinite
+            # timestamp reads as NULL on DuckDB): no verdict either way.
+            why = (
+                "the column holds values, but the warehouse returned no lag for "
+                "its newest one (an infinite or out-of-range timestamp)"
             )
-            result.findings.append(finding(model, rule, lag, None, rows))
+            result.notes.append(
+                f"the declared freshness on {model}.{rule.column} was not "
+                f"checked: {why}"
+            )
+            prepared.dropped["freshness"].append(f"{model}: {why}")
+            result.freshness.append(
+                record(
+                    model,
+                    rule,
+                    "unchecked",
+                    rows=rows,
+                    reason_code=LAG_UNREADABLE,
+                    reason=why,
+                )
+            )
+            continue
+        checked["freshness"] += 1
+        if lag > rule.max_lag_seconds:
+            result.freshness.append(
+                record(
+                    model, rule, "contradicted", lag_seconds=lag, rows=rows, shown=shown
+                )
+            )
+            result.findings.append(finding(model, rule, lag, None, rows, shown=shown))
             continue
         result.freshness.append(
-            record(model, rule, "satisfied", lag_seconds=lag, rows=rows)
+            record(model, rule, "satisfied", lag_seconds=lag, rows=rows, shown=shown)
         )
+
+
+def _lag_shown(
+    identifier: str, column: str, data_type: str | None, pii_overrides: Any
+) -> bool:
+    """Whether a column's lag may be shown: not where the column looks like
+    personal data, unless a human cleared it in ``pii_overrides``."""
+
+    from ..explore.profile import detect_pii, is_min_max_safe
+
+    path = f"{identifier}.{column}".lower()
+    if pii_overrides is not None and path in pii_overrides:
+        return True
+    kind = data_type or "TIMESTAMP"
+    return is_min_max_safe(kind, detect_pii(column, kind))
 
 
 def record(
@@ -346,6 +393,7 @@ def record(
     rows: int | None = None,
     reason_code: str | None = None,
     reason: str | None = None,
+    shown: bool = True,
 ) -> dict[str, Any]:
     """A ``data.freshness`` record: the declaration, what was measured, and a
     status of ``satisfied``, ``contradicted`` or ``unchecked``."""
@@ -362,7 +410,9 @@ def record(
         out["finding"] = CODE
     if rows is not None:
         out["rows"] = rows
-    if lag_seconds is not None:
+    if lag_seconds is not None and not shown:
+        out["lag_withheld"] = True
+    elif lag_seconds is not None:
         out["lag_seconds"] = lag_seconds
         if lag_seconds < 0:
             # The newest value sits ahead of the warehouse's clock: fresh, but a
@@ -391,6 +441,8 @@ def finding(
     lag: int | None,
     reason: str | None,
     rows: int,
+    *,
+    shown: bool = True,
 ) -> DriftFinding:
     from .drift import DriftFinding
 
@@ -401,6 +453,11 @@ def finding(
         found = (
             f"the column is NULL on all {rows} row(s), so it has no newest value, "
             "which is not fresh"
+        )
+    elif not shown:
+        found = (
+            "its newest value is further behind the warehouse's clock than that "
+            "(the lag is withheld because the column looks like personal data)"
         )
     else:
         found = (
@@ -428,13 +485,15 @@ def finding(
         "max_lag": rule.max_lag,
         "max_lag_seconds": rule.max_lag_seconds,
         "basis": rule.basis,
-        "lag_seconds": lag,
+        "lag_seconds": lag if shown else None,
         "rows": rows,
         # The count dex_freshness fails with: one stale column.
         "stale": 1,
     }
     if reason is not None:
         data["reason"] = reason
+    if not shown:
+        data["lag_withheld"] = True
     return DriftFinding(
         axis="declaration",
         code=CODE,

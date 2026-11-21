@@ -362,3 +362,65 @@ def test_each_dialects_statement_is_one_read_only_select(dialect):
         lag = freshness_mod.lag_sql(dialect, column, kind)
         sql = f'SELECT {lag} AS lag FROM "db"."s"."m"'  # noqa: S608
         assert assert_select_only(sql, dialect=dialect) == sql
+
+
+def test_a_personal_data_column_keeps_its_verdict_and_withholds_its_lag(
+    tmp_path: Path,
+):
+    # The lag is the clock minus the newest value, so it would disclose it.
+    result = _run(
+        tmp_path,
+        {"date_of_birth": _fresh("1d", "business")},
+        _table("select timestamp '1990-05-01' as date_of_birth"),
+    )
+    [finding] = result.findings
+    assert finding.data["lag_seconds"] is None
+    assert finding.data["lag_withheld"] is True
+    assert "withheld" in finding.detail
+    [record] = result.freshness
+    assert "lag_seconds" not in record
+    assert record["lag_withheld"] is True
+
+
+def test_an_infinite_newest_value_is_never_read_as_satisfied(tmp_path: Path):
+    # A DuckDB that reads EPOCH of -infinity as NULL gives no lag, which is
+    # unchecked; one that floors it to a huge number gives a stale column.
+    # Either way it is not fresh.
+    result = _run(
+        tmp_path,
+        {"t": _fresh()},
+        _table("select timestamp '-infinity' as t"),
+    )
+    [record] = result.freshness
+    assert record["status"] in {"unchecked", "contradicted"}
+    if record["status"] == "unchecked":
+        assert record["reason_code"] == freshness_mod.LAG_UNREADABLE
+        assert result.findings == []
+
+
+def test_a_lag_the_warehouse_returns_as_null_is_unchecked():
+    from types import SimpleNamespace
+
+    rule = freshness_mod.FreshnessRule("t", "6h", 21600, "capture")
+    model = facts_mod.DeclaredModel(
+        model="fct", unique_id="model.p.fct", relation="db.s.fct", freshness=(rule,)
+    )
+    probe = facts_mod._Probe(model=model, identifier="db.s.fct")
+    probe.freshness = freshness_mod.Written("select 1", [(0, rule, "t", "TIMESTAMP")])
+    answer = SimpleNamespace(
+        columns=["dex_rows", "dex_fresh_n_0", "dex_fresh_lag_0"], cells=[[3, 3, None]]
+    )
+    adapter = SimpleNamespace(run_query=lambda *a, **k: answer)
+    prepared = facts_mod.Prepared(dropped={"freshness": []})
+    result = facts_mod.DeclaredFactsResult()
+    checked = {"freshness": 0}
+
+    freshness_mod.run_probe(adapter, probe, result, checked, prepared, None)
+
+    assert result.findings == []
+    [record] = result.freshness
+    assert (record["status"], record["reason_code"]) == (
+        "unchecked",
+        freshness_mod.LAG_UNREADABLE,
+    )
+    assert checked["freshness"] == 0
