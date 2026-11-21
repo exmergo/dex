@@ -260,6 +260,26 @@ def test_a_key_that_cannot_stand_unquoted_is_quoted_in_the_dialect():
         assert join.child_columns == join.parent_columns == (quoted,)
 
 
+@pytest.mark.parametrize(
+    ("written", "rendered"), [('"CustId"', '"CustId"'), ("CustId", "CustId")]
+)
+def test_a_key_the_sql_quotes_keeps_its_quoting(written, rendered):
+    # On Snowflake an unquoted CustId folds to CUSTID, another column than the
+    # quoted "CustId" the model joins on; an unquoted one folds as the model's.
+    sql = (
+        f"select o.order_id, o.{written}, c.segment\n"
+        "from {{ ref('stg_orders') }} o\n"
+        f"join {{{{ ref('dim_customers') }}}} c on o.{written} = c.{written}\n"
+    )
+    payload = {
+        "model": MODEL,
+        "columns": {"CustId": {"references": "dim_customers.CustId"}},
+    }
+    [declaration] = parse_declarations([payload])
+    [join] = _joins(sql, "snowflake").required(declaration)
+    assert join.child_columns == join.parent_columns == (rendered,)
+
+
 def test_counting_null_keys_is_a_different_claim_and_a_different_test():
     once = _render(REFERENCES, True)
     never = {

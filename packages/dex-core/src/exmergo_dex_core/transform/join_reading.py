@@ -98,6 +98,9 @@ class ModelJoins:
     calls: dict[str, str] = field(default_factory=dict)
     #: Node name a ``references`` can name (lowered) -> its placeholder.
     parents: dict[str, str] = field(default_factory=dict)
+    #: The identifiers the SQL writes quoted (``o."CustId"``), which keep
+    #: their exact spelling in the test rather than folding.
+    quoted: frozenset[str] = frozenset()
 
     def required(self, declaration: Any) -> list[RequiredJoin]:
         """Every join of the model ``declaration`` requires, as
@@ -130,11 +133,11 @@ class ModelJoins:
         base = {
             "child": child,
             "child_columns": tuple(
-                _column(c, self.dialect) for c in candidate.from_columns
+                _column(c, self.dialect, self.quoted) for c in candidate.from_columns
             ),
             "parent": parent,
             "parent_columns": tuple(
-                _column(c, self.dialect) for c in candidate.to_columns
+                _column(c, self.dialect, self.quoted) for c in candidate.to_columns
             ),
             "driving": tuple(policy.driving),
             "required_by": policy.required_by,
@@ -187,13 +190,16 @@ class ModelJoins:
 _PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _column(name: str, dialect: str | None) -> str:
+def _column(
+    name: str, dialect: str | None, quoted: frozenset[str] = frozenset()
+) -> str:
     """A key column as the test writes it into SQL: as written where it is a
     plain identifier, which the warehouse folds as it folds the model's own
     columns, and quoted in ``dialect`` where it cannot stand unquoted
-    (``customer id``)."""
+    (``customer id``) or the SQL wrote it quoted (``"CustId"``, which folding
+    would turn into another column on Snowflake)."""
 
-    if _PLAIN_IDENTIFIER.match(name):
+    if _PLAIN_IDENTIFIER.match(name) and name not in quoted:
         return name
     from sqlglot import exp
 
@@ -330,6 +336,11 @@ def read_model_joins(
         candidates, _skipped = _model_joins(tree, sql_shape, dialect)
         lineage = _output_lineage(tree, sql_shape)
         projected = _final_output_map(tree)
+        quoted = frozenset(
+            identifier.name
+            for identifier in tree.find_all(sqlglot.exp.Identifier)
+            if identifier.args.get("quoted")
+        )
     except Exception:
         return ModelJoins(model, False, UNREAD_PARSE, dialect)
     return ModelJoins(
@@ -342,4 +353,5 @@ def read_model_joins(
         projected=projected,
         calls={k.lower(): v for k, v in calls.items()},
         parents=parents,
+        quoted=quoted,
     )
