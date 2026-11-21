@@ -66,8 +66,13 @@ afterwards, and when a ledger that cannot be read refuses a command, are in
 [`cost-controls.md`](cost-controls.md).
 
 BigQuery bills a 10 MB minimum per query; a remaining budget below that is
-refused with the math rather than letting the job fail server-side. Query-cache
-hits bill zero and are recorded as such.
+refused with the math rather than letting the job fail server-side. Every
+statement is charged at least that minimum, the same figure its estimate is
+priced at, so a command running several small statements books the minimum for
+each rather than its few-byte dry runs. The command's own booking can tighten a
+statement's cap but never push it under the minimum while the confirmed budget
+still covers one, so raising `--budget` is the fix only when the budget, not the
+booking, is what ran short. Query-cache hits bill zero and are recorded as such.
 
 ### What a profile estimate is made of
 
