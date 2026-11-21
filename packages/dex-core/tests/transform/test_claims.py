@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.transform.claims import claim_id, claim_of, without_claim
 from exmergo_dex_core.transform.declarations import parse_declarations, render
 from exmergo_dex_core.transform.rewrite import (
+    RewriteError,
     column_tests,
     column_tests_span,
     splice,
@@ -323,24 +325,105 @@ def test_a_test_whose_yaml_another_test_aliases_is_left_as_written():
     assert out.split("    columns:\n")[1] == shared.split("    columns:\n")[1]
 
 
-def test_a_test_list_two_columns_share_is_left_as_written():
-    # The list is aliased, so a claim written for one column reaches the other.
-    shared = (
+SHARED_LIST = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    columns:\n"
+    "      - name: order_id\n"
+    "        data_tests: &keys\n"
+    "          - unique:\n"
+    "              config:\n"
+    "                meta:\n"
+    "                  disable_test_samples: true\n"
+    "      - name: order_key\n"
+    "        data_tests: *keys\n"
+    "      - name: order_ref\n"
+    "        data_tests: *keys\n"
+)
+
+
+@pytest.mark.parametrize("column", ["order_id", "order_key", "order_ref"])
+def test_a_test_added_to_a_list_columns_share_lands_on_the_declared_column_only(
+    column: str,
+):
+    # The list is aliased: the declared column gets its own copy, whether it
+    # holds the anchor or an alias, and the others parse to the same tests (#1496).
+    out = _render(SHARED_LIST, {"model": "fct_orders", "grain": [column]})
+
+    others = {"order_id", "order_key", "order_ref"} - {column}
+    for other in others:
+        assert _tests(out, other) == _tests(SHARED_LIST, other)
+    declared = _tests(out, column)
+    assert [next(iter(test)) for test in declared] == ["unique", "not_null"]
+    assert all(claim_of(test) for test in declared)
+
+
+MERGED_COLUMN = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    columns:\n"
+    "      - &base\n"
+    "        name: order_id\n"
+    "        data_tests:\n"
+    "          - unique\n"
+    "      - <<: *base\n"
+    "        name: order_key\n"
+)
+ALIASED_COLUMN = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    columns:\n"
+    "      - &col\n"
+    "        name: order_id\n"
+    "        data_tests:\n"
+    "          - unique\n"
+    "      - *col\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("content", "anchor"), [(MERGED_COLUMN, "&base"), (ALIASED_COLUMN, "&col")]
+)
+def test_a_column_shared_through_its_entry_is_refused(content: str, anchor: str):
+    # The list sits in an entry another column shares, through a merge key or
+    # an alias: no copy of the list alone keeps the test off that column (#1496).
+    with pytest.raises(RewriteError, match=f"'{anchor}'"):
+        _render(content, {"model": "fct_orders", "grain": ["order_id"]})
+
+
+def test_the_column_holding_the_merge_key_still_takes_its_tests():
+    out = _render(MERGED_COLUMN, {"model": "fct_orders", "grain": ["order_key"]})
+
+    assert _tests(out, "order_id") == _tests(MERGED_COLUMN, "order_id")
+    declared = _tests(out, "order_key")
+    assert [next(iter(test)) for test in declared] == ["unique", "not_null"]
+
+
+def test_a_test_list_ending_in_an_alias_takes_the_new_tests_itself():
+    # The alias carries the marks of its anchor in another column, so the
+    # insert point comes from the list's own dashes (#1496).
+    content = (
         "version: 2\n"
         "models:\n"
         "  - name: fct_orders\n"
         "    columns:\n"
-        "      - name: order_id\n"
-        "        data_tests: &keys\n"
-        "          - unique:\n"
-        "              config:\n"
-        "                meta:\n"
-        "                  disable_test_samples: true\n"
-        "      - name: order_key\n"
-        "        data_tests: *keys\n"
+        "    - name: x\n"
+        "      data_tests:\n"
+        "        - &t {accepted_values: {values: [a]}}\n"
+        "    - name: order_id\n"
+        "      data_tests:\n"
+        "        - *t\n"
     )
 
-    out = _render(shared, {"model": "fct_orders", "grain": ["order_id"]})
+    out = _render(content, {"model": "fct_orders", "grain": ["order_id"]})
 
-    assert claim_of(_tests(out, "order_id")[0]) is None
-    assert claim_of(_tests(out, "order_key")[0]) is None
+    assert _tests(out, "x") == _tests(content, "x")
+    declared = _tests(out, "order_id")
+    assert [next(iter(test)) for test in declared] == [
+        "accepted_values",
+        "unique",
+        "not_null",
+    ]
