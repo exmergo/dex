@@ -230,6 +230,58 @@ def test_a_source_is_read_as_the_driving_input():
     assert test[NAME]["arguments"]["child"] == "source('shop', 'orders')"
 
 
+def test_a_left_join_to_a_filtered_parent_renders_the_test():
+    # relationships reads the whole parent, so it misses a child whose only
+    # parent row the model's filter drops; maintain verify counts it.
+    sql = LEFT.replace(
+        "{{ ref('dim_customers') }} c",
+        "(select * from {{ ref('dim_customers') }} where is_active) c",
+    )
+    generated: list = []
+    [test] = _model_tests(_render(REFERENCES, True, sql, generated=generated))
+    assert test[NAME]["arguments"]["parent_where"] == "is_active"
+    assert [g["status"] for g in generated if g["test"] == NAME] == ["added"]
+
+
+def test_a_key_that_cannot_stand_unquoted_is_quoted_in_the_dialect():
+    sql = (
+        'select o.order_id, o."customer id", c.segment\n'
+        "from {{ ref('stg_orders') }} o\n"
+        "join {{ ref('dim_customers') }} c\n"
+        '  on o."customer id" = c."customer id"\n'
+    )
+    payload = {
+        "model": MODEL,
+        "columns": {"customer id": {"references": "dim_customers.customer id"}},
+    }
+    for dialect, quoted in (("duckdb", '"customer id"'), ("bigquery", "`customer id`")):
+        [declaration] = parse_declarations([payload])
+        [join] = _joins(sql, dialect).required(declaration)
+        assert join.child_columns == join.parent_columns == (quoted,)
+
+
+def test_counting_null_keys_is_a_different_claim_and_a_different_test():
+    once = _render(REFERENCES, True)
+    never = {
+        "model": MODEL,
+        "columns": {
+            "customer_id": {
+                "references": "dim_customers.customer_id",
+                "null_rule": "never",
+            }
+        },
+    }
+    generated: list = []
+    again = _render(never, True, content=once, generated=generated)
+    arguments = [t[NAME]["arguments"].get("null_keys") for t in _model_tests(again)]
+    # The new test counts NULL keys; the earlier one is left for a reviewer.
+    assert sorted(arguments, key=str) == [None, "unmatched"]
+    assert sorted(g["status"] for g in generated if g["test"] == NAME) == [
+        "added",
+        "stale",
+    ]
+
+
 def test_a_required_left_join_is_listed_covered_by_the_builtin():
     generated: list = []
     content = _render(REFERENCES, True, LEFT, generated=generated)
@@ -579,19 +631,92 @@ def test_null_keys_unmatched_counts_them(tmp_path):
     assert (status, failures) == ("fail", 2)
 
 
-def test_the_filters_scope_both_sides(tmp_path):
-    child = (
-        "select 1 as customer_id, 'ok' as status\n"
-        "union all select 9, 'cancelled'\n"
-        "union all select 3, 'ok'\n"
+CHILD = (
+    "select 1 as customer_id, 'ok' as status\n"
+    "union all select 9, 'cancelled'\n"
+    "union all select 8, 'cancelled'\n"
+    "union all select 3, 'ok'\n"
+)
+PARENT = (
+    "select 1 as customer_id, true as is_active\n"
+    "union all select 3, false\n"
+    "union all select 4, false\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        # No filter: 9 and 8 are orphans; 3 has a parent row.
+        ({}, 2),
+        # The child filter drops the two cancelled orphans.
+        ({"child_where": "status <> 'cancelled'"}, 0),
+        # The parent filter drops 3's only parent row: 3 joins 9 and 8.
+        ({"parent_where": "is_active"}, 3),
+        # Both: only 3, whose parent the filter dropped.
+        ({"child_where": "status <> 'cancelled'", "parent_where": "is_active"}, 1),
+    ],
+)
+def test_each_filter_scopes_its_own_side(tmp_path, arguments, expected):
+    status, failures, _ = _failures(tmp_path, CHILD, PARENT, arguments)
+    assert failures == expected
+    assert status == ("fail" if expected else "pass")
+
+
+def test_a_sql_only_edit_of_a_version_file_is_checked_under_its_label(tmp_path):
+    from exmergo_dex_core.dbt_project import load
+    from exmergo_dex_core.transform.declarations import stale_join_tests
+
+    marts = tmp_path / "models" / "marts"
+    marts.mkdir(parents=True)
+    (tmp_path / "dbt_project.yml").write_text(
+        "name: p\nversion: '1.0'\nprofile: p\nconfig-version: 2\n", encoding="utf-8"
     )
-    parent = "select 1 as customer_id, true as is_active\nunion all select 3, false\n"
-    status, failures, _ = _failures(
-        tmp_path,
-        child,
-        parent,
-        {"child_where": "status <> 'cancelled'", "parent_where": "is_active"},
+    joined = (
+        "select t.team_id, s.team_label\n"
+        "from {{ ref('stg_teams') }} t\n"
+        "join {{ ref('dim_leagues') }} s on t.league_id = s.league_id\n"
     )
-    # 9 is filtered out of the driving side; 3's only parent row is filtered
-    # out, so it is one unmatched row.
-    assert (status, failures) == ("fail", 1)
+    (marts / "dim_teams.sql").write_text(joined, encoding="utf-8")
+    (marts / "dim_teams_v2.sql").write_text(joined, encoding="utf-8")
+    listed = {
+        NAME: {
+            "arguments": {
+                "child": "ref('stg_teams')",
+                "child_columns": ["league_id"],
+                "parent": "ref('dim_leagues')",
+                "parent_columns": ["league_id"],
+            },
+            "config": {"tags": [gt.SCHEDULED], "meta": {"dex": {"claim": "old"}}},
+        }
+    }
+    (marts / "_marts.yml").write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "models": [
+                    {
+                        "name": "dim_teams",
+                        "latest_version": 1,
+                        "versions": [
+                            {"v": 1, "defined_in": "dim_teams"},
+                            {"v": 2, "data_tests": [listed]},
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    view = load(tmp_path)
+    moved = joined.replace("ref('stg_teams')", "ref('stg_teams_v2')")
+    edit = PlanEdit(
+        path="models/marts/dim_teams_v2.sql", kind=EditKind.MODEL_SQL, new_content=moved
+    )
+
+    rows, notes = stale_join_tests(view, [edit], [], "duckdb")
+
+    assert [(r["model"], r["status"], r["claim"]) for r in rows] == [
+        ("dim_teams.v2", "stale", "old")
+    ]
+    assert len(notes) == 1

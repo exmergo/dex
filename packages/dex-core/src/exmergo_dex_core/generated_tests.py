@@ -186,7 +186,8 @@ HEURISTIC_ONLY = "heuristic_only"
 #: tell which join a ``references`` makes required; ``maintain verify``, which
 #: reads the compiled SQL, still judges it.
 JOIN_UNREAD = "join_unread"
-#: The required join is a LEFT join: it keeps every unmatched row, so the
+#: The required join is a LEFT join to the whole parent: it keeps every
+#: unmatched row, so the
 #: ``relationships`` (or ``not_null``) test the declaration already renders
 #: counts the same rows on the model's output.
 COVERED_BY_BUILTIN = "covered_by_builtin"
@@ -443,7 +444,9 @@ def _join_coverage(declaration: Any, joins: Any) -> list[Instance]:
     join's two inputs, through the filters the model applies to each, as the
     plan read them from the model's SQL.
 
-    A required LEFT join is listed and withheld (:data:`COVERED_BY_BUILTIN`), a
+    A required LEFT join to the whole parent is listed and withheld
+    (:data:`COVERED_BY_BUILTIN`); one to a filtered parent renders, since
+    ``relationships`` reads the whole parent. A
     shape this release does not render is withheld
     (:data:`JOIN_SHAPE_UNSUPPORTED`), and where the plan could not read the
     joins at all each declared ``references`` is listed withheld
@@ -488,6 +491,9 @@ def _join_coverage(declaration: Any, joins: Any) -> list[Instance]:
             "child_columns": [c.lower() for c in join.child_columns],
             "parent": join.parent or "",
             "parent_columns": [c.lower() for c in join.parent_columns],
+            # The NULL policy decides the count, so a declaration that starts
+            # or stops counting NULL keys is a different claim.
+            "null_keys": join.null_keys,
         }
         for key in ("child_where", "parent_where"):
             if arguments.get(key):

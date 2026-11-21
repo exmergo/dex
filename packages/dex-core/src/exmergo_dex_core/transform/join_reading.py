@@ -129,9 +129,13 @@ class ModelJoins:
         side = (candidate.side or "inner").split(" ")[0]
         base = {
             "child": child,
-            "child_columns": tuple(candidate.from_columns),
+            "child_columns": tuple(
+                _column(c, self.dialect) for c in candidate.from_columns
+            ),
             "parent": parent,
-            "parent_columns": tuple(candidate.to_columns),
+            "parent_columns": tuple(
+                _column(c, self.dialect) for c in candidate.to_columns
+            ),
             "driving": tuple(policy.driving),
             "required_by": policy.required_by,
             "null_keys": (
@@ -140,7 +144,10 @@ class ModelJoins:
             "side": candidate.side,
             "label": candidate.label,
         }
-        if side == "left":
+        if side == "left" and not candidate.to_filters:
+            # The relationships test reads the whole parent, so it counts the
+            # same rows only where the model joins the whole parent; a LEFT
+            # join to a filtered parent renders the test (below).
             return RequiredJoin(
                 **base,
                 status="covered_by_builtin",
@@ -150,7 +157,7 @@ class ModelJoins:
                 ),
             )
         unsupported = None
-        if side != "inner":
+        if side not in ("inner", "left"):
             unsupported = f"a {candidate.side} join"
         elif child is None or parent is None:
             unsupported = "a side that reads neither a ref() nor a source()"
@@ -175,6 +182,22 @@ class ModelJoins:
             child_where=child_where or None,
             parent_where=parent_where or None,
         )
+
+
+_PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _column(name: str, dialect: str | None) -> str:
+    """A key column as the test writes it into SQL: as written where it is a
+    plain identifier, which the warehouse folds as it folds the model's own
+    columns, and quoted in ``dialect`` where it cannot stand unquoted
+    (``customer id``)."""
+
+    if _PLAIN_IDENTIFIER.match(name):
+        return name
+    from sqlglot import exp
+
+    return exp.to_identifier(name, quoted=True).sql(dialect=dialect or "duckdb")
 
 
 def _declared_columns(declaration: Any) -> dict[str, dict]:

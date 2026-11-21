@@ -1449,16 +1449,18 @@ def stale_join_tests(
     its join changed is not known."""
 
     names = {name.lower() for name in declared}
-    edited = [
-        PurePosixPath(edit.path).stem
+    files = post_change_files(view, edits)
+    vmap = mv.cached_version_map(files, view.model_paths)
+    # A version's file builds its label (dim_teams_v2.sql is dim_teams.v2),
+    # whose YAML is the versioned entry, as undeclared_model_warnings reads it.
+    labels = [
+        mv.label_for_file(edit.path, vmap) or PurePosixPath(edit.path).stem
         for edit in edits
-        if edit.kind is EditKind.MODEL_SQL
-        and edit.op is EditOp.UPSERT
-        and PurePosixPath(edit.path).stem.lower() not in names
+        if edit.kind is EditKind.MODEL_SQL and edit.op is EditOp.UPSERT
     ]
+    edited = [label for label in labels if label.lower() not in names]
     if not edited:
         return [], []
-    files = post_change_files(view, edits)
     rows: list[dict[str, Any]] = []
     for model in dict.fromkeys(edited):
         path = schema_path(files, model)

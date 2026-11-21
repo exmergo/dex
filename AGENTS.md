@@ -671,7 +671,7 @@ with `reason: column_not_output`. A column declared `unit: percent` renders no
 test and is `not_rendered` with `reason: heuristic_only`: `maintain verify`
 flags a percent whose values all sit within 0 to 1 as a question, which correct
 small percentages answer too, so only `maintain verify` asks it. A required
-LEFT join renders no `dex_join_coverage` (`covered_by_builtin`: the
+LEFT join to the whole parent renders no `dex_join_coverage` (`covered_by_builtin`: the
 `relationships` test counts the same rows), nor does a key conversion or a
 grouped side (`join_shape_unsupported`) or SQL whose joins the plan cannot read
 (`join_unread`), and a listed one whose join the SQL no longer writes is

@@ -461,7 +461,8 @@ A column that carries a model's join key and declares a `references` naming the
 joined model makes that join required: every eligible row of the join's driving
 input must find a parent row. `maintain verify` holds the join to that claim at
 threshold zero (`join_orphans`, `join_zero_overlap`, `join_no_match`,
-`threshold_source: contract`). Where the join is an INNER join, the model
+`threshold_source: contract`). Where the join is an INNER join, or a LEFT
+join to a parent the model filters first, the model
 renders `dex_join_coverage` on its entry, tagged `dex_scheduled`, since it
 anti-joins two inputs whole:
 
@@ -512,7 +513,7 @@ connector:
 
 | Reason | When |
 |---|---|
-| `covered_by_builtin` | The required join is a LEFT join. It keeps every unmatched row, so the `relationships` test the `references` renders counts the same rows on the output, and a second, scheduled scan would only cost. |
+| `covered_by_builtin` | The required join is a LEFT join to the whole parent. It keeps every unmatched row, so the `relationships` test the `references` renders counts the same rows on the output, and a second, scheduled scan would only cost. A LEFT join to a parent the model filters first (a CTE's `WHERE`) renders the test: `relationships` reads the whole parent, so a child whose only parent row the filter drops passes it. |
 | `join_shape_unsupported` | A key compared through a conversion (`cast`, `try_cast`), a side read through a `GROUP BY`, a RIGHT or FULL join, a side that reads neither a `ref()` nor a `source()`, or a filter that does not carry into the dialect. |
 | `join_unread` | The plan could not read the model's joins: its SQL holds Jinja other than `ref()`, `source()` and `config()` (a macro, a loop, a conditional, a versioned `ref(..., v=2)`), or does not parse. Listed once per declared `references`. |
 
@@ -526,7 +527,7 @@ review.
 Its macro reaches the project as the others' do: `macros/dex_join_coverage.sql`
 (the [shipped macro](macros.md#dex_join_coverage)) as a `macro_sql` diff where
 neither the project nor the plan defines the test; a plan whose required joins
-are all LEFT joins writes none.
+are all LEFT joins to whole parents writes none.
 
 ### A versioned model
 

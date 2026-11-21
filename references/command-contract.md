@@ -1409,7 +1409,9 @@ default, or a filter or operator after it is refused. A key naming a location
   count equals the join contract's `unmatched_rows`, a NULL key is left out
   unless the key column is declared `null_rule: never` (`null_keys:
   unmatched`), a duplicated parent key multiplies nothing, and the test returns
-  that count and never a key. A required LEFT join renders nothing,
+  that count and never a key. A required LEFT join to a parent the model
+  filters first renders it too, since `relationships` reads the whole parent;
+  one to the whole parent renders nothing,
   `not_rendered` with `reason: covered_by_builtin`; a key conversion, a grouped
   side, a RIGHT or FULL join, a side that is no `ref()` or `source()` or a
   filter that does not transpile is `join_shape_unsupported`; SQL holding other

@@ -78,7 +78,8 @@ every connector, and a project overrides one warehouse with its own
 
 ## `dex_join_coverage`
 
-The generic test an INNER join a declared `references` requires renders
+The generic test an INNER join a declared `references` requires (or a LEFT
+join to a parent the model filters) renders
 ([declarations](declarations.md#dex_join_coverage-a-join-a-references-requires)),
 where `declarations.render_tests` turns it on. A declaration plan adds it for
 you; this command scaffolds or diffs it on its own. It reads the join's two

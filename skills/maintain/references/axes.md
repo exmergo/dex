@@ -327,7 +327,8 @@ Needs no baseline. The classes of finding:
     row (`threshold_source: contract`, high). With `declarations.render_tests`
     on, an INNER join so required also renders `dex_join_coverage`, a build
     test reading the same two inputs and failing with the same
-    `unmatched_rows` (#1456); a LEFT one leaves that to `relationships`.
+    `unmatched_rows` (#1456); a LEFT one to the whole parent leaves that to
+    `relationships`.
     Otherwise the stated defaults,
     0.2 and 0.9 of eligible rows (`threshold_source: default`). On a LEFT join
     with no requirement (no `references` on its driving key), unmatched rows are the optional relationship the join

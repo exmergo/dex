@@ -9,10 +9,12 @@
   (`join_orphans`, `join_zero_overlap`, `join_no_match`), and this test says the
   same thing in the build.
 
-  It renders only for an INNER join. An INNER join drops the rows it cannot
-  match, so the model's output, and the `relationships` test on it, never shows
-  them; this test reads the join's two inputs instead, as Dex read them from the
-  model's SQL when the plan rendered it:
+  It renders for an INNER join, and for a LEFT join to a parent the model
+  filters first (which `relationships`, reading the whole parent, misses). An
+  INNER join drops the rows it cannot match, so the model's output, and the
+  `relationships` test on it, never shows them; this test reads the join's two
+  inputs instead, as Dex read them from the model's SQL when the plan rendered
+  it:
 
   - `child` and `child_columns`: the relation the join's key is read from (the
     driving input) and the key columns, in order;
