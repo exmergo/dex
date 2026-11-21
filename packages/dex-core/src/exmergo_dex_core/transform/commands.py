@@ -24,7 +24,7 @@ import json
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,6 +38,7 @@ from ..dbt_tests import IncrementalUnitTest
 from ..dbt_tests import attached_tests as _attached_tests
 from ..dbt_tests import incremental_unit_tests as _incremental_unit_tests
 from ..dbt_tests import runs_full_build as _runs_full_build
+from ..dbt_tests import unit_test_overrides as _unit_test_overrides
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
 from ..errors import DexError, RequestError, UndeclaredPopulationChangeError
@@ -3098,6 +3099,7 @@ def test_mutations(
                     settle_uptime=refresh_batch is None,
                     on_meter=meters.append,
                     left_out=left_out,
+                    overrides=_unit_test_overrides(shadow.manifest(), node),
                 )
             except mutation_mod.MutationError as exc:
                 # A baseline that billed and then passed no test still spent:
@@ -4076,12 +4078,17 @@ def _run_mutants(
     settle_uptime: bool = True,
     on_meter=None,
     left_out: Sequence[dict[str, str]] = (),
+    overrides: Mapping[str, str] | None = None,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
 
     ``left_out`` names tests kept out of every run, the baseline included, each
     with its ``reason_code`` and ``reason``; they are reported in the
     baseline's ``excluded`` beside the tests that did not pass there (#1307).
+
+    ``overrides`` maps a unit test to what it overrides. A mutant is compiled
+    with the project's own vars and macros, so one of those that fails the
+    baseline is excluded for its overrides, not as a broken test (#1396).
 
     A survivor is compared with the model on the dev data straight after its
     own run, while its body is still the model file, so the comparison costs
@@ -4163,17 +4170,30 @@ def _run_mutants(
         baseline_summary = shadow.test(select, exclude=exclude)
         meter.settle(baseline_summary, "(baseline)")
         baseline = _test_statuses(baseline_summary)
+        overrides = overrides or {}
         excluded = [
-            {"name": name, "status": status, "reason": _exclusion_reason(status)}
+            {
+                "name": name,
+                "status": status,
+                "reason": _exclusion_reason(status, overrides.get(name)),
+            }
             for name, status in sorted(baseline.items())
             if status != "pass"
         ] + left_out_entries
         if not any(status == "pass" for status in baseline.values()):
+            overridden = sorted(set(baseline) & set(overrides))
             raise mutation_mod.MutationError(
                 f"no test of '{model}' passes against the unmutated model, so there "
                 "is nothing that could catch a defect. Build its parents first "
                 f"(`transform build --select +{model}`) and fix the failing tests, "
                 "then measure them"
+                + (
+                    ". " + ", ".join(overridden) + " set overrides, which a "
+                    "mutant cannot honour: it is compiled once with the project's "
+                    "own vars and macros"
+                    if overridden
+                    else ""
+                )
             )
 
         if equivalence is not None:
@@ -4249,6 +4269,7 @@ def _run_mutants(
             mutation_mod=mutation_mod,
             exhausted=exhausted,
             warnings=warnings,
+            overrides=overrides,
         )
 
     mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
@@ -4292,6 +4313,7 @@ def _run_incremental(
     mutation_mod,
     exhausted: bool,
     warnings: list[str],
+    overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The incremental branch's mutants, against the tests that run the branch.
 
@@ -4414,7 +4436,11 @@ def _run_incremental(
                 for name, status in sorted(baseline.items())
             ],
             "excluded": [
-                {"name": name, "status": status, "reason": _exclusion_reason(status)}
+                {
+                    "name": name,
+                    "status": status,
+                    "reason": _exclusion_reason(status, (overrides or {}).get(name)),
+                }
                 for name, status in sorted(baseline.items())
                 if status != "pass"
             ],
@@ -5086,7 +5112,14 @@ def _test_statuses(summary: dict | None) -> dict[str, str]:
     }
 
 
-def _exclusion_reason(status: str) -> str:
+def _exclusion_reason(status: str, overrides: str | None = None) -> str:
+    if overrides:
+        return (
+            f"this test overrides {overrides}, and a mutant is compiled once with "
+            "the project's own values, so the override cannot reach it; the test "
+            "can fail here and still pass in a build, so it is left out for its "
+            "overrides, not as a broken test"
+        )
     if status == "error":
         return (
             "this test could not run against the unmutated model, so it cannot "

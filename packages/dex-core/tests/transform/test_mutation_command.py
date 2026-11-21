@@ -613,6 +613,69 @@ def test_a_left_out_test_is_listed_when_the_baseline_never_runs():
     assert result["baseline"]["excluded"] == [{**_LEFT_OUT, "status": "not_run"}]
 
 
+def test_a_unit_test_that_overrides_vars_is_excluded_for_its_overrides(project):
+    """A mutant is compiled once with the project's own vars, so a unit test
+    whose ``overrides: vars`` a build applies fails the baseline here. It is
+    excluded naming those overrides, not as a broken test (#1396)."""
+
+    from exmergo_dex_core.dbt_tests import unit_test_overrides
+
+    class _Shadow:
+        def write(self, *args, **kwargs):
+            pass
+
+        def test(self, select, exclude=()):
+            return {
+                "nodes": [
+                    {
+                        "unique_id": "test.p.not_null.abc",
+                        "name": "not_null",
+                        "status": "pass",
+                    },
+                    {
+                        "unique_id": "unit_test.p.fct.fct_years",
+                        "name": "fct_years",
+                        "status": "fail",
+                    },
+                ]
+            }
+
+    node = {"unique_id": "model.p.fct", "name": "fct"}
+    manifest = {
+        "unit_tests": {
+            "unit_test.p.fct.fct_years": {
+                "name": "fct_years",
+                "model": "fct",
+                "depends_on": {"nodes": ["model.p.fct"]},
+                "overrides": {
+                    "vars": {"gta_v_year": 2013, "gta_6_year": 2016},
+                    "macros": {"is_incremental": False},
+                },
+            },
+            "unit_test.p.fct.plain": {
+                "name": "plain",
+                "model": "fct",
+                "depends_on": {"nodes": ["model.p.fct"]},
+                "overrides": {"macros": {"is_incremental": True}},
+            },
+        }
+    }
+    overrides = unit_test_overrides(manifest, node)
+    assert overrides == {"fct_years": "vars gta_6_year, gta_v_year"}
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    )
+    result, _meta = _run(
+        _Shadow(), batch, project, incremental_tests=[], overrides=overrides
+    )
+
+    (entry,) = result["baseline"]["excluded"]
+    assert entry["name"] == "fct_years"
+    assert "overrides vars gta_6_year, gta_v_year" in entry["reason"]
+    assert "already failing" not in entry["reason"]
+
+
 def test_only_the_left_out_tests_the_selection_reaches_are_named():
     """A monitoring test on a model the run does not select is not one it would
     have run, and one the downstream routing already excludes is named there."""
