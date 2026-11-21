@@ -64,6 +64,22 @@ The document carries every edit's operation, kind, preimage hash, content hash,
 content, project-relative path, and classification, plus a digest over the whole
 plan. `transform export` is the same thing on the command line.
 
+Where the authoring side must not run repository-controlled code (Jinja, macros,
+project hooks), store the plan with `no_parse=True` (`transform plan --no-parse`,
+#1517). No dbt process starts: the parse gate, the parse of a declared mart's
+derivation and compilation are skipped, while every structural check still runs
+(admission, placement, deletions, the PII and secret guards, hash pinning, the
+diffs). A model with Jinja control flow is refused, since only a compile can
+check it, so plan that one where dbt may run. Parsing the post-change project
+is then the sandbox's job, for example with
+`transform build --target dev --for-plan-file plan.json` after the apply.
+
+```python
+with DexEngine.from_repo(repo) as engine:
+    result = engine.plan("stage orders", edits=edits, no_parse=True)
+    exported = engine.export_plan(result.plan_id)
+```
+
 Applying it needs a repo root and nothing else: no plan store, no connector, no
 cache, no dbt, no network.
 

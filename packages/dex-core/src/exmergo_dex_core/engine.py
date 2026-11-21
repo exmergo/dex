@@ -1519,7 +1519,21 @@ class DexEngine:
         declarations: list[Any] | None = None,
         scaffold: list[str] | None = None,
         attribute_rows: bool | None = None,
+        no_parse: bool = False,
     ) -> PlanResult:
+        """Store a transform plan of reviewable diffs (see ``transform plan``).
+
+        ``no_parse`` stores the plan without starting dbt (#1517): no
+        ``dbt parse`` of the post-change project, none for a declared mart's
+        derived semantic model, and no ``dbt compile``. It is for a host that
+        must not run repository-controlled code (Jinja, macros, hooks) where it
+        authors, and parses the plan in a sandbox of its own, as
+        ``semantic_plan(no_parse=True)`` does. Every structural check still
+        runs: admission, placement, deletions, the PII and secret gates, hash
+        pinning and the diffs. A model with Jinja control flow cannot be checked
+        without compiling it, so it is refused rather than stored unchecked.
+        """
+
         from .transform import commands as transform
 
         return transform.plan(
@@ -1529,6 +1543,7 @@ class DexEngine:
             declarations=declarations,
             scaffold=scaffold,
             attribute_rows=attribute_rows,
+            no_parse=no_parse,
         )
 
     def compare(
