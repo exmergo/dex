@@ -268,21 +268,90 @@ class TargetInfo(BaseModel):
     is_default: bool
 
 
+# Directories the deeper project search never descends into: artifacts dbt
+# and Python tooling create, version control, and dex's own cache. A project
+# filed under one of these names is not one dex can own.
+_DEEP_SEARCH_SKIP = frozenset(
+    {
+        "dbt_packages",
+        "target",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".git",
+        ".hg",
+        ".svn",
+        ".dex",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+# How far below the repo root the deeper search looks for a dbt_project.yml.
+# Deep enough for a monorepo layout such as services/data/dbt, shallow enough
+# to stay cheap and to leave deeply nested fixtures alone.
+_DEEP_SEARCH_MAX_DEPTH = 4
+
+
 def discover_projects(repo_root: Path | str = ".") -> list[Path]:
-    """Every dbt project the search surface can see: the repo root itself, or
-    its immediate children. Shared by ``find_project`` and ``transform init``'s
-    already-exists refusal, so the two can never disagree."""
+    """Every dbt project the search surface can see: the repo root itself, its
+    immediate children, and projects deeper down, up to
+    :data:`_DEEP_SEARCH_MAX_DEPTH` levels below the root.
+
+    The deeper search skips the directories in :data:`_DEEP_SEARCH_SKIP`, and
+    never descends into a directory that is itself a project: anything under
+    it belongs to that project, so a project nested inside another one does
+    not make the outer one ambiguous. The repository root is the exception:
+    it is the search surface itself, so a project at the root does not hide
+    the projects below it; the root is reported together with any deeper
+    project, and ``find_project`` refuses the layout as ambiguous. A project
+    reached through a directory symlink counts too: ``os.walk`` never
+    descends into one, so the symlink's own marker is checked directly,
+    without following the link into its subtree. A marker that is a dangling
+    symlink is not a project: only a regular file counts. Two paths to one
+    directory are one project: candidates are deduplicated by their resolved
+    directory, so a symlinked alias of a project does not make it ambiguous.
+    Shared by ``find_project`` and ``transform init``'s already-exists
+    refusal, so the two can never disagree."""
 
     root = Path(repo_root)
-    if (root / PROJECT_FILE).is_file():
-        return [root]
     if not root.is_dir():
         return []
-    return sorted(child for child in root.iterdir() if (child / PROJECT_FILE).is_file())
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = len(Path(dirpath).relative_to(root).parts)
+        if depth >= _DEEP_SEARCH_MAX_DEPTH:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [d for d in dirnames if d not in _DEEP_SEARCH_SKIP]
+        if PROJECT_FILE in filenames and (Path(dirpath) / PROJECT_FILE).is_file():
+            found.append(Path(dirpath))
+            if depth:
+                # A project owns its subtree: do not descend into it. The
+                # repository root is the search surface itself, so a project
+                # there does not hide the projects below it.
+                dirnames[:] = []
+                continue
+        # os.walk never descends into a symlinked directory, so a project
+        # reached through one is invisible to the walk above, while the scan
+        # before this one listed directory entries directly and found it.
+        # Check each eligible symlink's own marker here, without following
+        # the link into its subtree.
+        for name in dirnames:
+            link = Path(dirpath) / name
+            if link.is_symlink() and link.is_dir() and (link / PROJECT_FILE).is_file():
+                found.append(link)
+    by_identity: dict[Path, Path] = {}
+    for candidate in sorted(found):
+        by_identity.setdefault(candidate.resolve(), candidate)
+    return sorted(by_identity.values())
 
 
 def find_project(repo_root: Path | str = ".") -> Path:
-    """Locate the dbt project: the repo root itself, or a unique child directory.
+    """Locate the dbt project: the repo root itself, or a unique project under
+    it, however deep :func:`discover_projects` looks.
 
     Ambiguity is an error rather than a guess; the caller can pin the project with
     ``dbt_project_dir`` in ``.dex/config.yml``.
@@ -1385,7 +1454,7 @@ def definitions(
     """Load the project's declared and semantic definitions, degrading quietly.
 
     ``project_dir`` pins the project (callers pass ``dbt_project_dir`` from
-    ``.dex/config.yml``); otherwise the repo root and its immediate children
+    ``.dex/config.yml``); otherwise the repo root and the projects under it
     are searched. No project, an ambiguous choice, or an unreadable project
     yields the empty view (with a note where there is something actionable to
     say), never an exception: explore runs on raw warehouses where absence is
