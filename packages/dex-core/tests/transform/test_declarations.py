@@ -523,6 +523,46 @@ def test_an_indentless_column_test_list_is_extended_indentless():
     assert other == {"name": "other"}
 
 
+def test_a_comment_between_indentless_items_stays_inside_the_list():
+    [declaration] = parse_declarations([{"model": "m", "description": "x"}])
+    head = (
+        "version: 2\n"
+        "models:\n"
+        "- name: m\n"
+        "  data_tests:\n"
+        "  - not_null_x\n"
+        "  # second test added by hand\n"
+        "  - unique_y\n"
+    )
+
+    out = render(head + "- name: m2\n", declaration)
+
+    assert out == head + "  description: x\n- name: m2\n"
+
+
+def test_replacing_an_indentless_list_replaces_every_item():
+    from exmergo_dex_core.transform.declarations import _model_entry, _set_key
+
+    content = (
+        "models:\n- name: m\n  data_tests:\n  - a\n  # note\n  - b\n  description: x\n"
+    )
+
+    out = _set_key(content, lambda r: _model_entry(r, "m"), "data_tests", ["z"])
+
+    assert out == "models:\n- name: m\n  data_tests:\n    - z\n  description: x\n"
+
+
+def test_an_indentless_pair_span_takes_inner_comments_but_not_a_trailing_one():
+    from exmergo_dex_core.transform.rewrite import _pair_span
+
+    content = "vars:\n  a:\n  - 1\n  # c\n  - 2\n  # trailing\n  b: 3\n"
+    key = content.index("a:")
+
+    start, end = _pair_span(content, (key, key + 1), None)
+
+    assert content[start:end] == "  a:\n  - 1\n  # c\n  - 2\n"
+
+
 def test_a_column_is_added_to_an_indentless_columns_list():
     [declaration] = parse_declarations(
         [{"model": "m", "columns": {"email": {"role": "attribute"}}}]
