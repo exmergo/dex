@@ -289,5 +289,5 @@ def test_generated_tests_agree_with_maintain_verify_live(
         capsys,
         tmp_path,
         connector="databricks",
-        budget=DBX_MAX_SECONDS * 20,
+        budget=DBX_MAX_SECONDS * 28,
     )

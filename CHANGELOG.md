@@ -14,6 +14,106 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.18.2] - 2026-11-21
+
+### Added
+
+- **`transform test --mutate` measures one version of a versioned model.** Name it
+  by its label, `<model>.v<N>`, the spelling `transform declare` takes. The bare
+  name measures the version an unversioned `ref()` resolves to (its
+  `latest_version`), with a warning, and `data.model` names the version measured.
+  Each version keeps its own mutation record, which `maintain coverage` reads as
+  that version's strength, and `--downstream` routes a mutant only to the models
+  that `ref()` that version. A version the model does not list is refused naming
+  the versions it has, and a version's file stem naming its label.
+
+  `maintain coverage --mutate` now refreshes each version of a versioned model by
+  its label instead of listing it under `refresh.skipped` with `versioned_model`.
+
+  The batch price splices each mutant into the CTE dbt names after the model's
+  alias, which for a version is `<name>_v<N>`, so a mutant of a version or of any
+  model with a custom alias is no longer priced at the unmutated baseline. An
+  ephemeral parent with an alias is matched the same way. ([#1405](https://github.com/exmergo/dex/pull/1405))
+- **A declared population filter renders a test, `dex_population_filter`.** With
+  `declarations.render_tests` on, each `includes` or `excludes` list in a
+  model's `population.filters` renders a count-only column test, tagged
+  `dex_every_run`, that fails on every run where a row breaks the filter, and the
+  plan writes its macro as a reviewable diff. It agrees with `maintain verify`'s
+  `population_contradicted` count for count on every connector: a NULL breaks an
+  `includes` list and never an `excludes` one. A filter on a column the model
+  does not output renders nothing and says `column_not_output`. ([#1516](https://github.com/exmergo/dex/pull/1516))
+- **A declared parent population renders a test, `dex_parent_population`, in both
+  directions.** With `declarations.render_tests` on, each `population.parent`
+  renders two count-only model tests, tagged `dex_scheduled`: `missing` fails
+  with the number of eligible parent keys the model lacks, and `unexpected` with
+  the number of the model's keys the parent lacks, and the plan writes its macro
+  as a reviewable diff. Each agrees with `maintain verify`'s
+  `parent_population_missing` and `parent_population_unexpected` count for count
+  on every connector, with the declared `population.filters` scoping which parent
+  keys are owed and a filter on a column the parent lacks skipped, as
+  `maintain verify` skips it. A grain or key column the model does not output now
+  renders no model-level test and says `column_not_output`. Each
+  `data.generated_tests` row of a kind that renders several tests on one model
+  names which one it is under `variant` (`missing` or `unexpected`, `includes` or
+  `excludes`). ([#1525](https://github.com/exmergo/dex/pull/1525))
+- **A column declared a fraction renders a test, `dex_unit_range`.** With
+  `declarations.render_tests` on, each column declared `unit: fraction` renders a
+  count-only column test, tagged `dex_every_run`, that fails on every run where a
+  value sits below 0 or above 1, and the plan writes its macro as a reviewable
+  diff. It agrees with `maintain verify`'s `unit_out_of_range` count for count on
+  every connector: a NULL never counts, and a column that is not a number is
+  checked by neither. The fraction finding now states that count as
+  `out_of_range_rows`. A column declared `unit: percent` renders no test and says
+  `heuristic_only`: `maintain verify`'s percent rule is a question that correct
+  small percentages also raise, so it stays with `maintain verify`. ([#1527](https://github.com/exmergo/dex/pull/1527))
+- **An INNER join a `references` requires renders a test, `dex_join_coverage`.**
+  With `declarations.render_tests` on, a model whose key column declares a
+  `references` naming the model it INNER-joins renders a count-only model test,
+  tagged `dex_scheduled`, that fails with the join's driving rows that find no
+  parent row. An INNER join drops those rows, so the model's output, and the
+  `relationships` test on it, never shows them: the test reads the join's two
+  inputs and the filters the model applies to each, as the plan reads them from
+  the model's SQL, and agrees with `maintain verify`'s join contract count for
+  count on every connector. A NULL key is a missing reference, counted only where
+  the column is declared `null_rule: never`. A required LEFT join to the whole
+  parent renders nothing
+  (`covered_by_builtin`, since `relationships` already counts those rows), nor
+  does a key conversion or a grouped side (`join_shape_unsupported`) or SQL whose
+  joins the plan cannot read (`join_unread`). A listed test whose join the SQL no
+  longer writes is reported `stale` with a warning. ([#1531](https://github.com/exmergo/dex/pull/1531))
+
+### Fixed
+
+- **The join-contract coverage probe resolves a model's key columns on Snowflake, Postgres and Redshift.** The probe that `transform build --verify` and `maintain verify` run quoted each join key column as the model's SQL spelled it, so on Snowflake a model written in lower case (`customer_id`) asked for a column the relation stores as `CUSTOMER_ID`, the statement was refused as an invalid identifier, and every such join came back `unchecked` with `reason_code: probe_refused`: `join_no_match`, `join_zero_overlap` and `join_orphans` never fired. Postgres and Redshift had the same defect for a model written in upper case. A key column not already spelled the way the connector folds unquoted names is now looked up in the relation's columns: a name the relation holds exactly keeps its spelling (a quoted mixed-case column), otherwise the folded name is used. A column the relation does not hold still comes back `probe_refused` with the warehouse's reason (#1366). ([#1413](https://github.com/exmergo/dex/pull/1413))
+- **The plan's `--expect` hint names the key value.** `data.refactor_comparison_offer.intended_change` now says `"key": "unchanged"` instead of "that the key holds", and shows the same whole expectation shape a refused `--expect` ends with, so following the hint does not take a refusal to learn the field's value. ([#1426](https://github.com/exmergo/dex/pull/1426))
+- **`transform plan` skips an edit that matches the file on disk.** A payload that resent an unchanged file counted it as a change: an unchanged seed made `transform compare` return `inputs_unsynchronized` for the model the plan did change, and an unchanged model was offered a comparison the build then reported as `comparison_not_run`. An edit whose content matches the file on disk is now left out of the plan, its diffs, `paths`, the comparison offer and the seed and snapshot check, and one warning names the skipped files ("N edits match the tree and were skipped"). A declaration whose rendered YAML is already the file is skipped the same way, and a payload whose every edit matches the tree, declarations included, stores no plan and returns `plan_id: null`, as `transform declare` does. A model file the payload's `declarations` name is kept even when it matches, so resending a model's SQL beside its declaration still brings the model into the plan and its `--for-plan` verification. ([#1431](https://github.com/exmergo/dex/pull/1431))
+- **A versioned deliverable a plan names by its file stem is `asserted` when a test checked it.** With `--for-plan`, a deliverable may be the version's file stem (`dim_customers_v2`) while a test names its model by label (`dim_customers.v2`), so a version a passing test checked read `build_only`, and one a failing test checked was missing from `failed_checks`. `data.completion.assurance` now matches the stem to the version it builds, as the deliverables block already does (#1499). ([#1503](https://github.com/exmergo/dex/pull/1503))
+- **A population filter stating both `includes` and `excludes` is judged on each
+  list.** `maintain verify` and `transform build --verify` compared the
+  `excludes` check against the `includes` values, so every included value read as
+  a contradiction. Each list is now its own rule with its own finding. ([#1516](https://github.com/exmergo/dex/pull/1516))
+- **A test declared on a column whose test list is a YAML alias lands on that
+  column only.** A list two columns share through an anchor and its aliases was
+  appended to as written, so the test reached every column using the list. The
+  declared column now gets its own copy of the list first: an alias is expanded
+  in place, and an anchor moves with a copy of the tests to the list's first
+  alias, so every other column parses to the same tests as before.
+  A column whose whole entry is shared, through a merge key (`<<: *base`) or an
+  alias, is refused with the anchor named, since no copy of its list alone keeps
+  the test off the other columns.
+  A test list whose last item is an alias to a test in another column now takes
+  the new tests itself, where they used to be written under that other column. ([#1522](https://github.com/exmergo/dex/pull/1522))
+- **`maintain verify` holds a join to a declared `references` whatever the column's role, on a LEFT join too.** A `references` renders dbt's `relationships` test, which fails on any non-null value the parent lacks. `maintain verify` required the join only where the column was also declared `role: foreign_key`, so a `references` with no role, or with role `key` or `dimension`, on a LEFT join recorded its orphans as an optional relationship and withheld `join_orphans`: the build's test failed while verify called the same rows fine. A `references` now makes the join into the parent it names required on every join side, any non-null orphan contradicts it at the contract threshold (`threshold_source: contract`, `threshold: 0`, high), and NULL keys stay excluded, since a NULL is a missing reference both checks accept. A version label (`dim_teams.v2.team_id`) is matched to that version's relation, and a bare name to the version an unversioned `ref()` resolves to; before, a versioned parent was never matched. This can raise new `join_orphans` or `join_zero_overlap` findings on a project that declares `references` on LEFT-joined columns: each names the declaration it rests on under `required_by` (`<column> declares references <model>.<column>`), so it reads as the declaration's meaning, not a change in the model (#1459). ([#1528](https://github.com/exmergo/dex/pull/1528))
+- **`maintain verify` judges a node's build status by the latest run that attempted it, and names that run on every build finding.** It read the `run_results.json` beside whichever `manifest.json` was newest, so a `dbt parse` after a Dex build (which rewrites the project's manifest and runs nothing) paired a fresh manifest with an older hand-run `dbt test` and reported a failure the build had since fixed, at high severity and with nothing to date it. Build status now reads every building run on disk (the project's target path and Dex's artifact directory, each with its `cold/`), ordered by dbt's `generated_at`. A compile is never read, and a node the current manifest no longer has is not reported. A run no dbt log names is still read, with a warning, since a rotated or cleaned log is no proof it came from elsewhere. Because Dex's builds share one artifact directory and each replaces the last one's results, `transform build` now also keeps one entry per node in `dex_node_runs.json` beside them (status, invocation, time and command, never a dbt message), so a node an earlier Dex build passed is not judged by an older hand run. Each `node_failed`, `node_skipped` and `node_warned` carries `data.run` (`invocation_id`, `generated_at`, `command`, `artifact`, `cold`, `source`, `invoked_by`, `logged` and `latest`), its `detail` names the run, and a failure from an earlier run than the latest says so. A skipped node's `caused_by` is read from its own run only. `data.build_status_runs` lists the runs read (#1524). ([#1529](https://github.com/exmergo/dex/pull/1529))
+- **A Cube time bucket reads the same under `--api` and `--local`.** The same grouped query returned `2025-03-01T00:00:00.000` typed `time` when Cube executed it over `/v1/load`, and the warehouse's own spelling and type name when Dex ran Cube's SQL (`2025-03-01T00:00:00` typed `TIMESTAMP` on DuckDB, `2025-03-01T00:00:00+00:00` on BigQuery). Both paths now spell every bucket as a UTC ISO timestamp with an explicit offset, `2025-03-01T00:00:00+00:00`, typed `timestamp`, on every connector and at every grain, so switching `execution` or `semantic.deployment` no longer changes the cells or `types` of a grouped time bucket. A time dimension grouped without a grain is passed through as each path returns it (#1497). ([#1530](https://github.com/exmergo/dex/pull/1530))
+- **`maintain verify` measures a join read through a filtering CTE on Snowflake.**
+  The join contract carries a filtering CTE's `WHERE` into its coverage probe, and
+  respelled the probe's key columns the way the relation stores them, but not the
+  filter's columns: on Snowflake a lower-case `status` named no column of a
+  relation storing `STATUS`, the probe was refused, and the join was left
+  unchecked. The filter's columns are now respelled the same way. ([#1531](https://github.com/exmergo/dex/pull/1531))
+
+
 ## [1.18.1] - 2026-11-20
 
 ### Added

@@ -95,6 +95,12 @@ class GeneratedTestKind:
     #: than rendering one whose answer nothing has held to ``maintain verify``'s.
     #: ``None`` means every connector.
     dialects: frozenset[str] | None = None
+    #: Whether :attr:`instances` also reads the model's joins (#1456): it is
+    #: then called as ``instances(declaration, joins)``, ``joins`` being what
+    #: the plan read of the model's SQL
+    #: (:class:`~.transform.join_reading.ModelJoins`), or ``None`` where the
+    #: caller read nothing, which gives no instance at all.
+    reads_joins: bool = False
 
 
 _KINDS: dict[str, GeneratedTestKind] = {}
@@ -172,6 +178,23 @@ COLUMN_NOT_OUTPUT = "column_not_output"
 #: values all sit within 0 to 1 may be a fraction stored as a percent, or a
 #: column of genuinely small percentages), so it stays with ``maintain verify``.
 HEURISTIC_ONLY = "heuristic_only"
+
+
+#: The reasons a required join renders no ``dex_join_coverage`` (#1456). The
+#: plan could not read the model's joins from its SQL (Jinja other than
+#: ``ref()``/``source()``/``config()``, or SQL that does not parse), so it cannot
+#: tell which join a ``references`` makes required; ``maintain verify``, which
+#: reads the compiled SQL, still judges it.
+JOIN_UNREAD = "join_unread"
+#: The required join is a LEFT join to the whole parent: it keeps every
+#: unmatched row, so the
+#: ``relationships`` (or ``not_null``) test the declaration already renders
+#: counts the same rows on the model's output.
+COVERED_BY_BUILTIN = "covered_by_builtin"
+#: The required join is a shape this release does not render (a key compared
+#: through a conversion, a grouped side, a RIGHT or FULL join, a side that is
+#: no ``ref()`` or ``source()``, a filter that does not carry into the dialect).
+JOIN_SHAPE_UNSUPPORTED = "join_shape_unsupported"
 
 
 def off_reason(setting: bool | list[str]) -> str:
@@ -406,5 +429,96 @@ register(
         _declared_units,
         macro=UNIT_RANGE,
         dialects=ALL_CONNECTORS,
+    )
+)
+
+JOIN_COVERAGE = "dex_join_coverage"
+
+
+def _join_coverage(declaration: Any, joins: Any) -> list[Instance]:
+    """One model-level test per INNER join the declaration requires (#1456):
+    every eligible row of the join's driving input finds a parent row, as
+    ``maintain verify``'s join contract holds a required join at threshold
+    zero. An INNER join drops its unmatched rows, so the model's output (and
+    the ``relationships`` test on it) cannot show them: the test reads the
+    join's two inputs, through the filters the model applies to each, as the
+    plan read them from the model's SQL.
+
+    A required LEFT join to the whole parent is listed and withheld
+    (:data:`COVERED_BY_BUILTIN`); one to a filtered parent renders, since
+    ``relationships`` reads the whole parent. A
+    shape this release does not render is withheld
+    (:data:`JOIN_SHAPE_UNSUPPORTED`), and where the plan could not read the
+    joins at all each declared ``references`` is listed withheld
+    (:data:`JOIN_UNREAD`). ``joins`` ``None`` (no reading asked for) gives
+    nothing."""
+
+    if joins is None:
+        return []
+    if not getattr(joins, "read", False):
+        out: list[Instance] = []
+        for name, column in (getattr(declaration, "columns", None) or {}).items():
+            target = getattr(column, "references", None)
+            if not isinstance(target, str) or not target.strip():
+                continue
+            out.append(
+                Instance(
+                    column=None,
+                    field="references",
+                    columns=(str(name),),
+                    params={"check": JOIN_COVERAGE, "references": target.strip()},
+                    withheld=JOIN_UNREAD,
+                )
+            )
+        return out
+    out = []
+    for join in joins.required(declaration):
+        arguments: dict[str, Any] = {
+            "child": join.child,
+            "child_columns": list(join.child_columns),
+            "parent": join.parent,
+            "parent_columns": list(join.parent_columns),
+        }
+        if join.child_where:
+            arguments["child_where"] = join.child_where
+        if join.parent_where:
+            arguments["parent_where"] = join.parent_where
+        if join.null_keys != "excluded":
+            arguments["null_keys"] = join.null_keys
+        params: dict[str, Any] = {
+            "check": JOIN_COVERAGE,
+            "child": join.child or "",
+            "child_columns": [c.lower() for c in join.child_columns],
+            "parent": join.parent or "",
+            "parent_columns": [c.lower() for c in join.parent_columns],
+            # The NULL policy decides the count, so a declaration that starts
+            # or stops counting NULL keys is a different claim.
+            "null_keys": join.null_keys,
+        }
+        for key in ("child_where", "parent_where"):
+            if arguments.get(key):
+                params[key] = [arguments[key]]
+        withheld = None if join.status == "render" else join.status
+        out.append(
+            Instance(
+                column=None,
+                field="references",
+                columns=tuple(join.driving) or tuple(join.child_columns),
+                params=params,
+                arguments=arguments if withheld is None else {},
+                withheld=withheld,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        JOIN_COVERAGE,
+        SCHEDULED,
+        _join_coverage,
+        macro=JOIN_COVERAGE,
+        dialects=ALL_CONNECTORS,
+        reads_joins=True,
     )
 )

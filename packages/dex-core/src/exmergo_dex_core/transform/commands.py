@@ -866,6 +866,13 @@ def _declare(
         )
         warnings.extend(rendered_warnings)
         edits = _with_generated_macros(view, edits, generated)
+    # A join is usually changed by editing the SQL alone (#1456): the models
+    # the payload does not declare are checked for a test left stale too.
+    stale, stale_notes = declarations_mod.stale_join_tests(
+        view, edits, (d.model for d in parsed), _dialect(engine)
+    )
+    generated.extend(stale)
+    warnings.extend(stale_notes)
     warnings.extend(
         declarations_mod.undeclared_model_warnings(
             edits, view, (d.model for d in parsed)

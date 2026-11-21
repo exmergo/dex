@@ -206,7 +206,21 @@ Needs no baseline. The classes of finding:
   (naming the one that actually failed, through a chain of skipped parents);
   nodes that warned rather than failed (`node_warned`, ranked low, because a
   project running relationship tests at `severity: warn` has warnings by design);
-  and models the project declares that built no relation.
+  and models the project declares that built no relation. Each node is judged
+  by the latest dated run that attempted it (#1524): every building
+  `run_results.json` in the project's target path and in Dex's artifact
+  directory, ordered by dbt's `generated_at`, plus the per-node record each
+  `transform build` keeps in `dex_node_runs.json` (statuses only), since Dex's
+  builds overwrite one file. Never the run results beside the newest manifest:
+  a `dbt parse` rewrites a manifest and runs nothing. A compile is never read,
+  and a node the current manifest no longer has is not reported. A run no dbt
+  log names is still read, with a warning and `logged: false`, since a rotated
+  log is no proof it came from elsewhere. Each finding names its run under `data.run`
+  (`invocation_id`, `generated_at`, `command`, `artifact`, `cold`, `source`,
+  `invoked_by`: `dex`, `outside_dex` or `unknown`, `logged` and `latest`), and `detail`
+  says so in words, marking a failure read from an earlier run than the latest.
+  A skip names its failed parent from its own run only.
+  `data.build_status_runs` lists the runs read.
 - **Row population**: `row_loss` where a model holds materially fewer rows than
   its **driving parent** (the relation in its FROM clause, followed through the
   CTE chain, as distinct from anything it joins) and nothing in its SQL accounts
@@ -324,7 +338,12 @@ Needs no baseline. The classes of finding:
     No threshold. `low` when every column the join supplies is declared as
     allowed to be NULL.
   - `join_orphans` and `join_zero_overlap`: on a required join any unmatched
-    row (`threshold_source: contract`, high). Otherwise the stated defaults,
+    row (`threshold_source: contract`, high). With `declarations.render_tests`
+    on, an INNER join so required also renders `dex_join_coverage`, a build
+    test reading the same two inputs and failing with the same
+    `unmatched_rows` (#1456); a LEFT one to the whole parent leaves that to
+    `relationships`.
+    Otherwise the stated defaults,
     0.2 and 0.9 of eligible rows (`threshold_source: default`). On a LEFT join
     with no requirement (no `references` on its driving key), unmatched rows are the optional relationship the join
     writes: no `join_orphans`, and `join_zero_overlap` at medium. On an INNER
@@ -539,10 +558,11 @@ one coverage number.
     target only (`--target`).
   - `refresh.skipped` lists models a run would refuse, read off the manifest at
     no cost and not counted toward the cap: Python models, models with a
-    `sql_header`, versioned models, whose versions share the name
-    `transform test --mutate` takes, and, on a metered connector, a model only
+    `sql_header`, and, on a metered connector, a model only
     downstream tests read (`downstream_only`), since routing a mutant through
     them is opt-in there (`transform test --mutate <model> --downstream`).
+  - Each version of a versioned model is a model of its own: it reads its own
+    strength and is refreshed by its label (`fct.v2`).
   - A model whose tests pass no baseline is recorded too: it reads `missing`
     with `last_refusal`, and a refresh retries it after the models it has not
     tried yet, so it never holds the first slots. It never replaces a score

@@ -63,6 +63,7 @@ from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
 from .claims import CLAIM_KEY, claim_id, claim_of, without_claim
+from .join_reading import read_model_joins
 from .package_overrides import (
     DocumentedOverride,
     documented_overrides,
@@ -656,6 +657,9 @@ def apply_declarations(
                 generated=generated,
                 dialect=dialect,
                 outputs=model_outputs(files, view.model_paths, declaration.model),
+                joins=read_model_joins(
+                    files, view.model_paths, declaration.model, dialect
+                ),
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -1342,6 +1346,7 @@ def render(
     generated: list[dict[str, Any]] | None = None,
     dialect: str | None = None,
     outputs: frozenset[str] | None = None,
+    joins: Any = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1365,16 +1370,22 @@ def render(
     the columns the model's SQL provably outputs (:func:`model_outputs`, or
     ``None`` where unknown): a test reading a column outside them (the column
     it sits under, or a model-level test's grain or parent key) is
-    ``not_rendered`` with the reason ``column_not_output`` (#1453, #1454). A generated
-    test already in the YAML is never removed: the switch decides what renders,
-    not what stays.
+    ``not_rendered`` with the reason ``column_not_output`` (#1453, #1454).
+    ``joins`` is what the plan read of the model's joins
+    (:func:`.join_reading.read_model_joins`), which ``dex_join_coverage`` reads
+    (#1456); ``None`` reads none. A generated test already in the YAML is never
+    removed: the switch decides what renders, not what stays. A listed
+    ``dex_join_coverage`` whose join the model's SQL no longer writes is
+    reported ``stale``, with a note, for a reviewer to remove.
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
     if not gt.kinds():
         # No kind registered: nothing to generate, so no entry to read back.
         return text
-    planned = _generated(_effective(text, declaration), render_tests, dialect, outputs)
+    planned = _generated(
+        _effective(text, declaration), render_tests, dialect, outputs, joins
+    )
     on = [g for g in planned if g["enabled"]]
     if on:
         # Rendered on their own, after the facts: a bare declaration of the
@@ -1405,7 +1416,139 @@ def render(
                 row["status"] = "not_rendered"
                 row["reason"] = g["off_reason"]
             generated.append(row)
+    if joins is not None and getattr(joins, "read", False):
+        for row in _stale_join_tests(content, declaration.model, planned):
+            if generated is not None:
+                generated.append(row)
+            if notes is not None:
+                notes.append(_stale_note(row))
     return text
+
+
+def _stale_note(row: Mapping[str, Any]) -> str:
+    return (
+        f"'{row['model']}' lists a {gt.JOIN_COVERAGE} test (claim {row['claim']}) "
+        "for a join its SQL no longer writes; it measures inputs the model does "
+        "not join, so remove it from the YAML (`transform declare "
+        f"{row['model']}` renders the test for the join it writes now)"
+    )
+
+
+def stale_join_tests(
+    view: DbtProjectView,
+    edits: list[PlanEdit],
+    declared: Iterable[str],
+    dialect: str | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """The listed ``dex_join_coverage`` tests a plan leaves stale on the models
+    whose SQL it edits without declaring them (#1456): a join is usually
+    changed by editing the SQL alone, which renders no declaration, so the
+    check :func:`render` runs for a declared model runs here for the rest.
+    Returns ``data.generated_tests`` rows (``status: stale``) and a warning
+    per row. A model whose new SQL the plan cannot read says nothing: whether
+    its join changed is not known."""
+
+    names = {name.lower() for name in declared}
+    files = post_change_files(view, edits)
+    vmap = mv.cached_version_map(files, view.model_paths)
+    # A version's file builds its label (dim_teams_v2.sql is dim_teams.v2),
+    # whose YAML is the versioned entry, as undeclared_model_warnings reads it.
+    labels = [
+        mv.label_for_file(edit.path, vmap) or PurePosixPath(edit.path).stem
+        for edit in edits
+        if edit.kind is EditKind.MODEL_SQL and edit.op is EditOp.UPSERT
+    ]
+    edited = [label for label in labels if label.lower() not in names]
+    if not edited:
+        return [], []
+    rows: list[dict[str, Any]] = []
+    for model in dict.fromkeys(edited):
+        path = schema_path(files, model)
+        content = files.get(path) if path else None
+        if not content or gt.JOIN_COVERAGE not in content:
+            continue
+        joins = read_model_joins(files, view.model_paths, model, dialect)
+        if not joins.read:
+            continue
+        stated = _effective(content, Declaration(model=model))
+        planned = _generated(
+            stated,
+            True,
+            dialect,
+            model_outputs(files, view.model_paths, model),
+            joins,
+        )
+        rows.extend(_stale_join_tests(content, model, planned))
+    return rows, [_stale_note(row) for row in rows]
+
+
+def _stale_join_tests(
+    content: str | None, model: str, planned: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The ``dex_join_coverage`` tests the model's entry lists whose join no
+    longer appears among the joins the plan read (#1456), as
+    ``data.generated_tests`` rows with ``status: stale``. Matched by claim, else
+    by arguments, as rendering matches a listed test."""
+
+    if not content:
+        return []
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return []
+    base, version = mv.split_label(model)
+    entries = loaded.get("models") if isinstance(loaded, Mapping) else None
+    node: Any = next(
+        (
+            e
+            for e in entries or []
+            if isinstance(e, Mapping) and str(e.get("name", "")).lower() == base.lower()
+        ),
+        None,
+    )
+    if node is not None and version is not None:
+        node = next(
+            (
+                item
+                for item in node.get("versions") or []
+                if isinstance(item, Mapping) and str(item.get("v")) == str(version)
+            ),
+            None,
+        )
+    if not isinstance(node, Mapping):
+        return []
+    listed = node.get("data_tests") or node.get("tests") or []
+    current = [
+        g["spec"] for g in planned if g["test"] == gt.JOIN_COVERAGE and g["enabled"]
+    ]
+    current += [
+        g["spec"]
+        for g in planned
+        if g["test"] == gt.JOIN_COVERAGE
+        and not g["enabled"]
+        and g["off_reason"] not in (gt.JOIN_UNREAD,)
+    ]
+    out: list[dict[str, Any]] = []
+    for test in listed if isinstance(listed, list) else []:
+        if _listed_name(test) != gt.JOIN_COVERAGE or not gt.is_generated(test):
+            continue
+        claims = {claim_of(spec) for spec in current}
+        if claim_of(test) in claims or any(
+            _arguments_of(test) == _arguments_of(spec) for spec in current
+        ):
+            continue
+        out.append(
+            {
+                "model": model,
+                "column": None,
+                "test": gt.JOIN_COVERAGE,
+                "cadence": gt.SCHEDULED,
+                "claim": claim_of(test),
+                "status": "stale",
+                "reason": "join_not_in_model",
+            }
+        )
+    return out
 
 
 def _render(
@@ -1476,10 +1619,12 @@ def _generated(
     render_tests: bool | list[str],
     dialect: str | None = None,
     outputs: frozenset[str] | None = None,
+    joins: Any = None,
 ) -> list[dict[str, Any]]:
     """Every generated test the declaration gives, each with its claim, its
     rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
-    ``dialect`` (#1451), for columns the model outputs (#1453, #1454)."""
+    ``dialect`` (#1451), for columns the model outputs (#1453, #1454), with
+    the joins the plan read for a kind that reads them (#1456)."""
 
     out: list[dict[str, Any]] = []
     model = declaration.model
@@ -1487,7 +1632,12 @@ def _generated(
         switched = gt.enabled(kind, render_tests)
         on = switched and gt.supports(kind, dialect)
         off_reason = gt.DIALECT_UNSUPPORTED if switched else gt.off_reason(render_tests)
-        for instance in kind.instances(declaration):
+        instances = (
+            kind.instances(declaration, joins)  # type: ignore[call-arg]
+            if kind.reads_joins
+            else kind.instances(declaration)
+        )
+        for instance in instances:
             claim = claim_id(
                 model, instance.field, instance.columns, dict(instance.params)
             )

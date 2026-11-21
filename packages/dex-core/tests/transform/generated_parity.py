@@ -546,6 +546,165 @@ RELATIONSHIPS_LEFT_JOIN = ParityRow(
     },
 )
 
+
+def _join_coverage_parent(_null: str) -> str:
+    return (
+        "select 1 as customer_id, 'retail' as segment\n"
+        "union all select 2, 'retail'\nunion all select 2, 'retail'\n"
+        "union all select 3, 'wholesale'\n"
+    )
+
+
+def _joined(prefix: str, orders: str, side: str = "inner") -> Callable[[str], str]:
+    """The fixture model: ``orders`` joined to the row's declared parent on
+    ``customer_id``, an INNER join by default, which drops an order whose
+    customer the parent lacks."""
+
+    def render(_null: str) -> str:
+        return (
+            "select o.order_id, o.customer_id, c.segment\n"
+            f"from {{{{ ref('dex_parity_{prefix}_{orders}') }}}} o\n"
+            f"{side} join {{{{ ref('dex_parity_{prefix}_parent') }}}} c\n"
+            "  on o.customer_id = c.customer_id\n"
+        )
+
+    return render
+
+
+def _join_row(
+    name: str,
+    orphaned: tuple[tuple[str, str | None], ...],
+    *,
+    side: str = "inner",
+    withheld: str | None = None,
+) -> ParityRow:
+    """A ``dex_join_coverage`` row (#1456): the violating fixture joins orders
+    holding ``orphaned``, the clean one orders whose every non-null customer
+    the parent has, a NULL among them, which both sides leave out (a missing
+    reference). The parent holds customer 2 twice, which must multiply
+    nothing."""
+
+    slug = name.removeprefix("dex_")
+    return ParityRow(
+        test=gt.JOIN_COVERAGE,
+        name=name,
+        codes=frozenset({"join_orphans", "join_zero_overlap", "join_no_match"}),
+        declaration={
+            "description": "Parity fixture: one row per matched order.",
+            "columns": {
+                "customer_id": {"references": f"dex_parity_{slug}_parent.customer_id"}
+            },
+        },
+        violating=_joined(slug, "orders_orphaned", side),
+        clean=_joined(slug, "orders_matched", side),
+        count=lambda finding: int(finding["data"]["unmatched_rows"]),
+        measured=_join_measured,
+        withheld=withheld,
+        fixtures={
+            "parent": _join_coverage_parent,
+            "orders_orphaned": lambda null: _orders(null, *orphaned),
+            "orders_matched": lambda null: _orders(
+                null, ("10", "1"), ("11", "2"), ("12", "3"), ("13", None)
+            ),
+        },
+    )
+
+
+#: #1456: an INNER join a `references` requires drops the two orders of
+#: customer 9, which no parent row holds; the output shows no orphan, so only a
+#: test reading the join's inputs agrees with `join_orphans`. The NULL customer
+#: is a missing reference on both sides.
+JOIN_COVERAGE_INNER = _join_row(
+    gt.JOIN_COVERAGE,
+    (("10", "1"), ("11", "2"), ("12", "3"), ("13", "9"), ("14", "9"), ("15", None)),
+)
+#: #1456: nothing matches, `join_no_match`, and the test fails with every
+#: eligible row.
+JOIN_COVERAGE_NO_MATCH = _join_row(
+    "dex_join_coverage_no_match", (("10", "7"), ("11", "8"), ("12", None))
+)
+#: #1456: a required LEFT join renders no test, since `relationships` counts
+#: the same rows on its output; `maintain verify` alone answers for it here.
+JOIN_COVERAGE_LEFT = _join_row(
+    "dex_join_coverage_left",
+    (("10", "1"), ("11", "9")),
+    side="left",
+    withheld=gt.COVERED_BY_BUILTIN,
+)
+
+
+def _statused_orders(null_int: str, *rows: tuple[str, str | None, str]) -> str:
+    """``_orders`` with a ``status`` column."""
+
+    def ident(value: str | None) -> str:
+        return null_int if value is None else value
+
+    (first_id, first, first_status), *rest = rows
+    lines = [
+        f"select {first_id} as order_id, {ident(first)} as customer_id, "
+        f"'{first_status}' as status"
+    ]
+    lines += [f"union all select {i}, {ident(c)}, '{st}'" for i, c, st in rest]
+    return "\n".join(lines) + "\n"
+
+
+def _filtered(orders: str) -> Callable[[str], str]:
+    """The fixture model reading its orders through a staging CTE's filter."""
+
+    def render(_null: str) -> str:
+        return (
+            "with orders as (\n"  # noqa: S608 - a fixture model's SQL
+            "    select * from "
+            f"{{{{ ref('dex_parity_join_coverage_filtered_{orders}') }}}}\n"
+            "    where status <> 'cancelled'\n"
+            ")\n"
+            "select orders.order_id, orders.customer_id, c.segment\n"
+            "from orders\n"
+            "join {{ ref('dex_parity_join_coverage_filtered_parent') }} c\n"
+            "  on orders.customer_id = c.customer_id\n"
+        )
+
+    return render
+
+
+#: #1456: the driving input is read through a staging CTE's filter. Customer 8
+#: is no parent's, on a cancelled order the filter drops before the join, so
+#: neither side counts it; customer 9, on a kept order, is the one orphan.
+JOIN_COVERAGE_FILTERED = ParityRow(
+    test=gt.JOIN_COVERAGE,
+    name="dex_join_coverage_filtered",
+    codes=JOIN_COVERAGE_INNER.codes,
+    declaration={
+        "description": "Parity fixture: one row per kept, matched order.",
+        "columns": {
+            "customer_id": {
+                "references": "dex_parity_join_coverage_filtered_parent.customer_id"
+            }
+        },
+    },
+    violating=_filtered("orders_orphaned"),
+    clean=_filtered("orders_matched"),
+    count=lambda finding: int(finding["data"]["unmatched_rows"]),
+    measured=_join_measured,
+    fixtures={
+        "parent": _join_coverage_parent,
+        "orders_orphaned": lambda null: _statused_orders(
+            null,
+            ("10", "1", "paid"),
+            ("11", "9", "paid"),
+            ("12", "8", "cancelled"),
+            ("13", None, "paid"),
+        ),
+        "orders_matched": lambda null: _statused_orders(
+            null,
+            ("10", "1", "paid"),
+            ("11", "3", "paid"),
+            ("12", "8", "cancelled"),
+            ("13", None, "paid"),
+        ),
+    },
+)
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -560,6 +719,10 @@ ROWS: tuple[ParityRow, ...] = (
     UNIT_FRACTION,
     UNIT_PERCENT,
     RELATIONSHIPS_LEFT_JOIN,
+    JOIN_COVERAGE_INNER,
+    JOIN_COVERAGE_NO_MATCH,
+    JOIN_COVERAGE_FILTERED,
+    JOIN_COVERAGE_LEFT,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.

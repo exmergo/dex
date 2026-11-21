@@ -4591,11 +4591,18 @@ def _null_checks(
     return checks, notes
 
 
-def _spell_key_columns(adapter, pairs: list) -> list[str]:
+def _spell_key_columns(
+    adapter, pairs: list, filters: dict[int, tuple] | None = None
+) -> list[str]:
     """Respell each relationship's key columns the way its relation stores them,
     in place, so the probe's quoted names resolve (#1366). Only the probe reads
     the respelling: what a finding or record names comes from the candidate, as
     the SQL wrote it, so a finding's fingerprint does not move with it.
+
+    ``filters`` (:func:`_scope_filters`) are respelled the same way, in place:
+    a side read through a filtering CTE carries its filter as DuckDB SQL over
+    quoted column names (#1085), so on Snowflake ``"status"`` named a column
+    the relation stores as ``STATUS`` and the probe failed (#1456).
 
     The columns come from the model's SQL, which is ordinarily lower case, and
     the probe quotes what it is handed; Snowflake stores an unquoted name upper
@@ -4640,9 +4647,33 @@ def _spell_key_columns(adapter, pairs: list) -> list[str]:
         names = live[identifier]
         return folded if column not in names and folded in names else column
 
+    def respell(model: str, identifier: str, predicate: str | None) -> str | None:
+        if predicate is None:
+            return None
+        import sqlglot
+        from sqlglot import expressions as exp
+
+        try:
+            tree = sqlglot.parse_one(predicate, read="duckdb")
+        except Exception:  # an unreadable filter keeps the SQL spelling
+            return predicate
+        for column in tree.find_all(exp.Column):
+            name = column.name
+            spelled = spell(model, identifier, name)
+            if spelled != name:
+                column.set("this", exp.to_identifier(spelled, quoted=True))
+        return tree.sql(dialect="duckdb")
+
+    scoped_filters = filters if filters is not None else {}
     for model, _candidate, rel in pairs:
         rel.from_columns = [spell(model, rel.from_dataset, c) for c in rel.from_columns]
         rel.to_columns = [spell(model, rel.to_dataset, c) for c in rel.to_columns]
+        scoped = scoped_filters.get(id(rel))
+        if scoped is not None:
+            scoped_filters[id(rel)] = (
+                respell(model, rel.from_dataset, scoped[0]),
+                respell(model, rel.to_dataset, scoped[1]),
+            )
     return notes
 
 
@@ -5062,7 +5093,7 @@ def join_coverage(
     checks, check_notes = _null_checks(adapter, plan, live_identifiers)
     result.notes.extend(check_notes)
     # Before pricing, so an EXPLAIN reads the names the probe will quote.
-    result.notes.extend(_spell_key_columns(adapter, pairs))
+    result.notes.extend(_spell_key_columns(adapter, pairs, filters))
     estimate, probe_count = join_probe_cost(
         adapter, relationships, exprs, filters, grouped
     )
