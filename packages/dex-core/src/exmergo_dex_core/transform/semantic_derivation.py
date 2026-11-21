@@ -338,9 +338,15 @@ def derive(
 
     # MetricFlow wants one element type per name, so a grain column that is also
     # a dimension (a time column grain) names its entity after the model too (#1416).
-    if primary in {d["name"] for d in dimensions}:
+    dimension_names = {d["name"] for d in dimensions}
+    if primary in dimension_names:
         stem = _LAYER_PREFIX.sub("", model).lower()
-        primary = re.sub(r"_+", "_", f"{stem}_{grain[0]}")
+        base = re.sub(r"_+", "_", f"{stem}_{grain[0]}")
+        taken = dimension_names | (used_names - {primary})
+        primary, suffix = base, 1
+        while primary in taken:
+            suffix += 1
+            primary = f"{base}_{suffix}"
         entities[0]["name"] = primary
         notes.append(
             f"{grain[0]}: the primary entity is named '{primary}' because the "
@@ -1013,13 +1019,16 @@ class MetricFlowDerivation:
 
         derivations: list[Derivation] = []
         claimed: dict[str, str] = {}
-        for declaration in request.declarations:
+        # on_ref plus the parents derived so far, for foreign keys alone: the
+        # collision check keeps reading on_ref, the project as it stands.
+        foreign_ref = {model: list(found) for model, found in on_ref.items()}
+        for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
             derivation = derive(
                 model,
                 declaration.declared,
                 column_types=declaration.column_types,
-                on_ref=on_ref,
+                on_ref=foreign_ref,
             )
             derivations.append(derivation)
             if derivation.body is None or derivation.status == "skipped":
@@ -1054,8 +1063,12 @@ class MetricFlowDerivation:
                 )
             if name and derivation.status != "failed":
                 # Reserve the name only for a derivation that stays in the plan,
-                # so one that is rejected here cannot refuse a later mart.
+                # so one that is rejected here cannot refuse a later mart. Its
+                # entities are the ones a later foreign key joins by name.
                 claimed[name] = derivation.model
+                foreign_ref.setdefault(derivation.model, []).append(
+                    (derivation.path or "", derivation.body)
+                )
 
         ready = [d for d in derivations if d.status == "proposed"]
         derived_edits = _spliced_edits(ready, files, edits)
@@ -1091,6 +1104,34 @@ class MetricFlowDerivation:
             _warnings(derivations),
             parse_result,
         )
+
+
+def _parents_first(declarations: Iterable[Any]) -> list[Any]:
+    """The declarations with each mart a foreign key references ahead of the mart
+    that holds it, otherwise in the order given, so a child finds its parent's
+    entity name whatever order the plan listed them in."""
+
+    pending = list(declarations)
+    by_model: dict[str, list[Any]] = {}
+    for declaration in pending:
+        by_model.setdefault(declaration.model, []).append(declaration)
+    ordered: list[Any] = []
+    seen: set[int] = set()
+
+    def visit(declaration: Any) -> None:
+        if id(declaration) in seen:
+            return
+        seen.add(id(declaration))  # also stops a reference cycle
+        for fields in (declaration.declared.get("columns") or {}).values():
+            ref = fields.get("references") if isinstance(fields, dict) else None
+            if isinstance(ref, str) and "." in ref:
+                for parent in by_model.get(ref.rsplit(".", 1)[0], []):
+                    visit(parent)
+        ordered.append(declaration)
+
+    for declaration in pending:
+        visit(declaration)
+    return ordered
 
 
 def _definition(derivation: Derivation) -> Any:

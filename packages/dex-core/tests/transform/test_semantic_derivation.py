@@ -1213,3 +1213,92 @@ def test_dbt_parses_a_mart_whose_grain_is_a_single_time_column(
     model = envelope["data"]["semantic_proposal"]["models"]["fct_world_output_daily"]
     assert model["status"] == "included", model
     assert model["validation"]["parse"]["result"] == "passed", model
+
+
+def test_a_time_grain_entity_never_takes_a_name_a_dimension_already_has():
+    """`fct_daily` + `output_day` would name the entity `daily_output_day`, which a
+    categorical dimension already holds, so the entity takes a numbered name."""
+    declared = {
+        "grain": ["output_day"],
+        "columns": {
+            "output_day": {"role": "time"},
+            "daily_output_day": {"role": "dimension"},
+        },
+    }
+
+    found = sd.derive(
+        "fct_daily",
+        declared,
+        column_types={"output_day": ("date", None)},
+        on_ref={},
+    )
+
+    assert found.body["entities"] == [
+        {"name": "daily_output_day_2", "type": "primary", "expr": "output_day"}
+    ]
+    assert {d["name"] for d in found.body["dimensions"]} == {
+        "output_day",
+        "daily_output_day",
+    }
+
+
+def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    child = {
+        "description": "One row per hourly reading.",
+        "grain": ["reading_id"],
+        "columns": {
+            "reading_id": {"role": "key"},
+            "read_at": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_world_output_daily.output_day",
+            },
+            "reading_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_world_output_daily.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as output_day, "
+                    "1.0 as output_total\n"
+                ),
+            },
+            {
+                "path": "models/marts/fct_readings.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as reading_id, cast('2024-01-01' as date) as read_at, "
+                    "cast('2024-01-01' as date) as output_day_id, "
+                    "1.0 as reading_total\n"
+                ),
+            },
+        ],
+        "declarations": [
+            DAILY_MART,
+            {**child, "model": "fct_readings"},
+        ],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "readings",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert models["fct_world_output_daily"]["status"] in ("proposed", "unvalidated")
+    content = models["fct_readings"]["content"]
+    assert "name: world_output_daily_output_day" in content
+    assert "name: output_day\n" not in content
