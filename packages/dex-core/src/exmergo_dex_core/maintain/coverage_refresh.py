@@ -464,7 +464,12 @@ def refresh(
     for key in ("refused", "not_run", "skipped", "refreshed"):
         block[f"{key}_count"] = len(block[key])
         block[key] = _named(block[key])
-    cost = Cost(paradigm=paradigm, estimate=estimate, ceiling=batch.ceiling)
+    cost = Cost(
+        paradigm=paradigm,
+        estimate=estimate,
+        ceiling=batch.ceiling,
+        handshake=("not_applicable" if paradigm is Paradigm.FREE_LOCAL else None),
+    )
     engine._last_spend = batch.spend
     return block, warnings, batch.spend, cost
 
