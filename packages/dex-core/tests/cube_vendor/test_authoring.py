@@ -548,6 +548,84 @@ def test_a_file_changed_after_planning_refuses_the_whole_plan(tmp_path, capsys):
     assert "semantic cube plan" in json.dumps(applied)
 
 
+def _edit(layer: CubeSemanticLayer, name: str, content: str) -> PlanEdit:
+    current = layer.semantic_edit_view().files.get(name)
+    return PlanEdit(
+        path=name,
+        kind=EditKind.SEMANTIC_DOCUMENT,
+        old_content_hash=current.sha256 if current is not None else None,
+        new_content=content,
+    )
+
+
+def test_apply_holds_a_written_file_to_the_strict_rules(tmp_path):
+    """A plan document applied elsewhere never ran planning's checks (#1270)."""
+
+    root = layered(tmp_path)
+    layer = CubeSemanticLayer(root, [ORDERS_FILE, CUSTOMERS_FILE])
+    before = read(root, ORDERS_FILE)
+    edit = _edit(layer, ORDERS_FILE, dump(dict(ORDERS, owner="data team")))
+    from exmergo_dex_core.errors import ProjectError
+
+    with pytest.raises(ProjectError, match=r"\[unknown_key\]") as refused:
+        layer.write_semantic_edits([edit])
+    assert "nothing was written" in str(refused.value)
+    assert "dex ignores it" not in str(refused.value)
+    assert read(root, ORDERS_FILE) == before
+
+
+def test_apply_lets_an_unknown_key_in_an_unwritten_file_through(tmp_path):
+    """Only the files apply writes are held to the strict rules, as at planning."""
+
+    root = repo(
+        tmp_path,
+        [ORDERS_FILE, CUSTOMERS_FILE],
+        **{
+            ORDERS_FILE: dump(ORDERS),
+            CUSTOMERS_FILE: dump(dict(CUSTOMERS, owner="data team")),
+        },
+    )
+    layer = CubeSemanticLayer(root, [ORDERS_FILE, CUSTOMERS_FILE])
+    content = dump(dict(ORDERS, title="Orders, revised"))
+
+    result = layer.write_semantic_edits([_edit(layer, ORDERS_FILE, content)])
+
+    assert result.written == [ORDERS_FILE]
+    assert read(root, ORDERS_FILE) == content
+
+
+def test_apply_keeps_the_file_mode(tmp_path):
+    root = layered(tmp_path)
+    target = root / ORDERS_FILE
+    target.chmod(0o644)
+    layer = CubeSemanticLayer(root, [ORDERS_FILE, CUSTOMERS_FILE])
+
+    result = layer.write_semantic_edits(
+        [_edit(layer, ORDERS_FILE, dump(dict(ORDERS, title="Orders, revised")))]
+    )
+
+    assert result.written == [ORDERS_FILE]
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_apply_gives_a_new_file_the_umask_mode(tmp_path):
+    import os
+
+    root = layered(tmp_path, VIEWS_FILE)
+    layer = CubeSemanticLayer(root, [ORDERS_FILE, CUSTOMERS_FILE, VIEWS_FILE])
+    a_view = view("sales", {"join_path": "orders", "includes": ["status"]})
+    previous = os.umask(0o022)
+    try:
+        result = layer.write_semantic_edits(
+            [_edit(layer, VIEWS_FILE, dump(views=(a_view,)))]
+        )
+    finally:
+        os.umask(previous)
+
+    assert result.written == [VIEWS_FILE]
+    assert (root / VIEWS_FILE).stat().st_mode & 0o777 == 0o644
+
+
 def test_authoring_opens_no_connection_and_no_cube_server(
     tmp_path, capsys, no_warehouse
 ):
