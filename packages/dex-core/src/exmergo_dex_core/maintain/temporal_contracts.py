@@ -110,10 +110,9 @@ class Written:
 def snapshot_nodes(nodes: dict[str, Any], project_dir: Path) -> dict[str, SnapshotNode]:
     """Every snapshot the manifest holds, by lowered name, with its last status."""
 
-    from .verify import _run_results
+    from .verify import node_results
 
-    results = _run_results(project_dir) or []
-    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    status = node_results(project_dir).statuses()
     out: dict[str, SnapshotNode] = {}
     for uid, node in nodes.items():
         if (

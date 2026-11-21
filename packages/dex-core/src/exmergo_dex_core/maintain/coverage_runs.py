@@ -28,23 +28,16 @@ its id and status is read: no message, no compiled SQL, no failing rows.
 
 from __future__ import annotations
 
-import json
-import os
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..transform.artifact_runtime import isolated_artifact_dir, shared_target_dir
+from ..transform.artifact_runtime import BuildingRun, building_runs, run_is_logged
 
 #: The statuses a test result is reported with, in the order counts print them.
 STATUSES: tuple[str, ...] = ("pass", "fail", "warn", "error", "skipped", "not_run")
-
-#: dbt commands that execute tests. Anything else that writes run_results.json
-#: (a compile, which Dex runs to price a build) says nothing about a test.
-_BUILDING_COMMANDS = frozenset({"build", "run", "seed", "snapshot", "test"})
 
 #: dbt's own statuses, normalized to the ones above. ``runtime error`` is the
 #: spelling older releases wrote for an error.
@@ -56,11 +49,6 @@ _STATUS_MAP = {
     "runtime error": "error",
     "skipped": "skipped",
 }
-
-#: The header line dbt's text log writes at the start of each invocation:
-#: ``============================== 10:00:00.000 | <uuid> ===...``.
-_TEXT_HEADER = re.compile(r"=+ .*\| ([0-9a-f-]{36}) =+")
-_JSON_INVOCATION = re.compile(r'"invocation_id"\s*:\s*"([0-9a-f-]{36})"')
 
 
 @dataclass
@@ -85,88 +73,6 @@ def counts(statuses_for_resource: Iterable[str]) -> dict[str, int]:
         if status in tally:
             tally[status] += 1
     return tally
-
-
-@dataclass
-class _Candidate:
-    document: dict[str, Any]
-    generated_at: str
-    mtime: float
-    directory: Path
-    artifact: str
-    cold: bool
-
-
-def _candidates(project_dir: Path) -> list[_Candidate]:
-    roots: list[tuple[Path, str]] = [(shared_target_dir(project_dir), "project")]
-    isolated = isolated_artifact_dir(project_dir)
-    if isolated is not None:
-        roots.append((isolated, "dex"))
-    found: list[_Candidate] = []
-    for root, artifact in roots:
-        for directory, cold in ((root, False), (root / "cold", True)):
-            path = directory / "run_results.json"
-            try:
-                mtime = path.stat().st_mtime
-                document = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if not isinstance(document, dict):
-                continue
-            which = str((document.get("args") or {}).get("which") or "build")
-            if which not in _BUILDING_COMMANDS:
-                continue
-            meta = document.get("metadata") or {}
-            found.append(
-                _Candidate(
-                    document=document,
-                    generated_at=str(meta.get("generated_at") or ""),
-                    mtime=mtime,
-                    directory=directory,
-                    artifact=artifact,
-                    cold=cold,
-                )
-            )
-    return found
-
-
-def _log_files(project_dir: Path, directory: Path) -> list[Path]:
-    """The dbt logs that could record the invocation that wrote ``directory``.
-
-    A build Dex runs in the project writes the project's log (``logs/`` under
-    the project, or ``DBT_LOG_PATH``); one it runs detached, in a copy, writes
-    ``logs/`` beside its artifacts.
-    """
-
-    paths = [directory / "logs" / "dbt.log"]
-    configured = os.environ.get("DBT_LOG_PATH")
-    if configured:
-        base = Path(configured).expanduser()
-        paths.append((base if base.is_absolute() else project_dir / base) / "dbt.log")
-    paths.append(project_dir / "logs" / "dbt.log")
-    # dbt rotates its log, so an older invocation can sit in dbt.log.1 and on.
-    found: list[Path] = []
-    for path in paths:
-        if path.is_file():
-            found.append(path)
-        found.extend(sorted(path.parent.glob("dbt.log.*")))
-    return list(dict.fromkeys(found))
-
-
-def _logged_invocations(path: Path) -> set[str]:
-    found: set[str] = set()
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if "invocation_id" in line:
-                    found.update(_JSON_INVOCATION.findall(line))
-                elif line.startswith("="):
-                    match = _TEXT_HEADER.search(line)
-                    if match:
-                        found.add(match.group(1))
-    except OSError:
-        return set()
-    return found
 
 
 def _parse_time(stamp: str) -> datetime | None:
@@ -205,7 +111,7 @@ def last_run(
     """The newest building run's status for each test ``manifest`` still has."""
 
     project_dir = Path(project_dir).absolute()
-    found = _candidates(project_dir)
+    found = building_runs(project_dir)
     if not found:
         return LastRun(
             notes=[
@@ -214,14 +120,12 @@ def last_run(
                 "test is not_run: nothing records that it ever ran"
             ]
         )
-    # ISO timestamps sort as text; a run with none sorts first, then by mtime.
-    newest = max(found, key=lambda run: (run.generated_at, run.mtime))
-    meta = newest.document.get("metadata") or {}
-    invocation = str(meta["invocation_id"]) if meta.get("invocation_id") else None
+    newest: BuildingRun = found[-1]
+    invocation = newest.invocation_id
     run: dict[str, Any] = {
         "invocation_id": invocation,
         "generated_at": newest.generated_at or None,
-        "command": str((newest.document.get("args") or {}).get("which") or "build"),
+        "command": newest.command,
         "artifact": newest.artifact,
         "cold": newest.cold,
     }
@@ -241,20 +145,16 @@ def last_run(
     if newest.cold:
         where += " (a --cold-deps build)"
 
-    logs = _log_files(project_dir, newest.directory)
-    if invocation and logs:
-        logged: set[str] = set()
-        for path in logs:
-            logged |= _logged_invocations(path)
-        if invocation not in logged:
-            result.warnings.append(
-                f"the run_results.json in {where} names invocation {invocation}, "
-                "which no dbt log beside it records, so it was written somewhere "
-                "else (copied artifacts, another checkout) and no test status is "
-                "taken from it: every test is reported not_run"
-            )
-            return result
-    elif invocation and not logs:
+    logged = run_is_logged(project_dir, newest)
+    if logged is False:
+        result.warnings.append(
+            f"the run_results.json in {where} names invocation {invocation}, "
+            "which no dbt log beside it records, so it was written somewhere "
+            "else (copied artifacts, another checkout) and no test status is "
+            "taken from it: every test is reported not_run"
+        )
+        return result
+    if logged is None and invocation:
         result.notes.append(
             "no dbt log was found to confirm the invocation that wrote "
             "run_results.json; its statuses are attributed as read"
