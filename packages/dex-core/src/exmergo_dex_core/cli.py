@@ -1300,6 +1300,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="store_false",
                         help="name row-affecting changes without measuring them",
                     )
+                    sp.add_argument(
+                        "--no-parse",
+                        action="store_true",
+                        default=False,
+                        help="store the plan without running dbt: no parse, no compile",
+                    )
                 if group == "transform" and name == "build":
                     sp.add_argument(
                         "--target",

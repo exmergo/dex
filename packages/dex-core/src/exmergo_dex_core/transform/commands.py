@@ -286,6 +286,7 @@ def plan(
     scaffold: list[str] | None = None,
     attribute_rows: bool | None = None,
     toggle: Any = None,
+    no_parse: bool = False,
 ) -> PlanResult:
     """Turn authored edits into a stored plan of reviewable diffs.
 
@@ -308,9 +309,21 @@ def plan(
 
     ``toggle`` is the payload's raw ``toggle`` contract (#1113): a flag that stays
     live, held on both of its values by :mod:`.toggle` once the plan is stored.
+
+    ``no_parse`` stores the plan without starting dbt (#1517): the parse gate,
+    the derivation's parse and compilation are not run, and the caller parses
+    the post-change project elsewhere. Every structural gate still runs. A
+    model with Jinja control flow is refused, since nothing but dbt's compile
+    can check it, and so is a ``toggle``, whose check compiles every model.
     """
 
     edits = list(edits or [])
+    if no_parse and toggle is not None:
+        raise ValueError(
+            "a toggle contract cannot be checked without running dbt: its check "
+            "compiles every model at both values. Plan it without --no-parse, "
+            "where dbt may run"
+        )
     if scaffold:
         from ..dbt_project import DbtProjectError
         from . import scaffold as scaffold_mod
@@ -442,13 +455,18 @@ def plan(
         # this plan's own `packages_yml` edit declares is checked too (#1166),
         # and ahead of the derivation, whose own parse would otherwise fail on
         # it first (twice) before the gate below said so.
+        # A no-parse plan runs neither the parse nor the compile this protects,
+        # so a missing package is the parsing side's to report (as on semantic
+        # `--no-parse`, #1206).
         if (
-            has_delete or parser_owned or version_report is not None
-        ) and _unparseable_reason(view, edits) is None:
+            not no_parse
+            and (has_delete or parser_owned or version_report is not None)
+            and _unparseable_reason(view, edits) is None
+        ):
             assert_plan_packages_installed(project, edits)
         # After the guards above, because a derivation is checked by dbt's
         # parse of a copy of the project with these edits in it.
-        derived = _derive_semantic(engine, view, edits)
+        derived = _derive_semantic(engine, view, edits, parse=not no_parse)
         edits = derived.edits
         semantic_proposal = derived.proposal
         derivation_notes = derived.warnings
@@ -463,6 +481,8 @@ def plan(
             ):
                 # The derivation's own parse covered exactly these edits.
                 parse_result = derived.parse
+            elif no_parse:
+                parse_result = {"available": False, "reason": NO_PARSE_REASON}
             elif blocker := _unparseable_reason(view, edits):
                 parse_result = {"available": False, "reason": blocker}
             else:
@@ -487,7 +507,7 @@ def plan(
                     _confirm_versions(version_report, parse_result, view.project_name)
                 )
 
-    result = _make_plan(engine, intent, edits)
+    result = _make_plan(engine, intent, edits, no_parse=no_parse)
     result.warnings.extend(unchanged_notes)
     result.warnings.extend(scaffold_notes)
     result.warnings.extend(declaration_notes)
@@ -1769,6 +1789,7 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             scaffold=getattr(args, "scaffold", None),
             attribute_rows=getattr(args, "attribute_rows", None),
             toggle=toggle,
+            no_parse=bool(getattr(args, "no_parse", False)),
         )
         hints = plan_hint(result) if result.plan_id else None
         return to_envelope(result, hints=hints)
@@ -8215,7 +8236,9 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
     return f"{prefix}: {messages[0]}" if messages else prefix
 
 
-def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
+def _make_plan(
+    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+) -> PlanResult:
     from ..adapters import get_dialect
     from ..adapters.project import PlacingProject, placement_gap
 
@@ -8242,7 +8265,10 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
     compiled_models = {}
     compilation = None
     compile_required = False
-    if _has_dbt_project(engine):
+    uncompiled_notes: list[str] = []
+    if _has_dbt_project(engine) and no_parse:
+        uncompiled_notes = _refuse_uncompiled(edits)
+    elif _has_dbt_project(engine):
         from .validate import needs_compilation
 
         compile_required = any(
@@ -8325,10 +8351,47 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
         diffs=diffs,
         warnings=[*warnings, gap] if gap else warnings,
     )
+    result.warnings.extend(uncompiled_notes)
     if compilation is not None:
         result.warnings.extend(compilation.warnings)
         compilation.settle(result)
     return result
+
+
+NO_PARSE_REASON = (
+    "dbt parse not run: the plan was stored with no_parse, so the post-change "
+    "project is the caller's to parse"
+)
+
+
+def _refuse_uncompiled(edits: list[PlanEdit]) -> list[str]:
+    """What a no-parse plan cannot check without compiling (#1517).
+
+    Control flow cannot be reduced to SQL by deleting its delimiters, so a model
+    carrying it is refused with the error a missing compile always raises. A
+    model that only lists columns through a macro reduces to SQL as it does
+    where dbt is absent: it is checked statically and named in a warning,
+    since its column list was never expanded.
+    """
+
+    from .validate import EditValidationError, has_control_flow, lists_columns
+
+    models = [
+        e for e in edits if e.kind is EditKind.MODEL_SQL and e.new_content is not None
+    ]
+    blocked = [e.path for e in models if has_control_flow(e.new_content or "")]
+    if blocked:
+        raise EditValidationError(
+            f"{', '.join(blocked)}: Jinja control flow requires dbt compilation, "
+            "which a no_parse plan does not run; plan this model where dbt may "
+            "run (without --no-parse)"
+        )
+    return [
+        f"{e.path}: its column-listing macro was not expanded, since a no_parse "
+        "plan does not compile, so its columns were checked from the SQL alone"
+        for e in models
+        if lists_columns(e.new_content or "")
+    ]
 
 
 def _semantic_plan(
@@ -8488,7 +8551,9 @@ def _semantic_plan(
     return result
 
 
-def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any:
+def _derive_semantic(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], *, parse: bool = True
+) -> Any:
     """The semantic definition each declared mart in ``edits`` implies (#499, #927).
 
     Free on every connector: it reads the post-change project and the stored
@@ -8518,6 +8583,7 @@ def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any
             models,
             cache=cache,
             dialect=get_dialect(engine.connector or engine.config.connector),
+            parse=parse,
         )
         outcome.warnings.extend(
             semantic_hook.versioned_marts(

@@ -14,6 +14,31 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.18.3] - 2026-11-21
+
+### Added
+
+- **`transform plan --no-parse` stores a plan without running dbt.** The library
+  form is `DexEngine.plan(..., no_parse=True)`. It is for a host that must not run
+  repository-controlled code where it authors and parses the plan in a sandbox of
+  its own. Unlike `semantic_plan(no_parse=True)`, which still parses a
+  derivation it adds, nothing starts dbt. No parse of the post-change project runs, none of a declared mart's
+  derived semantic model (reported `unvalidated`, left out of the plan and offered
+  for `semantic plan`), and no
+  compile. Every structural check still runs. A model with Jinja control flow is
+  refused, since only dbt's compile can check it, and so is a `toggle` contract. ([#1533](https://github.com/exmergo/dex/pull/1533))
+
+### Fixed
+
+- **`transform test --mutate` names a unit test's overrides when it leaves the
+  test out.** A mutant is compiled once with the project's own vars and macros, so
+  a unit test with `overrides: vars` (or `env_vars`, or a macro other than
+  `is_incremental`) can fail the baseline and still pass in `transform build`. Its
+  entry in `data.baseline.excluded` now names the overridden keys as the reason
+  instead of calling the test already failing, and the refusal when no test passes
+  says which tests set overrides. ([#1396](https://github.com/exmergo/dex/pull/1396))
+
+
 ## [1.18.2] - 2026-11-21
 
 ### Added
