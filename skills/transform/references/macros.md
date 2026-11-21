@@ -133,10 +133,11 @@ The generic test a time column's declared `freshness` renders
 ([declarations](declarations.md#dex_freshness-a-time-columns-freshness)), where
 `declarations.render_tests` turns it on. A declaration plan adds it for you;
 this command scaffolds or diffs it on its own. It takes `max_lag_seconds` and
-fails with one row (holding `1`, the lag in seconds and the limit, never a
-value) when the column's newest value trails the warehouse's clock by more than
-that, or when the column holds no value. Both sides are whole epoch seconds read
-in one statement, a timestamp with no time zone read as UTC, so a value exactly
+fails with one row (holding `1` and the limit) when no row's value sits within
+that many seconds of the warehouse's clock, or when the column holds no value.
+It counts the rows within the limit, so it never computes the newest value or
+the lag, which would disclose it. Each row's lag is whole epoch seconds read in
+one statement, a timestamp with no time zone read as UTC, so a value exactly
 at the limit passes; a column that is no date or timestamp is a compile error.
 The SQL goes through dbt's dispatch, `default__dex_freshness` holds on DuckDB,
 and each other warehouse has its own `<adapter>__dex_freshness_epoch(expression,

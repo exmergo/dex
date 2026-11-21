@@ -469,6 +469,7 @@ def prepare(
     check_grain: bool = False,
     tested_grain: bool = False,
     selection: str | None = None,
+    pii_overrides: Any = None,
 ) -> Prepared:
     """Resolve each model to its relation and write the statements that check it.
 
@@ -568,7 +569,9 @@ def prepare(
         if model.history is not None:
             temporal_mod.write_probe(adapter, probe, live, live_identifiers, prepared)
         if model.freshness:
-            freshness_mod.write_probe(probe, live, adapter.dialect, prepared)
+            freshness_mod.write_probe(
+                probe, live, adapter.dialect, prepared, pii_overrides
+            )
         if probe.statements():
             prepared.probes.append(probe)
     return prepared

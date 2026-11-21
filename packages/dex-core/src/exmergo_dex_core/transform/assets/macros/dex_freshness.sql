@@ -26,10 +26,12 @@
   it. Where the metadata read finds nothing (an ephemeral model), the column is
   read as an instant.
 
-  Counts only. The test returns at most one row, holding 1 and the lag in
-  seconds against the limit, and never a value from the column, so a test
-  materialization that samples failing rows (Elementary's) has nothing to keep.
-  `fail_calc` makes dbt's `failures` 1 for a stale column.
+  Counts only. The test counts the rows within the limit and never computes the
+  column's newest value, so neither it nor the lag (which would disclose that
+  value) is computed or returned, on any column, personal data included. It
+  returns at most one row, holding 1 and the limit, so a stored or sampled
+  failing row (dbt's `store_failures`, Elementary's samples) keeps nothing from
+  the column. `fail_calc` makes dbt's `failures` 1 for a stale column.
 
   One implementation per dialect through dbt's dispatch, with two pieces
   dispatched on their own: `dex_freshness_epoch(expression, kind)` (whole epoch
@@ -79,21 +81,24 @@
     {%- set name = adapter.quote(bare) -%}
     {%- set kind = 'unknown' -%}
 {%- endif -%}
-{%- set newest = adapter.dispatch('dex_freshness_epoch')('max(' ~ name ~ ')', kind) -%}
+{#- The rows within the limit of the clock, each row's lag floored as
+    maintain verify floors the newest one's: the column is fresh exactly where
+    one is, and the newest value itself is never computed. -#}
+{%- set row_epoch = adapter.dispatch('dex_freshness_epoch')(name, kind) -%}
 {%- set now = adapter.dispatch('dex_freshness_now')() -%}
-select dex_violating_rows, dex_lag_seconds, dex_max_lag_seconds
+select dex_violating_rows, dex_max_lag_seconds
 from (
     select
-        case when dex_values = 0 or dex_lag_seconds > {{ limit }} then 1 else 0 end
+        case when dex_values = 0 or dex_fresh_rows = 0 then 1 else 0 end
             as dex_violating_rows,
-        dex_lag_seconds,
         {{ limit }} as dex_max_lag_seconds
     from (
         select
             count({{ name }}) as dex_values,
-            ({{ now }}) - ({{ newest }}) as dex_lag_seconds
+            count(case when ({{ now }}) - ({{ row_epoch }}) <= {{ limit }} then 1 end)
+                as dex_fresh_rows
         from {{ model }}
-    ) as dex_newest
+    ) as dex_window
 ) as dex_freshness
 where dex_violating_rows > 0
 {% endmacro %}

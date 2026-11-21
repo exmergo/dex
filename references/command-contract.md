@@ -1495,9 +1495,12 @@ default, or a filter or operator after it is refused. A key naming a location
   as its one argument and the basis as its `data.generated_tests` `variant`
   (part of the claim, not an argument): it fails with one row when the column's
   newest value trails the warehouse's clock by more than the lag, or when the
-  column holds no value (an empty model, a column NULL on every row), returning
-  `1`, the lag in seconds and the limit, never a value, so dbt's `failures`
-  equals `freshness_exceeded`'s `stale`. Both sides read the warehouse's clock
+  column holds no value (an empty model, a column NULL on every row). It counts
+  the rows within the limit, never computing the newest value or the lag, and
+  returns `1` and the limit, so dbt's `failures` equals `freshness_exceeded`'s
+  `stale`. `maintain verify` reports the lag in seconds, except on a column that
+  looks like personal data, which it judges by the same count with the lag
+  withheld (`lag_withheld`). Both sides read the warehouse's clock
   in one statement, as whole epoch seconds with a timestamp carrying no time
   zone read as UTC, so a value exactly at the limit passes; a column that is no
   date or timestamp errors the test and is `unchecked` (`not_temporal`) in

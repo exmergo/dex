@@ -382,6 +382,54 @@ def test_a_personal_data_column_keeps_its_verdict_and_withholds_its_lag(
     assert record["lag_withheld"] is True
 
 
+def test_a_personal_data_column_is_judged_without_computing_its_newest_value(
+    tmp_path: Path,
+):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    columns = {"date_of_birth": _fresh("1d", "business")}
+    _manifest(tmp_path, {"model.p.fct": _model("fct", columns)})
+    path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(_table("select current_timestamp as date_of_birth"))
+    conn.close()
+    adapter = DuckDBAdapter(path)
+    try:
+        models, _ = facts_mod.plan(tmp_path)
+        live = [meta.identifier for meta in adapter.list_objects()]
+        prepared = facts_mod.prepare(adapter, models, live)
+        [sql] = prepared.statements()
+        result = facts_mod.findings(adapter, prepared)
+    finally:
+        adapter.close()
+    assert "MAX(" not in sql.upper()
+    assert result.findings == []
+    [record] = result.freshness
+    assert (record["status"], record["lag_withheld"]) == ("satisfied", True)
+
+
+def test_a_person_clearing_the_column_shows_its_lag(tmp_path: Path):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    columns = {"date_of_birth": _fresh("1d", "business")}
+    _manifest(tmp_path, {"model.p.fct": _model("fct", columns)})
+    path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(_table("select timestamp '1990-05-01' as date_of_birth"))
+    conn.close()
+    adapter = DuckDBAdapter(path)
+    try:
+        models, _ = facts_mod.plan(tmp_path)
+        live = [meta.identifier for meta in adapter.list_objects()]
+        cleared = {f"{live[0]}.date_of_birth".lower()}
+        prepared = facts_mod.prepare(adapter, models, live, pii_overrides=cleared)
+        result = facts_mod.findings(adapter, prepared, pii_overrides=cleared)
+    finally:
+        adapter.close()
+    [finding] = result.findings
+    assert finding.data["lag_seconds"] > 0
+
+
 def test_an_infinite_newest_value_is_never_read_as_satisfied(tmp_path: Path):
     # A DuckDB that reads EPOCH of -infinity as NULL gives no lag, which is
     # unchecked; one that floors it to a huge number gives a stale column.
@@ -406,7 +454,9 @@ def test_a_lag_the_warehouse_returns_as_null_is_unchecked():
         model="fct", unique_id="model.p.fct", relation="db.s.fct", freshness=(rule,)
     )
     probe = facts_mod._Probe(model=model, identifier="db.s.fct")
-    probe.freshness = freshness_mod.Written("select 1", [(0, rule, "t", "TIMESTAMP")])
+    probe.freshness = freshness_mod.Written(
+        "select 1", [(0, rule, "t", "TIMESTAMP", True)]
+    )
     answer = SimpleNamespace(
         columns=["dex_rows", "dex_fresh_n_0", "dex_fresh_lag_0"], cells=[[3, 3, None]]
     )

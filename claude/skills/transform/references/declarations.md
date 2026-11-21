@@ -715,8 +715,10 @@ agrees with `maintain verify`'s `freshness_exceeded` on every connector:
 - **No rows is not fresh.** An empty model, or a column NULL on every row, fails.
 - **A column that is no date or timestamp errors** rather than passing: no lag
   can be read from text.
-- **Counts only.** The failing row holds `1`, the lag in seconds and the limit,
-  never a value from the column; dbt's `failures` is `1`.
+- **Counts only.** The test counts the rows within the limit and never computes
+  the newest value or the lag, which would disclose it, so a stored failing row
+  (`store_failures`) keeps nothing from the column. The failing row holds `1`
+  and the limit; dbt's `failures` is `1`.
 - **`basis` is in the claim, not the arguments.** The test fails alike on both;
   `maintain verify` reads the basis to say how loud a stale column is.
 
@@ -1195,7 +1197,8 @@ a `status` of `satisfied`, `contradicted` (with `finding: freshness_exceeded`) o
 timestamp, `column_missing`, `lag_unreadable` where the column holds values but
 the warehouse returns no lag for them, `probe_refused`, `scan_offered`). The lag
 is the clock minus the newest value, so on a column that looks like personal
-data the verdict stands and the lag is withheld (`lag_withheld: true`), as a
+data the verdict stands and the lag is withheld (`lag_withheld: true`), and the
+newest value is never computed: the check counts the rows within `max_lag`, as a
 unit's range is, unless a person cleared the column in `pii_overrides`. The check is one
 statement per model, a `MAX` and a `COUNT` per declared column, priced with the
 other declared facts on a metered connector. With `declarations.render_tests` on

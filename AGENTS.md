@@ -700,7 +700,8 @@ an expression. A column declaring `freshness` (the column with role `time`:
 `freshness` covers sources only) renders `dex_freshness` (#1460) under it, tagged
 `dex_every_run`: it fails with one row when the column's newest value trails the
 warehouse's clock by more than `max_lag`, or when the column holds no value,
-returning the lag in seconds and never a value, as `maintain verify`'s
+counting the rows within the limit and never computing the newest value or the
+lag, as `maintain verify`'s
 `freshness_exceeded` judges it; the basis is in the claim and not the test's
 arguments, and a listed one a changed `max_lag` no longer gives is reported
 `stale` (`freshness_changed`). A version of a native dbt versioned model is

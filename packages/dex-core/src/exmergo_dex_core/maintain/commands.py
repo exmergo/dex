@@ -1389,6 +1389,7 @@ def verify(
                     [o.identifier for o in live],
                     check_grain=True,
                     tested_grain=True,
+                    pii_overrides=pii_override_paths(engine.config.pii_overrides),
                 )
                 row_ask, join_ask, facts_ask, _fk_ask = _combined_scan_handshake(
                     adapter,

@@ -1327,6 +1327,7 @@ def _declared_facts(
             [meta.identifier for meta in live],
             check_grain=True,
             selection=effective_selection,
+            pii_overrides=_pii_overrides(engine),
         )
         facts = facts_mod.findings(
             adapter,
