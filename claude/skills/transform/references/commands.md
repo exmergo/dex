@@ -51,6 +51,30 @@ stops declaring is not. A plan never installs anything, so declaring a package
 and using it is two plans: the `packages_yml` edit on its own (it needs no parse,
 so it is stored), applied, then `transform deps`, then the plan that uses it.
 
+`--no-parse` (`DexEngine.plan(..., no_parse=True)`, #1517) stores the plan
+without starting dbt: no parse of the post-change project, none of a declared
+mart's derived semantic model, no compile, and so no package check. It is for a
+host that must not run repository-controlled code where it authors and parses
+the plan in a sandbox of its own. What changes in the envelope:
+
+- a warning, `dbt parse not run: ...`, wherever a parse would have run;
+- `data.model_versions.<model>.manifest` is `unchecked` with `parse_skipped`;
+- a dbt (MetricFlow) derivation is `unvalidated` (parse `not_run`) in
+  `data.semantic_proposal` and stays out of the plan; `mode` is `proposed` and
+  `definitions` carries it, ready for `semantic plan --definitions-file` where
+  dbt may parse;
+- with a native semantic layer (`semantic.vendor` other than `dbt`) the
+  derivation runs no dbt, so `--no-parse` does not change it: its documents are
+  stored as the usual companion plan through the vendor's authoring route;
+- a model with Jinja `for`/`if` is refused, since only dbt's compile can check
+  it; a model that only lists columns through a macro (`dbt_utils.star`) is
+  checked from its SQL, with a warning naming it;
+- a `toggle` contract is refused, since its check compiles every model.
+
+Every structural gate still runs: admission, placement, deletions, the PII and
+secret guards, hash pinning and the diffs. Row attribution and identifier
+conversions are warehouse reads, not dbt, and follow `--attribute-rows` as usual.
+
 Compilation that reads no warehouse data needs no spend confirmation. For
 compile-time queries on billed connectors, the first discovered work is quoted
 through the existing `--confirm --budget` handshake. Its estimate is partial:
