@@ -83,30 +83,38 @@
         ~ "`entity` the declaration's history states"
     ) }}
 {%- endif -%}
-{%- set outs = entity.keys() | list -%}
-{%- set snaps = entity.values() | list -%}
-{%- set time = time_column if time_column else order_column -%}
+{#- Each declared name resolved to its physical spelling and quoted, as
+    maintain verify matches a declared name against the live columns, case
+    folded, and quotes the column it finds. A name the metadata does not hold
+    (no metadata at parse time, an ephemeral model) is written as declared. -#}
+{%- set snapshot_columns = {} -%}
+{%- set model_columns = {} -%}
+{%- if execute -%}
+    {%- for column in adapter.get_columns_in_relation(snapshot) -%}
+        {%- do snapshot_columns.update({column.name | lower: column}) -%}
+    {%- endfor -%}
+    {%- for column in adapter.get_columns_in_relation(model) -%}
+        {%- do model_columns.update({column.name | lower: column}) -%}
+    {%- endfor -%}
+{%- endif -%}
+{%- set outs = [] -%}
+{%- for column in entity.keys() -%}{%- do outs.append(dex_temporal_contract_resolved(column, model_columns)) -%}{%- endfor -%}
+{%- set snaps = [] -%}
+{%- for column in entity.values() -%}{%- do snaps.append(dex_temporal_contract_resolved(column, snapshot_columns)) -%}{%- endfor -%}
+{%- set status_found = snapshot_columns.get(status_column | replace('"', '') | replace('`', '') | lower) -%}
+{%- set measure_found = model_columns.get(measure_column | replace('"', '') | replace('`', '') | lower) -%}
+{%- set status_name = dex_temporal_contract_resolved(status_column, snapshot_columns) -%}
+{%- set order_name = dex_temporal_contract_resolved(order_column, snapshot_columns) -%}
+{%- set time = dex_temporal_contract_resolved(time_column if time_column else order_column, snapshot_columns) -%}
+{%- set measure_name = dex_temporal_contract_resolved(measure_column, model_columns) -%}
 {%- set timed = measure != 'transition_count' -%}
 {%- set business = provenance == 'business' -%}
 
 {#- The status compared as text where the target is text or the column is a
     text column, and as written otherwise, as maintain verify compares it. -#}
-{%- set string_column = namespace(on=false, known=false) -%}
-{%- set measure_is_date = namespace(on=false) -%}
-{%- if execute -%}
-    {%- for column in adapter.get_columns_in_relation(snapshot) -%}
-        {%- if column.name | lower == status_column | replace('"', '') | replace('`', '') | lower -%}
-            {%- set string_column.known = true -%}
-            {%- set string_column.on = column.is_string() -%}
-        {%- endif -%}
-    {%- endfor -%}
-    {%- for column in adapter.get_columns_in_relation(model) -%}
-        {%- if column.name | lower == measure_column | replace('"', '') | replace('`', '') | lower -%}
-            {%- set measure_is_date.on = (column.dtype | lower) == 'date' -%}
-        {%- endif -%}
-    {%- endfor -%}
-{%- endif -%}
-{%- set as_text = target is string or string_column.on -%}
+{%- set string_column = status_found is not none and status_found.is_string() -%}
+{%- set measure_is_date = measure_found is not none and (measure_found.dtype | lower) == 'date' -%}
+{%- set as_text = target is string or string_column -%}
 {%- if as_text -%}
     {%- if target is boolean -%}
         {%- set literal = adapter.dispatch('dex_temporal_contract_literal')('true' if target else 'false') -%}
@@ -118,12 +126,12 @@
 {%- else -%}
     {%- set literal = target | string -%}
 {%- endif -%}
-{%- set subject = status_column -%}
-{%- if as_text and string_column.known and not string_column.on -%}
-    {%- set subject = adapter.dispatch('dex_temporal_contract_text')(status_column) -%}
+{%- set subject = status_name -%}
+{%- if as_text and status_found is not none and not string_column -%}
+    {%- set subject = adapter.dispatch('dex_temporal_contract_text')(status_name) -%}
 {%- endif -%}
 {%- set timestamp = adapter.dispatch('dex_temporal_contract_timestamp')() -%}
-{%- set measure_type = 'date' if measure_is_date.on else timestamp -%}
+{%- set measure_type = 'date' if measure_is_date else timestamp -%}
 
 {%- set keys = [] -%}
 {%- for column in snaps -%}{%- do keys.append('dex_k' ~ loop.index0) -%}{%- endfor -%}
@@ -132,7 +140,7 @@
 {%- for column in snaps -%}{%- do snap_not_null.append(column ~ ' is not null') -%}{%- endfor -%}
 {%- set keep = snap_not_null | join(' and ') -%}
 {%- if null_status != 'state' -%}
-    {%- set keep = keep ~ ' and ' ~ status_column ~ ' is not null' -%}
+    {%- set keep = keep ~ ' and ' ~ status_name ~ ' is not null' -%}
 {%- endif -%}
 {%- set out_not_null = [] -%}
 {%- for column in outs -%}{%- do out_not_null.append(column ~ ' is not null') -%}{%- endfor -%}
@@ -149,8 +157,8 @@ with dex_versions as (
     {%- for column in snaps %}
         {{ column }} as dex_k{{ loop.index0 }},
     {%- endfor %}
-        {{ status_column }} as dex_s,
-        {{ order_column }} as dex_o,
+        {{ status_name }} as dex_s,
+        {{ order_name }} as dex_o,
         {{ time }} as dex_t,
         case when {{ subject }} = {{ literal }} then 1 else 0 end as dex_target
     from {{ snapshot }}
@@ -229,9 +237,9 @@ dex_out as (
         {{ column }} as dex_k{{ loop.index0 }},
     {%- endfor %}
         {%- if timed %}
-        cast({{ measure_column }} as {{ measure_type }}) as dex_m,
+        cast({{ measure_name }} as {{ measure_type }}) as dex_m,
         {%- else %}
-        {{ measure_column }} as dex_m,
+        {{ measure_name }} as dex_m,
         {%- endif %}
         1 as dex_hit
     from {{ model }}
@@ -254,6 +262,13 @@ from (
 ) as dex_violations
 where dex_mismatched_entities > 0
 {% endmacro %}
+
+{#- ``name`` as the column ``columns`` (folded name -> column) holds,
+    quoted, or as written where it holds none. -#}
+{% macro dex_temporal_contract_resolved(name, columns) -%}
+    {%- set found = columns.get(name | replace('"', '') | replace('`', '') | lower) -%}
+    {{- adapter.quote(found.name) if found is not none else name -}}
+{%- endmacro %}
 
 {% macro default__dex_temporal_contract_text(column_name) %}cast({{ column_name }} as {{ dbt.type_string() }}){% endmacro %}
 

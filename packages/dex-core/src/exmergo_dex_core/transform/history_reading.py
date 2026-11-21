@@ -154,42 +154,71 @@ def _lineage(
 # --- snapshot config --------------------------------------------------------------
 
 
+#: A config value no static read settles (a Jinja expression), per key.
+_UNREAD = object()
+
+
 def snapshot_config(files: Mapping[str, str], view: Any, name: str) -> dict[str, Any]:
-    """The keys of :data:`_KEYS` the snapshot ``name`` sets, read the way dbt
-    layers them: its own ``config()`` call (or YAML entry's ``config``) over
-    ``dbt_project.yml``'s ``snapshots:`` tree. ``_unread`` names a key set to
-    something no static read can settle (a Jinja expression)."""
+    """The keys of :data:`_KEYS` the snapshot ``name`` sets, layered as dbt
+    layers them, per key: ``dbt_project.yml``'s ``snapshots:`` tree, then the
+    snapshot's YAML properties entry, then each ``config()`` call in its SQL
+    block, in order, the later winning. ``_unread`` names a key whose effective
+    value is something no static read can settle (a Jinja expression); a
+    literal at a later layer settles it."""
 
     roots = [PurePosixPath(p) for p in view.snapshot_paths]
     block = re.compile(
         rf"{{%-?\s*snapshot\s+{re.escape(name)}\s*-?%}}(?P<body>.*?){{%-?\s*endsnapshot",
         re.DOTALL,
     )
-    where: PurePosixPath | None = None
-    own: dict[str, Any] = {}
+    sql_path: PurePosixPath | None = None
+    yaml_path: PurePosixPath | None = None
+    inline: list[dict[str, Any]] = []
+    properties: dict[str, Any] = {}
     for path in sorted(files):
         candidate = PurePosixPath(path)
         if candidate.suffix == ".sql" and any(r in candidate.parents for r in roots):
-            found = block.search(files[path])
+            found = block.search(files[path]) if sql_path is None else None
             if found is not None:
-                where, own = candidate, _config_call(found.group("body"))
-                break
+                sql_path, inline = candidate, _config_calls(found.group("body"))
         elif candidate.suffix in (".yml", ".yaml") and "snapshots" in files[path]:
-            entry = _yaml_entry(files[path], name)
+            entry = _yaml_entry(files[path], name) if yaml_path is None else None
             if entry is not None:
+                yaml_path = candidate
                 config = entry.get("config")
-                where = candidate
-                own = {
-                    key: config[key]
+                properties = {
+                    key: _settled(config[key])
                     for key in _KEYS
                     if isinstance(config, Mapping) and key in config
                 }
-                break
-    merged = _project_config(files, view, where)
-    merged.update(own)
-    if merged.get("invalidate_hard_deletes") is True and "hard_deletes" not in merged:
-        merged["hard_deletes"] = "invalidate"
-    return merged
+    layers = [
+        _project_config(files, view, sql_path or yaml_path, sql=sql_path is not None),
+        properties,
+        *inline,
+    ]
+    merged: dict[str, Any] = {}
+    for layer in layers:
+        merged.update(layer)
+    out = {key: value for key, value in merged.items() if value is not _UNREAD}
+    unread = [key for key in _KEYS if merged.get(key) is _UNREAD]
+    if unread:
+        out["_unread"] = unread[0]
+    if out.get("invalidate_hard_deletes") is True and "hard_deletes" not in merged:
+        out["hard_deletes"] = "invalidate"
+    return out
+
+
+def _settled(value: Any) -> Any:
+    """``value``, or :data:`_UNREAD` where it holds a Jinja expression (a
+    string, or any string inside a mapping or list)."""
+
+    if isinstance(value, str):
+        return _UNREAD if ("{{" in value or "{%" in value) else value
+    if isinstance(value, Mapping):
+        return _UNREAD if any(_settled(v) is _UNREAD for v in value.values()) else value
+    if isinstance(value, list):
+        return _UNREAD if any(_settled(v) is _UNREAD for v in value) else value
+    return value
 
 
 def _yaml_entry(content: str, name: str) -> Mapping[str, Any] | None:
@@ -204,46 +233,45 @@ def _yaml_entry(content: str, name: str) -> Mapping[str, Any] | None:
     return None
 
 
-def _config_call(body: str) -> dict[str, Any]:
-    """The :data:`_KEYS` a snapshot block's ``config()`` call sets."""
+def _config_calls(body: str) -> list[dict[str, Any]]:
+    """The :data:`_KEYS` each ``config()`` call in a snapshot block sets, in
+    the order written (a later call wins a key, as dbt merges them). A key set
+    to an expression maps to :data:`_UNREAD`; a call whose arguments do not
+    parse leaves every key it names unread."""
 
-    found = _CONFIG.search(body)
-    if found is None:
-        return {}
-    depth, end = 1, None
-    for offset in range(found.end(), len(body)):
-        if body[offset] == "(":
-            depth += 1
-        elif body[offset] == ")":
-            depth -= 1
-            if depth == 0:
-                end = offset
-                break
-    if end is None:
-        return _unread_if_named(body[found.end() :])
-    arguments = body[found.end() : end]
-    try:
-        call = ast.parse(f"f({arguments})", mode="eval").body
-    except SyntaxError:
-        return _unread_if_named(arguments)
-    out: dict[str, Any] = {}
-    if not isinstance(call, ast.Call):  # pragma: no cover - f(...) parses as a call
-        return out
-    for keyword in call.keywords:
-        if keyword.arg not in _KEYS:
-            continue
+    out: list[dict[str, Any]] = []
+    for found in _CONFIG.finditer(body):
+        depth, end = 1, None
+        for offset in range(found.end(), len(body)):
+            if body[offset] == "(":
+                depth += 1
+            elif body[offset] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = offset
+                    break
+        arguments = body[found.end() : end] if end is not None else body[found.end() :]
         try:
-            out[keyword.arg] = _literal(keyword.value)
-        except ValueError:
-            out.setdefault("_unread", keyword.arg)
+            call = ast.parse(f"f({arguments})", mode="eval").body
+        except SyntaxError:
+            out.append(_unread_if_named(arguments))
+            continue
+        layer: dict[str, Any] = {}
+        for keyword in getattr(call, "keywords", []):
+            if keyword.arg is None:
+                # `**something`: any key may come from it.
+                layer.update(dict.fromkeys(_KEYS, _UNREAD))
+            elif keyword.arg in _KEYS:
+                try:
+                    layer[keyword.arg] = _settled(_literal(keyword.value))
+                except ValueError:
+                    layer[keyword.arg] = _UNREAD
+        out.append(layer)
     return out
 
 
 def _unread_if_named(text: str) -> dict[str, Any]:
-    for key in _KEYS:
-        if re.search(rf"\b{key}\b", text):
-            return {"_unread": key}
-    return {}
+    return {key: _UNREAD for key in _KEYS if re.search(rf"\b{key}\b", text)}
 
 
 def _literal(node: ast.AST) -> Any:
@@ -263,11 +291,17 @@ def _literal(node: ast.AST) -> Any:
 
 
 def _project_config(
-    files: Mapping[str, str], view: Any, where: PurePosixPath | None
+    files: Mapping[str, str],
+    view: Any,
+    where: PurePosixPath | None,
+    *,
+    sql: bool,
 ) -> dict[str, Any]:
     """What ``dbt_project.yml``'s ``snapshots:`` tree sets for a snapshot
-    defined at ``where``: each level of the project, then each folder, the
-    deeper one winning, as dbt resolves it."""
+    defined at ``where``, walked along its fqn as dbt resolves it, the deeper
+    level winning: the project, each folder, and, for a SQL snapshot, the
+    file's stem (dbt puts it in the fqn; a YAML-defined snapshot's fqn has no
+    file level)."""
 
     try:
         parsed = yaml.safe_load(files.get("dbt_project.yml") or "")
@@ -280,13 +314,9 @@ def _project_config(
 
     def take(level: Mapping[str, Any]) -> None:
         for key in _KEYS:
-            for spelled in (f"+{key}", key):
+            for spelled in (key, f"+{key}"):
                 if spelled in level:
-                    value = level[spelled]
-                    if isinstance(value, str) and "{{" in value:
-                        out["_unread"] = key
-                    else:
-                        out[key] = value
+                    out[key] = _settled(level[spelled])
 
     take(tree)
     level = tree.get(view.project_name)
@@ -301,6 +331,8 @@ def _project_config(
         if root_path in where.parents:
             parts = list(where.relative_to(root_path).parent.parts)
             break
+    if sql:
+        parts.append(where.stem)
     for part in parts:
         level = level.get(part)
         if not isinstance(level, Mapping):

@@ -114,6 +114,12 @@ class GeneratedTestKind:
     #: :class:`HistoryReading`, or ``None`` where the caller read nothing,
     #: which gives no instance at all.
     reads_history: bool = False
+    #: Whether each test carries a dbt ``name`` built from its claim,
+    #: ``<kind>_<claim>`` (#1458), rather than the name dbt builds from its
+    #: arguments: two claims whose arguments stringify alike (a target of ``1``
+    #: and of ``"1"``) would otherwise share a name, which dbt refuses, and a
+    #: value from the data would sit in the node name.
+    named_by_claim: bool = False
 
 
 @dataclass(frozen=True)
@@ -770,5 +776,6 @@ register(
         macro=TEMPORAL_CONTRACT,
         dialects=ALL_CONNECTORS,
         reads_history=True,
+        named_by_claim=True,
     )
 )

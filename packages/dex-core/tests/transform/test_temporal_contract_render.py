@@ -924,3 +924,92 @@ def test_a_withheld_measure_already_listed_is_not_stale():
     reading = gt.HistoryReading(lineage="not_ancestor")
     _text, rows, _notes = _rerender(before, _history(), reading)
     assert {r["status"] for r in rows} == {"listed_while_off"}
+
+
+def _config(tmp_path: Path, files: dict[str, str]) -> dict:
+    view = _view(tmp_path, files)
+    contents = {p: f.content for p, f in view.files.items()}
+    return snapshot_config(contents, view, SNAPSHOT)
+
+
+def _properties(config: dict) -> dict[str, str]:
+    return {
+        "snapshots/schema.yml": yaml.safe_dump(
+            {"version": 2, "snapshots": [{"name": SNAPSHOT, "config": config}]}
+        )
+    }
+
+
+def test_a_sql_snapshot_s_yaml_properties_are_read_under_its_config_call(tmp_path):
+    files = {**_snap(), **_properties({"hard_deletes": "new_record"})}
+    assert _config(tmp_path, files)["hard_deletes"] == "new_record"
+    # The SQL block's own config() is the later layer, and wins.
+    files = {
+        **_snap(", hard_deletes='invalidate'"),
+        **_properties({"hard_deletes": "new_record"}),
+    }
+    assert _config(tmp_path, files)["hard_deletes"] == "invalidate"
+
+
+def test_a_templated_yaml_value_is_unread(tmp_path):
+    files = {**_snap(), **_properties({"hard_deletes": "{{ var('mode') }}"})}
+    assert _config(tmp_path, files)["_unread"] == "hard_deletes"
+    renamed = {"snapshot_meta_column_names": {"dbt_valid_from": "{{ var('c') }}"}}
+    files = {**_snap(), **_properties(renamed)}
+    assert _config(tmp_path, files)["_unread"] == "snapshot_meta_column_names"
+
+
+def test_a_literal_at_a_later_layer_settles_an_unread_one(tmp_path):
+    files = {
+        **_snap(", hard_deletes='invalidate'"),
+        "dbt_project.yml": (
+            "name: p\nprofile: p\nsnapshots:\n  p:\n"
+            "    +hard_deletes: \"{{ var('mode') }}\"\n"
+        ),
+    }
+    config = _config(tmp_path, files)
+    assert config["hard_deletes"] == "invalidate"
+    assert "_unread" not in config
+
+
+def test_every_config_call_in_the_block_is_read_the_later_winning(tmp_path):
+    sql = SNAP_SQL.replace("CONFIG", "").replace(
+        "{% endsnapshot %}",
+        "{{ config(hard_deletes='new_record') }}\n{% endsnapshot %}",
+    )
+    files = {"snapshots/hosts_snapshot.sql": sql, "models/hosts.sql": "select 1\n"}
+    assert _config(tmp_path, files)["hard_deletes"] == "new_record"
+
+
+def test_the_project_config_is_walked_through_the_sql_file_s_stem(tmp_path):
+    sql = SNAP_SQL.replace("CONFIG", "")
+    files = {
+        "snapshots/legacy.sql": sql,
+        "models/hosts.sql": "select 1\n",
+        "dbt_project.yml": (
+            "name: p\nprofile: p\nsnapshots:\n  p:\n    legacy:\n"
+            "      +hard_deletes: new_record\n"
+        ),
+    }
+    assert _config(tmp_path, files)["hard_deletes"] == "new_record"
+
+
+def test_each_test_is_named_by_its_claim_not_its_arguments():
+    for test in _tests(_render(_history())):
+        assert test["name"] == f"{NAME}_{test['config']['meta']['dex']['claim']}"
+    # A target of 1 and of "1" stringify alike: dbt would give both one name.
+    one = _tests(_render(_history(status={"column": "is_super", "target": 1})))
+    text = _tests(_render(_history(status={"column": "is_super", "target": "1"})))
+    assert {t["name"] for t in one}.isdisjoint({t["name"] for t in text})
+
+
+def test_a_declared_name_in_another_case_resolves_to_the_column(tmp_path):
+    # The macro quotes the physical spelling it finds, as verify does, so a
+    # declaration written in another case still reads the column.
+    history = _history(
+        entity={"HOST_ID": "Host_Id"},
+        status={"column": "IS_SUPER", "target": True},
+        measures={"transition_count": "Changes"},
+    )
+    result = _compare(tmp_path, FIRST_TRUE, [(1, 1, D1, D1)], history)
+    assert result == {"transition_count": (1, 1)}

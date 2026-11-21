@@ -1972,6 +1972,9 @@ def _generated(
                         cadence=kind.cadence,
                         claim=claim,
                         arguments=instance.arguments,
+                        test_name=(
+                            f"{kind.name}_{claim}" if kind.named_by_claim else None
+                        ),
                     ),
                 }
             )

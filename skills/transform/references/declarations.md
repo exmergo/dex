@@ -603,6 +603,7 @@ models:
   - name: host_history
     data_tests:
       - dex_temporal_contract:
+          name: dex_temporal_contract_<claim>
           arguments:
             snapshot: ref('hosts_snapshot')
             entity: {host_id: host_id}
@@ -642,6 +643,13 @@ models:
   is a fact about the snapshot's config; both stay with `maintain verify`.
 - A snapshot that renames its validity column (`snapshot_meta_column_names`)
   passes the new name as `order_column`.
+- **Named by its claim.** Each test carries `name: dex_temporal_contract_<claim>`
+  rather than the name dbt builds from its arguments, which would put the status
+  target in the node name and give two claims whose arguments read alike (a
+  target of `1` and of `"1"`) one name, which dbt refuses.
+- **Names resolved as verify resolves them.** Each column the test reads is
+  matched against the relation's columns, case folded, and its physical spelling
+  quoted, so a declaration spelled `Status` reads a column created as `"Status"`.
 
 **What renders nothing**, listed under `data.generated_tests` as `not_rendered`
 with the reason, which is `maintain verify`'s reason for leaving the same measure
@@ -656,8 +664,9 @@ unchecked (checked in this order):
 | `policy_missing` | The declaration leaves out a policy the measure depends on: `initial_observation` and `null_status` for `transition_count`, those and `time.provenance` for `latest_target_transition_at`, `time.provenance` for `first_target_at`. |
 | `column_not_output` | The model's SQL provably does not output the entity key or the measure column. |
 
-What only a run can tell (the snapshot failed to build, a column the history names
-is missing) makes the test error, never pass. A test the plan rendered is never
+What only a run can tell never reads as a pass: a snapshot that failed to build
+makes `dbt build` **skip** the test (look at the snapshot, not the test), and a
+column the history names that a relation lacks makes the test run and **error**. A test the plan rendered is never
 removed (nothing generated is). Where the history changes (a policy, the snapshot,
 a measure or its column, or the history removed), each listed test the new
 history no longer gives is reported `stale` (`reason: history_changed`, its
