@@ -165,13 +165,14 @@ test keeps failing, and the last run in which a claim was checked and passed.
 The three tests above are the **built-ins**. They always render. A **generated
 test** is one Dex writes for a declared fact the built-ins cannot check: a
 composite grain, a population filter, a parent's population, a fraction's
-range, an INNER join's coverage. Each kind arrives with its own issue (#1452
-onward); this release renders five,
+range, an INNER join's coverage, a referenced key's uniqueness. Each kind
+arrives with its own issue (#1452 onward); this release renders six,
 [`dex_unique_combination`](#dex_unique_combination-a-composite-grain),
 [`dex_population_filter`](#dex_population_filter-a-population-filter),
 [`dex_parent_population`](#dex_parent_population-a-parents-population),
-[`dex_unit_range`](#dex_unit_range-a-fraction) and
-[`dex_join_coverage`](#dex_join_coverage-a-join-a-references-requires). The switch
+[`dex_unit_range`](#dex_unit_range-a-fraction),
+[`dex_join_coverage`](#dex_join_coverage-a-join-a-references-requires) and
+[`dex_referenced_key`](#dex_referenced_key-a-key-a-references-names). The switch
 and the tag below are what every kind follows. Generated tests run in the
 project's production runs. Dex does not run those and the project pays for them,
 so two rules hold:
@@ -528,6 +529,64 @@ Its macro reaches the project as the others' do: `macros/dex_join_coverage.sql`
 (the [shipped macro](macros.md#dex_join_coverage)) as a `macro_sql` diff where
 neither the project nor the plan defines the test; a plan whose required joins
 are all LEFT joins to whole parents writes none.
+
+#### `dex_referenced_key`: a key a `references` names
+
+A column declared `references: dim_customers.customer_id` assumes
+`customer_id` is unique in `dim_customers`: a join to a key that repeats
+multiplies the rows of the model that joins it. The claim is about the
+**parent**, so the test renders into the parent's YAML entry, under the column,
+tagged `dex_every_run`:
+
+```yaml
+models:
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        data_tests:
+          - dex_referenced_key:
+              config:
+                tags: [dex_every_run]
+                meta:
+                  disable_test_samples: true
+                  dex: {claim: <id>}
+```
+
+- **Which references.** Every `references` in the project as the plan leaves it
+  whose child or parent the plan declares. Declaring the child renders it, and
+  `transform declare dim_customers` renders it for references declared before
+  the switch was on. One test per parent column, however many children name it;
+  its row under `data.generated_tests` names the parent as `model` and the
+  children under `referenced_by`.
+- **What it counts.** The rows repeating a non-NULL key, beyond the first of
+  each. A NULL is no key (it never matches a join), so NULLs never count, as
+  dbt's `unique` ignores them. Counts only: the test returns the count, never a
+  key.
+- **How it relates to `maintain verify`.** Verify does not check the parent's
+  key; it reports the consequence on the child, `row_fanout`. A repeated key
+  fans out a child that joins it, but a fan-out has other causes, so the two
+  agree in that direction only, and no count is compared.
+- **A failure stops the children in `dbt build`.** dbt skips every model
+  downstream of a failed test, as it does for a grain's `unique`; that is the
+  point of checking the key before the join runs.
+
+**What renders nothing**, listed under `data.generated_tests` as
+`not_rendered` with the reason:
+
+| Reason | When |
+|---|---|
+| `covered_by_builtin` | The parent declares that one column as its `grain` (which renders `unique`), or the column already lists `unique`. A composite grain holding the column does not cover it. |
+| `parent_undeclared` | The parent has no YAML entry under `models:` (a model nobody documented, a seed, a snapshot). Dex does not create an entry to hold a test: declare the parent, or write its entry, and plan again. |
+| `parent_in_package` | The parent is an installed package's model, or a project override of one its package documents. Dex never edits a package's YAML. |
+| `column_not_output` | The parent's SQL provably no longer outputs the column (a `references` a later edit left behind). |
+
+A version label (`dim_teams.v2.team_id`) renders into that version's item; a
+bare versioned name renders on the shared entry every version inherits. A test
+whose `references` later goes away is never removed (nothing generated is).
+
+Its macro reaches the project as the others' do: `macros/dex_referenced_key.sql`
+(the [shipped macro](macros.md#dex_referenced_key)) as a `macro_sql` diff where
+neither the project nor the plan defines the test.
 
 ### A versioned model
 

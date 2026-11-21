@@ -27,6 +27,7 @@ from transform.generated_parity import (
     POPULATION_EXCLUDES,
     POPULATION_INCLUDES,
     POPULATION_INCLUDES_NULL,
+    REFERENCED_KEY,
     RELATIONSHIPS_LEFT_JOIN,
     ROWS,
     UNIQUE_COMBINATION,
@@ -594,4 +595,75 @@ def test_a_macro_ignoring_the_filter_fails_the_harness(
         f"{label} on {violating}: dbt counts 2 failure(s), maintain verify counts 1",
         f"{label} on {clean}: the test should pass on the clean fixture, dbt "
         "says 'fail'",
+    ]
+
+
+# --- dex_referenced_key (#1457) -----------------------------------------------------
+
+#: A ``duckdb__dex_referenced_key`` that counts repeated NULLs as a repeated key:
+#: dbt's own ``unique`` ignores them, and a NULL never matches a join.
+COUNTS_NULL_KEYS = """
+select dex_duplicate_rows from (
+    select sum(dex_rows) - count(*) as dex_duplicate_rows
+    from (
+        select count(*) as dex_rows from {{ model }}
+        group by {{ column_name }} having count(*) > 1
+    ) as dex_groups
+) as dex_violations where dex_duplicate_rows > 0
+"""
+
+
+def test_the_referenced_key_row_agrees_and_renders_on_the_parent(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(REFERENCED_KEY,),
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [REFERENCED_KEY.label]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_referenced_key.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["column"], t["status"], tuple(t["referenced_by"]))
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.REFERENCED_KEY
+    )
+    assert rows == [
+        (
+            REFERENCED_KEY.model(side),
+            "customer_id",
+            "added",
+            (f"{REFERENCED_KEY.model('child_' + side)}.customer_id",),
+        )
+        for side in ("clean", "violating")
+    ]
+    written = (dbt_project_dir / "macros" / "dex_referenced_key.sql").read_text()
+    assert "select dex_duplicate_rows" in written
+
+
+def test_a_macro_counting_null_keys_fails_the_harness_on_the_clean_parent(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(REFERENCED_KEY,),
+        extra_edits=[
+            _planted(
+                "duckdb", COUNTS_NULL_KEYS, gt.REFERENCED_KEY, "model, column_name"
+            )
+        ],
+    )
+
+    clean = REFERENCED_KEY.model("clean")
+    assert report.disagreements == [
+        f"{REFERENCED_KEY.label} on {clean}: the test should pass on the clean "
+        "fixture, dbt says 'fail'"
     ]

@@ -283,6 +283,17 @@ def propose(
                     rendered, view.model_paths, model, dialect
                 ),
             )
+            # The tests a references implies on its parent (#1457), which the
+            # plan renders into the parent's entry: owed by this model as a
+            # parent, or as a child naming one.
+            referenced = declarations_mod.render_referenced_keys(
+                {**rendered, path: text},
+                view,
+                [model],
+                render_tests=render_tests,
+                dialect=dialect,
+                generated=generated,
+            )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
                 raise
@@ -294,12 +305,15 @@ def propose(
                 }
             )
             continue
-        if text == rendered.get(path):
+        if text == rendered.get(path) and not referenced:
             outcome.skipped.append(_why_nothing(model, entry, complete=True))
             continue
         rendered[path] = text
+        rendered.update(referenced)
         added = [
             {k: row[k] for k in ("test", "column", "cadence", "claim")}
+            # A test on another model (the parent a references names) says so.
+            | ({"model": row["model"]} if row["model"] != model else {})
             for row in generated
             if row["status"] == "added"
         ]
@@ -444,7 +458,23 @@ def _owes_generated_tests(
         )
     except (RewriteError, DeclarationError):
         return False
-    return any(row["status"] == "added" for row in generated)
+    if any(row["status"] == "added" for row in generated):
+        return True
+    # What other models' references imply about this one (#1457): a parent
+    # declared before the switch was on owes the test on its referenced key.
+    referenced: list[dict[str, Any]] = []
+    try:
+        declarations_mod.render_referenced_keys(
+            files,
+            view,
+            [model],
+            render_tests=render_tests,
+            dialect=dialect,
+            generated=referenced,
+        )
+    except (RewriteError, DeclarationError):
+        return False
+    return any(row["status"] == "added" for row in referenced)
 
 
 def _merge(

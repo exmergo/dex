@@ -1451,7 +1451,24 @@ default, or a filter or operator after it is refused. A key naming a location
   filter that does not transpile is `join_shape_unsupported`; SQL holding other
   Jinja, or not parsing, is `join_unread`, once per declared `references`; and a
   listed `dex_join_coverage` whose join the SQL no longer writes is reported
-  `stale` (`reason: join_not_in_model`) with a warning, and never removed. The plan writes each
+  `stale` (`reason: join_not_in_model`) with a warning, and never removed. It
+  renders `dex_referenced_key` (#1457) under each parent column a `references`
+  names, in the **parent's** YAML entry, tagged `dex_every_run`, on every
+  connector: the references read are every one in the project as the plan
+  leaves it whose child or parent the plan declares, one test per parent column
+  however many children name it, its `data.generated_tests` row carrying the
+  parent as `model` and the children under `referenced_by`. It fails with the
+  count of rows repeating a non-NULL key (rows beyond the first of each), NULLs
+  being no key, and returns that count and never a key. A parent whose declared
+  grain is exactly that column, or whose column already lists `unique`, renders
+  nothing, `covered_by_builtin`; a project model with no `models:` entry, a seed
+  or a snapshot renders nothing, `parent_undeclared` (Dex does not create an
+  entry to hold a test); a package's model, or an override its package
+  documents, renders nothing, `parent_in_package`. `maintain verify` holds the
+  same fact only through its consequence, `row_fanout` on a child joining the
+  parent, which has other causes, so the parity harness holds the two in that
+  direction alone. `transform declare <parent>` proposes the test where the
+  parent owes nothing else. The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a

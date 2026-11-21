@@ -101,6 +101,26 @@ class GeneratedTestKind:
     #: (:class:`~.transform.join_reading.ModelJoins`), or ``None`` where the
     #: caller read nothing, which gives no instance at all.
     reads_joins: bool = False
+    #: Whether the kind checks a fact about a model that another model's
+    #: declaration implies (#1457: a ``references`` implies its parent column
+    #: is unique). Such a kind gives nothing for a model's own declaration: it
+    #: is called as ``instances(parent_declaration, references)``, ``references``
+    #: being the :class:`ParentReferences` the project's declarations point at
+    #: the parent, and its tests render into the parent's YAML entry.
+    on_parent: bool = False
+
+
+@dataclass(frozen=True)
+class ParentReferences:
+    """What the project's declarations say about one parent (#1457).
+
+    ``columns`` maps each of the parent's columns a ``references`` names (as
+    the first declaration spelled it) to the ``child.column`` pairs naming it,
+    sorted. ``unique_tested`` are the parent's columns, folded to lower case,
+    that already list dbt's ``unique`` test, which asserts the same fact."""
+
+    columns: Mapping[str, tuple[str, ...]]
+    unique_tested: frozenset[str] = frozenset()
 
 
 _KINDS: dict[str, GeneratedTestKind] = {}
@@ -189,12 +209,23 @@ JOIN_UNREAD = "join_unread"
 #: The required join is a LEFT join to the whole parent: it keeps every
 #: unmatched row, so the
 #: ``relationships`` (or ``not_null``) test the declaration already renders
-#: counts the same rows on the model's output.
+#: counts the same rows on the model's output. Also the reason a referenced
+#: parent column renders no ``dex_referenced_key`` (#1457): the parent's
+#: one-column grain, or a ``unique`` test already listed on the column, asserts
+#: it.
 COVERED_BY_BUILTIN = "covered_by_builtin"
 #: The required join is a shape this release does not render (a key compared
 #: through a conversion, a grouped side, a RIGHT or FULL join, a side that is
 #: no ``ref()`` or ``source()``, a filter that does not carry into the dialect).
 JOIN_SHAPE_UNSUPPORTED = "join_shape_unsupported"
+
+#: The reasons a referenced parent column renders no ``dex_referenced_key``
+#: (#1457). The parent has no YAML entry under ``models:`` (a model nobody
+#: documented, a seed, a snapshot), and Dex does not create one to hold a test.
+PARENT_UNDECLARED = "parent_undeclared"
+#: The parent is an installed package's model, or a project override of one its
+#: package documents, whose YAML entry is the package's: Dex never edits it.
+PARENT_IN_PACKAGE = "parent_in_package"
 
 
 def off_reason(setting: bool | list[str]) -> str:
@@ -520,5 +551,49 @@ register(
         macro=JOIN_COVERAGE,
         dialects=ALL_CONNECTORS,
         reads_joins=True,
+    )
+)
+
+REFERENCED_KEY = "dex_referenced_key"
+
+
+def _referenced_keys(declaration: Any, references: Any) -> list[Instance]:
+    """One column test per parent column a ``references`` names (#1457): a
+    join to a key that is not unique multiplies rows, so the column the join
+    reads is held unique on the parent, the model the claim is about. Where the
+    parent declares that column as its whole grain, or the column already lists
+    dbt's ``unique``, that test asserts the same fact, and this one is listed
+    and withheld (:data:`COVERED_BY_BUILTIN`).
+
+    ``references`` is a :class:`ParentReferences`, or ``None`` (nothing points
+    at the model), which gives nothing."""
+
+    if not isinstance(references, ParentReferences):
+        return []
+    grain = [str(c).lower() for c in (getattr(declaration, "grain", None) or [])]
+    out: list[Instance] = []
+    for column in references.columns:
+        folded = column.lower()
+        covered = grain == [folded] or folded in references.unique_tested
+        out.append(
+            Instance(
+                column=column,
+                field="referenced_key",
+                columns=(column,),
+                params={"check": REFERENCED_KEY},
+                withheld=COVERED_BY_BUILTIN if covered else None,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        REFERENCED_KEY,
+        EVERY_RUN,
+        _referenced_keys,
+        macro=REFERENCED_KEY,
+        dialects=ALL_CONNECTORS,
+        on_parent=True,
     )
 )

@@ -38,6 +38,7 @@ rest alike.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -95,6 +96,19 @@ class ParityRow:
     #: no ``declarations.render_tests`` switch (#1459: ``relationships`` from a
     #: ``references``), rather than one of Dex's generated kinds.
     builtin: bool = False
+    #: Declarations for fixtures, by suffix (#1457: the children whose
+    #: ``references`` imply the row's test on the parent fixtures). A fixture
+    #: not named here stays undeclared.
+    declared_fixtures: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    #: Where ``maintain verify``'s finding sits, by side, where it is not the
+    #: model the test sits on (#1457: the test is on the parent, ``row_fanout``
+    #: on the child that joins it): each side names a fixture suffix.
+    finding_on: Mapping[str, str] = field(default_factory=dict)
+    #: Whether the finding follows from the violation but not the reverse
+    #: (#1457: a repeated parent key fans out a child, and a fan-out has other
+    #: causes). The violating fixture must still fail the test and get the
+    #: finding; the clean one need only pass the test.
+    directional: bool = False
 
     @property
     def label(self) -> str:
@@ -106,6 +120,12 @@ class ParityRow:
 
     def model(self, side: str) -> str:
         return f"dex_parity_{self.slug}_{side}"
+
+    def judged(self, side: str) -> str:
+        """The model ``maintain verify``'s finding is read on for ``side``."""
+
+        suffix = self.finding_on.get(side)
+        return self.model(suffix) if suffix is not None else self.model(side)
 
     def picks(self, arguments: Mapping[str, Any] | None) -> bool:
         """Whether a test with ``arguments`` is this row's test."""
@@ -705,6 +725,85 @@ JOIN_COVERAGE_FILTERED = ParityRow(
     },
 )
 
+
+def _referenced_parent(null_int: str, repeated: bool) -> str:
+    """A parent fixture as (customer_id, segment): customer 2 twice where
+    ``repeated``, and two NULL keys in both, which are no key and repeat
+    nothing."""
+
+    lines = [
+        "select 1 as customer_id, 'retail' as segment",
+        "union all select 2, 'retail'",
+    ]
+    if repeated:
+        lines.append("union all select 2, 'retail'")
+    lines += [
+        "union all select 3, 'wholesale'",
+        f"union all select {null_int}, 'unknown'",
+        f"union all select {null_int}, 'unknown'",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _referencing(side: str) -> Callable[[str], str]:
+    """A child fixture LEFT-joining the orders to the ``side`` parent, so a
+    repeated parent key gives an order two rows."""
+
+    def render(_null: str) -> str:
+        return (
+            "select o.order_id, o.customer_id, c.segment\n"
+            "from {{ ref('dex_parity_referenced_key_orders') }} o\n"
+            f"left join {{{{ ref('dex_parity_referenced_key_{side}') }}}} c\n"
+            "  on o.customer_id = c.customer_id\n"
+        )
+
+    return render
+
+
+def _references_parent(side: str) -> dict[str, Any]:
+    return {
+        "description": "Parity fixture: one row per order, with its segment.",
+        "columns": {
+            "customer_id": {
+                "references": f"dex_parity_referenced_key_{side}.customer_id"
+            }
+        },
+    }
+
+
+#: #1457: a `references` implies its parent column is unique. The test sits on
+#: the parent fixtures; `row_fanout` on the child joining each. Customer 2 is
+#: on the violating parent twice, so the order of customer 2 gets two rows (5
+#: rows against 4 orders, +25%). Directional: fan-out has other causes, so the
+#: clean arm asserts only that the test passes, and no count is compared (the
+#: finding counts the child's rows, the test the parent's).
+REFERENCED_KEY = ParityRow(
+    test=gt.REFERENCED_KEY,
+    codes=frozenset({"row_fanout"}),
+    declaration={"description": "Parity fixture: one row per customer."},
+    violating=lambda null: _referenced_parent(null, repeated=True),
+    clean=lambda null: _referenced_parent(null, repeated=False),
+    fixtures={
+        # The orders read a relation: maintain verify does not compare a model
+        # driven off a SELECT of literals (#988), which supplies anchors.
+        "orders_raw": lambda null: _orders(
+            null, ("10", "1"), ("11", "2"), ("12", "3"), ("13", None)
+        ),
+        "orders": lambda _null: (
+            "select order_id, customer_id\n"
+            "from {{ ref('dex_parity_referenced_key_orders_raw') }}\n"
+        ),
+        "child_violating": _referencing("violating"),
+        "child_clean": _referencing("clean"),
+    },
+    declared_fixtures={
+        "child_violating": _references_parent("violating"),
+        "child_clean": _references_parent("clean"),
+    },
+    finding_on={"violating": "child_violating", "clean": "child_clean"},
+    directional=True,
+)
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -723,6 +822,7 @@ ROWS: tuple[ParityRow, ...] = (
     JOIN_COVERAGE_NO_MATCH,
     JOIN_COVERAGE_FILTERED,
     JOIN_COVERAGE_LEFT,
+    REFERENCED_KEY,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
@@ -779,6 +879,10 @@ def payload(
                     "content": render(null_int),
                 }
             )
+            if suffix in row.declared_fixtures:
+                declarations.append(
+                    {"model": row.model(suffix), **row.declared_fixtures[suffix]}
+                )
         for side, render in (("violating", row.violating), ("clean", row.clean)):
             name = row.model(side)
             edits.append(
@@ -939,6 +1043,48 @@ def run_parity(
     model_status = {
         n["name"]: n["status"] for n in (built.get("data") or {}).get("nodes", [])
     }
+    # A row whose test sits on a parent fixture (#1457) fails it there, and
+    # dbt build skips every model downstream of a failed test. The whole
+    # selection is built again with its tests left out (dbt's
+    # DBT_INDIRECT_SELECTION=empty), so every model builds and the manifest
+    # holds every model's compiled SQL for verify to read; a narrower
+    # selection would leave the other rows' models uncompiled there. The test
+    # results are the first pass's, read above.
+    skipped = [
+        name for name in dict.fromkeys(selected) if model_status.get(name) == "skipped"
+    ]
+    if skipped:
+        previous = os.environ.get("DBT_INDIRECT_SELECTION")
+        os.environ["DBT_INDIRECT_SELECTION"] = "empty"
+        try:
+            _rc, rebuilt = step(
+                "build_models",
+                [
+                    *root,
+                    "transform",
+                    "build",
+                    "--target",
+                    "dev",
+                    "--select",
+                    " ".join(selected),
+                    *_paid(budget),
+                ],
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("DBT_INDIRECT_SELECTION", None)
+            else:
+                os.environ["DBT_INDIRECT_SELECTION"] = previous
+        model_status.update(
+            {
+                n["name"]: n["status"]
+                for n in (rebuilt.get("data") or {}).get("nodes", [])
+                if n["name"] in skipped
+            }
+        )
+        built = (
+            rebuilt if any(model_status.get(n) != "success" for n in skipped) else built
+        )
     for name in dict.fromkeys(selected):
         if model_status.get(name) != "success":
             report.disagreements.append(
@@ -979,8 +1125,9 @@ def _judge(
         uid = _test_uid(tests, model, row)
         result = results.get(uid or "", {})
         status = result.get("status")
+        judged = row.judged(side)
         found = [
-            f for f in findings if f["identifier"] == model and f["code"] in row.codes
+            f for f in findings if f["identifier"] == judged and f["code"] in row.codes
         ]
         test_failed = status == "fail"
         test_passed = status == "pass"
@@ -994,7 +1141,8 @@ def _judge(
             if not found:
                 report.disagreements.append(
                     f"{where}: maintain verify raised none of "
-                    f"{sorted(row.codes)} on the violating fixture"
+                    f"{sorted(row.codes)} on "
+                    + ("the violating fixture" if judged == model else judged)
                 )
             if test_failed and found and row.count is not None:
                 expected = row.count(found[0])
@@ -1003,6 +1151,14 @@ def _judge(
                         f"{where}: dbt counts {result.get('failures')} failure(s), "
                         f"maintain verify counts {expected}"
                     )
+        elif row.directional:
+            # The finding follows from the violation, not the reverse: a clean
+            # key says nothing about verify's finding, which has other causes.
+            if not test_passed:
+                report.disagreements.append(
+                    f"{where}: the test should pass on the clean fixture, dbt "
+                    f"says {status!r}"
+                )
         else:
             if row.measured is not None and not row.measured(verify, model):
                 report.disagreements.append(
