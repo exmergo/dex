@@ -10,6 +10,18 @@ Validates the edits and returns them as diffs with a plan id; nothing is applied
 plus per-model YAML with key tests and PII meta) from the `.dex/` cache, instead
 of or on top of hand-authored edits.
 
+An edit whose content is identical to the file already on disk is left out
+of the plan, its diffs, `data.paths`, the comparison offer and `transform
+compare`'s seed and snapshot check, and one warning names them ("N edits match
+the tree and were skipped: ..."), so resending a whole feature raises nothing for
+the files it did not change. A model file the payload's `declarations` name is
+kept, so resending a model's SQL beside its declaration still puts the model in
+the plan. A declaration whose rendered YAML is already the file is skipped the
+same way, and a payload whose every edit matches stores no plan and returns
+`plan_id: null`, as `transform declare` does (#1415). So a re-plan whose every
+edit matches returns `plan_id: null`, `plan_path: null` and no `declarations`
+block.
+
 Model SQL with Jinja `for`/`if` control flow is compiled by dbt in a throwaway
 copy containing all edits, then checked as a single read-only SELECT. dbt and a
 dev profile passing the usual build preflight are required; failed or missing
@@ -38,6 +50,30 @@ package the plan's own `packages_yml` edit declares is checked too, and one it
 stops declaring is not. A plan never installs anything, so declaring a package
 and using it is two plans: the `packages_yml` edit on its own (it needs no parse,
 so it is stored), applied, then `transform deps`, then the plan that uses it.
+
+`--no-parse` (`DexEngine.plan(..., no_parse=True)`, #1517) stores the plan
+without starting dbt: no parse of the post-change project, none of a declared
+mart's derived semantic model, no compile, and so no package check. It is for a
+host that must not run repository-controlled code where it authors and parses
+the plan in a sandbox of its own. What changes in the envelope:
+
+- a warning, `dbt parse not run: ...`, wherever a parse would have run;
+- `data.model_versions.<model>.manifest` is `unchecked` with `parse_skipped`;
+- a dbt (MetricFlow) derivation is `unvalidated` (parse `not_run`) in
+  `data.semantic_proposal` and stays out of the plan; `mode` is `proposed` and
+  `definitions` carries it, ready for `semantic plan --definitions-file` where
+  dbt may parse;
+- with a native semantic layer (`semantic.vendor` other than `dbt`) the
+  derivation runs no dbt, so `--no-parse` does not change it: its documents are
+  stored as the usual companion plan through the vendor's authoring route;
+- a model with Jinja `for`/`if` is refused, since only dbt's compile can check
+  it; a model that only lists columns through a macro (`dbt_utils.star`) is
+  checked from its SQL, with a warning naming it;
+- a `toggle` contract is refused, since its check compiles every model.
+
+Every structural gate still runs: admission, placement, deletions, the PII and
+secret guards, hash pinning and the diffs. Row attribution and identifier
+conversions are warehouse reads, not dbt, and follow `--attribute-rows` as usual.
 
 Compilation that reads no warehouse data needs no spend confirmation. For
 compile-time queries on billed connectors, the first discovered work is quoted
@@ -129,6 +165,21 @@ See the cost-controls reference for the shared budget mechanism.
   rewritten model, the unedited models below it in the `ref()` graph (`count`
   and up to 10 `models`): what the plan can move without editing, which a
   `--verify --for-plan` build measures under `data.completion.impact`.
+  `removed_tests` (#1420) lists each test the plan removes, on any plan that
+  removes one, whether or not it rewrites a model: a `unit_test` (by `name`,
+  with the `model` it targeted), a `singular_test` (a SQL file under the test
+  paths, deleted, with the `models` it `ref()`s) or a `data_test` (a generic
+  test by the name its YAML gives it, on a `model`, with its `version` under
+  `versions:`, a `snapshot`, a `seed` or a `source` table as
+  `source.table`, and its `column` where it has one), each with the `path` it
+  was read from, plus a warning naming them. Editing a unit test or a
+  singular test file is not a removal, nor is a test moved to another file,
+  nor a data test carried to a model the plan renames, which it reads only
+  from the plan's own edits: they delete a model file named for the old model
+  and create one named for the new, and the same test and column appear on
+  the new name. Anything else is listed, including a renamed versioned model
+  (its files are named for its versions) and any source, snapshot or seed. A YAML file that does
+  not parse is left out. Keep the test, or say the request asks to drop it.
   Advisory: nothing here refuses a plan.
 - `data.identifier_conversions` (#861): each conversion the plan adds to an
   identifier column, on a new model or an edited one. A conversion is a `cast`, a
@@ -225,6 +276,14 @@ See the cost-controls reference for the shared budget mechanism.
   passes one through, and the project holds a parent to resolve against. It names
   its precedent and its parent, judges only models the plan authors, and is the
   one check a project can decline (`conventions.resolved_keys: false`).
+- `data.generated_tests`: every generated test the plan's declarations give (a
+  test beyond the built-in `unique`, `not_null` and `relationships`), with its
+  cadence tag (`dex_every_run` or `dex_scheduled`), its claim and whether it
+  rendered. They render only where `declarations.render_tests` turns them on,
+  off by default. They come from the declaration as the entry states it after
+  the plan, so a model declared before the switch was on gets them from
+  `transform declare` without restating a fact. Absent when the declarations
+  give none. Details: `declarations.md`.
 - `data.semantic_proposal`: for a declared model under `transform.marts_paths`
   (default `[models/marts]`), the semantic definition its declaration states in
   the configured layer (`vendor`). MetricFlow: added to the plan
@@ -547,6 +606,16 @@ Runs `dbt build` against a dev target, with a cost preflight first.
   before they choose a budget. Inside committed `budget.ceiling` and
   `budget.session_ceiling`, a build is confirmed with `--confirm` alone and needs
   no number from anyone.
+- `cost.unpriced` says the estimate is a floor (#1309): where the Elementary
+  package runs its hooks (`elementary_hooks`), its monitoring tests
+  (`elementary_monitoring_tests`, each with the `days_back` window it reads) or
+  its test materialization's failed-row count and sample query
+  (`elementary_test_extras`), none of which a compiled node shows. `data.unpriced`
+  holds the record and a warning per kind names the work. Tell the user the
+  estimate is a floor before they choose a budget: `budget.ceiling` admits the
+  build against the estimate, and the profile's per-statement cap bounds each
+  query, but nothing bounds the run's total, so the unpriced work can bill
+  beyond the ceiling.
 - A refusal over the ceiling carries a calibration line from `.dex/spend.jsonl`.
   Builds over-estimate most on a partitioned or clustered warehouse.
 - dbt runs with its working directory pinned to the project dir, so relative
@@ -601,7 +670,7 @@ failed-build envelope carries it too, and Python callers get the same typed
 | `change` | the `plan_id` and `source` (`for_plan`, `for_plan_file`) the build was asked to validate, and the `selector` (cut at 200 characters; the whole one is in `data.evidence.selection`) |
 | `deliverables` | `coverage`: `known`, `unknown` (no plan named, so nothing says what the build was for) or `undetermined` (the plan's edits name no buildable node). Then `required`, and `built`, `failed`, `skipped`, `missing` and `stale` as `{count, names, elided}`. `blocked` names each required deliverable that did not build and the node that `cause`d it, walked back through skipped parents, a failing data test on a parent included. A skipped or failed deliverable is never counted as built: whatever relation it has in dev predates this run, and `note` says so |
 | `blockers` | the failed nodes, with the ones that stopped a deliverable first, and dbt's message cut to 160 characters (the whole message is in `data.evidence.nodes`). `next` is the one command that repairs it: `repair: dex transform repair <node>` for a package model the project can override, `repair: transform plan on <path>` for the project's own (#1229) |
-| `assurance` | over the required deliverables, or over every built model with no plan: `asserted` (a passing data test reads it, or a verification record judged it `satisfied`), `failed_checks` (a data test on it failed or warned, or a record was `contradicted`; `checks` lists each failure with its `kind`, `data_test` with the test's `name` or the record list such as `join_coverage` with its `finding` and `join`, so a join measured against a default threshold is not read as a failed test, #1162) and `build_only` (it built and nothing checked its rows; a unit test reads fixtures, so it does not count) |
+| `assurance` | over the required deliverables, or over every built model with no plan: `asserted` (a passing data test reads it, or a verification record judged it `satisfied`), `failed_checks` (a data test on it failed or warned, or a record was `contradicted`; `checks` lists each failure with its `kind`, `data_test` with the test's `name` or the record list such as `join_coverage` with its `finding` and `join`, so a join measured against a default threshold is not read as a failed test, #1162) and `build_only` (it built and nothing checked its rows; a unit test reads fixtures, so it does not count). `unchecked_tests`, present only when there is one, lists, at most five with the rest counted under `elided`, each passing test on a model the assurance covers whose pass is not counted, with its `models` and `reason_code`, and its pass makes no model `asserted` (#1308): an Elementary test whose compiled SQL is the package's no-results query (`package_disabled` where the package's models are disabled for the target, `compiled_to_no_results` where they are not, as `collect_metrics` always is), or, with the package enabled, an anomaly test, `schema_changes`, `volume_threshold`, `metric_stability` or `execution_sla`, which judge the run against history earlier runs stored and pass where it is missing (`history_unmeasured`, whenever the package is enabled: dex does not count that history, so the code says the pass is not counted, not that the test read no rows). A failing one still counts as a failed check. dbt's own tests and the `*_with_context` tests are never listed; `json_schema`, `schema_changes_from_baseline` and `data_freshness_sla` are never `history_unmeasured`, though like any Elementary test they are listed where they compiled to the no-results query |
 | `verification` | `ran` (and `reason` when it did not), on a `--for-plan` build `introduced` (the first five findings the plan introduced, ahead of everything else) and `by_attribution` (every finding counted as `introduced`, `unattributed` or `existing`), `finding_count` including the ones past the 50-finding cap (`findings_dropped`), `by_severity`, the `top` five as `{code, identifier, severity}` (with `attribution` on a `--for-plan` build, introduced first), the `suppressed` class names, and `offered` when the sweep's scan was offered rather than run |
 | `impact` | with `--verify` and a plan named, what the plan did to the models it rewrote and the unedited models below them (#1231): `ran` (and `reason_code` when nothing could be measured), `measured`, `changed` and `unchecked` counts, `top`, the changed models largest first (`model`, `role`, `rows` as `before -> after`, `keys_removed`, `keys_added`, `columns_changed` on a mart, `upstream`, `finding`, `settled`), and `unchecked_reasons` counted by code. The records are under `data.verification.impact` |
 | `obligations` | the declared contracts the sweep held the build to (`join_coverage`, `parent_population`, `temporal_contracts`, `population_delta`, and the column contract's unchecked models), counted `by_status`, with the `contradicted` ones named with their `finding`, the `unchecked` ones with their `reason_code`, and a drafted population that asks which rows belong under `needs_decision` (#1228), and the models that declare no columns under `no_declared_columns`. `checked: false` when the sweep did not run. An empty `by_status` from a sweep that ran means nothing declared a contract it could hold the build to, which is not the same as every contract holding |
@@ -914,6 +983,17 @@ can be tied to the repaired state it read. It names one run: other inputs may
 come from earlier builds, so `cold: true` does not mean every input came from a
 cold build. It is recorded on the plan with the verdict.
 
+A verdict also carries `baseline_never_built` where an input changed after the
+compared model's last build (#1387): the baseline is then the current SQL on
+today's inputs, a state no build wrote, and the verdict is computed against it.
+It holds `model_built_at` (`null` when the latest run did not build the model)
+and the evidence: `rebuilt_after`, the untouched upstream models a later run
+rebuilt, and on DuckDB `row_count` (`last_build`, `baseline`), where the built
+relation's exact count differs from the baseline's, which also sees a source
+reloaded outside dbt. A `warnings` line says the same. It is absent otherwise,
+and never set for a view. The verdict itself is unchanged: read an `unexpected`
+or `different` beside it before calling it a defect of the change.
+
 - Read `data.status`, then `data.reason_code`. `equivalent` holds for
   `data.input_scope` at `data.compared_at`, on the dev relations as they stand. Say
   that when you report it. It is not a proof for future inputs.
@@ -934,7 +1014,7 @@ cold build. It is recorded on the plan with the verdict.
 |---|---|
 | `plan_applied`, `plan_stale` | plan the change again against the tree as it is |
 | `baseline_not_compilable`, `proposed_not_compilable` | the model does not compile on that side; `detail` quotes a compile error, and a connection failure says to run `dbt compile` |
-| `inputs_unsynchronized` | build the named parents on dev; one the last build left `error` or `skipped` needs its failure repaired first, in a plan of its own, applied and built (`--cold-deps` where a package owns it). A cold build counts. A plan that changes a seed or snapshot, or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows. This plan stays uncompared: once it is applied the baseline is gone (`plan_applied`). After applying and building, a further change needs its own new, unapplied plan to compare |
+| `inputs_unsynchronized` | build the named parents on dev; one the last build left `error` or `skipped` needs its failure repaired first, in a plan of its own, applied and built (`--cold-deps` where a package owns it). A cold build counts. A plan that changes a seed or snapshot the proposed model reads (through any upstream model; one that does not read it compares as usual, #1429), or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows. For a seed or snapshot, plan it on its own, apply and build it, then plan the model edits again and compare them. This plan stays uncompared: once it is applied the baseline is gone (`plan_applied`). After applying and building, a further change needs its own new, unapplied plan to compare |
 | `nondeterministic_expression` | the model calls a random, uuid or current-time function, or samples, so two runs can differ on their own |
 | `unsupported_type` | the named column cannot be grouped on this connector; `detail` names it and its type |
 | `baseline_refused`, `proposed_refused` | before anything reaches the warehouse, that side's compiled SQL is not a single SELECT; fix the model |
@@ -984,6 +1064,13 @@ and the verdict becomes `as_expected` (`matches_expected_change`) or `unexpected
  "removed": "none" | "any" | {"where": "<predicate>"},
  "changed_columns": ["<column>", "..."],
  "key": "unchanged"}
+```
+
+A complete one, as `--expect-file` reads it:
+
+```json
+{"added": {"where": "region = 'emea'"}, "removed": "none",
+ "changed_columns": ["amount"], "key": "unchanged"}
 ```
 
 - Every field is optional: `added` and `removed` default to `"none"`,
@@ -1082,6 +1169,11 @@ flipped boundary, a dropped or negated filter, a swapped join type, a removed
 `CASE` branch, an inverted ratio, a shifted window frame, `sum` for `max`), runs
 the model's own tests against each, and reports which defects nothing caught.
 
+- A versioned model is measured one version at a time: name it `<model>.v<N>`,
+  as `transform declare` does. The bare name measures the version an
+  unversioned `ref()` resolves to (`latest_version`), with a warning, and
+  `data.model` names the version measured; its record and its downstream
+  routing are that version's alone (#1374).
 - Read `data.counts`, then the survivors, listed first. Each carries `defect` (what
   would now be wrong) and `suggested_test` (the test that would catch it).
 - Each survivor's `equivalence.status` says which test to suggest, and
@@ -1115,7 +1207,19 @@ the model's own tests against each, and reports which defects nothing caught.
   excluded (a unit test on a downstream model, a test that also reads a relation
   the mutant cannot reach) and why, and a `reason` when it was off.
 - `baseline.excluded` names tests already failing against the unmutated model;
-  every verdict is relative to the tests that passed.
+  every verdict is relative to the tests that passed. It also names the
+  Elementary monitoring tests kept out of every run, with status `not_run` and a
+  `reason_code` (`elementary_disabled` or `elementary_history`): with the
+  package installed, the copy strips its run hooks, disables its models where
+  nothing else refers to them (and otherwise has dbt run the tests under its own
+  test materialization, refusing where a project materialization still hands
+  them to Elementary's), and keeps these tests out, so the run writes nothing to
+  the dev target (#1307). A project's own test that wraps one of them is kept
+  out too. A model whose only tests are these is refused, since nothing would
+  measure it, and none of them counts as a test of an incremental model's full
+  build. A run where a package installed outside the project (an absolute
+  `packages-install-path`) declares a run hook is refused, since the copy
+  cannot strip it.
 - An incremental model's `{% if is_incremental() %}` branch is compiled a second
   time with the branch taken, and its own comparisons and filters are planted
   there (#1132). Only unit tests overriding `is_incremental` to true run against

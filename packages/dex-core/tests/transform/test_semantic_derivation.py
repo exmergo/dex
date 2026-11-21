@@ -474,6 +474,7 @@ def _plan(
     *,
     declaration: dict | None = None,
     sql_path: str = "models/marts/fct_orders.sql",
+    flags: tuple[str, ...] = (),
 ) -> tuple[int, dict]:
     body = {
         "edits": [{"path": sql_path, "kind": "model_sql", "content": MART_SQL}],
@@ -486,6 +487,7 @@ def _plan(
             "transform",
             "plan",
             "orders mart",
+            *flags,
             "--edits-file",
             _payload(tmp_path, body),
         ],
@@ -718,6 +720,35 @@ def test_without_dbt_a_derivation_is_never_included(
     assert model["validation"]["parse"]["result"] == "not_run"
     assert proposal["definitions"] == []
     assert "models/semantic/semantic.yml" not in envelope["data"]["paths"]
+
+
+def test_a_no_parse_transform_plan_leaves_the_derivation_unvalidated(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    # #1517: a host that may not run dbt where it authors still gets the
+    # derivation as a proposal, never parsed and never added to the plan.
+    _add_time_spine(dbt_project_dir)
+    _add_layer(dbt_project_dir)
+    calls = _fake_parse(monkeypatch)
+
+    rc, envelope = _plan(tmp_path, capsys, flags=("--no-parse",))
+
+    assert rc == 0, envelope
+    assert calls == [], "a no-parse transform plan started dbt"
+    proposal = envelope["data"]["semantic_proposal"]
+    model = proposal["models"]["fct_orders"]
+    assert model["status"] == "unvalidated"
+    assert model["validation"]["parse"]["result"] == "not_run"
+    assert "no_parse" in model["validation"]["parse"]["detail"]
+    assert "models/semantic/semantic.yml" not in envelope["data"]["paths"]
+    assert any("dbt parse not run" in w for w in envelope["warnings"])
+    # Nothing was added, so it is offered for the side that parses.
+    assert proposal["mode"] == "proposed"
+    assert [d["path"] for d in proposal["definitions"]] == [
+        "models/semantic/semantic.yml"
+    ]
+    assert "fct_orders" in proposal["definitions"][0]["content"]
+    assert "where dbt may parse it" in proposal["next"]
 
 
 def test_no_parse_never_skips_the_parse_of_an_included_derivation(

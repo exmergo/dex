@@ -17,6 +17,7 @@ import yaml
 
 from .conftest import (
     RS_MAX_SECONDS,
+    assert_generated_test_parity,
     assert_ok,
     assert_unpivot_build,
     integration_budget,
@@ -236,3 +237,27 @@ def test_an_unwritable_dev_schema_is_refused_before_the_cost_gate(
     assert "may not create it" in error
     assert "CREATE SCHEMA IF NOT EXISTS dex_absent_dev_schema AUTHORIZATION" in error
     assert not (tmp_path / ".dex" / "spend.jsonl").exists()
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, dev_env
+):
+    """The generated-test parity harness (#1450, #1451) on Redshift: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    seed_repo_password_path(tmp_path, schemas=["app"], budget=BUILD_BUDGET)
+    rc, envelope = run_cli(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "init",
+            "analytics",
+            "--connector",
+            "redshift",
+        ],
+        capsys,
+    )
+    assert_ok(rc, envelope)
+    assert_generated_test_parity(
+        run_cli, capsys, tmp_path, connector="redshift", budget=RS_MAX_SECONDS * 28
+    )

@@ -118,6 +118,41 @@ uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core demo
 uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core explore map
 ```
 
+## The generated-test parity harness
+
+A test Dex generates from a declaration (`dex_unique_combination`,
+`dex_population_filter`, and the kinds after it) has two implementations of one fact: its SQL macro, which runs in the
+customer's `dbt build`, and the check `maintain verify` runs. The parity harness,
+`packages/dex-core/tests/transform/generated_parity.py`, holds them to one answer.
+Each row names a generated test, the `maintain verify` finding codes it must
+agree with, and a violating and a clean fixture model. The runner declares both
+through `transform plan` with `declarations.render_tests` on, builds them with
+`transform build`, runs `maintain verify`, and fails on any disagreement,
+including a dbt failure count that differs from the count the finding states.
+
+It runs on DuckDB in the offline suite (`tests/transform/test_generated_parity.py`)
+and on every warehouse in `integration.yml` through each connector's
+`test_generated_tests_agree_with_maintain_verify_live`. A new generated test
+adds a `ParityRow` to `ROWS` (several, each with its own `name`, where one test
+has several cases to hold, as `dex_population_filter` does for `includes`,
+`excludes`, a NULL and a typed comparison); its fixtures are literal SELECTs,
+written once for every dialect, with the connector's typed integer NULL passed
+in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast. A row
+whose fixtures read another model (`dex_parent_population`'s declared parent)
+lists it under `fixtures`, built in the same selection, and a test that renders
+several instances on one model (a parent's `missing` and `unexpected`
+directions) picks its own with `arguments`. A fact that renders no test on any
+connector, only `maintain verify`'s check (`dex_unit_range`'s `percent` row,
+`heuristic_only`), sets `withheld`: the harness then checks that the plan lists
+both fixtures `not_rendered` with that reason, that no test builds, and that
+`maintain verify` alone flags the violating fixture and not the clean one
+(`dex_join_coverage`'s LEFT-join row, `covered_by_builtin`, is held the same
+way). A kind whose instances read the model's SQL (`dex_join_coverage`, which
+reads its joins) sets `GeneratedTestKind.reads_joins` and takes the joins the
+plan read beside the declaration. A kind that
+does not support a connector declares it (`GeneratedTestKind.dialects`), and the
+harness then checks that the plan renders nothing there.
+
 ## Live BigQuery integration tests
 
 `tests/integration/` runs the real loop against BigQuery: ADC discovery, the
@@ -1079,13 +1114,20 @@ commit:
    It pins the three skill wrappers to the engine version, bumps the four plugin
    manifests, writes the release's section of `CHANGELOG.md` dated today in UTC,
    and deletes the fragments it collected. It stages nothing; every change is
-   left in the working tree.
+   left in the working tree. Pass both versions bare: a leading `v` is dropped,
+   and a plugin version that is not semver is refused before anything is written.
 
 3. Review `git status` and `git diff`, and update any documentation the release
    changes: status and capability claims, install commands, version strings.
 4. Commit the changelog, the deleted fragments, the pins and the manifests
    together (`git commit -a` includes the deletions). The pull request edits
-   `CHANGELOG.md`, so it carries the `no-changelog` label.
+   `CHANGELOG.md`, so it carries the `no-changelog` label. Its **Release prep**
+   check (`.github/workflows/release-prep.yml`) holds the versions to their
+   shape with `scripts/check_release_versions.py` (bare PEP 440 engine pins, the
+   newest `CHANGELOG.md` section, bare semver manifests that agree with the
+   engine), and fails if the tree is not exactly what the script writes, such as
+   a `claude/` folder left behind by a skill edited after the script ran. Run
+   `python3 scripts/check_release_versions.py` to check before pushing.
 5. Once it is merged, tag the merged commit and push the tag. The release
    workflow refuses, before anything reaches PyPI, a tag whose wrapper pins do
    not match it or whose `CHANGELOG.md` has no section for it.

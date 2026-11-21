@@ -10,6 +10,18 @@ Validates the edits and returns them as diffs with a plan id; nothing is applied
 plus per-model YAML with key tests and PII meta) from the `.dex/` cache, instead
 of or on top of hand-authored edits.
 
+An edit whose content is identical to the file already on disk is left out
+of the plan, its diffs, `data.paths`, the comparison offer and `transform
+compare`'s seed and snapshot check, and one warning names them ("N edits match
+the tree and were skipped: ..."), so resending a whole feature raises nothing for
+the files it did not change. A model file the payload's `declarations` name is
+kept, so resending a model's SQL beside its declaration still puts the model in
+the plan. A declaration whose rendered YAML is already the file is skipped the
+same way, and a payload whose every edit matches stores no plan and returns
+`plan_id: null`, as `transform declare` does (#1415). So a re-plan whose every
+edit matches returns `plan_id: null`, `plan_path: null` and no `declarations`
+block.
+
 Model SQL with Jinja `for`/`if` control flow is compiled by dbt in a throwaway
 copy containing all edits, then checked as a single read-only SELECT. dbt and a
 dev profile passing the usual build preflight are required; failed or missing
@@ -38,6 +50,30 @@ package the plan's own `packages_yml` edit declares is checked too, and one it
 stops declaring is not. A plan never installs anything, so declaring a package
 and using it is two plans: the `packages_yml` edit on its own (it needs no parse,
 so it is stored), applied, then `transform deps`, then the plan that uses it.
+
+`--no-parse` (`DexEngine.plan(..., no_parse=True)`, #1517) stores the plan
+without starting dbt: no parse of the post-change project, none of a declared
+mart's derived semantic model, no compile, and so no package check. It is for a
+host that must not run repository-controlled code where it authors and parses
+the plan in a sandbox of its own. What changes in the envelope:
+
+- a warning, `dbt parse not run: ...`, wherever a parse would have run;
+- `data.model_versions.<model>.manifest` is `unchecked` with `parse_skipped`;
+- a dbt (MetricFlow) derivation is `unvalidated` (parse `not_run`) in
+  `data.semantic_proposal` and stays out of the plan; `mode` is `proposed` and
+  `definitions` carries it, ready for `semantic plan --definitions-file` where
+  dbt may parse;
+- with a native semantic layer (`semantic.vendor` other than `dbt`) the
+  derivation runs no dbt, so `--no-parse` does not change it: its documents are
+  stored as the usual companion plan through the vendor's authoring route;
+- a model with Jinja `for`/`if` is refused, since only dbt's compile can check
+  it; a model that only lists columns through a macro (`dbt_utils.star`) is
+  checked from its SQL, with a warning naming it;
+- a `toggle` contract is refused, since its check compiles every model.
+
+Every structural gate still runs: admission, placement, deletions, the PII and
+secret guards, hash pinning and the diffs. Row attribution and identifier
+conversions are warehouse reads, not dbt, and follow `--attribute-rows` as usual.
 
 Compilation that reads no warehouse data needs no spend confirmation. For
 compile-time queries on billed connectors, the first discovered work is quoted
@@ -129,6 +165,21 @@ See the cost-controls reference for the shared budget mechanism.
   rewritten model, the unedited models below it in the `ref()` graph (`count`
   and up to 10 `models`): what the plan can move without editing, which a
   `--verify --for-plan` build measures under `data.completion.impact`.
+  `removed_tests` (#1420) lists each test the plan removes, on any plan that
+  removes one, whether or not it rewrites a model: a `unit_test` (by `name`,
+  with the `model` it targeted), a `singular_test` (a SQL file under the test
+  paths, deleted, with the `models` it `ref()`s) or a `data_test` (a generic
+  test by the name its YAML gives it, on a `model`, with its `version` under
+  `versions:`, a `snapshot`, a `seed` or a `source` table as
+  `source.table`, and its `column` where it has one), each with the `path` it
+  was read from, plus a warning naming them. Editing a unit test or a
+  singular test file is not a removal, nor is a test moved to another file,
+  nor a data test carried to a model the plan renames, which it reads only
+  from the plan's own edits: they delete a model file named for the old model
+  and create one named for the new, and the same test and column appear on
+  the new name. Anything else is listed, including a renamed versioned model
+  (its files are named for its versions) and any source, snapshot or seed. A YAML file that does
+  not parse is left out. Keep the test, or say the request asks to drop it.
   Advisory: nothing here refuses a plan.
 - `data.identifier_conversions` (#861): each conversion the plan adds to an
   identifier column, on a new model or an edited one. A conversion is a `cast`, a
@@ -225,6 +276,14 @@ See the cost-controls reference for the shared budget mechanism.
   passes one through, and the project holds a parent to resolve against. It names
   its precedent and its parent, judges only models the plan authors, and is the
   one check a project can decline (`conventions.resolved_keys: false`).
+- `data.generated_tests`: every generated test the plan's declarations give (a
+  test beyond the built-in `unique`, `not_null` and `relationships`), with its
+  cadence tag (`dex_every_run` or `dex_scheduled`), its claim and whether it
+  rendered. They render only where `declarations.render_tests` turns them on,
+  off by default. They come from the declaration as the entry states it after
+  the plan, so a model declared before the switch was on gets them from
+  `transform declare` without restating a fact. Absent when the declarations
+  give none. Details: `declarations.md`.
 - `data.semantic_proposal`: for a declared model under `transform.marts_paths`
   (default `[models/marts]`), the semantic definition its declaration states in
   the configured layer (`vendor`). MetricFlow: added to the plan
@@ -1110,6 +1169,11 @@ flipped boundary, a dropped or negated filter, a swapped join type, a removed
 `CASE` branch, an inverted ratio, a shifted window frame, `sum` for `max`), runs
 the model's own tests against each, and reports which defects nothing caught.
 
+- A versioned model is measured one version at a time: name it `<model>.v<N>`,
+  as `transform declare` does. The bare name measures the version an
+  unversioned `ref()` resolves to (`latest_version`), with a warning, and
+  `data.model` names the version measured; its record and its downstream
+  routing are that version's alone (#1374).
 - Read `data.counts`, then the survivors, listed first. Each carries `defect` (what
   would now be wrong) and `suggested_test` (the test that would catch it).
 - Each survivor's `equivalence.status` says which test to suggest, and

@@ -4866,3 +4866,61 @@ def test_a_billed_build_without_elementary_claims_nothing_unpriced(
     assert envelope["status"] == "needs_confirmation"
     assert envelope["cost"]["unpriced"] is None
     assert "unpriced" not in envelope["data"]
+
+
+def test_a_build_records_each_node_it_attempted(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """#1524: the next build replaces run_results.json, so each build folds its
+    statuses into Dex's node record first, for `maintain verify` to read a node
+    an earlier build attempted and a later one did not."""
+
+    from exmergo_dex_core.transform.node_record import RECORD
+
+    invocation = "55555555-5555-5555-5555-555555555555"
+    results = {
+        "metadata": {
+            "invocation_id": invocation,
+            "generated_at": "2026-11-20T10:00:00.000000Z",
+        },
+        "args": {"which": "build"},
+        "results": [
+            {
+                "unique_id": "unit_test.p.orders.week_on_week",
+                "status": "pass",
+                "message": "warehouse text that must not be kept",
+            }
+        ],
+    }
+    _fake_runner_factory(
+        monkeypatch,
+        run_results_json=(
+            dex_target(dbt_project_dir) / "run_results.json",
+            json.dumps(results),
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    record = json.loads(
+        (dex_target(dbt_project_dir) / RECORD).read_text(encoding="utf-8")
+    )
+    assert record["nodes"] == {
+        "unit_test.p.orders.week_on_week": {
+            "status": "pass",
+            "invocation_id": invocation,
+            "generated_at": "2026-11-20T10:00:00.000000Z",
+            "command": "build",
+        }
+    }

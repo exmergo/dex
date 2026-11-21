@@ -120,6 +120,8 @@ class LocalMetricFlowBackend:
         self._dim_columns: dict[str, tuple[str, str]] | None = None
         self._dim_expressions: dict[str, tuple[str, str]] | None = None
         self._catalog_view = None
+        self._stale_checked = False
+        self._stale: str | None = None
         # Everything that happens to the SQL once MetricFlow has rendered it.
         self._governed = GovernedSql(
             engine,
@@ -175,6 +177,45 @@ class LocalMetricFlowBackend:
         return SemanticCatalog.from_view(
             view, self, notes=[_UNRESOLVED_JOINS_NOTE] if unresolved else []
         )
+
+    def disclosure(self) -> list[str]:
+        """The warning every result read from a stale semantic manifest carries."""
+
+        stale = self.stale_note()
+        return [stale] if stale else []
+
+    def stale_note(self) -> str | None:
+        """Which semantic YAML files changed after the manifest this backend reads.
+
+        ``transform apply`` writes YAML and leaves the manifest alone, so a metric
+        it just added is unknown here and a relabel still reads the old label until
+        ``dbt parse`` runs (#1269, #1417). Read once per command.
+        """
+
+        from ... import dbt_project
+
+        if not self._stale_checked:
+            self._stale_checked = True
+            files = dbt_project.stale_semantic_files(self._project)
+            shown = ", ".join(files[:3]) + (
+                f" and {len(files) - 3} more" if len(files) > 3 else ""
+            )
+            self._stale = (
+                f"the compiled semantic manifest is older than {shown}, so the local "
+                "layer may be missing or misstating what changed there; "
+                f"{_RECOMPILE_HINT} to refresh it"
+                if files
+                else None
+            )
+        return self._stale
+
+    def with_stale_note(self, message: str) -> str:
+        """``message``, with the stale-manifest note when there is one: for the
+        refusals a just-applied metric or dimension meets, which would otherwise
+        read as a typo."""
+
+        stale = self.stale_note()
+        return f"{message}\n\nNote: {stale}" if stale else message
 
     def declared_relationships(self) -> list[Any]:
         """MetricFlow entity joins are derived from the catalog by explore."""
@@ -267,7 +308,9 @@ class LocalMetricFlowBackend:
         except Exception as exc:  # a MetricFlow resolution error (unknown metric,
             # unresolvable dimension) is the query's fault, not a crash: surface it.
             raise SemanticBackendError(
-                f"could not resolve the metric query: {env.redact(str(exc))}"
+                self.with_stale_note(
+                    f"could not resolve the metric query: {env.redact(str(exc))}"
+                )
             ) from exc
 
         return self._governed.run(
@@ -333,7 +376,10 @@ class LocalMetricFlowBackend:
         rather than surfacing as a MetricFlow resolution error about something else.
         """
 
-        request = resolve_values_request(self._semantic_view(), dimension, metrics)
+        try:
+            request = resolve_values_request(self._semantic_view(), dimension, metrics)
+        except SemanticBackendError as exc:
+            raise type(exc)(self.with_stale_note(str(exc))) from exc
         cache = self._load_cache()
         notes = screen_values_request(
             request.name, meta_lookup=self._cache_pii_lookup(cache)

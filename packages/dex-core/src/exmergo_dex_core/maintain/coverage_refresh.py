@@ -21,9 +21,10 @@ Four rules shape a batch.
   and priced first, for free, and the total is confirmed once; the runs then
   draw on that one reservation, each stopping where the batch's budget ends, and
   a model the budget did not reach is reported ``not_run``. Free on DuckDB.
-- **Free refusals cost nothing.** A Python model, a model with a
-  ``sql_header`` and a versioned model are read off the manifest and listed as
-  ``skipped``, never planned and never counted against the cap.
+- **Free refusals cost nothing.** A Python model and a model with a
+  ``sql_header`` are read off the manifest and listed as ``skipped``, never
+  planned and never counted against the cap. Each version of a versioned model
+  is a model of its own, run by its label (#1374).
 """
 
 from __future__ import annotations
@@ -78,9 +79,11 @@ class RefreshBatch:
     spend: dict[str, Any] | None = None
 
     def add_price(self, node: dict, estimate, per_table, notes) -> None:
+        from ..dbt_project import manifest_node_label
         from ..guards.cost_guard import UPTIME_LINE
 
-        label = str(node.get("name"))
+        # The label, so two versions of one model are priced apart (#1374).
+        label = manifest_node_label(str(node.get("unique_id")), node)
         if estimate is None:
             self.unpriced.append(label)
             return
@@ -142,9 +145,6 @@ def skip_reason(node: dict[str, Any]) -> str | None:
         return "python_model"
     if (node.get("config") or {}).get("sql_header"):
         return "sql_header"
-    if node.get("version") not in (None, ""):
-        # `transform test --mutate` names a model, and every version shares it.
-        return "versioned_model"
     return None
 
 
@@ -299,7 +299,7 @@ def refresh(
     def attempt(candidate: Candidate):
         return test_mutations(
             engine,
-            candidate.name,
+            candidate.label,
             target=target,
             refresh_batch=batch,
         )
@@ -367,7 +367,7 @@ def refresh(
                     {"model": candidate.label, "reason_code": "budget"}
                 )
                 continue
-            if batch.ceiling is not None and candidate.name in batch.unpriced:
+            if batch.ceiling is not None and candidate.label in batch.unpriced:
                 # Its baseline has no price, so nothing says it fits: a model
                 # never starts on a guess where the batch bills.
                 block["not_run"].append(
@@ -383,7 +383,7 @@ def refresh(
             # The baseline runs before any check inside the model, so it has
             # to fit in what is left before the model starts.
             if left is not None and (
-                left <= 0 or left < batch.baselines.get(candidate.name, 0.0)
+                left <= 0 or left < batch.baselines.get(candidate.label, 0.0)
             ):
                 exhausted = True
                 block["not_run"].append(

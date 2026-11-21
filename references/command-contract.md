@@ -46,7 +46,10 @@ logic.
   an interactive caller's clock, and resolving through the shared path is what
   keeps it from warming an environment the next command would contradict.
 - The engine prints **exactly one** sanitized JSON envelope to stdout and nothing
-  else. Diagnostics go to stderr.
+  else. Diagnostics go to stderr. That includes an argv the parser refuses (a
+  missing argument, an unknown flag or command, a bad value): a `reason: request`
+  error envelope carrying the parser's message, exit 1, with the usage on stderr.
+  Only `--help` and a bare `dex` print their own text, and exit 0.
 - Every envelope carries a constant `connection` block. On success it names the
   resolved connector, its non-secret target coordinates, and the source of that
   resolution (`flag`, `.dex/config.yml`, `environment variable`,
@@ -248,7 +251,12 @@ dex explore semantic query <m,m>  -> one governed metric query, capped and row-m
   [--order-by <c>] [--grain <g>]     connector, PII gate, read-only assertion, relation pre-check and cost
   [--limit N] [--local|--api]        handshake; --api sends it to a hosted dbt Cloud deployment, which executes
                                      server-side where dex's cost guard is structurally unavailable and every
-                                     result says so
+                                     result says so. A local list, values or query read from a compiled
+                                     semantic manifest older than a semantic YAML file warns with the file and
+                                     `dbt parse`, and so does its refusal of an unknown metric or dimension or
+                                     a query that fails to resolve. The check sees only newer files that parse
+                                     and still declare semantic_models or metrics, so no warning does not prove
+                                     the manifest current
 dex init [<name>]                -> complete project setup: new dbt-backed Dex project,
                                      complete DuckDB demo, existing dbt adoption, or
                                      exploration without dbt. .dex/ stays at repo root;
@@ -295,6 +303,13 @@ dex transform plan "<intent>"     -> proposed dbt edits as diffs (nothing applie
                                      or a declared population.parent removed or replaced is kind
                                      redriven (reason redriven, against applied or earlier_plan),
                                      declared only by an assumption at request or contract tier (#1228);
+                                     data.change_scope.removed_tests (#1420) lists each unit test,
+                                     data test (on a model or its versions, a snapshot, a seed or a
+                                     source table) and deleted singular test file the plan removes
+                                     (kind, name, model / models / snapshot / seed / source, version,
+                                     column, path) with a warning, even on a plan that rewrites no
+                                     model, and never refuses; an edited test, a moved one and one
+                                     carried to a model whose file the plan renames are not removed;
                                      data.model_versions reports each native dbt versioned model
                                      the plan touches: versions (label, file, file_source,
                                      relation), the default before and after, each consumer's ref
@@ -709,7 +724,15 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      separated by spaces ("a b"), none = every model. Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
                                      through transitively skipped parents), nodes that warned rather
-                                     than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
+                                     than failed, and models with no relation in the warehouse. Each
+                                     node is judged by the latest dated run that attempted it, across
+                                     the project's target path, Dex's artifact directory and the
+                                     per-node record each Dex build keeps (dex_node_runs.json), never
+                                     by the run results beside the newest manifest; each build finding
+                                     names its run (data.run: invocation_id, generated_at, command,
+                                     artifact, cold, source, invoked_by, logged, latest) and
+                                     data.build_status_runs lists the runs read (#1524).
+                                     Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
                                      the compiled SQL through its CTE chain, naming each join beside
                                      its own key and stating both counts; a fan-out on a model whose
@@ -834,8 +857,9 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      narrows, never widens; the rest named under refresh.elided),
                                      priced and confirmed once for the batch on a metered connector,
                                      a budget that runs out leaving the rest under refresh.not_run
-                                     (reason_code budget); Python, sql_header and versioned models
-                                     are refresh.skipped for free; a model with no SQL to plant a
+                                     (reason_code budget); Python and sql_header models are
+                                     refresh.skipped for free, and each version of a versioned
+                                     model is refreshed by its label; a model with no SQL to plant a
                                      defect in is recorded and reads untestable (reason
                                      no_mutable_sql) until it changes. Dev target only; refused in
                                      values-free mode. Report only: status ok whatever the coverage.
@@ -1028,7 +1052,20 @@ missing package and `transform deps`. The check reads the post-edit tree
 (#1166): a package the plan's own `packages_yml` edit declares is refused the
 same way, with the route spelled out (the `packages_yml` edit as a plan of its
 own, applied, `transform deps`, then the rest); a `packages_yml`-only plan needs
-no parse and is stored. Installing the packages a project
+no parse and is stored. `--no-parse` (`DexEngine.plan(..., no_parse=True)`,
+#1517) stores a plan without starting dbt at all, for a host that must not run
+repository-controlled code (Jinja, macros, project hooks) where it authors: it
+skips the parse gate (a warning says so, and `data.model_versions` reads
+`unchecked` with `parse_skipped`), the parse of a declared mart's derivation
+(reported `unvalidated` under `data.semantic_proposal`, left out of the
+plan and offered under its `definitions` for `semantic plan` where dbt parses), compilation, and the package check that protects them. Every structural
+gate still runs: admission and placement, deletions, the PII and secret guards,
+hash pinning and the diffs. A model with Jinja control flow is refused with the
+error a missing compile raises, since nothing else can check it; a model that
+only lists columns through a macro is checked from its SQL, as where dbt is
+absent, with a warning naming it; and a `toggle` contract, whose check compiles
+every model, is refused. The caller parses the post-change project elsewhere,
+for example a `transform build --for-plan-file` in its sandbox. Installing the packages a project
 declares (at the versions `package-lock.yml` pins, where it matches) is not
 installing or upgrading a tool. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path
@@ -1097,6 +1134,16 @@ counted toward the cap: its boundary is untested by the run. `UNBOUNDED` and
 such a bound is refused, naming it. Each finding is written as the defect rather than as a diff,
 and carries `suggested_test`, because the reader's next action is to write a
 test.
+
+**A versioned model.** Each version is its own model, with its own SQL, tests and
+record, so a run measures one. `<model>.v<N>`, the label `transform declare`
+takes, names that version (#1374). The bare name measures the version an
+unversioned `ref('<model>')` resolves to (its `latest_version`, else the greatest
+version), with a warning, and `data.model` is always the label of the version
+measured. A version the model does not list, a label on a model with no versions,
+and a version's file stem (`<model>_v<N>`) are refused for free, the last naming
+the label. `--downstream` routes each mutant to the models that `ref()` the version
+measured, never to readers of another version.
 
 **Where a mutant lives.** In a throwaway copy of the project, and nowhere else.
 Each one is written with `materialized='ephemeral'`, so dbt inlines it into each
@@ -1321,6 +1368,19 @@ default, or a filter or operator after it is refused. A key naming a location
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests under `data_tests:` and PII flags in model and column `config.meta`)
   generated from the `.dex/` cache.
+- `transform plan` leaves out an edit whose content is identical to the
+  file already on disk (#1415): it is not in the diffs, `data.paths`, the
+  comparison offer or `transform compare`'s seed and snapshot check, and one
+  warning counts and names the skipped files ("N edits match the tree and were
+  skipped: ..."). A payload builder can resend a whole feature without its
+  unchanged files raising obligations. A declaration whose rendered YAML is
+  already the file is skipped the same way. A payload whose every edit matches
+  the tree, declarations included, stores no plan: `data.plan_id` and
+  `data.plan_path` are null and a note says so, as on `transform declare`. Identical is apply's own
+  no-op test (the file read as text), so a CRLF checkout resending LF content is
+  skipped too. A delete is never skipped, and neither is a model file the
+  payload's `declarations` name: resending a model's SQL beside its declaration
+  keeps the model in the plan, where a `--for-plan` build verifies it.
 - `transform plan` stamps a model it **creates** with the PII metadata of each
   flagged input column it carries through (`config.meta.contains_pii` and
   `pii_category`, with or without a declaration), and reports every judged
@@ -1329,6 +1389,76 @@ default, or a filter or operator after it is refused. A key naming a location
   other expression `unresolved` with a warning, a hand-written mark `kept` (or a
   `disagreement`), and a model that already exists `not_written`. The rule and
   the precedence: [`pii-policy.md`](pii-policy.md#pii-metadata-on-authored-models).
+- A declaration renders the built-in tests (`unique`, `not_null`,
+  `relationships`) always, and Dex's **generated tests** only where
+  `declarations.render_tests` in `.dex/config.yml` turns them on (#1449): `false`
+  by default, `true` for every kind this release renders, or a list of test
+  names and cadences. Each generated test carries a dbt tag fixed per kind,
+  `dex_every_run` or `dex_scheduled`, so an orchestrator selects them with
+  `--select tag:dex_scheduled` or leaves them out with `--exclude`. The plan
+  lists each one under `data.generated_tests` (`model`, `column`, `test`,
+  `cadence`, `claim`, a `variant` where one kind renders several tests on one
+  model, and a `status` of `added`, `already_listed`,
+  `not_rendered` with its `reason`, or `listed_while_off`). Turning the switch
+  off removes no test already written. A list entry this release does not render
+  is a non-fatal `unknown_test_kind` config problem. Each kind states the
+  connectors it supports (every one `maintain verify` runs its matching check
+  on); elsewhere it renders nothing and is `not_rendered` with
+  `reason: dialect_unsupported` (#1451). This release renders
+  `dex_unique_combination` for a declared grain of two or more columns (#1452),
+  on every connector: its `failures` count equals `grain_broken`'s
+  `duplicate_count`, a NULL grain value counts as a value, and the test returns
+  that count and never a key. It renders `dex_population_filter` (#1453) under
+  the column of each `population.filters` list, one test per `includes` or
+  `excludes` list, on every connector: its `failures` count equals
+  `population_contradicted`'s `contradicting_rows`, a NULL breaks an `includes`
+  list and never an `excludes` one, values compare as text where any value or
+  the column is text, and the test returns that count and never a value. A
+  filter on a column the model's SQL provably does not output renders nothing,
+  `not_rendered` with `reason: column_not_output`. `maintain verify` judges a
+  filter stating both lists as two rules, one per list. It renders
+  `dex_parent_population` (#1454) on the model entry twice per declared
+  `population.parent`, one test per `direction`, tagged `dex_scheduled`, on
+  every connector: `missing` fails with `parent_population_missing`'s
+  `missing_parents` and `unexpected` with `parent_population_unexpected`'s
+  `unexpected_keys`, both counting distinct non-NULL keys. The parent is an
+  argument written as a `ref()`, and the declaration's `population.filters`
+  scope the eligible parents of the `missing` test as `maintain verify` scopes
+  them: a filter whose column the parent lacks is skipped (where verify lowers
+  its finding to medium, the test fails with the same count). A model-level test
+  whose grain or key columns the model provably does not output renders nothing,
+  `column_not_output`. It renders `dex_unit_range` (#1455) under each column
+  declared `unit: fraction`, tagged `dex_every_run`, on every connector: it
+  fails with the count of non-NULL values below 0 or above 1, which equals
+  `unit_out_of_range`'s `out_of_range_rows` (a field the fraction finding now
+  carries), a NULL never counts, a column holding only NULLs passes where
+  `maintain verify` notes it unchecked, and a column that is not a number (text,
+  a boolean, a date or time) is checked by neither. A column declared
+  `unit: percent` renders nothing, `not_rendered` with `reason: heuristic_only`,
+  because `maintain verify`'s percent rule (every value within 0 to 1) is a
+  question correct small percentages also raise. It renders
+  `dex_join_coverage` (#1456) on the model entry for each INNER join a
+  `references` requires (a key column declaring a `references` that names the
+  joined model, read by `maintain verify`'s own `join_policy`), tagged
+  `dex_scheduled`, on every connector: the plan reads the join from the model's
+  SQL as it leaves it (each `ref()` and `source()` standing for its relation)
+  and writes its inputs as arguments, `child`/`child_columns`,
+  `parent`/`parent_columns`, and the `child_where`/`parent_where` filters the
+  model applies before joining, in the connector's dialect; its `failures`
+  count equals the join contract's `unmatched_rows`, a NULL key is left out
+  unless the key column is declared `null_rule: never` (`null_keys:
+  unmatched`), a duplicated parent key multiplies nothing, and the test returns
+  that count and never a key. A required LEFT join to a parent the model
+  filters first renders it too, since `relationships` reads the whole parent;
+  one to the whole parent renders nothing,
+  `not_rendered` with `reason: covered_by_builtin`; a key conversion, a grouped
+  side, a RIGHT or FULL join, a side that is no `ref()` or `source()` or a
+  filter that does not transpile is `join_shape_unsupported`; SQL holding other
+  Jinja, or not parsing, is `join_unread`, once per declared `references`; and a
+  listed `dex_join_coverage` whose join the SQL no longer writes is reported
+  `stale` (`reason: join_not_in_model`) with a warning, and never removed. The plan writes each
+  kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
+  `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

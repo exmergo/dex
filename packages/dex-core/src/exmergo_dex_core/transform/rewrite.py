@@ -1685,6 +1685,22 @@ def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str,
     return {name: {**body, "config": {"meta": meta}}}
 
 
+def generated_spec(
+    name: str, *, cadence: str, claim: str, arguments: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """A generated test as a declaration renders it (#1449).
+
+    The built-ins' shape (:func:`_unsampled`: the sampling flag and the claim)
+    plus the kind's cadence as a dbt tag, under ``config`` where dbt reads a
+    test's tags, so ``dbt build --select tag:dex_scheduled`` selects it. The
+    generic test's arguments go under ``arguments:``, dbt's spelling from 1.10.
+    """
+
+    [(_, rendered)] = _unsampled(name, claim=claim).items()
+    body: dict[str, Any] = {"arguments": dict(arguments)} if arguments else {}
+    return {name: {**body, "config": {"tags": [cadence], **rendered["config"]}}}
+
+
 def is_unsampled_render(test: Any, name: str) -> bool:
     """Whether a parsed test entry is exactly the test Dex renders as ``name``,
     with or without a claim id: the shape Dex may move, remove or claim."""

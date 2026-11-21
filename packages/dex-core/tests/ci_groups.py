@@ -53,6 +53,7 @@ GROUPS: dict[str, tuple[str, ...]] = {
     "mutation-equivalence": (f"{_T}test_mutation_equivalence.py",),  # 168s
     "mutation-downstream": (f"{_T}test_mutation_downstream.py",),  # 192s
     "mutation-incremental": (f"{_T}test_mutation_incremental.py",),  # 103s
+    "mutation-versions": (f"{_T}test_mutation_versions.py",),
     "transform-build": (  # 148s
         f"{_T}test_build",
         f"{_T}test_previous_build",
@@ -162,9 +163,55 @@ GROUPS: dict[str, tuple[str, ...]] = {
         f"{_T}test_unit_test_scaffold_incremental.py",
         f"{_T}test_unit_tests.py",
     ),
-    # Planning, attribution and the fast mutation command doubles; also
+    # Generated tests held to maintain verify on real dbt (189s in one file),
+    # split by test. Figures below from the 2026-11-20 run, Python 3.11.
+    "transform-parity": (  # 154s
+        f"{_T}test_generated_parity.py",
+        f"{_T}test_unit_range.py",
+        f"{_T}test_unique_combination.py",
+    ),
+    "transform-parity-b": (  # 160s
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_plan_writes_the_shipped_macro_beside_the_rendered_test",
+            "test_the_plan_writes_the_population_filter_macro",
+            "test_a_macro_that_lets_a_null_into_an_includes_list_fails_the_harness",
+            "test_the_parent_rows_agree_and_the_plan_writes_their_macro",
+            "test_a_macro_that_ignores_the_filters_fails_the_harness",
+            "test_a_left_join_read_as_optional_despite_its_references_fails_the_harness",
+            "test_the_unit_rows_agree_and_a_percent_renders_nothing",
+        ),
+        f"{_T}test_generated_tests.py",
+        f"{_T}test_change_scope.py",
+    ),
+    # dex_join_coverage (#1456): its parity rows and its own file.
+    "transform-parity-join": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_join_rows_agree_and_a_left_join_renders_nothing",
+            "test_a_macro_reading_the_output_misses_the_inner_join_and_fails_the_harness",
+            "test_a_macro_ignoring_the_filter_fails_the_harness",
+        ),
+        f"{_T}test_join_coverage_render.py",
+    ),
+    "transform-e2e": (  # 148s
+        f"{_T}test_package_repair_e2e.py",
+        f"{_T}test_test_only_plan_e2e.py",
+    ),
+    "transform-impact": (  # 171s
+        f"{_T}test_population_delta_build.py",
+        f"{_T}test_introduced_findings_e2e.py",
+        f"{_T}test_downstream_impact_e2e.py",
+    ),
+    "transform-population": (  # 147s
+        f"{_T}test_population_filter.py",
+        f"{_T}test_parent_population.py",
+        f"{_T}test_row_attribution.py",
+        f"{_T}test_identifier_conversion.py",
+    ),
+    # Planning, PII stamps and the fast mutation command doubles; also
     # catches every new transform file by default.
-    "transform": (_T,),  # about 90s
+    "transform": (_T,),  # 127s
     "explore-maintain": ("tests/explore/", "tests/maintain/", "tests/demo/"),  # 187s
     "packaging": ("tests/test_packaging.py",),  # 58s
     # Connectors, guards, storage, native semantic vendors, top-level contracts,

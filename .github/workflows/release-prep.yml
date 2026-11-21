@@ -1,0 +1,69 @@
+name: Release prep
+
+# A release is prepared in a pull request (scripts/prepare_release.sh, then commit),
+# and release.yml only verifies the tagged commit after the merge, when a mistake
+# costs a re-tag. This checks the same pull request before it merges, and runs only
+# when the pull request touches a file the script writes, which in practice means a
+# release.
+#
+# - The versions are what each reader expects (scripts/check_release_versions.py):
+#   bare PEP 440 engine pins, the newest CHANGELOG.md section titled with that
+#   version, and bare semver plugin manifests that agree with it. Re-running the
+#   script cannot catch a wrong argument, since it reproduces it; this can.
+# - Where the pull request adds a CHANGELOG.md release section, the tree is exactly
+#   what prepare_release.sh writes for that version, as release.yml checks at tag
+#   time: a forgotten `git add claude`, or a skill edited after the script ran,
+#   fails here. Only then, because claude/ moves with each release and not with
+#   main, so on any other pull request a re-run would rightly differ.
+#
+# Read-only and secret-free, so it runs the same for pull requests from forks.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - CHANGELOG.md
+      - .claude-plugin/plugin.json
+      - .codex-plugin/plugin.json
+      - plugin.json
+      - gemini-extension.json
+      - claude/**
+      - skills/*/scripts/run.py
+      - packages/dex-core/pyproject.toml
+      - scripts/prepare_release.sh
+      - scripts/check_release_versions.py
+      - .github/workflows/release-prep.yml
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request checks out its merge commit, whose first parent is the
+          # base branch tip, so two commits are enough to diff the pull request.
+          fetch-depth: 2
+      - name: Engine pins, CHANGELOG.md and plugin manifests carry release-shaped versions
+        run: python3 scripts/check_release_versions.py
+      - name: A release pull request is exactly what prepare_release.sh writes
+        run: |
+          added="$(git diff HEAD^1 HEAD -- CHANGELOG.md | grep -E '^\+## \[' || true)"
+          if [ -z "${added}" ]; then
+            echo "This pull request adds no CHANGELOG.md release section; nothing to re-run."
+            exit 0
+          fi
+          VERSION="$(sed -nE 's/^fallback_version = "([^"]*)"/\1/p' packages/dex-core/pyproject.toml)"
+          PLUGIN_VERSION="$(jq -r .version .claude-plugin/plugin.json)"
+          echo "Re-running scripts/prepare_release.sh ${VERSION} ${PLUGIN_VERSION}"
+          # The section exists by now, so towncrier is never invoked.
+          scripts/prepare_release.sh "${VERSION}" "${PLUGIN_VERSION}" >/dev/null
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "The pull request differs from what prepare_release.sh ${VERSION} ${PLUGIN_VERSION} writes:"
+            git status --short
+            git --no-pager diff
+            echo "Run it, commit the result (git add claude && git commit -a), and push."
+            exit 1
+          fi
+          echo "The pull request is exactly what prepare_release.sh ${VERSION} ${PLUGIN_VERSION} writes."

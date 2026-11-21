@@ -206,7 +206,21 @@ Needs no baseline. The classes of finding:
   (naming the one that actually failed, through a chain of skipped parents);
   nodes that warned rather than failed (`node_warned`, ranked low, because a
   project running relationship tests at `severity: warn` has warnings by design);
-  and models the project declares that built no relation.
+  and models the project declares that built no relation. Each node is judged
+  by the latest dated run that attempted it (#1524): every building
+  `run_results.json` in the project's target path and in Dex's artifact
+  directory, ordered by dbt's `generated_at`, plus the per-node record each
+  `transform build` keeps in `dex_node_runs.json` (statuses only), since Dex's
+  builds overwrite one file. Never the run results beside the newest manifest:
+  a `dbt parse` rewrites a manifest and runs nothing. A compile is never read,
+  and a node the current manifest no longer has is not reported. A run no dbt
+  log names is still read, with a warning and `logged: false`, since a rotated
+  log is no proof it came from elsewhere. Each finding names its run under `data.run`
+  (`invocation_id`, `generated_at`, `command`, `artifact`, `cold`, `source`,
+  `invoked_by`: `dex`, `outside_dex` or `unknown`, `logged` and `latest`), and `detail`
+  says so in words, marking a failure read from an earlier run than the latest.
+  A skip names its failed parent from its own run only.
+  `data.build_status_runs` lists the runs read.
 - **Row population**: `row_loss` where a model holds materially fewer rows than
   its **driving parent** (the relation in its FROM clause, followed through the
   CTE chain, as distinct from anything it joins) and nothing in its SQL accounts
@@ -260,8 +274,13 @@ Needs no baseline. The classes of finding:
   `data.join_coverage`, one record per join:
   - `declared`: what the declaration says about the join. It is `required` when
     a column it supplies is declared `null_rule: never` on a LEFT join, or the
-    column carrying the driving key is a `foreign_key` whose `references`
-    names the joined relation. `optional` is set when every column it supplies
+    column carrying the driving key declares a `references` that names the
+    joined relation, whatever its `role` and on a LEFT join too (#1459): a
+    `references` means every non-null value exists in the parent, which is how
+    the `relationships` test it renders reads it, so a missing reference is
+    written as a NULL and passes both. A version label
+    (`dim_teams.v2.team_id`) names that version's relation, and a bare name
+    the version an unversioned `ref()` resolves to. `optional` is set when every column it supplies
     states a NULL rule other than `never`. NULL keys are `excluded`, or
     counted `unmatched` where the key's column is `null_rule: never`.
   - `measured` and `coverage`: eligible, matched and unmatched rows and
@@ -273,16 +292,28 @@ Needs no baseline. The classes of finding:
     conversion fails on stay eligible and unmatched, and are counted apart as
     `measured.conversion_failed_rows` and `conversion_failed_keys`, so a failed
     cast reads differently from a missing parent.
-  - `effective_input` (#1085), on a join one of whose sides is read through a
-    filtering CTE or subquery: per side, the physical `relation`, the scopes it
-    was read `through` and the `filters` the probe applied to it. The measured
-    counts are over those rows, so a key present only in rows the filter drops
-    is not a match. Carried only when every filtering hop reads one relation,
-    its only reducing clause is a `WHERE`, and each conjunct is a row-by-row
-    condition over columns and literals (comparisons, `IN` over a literal list,
-    `BETWEEN`, `LIKE`, `IS`, boolean logic, `coalesce`, casts and
-    `lower`/`upper`/`trim`, as in `where coalesce(_fivetran_active, true)`)
-    that traces to the key's own physical relation.
+  - `effective_input` (#1085, #1324), on a join one of whose sides is read
+    through a filtering or grouped CTE or subquery: per side, the physical
+    `relation`, the scopes it was read `through` and the `filters` the probe
+    applied to it. The measured counts are over those rows, so a key present
+    only in rows the filter drops is not a match. Carried only when every
+    filtering hop reads one relation, its only reducing clause is a `WHERE`,
+    and each conjunct is a row-by-row condition over columns and literals
+    (comparisons, `IN` over a literal list, `BETWEEN`, `LIKE`, `IS`, boolean
+    logic, `coalesce`, casts and `lower`/`upper`/`trim`, as in
+    `where coalesce(_fivetran_active, true)`) that traces to the key's own
+    physical relation. A side grouped by *exactly* the join's key columns
+    (a direct `GROUP BY` over one input, with no `HAVING`, window, `LIMIT`,
+    set operation or grouping modifier (`ROLLUP`, `CUBE`, `GROUPING SETS`,
+    `GROUP BY ALL`), and optionally the supported `WHERE`) also carries
+    `grouped_by`, the key columns it groups by. That side is probed over its
+    groups, never the ungrouped relation underneath, and its own denominator
+    is `measured.group_rows`. Its aggregate outputs are attributed through the
+    model's final projections, so `null_rule: never` on a renamed output
+    (`o.total_amount as spend`) still makes the join required, and an
+    aggregate the model does not project is not treated as supplied. A grouping by anything else (an extra column, a
+    subset of a composite key, an expression, or a grouping inside another
+    grouping) stays `filtered_cte`.
   - `status`: `satisfied`, `contradicted` (with the finding), `not_applicable`
     (an empty input or all-NULL keys: no coverage, which is not full coverage)
     or `unchecked`, with a `reason_code`: `non_equality_join`,
@@ -291,8 +322,9 @@ Needs no baseline. The classes of finding:
     on Postgres, which has no cast that returns NULL, to a type other than
     `smallint`, `integer` or `bigint`: those are measured through a guarded cast), `key_and_filter_condition`, `ambiguous_using`, `unresolved_column`,
     `set_operation_cte` (a column read through a UNION CTE, which is not a
-    warehouse table), `filtered_cte` (a filtering scope of any other shape: a
-    `GROUP BY`, `DISTINCT`, `LIMIT`, `HAVING`, `QUALIFY`, a join beside the
+    warehouse table), `filtered_cte` (a reducing scope of any other shape: a
+    `GROUP BY` other than exactly the join's key columns, `DISTINCT`, `LIMIT`,
+    `HAVING`, `QUALIFY`, a join beside the
     filter, a subquery or clock function in it, or a filter on a computed or
     window column such as `rn = 1`, or a join that can drop rows of the
     relation the key is read from: an inner, bare, comma or CROSS join, a
@@ -306,9 +338,14 @@ Needs no baseline. The classes of finding:
     No threshold. `low` when every column the join supplies is declared as
     allowed to be NULL.
   - `join_orphans` and `join_zero_overlap`: on a required join any unmatched
-    row (`threshold_source: contract`, high). Otherwise the stated defaults,
+    row (`threshold_source: contract`, high). With `declarations.render_tests`
+    on, an INNER join so required also renders `dex_join_coverage`, a build
+    test reading the same two inputs and failing with the same
+    `unmatched_rows` (#1456); a LEFT one to the whole parent leaves that to
+    `relationships`.
+    Otherwise the stated defaults,
     0.2 and 0.9 of eligible rows (`threshold_source: default`). On a LEFT join
-    with no requirement, unmatched rows are the optional relationship the join
+    with no requirement (no `references` on its driving key), unmatched rows are the optional relationship the join
     writes: no `join_orphans`, and `join_zero_overlap` at medium. On an INNER
     join with no requirement whose unmatched rows the declaration accounts for
     (an `assumptions` entry whose `column` names the driving key column, or a
@@ -521,10 +558,11 @@ one coverage number.
     target only (`--target`).
   - `refresh.skipped` lists models a run would refuse, read off the manifest at
     no cost and not counted toward the cap: Python models, models with a
-    `sql_header`, versioned models, whose versions share the name
-    `transform test --mutate` takes, and, on a metered connector, a model only
+    `sql_header`, and, on a metered connector, a model only
     downstream tests read (`downstream_only`), since routing a mutant through
     them is opt-in there (`transform test --mutate <model> --downstream`).
+  - Each version of a versioned model is a model of its own: it reads its own
+    strength and is refreshed by its label (`fct.v2`).
   - A model whose tests pass no baseline is recorded too: it reads `missing`
     with `last_refusal`, and a refresh retries it after the models it has not
     tried yet, so it never holds the first slots. It never replaces a score

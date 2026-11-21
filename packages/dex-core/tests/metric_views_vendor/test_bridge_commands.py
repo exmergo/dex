@@ -347,19 +347,12 @@ def test_into_places_the_ossie_document(tmp_path, capsys):
 
 def test_the_bridge_flag_of_the_other_vendor_is_not_a_flag(tmp_path, capsys):
     ossie_repo(tmp_path)
-    with pytest.raises(SystemExit):
-        main(
-            [
-                "--repo-root",
-                str(tmp_path),
-                "semantic",
-                "ossie",
-                "plan",
-                "--from-ossie",
-                "x",
-            ]
-        )
-    capsys.readouterr()
+    rc = main(
+        ["--repo-root", str(tmp_path), "semantic", "ossie", "plan", "--from-ossie", "x"]
+    )
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert "unrecognized arguments: --from-ossie" in out["errors"][0]
 
 
 def test_the_vendor_must_be_the_configured_one(tmp_path, capsys):

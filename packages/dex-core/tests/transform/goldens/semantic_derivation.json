@@ -142,7 +142,7 @@
       "vendor": "dbt"
     },
     "warnings": [
-      "semantic model for 'fct_orders' was derived and not offered (unvalidated): parse: dbt is not installed"
+      "semantic model for 'fct_orders' was derived and not added to this plan (unvalidated): parse: dbt is not installed"
     ]
   },
   "layer_included": {

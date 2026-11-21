@@ -1103,3 +1103,89 @@ def test_the_warning_counts_the_unchecked_tests_the_cap_cut(monkeypatch):
     commands._attach_completion(result, None, {"graph": graph})
     assert len(result.completion.assurance.unchecked_tests) == 5
     assert any(line.startswith("9 passing Elementary") for line in result.warnings)
+
+
+# --- a versioned deliverable named by its file stem (#1499) ---------------------
+
+
+def _versioned(test_status: str) -> tuple[list[BuildNode], dict[str, list[str]]]:
+    """``dim_customers.v2`` built, with one data test on it in ``test_status``."""
+
+    uid = "model.dex_test.dim_customers.v2"
+    test = "test.dex_test.not_null_dim_customers_v2_id.1"
+    nodes = [
+        BuildNode(unique_id=uid, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=test,
+            name="not_null_dim_customers_v2_id",
+            resource_type="test",
+            status=test_status,
+        ),
+    ]
+    return nodes, {test: [uid]}
+
+
+@pytest.mark.parametrize("required", ["dim_customers_v2", "dim_customers.v2"])
+def test_a_versioned_deliverable_a_passing_test_checked_is_asserted(required):
+    nodes, graph = _versioned("pass")
+    completion = summarize_completion(
+        _evidence(nodes, required=[required]), None, graph=graph
+    )
+    assert completion.assurance.asserted.names == [required]
+    assert completion.assurance.build_only.names == []
+
+
+@pytest.mark.parametrize("required", ["dim_customers_v2", "dim_customers.v2"])
+def test_a_versioned_deliverable_a_failing_test_checked_is_failed(required):
+    nodes, graph = _versioned("fail")
+    completion = summarize_completion(
+        _evidence(nodes, required=[required]), None, graph=graph
+    )
+    failed = completion.assurance.failed_checks
+    assert failed.names == [required]
+    assert [(c.model, c.name) for c in failed.checks] == [
+        ("dim_customers.v2", "not_null_dim_customers_v2_id")
+    ]
+    assert completion.assurance.build_only.names == []
+
+
+def test_a_versioned_deliverable_nothing_checked_is_build_only():
+    nodes, _ = _versioned("pass")
+    completion = summarize_completion(
+        _evidence(nodes[:1], required=["dim_customers_v2"]), None, graph={}
+    )
+    assert completion.assurance.build_only.names == ["dim_customers_v2"]
+    assert completion.assurance.asserted.names == []
+
+
+def test_an_unversioned_deliverable_keeps_its_assurance():
+    nodes = [
+        BuildNode(unique_id=_uid("checked"), name="checked", status="success"),
+        BuildNode(unique_id=_uid("failing"), name="failing", status="success"),
+        BuildNode(unique_id=_uid("unchecked"), name="unchecked", status="success"),
+        BuildNode(
+            unique_id="test.dex_test.ok.1",
+            name="ok",
+            resource_type="test",
+            status="pass",
+        ),
+        BuildNode(
+            unique_id="test.dex_test.bad.2",
+            name="bad",
+            resource_type="test",
+            status="fail",
+        ),
+    ]
+    graph = {
+        "test.dex_test.ok.1": [_uid("checked")],
+        "test.dex_test.bad.2": [_uid("failing")],
+    }
+    completion = summarize_completion(
+        _evidence(nodes, required=["checked", "failing", "unchecked"]),
+        None,
+        graph=graph,
+    )
+    assurance = completion.assurance
+    assert assurance.asserted.names == ["checked"]
+    assert assurance.failed_checks.names == ["failing"]
+    assert assurance.build_only.names == ["unchecked"]

@@ -434,6 +434,44 @@ def assert_definitions_only(
         )
 
 
+def _assert_macro_file(path: str, content: str) -> None:
+    """A macro file: macro definitions and, as dbt reads them from the macro
+    paths too, generic test definitions (``{% test %}``), the way a package
+    ships a test beside the dispatched macros that implement it. Each kind is
+    held to its own balance, and nothing loose may sit between them. A block
+    inside a Jinja comment is not a definition, so comments go first."""
+
+    content = _JINJA_COMMENT.sub("", content)
+    if not (_TEST_OPEN.search(content) or _TEST_CLOSE.search(content)):
+        assert_definitions_only(
+            path,
+            content,
+            keyword="macro",
+            open_re=_MACRO_OPEN,
+            close_re=_MACRO_CLOSE,
+            block_re=_MACRO_BLOCK,
+        )
+        return
+    assert_definitions_only(
+        path,
+        _MACRO_BLOCK.sub("", content),
+        keyword="test",
+        open_re=_TEST_OPEN,
+        close_re=_TEST_CLOSE,
+        block_re=_TEST_BLOCK,
+    )
+    rest = _TEST_BLOCK.sub("", content)
+    if _MACRO_OPEN.search(rest) or _MACRO_CLOSE.search(rest):
+        assert_definitions_only(
+            path,
+            rest,
+            keyword="macro",
+            open_re=_MACRO_OPEN,
+            close_re=_MACRO_CLOSE,
+            block_re=_MACRO_BLOCK,
+        )
+
+
 def _assert_query_only(path: str, content: str, noun: str) -> list[str]:
     """Refuse SQL that is not a single read-only SELECT, once jinja is stripped.
 
@@ -908,14 +946,7 @@ def validate_edit(
 
     warnings: list[str] = []
     if edit.kind is EditKind.MACRO_SQL:
-        assert_definitions_only(
-            edit.path,
-            edit.new_content,
-            keyword="macro",
-            open_re=_MACRO_OPEN,
-            close_re=_MACRO_CLOSE,
-            block_re=_MACRO_BLOCK,
-        )
+        _assert_macro_file(edit.path, edit.new_content)
     elif edit.kind is EditKind.TEST_SQL:
         # Two shapes share the test paths and only the content tells them apart.
         # A generic test is a macro under another keyword, so it gets the

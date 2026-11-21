@@ -310,6 +310,60 @@ def test_a_fraction_above_one_is_out_of_range_and_states_the_range(tmp_path: Pat
     assert finding.data["max"] == 100.0
     assert "from 10 to 100" in finding.detail
     assert "unit" not in result.suppressed
+    # Every row sits above one: the count dex_unit_range fails with (#1455).
+    assert finding.data["out_of_range_rows"] == 10
+    assert "(10 rows outside it)" in finding.detail
+
+
+def test_a_fraction_counts_only_the_rows_outside_the_range(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns={"share": {"unit": "fraction"}})},
+        "CREATE TABLE t AS SELECT * FROM (VALUES (0.5), (1.5), (-0.2), (NULL), "
+        "(1.0), (0.0)) v(share)",
+    )
+    [finding] = result.findings
+    assert finding.data["out_of_range_rows"] == 2
+    assert finding.data["non_null_count"] == 5
+
+
+def test_a_fraction_just_past_one_is_out_of_range_though_its_max_rounds_to_one(
+    tmp_path: Path,
+):
+    # MAX reads back as the float 1.0; the exact count still says one row.
+    result = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns={"share": {"unit": "fraction"}})},
+        "CREATE TABLE t AS SELECT * FROM (VALUES "
+        "(CAST('1.000000000000000001' AS DECIMAL(19,18))), "
+        "(CAST('1' AS DECIMAL(19,18))), (CAST('0.5' AS DECIMAL(19,18)))) v(share)",
+    )
+    [finding] = result.findings
+    assert finding.data["out_of_range_rows"] == 1
+
+
+def test_a_fraction_of_exactly_one_passes(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"model.p.t": _model("t", columns={"share": {"unit": "fraction"}})},
+        "CREATE TABLE t AS SELECT * FROM (VALUES (CAST('1' AS DECIMAL(19,18))), "
+        "(CAST('0' AS DECIMAL(19,18)))) v(share)",
+    )
+    assert result.findings == []
+
+
+def test_a_percent_states_no_out_of_range_count(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {
+            "model.p.shares": _model(
+                "shares", columns={"small_percent": {"unit": "percent"}}
+            )
+        },
+        _SHARES,
+    )
+    [finding] = result.findings
+    assert "out_of_range_rows" not in finding.data
 
 
 def test_a_fraction_within_range_is_checked_and_clean(tmp_path: Path):
@@ -440,6 +494,33 @@ def test_an_includes_list_counts_every_other_value_and_null(tmp_path: Path):
     assert finding.data["contradicting_rows"] == 50
     assert finding.data["null_rows"] == 25
     assert "25 of them NULL" in finding.detail
+
+
+def test_a_filter_with_both_lists_judges_each_list_on_its_own(tmp_path: Path):
+    """#1453: a filter stating both ``includes`` and ``excludes`` is two rules.
+    It once probed ``IN (includes)`` as the excluded set, so every included
+    value read as a contradiction."""
+
+    result = _run(
+        tmp_path,
+        {
+            "model.p.orders": _model(
+                "orders",
+                dex=_population(
+                    includes=["paid", "shipped", "cancelled"], excludes=["cancelled"]
+                ),
+            )
+        },
+        _ORDERS,
+    )
+    by_list = {
+        "excludes" if "excludes" in f.data else "includes": f.data
+        for f in result.findings
+    }
+    assert _codes(result) == ["population_contradicted"] * 2
+    assert by_list["excludes"]["contradicting_rows"] == 25
+    assert by_list["includes"]["contradicting_rows"] == 25
+    assert by_list["includes"]["null_rows"] == 25
 
 
 def test_a_population_the_sql_implements_is_checked_and_clean(tmp_path: Path):

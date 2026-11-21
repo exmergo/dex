@@ -405,6 +405,363 @@ def test_plan_without_content_is_a_clean_error(
     assert "edits-file" in envelope["errors"][0]
 
 
+# --- edits that match the tree (#1415) ----------------------------------------
+
+_ON_DISK = "select 1 as id, 'a@example.com' as email\n"
+
+
+def _plan_payload(tmp_path: Path, capsys, edits: list[dict]) -> tuple[int, dict]:
+    payload = _write_payload(tmp_path, edits)
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "regenerate",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def test_an_edit_matching_the_tree_is_left_out_of_the_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    rc, envelope = _plan_payload(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "content": _ON_DISK,
+            },
+            {
+                "path": "models/staging/stg_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            },
+        ],
+    )
+    assert rc == 0, envelope
+    data = envelope["data"]
+    assert data["paths"] == ["models/staging/stg_orders.sql"]
+    assert [d["path"] for d in envelope["diffs"]] == ["models/staging/stg_orders.sql"]
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/stg_customers.sql"
+        in envelope["warnings"]
+    )
+
+
+def test_an_unchanged_model_resent_with_a_declaration_is_kept(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Resending a model's SQL beside its declaration keeps the model in the
+    plan, where `--for-plan` verification looks for it; an unchanged file the
+    payload does not declare is still skipped."""
+
+    (dbt_project_dir / "models" / "staging" / "stg_other.sql").write_text(
+        "select 2 as id\n", encoding="utf-8"
+    )
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "edits": [
+                    {
+                        "path": "models/staging/stg_customers.sql",
+                        "kind": "model_sql",
+                        "content": _ON_DISK,
+                    },
+                    {
+                        "path": "models/staging/stg_other.sql",
+                        "kind": "model_sql",
+                        "content": "select 2 as id\n",
+                    },
+                ],
+                "declarations": [
+                    {
+                        "model": "stg_customers",
+                        "description": "One row per customer.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    paths = envelope["data"]["paths"]
+    assert "models/staging/stg_customers.sql" in paths
+    assert "models/staging/stg_other.sql" not in paths
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/stg_other.sql"
+        in envelope["warnings"]
+    )
+
+
+_VERSIONED_YML = """\
+version: 2
+models:
+  - name: dim_teams
+    latest_version: 1
+    columns:
+      - name: team_id
+      - name: team_label
+    versions:
+      - v: 1
+        defined_in: dim_teams
+      - v: 2
+"""
+_DIM_V1 = "select team_id, team_label from {{ ref('stg_teams') }}\n"
+_DIM_V2 = "select team_id, upper(team_label) as team_label from {{ ref('stg_teams') }}"
+
+
+def _plan_versioned(
+    dbt_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    edits: list[dict],
+    declarations: list[dict],
+) -> dict:
+    """Plan ``edits`` and ``declarations`` over a project whose `dim_teams` has
+    version 1 in `dim_teams.sql` (the latest) and version 2 in `dim_teams_v2.sql`."""
+
+    marts = dbt_project_dir / "models" / "marts"
+    marts.mkdir()
+    (dbt_project_dir / "models" / "staging" / "stg_teams.sql").write_text(
+        "select 1 as team_id, 'a' as team_label\n", encoding="utf-8"
+    )
+    (marts / "dim_teams.sql").write_text(_DIM_V1, encoding="utf-8")
+    (marts / "dim_teams_v2.sql").write_text(_DIM_V2, encoding="utf-8")
+    (marts / "_marts.yml").write_text(_VERSIONED_YML, encoding="utf-8")
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps({"edits": edits, "declarations": declarations}), encoding="utf-8"
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope["errors"]
+    return envelope
+
+
+_RESENT_VERSIONS = [
+    {"path": "models/marts/dim_teams.sql", "kind": "model_sql", "content": _DIM_V1},
+    {"path": "models/marts/dim_teams_v2.sql", "kind": "model_sql", "content": _DIM_V2},
+]
+
+
+def test_a_declared_version_keeps_its_own_file_not_the_bare_names(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`dim_teams.v2` is built from `dim_teams_v2.sql`: that file stays in the
+    plan, and the unchanged `dim_teams.sql` (version 1) is still skipped."""
+
+    envelope = _plan_versioned(
+        dbt_project_dir,
+        tmp_path,
+        capsys,
+        _RESENT_VERSIONS,
+        [{"model": "dim_teams.v2", "description": "One row per team."}],
+    )
+    paths = envelope["data"]["paths"]
+    assert "models/marts/dim_teams_v2.sql" in paths
+    assert "models/marts/dim_teams.sql" not in paths
+    assert (
+        "1 edit matches the tree and was skipped: models/marts/dim_teams.sql"
+        in envelope["warnings"]
+    )
+
+
+def test_a_bare_name_declared_with_a_promotion_keeps_the_new_latest_file(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """The plan promotes version 2, so the bare `dim_teams` it declares is
+    `dim_teams_v2.sql` as the plan leaves the tree, not version 1 as it was."""
+
+    promoted = _VERSIONED_YML.replace("latest_version: 1", "latest_version: 2")
+    envelope = _plan_versioned(
+        dbt_project_dir,
+        tmp_path,
+        capsys,
+        [
+            *_RESENT_VERSIONS,
+            {
+                "path": "models/marts/_marts.yml",
+                "kind": "schema_yml",
+                "content": promoted,
+            },
+        ],
+        [{"model": "dim_teams", "description": "One row per team."}],
+    )
+    paths = envelope["data"]["paths"]
+    assert "models/marts/dim_teams_v2.sql" in paths
+    assert "models/marts/dim_teams.sql" not in paths
+
+
+def test_an_edit_differing_only_in_line_endings_is_skipped(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Apply reads a CRLF file as LF text and writes nothing for an LF payload,
+    so a CRLF checkout resending its files is skipped too."""
+
+    on_disk = dbt_project_dir / "models" / "staging" / "stg_customers.sql"
+    on_disk.write_bytes(_ON_DISK.replace("\n", "\r\n").encode("utf-8"))
+    rc, envelope = _plan_payload(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "content": _ON_DISK,
+            },
+            {
+                "path": "models/staging/stg_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            },
+        ],
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["paths"] == ["models/staging/stg_orders.sql"]
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/stg_customers.sql"
+        in envelope["warnings"]
+    )
+
+
+def test_a_plan_whose_every_edit_matches_the_tree_stores_no_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """Nothing is left to plan, so nothing is stored and `plan_id` is null."""
+
+    rc, envelope = _plan_payload(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_customers.sql",
+                "kind": "model_sql",
+                "content": _ON_DISK,
+            }
+        ],
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["plan_id"] is None
+    assert envelope["data"]["paths"] == []
+    assert envelope["diffs"] == []
+    assert not (tmp_path / ".dex" / "plans").exists() or not any(
+        (tmp_path / ".dex" / "plans").glob("*.json")
+    )
+
+
+_DECLARATION = {"model": "stg_customers", "description": "One row per customer."}
+
+
+def _plan_declared(tmp_path: Path, capsys, edits: list[dict]) -> tuple[int, dict]:
+    payload = tmp_path / "edits.json"
+    payload.write_text(
+        json.dumps({"edits": edits, "declarations": [_DECLARATION]}),
+        encoding="utf-8",
+    )
+    return _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare",
+            "--edits-file",
+            str(payload),
+        ],
+        capsys,
+    )
+
+
+def _declared_on_disk(tmp_path: Path, capsys) -> set[str]:
+    """Plan and apply `_DECLARATION`, and return the plan ids then stored."""
+
+    rc, envelope = _plan_declared(tmp_path, capsys, [])
+    assert rc == 0, envelope
+    rc, applied = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, applied
+    return {p.name for p in (tmp_path / ".dex" / "plans").glob("*.json")}
+
+
+def test_a_declaration_that_changes_nothing_stores_no_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """A declaration whose rendered YAML is already the file is a no-op, the
+    answer `transform declare` gives: `plan_id` null and no plan stored."""
+
+    stored = _declared_on_disk(tmp_path, capsys)
+    rc, envelope = _plan_declared(tmp_path, capsys, [])
+    assert rc == 0, envelope
+    assert envelope["data"]["plan_id"] is None
+    assert envelope["data"]["plan_path"] is None
+    assert "declarations" not in envelope["data"]
+    assert envelope["diffs"] == []
+    assert {p.name for p in (tmp_path / ".dex" / "plans").glob("*.json")} == stored
+
+
+def test_an_unchanged_declaration_beside_a_real_edit_plans_only_the_edit(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _declared_on_disk(tmp_path, capsys)
+    rc, envelope = _plan_declared(
+        tmp_path,
+        capsys,
+        [
+            {
+                "path": "models/staging/stg_orders.sql",
+                "kind": "model_sql",
+                "content": "select 1 as id\n",
+            }
+        ],
+    )
+    assert rc == 0, envelope
+    assert envelope["data"]["plan_id"]
+    assert envelope["data"]["paths"] == ["models/staging/stg_orders.sql"]
+    assert [d["path"] for d in envelope["diffs"]] == ["models/staging/stg_orders.sql"]
+    assert (
+        "1 edit matches the tree and was skipped: models/staging/schema.yml"
+        in envelope["warnings"]
+    )
+
+
 # --- project config kinds (project_yml / profiles_yml) ------------------------
 #
 # These exercise the engine directly (`transform.plan`), which does not run dbt
