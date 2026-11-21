@@ -212,13 +212,15 @@ Needs no baseline. The classes of finding:
   directory, ordered by dbt's `generated_at`, plus the per-node record each
   `transform build` keeps in `dex_node_runs.json` (statuses only), since Dex's
   builds overwrite one file. Never the run results beside the newest manifest:
-  a `dbt parse` rewrites a manifest and runs nothing. A compile is never read, a
-  run no dbt log records is ignored with a warning, and a node the manifest no
-  longer has is not reported. Each finding names its run under `data.run`
+  a `dbt parse` rewrites a manifest and runs nothing. A compile is never read,
+  and a node the current manifest no longer has is not reported. A run no dbt
+  log names is still read, with a warning and `logged: false`, since a rotated
+  log is no proof it came from elsewhere. Each finding names its run under `data.run`
   (`invocation_id`, `generated_at`, `command`, `artifact`, `cold`, `source`,
-  `invoked_by`: `dex`, `outside_dex` or `unknown`, and `latest`), and `detail`
+  `invoked_by`: `dex`, `outside_dex` or `unknown`, `logged` and `latest`), and `detail`
   says so in words, marking a failure read from an earlier run than the latest.
-  `data.build_status_runs` lists the runs read and ignored.
+  A skip names its failed parent from its own run only.
+  `data.build_status_runs` lists the runs read.
 - **Row population**: `row_loss` where a model holds materially fewer rows than
   its **driving parent** (the relation in its FROM clause, followed through the
   CTE chain, as distinct from anything it joins) and nothing in its SQL accounts

@@ -167,7 +167,8 @@ class NodeResults:
 
     ``nodes`` maps a unique id to ``(result row, run)``, the run a
     :class:`~..transform.artifact_runtime.BuildingRun`. ``runs`` are the runs
-    read, oldest first; ``ignored`` the runs left out, each with its reason.
+    read, oldest first. ``logged`` holds, per run, whether a dbt log beside it
+    names its invocation (``None`` where there is nothing to check against).
     ``pinned`` is set inside a build's own ``--verify`` sweep, which reads that
     build's invocation and nothing else.
 
@@ -175,17 +176,15 @@ class NodeResults:
     artifact directory (or the build this sweep belongs to), ``outside_dex`` for
     the project's target path while Dex writes its own directory, and
     ``unknown`` for the project's target path when ``transform.artifacts`` is
-    ``shared``, where Dex's builds and anyone else's write the same file.
+    ``shared``, where Dex's builds and anyone else's write the same file, unless
+    Dex's node record names the invocation.
     """
 
     nodes: dict[str, tuple[dict, Any]] = field(default_factory=dict)
     runs: list[Any] = field(default_factory=list)
-    ignored: list[tuple[Any, str]] = field(default_factory=list)
+    logged: dict[int, bool | None] = field(default_factory=dict)
     pinned: bool = False
     artifact_policy: str = "isolated"
-    #: Every run Dex's node record holds, read or not, so a run in the shared
-    #: target path whose invocation the record names is known to be Dex's.
-    recorded: list[Any] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -201,13 +200,13 @@ class NodeResults:
         return {uid: str(row.get("status")) for uid, (row, _) in self.nodes.items()}
 
     def invoked_by(self, run: Any) -> str:
-        if self.pinned or run.artifact == "dex" or run.source == "dex_record":
-            return "dex"
         # Under `transform.artifacts: shared` Dex writes the project's target
         # path too; its node record says which invocations were its own.
-        if run.invocation_id and any(
-            other.source == "dex_record" and other.invocation_id == run.invocation_id
-            for other in self.recorded
+        if (
+            self.pinned
+            or run.artifact == "dex"
+            or run.source == "dex_record"
+            or run.recorded_by_dex
         ):
             return "dex"
         return "unknown" if self.artifact_policy == "shared" else "outside_dex"
@@ -218,11 +217,21 @@ class NodeResults:
         return {
             **run.describe(),
             "invoked_by": self.invoked_by(run),
+            "logged": self.logged.get(id(run)),
             "latest": run is self.newest,
         }
 
+    def run_statuses(self, run: Any) -> dict[str, str]:
+        """Every status one run recorded, apart from any other run's."""
+
+        return {
+            str(row["unique_id"]): str(row.get("status", "unknown"))
+            for row in run.document.get("results") or []
+            if isinstance(row, dict) and row.get("unique_id")
+        }
+
     def summary(self) -> dict[str, Any]:
-        """``data.build_status_runs``: every run read and every run left out."""
+        """``data.build_status_runs``: every run read."""
 
         attributed: dict[int, int] = {}
         for _, run in self.nodes.values():
@@ -231,9 +240,6 @@ class NodeResults:
             "runs": [
                 {**self.describe(run), "nodes": attributed.get(id(run), 0)}
                 for run in self.runs
-            ],
-            "ignored": [
-                {**run.describe(), "reason": reason} for run, reason in self.ignored
             ],
         }
 
@@ -258,10 +264,11 @@ def node_results(
     ``generated_at`` and overlaid oldest first, so a node a later run attempted
     is judged by that run. The run results beside the newest *manifest* are not
     the answer: a ``dbt parse`` rewrites a manifest and runs nothing, which
-    paired a fresh manifest with an older run's failures. A run no dbt log
-    beside it records came from somewhere else and is left out, as
-    ``maintain coverage`` leaves it out; a result for a node the manifest no
-    longer has is not attributed.
+    paired a fresh manifest with an older run's failures. A run whose invocation
+    the dbt logs beside it do not name is still read, since a rotated or cleaned
+    log is no proof the results came from elsewhere and dropping them could hide
+    a failure; it is marked ``logged: false`` and a warning names it. A result
+    for a node the current manifest no longer has is not attributed.
 
     Inside a build's own ``--verify`` sweep the build's directory and
     invocation are pinned, and only that invocation's results are read: another
@@ -310,26 +317,25 @@ def node_results(
 
     result = NodeResults(artifact_policy=policy)
     for run in building_runs(project_dir, include_records=True):
-        if run.source == "dex_record":
-            result.recorded.append(run)
-        if run_is_logged(project_dir, run) is False:
-            result.ignored.append((run, "not_logged"))
+        logged = run_is_logged(project_dir, run)
+        result.logged[id(run)] = logged
+        if logged is False:
             result.warnings.append(
-                f"build status ignores the {_run_label(run)}: no dbt log beside "
-                "its run_results.json records that invocation, so it was written "
-                "somewhere else (copied artifacts, another checkout)"
+                f"no dbt log beside the {_run_label(run)} names that invocation: its "
+                "results may have been copied from elsewhere, or the log rotated "
+                "or was cleaned; its statuses are still read, and each finding "
+                "from it carries data.run.logged: false"
             )
-            continue
         result.runs.append(run)
         for row in run.document.get("results") or []:
             if isinstance(row, dict) and row.get("unique_id"):
                 result.nodes[str(row["unique_id"])] = (row, run)
 
     document = manifest if manifest is not None else _manifest_document(project_dir)
-    known = set((document or {}).get("nodes") or {}) | set(
-        (document or {}).get("unit_tests") or {}
-    )
-    if known:
+    # Whenever a manifest is on disk, an empty one included: a project whose
+    # last nodes were removed has nothing for an old failure to name.
+    if document is not None:
+        known = set(document.get("nodes") or {}) | set(document.get("unit_tests") or {})
         gone = [uid for uid in result.nodes if uid not in known]
         for uid in gone:
             del result.nodes[uid]
@@ -421,9 +427,11 @@ def build_status_findings(
         node = nodes.get(uid) or unit_tests.get(uid)
         return manifest_node_label(uid, node if isinstance(node, dict) else None)
 
-    status_by_uid = results.statuses()
-
-    def failed_ancestor(uid: str, seen: set[str]) -> str | None:
+    def failed_ancestor(
+        uid: str, seen: set[str], status_by_uid: dict[str, str]
+    ) -> str | None:
+        # Read from the skipped node's own run: a parent another run failed
+        # did not cause this skip, so no cause is named rather than a wrong one.
         if uid in seen:
             return None
         seen.add(uid)
@@ -433,7 +441,7 @@ def build_status_findings(
             if status and status_kind(status) == "failed":
                 return name_of(dep)
             if status and status_kind(status) == "skipped":
-                found = failed_ancestor(dep, seen)
+                found = failed_ancestor(dep, seen, status_by_uid)
                 if found:
                     return found
         return None
@@ -491,7 +499,7 @@ def build_status_findings(
             )
             continue
         if kind == "skipped":
-            cause = failed_ancestor(uid, set())
+            cause = failed_ancestor(uid, set(), results.run_statuses(run))
             run_data, said = provenance(run)
             findings.append(
                 DriftFinding(

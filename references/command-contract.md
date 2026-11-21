@@ -730,8 +730,8 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      per-node record each Dex build keeps (dex_node_runs.json), never
                                      by the run results beside the newest manifest; each build finding
                                      names its run (data.run: invocation_id, generated_at, command,
-                                     artifact, cold, source, invoked_by, latest) and
-                                     data.build_status_runs lists the runs read and ignored (#1524).
+                                     artifact, cold, source, invoked_by, logged, latest) and
+                                     data.build_status_runs lists the runs read (#1524).
                                      Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
                                      the compiled SQL through its CTE chain, naming each join beside

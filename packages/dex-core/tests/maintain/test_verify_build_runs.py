@@ -192,6 +192,7 @@ def test_a_failure_names_the_run_it_was_read_from(project: Path) -> None:
         "cold": False,
         "source": "run_results",
         "invoked_by": "dex",
+        "logged": True,
         "latest": True,
     }
     assert f"dbt build run {DEX_FIX} at 2026-11-20T10:00:00" in finding.detail
@@ -292,9 +293,10 @@ def test_a_compile_never_supersedes_a_build(project: Path) -> None:
     assert finding.data["run"]["invocation_id"] == HAND
 
 
-def test_a_run_no_dbt_log_records_is_ignored_with_a_warning(project: Path) -> None:
-    """Copied artifacts, or another checkout's target path: the log beside the
-    project names other invocations, so these results are not this project's."""
+def test_a_run_no_dbt_log_records_is_still_read_and_marked(project: Path) -> None:
+    """The log beside the project names other invocations: the results may be
+    copied, or the log rotated or cleaned. Dropping them could hide a real
+    failure, so they are read, and the finding says no log names its run."""
 
     _write_run(
         project / "target",
@@ -307,11 +309,10 @@ def test_a_run_no_dbt_log_records_is_ignored_with_a_warning(project: Path) -> No
 
     findings, notes = verify_mod.build_status_findings(project)
 
-    assert findings == []
+    [finding] = findings
+    assert finding.data["run"]["invocation_id"] == FOREIGN
+    assert finding.data["run"]["logged"] is False
     assert any(FOREIGN in n and "no dbt log" in n for n in notes)
-    assert any("no dbt run results found" in n for n in notes)
-    results = verify_mod.node_results(project)
-    assert results.summary()["ignored"][0]["reason"] == "not_logged"
 
 
 def test_a_result_for_a_node_the_manifest_lost_is_not_reported(
@@ -374,7 +375,7 @@ def test_the_summary_names_every_run_read(project: Path) -> None:
     assert by_id[DEX_FIX]["source"] == "dex_record"
     assert by_id[DEX_SEMANTIC]["latest"] is True
     assert by_id[DEX_SEMANTIC]["source"] == "run_results"
-    assert summary["ignored"] == []
+    assert by_id[HAND]["logged"] is True
 
 
 def test_without_the_record_the_hand_run_is_marked_as_an_earlier_run(
@@ -484,3 +485,94 @@ def test_passed_grain_tests_reads_the_latest_attempt(project: Path) -> None:
     path.write_text(json.dumps(manifest), encoding="utf-8")
 
     assert "fct_daily" in verify_mod.passed_grain_tests(project)
+
+
+def test_an_empty_manifest_still_drops_results_for_removed_nodes(
+    project: Path,
+) -> None:
+    """A project whose last nodes were removed parses to an empty manifest; an
+    old failure has nothing left to name."""
+
+    _write_run(
+        project / "target",
+        {MODEL: "error"},
+        invocation=HAND,
+        generated_at="2026-11-20T10:00:00.000000Z",
+    )
+    (project / "target" / "manifest.json").write_text(
+        json.dumps({"nodes": {}, "unit_tests": {}}), encoding="utf-8"
+    )
+
+    findings, notes = verify_mod.build_status_findings(project)
+
+    assert findings == []
+    assert any("no longer has" in n for n in notes)
+
+
+def test_a_skip_is_explained_by_its_own_run_only(project: Path) -> None:
+    """R1 skipped the child because its parent failed in R1. A later run R2
+    that fails another parent, without attempting the child, did not cause
+    R1's skip, so it is never named as the cause."""
+
+    manifest = {
+        "nodes": {
+            "model.shop.a": {"name": "a", "resource_type": "model"},
+            "model.shop.p": {"name": "p", "resource_type": "model"},
+            "model.shop.c": {
+                "name": "c",
+                "resource_type": "model",
+                "depends_on": {"nodes": ["model.shop.a", "model.shop.p"]},
+            },
+        }
+    }
+    _write_run(
+        project / "target",
+        {"model.shop.a": "success", "model.shop.p": "error", "model.shop.c": "skipped"},
+        invocation=HAND,
+        generated_at="2026-11-20T09:00:00.000000Z",
+    )
+    _write_run(
+        _dex(project),
+        {"model.shop.a": "error"},
+        invocation=DEX_FIX,
+        generated_at="2026-11-20T10:00:00.000000Z",
+    )
+    (project / "target" / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+    findings = verify_mod.build_status_findings(project)[0]
+
+    skipped = next(f for f in findings if f.identifier == "c")
+    assert skipped.data["caused_by"] == "p"
+
+
+def test_a_shared_path_run_dex_recorded_is_named_as_dex_s(project: Path) -> None:
+    """Under `transform.artifacts: shared` Dex's build writes the project's
+    target path; its node record holds the same invocation, so the run is
+    known to be Dex's, while a run the record does not hold stays unknown."""
+
+    _write_run(
+        project / "target",
+        {MODEL: "error"},
+        invocation=DEX_FIX,
+        generated_at="2026-11-20T10:00:00.000000Z",
+    )
+    record_node_runs(project / "target")
+    _write_manifest(project / "target", mtime=1_000)
+
+    results = verify_mod.node_results(project, artifact_policy="shared")
+    [finding] = verify_mod.build_status_findings(project, results=results)[0]
+
+    assert finding.data["run"]["invoked_by"] == "dex"
+    assert finding.data["run"]["source"] == "run_results"
+
+    _write_run(
+        project / "target",
+        {MODEL: "error"},
+        invocation=HAND,
+        generated_at="2026-11-20T11:00:00.000000Z",
+    )
+    results = verify_mod.node_results(project, artifact_policy="shared")
+    [finding] = verify_mod.build_status_findings(project, results=results)[0]
+    assert finding.data["run"]["invoked_by"] == "unknown"

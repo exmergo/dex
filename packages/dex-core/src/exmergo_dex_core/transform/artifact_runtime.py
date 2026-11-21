@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import os
 import re
@@ -559,6 +560,9 @@ class BuildingRun:
     #: from the node record Dex keeps after each of its own builds
     #: (:mod:`.node_record`), which holds statuses only.
     source: Literal["run_results", "dex_record"] = "run_results"
+    #: True for a ``run_results.json`` whose invocation Dex's node record also
+    #: holds, so a run in the shared target path is known to be Dex's own.
+    recorded_by_dex: bool = False
 
     def describe(self) -> dict[str, Any]:
         """The run's identity, for an envelope: no result row, no message."""
@@ -612,12 +616,17 @@ def building_runs(
     for root, artifact in roots:
         for directory, cold in ((root, False), (root / "cold", True)):
             on_disk = _file_run(directory, artifact, cold)
+            records = recorded_runs(directory) if include_records else []
             if on_disk is not None:
+                if on_disk.invocation_id and any(
+                    record["invocation_id"] == on_disk.invocation_id
+                    for record in records
+                ):
+                    on_disk = dataclasses.replace(on_disk, recorded_by_dex=True)
                 found.append(on_disk)
-            if not include_records:
-                continue
-            for record in recorded_runs(directory):
+            for record in records:
                 invocation = record["invocation_id"]
+                # The file holds that run's full rows, messages included.
                 if on_disk is not None and invocation == on_disk.invocation_id:
                     continue
                 found.append(
