@@ -62,6 +62,7 @@ from .policy import (
     screen_values_request,
     sub_threshold_note,
     unadjudicated_refs,
+    utc_timestamps,
     validate_grain,
 )
 
@@ -532,14 +533,13 @@ class CubeVendorLayer:
         query = request.query
         order = [
             *query.get("dimensions", []),
-            *(
-                f"{t['dimension']}.{t['granularity']}"
-                for t in query.get("timeDimensions", [])
-                if t.get("granularity")
-            ),
+            *request.buckets,
             *query.get("measures", []),
         ]
         columns, types, cells = decode_load(body, request.names, order)
+        types, cells = utc_timestamps(
+            columns, types, cells, [request.names[key] for key in request.buckets]
+        )
         limits = self._limits()
         return cap_columnar(
             columns,

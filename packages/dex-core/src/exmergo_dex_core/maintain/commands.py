@@ -1011,11 +1011,12 @@ def verify(
     """Is the project correct right now, with no baseline required (#224).
 
     Six finding classes. Build-status gaps (#225) read the compiled manifest
-    and the last run's ``run_results.json`` (failed nodes, nodes skipped by a
-    failed parent), plus models the project declares that have no relation in
-    the warehouse. Column contract (#230) compares a built relation's actual
-    columns against what its schema.yml declares, both directions, plus a type
-    check where a type is declared. Row population (#226) reads each model's
+    and, for each node, the latest dated run that attempted it (failed nodes,
+    nodes skipped by a failed parent, each naming its run, #1524), plus
+    models the project declares that have no relation in the warehouse.
+    Column contract (#230) compares a built relation's actual columns against
+    what its schema.yml declares, both directions, plus a type check where a
+    type is declared. Row population (#226) reads each model's
     compiled SQL for the relation it is built from and compares the two row
     counts, reporting a model that lost rows with nothing in its SQL to
     account for it, or one that fanned out on a join. Grain (#229) checks that
@@ -1070,6 +1071,7 @@ def verify(
 
     manifest_target: str | None = None
     judged_namespace: str | None = None
+    build_status_runs: dict | None = None
 
     project, project_reason = _read_project(engine)
     if project is None:
@@ -1158,11 +1160,19 @@ def verify(
             return result
 
         warnings.extend(compile_notes)
-        build_findings, build_notes = verify_mod.build_status_findings(project_dir)
+        node_results = verify_mod.node_results(
+            project_dir, artifact_policy=engine.config.transform.artifacts
+        )
+        if node_results.found:
+            build_status_runs = node_results.summary()
+        build_findings, build_notes = verify_mod.build_status_findings(
+            project_dir, results=node_results
+        )
         findings.extend(build_findings)
         warnings.extend(build_notes)
-        if any("no dbt run results found" in n for n in build_notes):
-            suppressed["build_status"] = build_notes[0]
+        missing = [n for n in build_notes if "no dbt run results found" in n]
+        if missing:
+            suppressed["build_status"] = missing[0]
 
     # A scope may be spelled as separate arguments, comma-separated, or as one
     # quoted argument with the names separated by spaces: `a b`, `"a b"` and
@@ -1474,6 +1484,7 @@ def verify(
         temporal_contracts=temporal_contracts,
         grain_coverage=grain_coverage,
         foreign_key_coverage=foreign_key_coverage,
+        build_status_runs=build_status_runs,
     )
     if cost is not None:
         result.cost = cost

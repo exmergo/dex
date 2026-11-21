@@ -10,6 +10,18 @@ Validates the edits and returns them as diffs with a plan id; nothing is applied
 plus per-model YAML with key tests and PII meta) from the `.dex/` cache, instead
 of or on top of hand-authored edits.
 
+An edit whose content is identical to the file already on disk is left out
+of the plan, its diffs, `data.paths`, the comparison offer and `transform
+compare`'s seed and snapshot check, and one warning names them ("N edits match
+the tree and were skipped: ..."), so resending a whole feature raises nothing for
+the files it did not change. A model file the payload's `declarations` name is
+kept, so resending a model's SQL beside its declaration still puts the model in
+the plan. A declaration whose rendered YAML is already the file is skipped the
+same way, and a payload whose every edit matches stores no plan and returns
+`plan_id: null`, as `transform declare` does (#1415). So a re-plan whose every
+edit matches returns `plan_id: null`, `plan_path: null` and no `declarations`
+block.
+
 Model SQL with Jinja `for`/`if` control flow is compiled by dbt in a throwaway
 copy containing all edits, then checked as a single read-only SELECT. dbt and a
 dev profile passing the usual build preflight are required; failed or missing

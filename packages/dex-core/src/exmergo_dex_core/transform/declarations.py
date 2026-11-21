@@ -2354,7 +2354,9 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     was newly inserted.
     """
 
-    node = locate(_compose(text))
+    root = _compose(text)
+    node = locate(root)
+    _refuse_shared_entry(text, root, node)
     found = None
     for key in ("data_tests", "tests"):
         found = _child(node, key)
@@ -2368,17 +2370,22 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     if not isinstance(found[1], yaml.SequenceNode):
         raise RewriteError("a column's test list is not a list")
     text = _claim_earlier_renders(text, locate, specs)
-    node = locate(_compose(text))
+    root = _compose(text)
+    node = locate(root)
     found = _child(node, "data_tests") or _child(node, "tests")
     if found is None:  # the claims above change no key, so this cannot happen
         raise RewriteError("a column's test list moved while it was claimed")
-    _key, listed = found
+    key, listed = found
     present = [_node_value(item) for item in _sequence(listed)]
     todo = [spec for spec in specs if not _is_listed(spec, present)]
     if not todo:
         return text, False
 
     inserted_flagged = any(_has_sampling_flag(s) for s in todo)
+    if _paths(root, listed) > 1:
+        # A list another column aliases: this column gets its own copy first,
+        # then the tests are added to that copy alone (#1496).
+        return _add_tests(_unshare_tests(text, key, listed), locate, specs)
     if listed.flow_style:
         end = listed.end_mark.index
         if text[end - 1] != "]":
@@ -2390,15 +2397,25 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
             inserted_flagged,
         )
 
-    first = listed.value[0]
-    line_start = text.rfind("\n", 0, first.start_mark.index) + 1
-    line = text[line_start : first.start_mark.index]
-    if line.strip() != "-":
+    # The list's own dashes, from the token stream: an item that is an alias
+    # carries the marks of its anchor, which can sit in another column (#1496).
+    column = listed.start_mark.column
+    dashes = [
+        t.start_mark.index
+        for t in yaml.scan(text)
+        if isinstance(t, yaml.BlockEntryToken)
+        and listed.start_mark.index <= t.start_mark.index < listed.end_mark.index
+        and t.start_mark.column == column
+    ]
+    if not dashes:
+        raise RewriteError("a column's test list does not start its items with '-'")
+    line_start = text.rfind("\n", 0, dashes[0]) + 1
+    dash_indent = text[line_start : dashes[0]]
+    if dash_indent.strip():
         raise RewriteError(
             "a column's test list does not start its items on their own lines"
         )
-    dash_indent = line[: len(line) - len(line.lstrip(" "))]
-    last_key_line = text.rfind("\n", 0, listed.value[-1].start_mark.index) + 1
+    last_key_line = text.rfind("\n", 0, dashes[-1]) + 1
     from ..yaml_spans import block_end
 
     end = block_end(text, last_key_line, len(dash_indent))
@@ -2406,6 +2423,113 @@ def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     rendered = "".join(_render_item(spec, dash_indent) for spec in todo)
     prefix = "" if at == 0 or text[at - 1] == "\n" else "\n"
     return splice(text, [(at, at, prefix + rendered)]), inserted_flagged
+
+
+def _paths(root: Any, target: Any) -> int:
+    """How many paths lead from ``root`` to ``target``: more than one when a
+    YAML alias or merge key shares it or a node above it, since PyYAML
+    resolves an alias to the anchored node itself."""
+
+    memo: dict[int, int] = {}
+
+    def walk(current: Any, above: frozenset[int]) -> int:
+        if current is target:
+            return 1
+        if id(current) in memo:
+            return memo[id(current)]
+        if id(current) in above:  # a recursive alias: no path through it
+            return 0
+        below = above | {id(current)}
+        if isinstance(current, yaml.MappingNode):
+            children = [n for pair in current.value for n in pair]
+        elif isinstance(current, yaml.SequenceNode):
+            children = current.value
+        else:
+            children = []
+        memo[id(current)] = sum(walk(child, below) for child in children)
+        return memo[id(current)]
+
+    return walk(root, frozenset())
+
+
+def _refuse_shared_entry(text: str, root: Any, node: Any) -> None:
+    """Refuse a column whose entry, or an entry above it, is shared through a
+    YAML alias or merge key (`<<`): anything written into it would land on
+    every entry sharing it (#1496). The list a column holds is unshared
+    instead, by ``_unshare_tests``; a shared entry above it is not."""
+
+    if _paths(root, node) < 2:
+        return
+    collections: dict[int, Any] = {}
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        if (
+            isinstance(current, yaml.ScalarNode)
+            or current.start_mark.index in collections
+        ):
+            continue
+        collections[current.start_mark.index] = current
+        if isinstance(current, yaml.MappingNode):
+            stack.extend(n for pair in current.value for n in pair)
+        else:
+            stack.extend(current.value)
+    names = sorted(
+        f"'&{t.value}'"
+        for t in yaml.scan(text)
+        if isinstance(t, yaml.AnchorToken)
+        and t.start_mark.index in collections
+        and _paths(collections[t.start_mark.index], node) > 0
+    )
+    via = " or ".join(names) if names else "a YAML alias"
+    raise RewriteError(
+        f"the column's entry is shared with others through {via} (an alias or a "
+        "merge key), so a test written into it would land on each of them; give "
+        "the column its own entry"
+    )
+
+
+def _unshare_tests(text: str, key: Any, listed: Any) -> str:
+    """``text`` with the column's aliased test list made its own (#1496).
+
+    A list another column shares through a YAML alias is not spliced: a test
+    added to it would land on every column that aliases it. The column is
+    given its own copy instead, the way a flow-style entry is restyled rather
+    than refused (#1203). Where it holds an alias, the alias is expanded into
+    a flow-style list of the same tests. Where it holds the anchor, the anchor
+    moves, with a flow-style copy of the tests, to the first alias of it, so
+    every other column parses to the same tests as before.
+    """
+
+    tokens = [t for t in yaml.scan(text) if t.start_mark.index >= key.end_mark.index]
+    if len(tokens) < 2 or not isinstance(tokens[0], yaml.ValueToken):
+        raise RewriteError(f"'{key.value}' is a test list shared through a YAML alias")
+    shared = tokens[1]
+    copy = "[" + ", ".join(_flow(_node_value(item)) for item in listed.value) + "]"
+    span = (shared.start_mark.index, shared.end_mark.index)
+    if isinstance(shared, yaml.AliasToken):
+        return splice(text, [(*span, copy)])
+    if isinstance(shared, yaml.AnchorToken):
+        first = next(
+            (
+                t
+                for t in tokens[2:]
+                if isinstance(t, (yaml.AliasToken, yaml.AnchorToken))
+                and t.value == shared.value
+            ),
+            None,
+        )
+        if isinstance(first, yaml.AliasToken):
+            mark = (first.start_mark.index, first.end_mark.index)
+            start = len(text[: span[0]].rstrip(" "))
+            return splice(
+                text,
+                [(start, span[1], ""), (*mark, f"&{shared.value} {copy}")],
+            )
+    raise RewriteError(
+        f"'{key.value}' is a test list shared through a YAML alias; give the "
+        "column its own list"
+    )
 
 
 def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:

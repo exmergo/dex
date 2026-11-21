@@ -593,7 +593,7 @@ def test_a_pinned_block_reads_the_build_directory_and_its_invocation_only(
     """A build's own sweep reads where it wrote, not the newest manifest, and
     refuses run results another invocation wrote there."""
 
-    from exmergo_dex_core.maintain.verify import _manifest_nodes, _run_results
+    from exmergo_dex_core.maintain.verify import _manifest_nodes, node_results
     from exmergo_dex_core.transform.artifact_runtime import pinned_artifacts
 
     shared = dbt_project_dir / "target"
@@ -605,10 +605,12 @@ def test_a_pinned_block_reads_the_build_directory_and_its_invocation_only(
 
     with pinned_artifacts(build_dir, "this-build"):
         assert "model.dex_test.mart" in (_manifest_nodes(dbt_project_dir) or {})
-        assert _run_results(dbt_project_dir)
+        results = node_results(dbt_project_dir)
+        assert results.nodes
+        assert [run.invocation_id for run in results.runs] == ["this-build"]
 
     with pinned_artifacts(build_dir, "a-later-build"):
-        assert _run_results(dbt_project_dir) is None
+        assert not node_results(dbt_project_dir).found
 
     # Outside a build, the newest on disk is still the answer.
     assert _manifest_nodes(dbt_project_dir) == {}

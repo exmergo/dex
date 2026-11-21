@@ -409,6 +409,72 @@ def test_the_cli_returns_one_envelope_with_no_rows(project, tmp_path, capsys):
     assert "someone" not in out
 
 
+def test_a_regenerated_feature_compares_the_one_model_it_changes(
+    project, tmp_path, capsys
+):
+    """The issue's repro (#1415): a payload re-sends an unchanged seed and
+    unchanged models beside the one model it rewrites. The repeats are skipped,
+    so the seed no longer blocks the comparison and the unchanged models are
+    offered none."""
+
+    seeds = project / "seeds"
+    seeds.mkdir()
+    (seeds / "codes.csv").write_text("code,label\n1,one\n", encoding="utf-8")
+    _engine(project).build(target="dev")
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\ndbt_target: dev\ndbt_project_dir: {project.name}\n"
+        f"path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    unchanged = ["seeds/codes.csv", "models/teams.sql", "models/event_counts.sql"]
+    edits = [
+        {
+            "path": path,
+            "kind": "seed_csv" if path.endswith(".csv") else "model_sql",
+            "content": (project / path).read_text(encoding="utf-8"),
+        }
+        for path in unchanged
+    ]
+    edits.append(
+        {
+            "path": "models/team_activity.sql",
+            "kind": "model_sql",
+            "content": _EQUIVALENT,
+        }
+    )
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"edits": edits}), encoding="utf-8")
+
+    def run(*argv: str) -> dict:
+        capsys.readouterr()
+        main(
+            [
+                "--repo-root",
+                str(tmp_path),
+                "--path",
+                str(tmp_path / "dev.duckdb"),
+                *argv,
+            ]
+        )
+        return json.loads(capsys.readouterr().out)
+
+    planned = run("transform", "plan", "regenerate", "--edits-file", str(payload))
+    assert planned["status"] == "ok", planned
+    assert planned["data"]["paths"] == ["models/team_activity.sql"]
+    assert (
+        "3 edits match the tree and were skipped: " + ", ".join(unchanged)
+        in planned["warnings"]
+    )
+    offer = planned["data"]["refactor_comparison_offer"]
+    assert offer["models"] == ["team_activity"]
+    assert [m["model"] for m in offer["per_model"]] == ["team_activity"]
+
+    compared = run("transform", "compare", planned["data"]["plan_id"])
+    assert compared["status"] == "ok", compared
+    assert compared["data"]["status"] == "equivalent", compared["data"]
+
+
 def test_an_accepted_type_change_still_compares_its_rows(project):
     engine = _engine(project)
     widened = _ORIGINAL.replace(

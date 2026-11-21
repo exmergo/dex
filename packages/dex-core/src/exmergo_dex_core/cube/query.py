@@ -100,6 +100,16 @@ class CubeRequest:
     #: ``member`` or ``member.grain`` as Cube names a result -> the caller's token.
     names: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def buckets(self) -> list[str]:
+        """``member.grain`` for every bucketed time dimension, in query order."""
+
+        return [
+            f"{t['dimension']}.{t['granularity']}"
+            for t in self.query.get("timeDimensions", [])
+            if t.get("granularity")
+        ]
+
 
 def index(cubes: Sequence[Cube], views: Sequence[Any]) -> dict[str, Target]:
     """Every queryable token in the repository's models."""

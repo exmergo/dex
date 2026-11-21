@@ -842,6 +842,43 @@ def _checked(
     return passed - failed, failed, failures, empty
 
 
+def _by_deliverable(
+    names: list[str],
+    evidence: BuildEvidence,
+    asserted: set[str],
+    failed: set[str],
+    failures: Mapping[str, list[FailedCheck]],
+) -> tuple[set[str], set[str], dict[str, list[FailedCheck]]]:
+    """What :func:`_checked` found, keyed by the deliverable ``names``.
+
+    A check names its model by label (``dim_customers.v2``), and with a plan a
+    deliverable may be the file stem (``dim_customers_v2``), so a name that is
+    no model's label is matched to the models that answer to it (#1499). It
+    failed if a check on any of them failed, and is asserted if every one of
+    them is. A verification record may name the deliverable itself, so the
+    name is looked up as is too.
+    """
+
+    owners: dict[str, list[str]] = {}
+    for n in evidence.nodes:
+        if n.unique_id.startswith("model.") or n.resource_type == "model":
+            for answer in node_answers(n):
+                owners.setdefault(answer, []).append(n.name)
+    labels = {m for models in owners.values() for m in models}
+    keyed_asserted: set[str] = set()
+    keyed_failed: set[str] = set()
+    keyed_failures: dict[str, list[FailedCheck]] = {}
+    for name in names:
+        models = [] if name in labels else owners.get(name, [])
+        hits = [m for m in [name, *models] if m in failed]
+        if hits:
+            keyed_failed.add(name)
+            keyed_failures[name] = [c for m in hits for c in failures.get(m, [])]
+        elif name in asserted or (models and all(m in asserted for m in models)):
+            keyed_asserted.add(name)
+    return keyed_asserted, keyed_failed, keyed_failures
+
+
 def _covered(
     tests: list[UncheckedTest], evidence: BuildEvidence, covered: list[str]
 ) -> list[UncheckedTest]:
@@ -1022,6 +1059,9 @@ def summarize_completion(
     blockers = _blockers(evidence, causes, prerequisites or ())
     asserted, failed_checks, failures, empty = _checked(
         evidence, graph, verification, unchecked_tests
+    )
+    asserted, failed_checks, failures = _by_deliverable(
+        built_names, evidence, asserted, failed_checks, failures
     )
     failed_names = list(dict.fromkeys(n for n in built_names if n in failed_checks))
     statuses = Counter(n.status.lower() for n in evidence.nodes)

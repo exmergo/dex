@@ -724,7 +724,15 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      separated by spaces ("a b"), none = every model. Build status:
                                      failed/skipped build nodes (naming the failed cause, walking back
                                      through transitively skipped parents), nodes that warned rather
-                                     than failed, and models with no relation in the warehouse. Row population: row_loss and row_fanout against
+                                     than failed, and models with no relation in the warehouse. Each
+                                     node is judged by the latest dated run that attempted it, across
+                                     the project's target path, Dex's artifact directory and the
+                                     per-node record each Dex build keeps (dex_node_runs.json), never
+                                     by the run results beside the newest manifest; each build finding
+                                     names its run (data.run: invocation_id, generated_at, command,
+                                     artifact, cold, source, invoked_by, logged, latest) and
+                                     data.build_status_runs lists the runs read (#1524).
+                                     Row population: row_loss and row_fanout against
                                      each model's driving parent, the FROM-clause relation read out of
                                      the compiled SQL through its CTE chain, naming each join beside
                                      its own key and stating both counts; a fan-out on a model whose
@@ -1342,6 +1350,19 @@ default, or a filter or operator after it is refused. A key naming a location
   deterministic staging skeleton (`stg_<table>.sql` plus per-model YAML with key
   tests under `data_tests:` and PII flags in model and column `config.meta`)
   generated from the `.dex/` cache.
+- `transform plan` leaves out an edit whose content is identical to the
+  file already on disk (#1415): it is not in the diffs, `data.paths`, the
+  comparison offer or `transform compare`'s seed and snapshot check, and one
+  warning counts and names the skipped files ("N edits match the tree and were
+  skipped: ..."). A payload builder can resend a whole feature without its
+  unchanged files raising obligations. A declaration whose rendered YAML is
+  already the file is skipped the same way. A payload whose every edit matches
+  the tree, declarations included, stores no plan: `data.plan_id` and
+  `data.plan_path` are null and a note says so, as on `transform declare`. Identical is apply's own
+  no-op test (the file read as text), so a CRLF checkout resending LF content is
+  skipped too. A delete is never skipped, and neither is a model file the
+  payload's `declarations` name: resending a model's SQL beside its declaration
+  keeps the model in the plan, where a `--for-plan` build verifies it.
 - `transform plan` stamps a model it **creates** with the PII metadata of each
   flagged input column it carries through (`config.meta.contains_pii` and
   `pii_category`, with or without a declaration), and reports every judged
