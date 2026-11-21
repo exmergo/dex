@@ -1823,11 +1823,27 @@ def _entry_span(content: str, node: Any) -> tuple[int, int]:
 
 
 def _pair_span(content: str, key_span: tuple[int, int], _value: Any) -> tuple[int, int]:
-    """A mapping entry's span, by the same indentation rule as a sequence item."""
+    """A mapping entry's span, by the same indentation rule as a sequence item.
+
+    A block sequence value may be written indentless, its dashes at the key's
+    own column (PyYAML's ``safe_dump`` default). Those items belong to the pair,
+    so the span runs on over every dash line at the key's column (#1495). A key
+    sharing its line with a bullet is measured from the bullet's column, where
+    a dash line is the next item of the outer list, so it is left as it was.
+    """
 
     line_start = content.rfind("\n", 0, key_span[0]) + 1
     indent = len(content[line_start:]) - len(content[line_start:].lstrip(" "))
-    return (line_start, block_end(content, line_start, indent))
+    end = block_end(content, line_start, indent)
+    if key_span[0] - line_start != indent:
+        return (line_start, end)
+    while (
+        end < len(content)
+        and indent_of(content, end) == indent
+        and re.match(r"-(\s|$)", content[end + indent :])
+    ):
+        end = block_end(content, end, indent)
+    return (line_start, end)
 
 
 def narrow_quotes(content: str, span: tuple[int, int]) -> tuple[int, int]:
