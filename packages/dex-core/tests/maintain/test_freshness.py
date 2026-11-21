@@ -1,0 +1,364 @@
+"""A declared freshness checked by ``maintain verify`` (#1460).
+
+The planning half reads ``meta.dex.freshness`` off a compiled manifest; the
+judging half runs against a real DuckDB file, since the statement is what is
+under test: the column's newest value and the warehouse's clock, in whole epoch
+seconds, read in one aggregate statement. Each other dialect's expression is
+held to the shipped macro's in ``transform/test_freshness.py``.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from exmergo_dex_core.maintain import declared_facts as facts_mod
+from exmergo_dex_core.maintain import freshness as freshness_mod
+
+duckdb = pytest.importorskip("duckdb")
+
+
+def _manifest(project: Path, nodes: dict) -> None:
+    target = project / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "manifest.json").write_text(
+        json.dumps({"nodes": nodes}), encoding="utf-8"
+    )
+
+
+def _model(name: str, columns: dict[str, dict]) -> dict:
+    node: dict = {
+        "name": name,
+        "resource_type": "model",
+        "relation_name": f'"warehouse"."main"."{name}"',
+        "config": {"materialized": "table", "meta": {}},
+        "columns": {},
+    }
+    for column, column_dex in columns.items():
+        node["columns"][column] = {
+            "name": column,
+            "config": {"meta": {"dex": column_dex}},
+        }
+    return node
+
+
+def _fresh(max_lag: str = "6h", basis: str = "capture") -> dict:
+    return {"role": "time", "freshness": {"max_lag": max_lag, "basis": basis}}
+
+
+def _run(tmp_path: Path, columns: dict[str, dict], *statements: str):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    _manifest(tmp_path, {"model.p.fct": _model("fct", columns)})
+    path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(path))
+    for statement in statements:
+        conn.execute(statement)
+    conn.close()
+    adapter = DuckDBAdapter(path)
+    try:
+        models, notes = facts_mod.plan(tmp_path)
+        assert notes == []
+        live = [meta.identifier for meta in adapter.list_objects()]
+        prepared = facts_mod.prepare(adapter, models, live)
+        return facts_mod.findings(adapter, prepared)
+    finally:
+        adapter.close()
+
+
+def _table(select: str) -> str:
+    return f"create table fct as {select}"
+
+
+# --- reading the declaration --------------------------------------------------------
+
+
+def test_the_plan_reads_each_columns_freshness(tmp_path: Path):
+    _manifest(
+        tmp_path,
+        {
+            "model.p.fct": _model(
+                "fct",
+                {"loaded_at": _fresh("360m", "capture"), "amount": {"unit": "count"}},
+            )
+        },
+    )
+    [model], _ = facts_mod.plan(tmp_path)
+    assert model.freshness == (
+        freshness_mod.FreshnessRule("loaded_at", "6h", 21600, "capture"),
+    )
+    assert model.declares("freshness")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"max_lag": "6 hours", "basis": "capture"},
+        {"max_lag": "6h", "basis": "loaded"},
+        {"max_lag": "0h", "basis": "capture"},
+        {"max_lag": 6, "basis": "capture"},
+        "6h",
+    ],
+)
+def test_a_rule_the_schema_would_refuse_is_never_guessed_into_a_check(value):
+    assert freshness_mod.read_rule("t", value) is None
+
+
+def test_nothing_declared_suppresses_the_class_by_name(tmp_path: Path):
+    result = _run(
+        tmp_path, {"share": {"unit": "fraction"}}, _table("select 0.5 as share")
+    )
+    assert "freshness" in result.suppressed
+    assert "freshness on a time column" in result.suppressed["freshness"]
+
+
+# --- judging --------------------------------------------------------------------
+
+
+def test_a_column_older_than_its_lag_is_stale(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        _table("select current_timestamp - interval 7 hour as loaded_at"),
+    )
+    [finding] = result.findings
+    assert finding.code == freshness_mod.CODE
+    assert (finding.identifier, finding.column) == ("fct", "loaded_at")
+    assert finding.data["stale"] == 1
+    assert finding.data["lag_seconds"] >= 25200
+    assert finding.data["max_lag_seconds"] == 21600
+    [record] = result.freshness
+    assert record["status"] == "contradicted"
+    assert record["finding"] == freshness_mod.CODE
+    assert "freshness" not in result.suppressed
+
+
+def test_a_view_exactly_at_its_lag_passes(tmp_path: Path):
+    # The view computes its value from the clock of the statement reading it,
+    # so the newest value is exactly 6h behind whatever that clock says.
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        "create view fct as select current_timestamp - interval 6 hour as loaded_at",
+    )
+    assert result.findings == []
+    [record] = result.freshness
+    assert (record["status"], record["lag_seconds"]) == ("satisfied", 21600)
+
+
+def test_one_second_past_the_lag_is_stale(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        "create view fct as select current_timestamp - interval 21601 second "
+        "as loaded_at",
+    )
+    [finding] = result.findings
+    assert finding.data["lag_seconds"] == 21601
+
+
+def test_a_column_well_inside_its_lag_passes(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        _table("select current_timestamp - interval 5 minute as loaded_at"),
+    )
+    assert result.findings == []
+    assert result.freshness[0]["status"] == "satisfied"
+
+
+def test_an_empty_model_is_not_fresh(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        _table("select current_timestamp as loaded_at where 1 = 0"),
+    )
+    [finding] = result.findings
+    assert finding.data["reason"] == "no_rows"
+    assert finding.data["lag_seconds"] is None
+    assert "no rows is not fresh" in finding.detail
+    assert result.freshness[0]["reason_code"] == "no_rows"
+
+
+def test_a_column_null_on_every_row_is_not_fresh(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        _table("select cast(null as timestamp) as loaded_at from range(3)"),
+    )
+    [finding] = result.findings
+    assert finding.data["reason"] == "all_null"
+    assert finding.data["rows"] == 3
+
+
+def test_the_newest_value_decides_whatever_older_rows_hold(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("1d")},
+        _table(
+            "select timestamp '2000-01-01' as loaded_at "
+            "union all select cast(null as timestamp) "
+            "union all select current_timestamp - interval 1 hour"
+        ),
+    )
+    assert result.findings == []
+
+
+def test_a_capture_time_is_loud_and_a_business_time_is_not(tmp_path: Path):
+    stale = _table("select timestamp '2000-01-01' as at")
+    capture = _run(tmp_path / "c", {"at": _fresh("1d", "capture")}, stale)
+    business = _run(tmp_path / "b", {"at": _fresh("1d", "business")}, stale)
+    assert capture.findings[0].severity == "high"
+    assert "loading has stopped" in capture.findings[0].detail
+    assert business.findings[0].severity == "medium"
+    assert "backfill" in business.findings[0].detail
+
+
+def test_a_value_ahead_of_the_clock_is_fresh_and_noted(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _fresh("6h")},
+        _table("select current_timestamp + interval 1 hour as loaded_at"),
+    )
+    assert result.findings == []
+    assert result.freshness[0]["ahead_of_clock"] is True
+
+
+def test_a_date_column_reads_as_its_utc_midnight(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"d": _fresh("2d", "business")},
+        _table("select current_date as d"),
+    )
+    assert result.findings == []
+    assert 0 <= result.freshness[0]["lag_seconds"] <= 86400 + 60
+
+
+def test_a_zoned_timestamp_is_read_as_the_instant_it_is(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"t": _fresh("6h")},
+        _table("select cast(current_timestamp as timestamptz) as t"),
+    )
+    assert result.findings == []
+    assert abs(result.freshness[0]["lag_seconds"]) <= 60
+
+
+def test_a_text_column_is_unchecked_and_named(tmp_path: Path):
+    result = _run(tmp_path, {"t": _fresh()}, _table("select '2026-01-01' as t"))
+    assert result.findings == []
+    [record] = result.freshness
+    assert (record["status"], record["reason_code"]) == (
+        "unchecked",
+        freshness_mod.NOT_TEMPORAL,
+    )
+    assert "not a date or timestamp" in result.suppressed["freshness"]
+
+
+def test_a_column_the_relation_lacks_is_unchecked_and_named(tmp_path: Path):
+    result = _run(tmp_path, {"t": _fresh()}, _table("select 1 as other"))
+    [record] = result.freshness
+    assert (record["status"], record["reason_code"]) == (
+        "unchecked",
+        freshness_mod.COLUMN_MISSING,
+    )
+
+
+def test_two_time_columns_are_judged_apart(tmp_path: Path):
+    result = _run(
+        tmp_path,
+        {"ordered_at": _fresh("1d", "business"), "loaded_at": _fresh("1h")},
+        _table(
+            "select current_timestamp - interval 2 hour as ordered_at, "
+            "current_timestamp - interval 2 hour as loaded_at"
+        ),
+    )
+    assert [f.column for f in result.findings] == ["loaded_at"]
+    assert sorted((r["column"], r["status"]) for r in result.freshness) == [
+        ("loaded_at", "contradicted"),
+        ("ordered_at", "satisfied"),
+    ]
+
+
+def test_the_statement_returns_counts_and_a_lag_never_a_value(tmp_path: Path):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    _manifest(tmp_path, {"model.p.fct": _model("fct", {"t": _fresh()})})
+    path = tmp_path / "warehouse.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute(_table("select current_timestamp as t"))
+    conn.close()
+    adapter = DuckDBAdapter(path)
+    try:
+        models, _ = facts_mod.plan(tmp_path)
+        live = [meta.identifier for meta in adapter.list_objects()]
+        prepared = facts_mod.prepare(adapter, models, live)
+    finally:
+        adapter.close()
+    [sql] = prepared.statements()
+    import sqlglot
+
+    parsed = sqlglot.parse_one(sql, read="duckdb")
+    # Every projection is an aggregate or arithmetic over aggregates.
+    assert all(
+        projection.find(sqlglot.exp.AggFunc) is not None
+        for projection in parsed.expressions
+    )
+
+
+# --- the dialect expressions --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("dialect", "data_type", "kind"),
+    [
+        ("duckdb", "TIMESTAMP", "ntz"),
+        ("duckdb", "TIMESTAMP WITH TIME ZONE", "tz"),
+        ("duckdb", "DATE", "date"),
+        ("postgres", "timestamp without time zone", "ntz"),
+        ("postgres", "timestamp with time zone", "tz"),
+        ("bigquery", "TIMESTAMP", "tz"),
+        ("bigquery", "DATETIME", "ntz"),
+        ("snowflake", "TIMESTAMP_NTZ", "ntz"),
+        ("snowflake", "TIMESTAMP_LTZ", "tz"),
+        ("snowflake", "TIMESTAMP_TZ", "tz"),
+        ("databricks", "timestamp", "tz"),
+        ("databricks", "timestamp_ntz", "ntz"),
+        ("clickhouse", "Nullable(DateTime64(3))", "tz"),
+        ("clickhouse", "Date32", "date"),
+        ("trino", "timestamp(6)", "ntz"),
+        ("trino", "timestamp(3) with time zone", "tz"),
+        ("redshift", "timestamptz", "tz"),
+        ("duckdb", "TIME", None),
+        ("duckdb", "INTERVAL", None),
+        ("duckdb", "VARCHAR", None),
+        ("duckdb", None, "unknown"),
+    ],
+)
+def test_a_type_is_read_as_the_kind_of_time_it_holds(dialect, data_type, kind):
+    assert freshness_mod.temporal_kind(dialect, data_type) == kind
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        "duckdb",
+        "postgres",
+        "redshift",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "clickhouse",
+        "trino",
+    ],
+)
+def test_each_dialects_statement_is_one_read_only_select(dialect):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    column = '"t"'
+    for kind in ("date", "ntz", "tz", "unknown"):
+        lag = freshness_mod.lag_sql(dialect, column, kind)
+        sql = f'SELECT {lag} AS lag FROM "db"."s"."m"'  # noqa: S608
+        assert assert_select_only(sql, dialect=dialect) == sql

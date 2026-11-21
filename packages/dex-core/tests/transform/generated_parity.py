@@ -952,6 +952,85 @@ TEMPORAL_LATEST = _temporal_row(
 )
 
 
+def _freshness_measured(verify: Mapping[str, Any], model: str) -> bool:
+    """``maintain verify`` measured ``model``'s declared freshness."""
+
+    return any(
+        record.get("model") == model
+        and record.get("status") in {"satisfied", "contradicted"}
+        for record in verify.get("freshness") or []
+    )
+
+
+def _loaded_at(expression: str, *, view: bool = False, empty: bool = False):
+    """A model with one ``loaded_at`` row, ``expression`` in dbt's Jinja so each
+    warehouse spells its own clock (``dbt.current_timestamp()``). A view reads
+    the clock of the statement reading it, so a value computed from it sits at
+    the same lag whenever the test and ``maintain verify`` read it."""
+
+    def render(_null: str) -> str:
+        head = "{{ config(materialized='view') }}\n" if view else ""
+        tail = " where 1 = 0" if empty else ""
+        return f"{head}select 1 as id, {expression} as loaded_at{tail}\n"
+
+    return render
+
+
+def _ago(seconds: int) -> str:
+    return f"{{{{ dbt.dateadd('second', -{seconds}, dbt.current_timestamp()) }}}}"
+
+
+_NOW = "{{ dbt.current_timestamp() }}"
+
+
+def _freshness_row(name: str, violating, clean) -> ParityRow:
+    return ParityRow(
+        test=gt.FRESHNESS,
+        name=name,
+        codes=frozenset({"freshness_exceeded"}),
+        declaration={
+            "description": "Parity fixture: one row per load.",
+            "columns": {
+                "loaded_at": {
+                    "role": "time",
+                    "freshness": {"max_lag": "6h", "basis": "capture"},
+                }
+            },
+        },
+        violating=violating,
+        clean=clean,
+        count=lambda finding: int(finding["data"]["stale"]),
+        measured=_freshness_measured,
+    )
+
+
+#: #1460: a load that stopped long ago fails both; one a few minutes old
+#: passes both.
+FRESHNESS_STALE = _freshness_row(
+    "dex_freshness_stale",
+    violating=_loaded_at("cast('2000-01-01 00:00:00' as timestamp)"),
+    clean=_loaded_at(_ago(300)),
+)
+
+#: #1460: the boundary. Views over the warehouse's clock sit exactly at the
+#: 6h limit (passes: the limit is inclusive) and one second past it (fails),
+#: whenever each side reads them; a check flooring or rounding its two epoch
+#: seconds differently, or reading the runner's clock, disagrees here.
+FRESHNESS_AT_LIMIT = _freshness_row(
+    "dex_freshness_at_limit",
+    violating=_loaded_at(_ago(21601), view=True),
+    clean=_loaded_at(_ago(21600), view=True),
+)
+
+#: #1460: no rows is not fresh. The empty model fails both; a fresh one beside
+#: it passes both.
+FRESHNESS_EMPTY = _freshness_row(
+    "dex_freshness_empty",
+    violating=_loaded_at(_NOW, empty=True),
+    clean=_loaded_at(_NOW),
+)
+
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -973,6 +1052,9 @@ ROWS: tuple[ParityRow, ...] = (
     REFERENCED_KEY,
     TEMPORAL_TRANSITIONS,
     TEMPORAL_LATEST,
+    FRESHNESS_STALE,
+    FRESHNESS_AT_LIMIT,
+    FRESHNESS_EMPTY,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.

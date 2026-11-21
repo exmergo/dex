@@ -835,6 +835,8 @@ def _check(
                 f"'{model}.{name}' is a foreign_key with no `references`, so no "
                 "relationships test was written for it"
             )
+        if column.freshness is not None:
+            _check_freshness(model, name, column, files)
 
     if declaration.population is not None:
         _check_filters(model, declaration.population, cache, pii_overrides)
@@ -1298,6 +1300,42 @@ def _check_filters(
             )
 
 
+def _check_freshness(
+    model: str, name: str, column: Any, files: Mapping[str, str]
+) -> None:
+    """Refuse a ``freshness`` on a column that is not the model's declared time
+    (#1460): the lag is read from the newest value of a timestamp, and a role
+    other than ``time`` says the column is something else. The role is this
+    declaration's, else the one the model's YAML already states."""
+
+    role = column.role.value if column.role is not None else None
+    if role is None:
+        role = _yaml_column_role(files, model, name)
+    if role == Role.TIME.value:
+        return
+    stated = f"its role is `{role}`" if role else "it declares no role"
+    raise DeclarationError(
+        f"'{model}.{name}' declares freshness, but {stated}; freshness belongs on "
+        "the column with role `time` (the event's time or the load time), so "
+        "declare `role: time` on it or move the freshness to that column"
+    )
+
+
+def _yaml_column_role(files: Mapping[str, str], model: str, column: str) -> str | None:
+    """The role the model's YAML already declares for ``column``, if any."""
+
+    for _label, entry in _entries(files, {model}):
+        for item in entry.get("columns") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                continue
+            if item["name"].lower() != column.lower():
+                continue
+            column_dex = entry_meta(item).get(DEX_META_KEY)
+            if isinstance(column_dex, dict) and isinstance(column_dex.get("role"), str):
+                return column_dex["role"]
+    return None
+
+
 def _declared_column_roles(files: Mapping[str, str], model: str) -> set[str]:
     """Column names that already have a role in the model's YAML declaration."""
     declared: set[str] = set()
@@ -1429,6 +1467,11 @@ def render(
                 generated.append(row)
             if notes is not None:
                 notes.append(_stale_note(row))
+    for row in _stale_freshness_tests(content, declaration.model, planned):
+        if generated is not None:
+            generated.append(row)
+        if notes is not None:
+            notes.append(_stale_note(row))
     if history is not None:
         # A listed dex_temporal_contract the history no longer gives (#1458):
         # a policy, the snapshot, a measure or its column changed, or the
@@ -1688,6 +1731,13 @@ def render_referenced_keys(
 
 
 def _stale_note(row: Mapping[str, Any]) -> str:
+    if row["test"] == gt.FRESHNESS:
+        return (
+            f"'{row['model']}.{row['column']}' lists a {gt.FRESHNESS} test (claim "
+            f"{row['claim']}) for a freshness it no longer declares (its max_lag or "
+            "basis changed); it still holds the column to the old lag, so remove it "
+            "from the YAML"
+        )
     if row["test"] == gt.TEMPORAL_CONTRACT:
         return (
             f"'{row['model']}' lists a {gt.TEMPORAL_CONTRACT} test (claim "
@@ -1767,32 +1817,8 @@ def _stale_join_tests(
     ask the same of another model-level kind (#1458: a ``dex_temporal_contract``
     whose claim the declared history no longer gives, ``history_changed``)."""
 
-    if not content:
-        return []
-    try:
-        loaded = yaml.safe_load(content)
-    except yaml.YAMLError:
-        return []
-    base, version = mv.split_label(model)
-    entries = loaded.get("models") if isinstance(loaded, Mapping) else None
-    node: Any = next(
-        (
-            e
-            for e in entries or []
-            if isinstance(e, Mapping) and str(e.get("name", "")).lower() == base.lower()
-        ),
-        None,
-    )
-    if node is not None and version is not None:
-        node = next(
-            (
-                item
-                for item in node.get("versions") or []
-                if isinstance(item, Mapping) and str(item.get("v")) == str(version)
-            ),
-            None,
-        )
-    if not isinstance(node, Mapping):
+    node = _listed_entry(content, model)
+    if node is None:
         return []
     listed = node.get("data_tests") or node.get("tests") or []
     current = [g["spec"] for g in planned if g["test"] == test and g["enabled"]]
@@ -1826,6 +1852,82 @@ def _stale_join_tests(
         if isinstance(measure, str):
             row["variant"] = measure
         out.append(row)
+    return out
+
+
+def _listed_entry(content: str | None, model: str) -> Mapping[str, Any] | None:
+    """The model's YAML entry in ``content`` as written (a version's item of
+    ``versions:`` for a label), or ``None``."""
+
+    if not content:
+        return None
+    try:
+        loaded = yaml.safe_load(content)
+    except yaml.YAMLError:
+        return None
+    base, version = mv.split_label(model)
+    entries = loaded.get("models") if isinstance(loaded, Mapping) else None
+    node: Any = next(
+        (
+            e
+            for e in entries or []
+            if isinstance(e, Mapping) and str(e.get("name", "")).lower() == base.lower()
+        ),
+        None,
+    )
+    if node is not None and version is not None:
+        node = next(
+            (
+                item
+                for item in node.get("versions") or []
+                if isinstance(item, Mapping) and str(item.get("v")) == str(version)
+            ),
+            None,
+        )
+    return node if isinstance(node, Mapping) else None
+
+
+def _stale_freshness_tests(
+    content: str | None, model: str, planned: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The ``dex_freshness`` tests a column lists whose claim the declared
+    freshness no longer gives (#1460): its ``max_lag`` or ``basis`` changed, so
+    the test still holds the column to the old lag. Each is a
+    ``data.generated_tests`` row with ``status: stale`` and ``reason:
+    freshness_changed``. Only the columns whose freshness this declaration
+    states are read: a column it says nothing about keeps what it lists."""
+
+    node = _listed_entry(content, model)
+    if node is None:
+        return []
+    current: dict[str, set[str | None]] = {}
+    for g in planned:
+        if g["test"] == gt.FRESHNESS and g["column"] is not None:
+            current.setdefault(str(g["column"]).lower(), set()).add(claim_of(g["spec"]))
+    out: list[dict[str, Any]] = []
+    for column in node.get("columns") or []:
+        if not isinstance(column, Mapping) or not isinstance(column.get("name"), str):
+            continue
+        claims = current.get(column["name"].lower())
+        if claims is None:
+            continue
+        listed = column.get("data_tests") or column.get("tests") or []
+        for item in listed if isinstance(listed, list) else []:
+            if _listed_name(item) != gt.FRESHNESS or not gt.is_generated(item):
+                continue
+            if claim_of(item) in claims:
+                continue
+            out.append(
+                {
+                    "model": model,
+                    "column": column["name"],
+                    "test": gt.FRESHNESS,
+                    "cadence": gt.EVERY_RUN,
+                    "claim": claim_of(item),
+                    "status": "stale",
+                    "reason": "freshness_changed",
+                }
+            )
     return out
 
 
@@ -2261,6 +2363,8 @@ def _rendered_columns(
             )
             if value is not None
         }
+        if column.freshness is not None:
+            entry["dex"]["freshness"] = column.freshness.model_dump(mode="json")
         if column.null_rule is not None and column.null_rule.strip().lower() == "never":
             entry["tests"].append(
                 _unsampled(

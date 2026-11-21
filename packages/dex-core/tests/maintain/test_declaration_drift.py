@@ -751,3 +751,29 @@ def test_beside_a_project_both_halves_must_be_compared_to_read_checked():
         "declaration drift was not checked for the semantic layer: "
         + status["semantic_layer"]["reason"]
     ]
+
+
+def test_a_loosened_freshness_is_high_drift_naming_the_field():
+    # A longer lag silences an alert with the SQL untouched (#1460).
+    fresh = DECLARED_YML.replace(
+        "      - name: customer_id\n        tests: [not_null]\n",
+        "      - name: customer_id\n        tests: [not_null]\n"
+        "      - name: loaded_at\n        config:\n          meta:\n            dex:\n"
+        "              role: time\n"
+        "              freshness: {max_lag: 6h, basis: capture}\n",
+    )
+    looser = fresh.replace("max_lag: 6h", "max_lag: 2d")
+
+    [finding] = _drift(fresh, looser)
+    assert finding.code == "declaration_changed"
+    assert (finding.column, finding.data["field"]) == ("loaded_at", "freshness")
+    assert finding.severity == "high"
+    assert (
+        _drift(
+            fresh,
+            fresh.replace(
+                "{max_lag: 6h, basis: capture}", "{basis: capture, max_lag: 6h}"
+            ),
+        )
+        == []
+    )

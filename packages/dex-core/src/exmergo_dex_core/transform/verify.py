@@ -86,6 +86,8 @@ class BuildVerification:
     parent_population: list[dict] = field(default_factory=list)
     #: One record per declared ``history`` among the built models (#1027).
     temporal_contracts: list[dict] = field(default_factory=list)
+    #: One record per declared ``freshness`` among the built models (#1460).
+    freshness: list[dict] = field(default_factory=list)
     #: One record per built model measured against a drafted parent, and per
     #: model the plan is about that no parent could be drafted for (#1228).
     population_delta: list[dict] = field(default_factory=list)
@@ -143,6 +145,8 @@ class BuildVerification:
             payload["parent_population"] = self.parent_population
         if self.temporal_contracts:
             payload["temporal_contracts"] = self.temporal_contracts
+        if self.freshness:
+            payload["freshness"] = self.freshness
         if self.population_delta:
             payload["population_delta"] = self.population_delta
         if self.column_contract is not None:
@@ -1347,6 +1351,7 @@ def _declared_facts(
     result.warnings.extend(facts.notes)
     result.parent_population = facts.parent_coverage
     result.temporal_contracts = facts.temporal_contracts
+    result.freshness = facts.freshness
     result.population_delta.extend(facts.population_delta)
     for finding_class, reason in facts.suppressed.items():
         result.suppressed[finding_class] = reason

@@ -127,6 +127,23 @@ null_status, provenance)` macro; the text cast, text literal, timestamp type and
 previous-version read are dispatched on their own
 (`dex_temporal_contract_text`, `_literal`, `_timestamp`, `_lag`).
 
+## `dex_freshness`
+
+The generic test a time column's declared `freshness` renders
+([declarations](declarations.md#dex_freshness-a-time-columns-freshness)), where
+`declarations.render_tests` turns it on. A declaration plan adds it for you;
+this command scaffolds or diffs it on its own. It takes `max_lag_seconds` and
+fails with one row (holding `1`, the lag in seconds and the limit, never a
+value) when the column's newest value trails the warehouse's clock by more than
+that, or when the column holds no value. Both sides are whole epoch seconds read
+in one statement, a timestamp with no time zone read as UTC, so a value exactly
+at the limit passes; a column that is no date or timestamp is a compile error.
+The SQL goes through dbt's dispatch, `default__dex_freshness` holds on DuckDB,
+and each other warehouse has its own `<adapter>__dex_freshness_epoch(expression,
+kind)` and `<adapter>__dex_freshness_now()`, the expressions `maintain verify`
+sends; a project overrides one warehouse with its own
+`<adapter>__dex_freshness(model, column_name, max_lag_seconds)` or either piece.
+
 ## `unpivot_json_object`
 
 Turns a JSON object column with dynamic keys (the NoSQL-sourced shape: a

@@ -213,6 +213,17 @@ GROUPS: dict[str, tuple[str, ...]] = {
         ),
         f"{_T}test_temporal_contract_render.py",
     ),
+    # dex_freshness (#1460): its parity rows and its own file, whose macro
+    # cases each run a dbt build.
+    "transform-parity-freshness": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_freshness_rows_agree_and_the_plan_writes_their_macro",
+            "test_a_freshness_macro_reading_an_empty_model_as_fresh_fails_the_harness",
+            "test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness",
+        ),
+        f"{_T}test_freshness.py",
+    ),
     "transform-e2e": (  # 148s
         f"{_T}test_package_repair_e2e.py",
         f"{_T}test_test_only_plan_e2e.py",

@@ -93,6 +93,7 @@ _RECORD_KINDS = (
     "join_coverage",
     "parent_population",
     "temporal_contracts",
+    "freshness",
     "population_delta",
     "retirement",
     "toggle",

@@ -64,6 +64,8 @@ How each fact kind is judged (dbt test; maintain verify codes):
   (``transform plan`` flags a SUM over a semi- or non-additive column, verify
   does not).
 - history: ``temporal_*``.
+- freshness (#1460): ``freshness_exceeded``, and dbt's ``dex_freshness`` where
+  the column carries it.
 """
 
 from __future__ import annotations
@@ -95,6 +97,7 @@ KINDS = (
     "unit",
     "additivity",
     "history",
+    "freshness",
 )
 
 _CHECKED_UNITS = frozenset({"fraction", "percent"})
@@ -895,6 +898,18 @@ def _model_facts(
                 [],
                 ["additivity_contradicted"] if additivity == "additive" else [],
                 what=_lower(additivity),
+            )
+        freshness = dex.get("freshness")
+        if isinstance(freshness, dict) and freshness.get("max_lag"):
+            found = (
+                ["dex_freshness"] if tests.on_column(uid, name, "dex_freshness") else []
+            )
+            add(
+                "freshness",
+                name,
+                found,
+                ["freshness_exceeded"],
+                what=f"{freshness.get('max_lag')} {freshness.get('basis')}",
             )
 
     population = model_dex.get("population")

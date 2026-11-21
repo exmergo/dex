@@ -258,6 +258,27 @@ def test_units_and_additivity() -> None:
     assert _fact(out, "additivity", "rate")["checked_by"] == "none"
 
 
+def test_a_freshness_is_checked_by_verify_and_by_its_generated_test() -> None:
+    fresh = {"role": "time", "freshness": {"max_lag": "6h", "basis": "capture"}}
+    manifest = _manifest(
+        [
+            _model("tested", columns={"loaded_at": fresh}),
+            _model("untested", columns={"loaded_at": fresh}),
+        ],
+        [_test("dex_freshness", "tested", "loaded_at")],
+    )
+    out = _run(manifest)
+    tested = _fact(out, "freshness", "loaded_at", model="tested")
+    assert (tested["checked_by"], tested["tests"], tested["verify"]) == (
+        "both",
+        ["dex_freshness"],
+        ["freshness_exceeded"],
+    )
+    assert _fact(out, "freshness", "loaded_at", model="untested")["checked_by"] == (
+        "dex_verify"
+    )
+
+
 def test_undeclared_model_is_counted_apart() -> None:
     manifest = _manifest(
         [

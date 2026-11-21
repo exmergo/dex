@@ -1186,6 +1186,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    freshness: list[dict] | None = None
     grain_coverage: list[dict] | None = None
     foreign_key_coverage: list[dict] | None = None
     fk_offer: ConfirmationRequest | None = None
@@ -1446,6 +1447,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                freshness = facts.freshness
                 grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
@@ -1482,6 +1484,7 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        freshness=freshness,
         grain_coverage=grain_coverage,
         foreign_key_coverage=foreign_key_coverage,
         build_status_runs=build_status_runs,
