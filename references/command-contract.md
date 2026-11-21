@@ -1502,8 +1502,9 @@ default, or a filter or operator after it is refused. A key naming a location
   zone read as UTC, so a value exactly at the limit passes; a column that is no
   date or timestamp errors the test and is `unchecked` (`not_temporal`) in
   `maintain verify`. A listed `dex_freshness` whose claim the column's declared
-  freshness no longer gives (its `max_lag` or `basis` changed) is reported
-  `stale`, `reason: freshness_changed`, with a warning; it is never removed.
+  freshness no longer gives (its `max_lag` changed) is reported `stale`,
+  `reason: freshness_changed`, with a warning, and is never removed; a change
+  of `basis` alone keeps the listed test, which behaves the same.
   The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.

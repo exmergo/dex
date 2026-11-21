@@ -721,10 +721,11 @@ agrees with `maintain verify`'s `freshness_exceeded` on every connector:
   `maintain verify` reads the basis to say how loud a stale column is.
 
 A test the plan rendered is never removed (nothing generated is). Where a
-column's `max_lag` or `basis` changes, the listed test for the old one is
-reported `stale` (`reason: freshness_changed`) with a warning, beside the test
-the new claim renders: remove it from the YAML, since it keeps failing on the
-old lag. A column the model's SQL provably does not output renders no test
+column's `max_lag` changes, the listed test for the old lag is reported `stale`
+(`reason: freshness_changed`) with a warning, beside the test the new claim
+renders: remove it from the YAML, since it keeps failing on the old lag. A
+change of `basis` alone keeps the listed test, which behaves the same, and
+reports nothing stale. A column the model's SQL provably does not output renders no test
 (`column_not_output`). Its macro reaches the project as the others' do:
 `macros/dex_freshness.sql` (the [shipped macro](macros.md#dex_freshness)) as a
 `macro_sql` diff where neither the project nor the plan defines the test.

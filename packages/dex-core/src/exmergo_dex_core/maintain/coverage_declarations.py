@@ -189,8 +189,9 @@ class _Tests:
         for name, col, kwargs, _reads in self.by_model.get(model, []):
             if _base(name) != "dex_freshness" or col != key:
                 continue
+            limit = kwargs.get("max_lag_seconds")
             try:
-                if int(kwargs.get("max_lag_seconds")) == seconds:
+                if limit is not None and int(limit) == seconds:
                     return True
             except (TypeError, ValueError):
                 continue

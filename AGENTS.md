@@ -702,8 +702,8 @@ an expression. A column declaring `freshness` (the column with role `time`:
 warehouse's clock by more than `max_lag`, or when the column holds no value,
 returning the lag in seconds and never a value, as `maintain verify`'s
 `freshness_exceeded` judges it; the basis is in the claim and not the test's
-arguments, and a listed one a changed `max_lag` or `basis` no longer gives is
-reported `stale` (`freshness_changed`). A version of a native dbt versioned model is
+arguments, and a listed one a changed `max_lag` no longer gives is reported
+`stale` (`freshness_changed`). A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry
 every version inherits, and a version's file stem is refused naming the label.

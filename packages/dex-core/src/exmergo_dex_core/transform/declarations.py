@@ -1756,8 +1756,8 @@ def _stale_note(row: Mapping[str, Any]) -> str:
     if row["test"] == gt.FRESHNESS:
         return (
             f"'{row['model']}.{row['column']}' lists a {gt.FRESHNESS} test (claim "
-            f"{row['claim']}) for a freshness it no longer declares (its max_lag or "
-            "basis changed); it still holds the column to the old lag, so remove it "
+            f"{row['claim']}) for a freshness it no longer declares (its max_lag "
+            "changed); it still holds the column to the old lag, so remove it "
             "from the YAML"
         )
     if row["test"] == gt.TEMPORAL_CONTRACT:
@@ -1913,7 +1913,7 @@ def _stale_freshness_tests(
     content: str | None, model: str, planned: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """The ``dex_freshness`` tests a column lists whose claim the declared
-    freshness no longer gives (#1460): its ``max_lag`` or ``basis`` changed, so
+    freshness no longer gives (#1460): its ``max_lag`` changed, so
     the test still holds the column to the old lag. Each is a
     ``data.generated_tests`` row with ``status: stale`` and ``reason:
     freshness_changed``. Only the columns whose freshness this declaration
