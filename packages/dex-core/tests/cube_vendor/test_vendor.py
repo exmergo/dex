@@ -612,6 +612,116 @@ def test_decode_load_reads_numbers_by_the_annotation():
     assert cells == [["paid", 21.75, 4], ["12", 1000.0, None]]
 
 
+# --- a time bucket reads one way whoever executes it (#1497) --------------------------
+
+
+def _bucketed(cube: FakeCube, grain: str) -> list[str]:
+    """``by_month`` recorded again at ``grain``, and the argv that asks for it."""
+
+    plan = json.dumps(cube.recordings["by_month"]).replace("month", grain)
+    cube.recordings[f"by_{grain}"] = json.loads(plan)
+    token = f"orders.ordered_at__{grain}"
+    return [
+        "explore",
+        "semantic",
+        "query",
+        "orders.revenue",
+        "--group-by",
+        token,
+        f"--order-by={token}",
+    ]
+
+
+@pytest.mark.parametrize("grain", ["day", "month", "hour", "minute"])
+def test_a_time_bucket_reads_the_same_under_api_and_local(
+    shop, monkeypatch, capsys, grain
+):
+    argv = _bucketed(_server(monkeypatch, shop), grain)
+    local = _run(capsys, shop, *argv, "--local")
+    api = _run(capsys, shop, *argv, "--api")
+
+    assert local["status"] == api["status"] == "ok", (local["errors"], api["errors"])
+    assert local["data"]["types"][0] == api["data"]["types"][0] == "timestamp"
+    buckets = [row[0] for row in local["data"]["cells"]]
+    assert buckets == [row[0] for row in api["data"]["cells"]]
+    assert buckets and all(b.endswith("+00:00") for b in buckets)
+
+
+def test_a_values_bucket_reads_the_same_under_api_and_local(shop, monkeypatch, capsys):
+    _server(monkeypatch, shop)
+    dimension, _ = VALUES["values_month"]
+    argv = ["explore", "semantic", "values", dimension]
+    local = _run(capsys, shop, *argv, "--local")
+    api = _run(capsys, shop, *argv, "--api")
+
+    assert local["status"] == api["status"] == "ok", (local["errors"], api["errors"])
+    assert local["data"]["types"][0] == api["data"]["types"][0] == "timestamp"
+    buckets = [row[0] for row in local["data"]["cells"]]
+    assert buckets == [row[0] for row in api["data"]["cells"]]
+    assert buckets and all(b.endswith("+00:00") for b in buckets)
+
+
+@pytest.mark.parametrize(
+    ("kind", "spell"),
+    [
+        # BigQuery: a TIMESTAMP comes back offset.
+        ("TIMESTAMP", lambda v: v + "+00:00"),
+        # Snowflake: Cube's bucket is a TIMESTAMP_NTZ, naive.
+        ("TIMESTAMP_NTZ", lambda v: v),
+        # Postgres and Redshift: naive, under the driver's own type name.
+        ("timestamp without time zone", lambda v: v),
+    ],
+)
+def test_a_billed_connector_s_bucket_type_is_reported_as_api_reports_it(
+    shop, monkeypatch, capsys, kind, spell
+):
+    from exmergo_dex_core.adapters.base import QueryResult
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    run_query = DuckDBAdapter.run_query
+
+    def as_billed(self, sql, **kwargs):
+        result = run_query(self, sql, **kwargs)
+        return QueryResult(
+            columns=result.columns,
+            types=[kind, *result.types[1:]],
+            cells=[[spell(row[0]), *row[1:]] for row in result.cells],
+            truncated=result.truncated,
+        )
+
+    _server(monkeypatch, shop)
+    api = _run(capsys, shop, *_argv("by_month"), "--api")
+    monkeypatch.setattr(DuckDBAdapter, "run_query", as_billed)
+    local = _run(capsys, shop, *_argv("by_month"), "--local")
+
+    assert local["data"]["types"][0] == api["data"]["types"][0] == "timestamp"
+    assert [r[0] for r in local["data"]["cells"]] == [
+        r[0] for r in api["data"]["cells"]
+    ]
+
+
+def test_utc_timestamps_spells_one_instant_one_way():
+    from exmergo_dex_core.explore.semantic.policy import utc_timestamps
+
+    cells = [
+        ["2025-03-01T00:00:00.000", "a"],
+        ["2025-03-01T01:00:00+01:00", "b"],
+        ["2025-03-01", "c"],
+        [None, "d"],
+        ["not a time", "e"],
+    ]
+    types, spelled = utc_timestamps(["t", "s"], ["time", "string"], cells, ["t"])
+
+    assert types == ["timestamp", "string"]
+    assert spelled == [
+        ["2025-03-01T00:00:00+00:00", "a"],
+        ["2025-03-01T00:00:00+00:00", "b"],
+        ["2025-03-01T00:00:00+00:00", "c"],
+        [None, "d"],
+        ["not a time", "e"],
+    ]
+
+
 # --- Cube Cloud ----------------------------------------------------------------------
 
 

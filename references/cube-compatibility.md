@@ -328,6 +328,15 @@ a grouped time dimension (`"last 7 days"`) is turned into timestamps by Cube at
 render time using the Cube server's clock, and returned as parameters; a server
 in another time zone or with a skewed clock resolves it differently.
 
+**Time buckets.** A grouped time dimension's bucket reads the same whoever
+executes the query: a UTC ISO timestamp with an explicit offset
+(`2025-03-01T00:00:00+00:00`), typed `timestamp` in `types`, at every grain,
+`day` and `month` included. `--local` would otherwise report the warehouse's
+own type name and spelling (a naive `TIMESTAMP` on DuckDB, an offset one on
+BigQuery), and `/v1/load` reports naive text with milliseconds typed `time`;
+all of them are the same instant in the query's UTC, so Dex spells them one
+way on both paths and on every connector.
+
 `explore semantic values` is a dimension-only query rooted at the dimension's
 own cube (`scoped_to` empty); `--metric` adds that measure and names it in
 `scoped_to`. A PII dimension is refused before Cube is asked.
@@ -388,8 +397,8 @@ the rows:
    deadline that counts every request and pause.
 6. **The rows**, named by the caller's tokens in the column order Cube's own SQL
    uses. Cube returns every number as text; Dex decodes the ones its
-   annotation types `number`. A time bucket is Cube's ISO text in UTC. Capped
-   like every other semantic result.
+   annotation types `number`. A time bucket is spelled as under `--local` (see
+   "Time buckets" above). Capped like every other semantic result.
 
 A warehouse error Cube relays from `/v1/load` can quote a value, so it is
 masked before it reaches an envelope, as on `explore query`.

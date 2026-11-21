@@ -40,7 +40,7 @@ silent. So this module imports no layer: neither MetricFlow nor SLayer.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from typing import Any
 
 from ... import command_args
@@ -49,7 +49,7 @@ from ...cache import mask_overridden, match_identifier
 from ...config import QueryLimits, pii_override_paths
 from ...guards import PII_BLOCK_CONFIDENCE
 from .backend import SemanticBackendError, SemanticQueryRefusedError
-from .policy import READS, UNREADABLE, cap_columnar
+from .policy import READS, UNREADABLE, cap_columnar, utc_timestamps
 
 #: ``dimension token -> (relation, physical column)``, as the layer resolves it.
 PhysicalColumns = Mapping[str, tuple[str, str]]
@@ -106,6 +106,7 @@ class GovernedSql:
         extra_notes: list[str] | None = None,
         column_names: Mapping[str, str] | None = None,
         utc_session: bool = False,
+        timestamps: Collection[str] = (),
         priced_relations: list[str] | None = None,
         live_relations: list[str] | None = None,
         **fields,
@@ -120,7 +121,10 @@ class GovernedSql:
         ``utc_session`` runs the statement in a UTC session, for a layer whose
         rendered SQL assumes its own driver's (Cube's): an adapter whose
         sessions carry no time zone (BigQuery, whose ``TIMESTAMP`` is UTC) has
-        nothing to pin.
+        nothing to pin. ``timestamps`` names the columns spelled as UTC ISO
+        timestamps typed ``timestamp`` whatever the warehouse returned
+        (:func:`~.policy.utc_timestamps`), for a layer whose vendor execution
+        answers them that way.
 
         ``live_relations`` names relations the statement may read that the
         adapter's inventory leaves out (a semantic view is no relation to
@@ -174,10 +178,13 @@ class GovernedSql:
             columns = list(result.columns)
             if column_names:
                 columns = [column_names.get(name, name) for name in columns]
+            types, cells = utc_timestamps(
+                columns, result.types, result.cells, timestamps
+            )
             capped = cap_columnar(
                 columns,
-                result.types,
-                result.cells,
+                types,
+                cells,
                 max_rows=self._limits.max_rows,
                 max_cell_chars=self._limits.max_cell_chars,
                 max_payload_bytes=self._limits.max_payload_bytes,

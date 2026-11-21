@@ -304,6 +304,7 @@ class LocalCubeLayer:
             ],
             column_names=names,
             utc_session=True,
+            timestamps=[request.names[key] for key in request.buckets],
         )
 
     def values(self, dimension: str, metrics: list[str]) -> SemanticValuesResult:
@@ -357,6 +358,7 @@ class LocalCubeLayer:
             extra_notes=notes,
             column_names=names,
             utc_session=True,
+            timestamps=[cube_request.names[key] for key in cube_request.buckets],
             dimension=request.token,
             scoped_to=request.metrics,
         )
