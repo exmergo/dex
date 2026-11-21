@@ -1220,8 +1220,16 @@ def _warnings(derivations: list[Derivation]) -> list[str]:
                 ),
                 derivation.status,
             )
+            # An unvalidated derivation can still be offered under
+            # `definitions` (a no-parse plan, #1517); it is only kept out of
+            # the plan, so say that rather than "not offered".
+            outcome = (
+                "not added to this plan"
+                if derivation.status == "unvalidated"
+                else "not offered"
+            )
             out.append(
-                f"semantic model for '{derivation.model}' was derived and not "
-                f"offered ({derivation.status}): {reason}"
+                f"semantic model for '{derivation.model}' was derived and "
+                f"{outcome} ({derivation.status}): {reason}"
             )
     return out

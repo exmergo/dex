@@ -59,9 +59,13 @@ the plan in a sandbox of its own. What changes in the envelope:
 
 - a warning, `dbt parse not run: ...`, wherever a parse would have run;
 - `data.model_versions.<model>.manifest` is `unchecked` with `parse_skipped`;
-- a derivation is `unvalidated` (parse `not_run`) in `data.semantic_proposal`
-  and stays out of the plan; `mode` is `proposed` and `definitions` carries it,
-  ready for `semantic plan --definitions-file` where dbt may parse;
+- a dbt (MetricFlow) derivation is `unvalidated` (parse `not_run`) in
+  `data.semantic_proposal` and stays out of the plan; `mode` is `proposed` and
+  `definitions` carries it, ready for `semantic plan --definitions-file` where
+  dbt may parse;
+- with a native semantic layer (`semantic.vendor` other than `dbt`) the
+  derivation runs no dbt, so `--no-parse` does not change it: its documents are
+  stored as the usual companion plan through the vendor's authoring route;
 - a model with Jinja `for`/`if` is refused, since only dbt's compile can check
   it; a model that only lists columns through a macro (`dbt_utils.star`) is
   checked from its SQL, with a warning naming it;

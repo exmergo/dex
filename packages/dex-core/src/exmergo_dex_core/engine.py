@@ -1527,8 +1527,9 @@ class DexEngine:
         ``dbt parse`` of the post-change project, none for a declared mart's
         derived semantic model, and no ``dbt compile``. It is for a host that
         must not run repository-controlled code (Jinja, macros, hooks) where it
-        authors, and parses the plan in a sandbox of its own, as
-        ``semantic_plan(no_parse=True)`` does. Every structural check still
+        authors, and parses the plan in a sandbox of its own. Unlike
+        ``semantic_plan(no_parse=True)``, which still parses a derivation it
+        adds, nothing here starts dbt. Every structural check still
         runs: admission, placement, deletions, the PII and secret gates, hash
         pinning and the diffs. A model with Jinja control flow cannot be checked
         without compiling it, so it is refused rather than stored unchecked.
