@@ -165,14 +165,16 @@ test keeps failing, and the last run in which a claim was checked and passed.
 The three tests above are the **built-ins**. They always render. A **generated
 test** is one Dex writes for a declared fact the built-ins cannot check: a
 composite grain, a population filter, a parent's population, a fraction's
-range, an INNER join's coverage, a referenced key's uniqueness. Each kind
-arrives with its own issue (#1452 onward); this release renders six,
+range, an INNER join's coverage, a referenced key's uniqueness, a history's
+measures. Each kind arrives with its own issue (#1452 onward); this release
+renders seven,
 [`dex_unique_combination`](#dex_unique_combination-a-composite-grain),
 [`dex_population_filter`](#dex_population_filter-a-population-filter),
 [`dex_parent_population`](#dex_parent_population-a-parents-population),
 [`dex_unit_range`](#dex_unit_range-a-fraction),
-[`dex_join_coverage`](#dex_join_coverage-a-join-a-references-requires) and
-[`dex_referenced_key`](#dex_referenced_key-a-key-a-references-names). The switch
+[`dex_join_coverage`](#dex_join_coverage-a-join-a-references-requires),
+[`dex_referenced_key`](#dex_referenced_key-a-key-a-references-names) and
+[`dex_temporal_contract`](#dex_temporal_contract-a-historys-measures). The switch
 and the tag below are what every kind follows. Generated tests run in the
 project's production runs. Dex does not run those and the project pays for them,
 so two rules hold:
@@ -588,6 +590,85 @@ whose `references` later goes away is never removed (nothing generated is).
 
 Its macro reaches the project as the others' do: `macros/dex_referenced_key.sql`
 (the [shipped macro](macros.md#dex_referenced_key)) as a `macro_sql` diff where
+neither the project nor the plan defines the test.
+
+#### `dex_temporal_contract`: a history's measures
+
+A declared [`history`](#temporal-contracts-history) says how the model reads its
+snapshot. Each measure it names renders its own model-level test, told apart by
+`measure`, tagged `dex_scheduled`:
+
+```yaml
+models:
+  - name: host_history
+    data_tests:
+      - dex_temporal_contract:
+          arguments:
+            snapshot: ref('hosts_snapshot')
+            entity: {host_id: host_id}
+            status_column: is_superhost
+            target: true
+            measure: transition_count
+            measure_column: status_change_count
+            initial_observation: baseline
+            null_status: ignore
+            time_column: dbt_valid_from
+            provenance: capture
+          config:
+            tags: [dex_scheduled]
+            meta: {disable_test_samples: true, dex: {claim: <id>}}
+```
+
+- **What it counts.** The entities whose column disagrees with the value the
+  snapshot's versions and the declared policy give, derived as `maintain verify`
+  derives it, never from the model's SQL. Each measure's count is the
+  `mismatched_entities` of one finding: `transition_count` is
+  `temporal_transition_count_mismatch`, `latest_target_transition_at`
+  `temporal_latest_transition_mismatch`, `first_target_at`
+  `temporal_first_attainment_mismatch`. One test per measure, so each failure
+  count is one finding's and each measure keeps its own history.
+- **The same exclusions.** Entities verify excludes are excluded here by the same
+  rules: versions sharing one validity time (`ambiguous_version_order`), and under
+  a `business` time a status change whose timestamp runs backwards
+  (`business_order_conflict`); the time measures also skip an entity whose
+  business timestamp is NULL or stands still at a change. A model key that
+  repeats is compared once per row, as verify compares it.
+- **Counts only.** The test returns the count, never a key or a value.
+- **Why `dex_scheduled`.** It scans the whole snapshot twice (a window over each
+  entity's versions, and its distinct entities) and the whole model, once per
+  measure: three measures are three such scans per scheduled run.
+- **The `population` and `time_provenance` assertions** render no test. The
+  population is the parent-population question in another shape, and provenance
+  is a fact about the snapshot's config; both stay with `maintain verify`.
+- A snapshot that renames its validity column (`snapshot_meta_column_names`)
+  passes the new name as `order_column`.
+
+**What renders nothing**, listed under `data.generated_tests` as `not_rendered`
+with the reason, which is `maintain verify`'s reason for leaving the same measure
+unchecked (checked in this order):
+
+| Reason | When |
+|---|---|
+| `snapshot_not_ancestor` | The model's `ref()` lineage, as the plan leaves the project, does not reach the declared snapshot. |
+| `lineage_unavailable` | Something on the way could hide it: a `ref()` dex cannot resolve, a macro call that may read a relation, a node the `ref()` graph cannot read. |
+| `hard_delete_records` | The snapshot's `hard_deletes` is `new_record`, read from its `config()`, its YAML entry or `dbt_project.yml`. |
+| `snapshot_config_unread` | The plan's own reason: the snapshot's `hard_deletes` or `snapshot_meta_column_names` is an expression (a `var()`, Jinja) no static read settles. |
+| `policy_missing` | The declaration leaves out a policy the measure depends on: `initial_observation` and `null_status` for `transition_count`, those and `time.provenance` for `latest_target_transition_at`, `time.provenance` for `first_target_at`. |
+| `column_not_output` | The model's SQL provably does not output the entity key or the measure column. |
+
+What only a run can tell (the snapshot failed to build, a column the history names
+is missing) makes the test error, never pass. A test the plan rendered is never
+removed (nothing generated is). Where the history changes (a policy, the snapshot,
+a measure or its column, or the history removed), each listed test the new
+history no longer gives is reported `stale` (`reason: history_changed`, its
+measure as `variant`) with a warning, beside the test the new claim renders:
+remove it from the YAML. Where only verify's reading changes (the model stops
+reading the snapshot), a listed test is `listed_while_off`, and `maintain verify`
+reports the contract unchecked while the test keeps running, so remove it by
+hand.
+
+Its macro reaches the project as the others' do: `macros/dex_temporal_contract.sql`
+(the [shipped macro](macros.md#dex_temporal_contract)) as a `macro_sql` diff where
 neither the project nor the plan defines the test.
 
 ### A versioned model
@@ -1099,6 +1180,10 @@ Under the `timestamp` strategy dbt copies the source's `updated_at` into its
 validity column, so that column is source time. Under `check` it is the time the
 snapshot ran. `temporal_provenance_contradicted` reports a declaration that says
 otherwise, and a column dbt does not write declared as `capture`.
+
+With `declarations.render_tests` on, each measure also renders a
+[`dex_temporal_contract`](#dex_temporal_contract-a-historys-measures) test that
+agrees with these findings count for count.
 
 `transform plan` also warns when a model refs a snapshot and walks its versions
 (`lag`, `lead`, `row_number`, `dbt_valid_from`, `dbt_updated_at`) with no `history`

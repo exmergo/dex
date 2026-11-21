@@ -94,6 +94,12 @@ MACRO_ASSETS: dict[str, str] = {
         "parent (#1457): fails with the count of rows repeating a non-NULL key, "
         "never a key; a declaration plan adds it where the project lacks it"
     ),
+    "dex_temporal_contract": (
+        "the generic test a declared history renders per measure (#1458): fails "
+        "with the count of entities whose column disagrees with what the "
+        "snapshot's versions and the declared policy give, never a key; a "
+        "declaration plan adds it where the project lacks it"
+    ),
 }
 
 

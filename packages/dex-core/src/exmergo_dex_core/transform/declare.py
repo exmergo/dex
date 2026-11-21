@@ -282,6 +282,7 @@ def propose(
                 joins=declarations_mod.read_model_joins(
                     rendered, view.model_paths, model, dialect
                 ),
+                history=declarations_mod.history_reader(view, rendered),
             )
             # The tests a references implies on its parent (#1457), which the
             # plan renders into the parent's entry: owed by this model as a
@@ -455,6 +456,7 @@ def _owes_generated_tests(
             joins=declarations_mod.read_model_joins(
                 files, view.model_paths, model, dialect
             ),
+            history=declarations_mod.history_reader(view, files),
         )
     except (RewriteError, DeclarationError):
         return False

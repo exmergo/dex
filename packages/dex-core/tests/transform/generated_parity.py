@@ -51,6 +51,8 @@ from exmergo_dex_core import generated_tests as gt
 
 #: Where the fixture models live in the project, apart from anything else.
 FOLDER = "models/dex_parity"
+#: Where the fixture snapshots live (#1458), under dbt's default snapshot path.
+SNAPSHOT_FOLDER = "snapshots/dex_parity"
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,13 @@ class ParityRow:
     #: causes). The violating fixture must still fail the test and get the
     #: finding; the clean one need only pass the test.
     directional: bool = False
+    #: dbt snapshots the row's fixtures read (#1458: the snapshot a declared
+    #: history is verified against), by suffix: each renders the SQL between
+    #: ``{% snapshot dex_parity_<slug>_<suffix> %}`` and ``{% endsnapshot %}``
+    #: (its ``config()`` included) and is written under ``snapshots/``. It is
+    #: built in the same selection; ``maintain verify`` is not pointed at it,
+    #: since it judges models.
+    snapshots: Mapping[str, Callable[[str], str]] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -804,6 +813,145 @@ REFERENCED_KEY = ParityRow(
     directional=True,
 )
 
+
+def _t(day: int) -> str:
+    """A timestamp literal every connector reads the same way."""
+
+    return f"cast('2024-01-0{day} 00:00:00' as timestamp)"
+
+
+#: #1458: the versions a status-history snapshot recorded, one row per version
+#: (``version_id`` is the snapshot's key, so one snapshot run records them all,
+#: and the timestamp strategy copies ``changed_at`` into ``dbt_valid_from``,
+#: which orders them). Host 1 goes basic, super, basic, super: three
+#: transitions, the last into super on day 4. Host 2 is super twice: no
+#: transition under a baseline first observation, first super on day 1. Host 3
+#: is basic only.
+_VERSIONS = [
+    (1, 1, "basic", 1),
+    (2, 1, "super", 2),
+    (3, 1, "basic", 3),
+    (4, 1, "super", 4),
+    (5, 2, "super", 1),
+    (6, 2, "super", 2),
+    (7, 3, "basic", 1),
+]
+
+
+def _versions(_null: str) -> str:
+    (vid, host, tier, day), *rest = _VERSIONS
+    lines = [
+        f"select {vid} as version_id, {host} as host_id, '{tier}' as tier, "
+        f"{_t(day)} as changed_at"
+    ]
+    lines += [f"union all select {v}, {h}, '{t}', {_t(d)}" for v, h, t, d in rest]
+    return "\n".join(lines) + "\n"
+
+
+def _history_snapshot(prefix: str) -> Callable[[str], str]:
+    def render(_null: str) -> str:
+        return (
+            "{{ config(unique_key='version_id', strategy='timestamp', "
+            "updated_at='changed_at') }}\n"
+            f"select * from {{{{ ref('{prefix}_versions') }}}}\n"
+        )
+
+    return render
+
+
+def _per_host(
+    prefix: str, column: str, values: Mapping[int, str]
+) -> Callable[[str], str]:
+    """A model with one row per host in the snapshot, ``column`` given per
+    host by ``values`` (NULL for a host not listed)."""
+
+    def render(_null: str) -> str:
+        cases = " ".join(f"when {host} then {value}" for host, value in values.items())
+        return (
+            f"select h.host_id, case h.host_id {cases} end as {column}\n"  # noqa: S608
+            f"from (select distinct host_id from {{{{ ref('{prefix}_snap') }}}}) h\n"
+        )
+
+    return render
+
+
+def _temporal_measured(measure: str) -> Callable[[Mapping[str, Any], str], bool]:
+    def measured(verify: Mapping[str, Any], model: str) -> bool:
+        for record in verify.get("temporal_contracts") or []:
+            if record.get("model") != model:
+                continue
+            for assertion in record.get("assertions") or []:
+                if assertion.get("assertion") == measure:
+                    return assertion.get("status") in {"satisfied", "contradicted"}
+        return False
+
+    return measured
+
+
+def _temporal_row(
+    name: str, measure: str, column: str, violating: dict, clean: dict
+) -> ParityRow:
+    prefix = f"dex_parity_{name.removeprefix('dex_')}"
+    return ParityRow(
+        test=gt.TEMPORAL_CONTRACT,
+        name=name,
+        codes=frozenset({_finding_code(measure)}),
+        declaration={
+            "description": "Parity fixture: one row per host.",
+            "history": {
+                "snapshot": f"{prefix}_snap",
+                "entity": {"host_id": "host_id"},
+                "status": {"column": "tier", "target": "super"},
+                "initial_observation": "baseline",
+                "null_status": "ignore",
+                "population": "all_observed",
+                # The timestamp strategy copies the source's time, so it is
+                # business time; `capture` would be contradicted.
+                "time": {"column": "dbt_valid_from", "provenance": "business"},
+                "measures": {measure: column},
+            },
+        },
+        violating=_per_host(prefix, column, violating),
+        clean=_per_host(prefix, column, clean),
+        count=lambda finding: int(finding["data"]["mismatched_entities"]),
+        measured=_temporal_measured(measure),
+        fixtures={"versions": _versions},
+        snapshots={"snap": _history_snapshot(prefix)},
+        arguments={"measure": measure},
+    )
+
+
+def _finding_code(measure: str) -> str:
+    from exmergo_dex_core.maintain.temporal_contracts import _MEASURE_FINDINGS
+
+    return _MEASURE_FINDINGS[measure]
+
+
+#: #1458: transition counts. The violating model counts host 1's four versions
+#: and host 2's invented prior state (a baseline first observation is no
+#: transition): two entities wrong, which a macro returning a flag would not
+#: count.
+TEMPORAL_TRANSITIONS = _temporal_row(
+    "dex_temporal_transitions",
+    "transition_count",
+    "transitions",
+    violating={1: "4", 2: "1", 3: "0"},
+    clean={1: "3", 2: "0", 3: "0"},
+)
+
+#: #1458: the latest transition into the target, a timestamp each warehouse
+#: types its own way (the cast is where a dialect goes wrong). Host 1's last
+#: transition into super is day 4; host 2 never transitioned, so NULL. The
+#: violating model gives host 1 day 3 and host 2 day 1.
+TEMPORAL_LATEST = _temporal_row(
+    "dex_temporal_latest",
+    "latest_target_transition_at",
+    "latest_super_at",
+    violating={1: _t(3), 2: _t(1)},
+    clean={1: _t(4)},
+)
+
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -823,6 +971,8 @@ ROWS: tuple[ParityRow, ...] = (
     JOIN_COVERAGE_FILTERED,
     JOIN_COVERAGE_LEFT,
     REFERENCED_KEY,
+    TEMPORAL_TRANSITIONS,
+    TEMPORAL_LATEST,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
@@ -843,6 +993,9 @@ class ParityReport:
     unsupported: list[str] = field(default_factory=list)
     withheld: list[str] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
+    #: The fixture snapshots built (#1458): tables, where ``models`` are the
+    #: connector's default materialization, so a caller drops them apart.
+    snapshots: list[str] = field(default_factory=list)
     envelopes: dict[str, Any] = field(default_factory=dict)
     #: Per command: seconds on the wall clock and the envelope's ``cost``, so a
     #: billed job can say what the harness spent (#1451).
@@ -871,6 +1024,18 @@ def payload(
     edits: list[dict] = list(extra_edits or [])
     declarations: list[dict] = []
     for row in rows:
+        for suffix, render in row.snapshots.items():
+            name = row.model(suffix)
+            edits.append(
+                {
+                    "path": f"{SNAPSHOT_FOLDER}/{name}.sql",
+                    "kind": "snapshot_sql",
+                    "content": (
+                        f"{{% snapshot {name} %}}\n{render(null_int)}"
+                        "{% endsnapshot %}\n"
+                    ),
+                }
+            )
         for suffix, render in row.fixtures.items():
             edits.append(
                 {
@@ -1025,6 +1190,8 @@ def run_parity(
         for side in (*row.fixtures, "violating", "clean")
     ]
     report.models = sorted(set(report.models) | set(selected))
+    snapshots = [row.model(suffix) for row in rows for suffix in row.snapshots]
+    report.snapshots = sorted(set(snapshots))
 
     _rc, built = step(
         "build",
@@ -1035,7 +1202,7 @@ def run_parity(
             "--target",
             "dev",
             "--select",
-            " ".join(selected),
+            " ".join([*snapshots, *selected]),
             *_paid(budget),
         ],
     )
@@ -1049,7 +1216,10 @@ def run_parity(
     # DBT_INDIRECT_SELECTION=empty), so every model builds and the manifest
     # holds every model's compiled SQL for verify to read; a narrower
     # selection would leave the other rows' models uncompiled there. The test
-    # results are the first pass's, read above.
+    # results are the first pass's, read above. A snapshot is not built again:
+    # its first pass stands, and a second would MERGE into it (which Trino's
+    # memory catalog cannot).
+    snapshot_status = {name: model_status.get(name) for name in snapshots}
     skipped = [
         name for name in dict.fromkeys(selected) if model_status.get(name) == "skipped"
     ]
@@ -1081,7 +1251,8 @@ def run_parity(
             n["name"]: n["status"] for n in (rebuilt.get("data") or {}).get("nodes", [])
         }
         built = rebuilt
-    for name in dict.fromkeys(selected):
+    model_status.update(snapshot_status)
+    for name in dict.fromkeys([*snapshots, *selected]):
         if model_status.get(name) != "success":
             report.disagreements.append(
                 f"{name} did not build ({model_status.get(name)}): "
@@ -1222,7 +1393,14 @@ def _claims(row: ParityRow, kind: gt.GeneratedTestKind) -> set[str] | None:
     for side in ("violating", "clean"):
         model = row.model(side)
         [declaration] = parse_declarations([{"model": model, **row.declaration}])
-        for instance in kind.instances(declaration):
+        if kind.reads_history:
+            # The fixture reads its snapshot through ref() (#1458).
+            instances = kind.instances(  # type: ignore[call-arg]
+                declaration, gt.HistoryReading(lineage="descends")
+            )
+        else:
+            instances = kind.instances(declaration)
+        for instance in instances:
             if row.picks(instance.arguments):
                 out.add(
                     claim_id(

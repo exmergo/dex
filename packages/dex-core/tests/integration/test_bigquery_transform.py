@@ -471,16 +471,17 @@ def test_generated_tests_agree_with_maintain_verify_live(
     assert_ok(rc, envelope)
     # One build prices every row's fixtures and tests, each statement at
     # BigQuery's 10 MB billing minimum, so the budget grows with the rows as
-    # the per-node connectors' does: 44 statements priced 461 MB (#1457).
+    # the per-node connectors' does: 44 statements priced 461 MB (#1457). The
+    # temporal rows (#1458) add a snapshot, five models and two tests a side.
     report = assert_generated_test_parity(
-        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 8
+        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 10
     )
 
     from google.cloud import bigquery
 
     client = bigquery.Client(project=bq_project)
     try:
-        for name in report.models:
+        for name in [*report.models, *report.snapshots]:
             client.delete_table(
                 f"{bq_project}.{bq_scratch_dataset}.{name}", not_found_ok=True
             )

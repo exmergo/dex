@@ -63,6 +63,7 @@ from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
 from .claims import CLAIM_KEY, claim_id, claim_of, without_claim
+from .history_reading import history_reader
 from .join_reading import read_model_joins
 from .package_overrides import (
     DocumentedOverride,
@@ -642,6 +643,9 @@ def apply_declarations(
 
     flagged_tests: list[bool] = []
     rendered: dict[str, str] = {}
+    # One reader over the project as the plan leaves it: its ref() graph is
+    # built on the first history it reads (#1458).
+    history = history_reader(view, files)
     for declaration in declarations:
         sql_path = model_sql_path(files, view.model_paths, declaration.model)
         path = schema_path(files, declaration.model)
@@ -660,6 +664,7 @@ def apply_declarations(
                 joins=read_model_joins(
                     files, view.model_paths, declaration.model, dialect
                 ),
+                history=history,
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -1362,6 +1367,7 @@ def render(
     dialect: str | None = None,
     outputs: frozenset[str] | None = None,
     joins: Any = None,
+    history: Any = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1391,7 +1397,9 @@ def render(
     (#1456); ``None`` reads none. A generated test already in the YAML is never
     removed: the switch decides what renders, not what stays. A listed
     ``dex_join_coverage`` whose join the model's SQL no longer writes is
-    reported ``stale``, with a note, for a reviewer to remove.
+    reported ``stale``, with a note, for a reviewer to remove. ``history``
+    reads a declared ``history`` block's snapshot for ``dex_temporal_contract``
+    (#1458; see :func:`_generated`).
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
@@ -1399,7 +1407,12 @@ def render(
         # No kind registered: nothing to generate, so no entry to read back.
         return text
     planned = _generated(
-        _effective(text, declaration), render_tests, dialect, outputs, joins
+        _effective(text, declaration),
+        render_tests,
+        dialect,
+        outputs,
+        joins,
+        history=history,
     )
     on = [g for g in planned if g["enabled"]]
     if on:
@@ -1412,6 +1425,22 @@ def render(
         generated.extend(_report_rows(content, text, planned))
     if joins is not None and getattr(joins, "read", False):
         for row in _stale_join_tests(content, declaration.model, planned):
+            if generated is not None:
+                generated.append(row)
+            if notes is not None:
+                notes.append(_stale_note(row))
+    if history is not None:
+        # A listed dex_temporal_contract the history no longer gives (#1458):
+        # a policy, the snapshot, a measure or its column changed, or the
+        # history was removed, so the test holds the model to a contract the
+        # declaration no longer states.
+        for row in _stale_join_tests(
+            content,
+            declaration.model,
+            planned,
+            test=gt.TEMPORAL_CONTRACT,
+            reason="history_changed",
+        ):
             if generated is not None:
                 generated.append(row)
             if notes is not None:
@@ -1659,6 +1688,14 @@ def render_referenced_keys(
 
 
 def _stale_note(row: Mapping[str, Any]) -> str:
+    if row["test"] == gt.TEMPORAL_CONTRACT:
+        return (
+            f"'{row['model']}' lists a {gt.TEMPORAL_CONTRACT} test (claim "
+            f"{row['claim']}) the history it declares no longer gives (a policy, "
+            "the snapshot, a measure or its column changed, or the history was "
+            "removed); it holds the model to a contract the declaration no longer "
+            "states, so remove it from the YAML"
+        )
     return (
         f"'{row['model']}' lists a {gt.JOIN_COVERAGE} test (claim {row['claim']}) "
         "for a join its SQL no longer writes; it measures inputs the model does "
@@ -1716,12 +1753,19 @@ def stale_join_tests(
 
 
 def _stale_join_tests(
-    content: str | None, model: str, planned: list[dict[str, Any]]
+    content: str | None,
+    model: str,
+    planned: list[dict[str, Any]],
+    *,
+    test: str = gt.JOIN_COVERAGE,
+    reason: str = "join_not_in_model",
 ) -> list[dict[str, Any]]:
     """The ``dex_join_coverage`` tests the model's entry lists whose join no
     longer appears among the joins the plan read (#1456), as
     ``data.generated_tests`` rows with ``status: stale``. Matched by claim, else
-    by arguments, as rendering matches a listed test."""
+    by arguments, as rendering matches a listed test. ``test`` and ``reason``
+    ask the same of another model-level kind (#1458: a ``dex_temporal_contract``
+    whose claim the declared history no longer gives, ``history_changed``)."""
 
     if not content:
         return []
@@ -1751,36 +1795,37 @@ def _stale_join_tests(
     if not isinstance(node, Mapping):
         return []
     listed = node.get("data_tests") or node.get("tests") or []
-    current = [
-        g["spec"] for g in planned if g["test"] == gt.JOIN_COVERAGE and g["enabled"]
-    ]
+    current = [g["spec"] for g in planned if g["test"] == test and g["enabled"]]
     current += [
         g["spec"]
         for g in planned
-        if g["test"] == gt.JOIN_COVERAGE
+        if g["test"] == test
         and not g["enabled"]
         and g["off_reason"] not in (gt.JOIN_UNREAD,)
     ]
     out: list[dict[str, Any]] = []
-    for test in listed if isinstance(listed, list) else []:
-        if _listed_name(test) != gt.JOIN_COVERAGE or not gt.is_generated(test):
+    for item in listed if isinstance(listed, list) else []:
+        if _listed_name(item) != test or not gt.is_generated(item):
             continue
         claims = {claim_of(spec) for spec in current}
-        if claim_of(test) in claims or any(
-            _arguments_of(test) == _arguments_of(spec) for spec in current
+        if claim_of(item) in claims or any(
+            _arguments_of(item) == _arguments_of(spec) for spec in current
         ):
             continue
-        out.append(
-            {
-                "model": model,
-                "column": None,
-                "test": gt.JOIN_COVERAGE,
-                "cadence": gt.SCHEDULED,
-                "claim": claim_of(test),
-                "status": "stale",
-                "reason": "join_not_in_model",
-            }
-        )
+        row: dict[str, Any] = {
+            "model": model,
+            "column": None,
+            "test": test,
+            "cadence": gt.SCHEDULED,
+            "claim": claim_of(item),
+            "status": "stale",
+            "reason": reason,
+        }
+        # A temporal test names its measure (#1458), as its rendered row does.
+        measure = (_arguments_of(item) or {}).get("measure")
+        if isinstance(measure, str):
+            row["variant"] = measure
+        out.append(row)
     return out
 
 
@@ -1854,6 +1899,7 @@ def _generated(
     outputs: frozenset[str] | None = None,
     joins: Any = None,
     parent_references: gt.ParentReferences | None = None,
+    history: Any = None,
 ) -> list[dict[str, Any]]:
     """Every generated test the declaration gives, each with its claim, its
     rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
@@ -1862,7 +1908,12 @@ def _generated(
 
     ``parent_references`` asks for the other half (#1457): the tests of the
     kinds that check what other models' declarations imply about this one
-    (``on_parent``), and only those. Without it, those kinds give nothing."""
+    (``on_parent``), and only those. Without it, those kinds give nothing.
+
+    ``history`` reads a declared ``history`` block's snapshot (#1458):
+    :func:`.history_reading.history_reader`, called as ``history(model,
+    history)``. ``None`` reads nothing, and a kind that reads it gives
+    nothing."""
 
     out: list[dict[str, Any]] = []
     model = declaration.model
@@ -1878,6 +1929,13 @@ def _generated(
             )
         elif kind.reads_joins:
             instances = kind.instances(declaration, joins)  # type: ignore[call-arg]
+        elif kind.reads_history:
+            reading = (
+                history(model, declaration.history)
+                if history is not None and declaration.history is not None
+                else None
+            )
+            instances = kind.instances(declaration, reading)  # type: ignore[call-arg]
         else:
             instances = kind.instances(declaration)
         for instance in instances:

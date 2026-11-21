@@ -203,6 +203,16 @@ GROUPS: dict[str, tuple[str, ...]] = {
         ),
         f"{_T}test_referenced_key.py",
     ),
+    # dex_temporal_contract (#1458): its parity rows and its own file, whose
+    # macro cases each run a dbt build.
+    "transform-parity-temporal": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_temporal_rows_agree_and_the_plan_writes_their_macro",
+            "test_a_temporal_macro_returning_a_flag_fails_the_harness",
+        ),
+        f"{_T}test_temporal_contract_render.py",
+    ),
     "transform-e2e": (  # 148s
         f"{_T}test_package_repair_e2e.py",
         f"{_T}test_test_only_plan_e2e.py",
