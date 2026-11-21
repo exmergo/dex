@@ -243,6 +243,89 @@ def test_a_constant_answer_model_with_no_check_is_only_build_validated():
     assert completion.assurance.asserted.names == ["checked"]
 
 
+def _package_models() -> list[BuildNode]:
+    """The package's models, ahead of the project's own in run order (#1500)."""
+
+    return [
+        BuildNode(
+            unique_id=f"model.elementary.{name}",
+            name=name,
+            resource_type="model",
+            status="success",
+        )
+        for name in (
+            "data_monitoring_metrics",
+            "dbt_columns",
+            "dbt_models",
+            "dbt_tests",
+            "elementary_test_results",
+        )
+    ]
+
+
+def _plain_build_with_package_nodes() -> tuple[BuildEvidence, dict[str, list[str]]]:
+    """A plain build (no plan): package models, then the project's own (#1500)."""
+
+    nodes = [
+        *_package_models(),
+        BuildNode(unique_id=_uid("fct_orders"), name="fct_orders", status="success"),
+        BuildNode(
+            unique_id=_uid("dim_customers"), name="dim_customers", status="success"
+        ),
+        BuildNode(
+            unique_id="test.elementary.not_null_data_monitoring_metrics_id.aaa",
+            name="not_null_data_monitoring_metrics_id",
+            resource_type="test",
+            status="pass",
+        ),
+        BuildNode(
+            unique_id="test.dex_test.not_null_fct_orders_id.bbb",
+            name="not_null_fct_orders_id",
+            resource_type="test",
+            status="pass",
+        ),
+    ]
+    graph = {
+        "test.elementary.not_null_data_monitoring_metrics_id.aaa": [
+            "model.elementary.data_monitoring_metrics"
+        ],
+        "test.dex_test.not_null_fct_orders_id.bbb": [_uid("fct_orders")],
+    }
+    return _evidence(nodes), graph
+
+
+def test_plain_build_lists_the_projects_own_models_first():
+    evidence, graph = _plain_build_with_package_nodes()
+    completion = summarize_completion(
+        evidence, None, graph=graph, project_name="dex_test"
+    )
+    assert completion.assurance.basis == "built_models"
+    # The project's own model leads both lists; the counts are unchanged.
+    assert completion.assurance.asserted.names == [
+        "fct_orders",
+        "data_monitoring_metrics",
+    ]
+    assert completion.assurance.asserted.count == 2
+    assert completion.assurance.build_only.names == [
+        "dim_customers",
+        "dbt_columns",
+        "dbt_models",
+        "dbt_tests",
+        "elementary_test_results",
+    ]
+    assert completion.assurance.build_only.count == 5
+
+
+def test_plain_build_without_a_project_name_keeps_the_builds_own_order():
+    evidence, graph = _plain_build_with_package_nodes()
+    completion = summarize_completion(evidence, None, graph=graph)
+    assert completion.assurance.asserted.names == [
+        "data_monitoring_metrics",
+        "fct_orders",
+    ]
+    assert completion.assurance.build_only.names[0] == "dbt_columns"
+
+
 def test_a_satisfied_record_counts_as_asserted_and_obligations_are_counted():
     nodes = [BuildNode(unique_id=_uid(REPORT), name=REPORT, status="success")]
     evidence = _evidence(nodes, required=[REPORT])

@@ -7997,6 +7997,12 @@ def _attach_completion(
     try:
         states = inputs.get("comparisons")
         diagnosed = _attach_prerequisites(result, inputs)
+        manifest = inputs.get("manifest")
+        project_name = (
+            (manifest.get("metadata") or {}).get("project_name")
+            if isinstance(manifest, dict)
+            else None
+        )
         result.completion = summarize_completion(
             result.evidence,
             result.verification,
@@ -8020,6 +8026,7 @@ def _attach_completion(
             prerequisites=diagnosed,
             cold=result.cold_verification,
             prose_population=_prose_population(result, inputs),
+            project_name=(project_name if isinstance(project_name, str) else None),
             identifier_conversions=inputs.get("identifier_conversions"),
             change_scope=inputs.get("change_scope"),
             incremental_replay=_incremental_replay_inputs(result, inputs),
