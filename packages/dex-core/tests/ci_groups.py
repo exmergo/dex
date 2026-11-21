@@ -184,6 +184,16 @@ GROUPS: dict[str, tuple[str, ...]] = {
         f"{_T}test_generated_tests.py",
         f"{_T}test_change_scope.py",
     ),
+    # dex_join_coverage (#1456): its parity rows and its own file.
+    "transform-parity-join": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_join_rows_agree_and_a_left_join_renders_nothing",
+            "test_a_macro_reading_the_output_misses_the_inner_join_and_fails_the_harness",
+            "test_a_macro_ignoring_the_filter_fails_the_harness",
+        ),
+        f"{_T}test_join_coverage_render.py",
+    ),
     "transform-e2e": (  # 148s
         f"{_T}test_package_repair_e2e.py",
         f"{_T}test_test_only_plan_e2e.py",

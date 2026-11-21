@@ -16,6 +16,10 @@ from pathlib import Path
 
 import pytest
 from transform.generated_parity import (
+    JOIN_COVERAGE_FILTERED,
+    JOIN_COVERAGE_INNER,
+    JOIN_COVERAGE_LEFT,
+    JOIN_COVERAGE_NO_MATCH,
     PARENT_MISSING,
     PARENT_MISSING_FILTERED,
     PARENT_MISSING_UNAPPLIED,
@@ -93,7 +97,7 @@ def test_every_row_agrees_with_maintain_verify_on_duckdb(
     assert report.disagreements == [], report.disagreements
     assert report.agreed == [row.label for row in ROWS if row.withheld is None]
     assert report.unsupported == []
-    assert report.withheld == [UNIT_PERCENT.label]
+    assert report.withheld == [UNIT_PERCENT.label, JOIN_COVERAGE_LEFT.label]
 
 
 def test_the_plan_writes_the_shipped_macro_beside_the_rendered_test(
@@ -475,4 +479,119 @@ def test_a_macro_missing_the_lower_bound_fails_on_the_count(
     assert report.disagreements == [
         f"{UNIT_FRACTION.label} on {violating}: dbt counts 1 failure(s), "
         "maintain verify counts 2"
+    ]
+
+
+# --- dex_join_coverage (#1456) -------------------------------------------------------
+
+JOIN_ROWS = (
+    JOIN_COVERAGE_INNER,
+    JOIN_COVERAGE_NO_MATCH,
+    JOIN_COVERAGE_FILTERED,
+    JOIN_COVERAGE_LEFT,
+)
+JOIN_SIGNATURE = (
+    "model, child, child_columns, parent, parent_columns, child_where, "
+    "parent_where, null_keys"
+)
+
+#: Reads the model's output, as `relationships` does: an INNER join has already
+#: dropped the unmatched rows there, so it passes the violating fixture.
+READS_THE_OUTPUT = (
+    "select count(*) as dex_unmatched_rows from {{ model }} m "
+    "where m.{{ child_columns[0] }} is not null and m.{{ child_columns[0] }} "
+    "not in (select {{ parent_columns[0] }} from {{ parent }} "
+    "where {{ parent_columns[0] }} is not null) having count(*) > 0"
+)
+#: Reads the driving input whole, ignoring the filter the model applies to it.
+IGNORES_THE_FILTER = (
+    "select count(*) as dex_unmatched_rows from {{ child }} c "
+    "where c.{{ child_columns[0] }} is not null and c.{{ child_columns[0] }} "
+    "not in (select {{ parent_columns[0] }} from {{ parent }} "
+    "where {{ parent_columns[0] }} is not null) having count(*) > 0"
+)
+
+
+def test_the_join_rows_agree_and_a_left_join_renders_nothing(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=JOIN_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [
+        JOIN_COVERAGE_INNER.label,
+        JOIN_COVERAGE_NO_MATCH.label,
+        JOIN_COVERAGE_FILTERED.label,
+    ]
+    assert report.withheld == [JOIN_COVERAGE_LEFT.label]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_join_coverage.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["status"], t.get("reason"))
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.JOIN_COVERAGE
+    )
+    assert rows == sorted(
+        [
+            *(
+                (row.model(side), "added", None)
+                for row in JOIN_ROWS[:3]
+                for side in ("violating", "clean")
+            ),
+            (
+                JOIN_COVERAGE_LEFT.model("violating"),
+                "not_rendered",
+                "covered_by_builtin",
+            ),
+            (JOIN_COVERAGE_LEFT.model("clean"), "not_rendered", "covered_by_builtin"),
+        ]
+    )
+    written = (dbt_project_dir / "macros" / "dex_join_coverage.sql").read_text()
+    assert "select dex_unmatched_rows" in written
+
+
+def test_a_macro_reading_the_output_misses_the_inner_join_and_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(JOIN_COVERAGE_INNER,),
+        extra_edits=[
+            _planted("duckdb", READS_THE_OUTPUT, gt.JOIN_COVERAGE, JOIN_SIGNATURE)
+        ],
+    )
+
+    violating = JOIN_COVERAGE_INNER.model("violating")
+    assert report.disagreements == [
+        f"{JOIN_COVERAGE_INNER.label} on {violating}: the test should fail on the "
+        "violating fixture, dbt says 'pass'"
+    ]
+
+
+def test_a_macro_ignoring_the_filter_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(JOIN_COVERAGE_FILTERED,),
+        extra_edits=[
+            _planted("duckdb", IGNORES_THE_FILTER, gt.JOIN_COVERAGE, JOIN_SIGNATURE)
+        ],
+    )
+
+    label = JOIN_COVERAGE_FILTERED.label
+    violating = JOIN_COVERAGE_FILTERED.model("violating")
+    clean = JOIN_COVERAGE_FILTERED.model("clean")
+    assert report.disagreements == [
+        f"{label} on {violating}: dbt counts 2 failure(s), maintain verify counts 1",
+        f"{label} on {clean}: the test should pass on the clean fixture, dbt "
+        "says 'fail'",
     ]

@@ -1397,7 +1397,25 @@ default, or a filter or operator after it is refused. A key naming a location
   a boolean, a date or time) is checked by neither. A column declared
   `unit: percent` renders nothing, `not_rendered` with `reason: heuristic_only`,
   because `maintain verify`'s percent rule (every value within 0 to 1) is a
-  question correct small percentages also raise. The plan writes each
+  question correct small percentages also raise. It renders
+  `dex_join_coverage` (#1456) on the model entry for each INNER join a
+  `references` requires (a key column declaring a `references` that names the
+  joined model, read by `maintain verify`'s own `join_policy`), tagged
+  `dex_scheduled`, on every connector: the plan reads the join from the model's
+  SQL as it leaves it (each `ref()` and `source()` standing for its relation)
+  and writes its inputs as arguments, `child`/`child_columns`,
+  `parent`/`parent_columns`, and the `child_where`/`parent_where` filters the
+  model applies before joining, in the connector's dialect; its `failures`
+  count equals the join contract's `unmatched_rows`, a NULL key is left out
+  unless the key column is declared `null_rule: never` (`null_keys:
+  unmatched`), a duplicated parent key multiplies nothing, and the test returns
+  that count and never a key. A required LEFT join renders nothing,
+  `not_rendered` with `reason: covered_by_builtin`; a key conversion, a grouped
+  side, a RIGHT or FULL join, a side that is no `ref()` or `source()` or a
+  filter that does not transpile is `join_shape_unsupported`; SQL holding other
+  Jinja, or not parsing, is `join_unread`, once per declared `references`; and a
+  listed `dex_join_coverage` whose join the SQL no longer writes is reported
+  `stale` (`reason: join_not_in_model`) with a warning, and never removed. The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a

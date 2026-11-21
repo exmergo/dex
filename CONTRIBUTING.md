@@ -145,7 +145,11 @@ directions) picks its own with `arguments`. A fact that renders no test on any
 connector, only `maintain verify`'s check (`dex_unit_range`'s `percent` row,
 `heuristic_only`), sets `withheld`: the harness then checks that the plan lists
 both fixtures `not_rendered` with that reason, that no test builds, and that
-`maintain verify` alone flags the violating fixture and not the clean one. A kind that
+`maintain verify` alone flags the violating fixture and not the clean one
+(`dex_join_coverage`'s LEFT-join row, `covered_by_builtin`, is held the same
+way). A kind whose instances read the model's SQL (`dex_join_coverage`, which
+reads its joins) sets `GeneratedTestKind.reads_joins` and takes the joins the
+plan read beside the declaration. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 

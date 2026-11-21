@@ -659,7 +659,10 @@ renders `dex_unique_combination` (#1452), each `population.filters` list
 renders `dex_population_filter` under its column (#1453), and a
 `population.parent` renders `dex_parent_population` twice, its `missing` and
 `unexpected` directions, tagged `dex_scheduled` (#1454), and a column declared
-`unit: fraction` renders `dex_unit_range` (#1455), each agreeing with
+`unit: fraction` renders `dex_unit_range` (#1455), and an INNER join a
+`references` requires renders `dex_join_coverage` on the model, tagged
+`dex_scheduled`, reading the join's two inputs and their filters as the plan
+reads them from the model's SQL (#1456), each agreeing with
 `maintain verify`'s finding count for count, and the plan writes each one's
 macro as a `macro_sql` diff; a kind renders only on the connectors it states,
 and is `not_rendered` with `reason: dialect_unsupported` elsewhere (#1451), and
@@ -667,7 +670,12 @@ a test reading a column the model provably does not output is `not_rendered`
 with `reason: column_not_output`. A column declared `unit: percent` renders no
 test and is `not_rendered` with `reason: heuristic_only`: `maintain verify`
 flags a percent whose values all sit within 0 to 1 as a question, which correct
-small percentages answer too, so only `maintain verify` asks it. A version of a native dbt versioned model is
+small percentages answer too, so only `maintain verify` asks it. A required
+LEFT join renders no `dex_join_coverage` (`covered_by_builtin`: the
+`relationships` test counts the same rows), nor does a key conversion or a
+grouped side (`join_shape_unsupported`) or SQL whose joins the plan cannot read
+(`join_unread`), and a listed one whose join the SQL no longer writes is
+reported `stale`. A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry
 every version inherits, and a version's file stem is refused naming the label.

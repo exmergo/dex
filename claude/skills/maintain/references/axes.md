@@ -324,7 +324,11 @@ Needs no baseline. The classes of finding:
     No threshold. `low` when every column the join supplies is declared as
     allowed to be NULL.
   - `join_orphans` and `join_zero_overlap`: on a required join any unmatched
-    row (`threshold_source: contract`, high). Otherwise the stated defaults,
+    row (`threshold_source: contract`, high). With `declarations.render_tests`
+    on, an INNER join so required also renders `dex_join_coverage`, a build
+    test reading the same two inputs and failing with the same
+    `unmatched_rows` (#1456); a LEFT one leaves that to `relationships`.
+    Otherwise the stated defaults,
     0.2 and 0.9 of eligible rows (`threshold_source: default`). On a LEFT join
     with no requirement (no `references` on its driving key), unmatched rows are the optional relationship the join
     writes: no `join_orphans`, and `join_zero_overlap` at medium. On an INNER

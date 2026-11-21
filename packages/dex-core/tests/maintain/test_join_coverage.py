@@ -1695,3 +1695,42 @@ def test_an_unreadable_relation_is_a_note_and_keeps_the_sql_spelling():
         "m: the join keys on db.s.orders were probed as the SQL spells them: "
         "the relation's columns could not be read (RuntimeError)"
     ) in result.notes
+
+
+@pytest.mark.parametrize("dialect", ["snowflake", "postgres"])
+def test_a_filtered_sides_columns_are_probed_as_the_relation_stores_them(dialect):
+    # A side read through a filtering CTE carries its filter as DuckDB SQL over
+    # quoted names (#1085); on Snowflake "status" named no column of a relation
+    # that stores STATUS, so the probe was refused and the join went unmeasured.
+    # The filter is respelled as the keys are (#1456).
+    fold = str.upper if dialect == "snowflake" else str.lower
+    adapter = _FoldingWarehouse(
+        dialect,
+        {
+            "db.s.orders": {
+                fold("customer_id"): ["a", "b", "z"],
+                fold("status"): ["paid", "paid", "cancelled"],
+            },
+            "db.s.customers": {fold("customer_id"): ["a", "x"]},
+        },
+    )
+    candidate = verify_mod.JoinCandidate(
+        from_relation="db.s.orders",
+        from_columns=("customer_id",),
+        to_relation="db.s.customers",
+        to_columns=("customer_id",),
+        side="inner",
+        label="inner join customers",
+        from_filters=("\"status\" <> 'cancelled'",),
+    )
+    result = verify_mod.join_coverage(
+        adapter,
+        verify_mod.JoinContractPlan(candidates={"m": [candidate]}),
+        {},
+        list(adapter.tables),
+        handshake=lambda _estimate, _count: None,
+    )
+    (record,) = result.records
+    # Two kept orders, one matched: the cancelled order's z is never counted.
+    assert record["measured"]["eligible_rows"] == 2, record
+    assert record["measured"]["matched_rows"] == 1, record

@@ -83,6 +83,12 @@ MACRO_ASSETS: dict[str, str] = {
         "with the count of rows whose value sits below 0 or above 1, never a "
         "value; a declaration plan adds it where the project lacks it"
     ),
+    "dex_join_coverage": (
+        "the generic test an INNER join a declared references requires renders "
+        "(#1456): fails with the count of the join's eligible driving rows that "
+        "find no parent row, never a key; a declaration plan adds it where the "
+        "project lacks it"
+    ),
 }
 
 
