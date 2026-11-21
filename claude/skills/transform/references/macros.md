@@ -109,6 +109,24 @@ selects a key. The SQL goes through dbt's dispatch,
 one warehouse with its own `<adapter>__dex_referenced_key(model, column_name)`
 macro.
 
+## `dex_temporal_contract`
+
+The generic test each measure of a declared `history` renders on the model
+([declarations](declarations.md#dex_temporal_contract-a-historys-measures)),
+where `declarations.render_tests` turns it on. A declaration plan adds it for
+you; this command scaffolds or diffs it on its own. It fails with the count of
+entities whose measure column disagrees with what the snapshot's versions and
+the declared policy give, the `mismatched_entities` of `maintain verify`'s
+`temporal_*_mismatch` finding for that measure. It never selects a key or a
+value, and refuses to compile when a policy the measure depends on is not given.
+The SQL goes through dbt's dispatch, `default__dex_temporal_contract` holds on
+every connector, and a project overrides one warehouse with its own
+`<adapter>__dex_temporal_contract(model, snapshot, entity, status_column, target,
+measure, measure_column, order_column, time_column, initial_observation,
+null_status, provenance)` macro; the text cast, text literal, timestamp type and
+previous-version read are dispatched on their own
+(`dex_temporal_contract_text`, `_literal`, `_timestamp`, `_lag`).
+
 ## `unpivot_json_object`
 
 Turns a JSON object column with dynamic keys (the NoSQL-sourced shape: a

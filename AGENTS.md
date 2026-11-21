@@ -686,7 +686,16 @@ renders none (`covered_by_builtin`); a parent with no `models:` YAML entry, a
 seed or a snapshot renders none (`parent_undeclared`: Dex does not create an
 entry to hold a test), nor does a package's model (`parent_in_package`).
 `maintain verify` reports the consequence on the child (`row_fanout`), which has
-other causes, so the two agree in one direction only. A version of a native dbt versioned model is
+other causes, so the two agree in one direction only. Each measure a declared
+`history` names renders `dex_temporal_contract` (#1458) on the model, tagged
+`dex_scheduled`, one test per measure: it fails with the entities whose column
+disagrees with what the snapshot's versions and the declared policy give, the
+`mismatched_entities` of `maintain verify`'s `temporal_*_mismatch` finding for
+that measure. A measure verify would leave unchecked renders none, with verify's
+reason (`snapshot_not_ancestor`, `lineage_unavailable`, `hard_delete_records`,
+`policy_missing`), read from the project's `ref()` graph and the snapshot's
+config as the plan leaves them, or `snapshot_config_unread` where that config is
+an expression. A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry
 every version inherits, and a version's file stem is refused naming the label.

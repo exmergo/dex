@@ -157,7 +157,13 @@ sits on with `finding_on`, and, where the finding follows from the violation but
 not the reverse (a repeated parent key fans a child out; a fan-out has other
 causes), sets `directional`, so the clean fixture need only pass the test. A
 model the build skips because a parent fixture's test failed is built again on
-its own before `maintain verify` reads it. A kind that
+its own before `maintain verify` reads it. A kind whose instances read what
+the plan read of a snapshot (`dex_temporal_contract`, from a declared
+`history`) sets `GeneratedTestKind.reads_history` and takes a
+`HistoryReading` beside the declaration; its row builds the snapshot its
+fixtures read with `snapshots`, written under `snapshots/dex_parity/`, built in
+the first pass only and reported under `ParityReport.snapshots` so a connector's
+cleanup drops them as tables. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 

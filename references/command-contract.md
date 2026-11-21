@@ -1468,7 +1468,23 @@ default, or a filter or operator after it is refused. A key naming a location
   same fact only through its consequence, `row_fanout` on a child joining the
   parent, which has other causes, so the parity harness holds the two in that
   direction alone. `transform declare <parent>` proposes the test where the
-  parent owes nothing else. The plan writes each
+  parent owes nothing else. It renders `dex_temporal_contract` (#1458) for each
+  measure a declared `history` names, a model-level test tagged `dex_scheduled`
+  on every connector, its `data.generated_tests` row naming the measure as
+  `variant`: it fails with the count of entities whose column disagrees with the
+  value the snapshot's versions and the declared policy give, derived and
+  excluded as `maintain verify` derives and excludes them, so each count is the
+  `mismatched_entities` of one `temporal_*_mismatch` finding, and returns that
+  count and never a key. A measure verify would leave unchecked renders nothing,
+  with verify's reason, in verify's order: `snapshot_not_ancestor` (the model's
+  `ref()` lineage as the plan leaves it does not reach the snapshot),
+  `lineage_unavailable` (an unresolved `ref()`, a macro that may read a
+  relation, or a node the graph cannot read), `hard_delete_records` (the
+  snapshot's `hard_deletes: new_record`, from its `config()`, YAML entry or
+  `dbt_project.yml`), `snapshot_config_unread` (the plan's own reason: that
+  config, or `snapshot_meta_column_names`, is an expression), then
+  `policy_missing`; `column_not_output` as for every kind. The `population` and
+  `time_provenance` assertions render no test. The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a

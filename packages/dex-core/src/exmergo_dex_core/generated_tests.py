@@ -108,6 +108,39 @@ class GeneratedTestKind:
     #: being the :class:`ParentReferences` the project's declarations point at
     #: the parent, and its tests render into the parent's YAML entry.
     on_parent: bool = False
+    #: Whether :attr:`instances` also reads what the plan read of a declared
+    #: ``history`` block's snapshot (#1458): it is then called as
+    #: ``instances(declaration, reading)``, ``reading`` being a
+    #: :class:`HistoryReading`, or ``None`` where the caller read nothing,
+    #: which gives no instance at all.
+    reads_history: bool = False
+    #: Whether each test carries a dbt ``name`` built from its claim,
+    #: ``<kind>_<claim>`` (#1458), rather than the name dbt builds from its
+    #: arguments: two claims whose arguments stringify alike (a target of ``1``
+    #: and of ``"1"``) would otherwise share a name, which dbt refuses, and a
+    #: value from the data would sit in the node name.
+    named_by_claim: bool = False
+
+
+@dataclass(frozen=True)
+class HistoryReading:
+    """What a plan read, statically, of a declared ``history`` block's snapshot
+    (#1458): the facts ``maintain verify`` reads from the manifest instead.
+
+    ``lineage`` is ``descends`` where the model's ``ref()`` ancestors hold the
+    snapshot, ``not_ancestor`` where they provably do not (``other_snapshots``
+    names the snapshots they do hold), and ``unknown`` where something on the
+    way could hide it (``why`` says what). ``hard_deletes`` and ``valid_from``
+    are the snapshot's config (``valid_from`` is ``dbt_valid_from`` unless
+    ``snapshot_meta_column_names`` renames it); ``config_unread`` names a
+    config key written as an expression the plan cannot read."""
+
+    lineage: str
+    why: str | None = None
+    other_snapshots: tuple[str, ...] = ()
+    hard_deletes: str | None = None
+    valid_from: str = "dbt_valid_from"
+    config_unread: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +259,24 @@ PARENT_UNDECLARED = "parent_undeclared"
 #: The parent is an installed package's model, or a project override of one its
 #: package documents, whose YAML entry is the package's: Dex never edits it.
 PARENT_IN_PACKAGE = "parent_in_package"
+
+#: The reasons a declared ``history`` measure renders no
+#: ``dex_temporal_contract`` (#1458), each the reason ``maintain verify`` leaves
+#: the same measure unchecked with. The declaration leaves out a policy the
+#: measure's value depends on, and none is assumed.
+POLICY_MISSING = "policy_missing"
+#: The model's ``ref()`` lineage does not reach the declared snapshot.
+SNAPSHOT_NOT_ANCESTOR = "snapshot_not_ancestor"
+#: Whether the model reaches the declared snapshot could not be read.
+LINEAGE_UNAVAILABLE = "lineage_unavailable"
+#: The snapshot writes hard-delete records, versions that are no observation.
+HARD_DELETE_RECORDS = "hard_delete_records"
+#: The plan's own reason, with no ``maintain verify`` twin (verify reads the
+#: compiled config): the snapshot's ``hard_deletes`` or
+#: ``snapshot_meta_column_names`` is written as an expression the plan cannot
+#: read, so it cannot tell whether the shape is supported or which column
+#: orders the versions.
+SNAPSHOT_CONFIG_UNREAD = "snapshot_config_unread"
 
 
 def off_reason(setting: bool | list[str]) -> str:
@@ -595,5 +646,136 @@ register(
         macro=REFERENCED_KEY,
         dialects=ALL_CONNECTORS,
         on_parent=True,
+    )
+)
+
+TEMPORAL_CONTRACT = "dex_temporal_contract"
+#: The measures a ``history`` block can declare, in the order verify reports.
+TEMPORAL_MEASURES: tuple[str, ...] = (
+    "transition_count",
+    "latest_target_transition_at",
+    "first_target_at",
+)
+#: The policies each measure's expected value depends on (#1027). ``time``
+#: means ``time.provenance``. ``maintain verify`` reads the same table, so the
+#: measures it leaves ``policy_missing`` are the ones that render no test.
+TEMPORAL_POLICY_OWED: Mapping[str, tuple[str, ...]] = {
+    "transition_count": ("initial_observation", "null_status"),
+    "latest_target_transition_at": ("initial_observation", "null_status", "time"),
+    "first_target_at": ("time",),
+}
+
+
+def policy_owed(history: Any, measure: str) -> list[str]:
+    """The policies ``history`` leaves out that ``measure`` depends on, as
+    ``maintain verify`` names them (``time.provenance`` for the time)."""
+
+    owed: list[str] = []
+    for name in TEMPORAL_POLICY_OWED[measure]:
+        if name == "time":
+            time = getattr(history, "time", None)
+            if time is None or getattr(time, "provenance", None) is None:
+                owed.append("time.provenance")
+        elif getattr(history, name, None) is None:
+            owed.append(name)
+    return owed
+
+
+def _enum(value: Any) -> str | None:
+    return None if value is None else str(getattr(value, "value", value))
+
+
+def _temporal_contracts(declaration: Any, reading: Any) -> list[Instance]:
+    """One model-level test per measure a declared ``history`` names (#1458):
+    it fails with the number of entities whose column disagrees with what the
+    snapshot's versions and the declared policy give, ``maintain verify``'s
+    ``mismatched_entities`` for that measure's finding. One test per measure,
+    so each failure count is one finding's count.
+
+    A measure ``maintain verify`` would leave unchecked is listed and withheld
+    with verify's reason, checked in verify's order: the snapshot is not an
+    ancestor, the lineage cannot be read, the snapshot writes hard-delete
+    records, then a policy the measure depends on is missing. ``reading``
+    ``None`` (nothing read) gives nothing."""
+
+    history = getattr(declaration, "history", None)
+    if history is None or not isinstance(reading, HistoryReading):
+        return []
+    from .model_versions import ref_call
+
+    measures = getattr(history, "measures", None)
+    time = getattr(history, "time", None)
+    entity = {str(out): str(snap) for out, snap in history.entity.items()}
+    out: list[Instance] = []
+    for measure in TEMPORAL_MEASURES:
+        column = getattr(measures, measure, None)
+        if column is None:
+            continue
+        withheld: str | None = None
+        if reading.lineage == "not_ancestor":
+            withheld = SNAPSHOT_NOT_ANCESTOR
+        elif reading.lineage != "descends":
+            withheld = LINEAGE_UNAVAILABLE
+        elif reading.hard_deletes == "new_record":
+            withheld = HARD_DELETE_RECORDS
+        elif reading.config_unread is not None:
+            withheld = SNAPSHOT_CONFIG_UNREAD
+        elif policy_owed(history, measure):
+            withheld = POLICY_MISSING
+        policies = {
+            "initial_observation": _enum(history.initial_observation),
+            "null_status": _enum(history.null_status),
+            "time_column": str(time.column) if time is not None else None,
+            "provenance": _enum(getattr(time, "provenance", None)),
+        }
+        params: dict[str, Any] = {
+            "check": TEMPORAL_CONTRACT,
+            "measure": measure,
+            "snapshot": str(history.snapshot),
+            # Names, folded as claim_id folds a string (a list is hashed as
+            # written).
+            "entity": [[o.lower(), s.lower()] for o, s in entity.items()],
+            "status_column": str(history.status.column),
+            # A value from the data, whose case is part of the fact.
+            "target": [history.status.target],
+            "order_column": reading.valid_from,
+            **{k: v for k, v in policies.items() if v is not None},
+        }
+        arguments: dict[str, Any] = {}
+        if withheld is None:
+            arguments = {
+                "snapshot": ref_call(str(history.snapshot)),
+                "entity": dict(entity),
+                "status_column": str(history.status.column),
+                "target": history.status.target,
+                "measure": measure,
+                "measure_column": str(column),
+                **{k: v for k, v in policies.items() if v is not None},
+            }
+            if reading.valid_from.lower() != "dbt_valid_from":
+                arguments["order_column"] = reading.valid_from
+        out.append(
+            Instance(
+                column=None,
+                field="history",
+                columns=(*entity, str(column)),
+                params=params,
+                arguments=arguments,
+                variant=measure,
+                withheld=withheld,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        TEMPORAL_CONTRACT,
+        SCHEDULED,
+        _temporal_contracts,
+        macro=TEMPORAL_CONTRACT,
+        dialects=ALL_CONNECTORS,
+        reads_history=True,
+        named_by_claim=True,
     )
 )

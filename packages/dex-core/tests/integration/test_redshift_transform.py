@@ -259,5 +259,5 @@ def test_generated_tests_agree_with_maintain_verify_live(
     )
     assert_ok(rc, envelope)
     assert_generated_test_parity(
-        run_cli, capsys, tmp_path, connector="redshift", budget=RS_MAX_SECONDS * 32
+        run_cli, capsys, tmp_path, connector="redshift", budget=RS_MAX_SECONDS * 40
     )

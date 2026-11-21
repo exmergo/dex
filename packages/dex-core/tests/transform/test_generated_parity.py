@@ -30,6 +30,8 @@ from transform.generated_parity import (
     REFERENCED_KEY,
     RELATIONSHIPS_LEFT_JOIN,
     ROWS,
+    TEMPORAL_LATEST,
+    TEMPORAL_TRANSITIONS,
     UNIQUE_COMBINATION,
     UNIT_FRACTION,
     UNIT_PERCENT,
@@ -666,4 +668,68 @@ def test_a_macro_counting_null_keys_fails_the_harness_on_the_clean_parent(
     assert report.disagreements == [
         f"{REFERENCED_KEY.label} on {clean}: the test should pass on the clean "
         "fixture, dbt says 'fail'"
+    ]
+
+
+#: The temporal rows (#1458): their own snapshot, models and tests.
+TEMPORAL_ROWS = (TEMPORAL_TRANSITIONS, TEMPORAL_LATEST)
+
+#: The temporal test's whole signature, for a planted override.
+TEMPORAL_SIGNATURE = (
+    "model, snapshot, entity, status_column, target, measure, measure_column, "
+    "order_column, time_column, initial_observation, null_status, provenance"
+)
+
+#: Fails every model by one entity: a flag, not a count of entities.
+ONE_MISMATCH = "select 1 as dex_mismatched_entities"
+
+
+def test_the_temporal_rows_agree_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=TEMPORAL_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in TEMPORAL_ROWS]
+    assert report.snapshots == sorted(row.model("snap") for row in TEMPORAL_ROWS)
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_temporal_contract.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["variant"], t["status"])
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.TEMPORAL_CONTRACT
+    )
+    assert rows == sorted(
+        (row.model(side), measure, "added")
+        for row, measure in (
+            (TEMPORAL_TRANSITIONS, "transition_count"),
+            (TEMPORAL_LATEST, "latest_target_transition_at"),
+        )
+        for side in ("violating", "clean")
+    )
+
+
+def test_a_temporal_macro_returning_a_flag_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(TEMPORAL_TRANSITIONS,),
+        extra_edits=[
+            _planted("duckdb", ONE_MISMATCH, gt.TEMPORAL_CONTRACT, TEMPORAL_SIGNATURE)
+        ],
+    )
+
+    violating = TEMPORAL_TRANSITIONS.model("violating")
+    clean = TEMPORAL_TRANSITIONS.model("clean")
+    assert report.disagreements == [
+        f"{TEMPORAL_TRANSITIONS.label} on {violating}: dbt counts 1 failure(s), "
+        "maintain verify counts 2",
+        f"{TEMPORAL_TRANSITIONS.label} on {clean}: the test should pass on the "
+        "clean fixture, dbt says 'fail'",
     ]

@@ -1686,7 +1686,12 @@ def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str,
 
 
 def generated_spec(
-    name: str, *, cadence: str, claim: str, arguments: Mapping[str, Any] | None = None
+    name: str,
+    *,
+    cadence: str,
+    claim: str,
+    arguments: Mapping[str, Any] | None = None,
+    test_name: str | None = None,
 ) -> dict[str, Any]:
     """A generated test as a declaration renders it (#1449).
 
@@ -1694,10 +1699,14 @@ def generated_spec(
     plus the kind's cadence as a dbt tag, under ``config`` where dbt reads a
     test's tags, so ``dbt build --select tag:dex_scheduled`` selects it. The
     generic test's arguments go under ``arguments:``, dbt's spelling from 1.10.
+    ``test_name`` is the dbt test ``name``, where the kind names its tests
+    rather than letting dbt build a name from the arguments (#1458).
     """
 
     [(_, rendered)] = _unsampled(name, claim=claim).items()
-    body: dict[str, Any] = {"arguments": dict(arguments)} if arguments else {}
+    body: dict[str, Any] = {"name": test_name} if test_name else {}
+    if arguments:
+        body["arguments"] = dict(arguments)
     return {name: {**body, "config": {"tags": [cadence], **rendered["config"]}}}
 
 
