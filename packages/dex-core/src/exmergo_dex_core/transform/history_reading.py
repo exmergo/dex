@@ -289,6 +289,12 @@ def _config_calls(body: str) -> list[dict[str, Any]]:
 
 
 def _unread_if_named(text: str) -> dict[str, Any]:
+    """The keys an unparsed ``config()`` call may set: those it names, and
+    every key where it expands a mapping (``**var('opts')``) or passes one
+    positionally, either of which can carry any key."""
+
+    if "**" in text or not re.match(r"\s*\w+\s*=", text):
+        return dict.fromkeys(_KEYS, _UNREAD)
     return {key: _UNREAD for key in _KEYS if re.search(rf"\b{key}\b", text)}
 
 

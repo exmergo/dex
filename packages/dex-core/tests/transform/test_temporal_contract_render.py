@@ -1057,3 +1057,26 @@ def test_a_positional_config_mapping_is_read(tmp_path):
     )
     files["snapshots/hosts_snapshot.sql"] = unread
     assert "_unread" in _config(tmp_path, files)
+
+
+@pytest.mark.parametrize(
+    "call",
+    ["{{ config(**var('snapshot_' ~ 'opts')) }}", "{{ config(var('a') ~ var('b')) }}"],
+)
+def test_an_unparsed_call_that_may_carry_any_key_leaves_every_key_unread(
+    tmp_path, call
+):
+    sql = SNAP_SQL.replace("CONFIG", "").replace(
+        "{% endsnapshot %}", f"{call}\n{{% endsnapshot %}}"
+    )
+    files = {"snapshots/hosts_snapshot.sql": sql, "models/hosts.sql": "select 1\n"}
+    assert _config(tmp_path, files)["_unread"] == "hard_deletes"
+
+
+def test_an_unparsed_keyword_call_leaves_only_the_keys_it_names_unread(tmp_path):
+    sql = SNAP_SQL.replace("CONFIG", "").replace(
+        "{% endsnapshot %}",
+        "{{ config(unique_key='a' ~ 'b', strategy='check') }}\n{% endsnapshot %}",
+    )
+    files = {"snapshots/hosts_snapshot.sql": sql, "models/hosts.sql": "select 1\n"}
+    assert "_unread" not in _config(tmp_path, files)
