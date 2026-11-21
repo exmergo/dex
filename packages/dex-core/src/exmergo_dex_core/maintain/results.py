@@ -250,7 +250,8 @@ class CoverageResult(Result):
     #: was found, which a note says; every test then reads ``not_run``.
     last_run: dict[str, Any] | None = None
     #: What checks each declared fact (#1283): a summary and one record per
-    #: fact, ``checked_by`` a dbt test, ``maintain verify``, both or nothing.
+    #: fact, ``checked_by`` a dbt test, ``maintain verify``, both or nothing,
+    #: and the tests whose claim names no declared fact (#1498).
     declarations: dict[str, Any] | None = None
     #: What ``--mutate`` refreshed (#1284): the models attempted, refreshed,
     #: refused, skipped, not run and left for the next run. ``None`` without
