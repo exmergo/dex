@@ -569,3 +569,66 @@ def test_authoring_opens_no_connection_and_no_cube_server(
         assert rc == 0, applied["errors"]
     finally:
         socket.socket.connect = real  # type: ignore[method-assign]
+
+
+def test_apply_holds_a_written_file_to_the_strict_rules(tmp_path):
+    """A plan document applied elsewhere never ran planning's checks (#1270)."""
+
+    layered(tmp_path)
+    layer = CubeSemanticLayer(tmp_path, [ORDERS_FILE, CUSTOMERS_FILE])
+    current = layer.semantic_edit_view().files[ORDERS_FILE]
+    edit = PlanEdit(
+        path=ORDERS_FILE,
+        kind=EditKind.SEMANTIC_DOCUMENT,
+        old_content_hash=current.sha256,
+        new_content=dump(dict(ORDERS, owner="finance")),
+    )
+    from exmergo_dex_core.errors import ProjectError
+
+    with pytest.raises(ProjectError, match=r"\[unknown_key\]"):
+        layer.write_semantic_edits([edit])
+    assert read(tmp_path, ORDERS_FILE) == current.content
+
+
+def test_apply_keeps_the_file_mode(tmp_path):
+    layered(tmp_path)
+    target = tmp_path / ORDERS_FILE
+    target.chmod(0o644)
+    layer = CubeSemanticLayer(tmp_path, [ORDERS_FILE, CUSTOMERS_FILE])
+    current = layer.semantic_edit_view().files[ORDERS_FILE]
+    result = layer.write_semantic_edits(
+        [
+            PlanEdit(
+                path=ORDERS_FILE,
+                kind=EditKind.SEMANTIC_DOCUMENT,
+                old_content_hash=current.sha256,
+                new_content=dump(
+                    dict(ORDERS, description="One row per order, revised.")
+                ),
+            )
+        ]
+    )
+    assert result.written == [ORDERS_FILE]
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+def test_apply_gives_a_new_file_the_umask_mode(tmp_path):
+    import os
+
+    root = layered(tmp_path, VIEWS_FILE)
+    layer = CubeSemanticLayer(tmp_path, [ORDERS_FILE, CUSTOMERS_FILE, VIEWS_FILE])
+    a_view = view("sales", {"join_path": "orders", "includes": ["status"]})
+    result = layer.write_semantic_edits(
+        [
+            PlanEdit(
+                path=VIEWS_FILE,
+                kind=EditKind.SEMANTIC_DOCUMENT,
+                old_content_hash=None,
+                new_content=dump(views=(a_view,)),
+            )
+        ]
+    )
+    assert result.written == [VIEWS_FILE]
+    umask = os.umask(0)
+    os.umask(umask)
+    assert (root / VIEWS_FILE).stat().st_mode & 0o777 == 0o666 & ~umask
