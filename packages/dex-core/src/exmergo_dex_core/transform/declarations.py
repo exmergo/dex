@@ -1512,7 +1512,9 @@ def _unique_tested(files: Mapping[str, str], model: str) -> frozenset[str]:
 def _whole_unique(test: Any) -> bool:
     """Whether ``test`` is dbt's ``unique`` over every row of the column: one
     with a ``where`` (which dbt applies first, so a key repeated outside it
-    goes unseen) or disabled covers nothing."""
+    goes unseen) or disabled covers nothing. An ``enabled`` other than a
+    literal true (a Jinja expression dbt renders per target) is not credited:
+    the referenced-key test then renders, rather than no check holding."""
 
     if _listed_name(test) != "unique":
         return False
@@ -1525,7 +1527,7 @@ def _whole_unique(test: Any) -> bool:
     for scope in (config if isinstance(config, Mapping) else {}, body):
         if scope.get("where") not in (None, ""):
             return False
-        if scope.get("enabled") is False:
+        if "enabled" in scope and scope["enabled"] is not True:
             return False
     return True
 

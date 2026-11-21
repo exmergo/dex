@@ -249,6 +249,7 @@ def test_a_hand_written_unique_test_on_the_column_covers_it():
     [
         "- unique:\n            config:\n              where: is_current\n",
         "- unique:\n            config:\n              enabled: false\n",
+        '- unique:\n            config:\n              enabled: "{{ false }}"\n',
     ],
 )
 def test_a_filtered_or_disabled_unique_test_does_not_cover_it(unique):
