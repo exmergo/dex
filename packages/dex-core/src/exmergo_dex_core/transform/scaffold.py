@@ -89,6 +89,11 @@ MACRO_ASSETS: dict[str, str] = {
         "find no parent row, never a key; a declaration plan adds it where the "
         "project lacks it"
     ),
+    "dex_referenced_key": (
+        "the generic test a column another model references renders on the "
+        "parent (#1457): fails with the count of rows repeating a non-NULL key, "
+        "never a key; a declaration plan adds it where the project lacks it"
+    ),
 }
 
 

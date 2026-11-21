@@ -469,8 +469,11 @@ def test_generated_tests_agree_with_maintain_verify_live(
         ["--repo-root", str(tmp_path), "transform", "init", "analytics"], capsys
     )
     assert_ok(rc, envelope)
+    # One build prices every row's fixtures and tests, each statement at
+    # BigQuery's 10 MB billing minimum, so the budget grows with the rows as
+    # the per-node connectors' does: 44 statements priced 461 MB (#1457).
     report = assert_generated_test_parity(
-        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES
+        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 8
     )
 
     from google.cloud import bigquery

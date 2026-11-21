@@ -675,7 +675,18 @@ LEFT join to the whole parent renders no `dex_join_coverage` (`covered_by_builti
 `relationships` test counts the same rows), nor does a key conversion or a
 grouped side (`join_shape_unsupported`) or SQL whose joins the plan cannot read
 (`join_unread`), and a listed one whose join the SQL no longer writes is
-reported `stale`. A version of a native dbt versioned model is
+reported `stale`. A column a `references` names renders
+`dex_referenced_key` (#1457) on that **parent** column, in the parent's YAML
+entry and tagged `dex_every_run`: a join to a repeated key multiplies rows, so it
+counts the rows repeating a non-NULL key, once per parent column however many
+children name it, each row of `data.generated_tests` listing them under
+`referenced_by`. It renders when the plan declares the child or the parent. A
+parent whose grain is that one column, or whose column already lists `unique`,
+renders none (`covered_by_builtin`); a parent with no `models:` YAML entry, a
+seed or a snapshot renders none (`parent_undeclared`: Dex does not create an
+entry to hold a test), nor does a package's model (`parent_in_package`).
+`maintain verify` reports the consequence on the child (`row_fanout`), which has
+other causes, so the two agree in one direction only. A version of a native dbt versioned model is
 declared by its label, `"model": "dim_teams.v2"`, and renders into that item of
 the model's `versions:` list (#895); the bare name is the shared top-level entry
 every version inherits, and a version's file stem is refused naming the label.

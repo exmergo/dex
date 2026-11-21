@@ -95,6 +95,20 @@ one warehouse with its own `<adapter>__dex_join_coverage(model, child,
 child_columns, parent, parent_columns, child_where, parent_where, null_keys)`
 macro.
 
+## `dex_referenced_key`
+
+The generic test a column another model's `references` names renders on that
+parent column, in the parent's YAML entry
+([declarations](declarations.md#dex_referenced_key-a-key-a-references-names)),
+where `declarations.render_tests` turns it on. A declaration plan adds it for
+you; this command scaffolds or diffs it on its own. It fails with the count of
+rows repeating a non-NULL value of the column, beyond the first of each, so a
+join to that key cannot multiply rows unnoticed. NULLs never count. It never
+selects a key. The SQL goes through dbt's dispatch,
+`default__dex_referenced_key` holds on every connector, and a project overrides
+one warehouse with its own `<adapter>__dex_referenced_key(model, column_name)`
+macro.
+
 ## `unpivot_json_object`
 
 Turns a JSON object column with dynamic keys (the NoSQL-sourced shape: a

@@ -668,6 +668,21 @@ def apply_declarations(
                 "declare again"
             ) from exc
         rendered[path] = files[path]
+    # A references implies its parent column is unique (#1457); that test is
+    # the parent's, so it renders into the parent's entry, after every
+    # declaration above has written its own.
+    for path, content in render_referenced_keys(
+        files,
+        view,
+        [d.model for d in declarations],
+        render_tests=render_tests,
+        dialect=dialect,
+        generated=generated,
+        notes=warnings,
+        flagged_tests=flagged_tests,
+    ).items():
+        files[path] = content
+        rendered[path] = content
 
     merged = list(edits)
     for path, content in rendered.items():
@@ -1394,28 +1409,7 @@ def render(
             text, Declaration(model=declaration.model), notes, flagged_tests, on
         )
     if generated is not None and planned:
-        for g in planned:
-            row = {
-                key: g[key] for key in ("model", "column", "test", "cadence", "claim")
-            }
-            if g.get("variant") is not None:
-                row["variant"] = g["variant"]
-            # Read at the test's own place, matched the way rendering matches,
-            # so a renamed model's tests elsewhere in the file and a hand-written
-            # equivalent are each told apart (#1449).
-            listed_before = _listed_at(content, g)
-            if g["enabled"]:
-                row["status"] = (
-                    "added"
-                    if not listed_before and _listed_at(text, g)
-                    else "already_listed"
-                )
-            elif listed_before:
-                row["status"] = "listed_while_off"
-            else:
-                row["status"] = "not_rendered"
-                row["reason"] = g["off_reason"]
-            generated.append(row)
+        generated.extend(_report_rows(content, text, planned))
     if joins is not None and getattr(joins, "read", False):
         for row in _stale_join_tests(content, declaration.model, planned):
             if generated is not None:
@@ -1423,6 +1417,245 @@ def render(
             if notes is not None:
                 notes.append(_stale_note(row))
     return text
+
+
+def _report_rows(
+    content: str | None, text: str, planned: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The ``data.generated_tests`` rows for ``planned``, rendered from
+    ``content`` into ``text``."""
+
+    rows: list[dict[str, Any]] = []
+    for g in planned:
+        row = {key: g[key] for key in ("model", "column", "test", "cadence", "claim")}
+        if g.get("variant") is not None:
+            row["variant"] = g["variant"]
+        # Read at the test's own place, matched the way rendering matches,
+        # so a renamed model's tests elsewhere in the file and a hand-written
+        # equivalent are each told apart (#1449).
+        listed_before = _listed_at(content, g)
+        if g["enabled"]:
+            row["status"] = (
+                "added"
+                if not listed_before and _listed_at(text, g)
+                else "already_listed"
+            )
+        elif listed_before:
+            row["status"] = "listed_while_off"
+        else:
+            row["status"] = "not_rendered"
+            row["reason"] = g["off_reason"]
+        rows.append(row)
+    return rows
+
+
+# --- tests on a referenced parent (#1457) ---------------------------------------
+
+
+def _project_references(
+    files: Mapping[str, str],
+) -> list[tuple[str, str, str, str]]:
+    """Every ``references`` the project's YAML declares, as ``(child, column,
+    parent, parent column)``, read from each model entry (each version under
+    its label, as dbt builds it) in file order."""
+
+    out: list[tuple[str, str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for path in sorted(files):
+        if not path.endswith((".yml", ".yaml")) or path == "dbt_project.yml":
+            continue
+        try:
+            parsed = yaml.safe_load(files[path])
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for entry in parsed.get("models") or []:
+            if not isinstance(entry, dict):
+                continue
+            for label, variant in mv.entry_variants(entry):
+                for column in variant.get("columns") or []:
+                    if not isinstance(column, dict) or not isinstance(
+                        column.get("name"), str
+                    ):
+                        continue
+                    dex = entry_meta(column).get(DEX_META_KEY)
+                    target = dex.get("references") if isinstance(dex, dict) else None
+                    if not isinstance(target, str):
+                        continue
+                    parent, _, parent_column = target.strip().rpartition(".")
+                    if not parent or not parent_column:
+                        continue
+                    key = (label.lower(), column["name"].lower(), target.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append((label, column["name"], parent, parent_column))
+    return out
+
+
+def _unique_tested(files: Mapping[str, str], model: str) -> frozenset[str]:
+    """The columns of ``model``'s entry that list dbt's ``unique`` test,
+    folded to lower case."""
+
+    out: set[str] = set()
+    for _label, entry in _entries(files, {model}):
+        for column in entry.get("columns") or []:
+            if not isinstance(column, dict) or not isinstance(column.get("name"), str):
+                continue
+            listed = column.get("data_tests") or column.get("tests") or []
+            if isinstance(listed, list) and any(_whole_unique(test) for test in listed):
+                out.add(column["name"].lower())
+    return frozenset(out)
+
+
+def _whole_unique(test: Any) -> bool:
+    """Whether ``test`` is dbt's ``unique`` over every row of the column: one
+    with a ``where`` (which dbt applies first, so a key repeated outside it
+    goes unseen) or disabled covers nothing. An ``enabled`` other than a
+    literal true (a Jinja expression dbt renders per target) is not credited:
+    the referenced-key test then renders, rather than no check holding."""
+
+    if _listed_name(test) != "unique":
+        return False
+    if not isinstance(test, Mapping):
+        return True
+    body = next(iter(test.values()))
+    if not isinstance(body, Mapping):
+        return True
+    config = body.get("config")
+    for scope in (config if isinstance(config, Mapping) else {}, body):
+        if scope.get("where") not in (None, ""):
+            return False
+        if "enabled" in scope and scope["enabled"] is not True:
+            return False
+    return True
+
+
+def _parent_unwritable(
+    files: Mapping[str, str], view: DbtProjectView, parent: str
+) -> str | None:
+    """Why ``parent``'s YAML entry cannot hold a test (#1457), or ``None``
+    where it can: its project model has an entry under ``models:``."""
+
+    if model_sql_path(files, view.model_paths, parent) is not None:
+        if package_documented_overrides(view, files, [parent]):
+            return gt.PARENT_IN_PACKAGE
+        return None if schema_path(files, parent) is not None else gt.PARENT_UNDECLARED
+    if _is_seed_or_snapshot(files, view, parent):
+        return gt.PARENT_UNDECLARED
+    with contextlib.suppress(Exception):
+        packaged = find_package_target(
+            view.root,
+            parent,
+            project_yml=files.get("dbt_project.yml"),
+            manifest=view.manifest,
+        )
+        if packaged is not None:
+            return gt.PARENT_IN_PACKAGE
+    return gt.PARENT_UNDECLARED
+
+
+def render_referenced_keys(
+    files: Mapping[str, str],
+    view: DbtProjectView,
+    declared: Iterable[str],
+    *,
+    render_tests: bool | list[str] = False,
+    dialect: str | None = None,
+    generated: list[dict[str, Any]] | None = None,
+    notes: list[str] | None = None,
+    flagged_tests: list[bool] | None = None,
+) -> dict[str, str]:
+    """The tests a ``references`` implies on its parent (#1457), rendered into
+    the parent's YAML entry: ``{path: new content}`` for each file changed.
+
+    Reads every ``references`` in ``files`` (the project as the plan leaves
+    it) whose child or parent is among ``declared``, so declaring a child
+    renders its parent's test, and declaring the parent renders the tests the
+    references declared before it imply. One test per parent column, however
+    many children reference it. A parent that cannot hold the test (no
+    ``models:`` entry, a seed, a snapshot, a package's model) renders nothing
+    and is listed ``not_rendered`` with the reason: Dex never creates an entry
+    to hold a test. Each row of ``generated`` names the children under
+    ``referenced_by``.
+    """
+
+    kinds = [kind for kind in gt.kinds() if kind.on_parent]
+    if not kinds:
+        return {}
+    vmap = mv.cached_version_map(files, view.model_paths)
+    wanted = {name.lower() for name in mv.expand(declared, vmap)}
+    wanted |= {name.lower() for name in declared}
+    # parent (folded) -> (its spelling, {column folded: (spelling, children)})
+    parents: dict[str, tuple[str, dict[str, tuple[str, list[str]]]]] = {}
+    for child, column, parent, parent_column in _project_references(files):
+        # A bare name of a versioned model is the version an unversioned
+        # ref() reads, so its test goes on that version alone: on the shared
+        # entry every version would inherit it, one the child never joins.
+        if mv.split_label(parent)[1] is None:
+            versioned = mv.lookup(vmap, parent)
+            if versioned is not None and versioned.default_label is not None:
+                parent = str(versioned.default_label)
+        if child.lower() not in wanted and parent.lower() not in wanted:
+            continue
+        spelled, columns = parents.setdefault(parent.lower(), (parent, {}))
+        _name, children = columns.setdefault(parent_column.lower(), (parent_column, []))
+        children.append(f"{child}.{column}")
+
+    out: dict[str, str] = {}
+    current = dict(files)
+    for spelled, columns in parents.values():
+        references = gt.ParentReferences(
+            columns={
+                name: tuple(sorted(children)) for name, children in columns.values()
+            },
+            unique_tested=_unique_tested(current, spelled),
+        )
+        referenced_by = {
+            name.lower(): refs for name, refs in references.columns.items()
+        }
+        blocked = _parent_unwritable(current, view, spelled)
+        path = schema_path(current, spelled) if blocked is None else None
+        content = current.get(path) if path else None
+        stated = (
+            _effective(content, Declaration(model=spelled))
+            if content
+            else Declaration(model=spelled)
+        )
+        planned = _generated(
+            stated,
+            render_tests,
+            dialect,
+            model_outputs(current, view.model_paths, spelled),
+            parent_references=references,
+        )
+        if blocked is not None:
+            for g in planned:
+                g["enabled"], g["off_reason"] = False, blocked
+        text = content
+        on = [g for g in planned if g["enabled"]]
+        if on and path is not None:
+            try:
+                text = _render(
+                    content, Declaration(model=spelled), notes, flagged_tests, on
+                )
+            except RewriteError as exc:
+                raise DeclarationError(
+                    f"dex could not write the {gt.REFERENCED_KEY} test into "
+                    f"'{spelled}''s entry in {path} predictably ({exc}); add it by "
+                    "hand, then declare again"
+                ) from exc
+            if text != content:
+                current[path] = text
+                out[path] = text
+        if generated is not None:
+            for row in _report_rows(content, text or "", planned):
+                row["referenced_by"] = list(
+                    referenced_by.get(str(row["column"]).lower(), ())
+                )
+                generated.append(row)
+    return out
 
 
 def _stale_note(row: Mapping[str, Any]) -> str:
@@ -1620,23 +1853,33 @@ def _generated(
     dialect: str | None = None,
     outputs: frozenset[str] | None = None,
     joins: Any = None,
+    parent_references: gt.ParentReferences | None = None,
 ) -> list[dict[str, Any]]:
     """Every generated test the declaration gives, each with its claim, its
     rendered spec, and whether ``render_tests`` turns its kind on (#1449) on
     ``dialect`` (#1451), for columns the model outputs (#1453, #1454), with
-    the joins the plan read for a kind that reads them (#1456)."""
+    the joins the plan read for a kind that reads them (#1456).
+
+    ``parent_references`` asks for the other half (#1457): the tests of the
+    kinds that check what other models' declarations imply about this one
+    (``on_parent``), and only those. Without it, those kinds give nothing."""
 
     out: list[dict[str, Any]] = []
     model = declaration.model
     for kind in gt.kinds():
+        if kind.on_parent != (parent_references is not None):
+            continue
         switched = gt.enabled(kind, render_tests)
         on = switched and gt.supports(kind, dialect)
         off_reason = gt.DIALECT_UNSUPPORTED if switched else gt.off_reason(render_tests)
-        instances = (
-            kind.instances(declaration, joins)  # type: ignore[call-arg]
-            if kind.reads_joins
-            else kind.instances(declaration)
-        )
+        if kind.on_parent:
+            instances = kind.instances(  # type: ignore[call-arg]
+                declaration, parent_references
+            )
+        elif kind.reads_joins:
+            instances = kind.instances(declaration, joins)  # type: ignore[call-arg]
+        else:
+            instances = kind.instances(declaration)
         for instance in instances:
             claim = claim_id(
                 model, instance.field, instance.columns, dict(instance.params)

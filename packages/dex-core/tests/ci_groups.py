@@ -194,6 +194,15 @@ GROUPS: dict[str, tuple[str, ...]] = {
         ),
         f"{_T}test_join_coverage_render.py",
     ),
+    # dex_referenced_key (#1457): its parity row and its own file.
+    "transform-parity-referenced": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_referenced_key_row_agrees_and_renders_on_the_parent",
+            "test_a_macro_counting_null_keys_fails_the_harness_on_the_clean_parent",
+        ),
+        f"{_T}test_referenced_key.py",
+    ),
     "transform-e2e": (  # 148s
         f"{_T}test_package_repair_e2e.py",
         f"{_T}test_test_only_plan_e2e.py",
