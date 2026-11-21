@@ -408,11 +408,14 @@ def build_status_findings(
     in the raw node list to find out which ones warned.
     """
 
-    manifest = _manifest_document(project_dir) or {}
+    document = _manifest_document(project_dir)
+    manifest = document or {}
     nodes = manifest.get("nodes") or {}
     unit_tests = manifest.get("unit_tests") or {}
     if results is None:
-        results = node_results(project_dir, manifest=manifest)
+        # None, not {}, when no manifest is on disk: an empty manifest drops
+        # every result, a missing one has nothing to filter by.
+        results = node_results(project_dir, manifest=document)
     if not results.found:
         return (
             [],

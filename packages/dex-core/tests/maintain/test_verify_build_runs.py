@@ -576,3 +576,19 @@ def test_a_shared_path_run_dex_recorded_is_named_as_dex_s(project: Path) -> None
     results = verify_mod.node_results(project, artifact_policy="shared")
     [finding] = verify_mod.build_status_findings(project, results=results)[0]
     assert finding.data["run"]["invoked_by"] == "unknown"
+
+
+def test_with_no_manifest_on_disk_every_result_is_still_read(project: Path) -> None:
+    """No manifest to filter by is not an empty project: the failure stands."""
+
+    _write_run(
+        project / "target",
+        {MODEL: "error"},
+        invocation=HAND,
+        generated_at="2026-11-20T10:00:00.000000Z",
+    )
+
+    [finding] = verify_mod.build_status_findings(project)[0]
+
+    assert finding.code == "node_failed"
+    assert finding.data["run"]["invocation_id"] == HAND
