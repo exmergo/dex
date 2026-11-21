@@ -800,6 +800,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "edits_file": _TRANSLATED,
             "scaffold": "scaffold",
             "attribute_rows": "attribute_rows",
+            "no_parse": "no_parse",
         },
     },
     ("transform", "apply"): {

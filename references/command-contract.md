@@ -1047,7 +1047,20 @@ missing package and `transform deps`. The check reads the post-edit tree
 (#1166): a package the plan's own `packages_yml` edit declares is refused the
 same way, with the route spelled out (the `packages_yml` edit as a plan of its
 own, applied, `transform deps`, then the rest); a `packages_yml`-only plan needs
-no parse and is stored. Installing the packages a project
+no parse and is stored. `--no-parse` (`DexEngine.plan(..., no_parse=True)`,
+#1517) stores a plan without starting dbt at all, for a host that must not run
+repository-controlled code (Jinja, macros, project hooks) where it authors: it
+skips the parse gate (a warning says so, and `data.model_versions` reads
+`unchecked` with `parse_skipped`), the parse of a declared mart's derivation
+(reported `unvalidated` under `data.semantic_proposal`, left out of the
+plan and offered under its `definitions` for `semantic plan` where dbt parses), compilation, and the package check that protects them. Every structural
+gate still runs: admission and placement, deletions, the PII and secret guards,
+hash pinning and the diffs. A model with Jinja control flow is refused with the
+error a missing compile raises, since nothing else can check it; a model that
+only lists columns through a macro is checked from its SQL, as where dbt is
+absent, with a warning naming it; and a `toggle` contract, whose check compiles
+every model, is refused. The caller parses the post-change project elsewhere,
+for example a `transform build --for-plan-file` in its sandbox. Installing the packages a project
 declares (at the versions `package-lock.yml` pins, where it matches) is not
 installing or upgrading a tool. `macro_sql` is how a macro is
 repaired or customized by hand; `transform macro <name>` is the scaffolding path

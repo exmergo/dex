@@ -839,8 +839,12 @@ def validate_parse(
     project: Any,
     target: str | None,
     spine: list[PlanEdit],
+    parse: bool = True,
 ) -> dict[str, Any] | None:
     """dbt's parse of a copy of the project with the derivations in it.
+
+    ``parse`` False records the parse as ``not_run`` and starts nothing: a
+    no-parse plan (#1517) leaves the post-change project to its caller.
 
     Returns the parse result when it covered exactly ``base_edits`` plus the
     derivations and no throwaway spine, so the caller can stand it in for its
@@ -867,6 +871,13 @@ def validate_parse(
                 )
             derivation.validation["parse"] = entry
 
+    if not parse:
+        record(
+            "not_run",
+            "the plan was stored with no_parse, so dbt did not parse the "
+            "derivation; author it with `semantic plan` once the project parses",
+        )
+        return None
     # dbt parses nothing whose declared packages are not installed, so a parse
     # here could only fail, twice, in dbt's `Run "dbt deps"` words. Say why in
     # Dex's, read against the post-edit tree (#1166). The plan's own gate
@@ -940,12 +951,16 @@ class MetricFlowDerivation:
         *,
         project: Any,
         target: str | None,
+        parse: bool = True,
     ) -> None:
         self.view = view
         self.edits = edits
         self.files = files
         self.project = project
         self.target = target
+        # False on a no-parse plan (#1517): no dbt is started, so each
+        # derivation is left unvalidated and out of the plan.
+        self.parse = parse
 
     def derive_semantic(self, request: Any) -> Any:
         from ..semantic_source import DerivedDefinition, SemanticDerivationResult
@@ -1056,6 +1071,7 @@ class MetricFlowDerivation:
                 project=self.project,
                 target=self.target,
                 spine=[] if layer else shadow_spine(view),
+                parse=self.parse,
             )
             for derivation in ready:
                 outcome = derivation.validation["parse"]["result"]
@@ -1075,7 +1091,12 @@ class MetricFlowDerivation:
         return (
             derivations,
             edits,
-            _proposal(derivations, layer=layer, spine_missing=spine_missing),
+            _proposal(
+                derivations,
+                layer=layer,
+                spine_missing=spine_missing,
+                parse_skipped=not self.parse,
+            ),
             _warnings(derivations),
             parse_result,
         )
@@ -1130,12 +1151,19 @@ def _with_derived(edits: list[PlanEdit], derived: list[PlanEdit]) -> list[PlanEd
 
 
 def _proposal(
-    derivations: list[Derivation], *, layer: bool, spine_missing: bool
+    derivations: list[Derivation],
+    *,
+    layer: bool,
+    spine_missing: bool,
+    parse_skipped: bool = False,
 ) -> dict[str, Any]:
-    proposed = [d for d in derivations if d.status == "proposed"]
+    # A no-parse plan (#1517) adds nothing to itself, so a derivation that
+    # passed every check but dbt's parse is offered for the side that parses.
+    offered = ("proposed", "unvalidated") if parse_skipped else ("proposed",)
+    proposed = [d for d in derivations if d.status in offered]
     data: dict[str, Any] = {
         "vendor": "dbt",
-        "mode": "included" if layer else "proposed",
+        "mode": "included" if layer and not parse_skipped else "proposed",
         "time_spine": "missing" if spine_missing else "present",
         "definitions": [
             {"kind": "semantic_model", "path": d.path, "content": d.content}
@@ -1157,11 +1185,17 @@ def _proposal(
             + "; nothing was added to the plan. Adopting one is the project "
             "owner's choice"
         )
+    if layer and parse_skipped:
+        notes.append(
+            "the plan was stored with no_parse, so no derivation was parsed or "
+            "added to it"
+        )
     if proposed:
         data["next"] = (
             "save this object as a file and pass it to `semantic plan "
             "--definitions-file <file>` to add it as a reviewable plan"
             + (", once the project has a time spine" if spine_missing else "")
+            + (", where dbt may parse it" if parse_skipped else "")
             + "; author the metrics on its measures there too"
         )
     data["notes"] = notes
