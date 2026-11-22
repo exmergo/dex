@@ -833,10 +833,14 @@ class _Resolver:
             )
         prod_parts = self.prod.split(".")
         prod_schema = prod_parts[-1]
+        # Production's container is prod's own, else the connection's project
+        # or database: never the node's, which a model's own `database` config
+        # sets, so an override cannot pass for prod (#1462).
         container = (
             prod_parts[0]
             if len(prod_parts) == 2
-            else (node or {}).get("database") or self.container
+            else self.container
+            or (None if config.get("database") else (node or {}).get("database"))
         )
         literal_database = (
             bool(config.get("database"))

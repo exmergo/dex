@@ -767,7 +767,7 @@ def test_bigquery_quoted_view_sql_is_read_in_its_own_dialect(tmp_path: Path):
     adapter = _Adapter(
         {
             "proj.analytics.fct_orders": (None, None, "view"),
-            "my-proj.analytics.raw_orders": (1, 3, "table"),
+            "proj.analytics.raw_orders": (1, 3, "table"),
         }
     )
     nodes = {
@@ -863,3 +863,17 @@ def test_a_provisioned_endpoint_is_read(tmp_path):
         adapter_factory=lambda: adapter,
     )
     assert row["cost"]["status"] == "estimated"
+
+
+def test_a_model_database_override_is_read_only_inside_the_allowlist(tmp_path: Path):
+    adapter = _Adapter({"other.analytics.fct_orders": (1, 1, "table")})
+    nodes = _node("fct_orders", database="other", config={"database": "other"})
+    _price(
+        _engine(prod="analytics", project="proj", datasets=["raw"]),
+        [row := _row()],
+        adapter,
+        _view(tmp_path, nodes),
+    )
+    assert row["cost"]["reason"] == test_cost.OUTSIDE_ALLOWLIST
+    assert adapter.asked == []
+    assert adapter.dev_reads == []
