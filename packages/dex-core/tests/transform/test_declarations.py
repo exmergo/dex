@@ -459,6 +459,177 @@ def test_an_entry_nested_in_a_flow_style_models_list_still_refuses():
         render("models: [{name: fct_orders}]\n", declaration)
 
 
+# --- indentless lists (#1495) ---------------------------------------------------
+
+# PyYAML's `safe_dump` writes a block list with its dashes at its key's own
+# column. Each case renders into such a list and keeps every line the file had.
+
+
+def _only_added_lines(before: str, after: str) -> None:
+    import difflib
+
+    ops = difflib.SequenceMatcher(
+        None, before.splitlines(keepends=True), after.splitlines(keepends=True)
+    ).get_opcodes()
+    assert all(tag in ("equal", "insert") for tag, *_ in ops), after
+
+
+def test_an_entry_with_an_indentless_data_tests_list_renders():
+    [declaration] = parse_declarations([{"model": "m", "description": "x"}])
+    content = "version: 2\nmodels:\n- name: m\n  data_tests:\n  - not_null_x\n"
+
+    assert render(content, declaration) == content + "  description: x\n"
+
+
+def test_an_indentless_model_test_list_is_extended_indentless():
+    [declaration] = parse_declarations([{"model": "m", "grain": ["a", "b"]}])
+    content = "version: 2\nmodels:\n- name: m\n  data_tests:\n  - not_null_x\n"
+
+    out = render(content, declaration, render_tests=["dex_unique_combination"])
+
+    _only_added_lines(content, out)
+    assert "  - not_null_x\n  - dex_unique_combination:\n" in out
+    assert [
+        next(iter(t)) if isinstance(t, dict) else t
+        for t in _entry(out, "m")["data_tests"]
+    ] == ["not_null_x", "dex_unique_combination"]
+    assert _entry(out, "m")["config"]["meta"]["dex"]["grain"] == ["a", "b"]
+
+
+def test_an_indentless_column_test_list_is_extended_indentless():
+    [declaration] = parse_declarations(
+        [{"model": "m", "grain": ["id"], "columns": {"id": {"description": "d"}}}]
+    )
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "- name: m\n"
+        "  columns:\n"
+        "  - name: id\n"
+        "    data_tests:\n"
+        "    - not_null\n"
+        "  - name: other\n"
+    )
+
+    out = render(content, declaration)
+
+    _only_added_lines(content, out)
+    assert "    - not_null\n    - unique:\n" in out
+    [column, other] = _entry(out, "m")["columns"]
+    assert column["description"] == "d"
+    assert [
+        t if isinstance(t, str) else next(iter(t)) for t in column["data_tests"]
+    ] == ["not_null", "unique"]
+    assert other == {"name": "other"}
+
+
+def test_a_comment_between_indentless_items_stays_inside_the_list():
+    [declaration] = parse_declarations([{"model": "m", "description": "x"}])
+    head = (
+        "version: 2\n"
+        "models:\n"
+        "- name: m\n"
+        "  data_tests:\n"
+        "  - not_null_x\n"
+        "  # second test added by hand\n"
+        "  - unique_y\n"
+    )
+
+    out = render(head + "- name: m2\n", declaration)
+
+    assert out == head + "  description: x\n- name: m2\n"
+
+
+def test_replacing_an_indentless_list_replaces_every_item():
+    from exmergo_dex_core.transform.declarations import _model_entry, _set_key
+
+    content = (
+        "models:\n- name: m\n  data_tests:\n  - a\n  # note\n  - b\n  description: x\n"
+    )
+
+    out = _set_key(content, lambda r: _model_entry(r, "m"), "data_tests", ["z"])
+
+    assert out == "models:\n- name: m\n  data_tests:\n    - z\n  description: x\n"
+
+
+def test_an_indentless_pair_span_takes_inner_comments_but_not_a_trailing_one():
+    from exmergo_dex_core.transform.rewrite import _pair_span
+
+    content = "vars:\n  a:\n  - 1\n  # c\n  - 2\n  # trailing\n  b: 3\n"
+    key = content.index("a:")
+
+    start, end = _pair_span(content, (key, key + 1), None)
+
+    assert content[start:end] == "  a:\n  - 1\n  # c\n  - 2\n"
+
+
+def test_a_column_is_added_to_an_indentless_columns_list():
+    [declaration] = parse_declarations(
+        [{"model": "m", "columns": {"email": {"role": "attribute"}}}]
+    )
+    content = "version: 2\nmodels:\n- name: m\n  columns:\n  - name: id\n- name: n\n"
+
+    out = render(content, declaration)
+
+    _only_added_lines(content, out)
+    assert "  - name: id\n  - name: email\n" in out
+    assert [c["name"] for c in _entry(out, "m")["columns"]] == ["id", "email"]
+    assert _entry(out, "n") == {"name": "n"}
+
+
+def test_a_declaration_into_indentless_lists_passes_dbt_parse(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    pytest.importorskip("dbt.adapters.duckdb")
+    from exmergo_dex_core.transform.build import shadow_parse
+
+    schema = dbt_project_dir / "models/staging/schema.yml"
+    before = (
+        "version: 2\n"
+        "models:\n"
+        "- name: stg_customers\n"
+        "  data_tests:\n"
+        "  - not_null:\n"
+        "      column_name: email\n"
+        "  columns:\n"
+        "  - name: id\n"
+        "    data_tests:\n"
+        "    - not_null\n"
+    )
+    schema.write_text(before, encoding="utf-8")
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "declare stg_customers",
+            "--edits-file",
+            _payload(tmp_path, {"declarations": [STAGING]}),
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+    rc, applied = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "apply",
+            envelope["data"]["plan_id"],
+        ],
+        capsys,
+    )
+    assert rc == 0, applied
+
+    after = schema.read_text(encoding="utf-8")
+    _only_added_lines(before, after)
+    assert "    - not_null\n    - unique:\n" in after
+    parsed = shadow_parse(dbt_project_dir, [])
+    assert parsed["available"], parsed
+    assert parsed["success"], parsed
+
+
 # --- where it lands -------------------------------------------------------------
 
 

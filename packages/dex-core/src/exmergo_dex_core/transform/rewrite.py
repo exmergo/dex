@@ -1832,11 +1832,40 @@ def _entry_span(content: str, node: Any) -> tuple[int, int]:
 
 
 def _pair_span(content: str, key_span: tuple[int, int], _value: Any) -> tuple[int, int]:
-    """A mapping entry's span, by the same indentation rule as a sequence item."""
+    """A mapping entry's span, by the same indentation rule as a sequence item.
+
+    A block sequence value may be written indentless, its dashes at the key's
+    own column (PyYAML's ``safe_dump`` default). Those items belong to the pair,
+    so the span runs on over every dash line at the key's column, and over the
+    comments at that column between two of them (#1495). A key
+    sharing its line with a bullet is measured from the bullet's column, where
+    a dash line is the next item of the outer list, so it is left as it was.
+    """
 
     line_start = content.rfind("\n", 0, key_span[0]) + 1
     indent = len(content[line_start:]) - len(content[line_start:].lstrip(" "))
-    return (line_start, block_end(content, line_start, indent))
+    end = block_end(content, line_start, indent)
+    if key_span[0] - line_start != indent:
+        return (line_start, end)
+    while True:
+        # Comments and blank lines at the key's column between two items belong
+        # to the list; after its last item they are left to what follows.
+        at = end
+        while at < len(content):
+            newline = content.find("\n", at)
+            line = content[at : len(content) if newline < 0 else newline]
+            if line.strip() and not (
+                indent_of(content, at) == indent and line.lstrip(" ").startswith("#")
+            ):
+                break
+            at += len(line) + 1
+        if not (
+            at < len(content)
+            and indent_of(content, at) == indent
+            and re.match(r"-(\s|$)", content[at + indent :])
+        ):
+            return (line_start, end)
+        end = block_end(content, at, indent)
 
 
 def narrow_quotes(content: str, span: tuple[int, int]) -> tuple[int, int]:
