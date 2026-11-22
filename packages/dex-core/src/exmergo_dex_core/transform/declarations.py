@@ -578,7 +578,10 @@ def _elementary_sampling_warning(
             if runtime.installed:
                 materialization = runtime.materialization
 
-    if materialization != "elementary":
+    # ``unknown``: the package's materialization is picked while the package is
+    # disabled, on a release Dex was not run against (#1445), so nothing says it
+    # hands the tests to dbt's.
+    if materialization not in ("elementary", "unknown"):
         return None
 
     below = _is_below_0_20(release)
@@ -593,6 +596,16 @@ def _elementary_sampling_warning(
             "could not tell the installed Elementary release; releases below 0.20.0 "
             "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
             "set test_sample_row_count: 0 for the project"
+        )
+    if elementary.release_status(release) == "untested":
+        # Above the newest release dex was run against (#1445): that it still
+        # reads the flag is not taken from the releases before it.
+        return (
+            f"installed Elementary release {release} is newer than the newest "
+            f"release dex was run against ({elementary.NEWEST_TESTED}), so whether "
+            "it honours disable_test_samples is unchecked "
+            f"({elementary.RELEASE_UNTESTED}); set test_sample_row_count: 0 for "
+            "the project to keep samples off whatever it does"
         )
     return None
 

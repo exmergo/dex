@@ -3573,7 +3573,10 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
        package's needs the cache its stripped ``on_run_start`` builds and fails
        every test without it (measured on the fixture's variant e at 0.26.1),
        so it cannot be left to run. Where a root-project materialization still
-       hands the tests to the package's, the run is refused.
+       hands the tests to the package's, the run is refused. On a release Dex
+       was not run against (#1445) the flag is set with the models disabled
+       too, since only the tested releases show their materialization handing
+       each test to dbt's there.
     3. Each monitoring test is kept out of every run, the baseline included:
        with the package disabled it checks nothing, and with it enabled it
        reads and writes the package's history. Each is returned with its
@@ -3586,7 +3589,6 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
 
     from . import elementary as elementary_mod
     from .build import DbtRunError
-    from .mutation import MutationError
     from .package_overrides import _installed
 
     root = getattr(shadow, "shadow", None)
@@ -3596,6 +3598,11 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
         return [], []
     warnings: list[str] = []
     manifest = shadow.parse()
+    # The copy is made inert the same way on any release (#1445); a release
+    # dex was not run against is named rather than read as a known one.
+    release_warning = elementary_mod.read(root, manifest).release_warning()
+    if release_warning is not None:
+        warnings.append(release_warning)
     dependents = elementary_mod.package_model_dependents(manifest)
     disabled = False
     if dependents:
@@ -3620,28 +3627,16 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
                 "copy, so they stay enabled; the tests run under dbt's own test "
                 "materialization and its monitoring tests are left out instead"
             )
-    if not disabled:
-        undo = shadow.set_project_flag(elementary_mod.OVERRIDE_FLAG, True)
-        try:
-            manifest = shadow.parse()
-        except DbtRunError as exc:
-            # dbt 1.12.5 refuses `flags:` in dbt_project.yml beside a legacy
-            # `config:` block in profiles.yml, among others.
-            undo()
-            raise MutationError(
-                "the Elementary package stays enabled in this project's copy, so "
-                "dex sets dbt's require_explicit_package_overrides_for_builtin_"
-                "materializations there to run the tests under dbt's own test "
-                f"materialization, and dbt would not parse the copy with it: {exc}"
-            ) from exc
-        if elementary_mod.read(root, manifest).materialization == "elementary":
-            raise MutationError(
-                "the Elementary package stays enabled in this project's copy, and "
-                "a test materialization in the project still hands every test to "
-                "Elementary's, which needs the run hooks a mutation run cannot "
-                "fire. Measuring would write to the dev target or fail every "
-                "test, so dex does not run it"
-            )
+    # With the package disabled, its materialization hands each test to dbt's
+    # on every release dex read; on another (#1445) nothing says it does, so
+    # dbt's own is pinned as it is where the package stays enabled.
+    if not disabled or elementary_mod.read(root, manifest).materialization == "unknown":
+        why = (
+            "the Elementary package stays enabled in this project's copy"
+            if not disabled
+            else "the installed Elementary release is not one dex was run against"
+        )
+        manifest = _pin_dbt_test_materialization(shadow, root, why)
     code = "elementary_disabled" if disabled else "elementary_history"
     left_out = [
         {
@@ -3653,6 +3648,37 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
         for name, reads in elementary_mod.monitoring_tests(manifest).items()
     ]
     return left_out, warnings
+
+
+def _pin_dbt_test_materialization(shadow, root: Path, why: str) -> dict:
+    """Set dbt's override flag in the copy so its own ``test`` materialization
+    runs, and return the manifest; refuse where dbt will not parse the copy
+    with it, or where the project still hands the tests to Elementary's."""
+
+    from . import elementary as elementary_mod
+    from .build import DbtRunError
+    from .mutation import MutationError
+
+    undo = shadow.set_project_flag(elementary_mod.OVERRIDE_FLAG, True)
+    try:
+        manifest = shadow.parse()
+    except DbtRunError as exc:
+        # dbt 1.12.5 refuses `flags:` in dbt_project.yml beside a legacy
+        # `config:` block in profiles.yml, among others.
+        undo()
+        raise MutationError(
+            f"{why}, so dex sets dbt's require_explicit_package_overrides_for_"
+            "builtin_materializations there to run the tests under dbt's own test "
+            f"materialization, and dbt would not parse the copy with it: {exc}"
+        ) from exc
+    if elementary_mod.read(root, manifest).materialization != "dbt":
+        raise MutationError(
+            f"{why}, and a test materialization in the project still hands "
+            "every test to Elementary's, which needs the run hooks a mutation "
+            "run cannot fire. Measuring would write to the dev target or fail "
+            "every test, so dex does not run it"
+        )
+    return manifest
 
 
 def _left_out_of(
@@ -8081,6 +8107,9 @@ def _attach_completion(
     try:
         states = inputs.get("comparisons")
         diagnosed = _attach_prerequisites(result, inputs)
+        release_warning = _elementary_release_warning(inputs)
+        if release_warning is not None:
+            result.warnings.append(release_warning)
         result.completion = summarize_completion(
             result.evidence,
             result.verification,
@@ -8122,7 +8151,8 @@ def _attach_completion(
             result.warnings.append(
                 f"{unchecked} passing Elementary test(s) are not counted toward "
                 "any model's assurance (compiled to the package's no-results "
-                "query, or judged against history dex did not measure); they are "
+                "query, judged against history dex did not measure, or run by an "
+                "Elementary release dex was not run against); they are "
                 "under data.completion.assurance.unchecked_tests with a "
                 "reason_code, any past the list's cap counted in "
                 "data.completion.elided"
@@ -8143,6 +8173,28 @@ def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
     effort: an unreadable manifest leaves every test counted as it was.
     """
 
+    runtime = _elementary_runtime(inputs)
+    if runtime is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        return dict(elementary_mod.unchecked_tests(inputs["manifest"], runtime)) or None
+    return None
+
+
+def _elementary_release_warning(inputs: dict[str, Any]) -> str | None:
+    """The warning for an Elementary release dex was not run against (#1445),
+    ``None`` where the release is supported or the package is not installed."""
+
+    runtime = _elementary_runtime(inputs)
+    return runtime.release_warning() if runtime is not None else None
+
+
+def _elementary_runtime(inputs: dict[str, Any]) -> Any:
+    """What the installed Elementary package does for the build's target, read
+    from the build's own manifest; ``None`` where it cannot be read."""
+
     manifest = inputs.get("manifest")
     project = inputs.get("project")
     if not isinstance(manifest, dict) or project is None:
@@ -8150,8 +8202,7 @@ def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
     from . import elementary as elementary_mod
 
     with contextlib.suppress(Exception):
-        runtime = elementary_mod.read(project, manifest)
-        return dict(elementary_mod.unchecked_tests(manifest, runtime)) or None
+        return elementary_mod.read(project, manifest)
     return None
 
 

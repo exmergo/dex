@@ -475,6 +475,8 @@ def test_the_resolver_reads_what_each_variant_does_on_dev(
 
     assert record.installed
     assert record.release == version
+    # Acceptance, first case (#1445): a release the fixture runs is supported.
+    assert (record.release_status, record.release_reason_code) == ("supported", None)
     assert (record.enabled, record.hooks, record.materialization) == RESOLVED[variant]
     assert (record.materialization == "elementary") is BEHAVIOUR[variant][0]
     assert not (tmp_path / "prod.duckdb").exists()
@@ -600,6 +602,128 @@ def test_an_elementary_test_that_checked_nothing_asserts_no_model(
     assert assurance.asserted.names == ["fct"]
     assert not FCT_TESTS - ELEMENTARY_FCT_TESTS & set(listed)
     assert any("unchecked_tests" in line for line in result.warnings)
+
+
+# --- a release Dex was not run against (#1445) -----------------------------------
+
+
+def _installed_project_file(project: Path) -> Path:
+    return project / "dbt_packages" / "elementary" / "dbt_project.yml"
+
+
+def _patch_above_newest() -> str:
+    """A patch release above the newest the fixture runs, which the fixture's own
+    constants decide, so the case moves with them."""
+
+    major, minor, patch = (int(part) for part in CURRENT_VERSION.split("."))
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def _set_installed_release(project: Path, release: str) -> None:
+    """Edit the installed package's own ``version``, and nothing else, so dbt and
+    the package's code are those of the release the fixture installed."""
+
+    path = _installed_project_file(project)
+    own = yaml.safe_load(path.read_text("utf-8"))
+    own["version"] = release
+    path.write_text(yaml.safe_dump(own, sort_keys=False), "utf-8")
+
+
+@requires_elementary
+def test_a_release_above_the_newest_tested_is_unchecked_and_the_copy_stays_inert(
+    tmp_path: Path, installed_elementary: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Acceptance, second case: the package at a patch above the newest release
+    the fixture runs. A build lists each Elementary test under
+    ``elementary_release_untested`` and counts none toward a model, the estimate
+    record carries the code, the warning names the release and the newest
+    tested, and a mutation run still leaves the dev warehouse as it found it."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+    from exmergo_dex_core.transform.elementary import read, unpriced_work
+
+    release = _patch_above_newest()
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    _set_installed_release(project, release)
+    engine = _engine(project)
+
+    result = engine.build(target="dev")
+
+    listed = {
+        t.test: (t.models, t.reason_code)
+        for t in result.completion.assurance.unchecked_tests or []
+    }
+    assert {name: listed.get(name) for name in ELEMENTARY_FCT_TESTS} == dict.fromkeys(
+        ELEMENTARY_FCT_TESTS, (["fct"], "elementary_release_untested")
+    )
+    assert {code for _, code in listed.values()} == {"elementary_release_untested"}
+    # dbt's own tests on fct still pass and still count.
+    assert "fct" in result.completion.assurance.asserted.names
+    assert any(
+        release in w and CURRENT_VERSION in w and "elementary_release_untested" in w
+        for w in result.warnings
+    )
+    manifest = _parsed(project, "dev")
+    record = read(project, manifest)
+    work = unpriced_work(record, manifest, (project / "dbt_project.yml").read_text())
+    assert (record.release, record.hooks) == (release, "unknown")
+    assert work.as_dict()["release_reason_code"] == "elementary_release_untested"
+
+    picked: list[str] = []
+    test = ShadowRun.test
+
+    def recording(self, select, **kwargs):
+        picked.append(read(self.shadow, self.manifest()).materialization)
+        return test(self, select, **kwargs)
+
+    monkeypatch.setattr(ShadowRun, "test", recording)
+    warehouse = tmp_path / "dev.duckdb"
+    before = duckdb_census(warehouse)
+    mutated = engine.test_mutations("fct")
+
+    assert _executed(mutated) >= 1, "no mutant ran, so nothing was measured"
+    assert footprint(before, duckdb_census(warehouse)) == {}
+    assert any("elementary_release_untested" in w for w in mutated.warnings)
+    # The copy disables the package's models; what the package's materialization
+    # then does is the release's to say, so the copy also pins dbt's own.
+    assert picked and set(picked) == {"dbt"}
+
+
+@requires_elementary
+def test_an_unreadable_installed_project_file_reports_the_release_unknown(
+    tmp_path: Path, installed_elementary: Path
+):
+    """Acceptance, third case: the manifest dbt parsed for ``dev``, read after
+    the installed package's ``dbt_project.yml`` stopped being readable. Every
+    result that rests on the release carries ``elementary_release_unknown``."""
+
+    from exmergo_dex_core.transform.elementary import (
+        read,
+        unchecked_tests,
+        unpriced_work,
+    )
+
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    manifest = _parsed(project, "dev")
+    _installed_project_file(project).write_bytes(b"\xff\xfe version: [")
+
+    record = read(project, manifest)
+    nodes = manifest["nodes"]
+    listed = {
+        nodes[uid]["name"]: code
+        for uid, code in unchecked_tests(manifest, record).items()
+    }
+    work = unpriced_work(record, manifest, (project / "dbt_project.yml").read_text())
+
+    assert record.installed
+    assert record.release is None
+    assert record.release_reason_code == "elementary_release_unknown"
+    assert {name: listed.get(name) for name in ELEMENTARY_FCT_TESTS} == dict.fromkeys(
+        ELEMENTARY_FCT_TESTS, "elementary_release_unknown"
+    )
+    assert set(listed.values()) == {"elementary_release_unknown"}
+    assert work.as_dict()["release_reason_code"] == "elementary_release_unknown"
+    assert "elementary_release_unknown" in (record.release_warning() or "")
 
 
 # --- explore ranking leaves the package's tables out (#1311) ---------------------

@@ -1523,6 +1523,26 @@ def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owe
             False,
             None,
         ),
+        # Above the newest release the fixture runs (#1445): that the flag is
+        # still read is not taken from the releases before it.
+        (
+            "0.26.2",
+            "elementary",
+            True,
+            (
+                "installed Elementary release 0.26.2 is newer than the newest "
+                "release dex was run against (0.26.1), so whether it honours "
+                "disable_test_samples is unchecked (elementary_release_untested); "
+                "set test_sample_row_count: 0 for the project to keep samples off "
+                "whatever it does"
+            ),
+        ),
+        (
+            "0.26.2",
+            "dbt",
+            False,
+            None,
+        ),
         (
             None,
             "elementary",
@@ -1588,6 +1608,38 @@ def test_elementary_sampling_warning_when_declaring_model(
         assert expected_msg in warnings
     else:
         assert not any("disable_test_samples" in w for w in warnings)
+
+
+@pytest.mark.parametrize(("release", "warns"), [("0.26.1", False), ("0.26.2", True)])
+def test_a_disabled_package_s_materialization_off_the_tested_releases_warns(
+    tmp_path: Path, release: str, warns: bool
+):
+    """The package's materialization is picked while its models are disabled.
+    On a tested release it hands each test to dbt's, so samples are not its to
+    take; on an untested one nothing says so, and the warning stays (#1445)."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        f'name: elementary\nversion: "{release}"\n',
+    )
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in _project().items()
+        },
+        manifest=manifest(models="disabled", hooks="disabled"),
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+
+    assert any("elementary_release_untested" in w for w in warnings) is warns
 
 
 def test_elementary_sampling_warning_not_emitted_when_no_unsampled_tests_rendered(
