@@ -188,7 +188,9 @@ def _adopt(
     problems = []
     try:
         resolved = resolve_target(root / project_dir, chosen)
-        assert_dev_target(resolved.name, chosen, prod=config.dbt_prod_target)
+        assert_dev_target(
+            resolved.name, chosen, prod=getattr(config, "dbt_prod_target", None)
+        )
         if connector and connector != resolved.type:
             raise RequestError(
                 f"connector {connector} conflicts with existing profile type "
@@ -800,7 +802,9 @@ def _verify(
                     )
                 selected = config.dbt_target or "dev"
                 assert_dev_target(
-                    selected, config.dbt_target, prod=config.dbt_prod_target
+                    selected,
+                    config.dbt_target,
+                    prod=getattr(config, "dbt_prod_target", None),
                 )
                 resolve_target(root / result.project_dir, selected)
                 warnings = dev_target.check(

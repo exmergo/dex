@@ -290,7 +290,9 @@ def refresh(
         block["ran"] = False
         return block, warnings, None, None
 
-    assert_dev_target(target, config.dbt_target, prod=config.dbt_prod_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
 
     batch = RefreshBatch(ceiling=None if paradigm is Paradigm.FREE_LOCAL else ceiling)

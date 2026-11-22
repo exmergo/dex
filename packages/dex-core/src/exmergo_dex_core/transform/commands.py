@@ -2873,7 +2873,9 @@ def test_mutations(
     store = engine.store
     repo_root = engine.require_repo_root("running mutation coverage")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target, prod=config.dbt_prod_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     connector = engine.connector or config.connector
     effective = config.model_copy(update={"connector": connector})
     paradigm = paradigm_for(connector, effective)
@@ -6183,7 +6185,7 @@ def build(
     assert_dev_target(
         target or engine.config.dbt_target or "dev",
         engine.config.dbt_target,
-        prod=engine.config.dbt_prod_target,
+        prod=getattr(engine.config, "dbt_prod_target", None),
     )
     project = engine.project_dir()
     if not has_package_spec(project):
@@ -6348,7 +6350,9 @@ def _build_project(
     config = engine.config
     repo_root = engine.require_repo_root("building the dbt project")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target, prod=config.dbt_prod_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
     connector = engine.connector or config.connector
 
@@ -6402,7 +6406,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
-            prod_target=config.dbt_prod_target,
+            prod_target=getattr(config, "dbt_prod_target", None),
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -6537,7 +6541,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
-            prod_target=config.dbt_prod_target,
+            prod_target=getattr(config, "dbt_prod_target", None),
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,

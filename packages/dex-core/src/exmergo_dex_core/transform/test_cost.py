@@ -500,7 +500,7 @@ class _Resolver:
         self.container = container
         self.target = target
         self.prod = prod
-        self.prod_target = engine.config.dbt_prod_target
+        self.prod_target = getattr(engine.config, "dbt_prod_target", None)
         if view is None:
             view = _load_view(engine)
         self.view = view

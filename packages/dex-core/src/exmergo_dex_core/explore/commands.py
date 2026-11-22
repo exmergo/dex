@@ -888,7 +888,9 @@ def profile(
         from ..transform.build import assert_dev_target
 
         assert_dev_target(
-            target, engine.config.dbt_target, prod=engine.config.dbt_prod_target
+            target,
+            engine.config.dbt_target,
+            prod=getattr(engine.config, "dbt_prod_target", None),
         )
         reads_dev_target = True
     mode = engine.resolve_result_mode(result_mode)
@@ -1868,7 +1870,9 @@ def _reads_dev_target(engine: DexEngine, target: str | None) -> bool:
     from ..transform.build import assert_dev_target
 
     assert_dev_target(
-        target, engine.config.dbt_target, prod=engine.config.dbt_prod_target
+        target,
+        engine.config.dbt_target,
+        prod=getattr(engine.config, "dbt_prod_target", None),
     )
     return True
 
