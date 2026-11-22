@@ -9,6 +9,8 @@ reaches it through: the adapters' ``warehouse_refusal`` and ``failure_text``.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from exmergo_dex_core.adapters.base import warehouse_refusal
@@ -298,3 +300,166 @@ def test_a_json_value_containing_the_column_clause_is_masked_whole():
     assert SENTINEL not in masked
     assert "tail" not in masked
     assert masked.endswith(f"{VALUE_WITHHELD} when casting from source column j")
+
+
+# A value that holds a line break is whole on no single line (#1412).
+_SPLIT_VALUE = f"{SENTINEL}_head\n{SENTINEL}_tail"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"Conversion Error: Could not convert string '{_SPLIT_VALUE}' to INT32",
+        f'invalid input syntax for type integer: "{_SPLIT_VALUE}"',
+        f"Numeric value '{_SPLIT_VALUE}' is not recognized",
+        # No listed shape: the conversion marker masks the quoted segment.
+        f"Conversion Error: unexpected '{_SPLIT_VALUE}' in column k",
+        # The marker is on the line the value closes on.
+        f"Timestamp '{_SPLIT_VALUE}' is not recognized",
+        "Invalid Input Error: Malformed JSON at byte 0 of input: unexpected "
+        f'character.  Input: "{_SPLIT_VALUE}"',
+    ],
+)
+def test_a_value_that_spans_a_line_break_is_masked_whole(message):
+    masked = mask_values(message)
+    assert SENTINEL not in masked
+    assert masked.count(VALUE_WITHHELD) == 1
+    assert mask_values(masked) == masked  # idempotent
+
+
+def test_a_quoted_name_spanning_lines_outside_a_conversion_is_kept():
+    message = "Parsing Error: The metric 'dnf\ncount' does not exist"
+    assert mask_values(message) == message
+
+
+def test_warehouse_refusal_masks_a_value_that_spans_a_line_break():
+    refusal = warehouse_refusal(
+        f"Could not convert string '{_SPLIT_VALUE}' to INT32\nLINE 1: select 1"
+    )
+    assert SENTINEL not in refusal.detail
+    assert refusal.detail == f"Could not convert string {VALUE_WITHHELD} to INT32"
+
+
+def test_failure_text_masks_a_value_that_spans_a_line_break():
+    exc = RuntimeError(f"Could not convert string '{_SPLIT_VALUE}' to INT32")
+    assert failure_text(exc) == (
+        f"RuntimeError: Could not convert string {VALUE_WITHHELD} to INT32"
+    )
+
+
+def test_a_value_too_long_to_close_nearby_is_masked_to_the_end():
+    """After a phrase that names a value, an open quote fails closed (#1412)."""
+
+    message = "Could not convert string '" + "a" * 1000 + "\n" + "b" * 1001
+    assert mask_values(message + "' to INT32") == (
+        f"Could not convert string {VALUE_WITHHELD} to INT32"
+    )
+    assert mask_values(message) == f"Could not convert string {VALUE_WITHHELD}"
+    refusal = warehouse_refusal(message + "' to INT32")
+    assert "aaaa" not in refusal.detail
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "HTTPError: 400 {" + ", ".join(f'"k{i}": "v{i}"' for i in range(2000)) + "}",
+        "Conversion Error: x\n" + (" 'a" * 20 + "\n") * 2000,
+        "Value 'x\n" * 20000,
+        "Conversion Error: " + " 'a'b" * 20000,
+        "is not recognized" + " 'a'b" * 20000,
+        "Conversion Error: 'a\n" + "b' 'c\n" * 4000 + "d' to INT",
+    ],
+    ids=[
+        "many-quotes-one-line",
+        "stray-quotes-many-lines",
+        "open-values",
+        "unclosed-quotes-one-marker-line",
+        "unclosed-quotes-after-a-suffix-phrase",
+        "values-chained-over-lines",
+    ],
+)
+def test_masking_a_long_message_stays_linear(message):
+    """Many quotes once took tens of seconds; the bound catches a blow-up, not
+    a slow machine."""
+
+    started = time.monotonic()
+    mask_values(message)
+    assert time.monotonic() - started < 5
+
+
+def test_a_real_duckdb_json_input_over_a_line_break_is_masked_whole():
+    """DuckDB quotes a malformed JSON input as stored, line break included; the
+    refusal keeps its first line only, so the driver error is read whole."""
+
+    duckdb = pytest.importorskip("duckdb")
+    sql = f"select json_extract('{SENTINEL}_head' || chr(10) || '{SENTINEL}', '$.a')"
+    with pytest.raises(duckdb.Error) as raised:
+        duckdb.connect().sql(sql).fetchall()
+    assert "\n" in str(raised.value)
+    assert SENTINEL not in failure_text(raised.value)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"Timestamp '{SENTINEL}'\n{SENTINEL}' is not recognized",
+        f"100040 (22007): Date '{SENTINEL}'\n{SENTINEL}' is not recognized",
+        f"Numeric value '{SENTINEL}'\n{SENTINEL}' is not recognized",
+    ],
+)
+def test_a_value_holding_a_quote_and_a_line_break_is_masked_whole(message):
+    """The quote inside the value is followed by a line break, which reads as a
+    close; the phrase after the value is what finds its real end (#1412)."""
+
+    masked = mask_values(message)
+    assert SENTINEL not in masked
+    assert masked.endswith(f"{VALUE_WITHHELD} is not recognized")
+    assert mask_values(masked) == masked
+
+
+@pytest.mark.parametrize("value", [SENTINEL, _SPLIT_VALUE])
+def test_a_json_input_keeps_the_column_clause_and_the_statement(value):
+    """Only the quoted input is masked; what DuckDB says after it is kept."""
+
+    statement = "LINE 1: select (s||'')::json from t\n               ^"
+    message = (
+        "Conversion Error: Malformed JSON at byte 0 of input: unexpected "
+        f'character.  Input: "{value}" when casting from source column s\n\n'
+    ) + statement
+    masked = mask_values(message)
+    assert SENTINEL not in masked
+    assert f"Input: {VALUE_WITHHELD} when casting from source column s" in masked
+    assert "LINE 1:" in masked
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"ssn": 987654321, "card": 4111111111111111',
+        '{"dob": 19870412 "x"}',
+        '["a", 987654321 , "b"',
+        '{"k":\n 987654321',
+    ],
+)
+@pytest.mark.parametrize(
+    "sql", ["select json_extract(s, '$.a') from t", "select s::json from t"]
+)
+def test_a_real_duckdb_json_input_with_inner_quotes_is_masked_whole(value, sql):
+    """DuckDB prints the input in double quotes without escaping the ones
+    inside it, so a JSON key's quotes must not end the value (#1412)."""
+
+    duckdb = pytest.importorskip("duckdb")
+    conn = duckdb.connect()
+    conn.execute("create table t (s varchar)")
+    conn.execute("insert into t values (?)", [value])
+    with pytest.raises(duckdb.Error) as raised:
+        conn.sql(sql).fetchall()
+    text = failure_text(raised.value)
+    assert "987654321" not in text
+    assert "4111111111111111" not in text
+    assert "19870412" not in text
+    assert f"Input: {VALUE_WITHHELD}" in text
+    if "::json" in sql:
+        assert "when casting from source column s" in text
+        assert "LINE 1:" in text
+    assert mask_values(text) == text

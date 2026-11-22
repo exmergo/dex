@@ -131,8 +131,13 @@ def derive(
     *,
     cache: Any,
     dialect: str,
+    parse: bool = True,
 ) -> Outcome:
-    """Each declared mart in ``edits``, derived into the configured layer."""
+    """Each declared mart in ``edits``, derived into the configured layer.
+
+    ``parse`` False keeps MetricFlow's derivation from starting dbt (#1517):
+    each derivation is reported unvalidated and stays out of the plan.
+    """
 
     from ..config import SEMANTIC_SOURCE_FACTORIES
     from ..semantic_source import SemanticDerivationRequest, SemanticDerivationSource
@@ -170,6 +175,7 @@ def derive(
             files,
             project=engine.project_dir(),
             target=engine.config.dbt_target,
+            parse=parse,
         )
         documents = files
 

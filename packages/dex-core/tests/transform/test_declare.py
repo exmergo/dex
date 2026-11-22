@@ -19,6 +19,7 @@ import yaml
 from exmergo_dex_core.cli import main
 from exmergo_dex_core.dbt_project import DbtProjectView, SourceFile
 from exmergo_dex_core.transform import declare as declare_mod
+from exmergo_dex_core.transform.claims import claim_id
 from exmergo_dex_core.transform.declarations import parse_declarations
 
 ORDERS = "select order_id, customer_id, amount from {{ ref('stg_orders') }}\n"
@@ -613,7 +614,23 @@ def test_apply_then_declare_again_is_a_clean_no_op(shop: Path, capsys):
     assert entry["description"] == "One row per customer."
     assert entry["columns"][0]["tests"] == [
         "unique",
-        {"not_null": {"config": {"meta": {"disable_test_samples": True}}}},
+        {
+            "not_null": {
+                "config": {
+                    "meta": {
+                        "disable_test_samples": True,
+                        "dex": {
+                            "claim": claim_id(
+                                "stg_customers",
+                                "grain",
+                                ["customer_id"],
+                                {"check": "not_null"},
+                            )
+                        },
+                    }
+                }
+            }
+        },
     ]
 
     again = _dex(shop, ["transform", "declare", "stg_orders,stg_customers"], capsys)

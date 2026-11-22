@@ -15,6 +15,7 @@ import yaml
 
 from .conftest import (
     DBX_MAX_SECONDS,
+    assert_generated_test_parity,
     assert_ok,
     assert_unpivot_build,
     unpivot_fixture_edits,
@@ -266,3 +267,27 @@ def test_unpivot_json_object_macro_builds_live(
     )
     assert_ok(rc, built)
     assert_unpivot_build(built)
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, dbx_warehouse, dbx_scratch_catalog
+):
+    """The generated-test parity harness (#1450, #1451) on Databricks: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    pytest.importorskip("dbt.adapters.databricks")
+    if not dbx_scratch_catalog:
+        pytest.skip("transform needs DEX_TEST_DATABRICKS_CATALOG (a writable scratch)")
+    if not os.environ.get("DATABRICKS_TOKEN") and os.environ.get("DATABRICKS_HOST"):
+        pytest.skip("DATABRICKS_HOST is set without DATABRICKS_TOKEN; dbt needs one")
+    seed_repo(tmp_path, dbx_warehouse, dbx_scratch_catalog)
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+    assert_generated_test_parity(
+        run_cli,
+        capsys,
+        tmp_path,
+        connector="databricks",
+        budget=DBX_MAX_SECONDS * 48,  # the freshness rows (#1460) add six tests
+    )

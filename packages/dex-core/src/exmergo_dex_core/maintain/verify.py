@@ -148,27 +148,220 @@ def _artifact(project_dir: Path, name: str) -> Path:
     return readable_artifact_dir(project_dir) / name
 
 
-def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
+def _manifest_document(project_dir: Path) -> dict | None:
     path = _artifact(project_dir, "manifest.json")
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8")).get("nodes", {})
-
-
-def _run_results(project_dir: Path) -> list[dict] | None:
-    from ..transform.artifact_runtime import pinned_invocation_id
-
-    path = _artifact(project_dir, "run_results.json")
-    if not path.is_file():
-        return None
     document = json.loads(path.read_text(encoding="utf-8"))
-    # A build's own sweep reads only its own invocation's results; another
-    # run's passing tests must not vouch for this build's rows.
-    expected = pinned_invocation_id()
-    written = (document.get("metadata") or {}).get("invocation_id")
-    if expected is not None and written is not None and str(written) != expected:
-        return None
-    return document.get("results", [])
+    return document if isinstance(document, dict) else None
+
+
+def _manifest_nodes(project_dir: Path) -> dict[str, dict] | None:
+    document = _manifest_document(project_dir)
+    return None if document is None else document.get("nodes", {})
+
+
+@dataclass
+class NodeResults:
+    """Each node's latest building attempt, and the run it was read from (#1524).
+
+    ``nodes`` maps a unique id to ``(result row, run)``, the run a
+    :class:`~..transform.artifact_runtime.BuildingRun`. ``runs`` are the runs
+    read, oldest first. ``logged`` holds, per run, whether a dbt log beside it
+    names its invocation (``None`` where there is nothing to check against).
+    ``pinned`` is set inside a build's own ``--verify`` sweep, which reads that
+    build's invocation and nothing else.
+
+    Who started a run is read from where its results sit: ``dex`` for Dex's own
+    artifact directory (or the build this sweep belongs to), ``outside_dex`` for
+    the project's target path while Dex writes its own directory, and
+    ``unknown`` for the project's target path when ``transform.artifacts`` is
+    ``shared``, where Dex's builds and anyone else's write the same file, unless
+    Dex's node record names the invocation.
+    """
+
+    nodes: dict[str, tuple[dict, Any]] = field(default_factory=dict)
+    runs: list[Any] = field(default_factory=list)
+    logged: dict[int, bool | None] = field(default_factory=dict)
+    pinned: bool = False
+    artifact_policy: str = "isolated"
+    notes: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.runs)
+
+    @property
+    def newest(self) -> Any | None:
+        return self.runs[-1] if self.runs else None
+
+    def statuses(self) -> dict[str, str]:
+        return {uid: str(row.get("status")) for uid, (row, _) in self.nodes.items()}
+
+    def invoked_by(self, run: Any) -> str:
+        # Under `transform.artifacts: shared` Dex writes the project's target
+        # path too; its node record says which invocations were its own.
+        if (
+            self.pinned
+            or run.artifact == "dex"
+            or run.source == "dex_record"
+            or run.recorded_by_dex
+        ):
+            return "dex"
+        return "unknown" if self.artifact_policy == "shared" else "outside_dex"
+
+    def describe(self, run: Any) -> dict[str, Any]:
+        """One run's identity and who started it, never a result row."""
+
+        return {
+            **run.describe(),
+            "invoked_by": self.invoked_by(run),
+            "logged": self.logged.get(id(run)),
+            "latest": run is self.newest,
+        }
+
+    def run_statuses(self, run: Any) -> dict[str, str]:
+        """Every status one run recorded, apart from any other run's."""
+
+        return {
+            str(row["unique_id"]): str(row.get("status", "unknown"))
+            for row in run.document.get("results") or []
+            if isinstance(row, dict) and row.get("unique_id")
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """``data.build_status_runs``: every run read."""
+
+        attributed: dict[int, int] = {}
+        for _, run in self.nodes.values():
+            attributed[id(run)] = attributed.get(id(run), 0) + 1
+        return {
+            "runs": [
+                {**self.describe(run), "nodes": attributed.get(id(run), 0)}
+                for run in self.runs
+            ],
+        }
+
+
+def _run_label(run: Any) -> str:
+    return (
+        f"dbt {run.command} run {run.invocation_id or '(no recorded id)'} at "
+        f"{run.generated_at or 'an unrecorded time'}"
+    )
+
+
+def node_results(
+    project_dir: Path,
+    *,
+    manifest: dict | None = None,
+    artifact_policy: str | None = None,
+) -> NodeResults:
+    """Each node's status from the latest dated run that attempted it (#1524).
+
+    Standalone, every building run on disk is read (Dex's directory and the
+    project's target path, with their ``cold/``), ordered by dbt's own
+    ``generated_at`` and overlaid oldest first, so a node a later run attempted
+    is judged by that run. The run results beside the newest *manifest* are not
+    the answer: a ``dbt parse`` rewrites a manifest and runs nothing, which
+    paired a fresh manifest with an older run's failures. A run whose invocation
+    the dbt logs beside it do not name is still read, since a rotated or cleaned
+    log is no proof the results came from elsewhere and dropping them could hide
+    a failure; it is marked ``logged: false`` and a warning names it. A result
+    for a node the current manifest no longer has is not attributed.
+
+    Inside a build's own ``--verify`` sweep the build's directory and
+    invocation are pinned, and only that invocation's results are read: another
+    run's passing tests must not vouch for this build's rows.
+    """
+
+    from ..transform.artifact_runtime import (
+        BuildingRun,
+        building_runs,
+        pinned_directory,
+        pinned_invocation_id,
+        run_is_logged,
+    )
+
+    policy = artifact_policy or "isolated"
+    directory = pinned_directory()
+    if directory is not None:
+        result = NodeResults(pinned=True, artifact_policy=policy)
+        path = directory / "run_results.json"
+        if not path.is_file():
+            return result
+        document = json.loads(path.read_text(encoding="utf-8"))
+        meta = document.get("metadata") or {}
+        expected = pinned_invocation_id()
+        written = meta.get("invocation_id")
+        if expected is not None and written is not None and str(written) != expected:
+            return result
+        args = document.get("args") or {}
+        run = BuildingRun(
+            directory=directory,
+            artifact="dex",
+            cold=False,
+            command=str(
+                (args if isinstance(args, dict) else {}).get("which") or "build"
+            ),
+            invocation_id=str(written) if written else expected,
+            generated_at=str(meta.get("generated_at") or ""),
+            mtime=path.stat().st_mtime,
+            document=document,
+        )
+        result.runs.append(run)
+        for row in document.get("results", []):
+            if isinstance(row, dict) and row.get("unique_id"):
+                result.nodes[str(row["unique_id"])] = (row, run)
+        return result
+
+    result = NodeResults(artifact_policy=policy)
+    for run in building_runs(project_dir, include_records=True):
+        logged = run_is_logged(project_dir, run)
+        result.logged[id(run)] = logged
+        if logged is False:
+            result.warnings.append(
+                f"no dbt log beside the {_run_label(run)} names that invocation: its "
+                "results may have been copied from elsewhere, or the log rotated "
+                "or was cleaned; its statuses are still read, and each finding "
+                "from it carries data.run.logged: false"
+            )
+        result.runs.append(run)
+        for row in run.document.get("results") or []:
+            if isinstance(row, dict) and row.get("unique_id"):
+                result.nodes[str(row["unique_id"])] = (row, run)
+
+    document = manifest if manifest is not None else _manifest_document(project_dir)
+    # Whenever a manifest is on disk, an empty one included: a project whose
+    # last nodes were removed has nothing for an old failure to name.
+    if document is not None:
+        known = set(document.get("nodes") or {}) | set(document.get("unit_tests") or {})
+        gone = [uid for uid in result.nodes if uid not in known]
+        for uid in gone:
+            del result.nodes[uid]
+        if gone:
+            result.notes.append(
+                f"{len(gone)} build result(s) belong to nodes the manifest no "
+                "longer has, or has since disabled, and are not reported"
+            )
+
+    newest = result.newest
+    if (
+        newest is not None
+        and result.invoked_by(newest) != "dex"
+        and any(result.invoked_by(run) == "dex" for run in result.runs)
+    ):
+        who = (
+            "was not started by Dex"
+            if result.invoked_by(newest) == "outside_dex"
+            else "sits in the shared target path, so dex cannot tell who ran it"
+        )
+        result.notes.append(
+            f"the newest dbt run on disk, the {_run_label(newest)}, {who}; "
+            "each node's build status is read from the latest run that "
+            "attempted it, named on every build finding under data.run"
+        )
+    return result
 
 
 def read_manifest_target(project_dir: Path) -> str | None:
@@ -189,11 +382,19 @@ def read_manifest_target(project_dir: Path) -> str | None:
     return None
 
 
-def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[str]]:
-    """Nodes that failed, were skipped because a parent failed, or warned, from
-    the last run's ``run_results.json`` joined to the compiled manifest for
-    names and the dependency graph. Free: reads artifacts already on disk,
-    opens no connection.
+def build_status_findings(
+    project_dir: Path, *, results: NodeResults | None = None
+) -> tuple[list[DriftFinding], list[str]]:
+    """Nodes that failed, were skipped because a parent failed, or warned, each
+    judged by the latest dated run that attempted it (:func:`node_results`)
+    and joined to the compiled manifest for names and the dependency graph.
+    Free: reads artifacts already on disk, opens no connection.
+
+    Every finding names the run it was read from under ``data.run``
+    (``invocation_id``, ``generated_at``, ``command``, ``artifact``, ``cold``,
+    ``invoked_by`` and ``latest``), and its ``detail`` says the same in words,
+    so a failure an earlier run recorded and no later run attempted reads as
+    that, never as the current state (#1524).
 
     A skip is walked back through however many transitively-skipped parents
     it takes to name the node that actually failed, since a two-layer partial
@@ -207,27 +408,33 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
     in the raw node list to find out which ones warned.
     """
 
-    nodes = _manifest_nodes(project_dir) or {}
-    results = _run_results(project_dir)
+    document = _manifest_document(project_dir)
+    manifest = document or {}
+    nodes = manifest.get("nodes") or {}
+    unit_tests = manifest.get("unit_tests") or {}
     if results is None:
+        # None, not {}, when no manifest is on disk: an empty manifest drops
+        # every result, a missing one has nothing to filter by.
+        results = node_results(project_dir, manifest=document)
+    if not results.found:
         return (
             [],
             [
+                *results.warnings,
                 "no dbt run results found; run `dbt run` or `dbt build` for "
-                "build-status findings"
+                "build-status findings",
             ],
         )
 
     def name_of(uid: str) -> str:
-        return manifest_node_label(uid, nodes.get(uid))
+        node = nodes.get(uid) or unit_tests.get(uid)
+        return manifest_node_label(uid, node if isinstance(node, dict) else None)
 
-    status_by_uid = {
-        r["unique_id"]: str(r.get("status", "unknown"))
-        for r in results
-        if r.get("unique_id")
-    }
-
-    def failed_ancestor(uid: str, seen: set[str]) -> str | None:
+    def failed_ancestor(
+        uid: str, seen: set[str], status_by_uid: dict[str, str]
+    ) -> str | None:
+        # Read from the skipped node's own run: a parent another run failed
+        # did not cause this skip, so no cause is named rather than a wrong one.
         if uid in seen:
             return None
         seen.add(uid)
@@ -237,49 +444,66 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
             if status and status_kind(status) == "failed":
                 return name_of(dep)
             if status and status_kind(status) == "skipped":
-                found = failed_ancestor(dep, seen)
+                found = failed_ancestor(dep, seen, status_by_uid)
                 if found:
                     return found
         return None
 
+    newest = results.newest
+
+    def provenance(run) -> tuple[dict, str]:
+        described = results.describe(run)
+        who = {
+            "dex": "started by Dex",
+            "outside_dex": "not started by Dex",
+            "unknown": "in the shared target path",
+        }[described["invoked_by"]]
+        said = f" (read from the {_run_label(run)}, {who}"
+        if run is not newest and newest is not None:
+            said += (
+                f"; an earlier run than the latest, the {_run_label(newest)}, "
+                "which did not attempt it"
+            )
+        return described, said + ")"
+
     findings: list[DriftFinding] = []
-    notes: list[str] = []
+    notes: list[str] = [*results.warnings, *results.notes]
     unrecognized: list[str] = []
-    for result in results:
-        uid = result.get("unique_id")
-        if not uid:
-            continue
+    for uid, (result, run) in results.nodes.items():
         status = str(result.get("status", "unknown"))
         kind = status_kind(status)
         name = name_of(uid)
         if status.lower() in _WARNING_STATUSES:
             message = _dbt_message(result, status)
+            run_data, said = provenance(run)
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="node_warned",
                     identifier=name,
                     severity="low",
-                    detail=f"'{name}' warned rather than failed: {message}",
-                    data={"status": status},
+                    detail=f"'{name}' warned rather than failed: {message}{said}",
+                    data={"status": status, "run": run_data},
                 )
             )
             continue
         if kind == "failed":
             message = _dbt_message(result, status)
+            run_data, said = provenance(run)
             findings.append(
                 DriftFinding(
                     axis="build",
                     code="node_failed",
                     identifier=name,
                     severity="high",
-                    detail=f"'{name}' failed to build: {message}",
-                    data={"status": status},
+                    detail=f"'{name}' failed to build: {message}{said}",
+                    data={"status": status, "run": run_data},
                 )
             )
             continue
         if kind == "skipped":
-            cause = failed_ancestor(uid, set())
+            cause = failed_ancestor(uid, set(), results.run_statuses(run))
+            run_data, said = provenance(run)
             findings.append(
                 DriftFinding(
                     axis="build",
@@ -293,8 +517,13 @@ def build_status_findings(project_dir: Path) -> tuple[list[DriftFinding], list[s
                         f"'{name}' was skipped because '{cause}' failed to build"
                         if cause
                         else f"'{name}' was skipped"
+                    )
+                    + said,
+                    data=(
+                        {"caused_by": cause, "run": run_data}
+                        if cause
+                        else {"run": run_data}
                     ),
-                    data={"caused_by": cause} if cause else {},
                 )
             )
             continue
@@ -2464,8 +2693,7 @@ def passed_grain_tests(project_dir: Path) -> dict[str, dict]:
     from ..dbt_project import manifest_node_label
 
     nodes = _manifest_nodes(project_dir) or {}
-    results = _run_results(project_dir) or []
-    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    status = node_results(project_dir).statuses()
     proven: dict[str, dict] = {}
     unproven: set[str] = set()
     for unique_id in sorted(status):
@@ -3650,8 +3878,8 @@ class ModelJoinContext:
     column it reads, as far as the compiled SQL lets that be followed; a
     computed column has no entry. ``columns`` is each output column's declared
     ``config.meta.dex`` (lowered keys). ``parents`` maps every project node
-    name (lowered) to its relation, so a ``references`` can be lined up with
-    the relation a join reads. ``assumptions`` is the model's declared
+    name and version label (lowered) to its relation, so a ``references`` can
+    be lined up with the relation a join reads. ``assumptions`` is the model's declared
     ``assumptions`` entries and ``population_filters`` the columns its
     ``population.filters`` entries name (lowered), which say an INNER join's
     unmatched rows are the population the model means to drop (#1162).
@@ -3715,18 +3943,7 @@ def plan_join_contract(
 
     import sqlglot
 
-    parents: dict[str, str] = {}
-    for node in nodes.values():
-        if (
-            isinstance(node, dict)
-            and node.get("resource_type") in ("model", "seed", "snapshot")
-            and isinstance(node.get("name"), str)
-            and isinstance(node.get("relation_name"), str)
-            and node["relation_name"]
-        ):
-            parents.setdefault(
-                node["name"].lower(), strip_relation_quoting(node["relation_name"])
-            )
+    parents = _parent_relations(nodes)
 
     plan = JoinContractPlan()
     for uid, node in nodes.items():
@@ -3783,6 +4000,55 @@ def plan_join_contract(
                 projected=_final_output_map(tree),
             )
     return plan
+
+
+def _parent_relations(nodes: dict) -> dict[str, str]:
+    """Every model, seed and snapshot name (lowered) a ``references`` can name,
+    mapped to its relation, as ``ref()`` resolves it.
+
+    A version of a versioned model is also keyed by its label
+    (``dim_teams.v2``), which is how a declaration names it, and the bare name
+    is the version an unversioned ``ref('dim_teams')`` resolves to, its
+    ``latest_version``, not whichever version the manifest lists first (#1459).
+    """
+
+    from .. import model_versions as mv
+
+    parents: dict[str, str] = {}
+    latest: dict[str, str] = {}
+    versions: dict[str, dict[str, str]] = {}
+    for node in nodes.values():
+        if not (
+            isinstance(node, dict)
+            and node.get("resource_type") in ("model", "seed", "snapshot")
+            and isinstance(node.get("name"), str)
+            and isinstance(node.get("relation_name"), str)
+            and node["relation_name"]
+        ):
+            continue
+        name = node["name"].lower()
+        relation = strip_relation_quoting(node["relation_name"])
+        version = node.get("version")
+        if version is None or version == "":
+            parents.setdefault(name, relation)
+            continue
+        label = mv.version_text(version)
+        parents.setdefault(f"{name}.v{label.lower()}", relation)
+        versions.setdefault(name, {}).setdefault(label, relation)
+        latest_version = node.get("latest_version")
+        if latest_version is not None and mv.version_text(latest_version) == label:
+            latest[name] = relation
+    for name, by_label in versions.items():
+        if name in latest:
+            # The default version wins the bare name over an earlier version.
+            parents[name] = latest[name]
+            continue
+        # No latest_version recorded: dbt's own default (numeric order when
+        # every label is numeric, alphabetical otherwise).
+        default = mv.default_version({"versions": [{"v": v} for v in by_label]})
+        if default is not None:
+            parents[name] = by_label[default]
+    return parents
 
 
 def _model_population_intent(dex) -> tuple[list[dict], tuple[str, ...]]:
@@ -4089,10 +4355,14 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
 
     A join is required when the model declares a column it supplies
     ``null_rule: never`` on a LEFT join (an unmatched row would put a NULL
-    there), or declares the column carrying its driving key a ``foreign_key``
-    whose ``references`` names the joined relation (every key must exist in the
-    parent). NULL driving keys count against coverage only when the column
-    carrying them is declared ``null_rule: never``.
+    there), or declares on the column carrying its driving key a
+    ``references`` that names the joined relation, whatever the column's
+    ``role`` and on a LEFT join too: every non-null key must exist in the
+    parent, as the ``relationships`` test the reference renders holds it
+    (#1459). A version label (``dim_teams.v2``) names that version, and a bare
+    name the version ``ref()`` resolves to. NULL driving keys count against
+    coverage only when the column carrying them is declared ``null_rule:
+    never``: otherwise a NULL is a missing reference, which both checks accept.
 
     An INNER join that is not required drops its unmatched driving rows, which
     is a filter when the model means it: an ``assumptions`` entry whose
@@ -4139,11 +4409,18 @@ def join_policy(candidate: JoinCandidate, ctx: ModelJoinContext | None) -> JoinP
         for col in driving:
             meta = ctx.columns.get(col) or {}
             target = meta.get("references")
-            if meta.get("role") != "foreign_key" or not isinstance(target, str):
+            if not isinstance(target, str) or not target.strip():
                 continue
-            parent = ctx.parents.get(target.rpartition(".")[0].lower())
+            # A `references` is the claim whatever the column's role: it is
+            # what renders the `relationships` test, which holds every non-null
+            # value to the parent on a LEFT join too (#1459).
+            parent = ctx.parents.get(target.strip().rpartition(".")[0].lower())
             if parent is not None and _same_relation(parent, candidate.to_relation):
-                required_by = f"{col} is declared a foreign_key referencing {target}"
+                required_by = (
+                    f"{col} is declared a foreign_key referencing {target}"
+                    if meta.get("role") == "foreign_key"
+                    else f"{col} declares references {target}"
+                )
                 break
     declared_optional = bool(derived) and all(
         _null_allowed(ctx.columns.get(c)) for c in derived
@@ -4312,6 +4589,92 @@ def _null_checks(
             )
         )
     return checks, notes
+
+
+def _spell_key_columns(
+    adapter, pairs: list, filters: dict[int, tuple] | None = None
+) -> list[str]:
+    """Respell each relationship's key columns the way its relation stores them,
+    in place, so the probe's quoted names resolve (#1366). Only the probe reads
+    the respelling: what a finding or record names comes from the candidate, as
+    the SQL wrote it, so a finding's fingerprint does not move with it.
+
+    ``filters`` (:func:`_scope_filters`) are respelled the same way, in place:
+    a side read through a filtering CTE carries its filter as DuckDB SQL over
+    quoted column names (#1085), so on Snowflake ``"status"`` named a column
+    the relation stores as ``STATUS`` and the probe failed (#1456).
+
+    The columns come from the model's SQL, which is ordinarily lower case, and
+    the probe quotes what it is handed; Snowflake stores an unquoted name upper
+    case, so the quoted SQL spelling is an invalid identifier there (Postgres and
+    Redshift the other way round). A name already spelled the way the connector
+    folds it needs nothing and reads no metadata. Otherwise the relation's own
+    spelling wins: the name exactly (a column the SQL quoted keeps its case),
+    else the connector's fold of it. A column with neither, or a relation whose
+    columns cannot be read, keeps the SQL spelling and the probe reports what the
+    warehouse says, as before; an unreadable relation is a note, returned.
+    """
+
+    from ..adapters import fold_identifier
+    from ..guards.cost_guard import CostGuardError
+
+    dialect = getattr(adapter, "dialect", None)
+    live: dict[str, set[str]] = {}
+    unreadable: dict[str, str] = {}
+    notes: list[str] = []
+
+    def spell(model: str, identifier: str, column: str) -> str:
+        folded = fold_identifier(dialect, column)
+        if folded == column:
+            return column
+        if identifier not in live:
+            try:
+                _meta, columns = adapter.table_metadata(identifier)
+            except CostGuardError:
+                raise
+            except Exception as exc:  # an unreadable relation keeps the SQL spelling
+                unreadable[identifier] = type(exc).__name__
+                columns = []
+            live[identifier] = {c.name for c in columns}
+        if identifier in unreadable:
+            note = (
+                f"{model}: the join keys on {identifier} were probed as the SQL "
+                f"spells them: the relation's columns could not be read "
+                f"({unreadable[identifier]})"
+            )
+            if note not in notes:
+                notes.append(note)
+        names = live[identifier]
+        return folded if column not in names and folded in names else column
+
+    def respell(model: str, identifier: str, predicate: str | None) -> str | None:
+        if predicate is None:
+            return None
+        import sqlglot
+        from sqlglot import expressions as exp
+
+        try:
+            tree = sqlglot.parse_one(predicate, read="duckdb")
+        except Exception:  # an unreadable filter keeps the SQL spelling
+            return predicate
+        for column in tree.find_all(exp.Column):
+            name = column.name
+            spelled = spell(model, identifier, name)
+            if spelled != name:
+                column.set("this", exp.to_identifier(spelled, quoted=True))
+        return tree.sql(dialect="duckdb")
+
+    scoped_filters = filters if filters is not None else {}
+    for model, _candidate, rel in pairs:
+        rel.from_columns = [spell(model, rel.from_dataset, c) for c in rel.from_columns]
+        rel.to_columns = [spell(model, rel.to_dataset, c) for c in rel.to_columns]
+        scoped = scoped_filters.get(id(rel))
+        if scoped is not None:
+            scoped_filters[id(rel)] = (
+                respell(model, rel.from_dataset, scoped[0]),
+                respell(model, rel.to_dataset, scoped[1]),
+            )
+    return notes
 
 
 def _split_unsafe(pairs: list[tuple], dialect: str) -> tuple[list[tuple], list[tuple]]:
@@ -4663,9 +5026,11 @@ def join_coverage(
       declaration makes the join required, any unmatched row contradicts it
       (``threshold_source: contract``). Otherwise the default thresholds apply
       (``threshold_source: default``, stated in ``data``), and on a LEFT join
-      unmatched rows are the optional relationship a LEFT join writes: recorded
-      as evidence, with ``join_orphans`` withheld and ``join_zero_overlap``
-      ranked medium. On an INNER join whose unmatched rows the declaration
+      the declaration does not require (its driving key declares no
+      ``references`` to the joined relation) unmatched rows are the optional
+      relationship a LEFT join writes: recorded as evidence, with
+      ``join_orphans`` withheld and ``join_zero_overlap`` ranked medium
+      (#1459). On an INNER join whose unmatched rows the declaration
       accounts for (an ``assumptions`` entry or a ``population.filters`` entry
       naming the driving key column), the join is the model's filter: the
       record is ``satisfied``, keeps its counts and names that entry under
@@ -4727,6 +5092,8 @@ def join_coverage(
     grouped = _grouped_sides(pairs)
     checks, check_notes = _null_checks(adapter, plan, live_identifiers)
     result.notes.extend(check_notes)
+    # Before pricing, so an EXPLAIN reads the names the probe will quote.
+    result.notes.extend(_spell_key_columns(adapter, pairs, filters))
     estimate, probe_count = join_probe_cost(
         adapter, relationships, exprs, filters, grouped
     )
@@ -4933,8 +5300,10 @@ def _judge_coverage(
         return None
 
     orphan_fraction = round(unmatched_rows / eligible_rows, 4)
-    from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in rel.from_columns)
-    to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in rel.to_columns)
+    # The SQL's spelling, not the probe's (#1366): a finding's column is part of
+    # its fingerprint, and the record beside it names the candidate's.
+    from_key = ", ".join(f"{rel.from_dataset}.{c}" for c in candidate.from_columns)
+    to_key = ", ".join(f"{rel.to_dataset}.{c}" for c in candidate.to_columns)
     measured = (
         f"{unmatched_rows} of {eligible_rows} eligible {child} row(s) "
         f"({orphan_fraction:.0%}) and {eligible_keys - matched_keys} of "
@@ -4949,9 +5318,9 @@ def _judge_coverage(
         "join": candidate.label or None,
         "side": candidate.side,
         "from_relation": rel.from_dataset,
-        "from_columns": list(rel.from_columns),
+        "from_columns": list(candidate.from_columns),
         "to_relation": rel.to_dataset,
-        "to_columns": list(rel.to_columns),
+        "to_columns": list(candidate.to_columns),
         "orphan_fraction": orphan_fraction,
         **record["measured"],
         "coverage_rows": coverage_rows,
@@ -5039,7 +5408,9 @@ def _judge_coverage(
         axis="join_contract",
         code=code,
         identifier=model,
-        column=rel.from_columns[0] if len(rel.from_columns) == 1 else None,
+        column=(
+            candidate.from_columns[0] if len(candidate.from_columns) == 1 else None
+        ),
         severity=severity,
         detail=detail,
         data=data,

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
+from datetime import UTC, date, datetime
 from typing import Any
 
 from ...adapters.base import clip_cell_value
@@ -365,6 +366,52 @@ def values_reach_note(dimension: str, used: list[str], reachable: list[str]) -> 
         f"in the context of a metric; dex used {', '.join(used)}. These are "
         "therefore the values present for that metric, which can be narrower than "
         f"the column's own domain.{alternatives} Pass --metric to choose."
+    )
+
+
+#: The ``types`` entry of a column :func:`utc_timestamps` spells.
+TIMESTAMP_TYPE = "timestamp"
+
+
+def _utc_timestamp(value: Any) -> Any:
+    """``value`` as a UTC ISO timestamp with an explicit offset. A naive value is
+    read as UTC; a value that is not a date or a timestamp is kept as it came."""
+
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+    if not isinstance(value, datetime):
+        if not isinstance(value, date):
+            return value
+        value = datetime(value.year, value.month, value.day)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
+
+
+def utc_timestamps(
+    columns: list[str], types: list[str], cells: list[list[Any]], named: Collection[str]
+) -> tuple[list[str], list[list[Any]]]:
+    """``types`` and ``cells`` with every column in ``named`` spelled one way.
+
+    For a layer whose time buckets read the same whoever executes them (Cube,
+    #1497): a warehouse returns a naive or an offset timestamp under its own
+    type name, Cube's ``/v1/load`` returns naive text typed ``time``, and all of
+    them are the same UTC instant, spelled here as ``2025-03-01T00:00:00+00:00``
+    and typed ``timestamp``.
+    """
+
+    at = {i for i, column in enumerate(columns) if column in named}
+    if not at:
+        return types, cells
+    return (
+        [TIMESTAMP_TYPE if i in at else kind for i, kind in enumerate(types)],
+        [
+            [_utc_timestamp(v) if i in at else v for i, v in enumerate(row)]
+            for row in cells
+        ],
     )
 
 

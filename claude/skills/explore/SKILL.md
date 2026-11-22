@@ -96,7 +96,15 @@ the project edits, migrations and dev builds described below.
    which rows may be `added` and `removed` (`"none"`, `"any"`, or
    `{"where": "<predicate over output columns>"}`, which may test a column
    with `IN (SELECT <column> FROM ref('<model>') WHERE ...)`), the
-   `changed_columns` a kept key may change, and that the key holds.
+   `changed_columns` a kept key may change, and `"key": "unchanged"` (or
+   `"any"` when the key may stop being unique). The same object can come from
+   a file with `--expect-file <f>`; a complete one:
+
+   ```json
+   {"added": {"where": "region = 'emea'"}, "removed": "none",
+    "changed_columns": ["amount"], "key": "unchanged"}
+   ```
+
    `as_expected` is the verdict to relay; `unexpected` is a defect, as
    `different` is: its `findings` and `unexpected_keys` name the rows the
    change reached beyond its statement.
@@ -478,6 +486,10 @@ fetches the engine's dependencies from PyPI or your configured index.
    `semantic.cube.url`: members are `cube.member`, a time grouping is
    `--group-by orders.ordered_at__month`, `--where` is Cube's JSON filter, and a
    stale-renderer refusal means the Cube server needs a restart, not a new query.
+   `--api` has the Cube server execute instead (`execution: vendor`, no cost
+   guard, said on the result); under `semantic.deployment: cube_cloud` that is
+   the default and the catalog is Cube Cloud's, while `--local` keeps Dex
+   executing and holds the deployment to the reviewed files.
    On a Snowflake Semantic View layer both run through Dex's own Snowflake
    connector as a `SEMANTIC_VIEW()` clause: tokens are the catalog's
    `view.table.member` (`view.metric` for a view-level metric), one view per
@@ -488,8 +500,12 @@ fetches the engine's dependencies from PyPI or your configured index.
    `list --deployed` reads the account's copy. Under `semantic.deployment:
    snowflake_account` the account is the only definition: nothing is held to a
    file, and every result warns so; relay that warning with the answer. On a
-   Databricks Metric View layer
-   both refuse by name for now and name the physical route.
+   Databricks Metric View layer both run through Dex's own Databricks connector
+   as `SELECT ... MEASURE(...)` over the deployed view, held to the repository's
+   file first, with tokens `view.field` and `view.measure`, one view per query.
+   Under `semantic.deployment: databricks_workspace` Unity Catalog is the only
+   definition: nothing is held to a file, and every result warns so; relay that
+   warning with the answer.
 
 Per-command fields, caps, and backend detail are in
 `${CLAUDE_SKILL_DIR}/references/commands.md`. Read it when a field or flag you

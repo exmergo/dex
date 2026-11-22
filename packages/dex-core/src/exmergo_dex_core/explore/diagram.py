@@ -95,6 +95,7 @@ def render_er_mermaid(
     *,
     full: bool = False,
     max_entities: int = MAX_ENTITIES,
+    excluded: frozenset[str] = frozenset(),
 ) -> MermaidDiagram:
     """Render ``cache`` as a Mermaid ``erDiagram``.
 
@@ -105,9 +106,34 @@ def render_er_mermaid(
 
     ``full`` widens eligibility to unprofiled and isolated objects and to every
     column. It does not lift ``max_entities``, which always binds.
+
+    ``excluded`` holds lower-cased identifiers the caller leaves out before the
+    cap (the Elementary package's own tables, #1494): never an entity, never
+    counted as an elided entity, and an edge onto one is dropped as any edge
+    whose endpoint is not drawn, counted in ``elided_edge_count``. Nor does such
+    an edge connect anything: an object whose only join is onto an excluded one
+    is as isolated here as one with no join, so the default does not draw it.
+    Naming them is the caller's job, since this module knows the cache and
+    nothing about what a table is.
     """
 
-    ranked = cache.ranked_datasets(profiled_only=not full, connected_only=not full)
+    # Connectivity is read over the edges this diagram can draw. Over the
+    # cache's own, a project table whose only join is onto an excluded one would
+    # pass as connected, lose its edge below, and take a cap slot as an edge-less
+    # box.
+    drawable = [
+        rel
+        for rel in cache.relationships
+        if rel.from_dataset.lower() not in excluded
+        and rel.to_dataset.lower() not in excluded
+    ]
+    ranked = [
+        d
+        for d in cache.ranked_datasets(
+            profiled_only=not full, connected_only=not full, relationships=drawable
+        )
+        if d.identifier.lower() not in excluded
+    ]
     kept = ranked[:max_entities]
     kept_names = {d.identifier for d in kept}
     lowered = {d.identifier.lower() for d in kept}

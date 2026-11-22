@@ -500,6 +500,8 @@ _DECLARATION_WEIGHT = {
     "additivity": "high",
     "unit": "high",
     "aggregation": "high",
+    # How old the newest row may be: a looser lag silences an alert (#1460).
+    "freshness": "high",
     "description": "low",
 }
 

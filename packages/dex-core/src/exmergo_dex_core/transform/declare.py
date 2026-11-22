@@ -202,6 +202,8 @@ def propose(
     *,
     draft: Callable[[str], tuple[dict[str, Any] | None, list[str]]],
     cap: int,
+    render_tests: bool | list[str] = False,
+    dialect: str | None = None,
 ) -> Outcome:
     """Each model's proposal, or the reason it has none, up to ``cap`` proposals.
 
@@ -241,7 +243,11 @@ def propose(
             payload, supplied_fields = _merge(payload, given)
         else:
             supplied_fields = []
-        if not fields and not supplied_fields:
+        if (
+            not fields
+            and not supplied_fields
+            and not _owes_generated_tests(model, rendered, view, render_tests, dialect)
+        ):
             # Whether anything would have been proposed had nothing been declared
             # yet: that separates a model already complete from one dex has no
             # measured fact for.
@@ -263,7 +269,32 @@ def propose(
                 declarations_mod._check(
                     declaration, rendered, view, cache=None, pii_overrides=None
                 )
-            text = declarations_mod.render(rendered.get(path), declaration)
+            generated: list[dict[str, Any]] = []
+            text = declarations_mod.render(
+                rendered.get(path),
+                declaration,
+                render_tests=render_tests,
+                generated=generated,
+                dialect=dialect,
+                outputs=declarations_mod.model_outputs(
+                    rendered, view.model_paths, model
+                ),
+                joins=declarations_mod.read_model_joins(
+                    rendered, view.model_paths, model, dialect
+                ),
+                history=declarations_mod.history_reader(view, rendered),
+            )
+            # The tests a references implies on its parent (#1457), which the
+            # plan renders into the parent's entry: owed by this model as a
+            # parent, or as a child naming one.
+            referenced = declarations_mod.render_referenced_keys(
+                {**rendered, path: text},
+                view,
+                [model],
+                render_tests=render_tests,
+                dialect=dialect,
+                generated=generated,
+            )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
                 raise
@@ -275,10 +306,28 @@ def propose(
                 }
             )
             continue
-        if text == rendered.get(path):
+        if text == rendered.get(path) and not referenced:
             outcome.skipped.append(_why_nothing(model, entry, complete=True))
             continue
         rendered[path] = text
+        rendered.update(referenced)
+        added = [
+            {k: row[k] for k in ("test", "column", "cadence", "claim")}
+            # A test on another model (the parent a references names) says so.
+            | ({"model": row["model"]} if row["model"] != model else {})
+            for row in generated
+            if row["status"] == "added"
+        ]
+        if added:
+            # Not a measured fact: the tests the declared facts imply, which
+            # `declarations.render_tests` turns on (#1449).
+            fields = {
+                **fields,
+                "generated_tests": {
+                    "value": added,
+                    "evidence": "declared facts; declarations.render_tests",
+                },
+            }
         outcome.proposals.append(
             Proposal(
                 model=model,
@@ -376,6 +425,58 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
         and packaged.enabled
         and (packaged.columns is None or column.lower() in packaged.columns)
     )
+
+
+def _owes_generated_tests(
+    model: str,
+    files: Mapping[str, str],
+    view: Any,
+    render_tests: bool | list[str],
+    dialect: str | None = None,
+) -> bool:
+    """Whether the model's declared facts imply a generated test its YAML does
+    not list yet, with ``render_tests`` turning it on (#1449): a model declared
+    before the switch was on, which has no fact left to propose."""
+
+    if render_tests is False or render_tests == []:
+        return False
+    sql_path = declarations_mod.model_sql_path(files, view.model_paths, model)
+    path = declarations_mod.schema_path(files, model)
+    if path is None or sql_path is None:
+        return False
+    generated: list[dict[str, Any]] = []
+    try:
+        declarations_mod.render(
+            files.get(path),
+            Declaration(model=model),
+            render_tests=render_tests,
+            generated=generated,
+            dialect=dialect,
+            outputs=declarations_mod.model_outputs(files, view.model_paths, model),
+            joins=declarations_mod.read_model_joins(
+                files, view.model_paths, model, dialect
+            ),
+            history=declarations_mod.history_reader(view, files),
+        )
+    except (RewriteError, DeclarationError):
+        return False
+    if any(row["status"] == "added" for row in generated):
+        return True
+    # What other models' references imply about this one (#1457): a parent
+    # declared before the switch was on owes the test on its referenced key.
+    referenced: list[dict[str, Any]] = []
+    try:
+        declarations_mod.render_referenced_keys(
+            files,
+            view,
+            [model],
+            render_tests=render_tests,
+            dialect=dialect,
+            generated=referenced,
+        )
+    except (RewriteError, DeclarationError):
+        return False
+    return any(row["status"] == "added" for row in referenced)
 
 
 def _merge(

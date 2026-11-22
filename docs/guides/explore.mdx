@@ -30,6 +30,15 @@ Inventory identifies the important objects; the map adds profiles and inferred
 relationships. Read the map's skipped objects and elision counts before treating
 it as a complete inventory of the warehouse.
 
+If the project installs the Elementary dbt package, both commands leave the
+package's own tables (`dbt_run_results`, `data_monitoring_metrics` and the rest)
+out of the ranking, so its run metadata does not crowd out your models. The map's
+excluded objects and a note name them. `dex explore relationships` leaves them out
+of profiling and inference the same way, so a metered estimate prices none of
+them, and `dex explore diagram` draws none of them. They stay readable with
+`dex explore profile` and `dex explore query`, and `--include-elementary` on any
+of the four commands brings them back.
+
 Then profile the relations your question actually reads. On the demo:
 
 ```bash

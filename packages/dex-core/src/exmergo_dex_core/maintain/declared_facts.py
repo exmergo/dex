@@ -54,11 +54,19 @@ from typing import Any
 from ..cache import match_identifier
 from ..dbt_project import manifest_node_label, strip_relation_quoting
 from ..guards.pii_meta import entry_meta
+from . import freshness as freshness_mod
 from . import temporal_contracts as temporal_mod
 from .drift import DriftFinding
 
 #: The declared-fact finding classes this module owns, as `suppressed` names them.
-CLASSES = ("unit", "additivity", "population", "parent_population", "temporal")
+CLASSES = (
+    "unit",
+    "additivity",
+    "population",
+    "parent_population",
+    "temporal",
+    "freshness",
+)
 
 #: The units this module can check. Anything else (``currency:EUR``, ``count``,
 #: a plain unit) has no range to check against.
@@ -131,6 +139,8 @@ class DeclaredModel:
     declared_types: tuple[tuple[str, str], ...] = ()
     parent: ParentRule | None = None
     history: temporal_mod.HistoryRule | None = None
+    #: Each declared ``freshness`` on a time column (#1460).
+    freshness: tuple[freshness_mod.FreshnessRule, ...] = ()
 
     def declares(self, finding_class: str) -> bool:
         return bool(
@@ -141,6 +151,7 @@ class DeclaredModel:
                 "parent_population": self.parent is not None
                 and not self.parent.drafted,
                 "temporal": self.history,
+                "freshness": self.freshness,
             }[finding_class]
         )
 
@@ -248,7 +259,10 @@ def plan(
             nodes,
             uid,
         )
-        if not (units or additive or filters or grain or parent or history):
+        freshness = _freshness_rules(node)
+        if not (
+            units or additive or filters or grain or parent or history or freshness
+        ):
             continue
         models.append(
             DeclaredModel(
@@ -264,6 +278,7 @@ def plan(
                 declared_types=types,
                 parent=parent,
                 history=history,
+                freshness=freshness,
             )
         )
     return sorted(models, key=lambda m: m.model), []
@@ -304,8 +319,12 @@ def _read(node: dict[str, Any]):
             continue
         includes = _values(entry.get("includes"))
         excludes = _values(entry.get("excludes"))
-        if includes or excludes:
-            filters.append(PopulationRule(entry["column"], includes, excludes))
+        # A filter stating both lists is two rules, each judged on its own list
+        # (#1453): one probe per list, as the generated tests check them.
+        if includes:
+            filters.append(PopulationRule(entry["column"], includes=includes))
+        if excludes:
+            filters.append(PopulationRule(entry["column"], excludes=excludes))
 
     from ..project_definitions import read_population_parent
 
@@ -329,6 +348,24 @@ def _read(node: dict[str, Any]):
         tuple(types),
         parent,
     )
+
+
+def _freshness_rules(node: dict[str, Any]) -> tuple[freshness_mod.FreshnessRule, ...]:
+    """Each column's declared ``freshness`` (#1460), in column order."""
+
+    out: list[freshness_mod.FreshnessRule] = []
+    columns = node.get("columns")
+    for key, column in columns.items() if isinstance(columns, dict) else []:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("name") if isinstance(column.get("name"), str) else key
+        dex = entry_meta(column).get("dex")
+        if not isinstance(name, str) or not name or not isinstance(dex, dict):
+            continue
+        rule = freshness_mod.read_rule(name, dex.get("freshness"))
+        if rule is not None:
+            out.append(rule)
+    return tuple(out)
 
 
 def _values(raw: Any) -> tuple[Any, ...] | None:
@@ -366,6 +403,8 @@ class _Probe:
     empty_columns: list[str] = field(default_factory=list)
     #: The temporal contract's statement (#1027) and what it measured.
     temporal: temporal_mod.Written | None = None
+    #: The freshness statement (#1460) and the rules it measures.
+    freshness: freshness_mod.Written | None = None
 
     def statements(self) -> list[str]:
         return [
@@ -375,6 +414,7 @@ class _Probe:
                 self.cumulative_sql,
                 self.parent_sql,
                 self.temporal.sql if self.temporal else None,
+                self.freshness.sql if self.freshness else None,
             )
             if s
         ]
@@ -403,6 +443,12 @@ class Prepared:
     temporal_models: list[DeclaredModel] = field(default_factory=list)
     #: Each contract no statement could be written for, with why (#1027).
     temporal_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: Every model in scope that declares a freshness (#1460), and each rule
+    #: no statement could be written for, by (model, column), with why.
+    freshness_models: list[DeclaredModel] = field(default_factory=list)
+    freshness_unwritten: dict[tuple[str, str], tuple[str, str]] = field(
+        default_factory=dict
+    )
     #: Each parent check no statement could be written for, with code and why.
     parent_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
     #: A ``grain_coverage`` record for each declared grain no statement could
@@ -423,6 +469,7 @@ def prepare(
     check_grain: bool = False,
     tested_grain: bool = False,
     selection: str | None = None,
+    pii_overrides: Any = None,
 ) -> Prepared:
     """Resolve each model to its relation and write the statements that check it.
 
@@ -456,6 +503,7 @@ def prepare(
         prepared.dropped[finding_class] = []
     prepared.parent_models = [m for m in models if m.parent is not None]
     prepared.temporal_models = [m for m in models if m.history is not None]
+    prepared.freshness_models = [m for m in models if m.freshness]
 
     for model in models:
         grain_here = check_grain and (tested_grain or grain_untested(model))
@@ -520,6 +568,10 @@ def prepare(
             _parent_probe(adapter, probe, live, live_identifiers, prepared)
         if model.history is not None:
             temporal_mod.write_probe(adapter, probe, live, live_identifiers, prepared)
+        if model.freshness:
+            freshness_mod.write_probe(
+                probe, live, adapter.dialect, prepared, pii_overrides
+            )
         if probe.statements():
             prepared.probes.append(probe)
     return prepared
@@ -608,6 +660,12 @@ def _probe(
             f"MIN({q}) AS dex_min_{index}, MAX({q}) AS dex_max_{index}, "
             f"COUNT({q}) AS dex_n_{index}"
         )
+        if unit == "fraction":
+            # The rows outside 0 to 1, the count dex_unit_range fails with
+            # (#1455), so the generated test and this check agree on a number.
+            parts.append(
+                f"COUNT(CASE WHEN {q} < 0 OR {q} > 1 THEN 1 END) AS dex_out_{index}"
+            )
         probe.units.append((index, column, unit, data_type))
 
     for index, rule in enumerate(model.filters):
@@ -1099,6 +1157,8 @@ class DeclaredFactsResult:
     parent_coverage: list[dict] = field(default_factory=list)
     #: One record per declared temporal contract, measured or not (#1027).
     temporal_contracts: list[dict] = field(default_factory=list)
+    #: One record per declared freshness, measured or not (#1460).
+    freshness: list[dict] = field(default_factory=list)
     #: One record per drafted parent, measured or not (#1228): the population
     #: a model with no declared parent holds against the entity dex drafted.
     population_delta: list[dict] = field(default_factory=list)
@@ -1116,6 +1176,7 @@ def nothing_declared(finding_class: str, where: str) -> str:
         ),
         "parent_population": f"no model {where} declares a population.parent",
         "temporal": f"no model {where} declares a history temporal contract",
+        "freshness": f"no model {where} declares a freshness on a time column",
     }[finding_class]
 
 
@@ -1175,6 +1236,7 @@ def findings(
             result.offer = offer
             _unchecked_parents(prepared, result, "scan_offered", reason)
             temporal_mod.record_unmeasured(prepared, result, "scan_offered", reason)
+            freshness_mod.record_unmeasured(prepared, result, "scan_offered", reason)
             return result
 
     checked: dict[str, int] = dict.fromkeys(CLASSES, 0)
@@ -1213,6 +1275,16 @@ def findings(
             temporal_mod.run_probe(
                 adapter, probe, result, checked, prepared, timeout_seconds
             )
+        if probe.freshness is not None:
+            freshness_mod.run_probe(
+                adapter,
+                probe,
+                result,
+                checked,
+                prepared,
+                timeout_seconds,
+                pii_overrides,
+            )
         if probe.cumulative is not None:
             try:
                 fractions = cumulative_mod.measure_fractions(
@@ -1237,6 +1309,7 @@ def findings(
 
     _unchecked_parents(prepared, result, "not_measured", None)
     temporal_mod.record_unmeasured(prepared, result, "not_measured", None)
+    freshness_mod.record_unmeasured(prepared, result, "not_measured", None)
     for finding_class in CLASSES:
         if finding_class in result.suppressed:
             continue
@@ -1719,9 +1792,15 @@ def _judge_aggregate(
             )
             continue
         unit_checked = True
+        outside = row.get(f"dex_out_{index}")
         # A percent whose every value sits within 0 to 1 is the fraction it
-        # was probably computed as; a fraction outside it is arithmetic.
-        wrong = (low < 0 or high > 1) if unit == "fraction" else high <= 1 and low >= 0
+        # was probably computed as; a fraction outside it is arithmetic, decided
+        # by the exact count where the probe has one: a float extremum can round
+        # a high-precision decimal just past 1 down to 1.0 (#1455).
+        if unit == "fraction":
+            wrong = int(outside) > 0 if outside is not None else low < 0 or high > 1
+        else:
+            wrong = high <= 1 and low >= 0
         if not wrong:
             continue
         path = f"{probe.identifier}.{column}"
@@ -1730,7 +1809,16 @@ def _judge_aggregate(
             data_type or "DOUBLE", detect_pii(column, data_type or "DOUBLE")
         )
         result.findings.append(
-            _unit_finding(model, column, unit, low, high, non_null, safe)
+            _unit_finding(
+                model,
+                column,
+                unit,
+                low,
+                high,
+                non_null,
+                safe,
+                out_of_range=None if outside is None else int(outside),
+            )
         )
     if unit_checked:
         checked["unit"] += 1
@@ -1777,6 +1865,8 @@ def _unit_finding(
     high: float,
     non_null: int,
     show_values: bool,
+    *,
+    out_of_range: int | None = None,
 ) -> DriftFinding:
     if show_values:
         observed = f"its values run from {low:g} to {high:g}"
@@ -1785,10 +1875,15 @@ def _unit_finding(
             "its observed range is withheld because the column looks like personal data"
         )
     if unit == "fraction":
+        rows = (
+            ""
+            if out_of_range is None
+            else f" ({out_of_range} row{'' if out_of_range == 1 else 's'} outside it)"
+        )
         detail = (
-            f"'{model}.{column}' is declared a fraction (0 to 1), but {observed}; a "
-            "share computed as a percentage, or a ratio over the wrong denominator, "
-            "lands here"
+            f"'{model}.{column}' is declared a fraction (0 to 1), but {observed}"
+            f"{rows}; a share computed as a percentage, or a ratio over the wrong "
+            "denominator, lands here"
         )
     else:
         detail = (
@@ -1803,6 +1898,8 @@ def _unit_finding(
         "declared_unit": unit,
         "non_null_count": non_null,
     }
+    if out_of_range is not None:
+        data["out_of_range_rows"] = out_of_range
     if show_values:
         data.update({"min": low, "max": high})
     else:

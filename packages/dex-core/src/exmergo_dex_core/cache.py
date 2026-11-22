@@ -17,7 +17,7 @@ import re
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_serializer
+from pydantic import BaseModel, Field, model_serializer, model_validator
 
 from .project_definitions import DeclaredHistory
 
@@ -326,6 +326,26 @@ class Dataset(BaseModel):
     #: the cache document never carries it.
     declaration: DatasetDeclaration | None = Field(default=None, exclude=True)
 
+    @model_validator(mode="after")
+    def _withhold_elementary_values(self) -> Dataset:
+        """Drop any value a column of Elementary's schema holds (#1310).
+
+        On every dataset built or loaded, so a profile cached before the
+        profiler withheld them, or carried untouched through a merge, never
+        serves a minimum, maximum or value domain for them. The cache's version
+        does not decide it, since a merge restamps the profiles it carries.
+        """
+
+        from .guards.elementary_values import withheld_columns
+
+        held = withheld_columns(self.identifier, (c.name for c in self.columns))
+        for col in self.columns:
+            if col.name in held:
+                col.min_value = None
+                col.max_value = None
+                col.value_domain = None
+        return self
+
     def notable_columns(
         self,
         join_columns: set[str] | None = None,
@@ -612,7 +632,11 @@ class DexCache(BaseModel):
     provenance: CacheProvenance = Field(default_factory=CacheProvenance)
 
     def ranked_datasets(
-        self, *, profiled_only: bool = True, connected_only: bool = False
+        self,
+        *,
+        profiled_only: bool = True,
+        connected_only: bool = False,
+        relationships: list[Relationship] | None = None,
     ) -> list[Dataset]:
         """The datasets worth reporting, best first.
 
@@ -626,14 +650,18 @@ class DexCache(BaseModel):
         nothing about the model. A findings payload does not: an isolated object
         that carries four PII flags and an empty-table warning is exactly a
         finding, and dropping it would leave the envelope's own
-        ``pii_column_count`` contradicting the objects beside it.
+        ``pii_column_count`` contradicting the objects beside it. ``relationships``
+        names the edges connectivity is read over, for a caller that draws only
+        some of the cache's (a diagram leaving endpoints out, #1494); the cache's
+        own by default.
 
         Order is rank first and identifier second, never cache order, so the same
         cache reports byte-identically however its datasets happen to be stored.
         """
 
-        connected = {r.from_dataset.lower() for r in self.relationships}
-        connected |= {r.to_dataset.lower() for r in self.relationships}
+        edges = self.relationships if relationships is None else relationships
+        connected = {r.from_dataset.lower() for r in edges}
+        connected |= {r.to_dataset.lower() for r in edges}
         candidates = [
             d
             for d in self.datasets

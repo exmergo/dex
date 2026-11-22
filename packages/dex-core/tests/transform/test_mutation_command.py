@@ -613,6 +613,69 @@ def test_a_left_out_test_is_listed_when_the_baseline_never_runs():
     assert result["baseline"]["excluded"] == [{**_LEFT_OUT, "status": "not_run"}]
 
 
+def test_a_unit_test_that_overrides_vars_is_excluded_for_its_overrides(project):
+    """A mutant is compiled once with the project's own vars, so a unit test
+    whose ``overrides: vars`` a build applies fails the baseline here. It is
+    excluded naming those overrides, not as a broken test (#1396)."""
+
+    from exmergo_dex_core.dbt_tests import unit_test_overrides
+
+    class _Shadow:
+        def write(self, *args, **kwargs):
+            pass
+
+        def test(self, select, exclude=()):
+            return {
+                "nodes": [
+                    {
+                        "unique_id": "test.p.not_null.abc",
+                        "name": "not_null",
+                        "status": "pass",
+                    },
+                    {
+                        "unique_id": "unit_test.p.fct.fct_years",
+                        "name": "fct_years",
+                        "status": "fail",
+                    },
+                ]
+            }
+
+    node = {"unique_id": "model.p.fct", "name": "fct"}
+    manifest = {
+        "unit_tests": {
+            "unit_test.p.fct.fct_years": {
+                "name": "fct_years",
+                "model": "fct",
+                "depends_on": {"nodes": ["model.p.fct"]},
+                "overrides": {
+                    "vars": {"gta_v_year": 2013, "gta_6_year": 2016},
+                    "macros": {"is_incremental": False},
+                },
+            },
+            "unit_test.p.fct.plain": {
+                "name": "plain",
+                "model": "fct",
+                "depends_on": {"nodes": ["model.p.fct"]},
+                "overrides": {"macros": {"is_incremental": True}},
+            },
+        }
+    }
+    overrides = unit_test_overrides(manifest, node)
+    assert overrides == {"fct_years": "vars gta_6_year, gta_v_year"}
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    )
+    result, _meta = _run(
+        _Shadow(), batch, project, incremental_tests=[], overrides=overrides
+    )
+
+    (entry,) = result["baseline"]["excluded"]
+    assert entry["name"] == "fct_years"
+    assert "overrides vars gta_6_year, gta_v_year" in entry["reason"]
+    assert "already failing" not in entry["reason"]
+
+
 def test_only_the_left_out_tests_the_selection_reaches_are_named():
     """A monitoring test on a model the run does not select is not one it would
     have run, and one the downstream routing already excludes is named there."""
@@ -1121,6 +1184,56 @@ def test_each_mutant_is_priced_as_its_own_statement():
     assert per_table[f"{dropped.id} predicate_drop"] != per_table["(baseline)"]
     assert prices[dropped.id] == per_table[f"{dropped.id} predicate_drop"]
     assert estimate == sum(per_table.values())
+
+
+@pytest.mark.parametrize("alias", ["fct_v2", "fct_final"])
+def test_a_mutant_is_spliced_into_the_cte_dbt_names_after_the_alias(alias):
+    """dbt names a model's CTE in a test after its alias: `<name>_v<N>` for a
+    version, or whatever the config sets. Looking the CTE up by the model's name
+    found nothing, so every mutant was priced at the baseline."""
+
+    from exmergo_dex_core.transform.commands import _price_mutations
+
+    class _Aliased(_PricingCopy):
+        def manifest(self):
+            manifest = super().manifest()
+            for test in manifest["nodes"].values():
+                test["compiled_code"] = test["compiled_code"].replace(
+                    "__dbt__cte__fct", f"__dbt__cte__{alias}"
+                )
+            return manifest
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1 and b > 2", dialect="duckdb")
+    )
+    _estimate, per_table, _prices, _notes = _price_mutations(
+        _TextPricedAdapter(),
+        _Aliased(None),
+        "models/fct.sql",
+        batch,
+        {"name": "fct", "alias": alias},
+        mutation,
+    )
+    dropped = next(m for m in batch.mutants if m.operator == "predicate_drop")
+    assert per_table[f"{dropped.id} predicate_drop"] != per_table["(baseline)"]
+
+
+def test_an_ephemeral_parent_is_matched_by_the_cte_dbt_names_after_its_alias():
+    from exmergo_dex_core.transform.commands import _parent_relations
+
+    manifest = {
+        "nodes": {
+            "model.p.stg.v2": {
+                "name": "stg",
+                "alias": "stg_v2",
+                "version": 2,
+                "config": {"materialized": "ephemeral"},
+            }
+        }
+    }
+    node = {"depends_on": {"nodes": ["model.p.stg.v2"]}}
+    [parent] = _parent_relations(manifest, node, mutation)
+    assert parent.rendered == "__dbt__cte__stg_v2"
 
 
 def test_the_comparisons_are_priced_into_the_same_batch_as_if_all_survive():

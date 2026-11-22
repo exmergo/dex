@@ -465,7 +465,10 @@ fetches the engine's dependencies from PyPI or your configured index.
    (`vendor`: a MetricFlow model, or a SLayer, Cube, Metric View or Semantic View
    file stored as a second plan whose id is `plan_id`), already planned (`mode: included`) or offered with
    the commands that adopt it (`mode: proposed`), with every gap it could not
-   fill named and every declared field it could not carry in `not_carried`. When the user
+   fill named and every declared field it could not carry in `not_carried`. Relay
+   `data.generated_tests` where present: the tests beyond the built-ins that the
+   declaration renders, each with its cadence tag, only where the project's
+   `declarations.render_tests` turns them on. Never set that switch unasked. When the user
    wants models that already exist declared, run `transform declare <models>`
    (none selects every model, 25 per plan). It proposes only what each model's
    YAML does not state and lists every model it skipped; relay `data.skipped`
@@ -689,7 +692,9 @@ a field, flag, or macro you need is not described here.
   Dex will not create a database itself.
 - On a billed connector the first call returns `needs_confirmation` with an
   estimate (`per_table_bytes` names which node drives it, and `upper_bounds`
-  names the incremental lines that will likely bill less).
+  names the incremental lines that will likely bill less). `cost.unpriced`
+  marks the estimate a floor where the Elementary package runs hooks or tests
+  no compiled node shows; say so when you relay the estimate.
 - When `.dex/config.yml` commits both `budget.ceiling` and
   `budget.session_ceiling` and the estimate fits `budget.ceiling`, re-issue with
   `--confirm` alone and let `budget.ceiling` bind. Do not pick a `--budget`

@@ -12,7 +12,10 @@ from exmergo_dex_core.config import DexConfig
 from exmergo_dex_core.engine import DexEngine
 from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit
-from exmergo_dex_core.transform.refactor_compare import nondeterministic_expression
+from exmergo_dex_core.transform.refactor_compare import (
+    _upstream_seeds,
+    nondeterministic_expression,
+)
 
 pytestmark = pytest.mark.live_open_adapter
 
@@ -406,6 +409,72 @@ def test_the_cli_returns_one_envelope_with_no_rows(project, tmp_path, capsys):
     assert "someone" not in out
 
 
+def test_a_regenerated_feature_compares_the_one_model_it_changes(
+    project, tmp_path, capsys
+):
+    """The issue's repro (#1415): a payload re-sends an unchanged seed and
+    unchanged models beside the one model it rewrites. The repeats are skipped,
+    so the seed no longer blocks the comparison and the unchanged models are
+    offered none."""
+
+    seeds = project / "seeds"
+    seeds.mkdir()
+    (seeds / "codes.csv").write_text("code,label\n1,one\n", encoding="utf-8")
+    _engine(project).build(target="dev")
+    (tmp_path / ".dex").mkdir(exist_ok=True)
+    (tmp_path / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\ndbt_target: dev\ndbt_project_dir: {project.name}\n"
+        f"path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    unchanged = ["seeds/codes.csv", "models/teams.sql", "models/event_counts.sql"]
+    edits = [
+        {
+            "path": path,
+            "kind": "seed_csv" if path.endswith(".csv") else "model_sql",
+            "content": (project / path).read_text(encoding="utf-8"),
+        }
+        for path in unchanged
+    ]
+    edits.append(
+        {
+            "path": "models/team_activity.sql",
+            "kind": "model_sql",
+            "content": _EQUIVALENT,
+        }
+    )
+    payload = tmp_path / "payload.json"
+    payload.write_text(json.dumps({"edits": edits}), encoding="utf-8")
+
+    def run(*argv: str) -> dict:
+        capsys.readouterr()
+        main(
+            [
+                "--repo-root",
+                str(tmp_path),
+                "--path",
+                str(tmp_path / "dev.duckdb"),
+                *argv,
+            ]
+        )
+        return json.loads(capsys.readouterr().out)
+
+    planned = run("transform", "plan", "regenerate", "--edits-file", str(payload))
+    assert planned["status"] == "ok", planned
+    assert planned["data"]["paths"] == ["models/team_activity.sql"]
+    assert (
+        "3 edits match the tree and were skipped: " + ", ".join(unchanged)
+        in planned["warnings"]
+    )
+    offer = planned["data"]["refactor_comparison_offer"]
+    assert offer["models"] == ["team_activity"]
+    assert [m["model"] for m in offer["per_model"]] == ["team_activity"]
+
+    compared = run("transform", "compare", planned["data"]["plan_id"])
+    assert compared["status"] == "ok", compared
+    assert compared["data"]["status"] == "equivalent", compared["data"]
+
+
 def test_an_accepted_type_change_still_compares_its_rows(project):
     engine = _engine(project)
     widened = _ORIGINAL.replace(
@@ -511,3 +580,105 @@ def test_nondeterminism_is_read_from_the_statement(sql, found):
         assert result is None
     else:
         assert result is not None
+
+
+def _seeded(project: Path) -> DexEngine:
+    """A seed under ``mart_s`` through ``int_s``, built beside the rest (#1429)."""
+
+    (project / "seeds").mkdir()
+    (project / "seeds" / "seed_s.csv").write_text("id,v\n1,a\n", encoding="utf-8")
+    (project / "models" / "int_s.sql").write_text(
+        "select id, v from {{ ref('seed_s') }}", encoding="utf-8"
+    )
+    (project / "models" / "mart_s.sql").write_text(
+        "select id, v from {{ ref('int_s') }}", encoding="utf-8"
+    )
+    engine = _engine(project)
+    engine.build(target="dev")
+    return engine
+
+
+def _plan_with_seed(engine: DexEngine, mart_s: str) -> str:
+    """A seed edit beside a comment-only edit to a model apart from it."""
+
+    return engine.plan(
+        "refactor",
+        edits=[
+            PlanEdit(
+                path="seeds/seed_s.csv",
+                new_content="id,v\n1,b\n",
+                kind=EditKind.SEED_CSV,
+            ),
+            PlanEdit(
+                path="models/team_activity.sql",
+                new_content="-- renamed\n" + _ORIGINAL,
+                kind=EditKind.MODEL_SQL,
+            ),
+            PlanEdit(
+                path="models/mart_s.sql", new_content=mart_s, kind=EditKind.MODEL_SQL
+            ),
+        ],
+    ).plan_id
+
+
+def test_a_seed_edit_does_not_block_a_model_that_does_not_read_it(project):
+    """The refusal follows the model's own inputs, not the whole plan (#1429)."""
+
+    engine = _seeded(project)
+    plan_id = _plan_with_seed(engine, "select id, v from {{ ref('int_s') }}\n")
+    result = engine.compare(plan_id, model="team_activity")
+    assert result.status == "equivalent", result.detail
+    assert any("event_counts" in name for name in result.input_scope)
+
+
+def test_a_seed_edit_blocks_a_model_below_it_and_names_the_seed(project):
+    engine = _seeded(project)
+    plan_id = _plan_with_seed(engine, "select id, v from {{ ref('int_s') }}\n")
+    result = engine.compare(plan_id, model="mart_s")
+    assert result.status == "not_checked"
+    assert result.reason_code == "inputs_unsynchronized"
+    assert "seeds/seed_s.csv" in result.detail
+    assert "mart_s" in result.detail
+    assert "on its own" in result.detail
+
+
+def test_a_proposal_that_stops_reading_the_seed_is_compared(project):
+    """The baseline reads the rows dev holds, which are the pre-plan rows, so
+    only a proposal that reads the changed seed is refused (#1429)."""
+
+    engine = _seeded(project)
+    plan_id = _plan_with_seed(engine, "select 1 as id, 'a' as v\n")
+    result = engine.compare(plan_id, model="mart_s")
+    assert result.status != "not_checked", result.detail
+
+
+def test_a_packages_seed_at_a_project_path_is_not_the_projects():
+    """A package records paths relative to itself, so its seeds/x.csv is not the
+    project's (#1429); the walk still goes through package nodes."""
+
+    def seed(package: str) -> dict:
+        return {"package_name": package, "original_file_path": "seeds/codes.csv"}
+
+    manifest = {
+        "metadata": {"project_name": "p"},
+        "nodes": {
+            "seed.pkg.codes": seed("pkg"),
+            "model.pkg.stg": {
+                "package_name": "pkg",
+                "depends_on": {"nodes": ["seed.p.codes"]},
+            },
+            "seed.p.codes": seed("p"),
+        },
+    }
+    assert _upstream_seeds(manifest, {"depends_on": {"nodes": ["seed.pkg.codes"]}}) == (
+        frozenset()
+    )
+    assert _upstream_seeds(manifest, {"depends_on": {"nodes": ["model.pkg.stg"]}}) == (
+        frozenset({"seeds/codes.csv"})
+    )
+    # A manifest that names no project keeps every seed, so it refuses rather
+    # than compares against stale rows.
+    del manifest["metadata"]
+    assert _upstream_seeds(manifest, {"depends_on": {"nodes": ["seed.pkg.codes"]}}) == (
+        frozenset({"seeds/codes.csv"})
+    )

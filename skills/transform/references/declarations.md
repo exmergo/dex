@@ -45,11 +45,12 @@ exist.
 | `additivity` | `additive`; `semi_additive` (does not add across time: a balance, a running or season-to-date total); `non_additive` (a ratio, a share, a distinct count) |
 | `unit` | `currency:<ISO code>`, `fraction` (0 to 1), `percent` (0 to 100), `count`, or a plain unit such as `days` |
 | `null_rule` | `never`, or a sentence saying what NULL means in this column |
+| `freshness` | on the column with role `time` only: `{"max_lag": "<n><unit>", "basis": "business" \| "capture"}`, how far the column's newest value may trail the warehouse's clock ([below](#freshness-how-old-the-newest-row-may-be)). `max_lag` is a whole number and one of `s`, `m`, `h`, `d`, `w` (`30m`, `6h`, `2d`), written back in its largest unit (`360m` is `6h`); `basis` is `business` where the column is the event's own time and `capture` where it is when the row was loaded |
 | `references` | `<model>.<column>`, a model, seed or snapshot the project has, or one an installed package has (a package's staging model, say) where the project defines none of that name |
 | `population.parent` | `{"model": <model, seed or snapshot, the project's or an installed package's>, "key": {<output column>: <parent column>, ...}}`: the entity the model holds one row per. Use it when every parent should be in the model (a parent with no children included), so verification counts the parents missing from it, and the plan warns when the SQL is driven from a relation unrelated to it (`check: population_parent`). A population that only has a `rule` is `prose` under `population_contract`: nothing can run it |
 | `evidence` | `request` (what the request settles), `contract` (what the project's declared columns, tests or metric filters settle), `precedent` (how sibling models decide the same thing), `data` (what profiling showed about the data, never the intended population or NULL policy), `default` (the conventional analytics-engineering choice, including a reasonable choice where wording leaves the question open). Name `request` or `contract` only when that source settles the choice: "per account" alone does not say whether accounts without events belong, so that choice is a `default` |
 
-| `assumptions[].column` | optional: the output or source column the decision governs. `data.identifier_conversions` reads it: a conversion that drops, merges or respells identifiers of a column an assumption names is `declared` rather than `undeclared` (#861). Use it when a repair excludes identifiers of a second scheme or merges `7` and `007` on purpose, with the evidence that settles it. Join coverage reads it too: on an INNER join used as a filter, an assumption naming the driving key column (or a `population.filters` entry on it) says the unmatched rows are meant to be dropped, so the join is `satisfied` rather than `join_orphans` (#1162) |
+| `assumptions[].column` | optional: the output or source column the decision governs. `data.identifier_conversions` reads it: a conversion that drops, merges or respells identifiers of a column an assumption names is `declared` rather than `undeclared` (#861). Use it when a repair excludes identifiers of a second scheme or merges `7` and `007` on purpose, with the evidence that settles it. Join coverage reads it too: on an INNER join used as a filter, an assumption naming the driving key column (or a `population.filters` entry on it) says the unmatched rows are meant to be dropped, so the join is `satisfied` rather than `join_orphans` (#1162), unless the key declares a `references` to the joined relation, which requires every non-null key to match whatever an assumption says (#1459) |
 
 A field Dex does not know is refused by name, so a typo cannot silently drop
 part of a declaration.
@@ -72,9 +73,10 @@ the models that read it.
 | `description` (model or column) | dbt's own `description` |
 | a single-column `grain` | `unique` and `not_null` tests on that column |
 | `null_rule: never` | `not_null` on that column |
-| `foreign_key` with `references` | a `relationships` test (`arguments: {to, field}`) |
+| `references`, whatever the `role` | a `relationships` test (`arguments: {to, field}`): every non-null value exists in the parent, and `maintain verify` holds a join the model makes into that parent to the same claim, on a LEFT join too (#1459) |
+| a fact a generated test checks, where `declarations.render_tests` turns it on | that generated test, tagged with its cadence ([below](#generated-tests-an-opt-in-switch-and-a-cadence-tag)) |
 | `grain`, `population`, `assumptions` | model `config.meta.dex` |
-| `role`, `null_rule`, `aggregation`, `additivity`, `unit`, `references` | column `config.meta.dex` |
+| `role`, `null_rule`, `aggregation`, `additivity`, `unit`, `references`, `freshness` | column `config.meta.dex` |
 
 A PII stamp is not a declaration field and never needs one: on a model the plan
 creates, every column that carries a flagged input through gets
@@ -100,6 +102,635 @@ already uses, so it gains no flag. Declaring again merges: a key the new declara
 one, and a key it leaves out is kept. `population` merges one level further, so
 adding a `parent` keeps the `rule` and `filters` declared earlier. Every byte outside the keys above, comments
 included, stays where it was.
+
+### The claim each test checks
+
+Each test a declaration renders names the declared fact it checks, the
+**claim**, at `config.meta.dex.claim`, beside the Elementary flag:
+
+```yaml
+- unique:
+    config:
+      meta:
+        disable_test_samples: true
+        dex:
+          claim: 20bd854de99db020
+```
+
+A test's name and dbt's `unique_id` are built from the model, the column, the
+test and its arguments, so they change when any of those do. The claim id does
+not. Use it to name the fact a test checks across runs: one incident while a
+test keeps failing, and the last run in which a claim was checked and passed.
+
+| Declared | Claim | Test |
+|---|---|---|
+| a single-column `grain` | `grain`, the column, `check: unique` | `unique` |
+| a single-column `grain` | `grain`, the column, `check: not_null` | `not_null` |
+| `null_rule: never` | `null_rule`, the column | `not_null` |
+| `references` | `references`, the column, the parent it names | `relationships` |
+
+- **How the id is made.** It is the first 16 hex characters of a SHA-256 over
+  the claim: the model's label (`dim_teams.v2` for a version), the declared
+  field, its columns and its parameters, with names folded to lower case. It is
+  never made from the test's name. Two facts on one column get two ids,
+  including the two tests of one grain, since either can fail alone. A grain
+  column also declared `null_rule: never` has one `not_null`. It carries the
+  claim of the fact rendered first: the null rule's when both are declared
+  together, and the grain's when the null rule is declared after it.
+- **After the first render, the file holds the id.** A test the column already
+  lists by name is left as written. Renaming the test (`name:`), declaring the
+  same fact again or editing the rest of the declaration leaves its claim alone,
+  and a plan shows no diff on it. Read the id from the file, not by recomputing
+  it. A model renamed with `transform rename` keeps its tests' ids, since the
+  rename does not touch them. A new model that later takes the old name and
+  declares the same facts derives the same ids, so a history kept across a
+  rename should key on the claim and the tested node, not the claim alone. A fact that changes (a `references` to another
+  parent) gets no new id, because the test already listed under that name is
+  kept as written.
+- **Tests Dex rendered before claims.** A test that is exactly what Dex
+  rendered earlier (the flag, the same arguments, nothing else) gets its claim
+  the next time the declaration renders, and that one key is the only change. A
+  bare `not_null` or `unique` could have been written by a person, so it stays
+  bare (#1350), as does a test with any other config or a claim already, a test
+  whose YAML is an anchor another test aliases, and a version's inherited test,
+  which only a declaration of the shared entry claims.
+- **Tests that check no declared fact carry no claim.** The scaffold's tests
+  and the `not_null` or `unique` that `maintain reconcile` adds are not
+  declarations. `maintain reconcile` still treats a claimed `not_null` as Dex's
+  own, and removes it when the column starts accepting NULLs.
+- Neither dbt nor Elementary reads a `dex` key in a test's `meta`. Elementary
+  copies a test's `meta` into its `dbt_tests` table, so the claim is also there.
+
+### Generated tests: an opt-in switch and a cadence tag
+
+The three tests above are the **built-ins**. They always render. A **generated
+test** is one Dex writes for a declared fact the built-ins cannot check: a
+composite grain, a population filter, a parent's population, a fraction's
+range, an INNER join's coverage, a referenced key's uniqueness, a history's
+measures, a time column's freshness. Each kind arrives with its own issue (#1452
+onward); this release renders eight,
+[`dex_unique_combination`](#dex_unique_combination-a-composite-grain),
+[`dex_population_filter`](#dex_population_filter-a-population-filter),
+[`dex_parent_population`](#dex_parent_population-a-parents-population),
+[`dex_unit_range`](#dex_unit_range-a-fraction),
+[`dex_join_coverage`](#dex_join_coverage-a-join-a-references-requires),
+[`dex_referenced_key`](#dex_referenced_key-a-key-a-references-names),
+[`dex_temporal_contract`](#dex_temporal_contract-a-historys-measures) and
+[`dex_freshness`](#dex_freshness-a-time-columns-freshness). The switch
+and the tag below are what every kind follows. Generated tests run in the
+project's production runs. Dex does not run those and the project pays for them,
+so two rules hold:
+
+- **They are opt-in.** `declarations.render_tests` in `.dex/config.yml` turns
+  them on. It is off by default.
+
+  | Setting | Renders |
+  |---|---|
+  | `false` (default) | the built-ins only |
+  | `true` | every generated test this release renders, kinds a later release adds included |
+  | `[dex_every_run]` | the generated tests of that cadence, to start with the cheap ones |
+  | `[dex_unique_combination, ...]` | the kinds it names, and no kind a later release adds |
+
+  A list can mix test names and cadences. A name this release does not render
+  turns nothing on: `dex config validate` reports it as `unknown_test_kind`, and
+  the file still loads, so a config written for a later release works on an
+  earlier one. `dex config set declarations.render_tests '[dex_every_run]'`
+  shows the diff and writes it on `--confirm`. Turning tests on is the
+  project's decision, not the agent's.
+- **Each carries a cadence tag**, written as a dbt tag beside the sampling flag
+  and the claim:
+
+  ```yaml
+  data_tests:
+    - dex_unique_combination:
+        arguments:
+          columns: [order_id, line_number]
+        config:
+          tags: [dex_every_run]
+          meta:
+            disable_test_samples: true
+            dex:
+              claim: c52a973cba4cda23
+  ```
+
+  `dex_every_run` marks a test cheap enough for every production run, and
+  `dex_scheduled` one that scans whole tables (an anti-join, a gap search). The
+  tag is fixed per kind, never chosen per project. An orchestrator runs them
+  apart: `dbt build --exclude tag:dex_scheduled` on every run, and
+  `dbt build --select tag:dex_scheduled` on its own schedule. The built-ins
+  carry no cadence tag, so they run with every build.
+
+A generated test checks the declaration as the entry states it once the plan's
+declaration is merged in, not only the facts the payload restates. Declaring a
+description alone renders the generated tests for a grain declared earlier, and
+on a project that turns the switch on after declaring its models,
+`transform declare` proposes the tests their declared facts imply (under the
+proposal's `fields.generated_tests`), with no fact restated.
+
+A generated test sits on the model entry (`data_tests:` beside `columns:`, or
+in the version's own item for a version label) or under the column it checks.
+Its claim tells two tests of one kind apart, so a model with two population
+filters gets two tests. A generated test already listed is left as written. It
+is matched by its claim, so a `name:` added by hand does not make Dex render it
+again, or by the same test with the same arguments, which dbt would build into
+the same node. A changed parameter is a new claim and renders a second test
+beside the first: remove the old one in review.
+
+Turning the switch off, or leaving a kind out of the list, renders no new
+generated test and **removes none**: a test in the YAML is the file's (#1350).
+Remove one by deleting it from the YAML.
+
+**`data.generated_tests`** on the plan (and on `transform declare`) lists every
+generated test the plan's declarations give, rendered or not:
+
+| Field | Meaning |
+|---|---|
+| `render_tests` | the setting as the plan read it |
+| `counts` | how many tests have each status |
+| `tests[]` | per test: `model`, `column` (`null` on the model entry), `test`, `cadence`, `claim`, `variant` where a kind renders several tests on one model (`includes` or `excludes` for a population filter, `missing` or `unexpected` for a parent), `status` |
+
+`status` is `added` (rendered by this plan), `already_listed` (already in the
+YAML, so nothing changed), `not_rendered` (with `reason`: `render_tests_off`,
+`kind_not_enabled` where a list leaves its kind out, `dialect_unsupported`
+where the kind is on but not proved on the configured connector, or
+`column_not_output` for a test reading a column the model's SQL provably does
+not output: the column it sits under, or a model-level test's grain or parent
+key), or
+`listed_while_off` (in the YAML although the setting leaves its kind off; it
+stays). The key is absent when the declarations give no generated test.
+
+Each generated test states the connectors it supports: every connector
+`maintain verify` runs the matching check on. On any other connector it renders
+nothing, rather than a test whose answer nothing has held to `maintain verify`'s,
+and the plan says `dialect_unsupported`; `maintain verify` still checks the fact
+there.
+
+#### `dex_unique_combination`: a composite grain
+
+A declared `grain` of two or more columns (`grain: [order_id, line_number]`)
+renders `dex_unique_combination` on the model entry, tagged `dex_every_run`, on
+every connector. (A one-column grain renders dbt's `unique` and `not_null`
+instead.) It fails when two rows share the grain, and it agrees with
+`maintain verify`'s `grain_broken`:
+
+- **The same count.** dbt's `failures` is the number of rows beyond the first
+  of each grain value, which is `grain_broken`'s `duplicate_count`.
+- **NULL is a value.** Two rows `(1, NULL)` share the grain on both sides, as
+  `SELECT DISTINCT` and `GROUP BY` treat them.
+- **Counts only.** The test returns one row holding that count, never a key
+  value, so Elementary's sampling of failing rows has no key to keep even
+  where the per-test flag is ignored.
+
+The test needs its generic test macro in the project. The plan that first
+renders it adds `macros/dex_unique_combination.sql` (the
+[shipped macro](macros.md#dex_unique_combination)) as a `macro_sql` diff where
+neither the project nor the plan defines `{% test dex_unique_combination(`. A
+copy the project already has is left alone; `transform macro
+dex_unique_combination` diffs it against the shipped one.
+
+#### `dex_population_filter`: a population filter
+
+Each list a `population.filters` entry declares renders `dex_population_filter`
+under that filter's column, tagged `dex_every_run`, on every connector:
+
+```yaml
+columns:
+  - name: status
+    data_tests:
+      - dex_population_filter:
+          arguments:
+            excludes: [cancelled]
+          config:
+            tags: [dex_every_run]
+            meta:
+              disable_test_samples: true
+              dex:
+                claim: 6f0c2d1e9a4b7c35
+```
+
+One test per list: a filter stating both `includes` and `excludes` renders two,
+each its own claim, and so does a second filter. The values go into the claim
+as written, so `Paid` and `paid` are two claims. It fails when a row breaks the
+filter, and it agrees with `maintain verify`'s `population_contradicted`:
+
+- **`excludes`**: a row whose column holds an excluded value breaks it. A NULL
+  holds no value, so it never breaks an `excludes` list.
+- **`includes`**: a row whose column holds a value outside the list breaks it,
+  and a NULL counts as outside. The finding states those NULLs apart, as
+  `null_rows`, inside `contradicting_rows`.
+- **The same count.** dbt's `failures` is the number of rows that break the
+  filter, the finding's `contradicting_rows`.
+- **The same comparison.** Where any listed value is text, or the column is a
+  text column, both sides compare as text: the column cast to the warehouse's
+  string type and booleans written `true` and `false`. Otherwise the values are
+  compared as written. Only where every value is a number or a boolean does the
+  test read the column's type, from the relation's metadata; where that finds
+  nothing (an ephemeral model, a `transform test --mutate` mutant), it compares
+  as written.
+- **Counts only.** The test returns the count, never a value from the column.
+
+A filter on a column the model's SQL provably does not output (a rollup that
+groups the column away, whose filter `maintain verify` reports unchecked)
+renders no test and no column entry, and the plan lists it `not_rendered` with
+`reason: column_not_output`. Where Dex cannot tell (a `select *`, Jinja in the
+select list, a set operation), it renders the test.
+
+Its macro reaches the project as `dex_unique_combination`'s does:
+`macros/dex_population_filter.sql` (the
+[shipped macro](macros.md#dex_population_filter)) as a `macro_sql` diff where
+neither the project nor the plan defines the test.
+
+#### `dex_parent_population`: a parent's population
+
+A declared `population.parent` (`{model: dim_customers, key: {customer_id:
+customer_id}}`) makes two claims, and each renders as its own
+`dex_parent_population` test on the model entry, told apart by `direction`,
+tagged `dex_scheduled`, on every connector:
+
+```yaml
+data_tests:
+  - dex_parent_population:
+      arguments:
+        parent: ref('dim_customers')
+        key: {customer_id: customer_id}
+        direction: missing
+        filters:
+          - column: status
+            excludes: [churned]
+      config:
+        tags: [dex_scheduled]
+        meta:
+          disable_test_samples: true
+          dex:
+            claim: 9e42f60ca3504a9b
+  - dex_parent_population:
+      arguments:
+        parent: ref('dim_customers')
+        key: {customer_id: customer_id}
+        direction: unexpected
+      config:
+        tags: [dex_scheduled]
+        meta:
+          disable_test_samples: true
+          dex:
+            claim: 5791377c25b05705
+```
+
+Two tests rather than one with a summed count, so each `failures` is the count
+of one `maintain verify` finding, a repair of one direction is not hidden by
+the other, and Elementary keeps each direction's history apart. One entry in
+`render_tests` (`dex_parent_population`, or `dex_scheduled`) turns both on. Both
+are anti-joins over the model and the parent whole, hence the scheduled
+cadence. They agree with `maintain verify`:
+
+- **`missing`**: an eligible parent key with no row in the model. dbt's
+  `failures` is `parent_population_missing`'s `missing_parents`.
+- **`unexpected`**: a key in the model the parent does not have. dbt's
+  `failures` is `parent_population_unexpected`'s `unexpected_keys`.
+- **Distinct keys.** Both count keys, not rows: a key the model holds twice is
+  one key. A key with a NULL component is no key on either side.
+- **The eligible parents.** The declaration's `population.filters` scope which
+  parent keys are owed, as `maintain verify` scopes them: each filter applies
+  to the parent where the parent has its column, with the comparison
+  `dex_population_filter` makes (an `excludes` list keeps a parent whose column
+  is NULL, an `includes` list does not). The `unexpected` direction reads every
+  parent key, since a key the whole parent lacks is unexpected whatever a filter
+  says, so the filters ride on the `missing` test only.
+- **A filter the parent cannot evaluate is skipped.** Where the parent has no
+  column of the filter's name (read from the parent's metadata when the test
+  runs), the filter does not apply, as in `maintain verify`. There the finding
+  drops to `medium` and says some missing parents may be exclusions the count
+  cannot see; the test has no severity to lower, so it fails with the same
+  count. Declare the filter on a column the parent carries, or bring the column
+  into the parent. Where the metadata read finds nothing (an ephemeral parent),
+  every filter applies.
+- **Counts only.** Each test returns its count, never a key.
+
+The parent is written as a `ref()` (`ref('dim_customers', v=2)` for a version
+label), so dbt orders the test after the parent and resolves a seed, a snapshot
+or an installed package's model as it resolves any ref. A key column the
+model's SQL provably does not output renders neither test (`column_not_output`);
+a plan writing such a model is already refused for the key. Its macro reaches
+the project as the others' do: `macros/dex_parent_population.sql` (the
+[shipped macro](macros.md#dex_parent_population)) as a `macro_sql` diff where
+neither the project nor the plan defines the test. A parent drafted by Dex
+(`drafted.population_parent`) is never written, so it renders no test.
+
+#### `dex_unit_range`: a fraction
+
+A column declared `unit: fraction` renders `dex_unit_range` under it, tagged
+`dex_every_run`, with no arguments: the range is the unit's own.
+
+```yaml
+columns:
+  - name: discount_rate
+    data_tests:
+      - dex_unit_range:
+          config:
+            tags: [dex_every_run]
+            meta:
+              disable_test_samples: true
+              dex: {claim: <id>}
+```
+
+It fails with the count of rows whose value sits below 0 or above 1, the
+`out_of_range_rows` that `maintain verify`'s `unit_out_of_range` states, and it
+agrees with that finding on every connector:
+
+- **A NULL is no value.** It never counts, and a column holding only NULLs
+  passes, where `maintain verify` notes it as not checked.
+- **A column that is not a number is checked by neither.** Text, a boolean, a
+  date, a UUID, JSON: `maintain verify` names it in a note, and the test, reading
+  the column's type from the relation's metadata, compiles to a count of
+  nothing. Where that read finds nothing (an ephemeral model), the column is
+  compared as it is.
+- **Counts only.** The test returns the count, never a value.
+
+**A percent renders no test.** A column declared `unit: percent` is listed
+under `data.generated_tests` as `not_rendered` with `reason: heuristic_only`.
+`maintain verify` flags a percent whose every value sits within 0 to 1, which is
+what a fraction stored as a percent looks like, and also what a column of
+genuinely small percentages looks like: the finding is a question, and a test
+that failed a production run on it would fail correct data. Run
+`maintain verify` (or `transform build --verify`) to ask it.
+
+A column the model's SQL provably does not output renders no test
+(`column_not_output`). Its macro reaches the project as the others' do:
+`macros/dex_unit_range.sql` (the [shipped macro](macros.md#dex_unit_range)) as
+a `macro_sql` diff where neither the project nor the plan defines the test; a
+plan declaring only percent columns writes none.
+
+#### `dex_join_coverage`: a join a `references` requires
+
+A column that carries a model's join key and declares a `references` naming the
+joined model makes that join required: every eligible row of the join's driving
+input must find a parent row. `maintain verify` holds the join to that claim at
+threshold zero (`join_orphans`, `join_zero_overlap`, `join_no_match`,
+`threshold_source: contract`). Where the join is an INNER join, or a LEFT
+join to a parent the model filters first, the model
+renders `dex_join_coverage` on its entry, tagged `dex_scheduled`, since it
+anti-joins two inputs whole:
+
+```yaml
+models:
+  - name: fct_orders
+    data_tests:
+      - dex_join_coverage:
+          arguments:
+            child: ref('stg_orders')
+            child_columns: [customer_id]
+            parent: ref('dim_customers')
+            parent_columns: [customer_id]
+            child_where: status <> 'cancelled'
+          config:
+            tags: [dex_scheduled]
+            meta:
+              disable_test_samples: true
+              dex: {claim: <id>}
+```
+
+**It reads the join's inputs, not the model's output.** An INNER join drops the
+rows it cannot match, so the model never holds an orphan and the
+`relationships` test on its output always passes. The plan reads the join from
+the model's SQL as it leaves it, with the same readers `maintain verify` uses on
+the compiled SQL (each `ref()` and `source()` stands for its relation), and
+writes the two inputs into the test: `child` and `child_columns`, the relation
+the key is read from and its key columns in order, `parent` and
+`parent_columns`, the joined relation and its key, and `child_where` and
+`parent_where`, the row filters the model applies to each side before joining
+it (a staging CTE's `WHERE`), written in the connector's dialect. A filter is
+part of the input: a row the model never joins is counted by neither side.
+
+It fails with the eligible driving rows that find no parent row, the
+`unmatched_rows` `maintain verify` states, and agrees with that finding on every
+connector:
+
+- **A NULL key is a missing reference.** A row with a NULL key component is
+  left out, as `relationships` and `maintain verify` leave it. Where the key
+  column is also declared `null_rule: never`, `maintain verify` counts those rows
+  as unmatched, and so does the test (`null_keys: unmatched`).
+- **A duplicated parent key multiplies nothing.** The parent's keys are read
+  `DISTINCT`, so each driving row counts once.
+- **Counts only.** The test returns the count, never a key.
+
+**What renders nothing**, listed under `data.generated_tests` as
+`not_rendered` with the reason, while `maintain verify` still judges the join:
+
+| Reason | When |
+|---|---|
+| `covered_by_builtin` | The required join is a LEFT join to the whole parent. It keeps every unmatched row, so the `relationships` test the `references` renders counts the same rows on the output, and a second, scheduled scan would only cost. A LEFT join to a parent the model filters first (a CTE's `WHERE`) renders the test: `relationships` reads the whole parent, so a child whose only parent row the filter drops passes it. |
+| `join_shape_unsupported` | A key compared through a conversion (`cast`, `try_cast`), a side read through a `GROUP BY`, a RIGHT or FULL join, a side that reads neither a `ref()` nor a `source()`, or a filter that does not carry into the dialect. |
+| `join_unread` | The plan could not read the model's joins: its SQL holds Jinja other than `ref()`, `source()` and `config()` (a macro, a loop, a conditional, a versioned `ref(..., v=2)`), or does not parse. Listed once per declared `references`. |
+
+**The test describes the join as the SQL wrote it.** Its claim is the join's
+two inputs, keys and filters, so a plan that changes the join renders a new
+test with a new claim. The old one is never removed (nothing generated is), and
+the plan lists it under `data.generated_tests` as `stale` with
+`reason: join_not_in_model` and a warning: remove it from the YAML in the same
+review.
+
+Its macro reaches the project as the others' do: `macros/dex_join_coverage.sql`
+(the [shipped macro](macros.md#dex_join_coverage)) as a `macro_sql` diff where
+neither the project nor the plan defines the test; a plan whose required joins
+are all LEFT joins to whole parents writes none.
+
+#### `dex_referenced_key`: a key a `references` names
+
+A column declared `references: dim_customers.customer_id` assumes
+`customer_id` is unique in `dim_customers`: a join to a key that repeats
+multiplies the rows of the model that joins it. The claim is about the
+**parent**, so the test renders into the parent's YAML entry, under the column,
+tagged `dex_every_run`:
+
+```yaml
+models:
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        data_tests:
+          - dex_referenced_key:
+              config:
+                tags: [dex_every_run]
+                meta:
+                  disable_test_samples: true
+                  dex: {claim: <id>}
+```
+
+- **Which references.** Every `references` in the project as the plan leaves it
+  whose child or parent the plan declares. Declaring the child renders it, and
+  `transform declare dim_customers` renders it for references declared before
+  the switch was on. One test per parent column, however many children name it;
+  its row under `data.generated_tests` names the parent as `model` and the
+  children under `referenced_by`.
+- **What it counts.** The rows repeating a non-NULL key, beyond the first of
+  each. A NULL is no key (it never matches a join), so NULLs never count, as
+  dbt's `unique` ignores them. Counts only: the test returns the count, never a
+  key.
+- **How it relates to `maintain verify`.** Verify does not check the parent's
+  key; it reports the consequence on the child, `row_fanout`. A repeated key
+  fans out a child that joins it, but a fan-out has other causes, so the two
+  agree in that direction only, and no count is compared.
+- **A failure stops the children in `dbt build`.** dbt skips every model
+  downstream of a failed test, as it does for a grain's `unique`; that is the
+  point of checking the key before the join runs.
+
+**What renders nothing**, listed under `data.generated_tests` as
+`not_rendered` with the reason:
+
+| Reason | When |
+|---|---|
+| `covered_by_builtin` | The parent declares that one column as its `grain` (which renders `unique`), or the column already lists an enabled `unique` with no `where`. A composite grain holding the column, or a `unique` filtered by `where` (dbt applies it first), does not cover it. |
+| `parent_undeclared` | The parent has no YAML entry under `models:` (a model nobody documented, a seed, a snapshot). Dex does not create an entry to hold a test: declare the parent, or write its entry, and plan again. |
+| `parent_in_package` | The parent is an installed package's model, or a project override of one its package documents. Dex never edits a package's YAML. |
+| `column_not_output` | The parent's SQL provably no longer outputs the column (a `references` a later edit left behind). |
+
+A version label (`dim_teams.v2.team_id`) renders into that version's item; a
+bare versioned name (`dim_teams.team_id`) is the version an unversioned `ref()`
+reads, its `latest_version`, and renders into that item alone, never on the
+shared entry every version would inherit. A test
+whose `references` later goes away is never removed (nothing generated is).
+
+Its macro reaches the project as the others' do: `macros/dex_referenced_key.sql`
+(the [shipped macro](macros.md#dex_referenced_key)) as a `macro_sql` diff where
+neither the project nor the plan defines the test.
+
+#### `dex_temporal_contract`: a history's measures
+
+A declared [`history`](#temporal-contracts-history) says how the model reads its
+snapshot. Each measure it names renders its own model-level test, told apart by
+`measure`, tagged `dex_scheduled`:
+
+```yaml
+models:
+  - name: host_history
+    data_tests:
+      - dex_temporal_contract:
+          name: dex_temporal_contract_<claim>
+          arguments:
+            snapshot: ref('hosts_snapshot')
+            entity: {host_id: host_id}
+            status_column: is_superhost
+            target: true
+            measure: transition_count
+            measure_column: status_change_count
+            initial_observation: baseline
+            null_status: ignore
+            time_column: dbt_valid_from
+            provenance: capture
+          config:
+            tags: [dex_scheduled]
+            meta: {disable_test_samples: true, dex: {claim: <id>}}
+```
+
+- **What it counts.** The entities whose column disagrees with the value the
+  snapshot's versions and the declared policy give, derived as `maintain verify`
+  derives it, never from the model's SQL. Each measure's count is the
+  `mismatched_entities` of one finding: `transition_count` is
+  `temporal_transition_count_mismatch`, `latest_target_transition_at`
+  `temporal_latest_transition_mismatch`, `first_target_at`
+  `temporal_first_attainment_mismatch`. One test per measure, so each failure
+  count is one finding's and each measure keeps its own history.
+- **The same exclusions.** Entities verify excludes are excluded here by the same
+  rules: versions sharing one validity time (`ambiguous_version_order`), and under
+  a `business` time a status change whose timestamp runs backwards
+  (`business_order_conflict`); the time measures also skip an entity whose
+  business timestamp is NULL or stands still at a change. A model key that
+  repeats is compared once per row, as verify compares it.
+- **Counts only.** The test returns the count, never a key or a value.
+- **Why `dex_scheduled`.** It scans the whole snapshot twice (a window over each
+  entity's versions, and its distinct entities) and the whole model, once per
+  measure: three measures are three such scans per scheduled run.
+- **The `population` and `time_provenance` assertions** render no test. The
+  population is the parent-population question in another shape, and provenance
+  is a fact about the snapshot's config; both stay with `maintain verify`.
+- A snapshot that renames its validity column (`snapshot_meta_column_names`)
+  passes the new name as `order_column`.
+- **Named by its claim.** Each test carries `name: dex_temporal_contract_<claim>`
+  rather than the name dbt builds from its arguments, which would put the status
+  target in the node name and give two claims whose arguments read alike (a
+  target of `1` and of `"1"`) one name, which dbt refuses.
+- **Names resolved as verify resolves them.** Each column the test reads is
+  matched against the relation's columns, case folded, and its physical spelling
+  quoted, so a declaration spelled `Status` reads a column created as `"Status"`.
+
+**What renders nothing**, listed under `data.generated_tests` as `not_rendered`
+with the reason, which is `maintain verify`'s reason for leaving the same measure
+unchecked (checked in this order):
+
+| Reason | When |
+|---|---|
+| `snapshot_not_ancestor` | The model's `ref()` lineage, as the plan leaves the project, does not reach the declared snapshot. |
+| `lineage_unavailable` | Something on the way could hide it: a `ref()` dex cannot resolve, a macro call that may read a relation, a node the `ref()` graph cannot read. |
+| `hard_delete_records` | The snapshot's `hard_deletes` is `new_record`, read from its `config()`, its YAML entry or `dbt_project.yml`. |
+| `snapshot_config_unread` | The plan's own reason: the snapshot's `hard_deletes` or `snapshot_meta_column_names` is an expression (a `var()`, Jinja) no static read settles. |
+| `policy_missing` | The declaration leaves out a policy the measure depends on: `initial_observation` and `null_status` for `transition_count`, those and `time.provenance` for `latest_target_transition_at`, `time.provenance` for `first_target_at`. |
+| `column_not_output` | The model's SQL provably does not output the entity key or the measure column. |
+
+What only a run can tell never reads as a pass: a snapshot that failed to build
+makes `dbt build` **skip** the test (look at the snapshot, not the test), and a
+column the history names that a relation lacks makes the test run and **error**. A test the plan rendered is never
+removed (nothing generated is). Where the history changes (a policy, the snapshot,
+a measure or its column, or the history removed), each listed test the new
+history no longer gives is reported `stale` (`reason: history_changed`, its
+measure as `variant`) with a warning, beside the test the new claim renders:
+remove it from the YAML. Where only verify's reading changes (the model stops
+reading the snapshot), a listed test is `listed_while_off`, and `maintain verify`
+reports the contract unchecked while the test keeps running, so remove it by
+hand.
+
+Its macro reaches the project as the others' do: `macros/dex_temporal_contract.sql`
+(the [shipped macro](macros.md#dex_temporal_contract)) as a `macro_sql` diff where
+neither the project nor the plan defines the test.
+
+#### `dex_freshness`: a time column's freshness
+
+A column declaring [`freshness`](#freshness-how-old-the-newest-row-may-be)
+renders `dex_freshness` under it, tagged `dex_every_run`, with the lag in
+seconds as its one argument:
+
+```yaml
+columns:
+  - name: loaded_at
+    config:
+      meta:
+        dex:
+          role: time
+          freshness: {max_lag: 6h, basis: capture}
+    data_tests:
+      - dex_freshness:
+          arguments: {max_lag_seconds: 21600}
+          config:
+            tags: [dex_every_run]
+            meta: {disable_test_samples: true, dex: {claim: <id>}}
+```
+
+It fails with one row when the column's newest value trails the warehouse's
+clock by more than `max_lag`, and when the column holds no value at all, and it
+agrees with `maintain verify`'s `freshness_exceeded` on every connector:
+
+- **The warehouse's clock**, read in the same statement as the newest value,
+  never the clock of the machine running dbt.
+- **The limit is inclusive.** Each side is whole epoch seconds, floored, so a
+  value exactly `max_lag` behind the clock passes.
+- **No rows is not fresh.** An empty model, or a column NULL on every row, fails.
+- **A column that is no date or timestamp errors** rather than passing: no lag
+  can be read from text.
+- **Counts only.** The test counts the rows within the limit and never computes
+  the newest value or the lag, which would disclose it, so a stored failing row
+  (`store_failures`) keeps nothing from the column. The failing row holds `1`
+  and the limit; dbt's `failures` is `1`.
+- **`basis` is in the claim, not the arguments.** The test fails alike on both;
+  `maintain verify` reads the basis to say how loud a stale column is.
+
+A test the plan rendered is never removed (nothing generated is). Where a
+column's `max_lag` changes, the listed test for the old lag is reported `stale`
+(`reason: freshness_changed`) with a warning, beside the test the new claim
+renders: remove it from the YAML, since it keeps failing on the old lag. A
+change of `basis` alone keeps the listed test, which behaves the same, and
+reports nothing stale. A column the model's SQL provably does not output renders no test
+(`column_not_output`). Its macro reaches the project as the others' do:
+`macros/dex_freshness.sql` (the [shipped macro](macros.md#dex_freshness)) as a
+`macro_sql` diff where neither the project nor the plan defines the test.
 
 ### A versioned model
 
@@ -500,6 +1131,10 @@ warehouse):
 | `history`, a measure disagreeing with the declared policy | `temporal_transition_count_mismatch`, `temporal_latest_transition_mismatch`, `temporal_first_attainment_mismatch`; entity counts, never values | high |
 | `history`, entities differing from its `population` | `temporal_population_missing`, `temporal_population_unexpected` | high |
 | `history.time.provenance` its column and the snapshot's strategy cannot satisfy | `temporal_provenance_contradicted` | medium |
+| `freshness` on a time column whose newest value trails the warehouse's clock by more than `max_lag`, or that holds no value | `freshness_exceeded`, with `lag_seconds` (`null` and a `reason` of `no_rows` or `all_null` where there is no newest value), `max_lag_seconds` and `basis` | high on a `capture` basis, medium on `business` |
+
+A `population.filters` entry stating both `includes` and `excludes` is judged as
+two rules, one per list, each with its own `population_contradicted`.
 
 `null_rule: never` needs no check of its own: it renders as a `not_null` test,
 which the build runs. A single-column `grain` renders as a `unique` test, so the
@@ -520,6 +1155,56 @@ maintain skill's `axes.md`, "Join contract".
 
 A model derived from a dbt snapshot's status history declares its temporal
 contract in `history`; see "Temporal contracts: `history`" below.
+
+### Freshness: how old the newest row may be
+
+A model's time column may say how fresh its data should be (#1460):
+
+```json
+"columns": {"loaded_at": {"role": "time",
+                          "freshness": {"max_lag": "6h", "basis": "capture"}}}
+```
+
+- **On the time column only.** A `freshness` on a column whose role, in the
+  declaration or already in the model's YAML, is anything but `time` is refused,
+  naming the fix. Several time columns may each declare one.
+- **`basis`** says what the column is. `capture` is when the row was loaded: a
+  stale capture time means loading stopped, and nothing excuses it (`high`).
+  `business` is the event's own time: a quiet period, late-arriving events or a
+  backfill can leave it legitimately old (`medium`, and the finding says to
+  check the load before the source). The verdict is the same on both.
+- **The clock is the warehouse's**, read in the same statement as the newest
+  value, by `maintain verify` and by the generated test alike, so the two agree
+  and neither depends on the machine running them. A timestamp with no time zone
+  is read as UTC, as dbt's source freshness reads one; a date is read as its UTC
+  midnight, so give a date column a lag of a day or more. A newest value ahead of
+  the clock passes, and its record says `ahead_of_clock`. On Redshift the clock
+  is `getdate()`, which reads the session's time zone: UTC unless a user or
+  session sets another, so keep the dbt and Dex sessions on UTC there.
+- **No rows is not fresh.** An empty model, or a column NULL on every row, is
+  `freshness_exceeded` with `reason: no_rows` or `all_null`.
+- **Why a declaration field and not dbt's `freshness`.** dbt's `freshness`
+  block covers sources only: `dbt source freshness` reads a source's
+  `loaded_at_field`, and nothing in dbt checks a model's own data. A model is
+  where a stale load shows up for the people reading it, and a declaration is
+  what `maintain verify` already holds to the built relation.
+
+Each declared freshness gets a record under `data.freshness` (`maintain verify`,
+and `data.verification.freshness` on `transform build --verify`): the column,
+`max_lag`, `max_lag_seconds`, `basis`, the `rows` and `lag_seconds` measured, and
+a `status` of `satisfied`, `contradicted` (with `finding: freshness_exceeded`) or
+`unchecked` with a `reason_code` (`not_temporal` for a column that is no date or
+timestamp, `column_missing`, `lag_unreadable` where the column holds values but
+the warehouse returns no lag for them, `probe_refused`, `scan_offered`). The lag
+is the clock minus the newest value, so on a column that looks like personal
+data the verdict stands and the lag is withheld (`lag_withheld: true`), and the
+newest value is never computed: the check counts the rows within `max_lag`, as a
+unit's range is, unless a person cleared the column in `pii_overrides`. The check is one
+statement per model, a `MAX` and a `COUNT` per declared column, priced with the
+other declared facts on a metered connector. With `declarations.render_tests` on
+it also renders [`dex_freshness`](#dex_freshness-a-time-columns-freshness).
+`maintain semantic` reports a changed `freshness` as high-severity declaration
+drift, since a looser lag silences an alert with the SQL untouched.
 
 ### Measured against a drafted parent
 
@@ -607,6 +1292,10 @@ Under the `timestamp` strategy dbt copies the source's `updated_at` into its
 validity column, so that column is source time. Under `check` it is the time the
 snapshot ran. `temporal_provenance_contradicted` reports a declaration that says
 otherwise, and a column dbt does not write declared as `capture`.
+
+With `declarations.render_tests` on, each measure also renders a
+[`dex_temporal_contract`](#dex_temporal_contract-a-historys-measures) test that
+agrees with these findings count for count.
 
 `transform plan` also warns when a model refs a snapshot and walks its versions
 (`lag`, `lead`, `row_number`, `dbt_valid_from`, `dbt_updated_at`) with no `history`

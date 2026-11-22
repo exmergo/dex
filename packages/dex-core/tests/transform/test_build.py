@@ -4716,3 +4716,211 @@ def test_a_failed_build_message_never_carries_the_value_a_cast_failed_on():
         )
     )
     assert stderr_only == ["Bad int64 value: <value withheld>"]
+
+
+def test_a_build_message_masks_a_value_that_spans_a_line_break():
+    """A value holding a line break is whole on no single line, so the message
+    is masked before it is split into lines (#1412)."""
+
+    import subprocess
+
+    from exmergo_dex_core.transform.build import _collect_messages, _failed_node
+
+    value = "zq_sentinel_7_head\nzq_sentinel_7_tail"
+    message = f"Conversion Error: Could not convert string '{value}' to INT32"
+    line = json.dumps(
+        {"info": {"name": "RunResultError", "level": "error", "msg": message}}
+    )
+    messages = _collect_messages(
+        subprocess.CompletedProcess(["dbt"], 1, stdout=line + "\n", stderr="")
+    )
+    assert "zq_sentinel_7" not in json.dumps(messages)
+    stderr_only = _collect_messages(
+        subprocess.CompletedProcess(["dbt"], 1, stdout="", stderr=message)
+    )
+    assert "zq_sentinel_7" not in json.dumps(stderr_only)
+    header = json.dumps(
+        {
+            "info": {
+                "level": "error",
+                "msg": f"Database Error in model bad (models/bad.sql)\n  {message}",
+            }
+        }
+    )
+    found = _failed_node(
+        subprocess.CompletedProcess(["dbt"], 1, stdout=header, stderr="")
+    )
+    assert found is not None
+    assert "zq_sentinel_7" not in found[1]
+
+
+def _write_elementary_artifacts(project: Path) -> None:
+    """A pricing compile's artifacts for a project with Elementary enabled: its
+    hooks declared, an anomaly test and dbt's own test selected (#1309)."""
+
+    from .test_elementary import _built
+
+    built = _built()
+    built["nodes"]["model.shop.fct"].update(
+        compiled_code="select 1", config={"materialized": "table"}
+    )
+    dex_target(project).mkdir(parents=True, exist_ok=True)
+    (dex_target(project) / "manifest.json").write_text(
+        json.dumps(built), encoding="utf-8"
+    )
+    (dex_target(project) / "run_results.json").write_text(
+        json.dumps({"results": [{"unique_id": uid} for uid in built["nodes"]]}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_a_billed_build_names_the_elementary_work_it_does_not_price(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch, confirmed
+):
+    """The ask, and a refusal over the ceiling, both say the estimate is a floor:
+    in ``cost.unpriced`` by code, and in a warning per kind of work. The
+    project's own flag is unset, so dbt keeps its own test materialization and
+    no per-test extras are owed."""
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"fct": 7_000_000_000.0},
+        confirmed=confirmed,
+        ceiling=10_000_000_000 if not confirmed else 5_000_000_000,
+    )
+    _write_elementary_artifacts(bigquery_project_dir)
+    budget = "10000000000" if not confirmed else "5000000000"
+    _rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            *(["--confirm"] if confirmed else []),
+            "--budget",
+            budget,
+        ],
+        capsys,
+    )
+    codes = ["elementary_hooks", "elementary_monitoring_tests"]
+    assert envelope["cost"]["unpriced"] == codes
+    if confirmed:
+        assert envelope["status"] == "error"
+        message = " ".join(str(e) for e in envelope["errors"])
+        assert "the estimate is a floor" in message
+        assert "elementary_hooks" in message
+        return
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["data"]["unpriced"]["work"] == codes
+    assert envelope["data"]["unpriced"]["monitoring_tests"][1] == {
+        "name": "volume",
+        "days_back": 14,
+        "days_back_source": "default",
+    }
+    notes = " ".join(envelope["data"]["notes"])
+    assert "on-run-start and on-run-end hooks run" in notes
+    assert "volume over 14 days" in notes
+    assert "test materialization" not in notes
+
+
+def test_a_billed_build_without_elementary_claims_nothing_unpriced(
+    bigquery_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+
+    _install_fake_pricing(
+        monkeypatch,
+        connector="bigquery",
+        paradigm=Paradigm.BYTES_SCANNED,
+        estimate=7_000_000_000.0,
+        per_node={"stg_events": 6_000_000_000.0, "dim_customers": 1_000_000_000.0},
+        confirmed=False,
+        ceiling=10_000_000_000,
+    )
+    _write_incremental_artifacts(bigquery_project_dir)
+    _rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--connector",
+            "bigquery",
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--budget",
+            "10000000000",
+        ],
+        capsys,
+    )
+    assert envelope["status"] == "needs_confirmation"
+    assert envelope["cost"]["unpriced"] is None
+    assert "unpriced" not in envelope["data"]
+
+
+def test_a_build_records_each_node_it_attempted(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """#1524: the next build replaces run_results.json, so each build folds its
+    statuses into Dex's node record first, for `maintain verify` to read a node
+    an earlier build attempted and a later one did not."""
+
+    from exmergo_dex_core.transform.node_record import RECORD
+
+    invocation = "55555555-5555-5555-5555-555555555555"
+    results = {
+        "metadata": {
+            "invocation_id": invocation,
+            "generated_at": "2026-11-20T10:00:00.000000Z",
+        },
+        "args": {"which": "build"},
+        "results": [
+            {
+                "unique_id": "unit_test.p.orders.week_on_week",
+                "status": "pass",
+                "message": "warehouse text that must not be kept",
+            }
+        ],
+    }
+    _fake_runner_factory(
+        monkeypatch,
+        run_results_json=(
+            dex_target(dbt_project_dir) / "run_results.json",
+            json.dumps(results),
+        ),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 0, envelope
+
+    record = json.loads(
+        (dex_target(dbt_project_dir) / RECORD).read_text(encoding="utf-8")
+    )
+    assert record["nodes"] == {
+        "unit_test.p.orders.week_on_week": {
+            "status": "pass",
+            "invocation_id": invocation,
+            "generated_at": "2026-11-20T10:00:00.000000Z",
+            "command": "build",
+        }
+    }

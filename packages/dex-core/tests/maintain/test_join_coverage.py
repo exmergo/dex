@@ -368,6 +368,218 @@ def test_a_required_relationship_is_judged_against_the_contract_not_a_default(
     assert "foreign_key referencing subscriptions" in orphans["data"]["required_by"]
 
 
+# --- #1459: a `references` is the claim, on a LEFT join and whatever the role ---
+
+
+def _join_findings(data: dict, model: str) -> list[str]:
+    return [
+        f["code"]
+        for f in data["findings"]
+        if f["identifier"] == model and f["axis"] == "join_contract"
+    ]
+
+
+_LEFT_ACTIVITY = (
+    "select a.activity_id, a.subscription_id, s.created_at "
+    f"from {W}.activity a left join {W}.subscriptions s "
+    "on a.subscription_id = s.subscription_id"
+)
+
+
+def _left_activity(repo, orphan: str | None, columns: dict) -> dict:
+    """Forty activity rows LEFT-joining subscriptions, the first keyed
+    ``orphan`` (a value no subscription has, or NULL), with ``columns``
+    declared on the model."""
+
+    _subscriptions(repo)
+    first = "NULL" if orphan is None else f"'{orphan}'"
+    repo.sql(
+        "CREATE TABLE activity (activity_id INTEGER, subscription_id VARCHAR)",
+        f"INSERT INTO activity SELECT i, CASE WHEN i = 1 THEN {first} "
+        "ELSE 'sub_oak' END FROM range(1, 41) t(i)",
+    )
+    _build(repo, "fct_activity", _LEFT_ACTIVITY)
+    _write_artifacts(
+        repo.project_dir,
+        nodes={
+            "model.maintain_test.subscriptions": _source_model("subscriptions"),
+            "model.maintain_test.fct_activity": _node(
+                "fct_activity", _LEFT_ACTIVITY, columns=columns
+            ),
+        },
+        results=[],
+    )
+    return _verify(repo, "fct_activity")
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        pytest.param({}, id="no-role"),
+        pytest.param({"role": "key"}, id="key"),
+        pytest.param({"role": "dimension"}, id="dimension"),
+    ],
+)
+def test_a_references_with_no_foreign_key_role_requires_the_left_join(
+    maintain_repo, _assume_the_project_compiles, declared: dict
+):
+    """The issue: a `references` renders a `relationships` test whatever the
+    column's role, and that test fails on one non-null orphan. `maintain
+    verify` now reads the same claim: the LEFT join is required, and the one
+    orphan in forty contradicts it at the contract threshold, naming the
+    declaration it rests on."""
+
+    data = _left_activity(
+        maintain_repo,
+        "unknown",
+        {
+            "subscription_id": {
+                **declared,
+                "references": "subscriptions.subscription_id",
+            }
+        },
+    )
+    orphans = _codes(data, "fct_activity")["join_orphans"]
+    assert orphans["severity"] == "high"
+    assert orphans["data"]["threshold_source"] == "contract"
+    assert orphans["data"]["threshold"] == 0
+    assert orphans["data"]["unmatched_rows"] == 1
+    assert orphans["data"]["required_by"] == (
+        "subscription_id declares references subscriptions.subscription_id"
+    )
+    (record,) = _records(data, "fct_activity")
+    assert record["status"] == "contradicted"
+    assert record["declared"]["required"] is True
+    assert "optional_unmatched" not in record
+
+
+def test_a_missing_reference_written_as_null_satisfies_the_left_join(
+    maintain_repo, _assume_the_project_compiles
+):
+    """The same model with the orphan's key written as NULL: a NULL is a
+    missing reference, which `relationships` skips and the coverage probe
+    counts apart, so the required join is satisfied."""
+
+    data = _left_activity(
+        maintain_repo,
+        None,
+        {"subscription_id": {"references": "subscriptions.subscription_id"}},
+    )
+    assert not _join_findings(data, "fct_activity")
+    (record,) = _records(data, "fct_activity")
+    assert record["status"] == "satisfied"
+    assert record["declared"]["required"] is True
+    assert record["measured"]["null_key_rows"] == 1
+    assert record["measured"]["eligible_rows"] == 39
+    assert record["measured"]["unmatched_rows"] == 0
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [
+        pytest.param({}, id="nothing-declared"),
+        pytest.param({"subscription_id": {"role": "foreign_key"}}, id="no-references"),
+        pytest.param({"subscription_id": {"role": "dimension"}}, id="dimension"),
+    ],
+)
+def test_a_left_join_whose_key_declares_no_references_is_unchanged(
+    maintain_repo, _assume_the_project_compiles, columns: dict
+):
+    """With no `references` on the key, the LEFT join keeps today's reading:
+    its unmatched rows are the optional relationship it writes."""
+
+    data = _left_activity(maintain_repo, "unknown", columns)
+    assert not _join_findings(data, "fct_activity")
+    (record,) = _records(data, "fct_activity")
+    assert record["status"] == "satisfied"
+    assert record["declared"]["required"] is False
+    assert record["optional_unmatched"] is True
+    assert record["threshold_source"] == "default"
+
+
+def test_a_references_to_another_relation_does_not_require_this_join(
+    maintain_repo, _assume_the_project_compiles
+):
+    """A `references` names one parent: a join into another relation is not
+    the one it holds to the parent, so it keeps the LEFT join's reading."""
+
+    data = _left_activity(
+        maintain_repo,
+        "unknown",
+        {"subscription_id": {"references": "dim_subscriptions.subscription_id"}},
+    )
+    (record,) = _records(data, "fct_activity")
+    assert record["declared"]["required"] is False
+    assert record["status"] == "satisfied"
+
+
+def _versioned(version: int, latest: int | None = 2) -> dict:
+    node = {
+        "name": "subscriptions",
+        "resource_type": "model",
+        "version": version,
+        "relation_name": f'{W}."subscriptions_v{version}"',
+        "compiled_code": f'select * from {W}."raw_subscriptions"',
+    }
+    if latest is not None:
+        node["latest_version"] = latest
+    return node
+
+
+@pytest.mark.parametrize(
+    ("joined", "reference", "latest", "required"),
+    [
+        pytest.param(1, "subscriptions.v1.subscription_id", 2, True, id="label"),
+        pytest.param(2, "subscriptions.v1.subscription_id", 2, False, id="other"),
+        pytest.param(2, "subscriptions.subscription_id", 2, True, id="bare-latest"),
+        pytest.param(1, "subscriptions.subscription_id", 2, False, id="bare-old"),
+        pytest.param(1, "subscriptions.subscription_id", 1, True, id="latest-1"),
+        pytest.param(2, "subscriptions.subscription_id", None, True, id="no-latest"),
+    ],
+)
+def test_a_versioned_reference_names_the_version_ref_resolves_to(
+    maintain_repo, _assume_the_project_compiles, joined, reference, latest, required
+):
+    """`subscriptions.v1.subscription_id` renders `ref('subscriptions', v=1)`,
+    and a bare `subscriptions.subscription_id` the version an unversioned
+    `ref()` resolves to (its `latest_version`, else the highest): the join is
+    required only where it reads that version's relation."""
+
+    for v in (1, 2):
+        maintain_repo.sql(
+            f"CREATE TABLE subscriptions_v{v} (subscription_id VARCHAR)",
+            f"INSERT INTO subscriptions_v{v} VALUES ('sub_elm'), ('sub_oak')",
+        )
+    maintain_repo.sql(
+        "CREATE TABLE activity (activity_id INTEGER, subscription_id VARCHAR)",
+        "INSERT INTO activity SELECT i, CASE WHEN i = 1 THEN 'unknown' "
+        "ELSE 'sub_oak' END FROM range(1, 41) t(i)",
+    )
+    sql = (
+        "select a.activity_id, a.subscription_id "
+        f"from {W}.activity a left join {W}.subscriptions_v{joined} s "
+        "on a.subscription_id = s.subscription_id"
+    )
+    _build(maintain_repo, "fct_activity", sql)
+    _write_artifacts(
+        maintain_repo.project_dir,
+        nodes={
+            "model.maintain_test.subscriptions.v1": _versioned(1, latest),
+            "model.maintain_test.subscriptions.v2": _versioned(2, latest),
+            "model.maintain_test.fct_activity": _node(
+                "fct_activity",
+                sql,
+                columns={"subscription_id": {"references": reference}},
+            ),
+        },
+        results=[],
+    )
+    data = _verify(maintain_repo, "fct_activity")
+    (record,) = _records(data, "fct_activity")
+    assert record["declared"]["required"] is required
+    assert ("join_orphans" in _codes(data, "fct_activity")) is required
+
+
 def test_an_intentional_parent_filter_excludes_parents_rather_than_missing_them(
     maintain_repo, _assume_the_project_compiles
 ):
@@ -1262,3 +1474,263 @@ def test_the_build_completion_reads_the_accounted_join_as_asserted(
     assert check.kind == "join_coverage"
     assert check.finding == "join_orphans"
     assert check.join == (f"inner join {W}.handles AS h on m.member_id = h.member_id")
+
+
+# --- key columns read from SQL, spelled the way the relation stores them (#1366) --
+
+
+class _FoldingWarehouse:
+    """A warehouse that folds an unquoted name (upper on Snowflake, lower on
+    Postgres and Redshift) and resolves a quoted one exactly, the way those
+    connectors do, so a probe quoting a name no relation holds is refused with
+    Snowflake's 000904. The rows live in DuckDB, which matches names regardless
+    of case, so each stored name is renamed to a physical one there and the
+    probe runs once every name has resolved."""
+
+    def __init__(self, dialect: str, tables: dict[str, dict[str, list]]):
+        duckdb = pytest.importorskip("duckdb")
+        self.dialect = dialect
+        self.tables = tables
+        self.metadata_reads: list[str] = []
+        self.physical: dict[str, str] = {}
+        self.conn = duckdb.connect()
+        self.conn.execute("ATTACH ':memory:' AS db")
+        self.conn.execute("CREATE SCHEMA db.s")
+        for identifier, columns in tables.items():
+            names = list(columns)
+            for name in names:
+                self.physical.setdefault(name, f"col_{len(self.physical)}")
+            ddl = ", ".join(f"{self.physical[n]} VARCHAR" for n in names)
+            self.conn.execute(f"CREATE TABLE {identifier} ({ddl})")
+            for row in zip(*columns.values(), strict=True):
+                marks = ", ".join("?" for _ in names)
+                self.conn.execute(f"INSERT INTO {identifier} VALUES ({marks})", row)
+
+    def _fold(self, name: str) -> str:
+        return name.upper() if self.dialect == "snowflake" else name.lower()
+
+    def table_metadata(self, identifier: str):
+        from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+
+        self.metadata_reads.append(identifier)
+        columns = self.tables[identifier]
+        return (
+            ObjectMeta(identifier, "table", "s", identifier, None, None, len(columns)),
+            [
+                ColumnMeta(name, "VARCHAR", True, ordinal)
+                for ordinal, name in enumerate(columns, start=1)
+            ],
+        )
+
+    def run_query(self, sql: str, *, max_rows: int, timeout_seconds: float):
+        import sqlglot
+        from sqlglot import exp
+
+        from exmergo_dex_core.adapters.base import QueryResult
+        from exmergo_dex_core.errors import WarehouseQueryError
+
+        tree = sqlglot.parse_one(sql, read=self.dialect)
+        aliases = {self._fold(a.alias) for a in tree.find_all(exp.Alias)}
+        for column in list(tree.find_all(exp.Column)):
+            ident = column.this
+            name = ident.name if ident.quoted else self._fold(ident.name)
+            if name in self.physical:
+                column.set("this", exp.to_identifier(self.physical[name]))
+            elif name not in aliases:
+                raise WarehouseQueryError(
+                    f"000904 (42000): SQL compilation error: invalid identifier "
+                    f"'\"{ident.name}\"'"
+                )
+        cursor = self.conn.execute(tree.sql(dialect="duckdb"))
+        names = [d[0] for d in cursor.description]
+        row = list(cursor.fetchone())
+        return QueryResult(names, ["BIGINT"] * len(names), [row], truncated=False)
+
+
+def _coverage(adapter: _FoldingWarehouse, from_col: str, to_col: str):
+    candidate = verify_mod.JoinCandidate(
+        from_relation="db.s.orders",
+        from_columns=(from_col,),
+        to_relation="db.s.customers",
+        to_columns=(to_col,),
+        side="left",
+        label="left join customers",
+    )
+    return verify_mod.join_coverage(
+        adapter,
+        verify_mod.JoinContractPlan(candidates={"m": [candidate]}),
+        {},
+        list(adapter.tables),
+        handshake=lambda _estimate, _count: None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dialect", "written"),
+    [
+        ("snowflake", "customer_id"),
+        ("snowflake", "CUSTOMER_ID"),
+        ("snowflake", "Customer_Id"),
+        ("postgres", "CUSTOMER_ID"),
+        ("postgres", "customer_id"),
+        ("redshift", "CUSTOMER_ID"),
+        ("redshift", "customer_id"),
+    ],
+)
+def test_a_key_written_in_either_case_is_probed_as_the_relation_stores_it(
+    dialect, written
+):
+    # An unquoted key the warehouse folded (upper on Snowflake, lower on
+    # Postgres and Redshift) is probed under the folded name, so a join that
+    # matches nothing reports join_no_match rather than probe_refused (#1366).
+    stored = written.upper() if dialect == "snowflake" else written.lower()
+    adapter = _FoldingWarehouse(
+        dialect,
+        {
+            "db.s.orders": {stored: ["a", "b"]},
+            "db.s.customers": {stored: ["x", "y"]},
+        },
+    )
+    result = _coverage(adapter, written, written)
+    (record,) = result.records
+    assert record["status"] == "contradicted", record
+    assert [f.code for f in result.findings] == ["join_no_match"]
+    # A name already spelled the way the connector folds it reads no metadata.
+    assert bool(adapter.metadata_reads) == (written != stored)
+
+
+def test_a_quoted_mixed_case_key_keeps_its_exact_spelling():
+    # A column the SQL quoted keeps its case: the relation holds "CustId" and,
+    # beside it, the CUSTID an unquoted custid would fold to; the probe reads
+    # the one the SQL named (#1366).
+    adapter = _FoldingWarehouse(
+        "snowflake",
+        {
+            "db.s.orders": {"CustId": ["a", "b"], "CUSTID": ["x", "y"]},
+            "db.s.customers": {"CustId": ["a", "b"]},
+        },
+    )
+    result = _coverage(adapter, "CustId", "CustId")
+    (record,) = result.records
+    assert record["status"] == "satisfied", record
+    assert result.findings == []
+
+
+def test_a_key_the_relation_does_not_hold_is_still_refused_with_the_reason():
+    adapter = _FoldingWarehouse(
+        "snowflake",
+        {
+            "db.s.orders": {"CUSTOMER_ID": ["a"]},
+            "db.s.customers": {"CUSTOMER_ID": ["a"]},
+        },
+    )
+    result = _coverage(adapter, "client_id", "customer_id")
+    (record,) = result.records
+    assert record["status"] == "unchecked"
+    assert record["reason_code"] == "probe_refused"
+
+
+def test_a_respelled_key_is_reported_as_the_sql_wrote_it():
+    # The probe reads CUSTOMER_ID, but the finding, its data and its detail name
+    # the customer_id the model wrote, as the record beside it does (#1366).
+    adapter = _FoldingWarehouse(
+        "snowflake",
+        {
+            "db.s.orders": {"CUSTOMER_ID": ["a", "b"]},
+            "db.s.customers": {"CUSTOMER_ID": ["x", "y"]},
+        },
+    )
+    result = _coverage(adapter, "customer_id", "customer_id")
+    (finding,) = result.findings
+    (record,) = result.records
+    assert finding.code == "join_no_match"
+    assert finding.column == "customer_id"
+    assert finding.data["from_columns"] == record["from_columns"] == ["customer_id"]
+    assert finding.data["to_columns"] == record["to_columns"] == ["customer_id"]
+    assert "(db.s.orders.customer_id) to (db.s.customers.customer_id)" in (
+        finding.detail
+    )
+
+
+@pytest.mark.parametrize("dialect", ["databricks", "trino"])
+def test_a_key_that_already_resolved_keeps_its_finding_fingerprint(dialect):
+    # Databricks and Trino resolve an upper-case key against the lower-case
+    # column regardless of quoting, so the probe already worked before #1366;
+    # respelling it for the probe must not rename the finding, or a baseline
+    # taken before would report it as introduced.
+    from exmergo_dex_core.transform.finding_attribution import fingerprint
+
+    adapter = _FoldingWarehouse(
+        dialect,
+        {
+            "db.s.orders": {"customer_id": ["a", "b"]},
+            "db.s.customers": {"customer_id": ["x", "y"]},
+        },
+    )
+    result = _coverage(adapter, "CUSTOMER_ID", "CUSTOMER_ID")
+    (finding,) = result.findings
+    assert finding.column == "CUSTOMER_ID"
+    assert finding.data["from_columns"] == ["CUSTOMER_ID"]
+    assert fingerprint(finding) == (
+        "join_contract|join_no_match|m|CUSTOMER_ID|left join customers"
+    )
+
+
+def test_an_unreadable_relation_is_a_note_and_keeps_the_sql_spelling():
+    class _Unreadable(_FoldingWarehouse):
+        def table_metadata(self, identifier: str):
+            raise RuntimeError("no metadata")
+
+    adapter = _Unreadable(
+        "snowflake",
+        {
+            "db.s.orders": {"CUSTOMER_ID": ["a"]},
+            "db.s.customers": {"CUSTOMER_ID": ["a"]},
+        },
+    )
+    result = _coverage(adapter, "customer_id", "customer_id")
+    (record,) = result.records
+    assert record["reason_code"] == "probe_refused"
+    assert (
+        "m: the join keys on db.s.orders were probed as the SQL spells them: "
+        "the relation's columns could not be read (RuntimeError)"
+    ) in result.notes
+
+
+@pytest.mark.parametrize("dialect", ["snowflake", "postgres"])
+def test_a_filtered_sides_columns_are_probed_as_the_relation_stores_them(dialect):
+    # A side read through a filtering CTE carries its filter as DuckDB SQL over
+    # quoted names (#1085); on Snowflake "status" named no column of a relation
+    # that stores STATUS, so the probe was refused and the join went unmeasured.
+    # The filter is respelled as the keys are (#1456).
+    fold = str.upper if dialect == "snowflake" else str.lower
+    adapter = _FoldingWarehouse(
+        dialect,
+        {
+            "db.s.orders": {
+                fold("customer_id"): ["a", "b", "z"],
+                fold("status"): ["paid", "paid", "cancelled"],
+            },
+            "db.s.customers": {fold("customer_id"): ["a", "x"]},
+        },
+    )
+    candidate = verify_mod.JoinCandidate(
+        from_relation="db.s.orders",
+        from_columns=("customer_id",),
+        to_relation="db.s.customers",
+        to_columns=("customer_id",),
+        side="inner",
+        label="inner join customers",
+        from_filters=("\"status\" <> 'cancelled'",),
+    )
+    result = verify_mod.join_coverage(
+        adapter,
+        verify_mod.JoinContractPlan(candidates={"m": [candidate]}),
+        {},
+        list(adapter.tables),
+        handshake=lambda _estimate, _count: None,
+    )
+    (record,) = result.records
+    # Two kept orders, one matched: the cancelled order's z is never counted.
+    assert record["measured"]["eligible_rows"] == 2, record
+    assert record["measured"]["matched_rows"] == 1, record

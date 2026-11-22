@@ -16,10 +16,12 @@ import pytest
 from exmergo_dex_core.transform.elementary import (
     OVERRIDE_FLAG,
     UPLOAD_VARS,
+    is_no_results_query,
     monitoring_tests,
     package_model_dependents,
     read,
     resolve,
+    unchecked_tests,
 )
 
 ROOT = "shop"
@@ -616,3 +618,325 @@ def test_read_without_the_package_files_has_no_release(tmp_path: Path):
 
     assert record.installed
     assert record.release is None
+
+
+# --- the work a build's estimate leaves out (#1309) ----------------------------------
+
+_CHECK = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+_MONITORING_MACROS = (
+    _macro(
+        "elementary",
+        "test_volume_anomalies",
+        depends=("macro.elementary.test_table_anomalies",),
+    ),
+    _macro("elementary", "test_table_anomalies", sql=_CHECK),
+    _macro("elementary", "test_schema_changes", sql=_CHECK),
+    _macro("dbt", "test_not_null"),
+)
+
+
+def _test(name: str, macro: str, *, namespace=None, test_name="", kwargs=None):
+    node = _reading(
+        _node(ROOT, "test", name), "model.shop.fct", macros=(f"macro.{macro}",)
+    )
+    node["test_metadata"] = {
+        "namespace": namespace,
+        "name": test_name,
+        "kwargs": kwargs or {},
+    }
+    return node
+
+
+def _built(models: str | None = "enabled", hooks: str | None = "enabled"):
+    """A manifest with an anomaly test, a schema-change test and dbt's not_null."""
+
+    built = manifest(models=models, hooks=hooks, extra_macros=_MONITORING_MACROS)
+    tests = [
+        _test(
+            "volume",
+            "elementary.test_volume_anomalies",
+            namespace="elementary",
+            test_name="volume_anomalies",
+            kwargs={"timestamp_column": "ordered_at"},
+        ),
+        _test(
+            "changes",
+            "elementary.test_schema_changes",
+            namespace="elementary",
+            test_name="schema_changes",
+        ),
+        _test("not_null_fct_id", "dbt.test_not_null", test_name="not_null"),
+    ]
+    built["nodes"].update({t["unique_id"]: t for t in tests})
+    return built
+
+
+def _work(built, flag=False, vars_=None, selected=None):
+    from exmergo_dex_core.transform.elementary import unpriced_work
+
+    text = project_yml(flag=flag, vars_=vars_)
+    return unpriced_work(resolve(built, text), built, text, selected=selected)
+
+
+def test_elementary_s_materialization_owes_all_three_kinds_of_work():
+    """Variant a: hooks run, the package is enabled and dbt picks its
+    materialization."""
+
+    work = _work(_built())
+
+    assert work.codes == [
+        "elementary_hooks",
+        "elementary_monitoring_tests",
+        "elementary_test_extras",
+    ]
+    assert [t.name for t in work.gated_tests] == ["changes", "volume"]
+    # Only dbt's own test gets the failed-row count and the sample query: the
+    # package's anomaly and schema-change tests collect their own rows.
+    assert work.extras_tests == ("not_null_fct_id",)
+    assert len(work.warnings()) == 3
+    assert all("the estimate is a floor" in w for w in work.warnings())
+
+
+def test_dbt_s_materialization_owes_the_hooks_and_the_monitoring_tests():
+    """Variant b: the flag keeps dbt's materialization, so no extras."""
+
+    work = _work(_built(), flag=True)
+
+    assert work.codes == ["elementary_hooks", "elementary_monitoring_tests"]
+    assert work.extras_tests == ()
+
+
+def test_a_package_disabled_for_the_target_owes_nothing():
+    """Variant d: the models, and with them the hooks, are disabled."""
+
+    work = _work(_built(models="disabled", hooks="disabled"))
+
+    assert work.codes == []
+    assert work.warnings() == []
+
+
+def test_hooks_that_return_early_are_not_work():
+    work = _work(_built(), vars_={"edr_cli_run": True})
+
+    assert "elementary_hooks" not in work.codes
+    assert "elementary_monitoring_tests" in work.codes
+
+
+def test_a_project_without_the_package_owes_nothing():
+    from exmergo_dex_core.transform.elementary import unpriced_work
+
+    built = manifest(elementary=False)
+
+    assert unpriced_work(resolve(built, project_yml()), built).codes == []
+
+
+def test_only_the_selected_tests_are_counted():
+    work = _work(_built(), selected={"test.shop.changes"})
+
+    assert [t.name for t in work.gated_tests] == ["changes"]
+    assert work.extras_tests == ()
+    # The hooks run whatever the selection.
+    assert work.codes == ["elementary_hooks", "elementary_monitoring_tests"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "vars_", "expected"),
+    [
+        ({}, None, (14, "default")),
+        ({"days_back": 30}, None, (30, "test")),
+        ({}, {"days_back": "7"}, (7, "project")),
+        ({}, {"elementary": {"days_back": 21}}, (21, "project")),
+        ({"days_back": "{{ var('window') }}"}, None, (None, "unknown")),
+        ({"training_period": {"period": "day", "count": 30}}, None, (None, "unread")),
+        ({"seasonality": "day_of_week"}, None, (None, "unread")),
+    ],
+)
+def test_an_anomaly_test_names_the_window_it_reads(kwargs, vars_, expected):
+    built = _built()
+    built["nodes"]["test.shop.volume"]["test_metadata"]["kwargs"].update(kwargs)
+
+    [volume] = [t for t in _work(built, vars_=vars_).gated_tests if t.name == "volume"]
+
+    assert (volume.days_back, volume.days_back_source) == expected
+
+
+def test_the_warning_names_each_anomaly_test_s_window():
+    [_, gated, _] = _work(_built()).warnings()
+
+    assert "volume over 14 days" in gated
+    assert "2 Elementary monitoring tests" in gated
+
+
+@pytest.mark.parametrize(
+    ("model_config", "expected"),
+    [
+        ({"config": {"elementary": {"days_back": 30}}}, (30, "model")),
+        ({"config": {"meta": {"elementary": {"days_back": 45}}}}, (45, "model")),
+        ({"meta": {"elementary": {"days_back": 60}}}, (60, "model")),
+        ({"config": {"elementary": {"seasonality": "day_of_week"}}}, (None, "unread")),
+    ],
+)
+def test_the_tested_model_s_elementary_config_comes_before_the_vars(
+    model_config, expected
+):
+    built = _built()
+    built["nodes"]["model.shop.fct"].update(model_config)
+
+    [volume] = [
+        t
+        for t in _work(built, vars_={"days_back": 7}).gated_tests
+        if t.name == "volume"
+    ]
+
+    assert (volume.days_back, volume.days_back_source) == expected
+
+
+def test_a_test_argument_beats_the_model_s_config():
+    built = _built()
+    built["nodes"]["model.shop.fct"]["config"] = {"elementary": {"days_back": 30}}
+    built["nodes"]["test.shop.volume"]["test_metadata"]["kwargs"]["days_back"] = 3
+
+    [volume] = [t for t in _work(built).gated_tests if t.name == "volume"]
+
+    assert (volume.days_back, volume.days_back_source) == (3, "test")
+
+
+# --- tests that checked nothing (#1308) -------------------------------------------
+
+#: What ``no_results_query()`` compiles to at 0.16.4 and 0.26.1.
+NO_RESULTS = (
+    "\n    with nothing as (select 1 as num)\n    select * from nothing where num = 2\n"
+)
+
+
+def test_the_no_results_query_is_matched_and_nothing_else_is():
+    assert is_no_results_query(NO_RESULTS)
+    assert is_no_results_query(
+        "WITH nothing AS (SELECT 1 AS num) SELECT * FROM nothing WHERE num = 0;"
+    )
+    assert not is_no_results_query(None)
+    assert not is_no_results_query("")
+    assert not is_no_results_query(
+        f"{NO_RESULTS} union all select 1 from fct where amount < 0"  # noqa: S608
+    )
+    assert not is_no_results_query("select * from fct where id is null")
+
+
+def _elementary_test_manifest(*, models: str) -> dict[str, Any]:
+    """Every kind of test the classifier tells apart, on ``fct``.
+
+    ``compiled`` maps a test's name to the SQL the build recorded for it, with
+    ``None`` for a test the manifest holds no compiled SQL for.
+    """
+
+    check = "{% if elementary.is_elementary_enabled() %}{% endif %}"
+    macros = (
+        _macro(
+            "elementary",
+            "test_volume_anomalies",
+            depends=("macro.elementary.test_table_anomalies",),
+        ),
+        _macro("elementary", "test_table_anomalies", sql=check),
+        _macro("elementary", "test_schema_changes", sql=check),
+        _macro("elementary", "test_volume_threshold", sql=check),
+        _macro("elementary", "test_json_schema", sql=check),
+        _macro("elementary", "test_collect_metrics", sql=check),
+        _macro("elementary", "test_not_null_with_context"),
+        _macro(
+            ROOT, "test_my_volume", depends=("macro.elementary.test_volume_anomalies",)
+        ),
+    )
+    return manifest(models=models, extra_macros=macros)
+
+
+def _with_tests(built: dict[str, Any], compiled: dict[str, str | None]) -> dict:
+    macro_of = {
+        "volume": "macro.elementary.test_volume_anomalies",
+        "changes": "macro.elementary.test_schema_changes",
+        "threshold": "macro.elementary.test_volume_threshold",
+        "json": "macro.elementary.test_json_schema",
+        "collect": "macro.elementary.test_collect_metrics",
+        "with_context": "macro.elementary.test_not_null_with_context",
+        "wrapped_volume": f"macro.{ROOT}.test_my_volume",
+        "not_null_fct_id": "macro.dbt.test_not_null",
+    }
+    for name, sql in compiled.items():
+        node = _reading(
+            _node(ROOT, "test", name), "model.shop.fct", macros=(macro_of[name],)
+        )
+        if sql is not None:
+            node["compiled_code"] = sql
+        built["nodes"][node["unique_id"]] = node
+    return built
+
+
+def _classified(built: dict[str, Any]) -> dict[str, str]:
+    record = resolve(built, project_yml())
+    return {
+        uid.split(".")[2]: reason
+        for uid, reason in unchecked_tests(built, record).items()
+    }
+
+
+def test_with_the_package_disabled_every_test_compiled_to_no_results_is_unchecked():
+    """Acceptance, first half: whatever the name, a test that compiled to the
+    no-results query is listed; a dbt test, and an Elementary test that
+    compiled to a real query, are not."""
+
+    built = _with_tests(
+        _elementary_test_manifest(models="disabled"),
+        {
+            "volume": NO_RESULTS,
+            "changes": NO_RESULTS,
+            "json": NO_RESULTS,
+            "wrapped_volume": NO_RESULTS,
+            "with_context": "select * from fct where id is null",
+            "not_null_fct_id": "select id from fct where id is null",
+        },
+    )
+    assert _classified(built) == dict.fromkeys(
+        ("volume", "changes", "json", "wrapped_volume"), "package_disabled"
+    )
+
+
+def test_with_the_package_disabled_and_no_compiled_sql_the_enabled_check_decides():
+    built = _with_tests(
+        _elementary_test_manifest(models="disabled"),
+        {"volume": None, "with_context": None, "not_null_fct_id": None},
+    )
+    assert _classified(built) == {"volume": "package_disabled"}
+
+
+def test_with_the_package_enabled_the_history_tests_are_unchecked():
+    """Acceptance, second half: the anomaly tests (through a project's wrapper
+    too), ``schema_changes`` and ``volume_threshold`` rest on history; a
+    ``*_with_context`` test, ``json_schema`` and dbt's own do not. A test that
+    still compiled to the no-results query checked nothing for that reason."""
+
+    real = "select * from elementary_test_results_tmp where is_anomalous"
+    built = _with_tests(
+        _elementary_test_manifest(models="enabled"),
+        {
+            "volume": real,
+            "changes": real,
+            "threshold": None,
+            "wrapped_volume": real,
+            "json": "select * from fct where not valid",
+            "collect": NO_RESULTS,
+            "with_context": "select * from fct where id is null",
+            "not_null_fct_id": "select id from fct where id is null",
+        },
+    )
+    assert _classified(built) == {
+        "volume": "history_unmeasured",
+        "changes": "history_unmeasured",
+        "threshold": "history_unmeasured",
+        "wrapped_volume": "history_unmeasured",
+        "collect": "compiled_to_no_results",
+    }
+
+
+def test_a_project_without_the_package_has_no_unchecked_tests():
+    built = manifest(elementary=False)
+    built = _with_tests(built, {"not_null_fct_id": NO_RESULTS})
+    assert unchecked_tests(built, resolve(built, project_yml())) == {}

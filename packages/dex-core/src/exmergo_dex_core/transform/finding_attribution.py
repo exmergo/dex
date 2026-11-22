@@ -70,7 +70,14 @@ _AXIS_CLASSES: dict[str, frozenset[str]] = {
     # Read per code below: one axis, several classes, and a sweep routinely
     # suppresses some of them ("nothing declares a unit") while running others.
     "declaration": frozenset(
-        {"unit", "additivity", "population", "parent_population", "temporal"}
+        {
+            "unit",
+            "additivity",
+            "population",
+            "parent_population",
+            "temporal",
+            "freshness",
+        }
     ),
 }
 
@@ -86,6 +93,7 @@ _CODE_CLASSES: tuple[tuple[str, frozenset[str]], ...] = (
     ("temporal_", frozenset({"temporal"})),
     ("no_entity_comparable", frozenset({"temporal"})),
     ("policy_missing", frozenset({"temporal"})),
+    ("freshness_exceeded", frozenset({"freshness"})),
 )
 
 
@@ -224,6 +232,7 @@ _RECORD_AXES = (
     ("join_coverage", "join_contract"),
     ("parent_population", "declaration"),
     ("temporal_contracts", "declaration"),
+    ("freshness", "declaration"),
     ("population_delta", "declaration"),
 )
 
