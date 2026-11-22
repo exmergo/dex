@@ -350,8 +350,10 @@ a floor. An unknown estimate says why, and Dex never guesses one:
 Reading the catalog is free on DuckDB, BigQuery (the table API), Snowflake
 (`SHOW`), Postgres, Redshift provisioned, ClickHouse and Trino. Databricks'
 free listing carries no size, and Redshift Serverless bills a wake, so both
-report the estimate unknown rather than spend; on Redshift Serverless the plan opens
-no connection at all.
+report the estimate unknown rather than spend. A Serverless endpoint is told apart
+before any connection, from `redshift.workgroup` or the endpoint host, and a
+Redshift connection a host supplies, whose compute Dex cannot tell, is not
+opened either.
 
 #### `dex_unique_combination`: a composite grain
 
