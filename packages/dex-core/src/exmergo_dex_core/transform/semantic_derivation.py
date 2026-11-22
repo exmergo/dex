@@ -336,17 +336,31 @@ def derive(
             carried.extend(_carried_column(name, fields, described=True))
             time_columns.append(name)
 
-    # MetricFlow wants one element type per name, so a grain column that is also
-    # a dimension (a time column grain) names its entity after the model too (#1416).
+    # MetricFlow wants one element type per name. A foreign entity keeps the name
+    # the parent gave it, so a dimension of that name moves aside and keeps its
+    # column through `expr`; a grain column that is also a dimension (a time column
+    # grain) names its primary entity after the model instead (#1416).
+    stem = _LAYER_PREFIX.sub("", model).lower()
+    foreign_names = {e["name"] for e in entities if e["type"] == "foreign"}
+    dimension_name = {d["name"]: d["name"] for d in dimensions}
+    for dimension in dimensions:
+        column = dimension["name"]
+        if column not in foreign_names:
+            continue
+        taken = {d["name"] for d in dimensions} | {e["name"] for e in entities}
+        renamed = _free_name(f"{stem}_{column}", taken)
+        dimension["name"], dimension["expr"] = renamed, column
+        dimension_name[column] = renamed
+        notes.append(
+            f"{column}: the dimension is named '{renamed}' because the foreign "
+            "entity of the same name joins by it, and MetricFlow does not allow "
+            "one name for both"
+        )
     dimension_names = {d["name"] for d in dimensions}
     if primary in dimension_names:
-        stem = _LAYER_PREFIX.sub("", model).lower()
-        base = re.sub(r"_+", "_", f"{stem}_{grain[0]}")
-        taken = dimension_names | (used_names - {primary})
-        primary, suffix = base, 1
-        while primary in taken:
-            suffix += 1
-            primary = f"{base}_{suffix}"
+        primary = _free_name(
+            f"{stem}_{grain[0]}", dimension_names | (used_names - {primary})
+        )
         entities[0]["name"] = primary
         notes.append(
             f"{grain[0]}: the primary entity is named '{primary}' because the "
@@ -354,7 +368,7 @@ def derive(
             "for both"
         )
 
-    agg_time = time_columns[0] if time_columns else None
+    agg_time = dimension_name[time_columns[0]] if time_columns else None
     if len(time_columns) > 1:
         notes.append(
             f"default time dimension is {agg_time}, the first time column declared; "
@@ -592,6 +606,17 @@ def _described(
     if isinstance(description, str) and description.strip():
         element["description"] = description
     return element
+
+
+def _free_name(base: str, taken: set[str]) -> str:
+    """``base`` with underscores collapsed, numbered until it is not in ``taken``."""
+
+    base = re.sub(r"_+", "_", base)
+    name, suffix = base, 1
+    while name in taken:
+        suffix += 1
+        name = f"{base}_{suffix}"
+    return name
 
 
 def _entity_name(column: str, model: str) -> str:

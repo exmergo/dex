@@ -1242,6 +1242,44 @@ def test_a_time_grain_entity_never_takes_a_name_a_dimension_already_has():
     }
 
 
+def test_a_dimension_never_takes_the_name_of_a_foreign_entity():
+    declared = {
+        "grain": ["reading_id"],
+        "columns": {
+            "reading_id": {"role": "key"},
+            "read_at": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_daily.output_day",
+            },
+            "daily_output_day": {"role": "dimension"},
+            "reading_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    parent = {
+        "name": "daily",
+        "entities": [
+            {"name": "daily_output_day", "type": "primary", "expr": "output_day"}
+        ],
+    }
+
+    found = sd.derive(
+        "fct_readings",
+        declared,
+        column_types={"read_at": ("date", None)},
+        on_ref={"fct_daily": [("models/marts/daily.yml", parent)]},
+    )
+
+    assert {"name": "daily_output_day", "type": "foreign", "expr": "output_day_id"} in (
+        found.body["entities"]
+    )
+    assert [d["name"] for d in found.body["dimensions"]] == [
+        "read_at",
+        "readings_daily_output_day",
+    ]
+    assert found.body["dimensions"][1]["expr"] == "daily_output_day"
+
+
 def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
@@ -1255,6 +1293,7 @@ def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
                 "role": "foreign_key",
                 "references": "fct_world_output_daily.output_day",
             },
+            "world_output_daily_output_day": {"role": "dimension"},
             "reading_total": {"role": "measure", "aggregation": "sum"},
         },
     }
@@ -1274,7 +1313,7 @@ def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
                 "content": (
                     "select 1 as reading_id, cast('2024-01-01' as date) as read_at, "
                     "cast('2024-01-01' as date) as output_day_id, "
-                    "1.0 as reading_total\n"
+                    "'x' as world_output_daily_output_day, 1.0 as reading_total\n"
                 ),
             },
         ],
@@ -1302,3 +1341,7 @@ def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
     content = models["fct_readings"]["content"]
     assert "name: world_output_daily_output_day" in content
     assert "name: output_day\n" not in content
+    # a dimension of the parent's entity name moves aside, keeping its column
+    assert content.count("name: world_output_daily_output_day\n") == 1
+    assert "name: readings_world_output_daily_output_day\n" in content
+    assert "expr: world_output_daily_output_day\n" in content
