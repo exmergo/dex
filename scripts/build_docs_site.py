@@ -414,9 +414,9 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         "reference/incidents",
         PageMeta(
             "Test failures as incidents",
-            "How dex folds test outcomes from every source into incidents: three "
-            "states per interval, one lifecycle rule, a derived schedule, and no "
-            "value from the data.",
+            "How dex folds test outcomes from every source into incidents by one "
+            "rule, on a coverage timeline that never reads an unobserved interval "
+            "as good.",
             "Incidents",
         ),
     ),
