@@ -1425,20 +1425,26 @@ def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
     )
 
     assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
-    models = envelope["data"]["semantic_proposal"]["models"]
-    assert models["fct_world_output_daily"]["status"] in ("proposed", "unvalidated")
+    offered = _offered(envelope)
     # the child's dimension holds the parent's first-choice name, so the parent's
     # entity is numbered and the child joins by that name, its dimension untouched
-    assert (
-        "name: world_output_daily_output_day_2\n"
-        in models["fct_world_output_daily"]["content"]
+    assert offered["fct_world_output_daily"]["entities"] == [
+        {
+            "name": "world_output_daily_output_day_2",
+            "type": "primary",
+            "expr": "output_day",
+        }
+    ]
+    readings = offered["fct_readings"]
+    assert {
+        "name": "world_output_daily_output_day_2",
+        "type": "foreign",
+        "expr": "output_day_id",
+    } in readings["entities"]
+    assert "output_day" not in {e["name"] for e in readings["entities"]}
+    assert {"name": "world_output_daily_output_day", "type": "categorical"} in (
+        readings["dimensions"]
     )
-    content = models["fct_readings"]["content"]
-    assert "name: world_output_daily_output_day_2\n" in content
-    assert "expr: output_day_id\n" in content
-    assert "name: output_day\n" not in content
-    assert content.count("name: world_output_daily_output_day\n") == 1
-    assert "readings_world_output_daily_output_day" not in content
 
 
 def test_a_foreign_key_joins_by_a_name_the_primary_entity_gave_up():
@@ -2242,3 +2248,144 @@ def test_a_foreign_key_to_an_anchored_entity_this_model_holds_is_not_derived(
         "whose entity 'alpha'" in limitation
         for limitation in models["fct_alphas"]["limitations"]
     ), models["fct_alphas"]
+
+
+def test_a_fallback_that_only_shares_an_authored_name_does_not_propagate(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_orders.customer_id` references `stg_customers.email`, which carries no
+    entity, so its `customer` is a column-named fallback that merely shares the
+    authored entity's name. A mart referencing `fct_orders.customer_id` does not
+    adopt `customer` (which would join the unrelated customers model); with no
+    entity to join, its foreign key is left out and says so."""
+    _add_layer(dbt_project_dir)
+
+    def mart(model: str, grain: str, **foreign: str) -> dict:
+        return {
+            "model": model,
+            "description": f"One row per {grain}.",
+            "grain": [grain],
+            "columns": {
+                grain: {"role": "key"},
+                "happened_at": {"role": "time"},
+                **{
+                    column: {"role": "foreign_key", "references": ref}
+                    for column, ref in foreign.items()
+                },
+                "amount": {"role": "measure", "aggregation": "sum"},
+            },
+        }
+
+    marts = [
+        mart("fct_orders", "order_id", customer_id="stg_customers.email"),
+        mart("fct_returns", "return_id", buyer_id="fct_orders.customer_id"),
+    ]
+    body = {
+        "edits": [
+            {
+                "path": f"models/marts/{m['model']}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select "
+                    + ", ".join(
+                        "current_date as happened_at"
+                        if c == "happened_at"
+                        else f"1 as {c}"
+                        for c in m["columns"]
+                    )
+                    + "\n"
+                ),
+            }
+            for m in marts
+        ],
+        "declarations": marts,
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "fallback",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert "buyer_id" not in {e["expr"] for e in offered["fct_returns"]["entities"]}
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert any(
+        "references fct_orders.customer_id" in limitation
+        for limitation in models["fct_returns"]["limitations"]
+    ), models["fct_returns"]
+
+
+def test_a_foreign_key_to_a_planned_mart_that_derives_nothing_is_not_derived(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_billing` declares only its grain, so the plan derives no semantic model
+    for it; a foreign key referencing it has nothing to join and is left out."""
+    billing = {
+        "model": "fct_billing",
+        "description": "One row per billing account.",
+        "grain": ["billing_id"],
+        "columns": {"billing_id": {"role": "key"}},
+    }
+    invoices = {
+        "model": "fct_invoices",
+        "description": "One row per invoice.",
+        "grain": ["invoice_id"],
+        "columns": {
+            "invoice_id": {"role": "key"},
+            "issued_at": {"role": "time"},
+            "billing_id": {
+                "role": "foreign_key",
+                "references": "fct_billing.billing_id",
+            },
+            "amount": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_billing.sql",
+                "kind": "model_sql",
+                "content": "select 1 as billing_id\n",
+            },
+            {
+                "path": "models/marts/fct_invoices.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as invoice_id, current_date as issued_at, "
+                    "1 as billing_id, 1.0 as amount\n"
+                ),
+            },
+        ],
+        "declarations": [billing, invoices],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "billing",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert offered["fct_invoices"]["entities"] == [
+        {"name": "invoice", "type": "primary", "expr": "invoice_id"}
+    ]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert any(
+        "references fct_billing.billing_id" in limitation
+        for limitation in models["fct_invoices"]["limitations"]
+    ), models["fct_invoices"]

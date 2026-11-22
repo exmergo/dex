@@ -1234,36 +1234,50 @@ class MetricFlowDerivation:
                 # a later draft keeps clear of it, so two settled names never meet
                 held["entity"].add(primary[0]["name"])
         # Only names anchored in an entity that exists either way, the layer's or
-        # a settled primary, enter a draft: a pair of foreign keys that reference
+        # a settled primary, enter a draft, and a foreign key with `references`
+        # only when that reference resolves to the anchor (a fallback that merely
+        # shares its name never propagates): a pair of foreign keys that reference
         # each other with no such anchor never enters, so the drafts only gain
         # entities and settle. If they still have not settled by the pass limit,
         # the plan joins primary entities alone rather than a half-settled state.
         anchored = authored | set(settled.values())
+        every_planned = {d.model for d in planned_marts}
+
+        def anchors(entity: dict[str, Any], columns: Any, lookup: Any) -> bool:
+            if entity["type"] == "primary":
+                return True
+            fields = columns.get(entity["expr"]) if isinstance(columns, dict) else None
+            references = fields.get("references") if isinstance(fields, dict) else None
+            if not references:
+                return entity["name"] in anchored
+            name, joined = _foreign_entity(entity["expr"], references, lookup)
+            return joined is not None and name == entity["name"] and name in anchored
+
         primaries = dict(drafts)
         for _ in range(2 * len(planned_marts) + 2):
             refined: dict[str, list[tuple[str, dict[str, Any]]]] = {}
             for declaration in planned_marts:
                 if declaration.model not in drafts:
                     continue
+                lookup = {
+                    **on_ref,
+                    **{m: d for m, d in drafts.items() if m != declaration.model},
+                }
                 body = derive(
                     declaration.model,
                     declaration.declared,
                     column_types=declaration.column_types,
-                    on_ref={
-                        **on_ref,
-                        **{m: d for m, d in drafts.items() if m != declaration.model},
-                    },
+                    on_ref=lookup,
                     reserved=reserved_for(declaration.model),
                     primary_name=settled[declaration.model],
-                    drafted=set(drafts),
+                    drafted=every_planned,
                 ).body
                 if body is None:
                     refined[declaration.model] = drafts[declaration.model]
                     continue
+                columns = declaration.declared.get("columns")
                 entities = [
-                    e
-                    for e in body.get("entities", [])
-                    if e["type"] == "primary" or e["name"] in anchored
+                    e for e in body.get("entities", []) if anchors(e, columns, lookup)
                 ]
                 refined[declaration.model] = [
                     ("", {"name": body["name"], "entities": entities})
@@ -1284,7 +1298,7 @@ class MetricFlowDerivation:
                 on_ref={m: found for m, found in foreign_ref.items() if m != model},
                 reserved=reserved_for(model),
                 primary_name=settled.get(model),
-                drafted=set(drafts),
+                drafted=every_planned,
             )
             derivations.append(derivation)
             if derivation.body is None or derivation.status == "skipped":
