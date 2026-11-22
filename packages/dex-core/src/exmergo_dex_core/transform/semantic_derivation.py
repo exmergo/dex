@@ -1187,6 +1187,8 @@ class MetricFlowDerivation:
                 ]
                 drafted.add(declaration.model)
                 settled[declaration.model] = primary[0]["name"]
+                # a later draft keeps clear of it, so two settled names never meet
+                planned["entity"].add(primary[0]["name"])
         for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
             if model in drafted:

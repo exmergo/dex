@@ -1743,3 +1743,77 @@ def test_a_settled_primary_name_holds_whichever_mart_derives_first(
         "type": "foreign",
         "expr": "b_id",
     }
+
+
+def test_two_settled_primary_names_never_meet(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_a_b` (grain `cd`) and `fct_a` (grain `b_cd`) both reach `a_b_cd` for a
+    replacement primary name. The one settled second is numbered, so the child's
+    foreign key still joins the parent."""
+    parent = {
+        "model": "fct_a_b",
+        "description": "One row per cd.",
+        "grain": ["cd"],
+        "columns": {
+            "cd": {"role": "time"},
+            "parent_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    child = {
+        "model": "fct_a",
+        "description": "One row per b_cd.",
+        "grain": ["b_cd"],
+        "columns": {
+            "b_cd": {"role": "time"},
+            "parent_id": {"role": "foreign_key", "references": "fct_a_b.cd"},
+            "child_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_a_b.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as cd, 1.0 as parent_total\n"
+                ),
+            },
+            {
+                "path": "models/marts/fct_a.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as b_cd, "
+                    "cast('2024-01-01' as date) as parent_id, 1.0 as child_total\n"
+                ),
+            },
+        ],
+        "declarations": [parent, child],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "settled",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    for model in ("fct_a_b", "fct_a"):
+        assert models[model]["status"] in ("proposed", "unvalidated"), json.dumps(
+            models[model]
+        )[:1500]
+    parent_entities = yaml.safe_load(models["fct_a_b"]["content"])["entities"]
+    child_entities = yaml.safe_load(models["fct_a"]["content"])["entities"]
+    (parent_primary,) = [e["name"] for e in parent_entities if e["type"] == "primary"]
+    (child_primary,) = [e["name"] for e in child_entities if e["type"] == "primary"]
+    assert {parent_primary, child_primary} == {"a_b_cd", "a_b_cd_2"}
+    assert {"name": parent_primary, "type": "foreign", "expr": "parent_id"} in (
+        child_entities
+    )
