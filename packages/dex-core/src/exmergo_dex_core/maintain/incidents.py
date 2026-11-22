@@ -55,6 +55,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from ..errors import DexError
 from .observations import (
     SOURCE_PATTERN,
     UNKNOWN,
@@ -103,7 +104,7 @@ CoverageSegment = TimelineSegment
 FoldInputCode = Literal["run_sequence_conflict", "opener_tie_undeclared"]
 
 
-class FoldInputError(ValueError):
+class FoldInputError(DexError, ValueError):
     """Input the fold refuses rather than read in an order nobody declared.
 
     ``run_sequence_conflict``: one run id carries two ``sequence`` values
