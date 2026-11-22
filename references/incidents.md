@@ -50,7 +50,7 @@ An incident is keyed by a **subject** and a **signal**.
 | Event | Effect |
 | --- | --- |
 | An observed failure for a subject and signal | Opens an incident, or extends the open one. The source that observed it is the incident's opening source. |
-| `N` consecutive observed passes from the opening source | Closes it. `N` is set per subject and signal and defaults to 2, so a test that flaps stays one incident. |
+| `N` consecutive observed passes from the opening source | Closes it. `N` is set per subject and signal and defaults to 2, so a test that flaps stays one incident. `N` counts runs, not rows: see below. |
 | An unobserved interval | Neither opens nor closes an incident, and does not break a run of passes: `N` counts observed passes. |
 | The check stops running | Ends it as `no_longer_observed`, never as `closed`. |
 | An observation from another source that disagrees | Attached as evidence. It never counts toward `N` and never closes the incident. |
@@ -58,6 +58,36 @@ An incident is keyed by a **subject** and a **signal**.
 Observations are ordered by invocation, not by clock, because sources stamp times
 with different clocks. Within one invocation a failure is read before a pass, so a
 source that passes in the same run another fails is evidence, not the opener.
+
+### One outcome per source per run
+
+A source has one outcome for a subject and signal in each run. Where it holds
+more than one row for that run (two tests carrying one claim, or an adapter that
+did not deduplicate), a failure wins over a pass, as on the coverage timeline.
+So `N` counts runs: two passing rows in one run are one pass, and a run that
+failed is never also counted as a pass.
+
+### One invocation order for every source
+
+A run id names one invocation, so it has one place in invocation order whichever
+source holds it. `fold_incidents` refuses, with a `FoldInputError` whose `code`
+is `run_sequence_conflict`, any run id that carries two `sequence` values across
+the observations, the runs each `SourceHistory` holds and the timelines. Reading
+such input would order one source's outcomes against another's wrongly, so the
+adapters have to number every source's runs from one series.
+
+### Which source opens a tie
+
+Where more than one source fails in the run that opens an incident, the source
+named first in `sources` opens it. The order of `sources` is the only precedence:
+source names are never compared. A tie between sources that `sources` does not
+name is refused, with `code` `opener_tie_undeclared`, rather than settled by an
+order nobody declared.
+
+The choice matters, because only the opening source's passes close an incident.
+Name first the source that holds the longer run history of a check: a source
+that holds only the invocation it read cannot supply `N` passes, so an incident
+it opens stays open until the check stops running.
 
 ### When a check has stopped running
 
