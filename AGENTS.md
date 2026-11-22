@@ -1079,8 +1079,10 @@ them.
 - A native Ossie layer end to end on a local warehouse, with no dbt project:
   `references/ossie-walkthrough.md`.
 - How test outcomes from every source fold into incidents (three states per
-  interval, one lifecycle rule, no value from the data):
-  `references/incidents.md`.
+  interval, one lifecycle rule, no value from the data), and the coverage
+  timeline they are laid on (a named heartbeat, every unobserved interval and
+  its reason, a subject's last verified run, and the break a diagnosis
+  bisects): `references/incidents.md`.
 - Running the lifecycle across more than one process (a plan a second
   process can carry and check, what it depends on, what its edits contain,
   and what a build established): `references/host-integration.md`.

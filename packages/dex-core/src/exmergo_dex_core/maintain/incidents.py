@@ -24,6 +24,11 @@ The rule, per subject and signal, with observations in invocation order:
   reported as derived; with too little history it is ``unknown`` and nothing
   is ended for staleness.
 
+Each incident's ``coverage`` and ``onset`` are read off its opening source's
+coverage timeline (:mod:`.timeline`, #1466), so a missed run, a run with the
+package's hooks or uploads off and a run that did not check the test each read
+unobserved, with the reason, and the onset is the break a diagnosis bisects.
+
 Three states, never two: an interval is observed good, observed bad, or
 unobserved, and nothing here reads an unobserved one as good. An incident's
 first failure is ``unknown`` unless an observed pass precedes it, because a
@@ -39,23 +44,40 @@ incident state is kept between calls.
 
 from __future__ import annotations
 
-import itertools
-import statistics
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
-#: The three outcomes an interval of a check's history can have.
-Outcome = Literal["good", "bad", "unobserved"]
+from .observations import (
+    SOURCE_PATTERN,
+    UNKNOWN,
+    Observation,
+    ObservedPoint,
+    Outcome,
+    RunRef,
+    RunUnobserved,
+    Signal,
+    Subject,
+    median_gap,
+    utc,
+)
+from .observations import Value as _Value
+from .timeline import (
+    Break,
+    Heartbeat,
+    HeartbeatBasis,
+    Timeline,
+    TimelineSegment,
+    build_timeline,
+    subject_history,
+    window_segments,
+)
 
 #: Where an incident stands at call time.
 State = Literal["open", "closed", "no_longer_observed"]
-
-#: Written where no source holds the answer, never a guess.
-UNKNOWN: Literal["unknown"] = "unknown"
 
 #: Passes from the opening source that close an incident when nothing else is set.
 DEFAULT_CLOSE_AFTER = 2
@@ -70,94 +92,8 @@ DEFAULT_STALE_AFTER_GAPS = 3.0
 #: commonly keep.
 DEFAULT_STALE_FLOOR_SECONDS = 3600.0
 
-#: Fewest observation times a schedule is derived from (two gaps).
-_MIN_SCHEDULE_POINTS = 3
-
-#: A source's name, as the adapters spell it (``dbt_run_results``, ``elementary``).
-_SOURCE_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
-
-#: A severity is a source's own token (``warn``, ``ERROR``), never free text: a
-#: pattern this narrow cannot carry a sampled value.
-_SEVERITY_PATTERN = r"^[A-Za-z][A-Za-z_ -]{0,31}$"
-
-
-class _Value(BaseModel):
-    """Immutable, and refusing every field it does not declare."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class Subject(_Value):
-    """What an incident is about: a declared claim, or one test.
-
-    The claim id from ``config.meta.dex.claim`` where Dex rendered the test
-    (it survives a rename), otherwise the test's dbt ``unique_id``. The kind is
-    part of the identity, so a claim and a ``unique_id`` that happen to be
-    spelled alike are two subjects.
-    """
-
-    kind: Literal["claim", "unique_id"]
-    key: str = Field(min_length=1, max_length=512)
-
-    @classmethod
-    def of(cls, unique_id: str, claim: str | None = None) -> Subject:
-        """The subject of a test: its claim where it carries one."""
-
-        if claim:
-            return cls(kind="claim", key=claim)
-        return cls(kind="unique_id", key=unique_id)
-
-
-class Signal(_Value):
-    """What failed, beyond the subject: the column and metric of a test that
-    writes one row per column (an Elementary anomaly test), else nothing.
-
-    Never the test's name: a renamed test checking the same claim is the same
-    signal, so it stays one incident.
-    """
-
-    column: str | None = Field(default=None, max_length=512)
-    metric: str | None = Field(default=None, max_length=512)
-
-
-class Observation(_Value):
-    """One source's outcome for one subject and signal in one run.
-
-    ``sequence`` is the run's position in invocation order, which the caller
-    supplies: sources stamp times with different clocks, so the order is the
-    invocations', and ``at`` is carried for the schedule and for reporting.
-    Two sources observing the same invocation give it the same ``sequence``.
-    """
-
-    subject: Subject
-    signal: Signal = Field(default_factory=Signal)
-    #: The test's dbt ``unique_id`` in this run, which a rename changes.
-    test: str = Field(min_length=1, max_length=512)
-    outcome: Outcome
-    source: str = Field(pattern=_SOURCE_PATTERN)
-    run: str = Field(min_length=1, max_length=128)
-    sequence: int
-    at: datetime | None = None
-    commit: str | None = Field(default=None, max_length=64)
-    #: In the source's own words, never mapped onto a Dex scale.
-    severity: str | None = Field(default=None, pattern=_SEVERITY_PATTERN)
-
-
-class RunRef(_Value):
-    """One run a source holds, whether or not it observed a given subject."""
-
-    run: str = Field(min_length=1, max_length=128)
-    sequence: int
-    at: datetime | None = None
-    commit: str | None = Field(default=None, max_length=64)
-
-
-class ObservedPoint(_Value):
-    """A run and its time, as one source recorded them."""
-
-    run: str
-    at: datetime | None = None
-    source: str
+#: Kept under its #1465 name: a coverage segment is a timeline segment.
+CoverageSegment = TimelineSegment
 
 
 class SourceHistory(_Value):
@@ -169,7 +105,7 @@ class SourceHistory(_Value):
     holds, as read at call time; left out, the oldest run stands in.
     """
 
-    name: str = Field(pattern=_SOURCE_PATTERN)
+    name: str = Field(pattern=SOURCE_PATTERN)
     runs: tuple[RunRef, ...] = ()
     retention_bound: ObservedPoint | None = None
 
@@ -189,20 +125,18 @@ class IncidentObservation(_Value):
     evidence: bool = False
 
 
-class CoverageSegment(_Value):
-    """Consecutive runs of the opening source in one of the three states."""
-
-    state: Literal["observed_good", "observed_bad", "unobserved"]
-    from_run: str
-    to_run: str
-    runs: int
-
-
 class Coverage(_Value):
-    """Which runs of the incident's window the opening source observed."""
+    """Which intervals of the incident's window the opening source observed.
+
+    Laid on the opening source's timeline (#1466): ``heartbeat`` names the run
+    series it was read from, and a run that recorded nothing, a run that did
+    not check this test and a gap the schedule says held runs are each an
+    ``unobserved`` segment with its reason, never a pass.
+    """
 
     source: str
-    segments: tuple[CoverageSegment, ...] = ()
+    heartbeat: HeartbeatBasis = "observations"
+    segments: tuple[TimelineSegment, ...] = ()
 
 
 class Schedule(_Value):
@@ -238,6 +172,11 @@ class Incident(_Value):
     severity: str | None = None
     opening_source: str
     coverage: Coverage
+    #: Where the check broke: after the last observed-good run before the
+    #: first failure, up to and including that failure, with the unobserved
+    #: intervals between them (#1466). ``after`` is ``unknown`` exactly where
+    #: ``first_observed`` is.
+    onset: Break | None = None
     #: The oldest point each source holds, or ``unknown``.
     retention_bound: dict[str, ObservedPoint | Literal["unknown"]]
     state: State
@@ -293,6 +232,7 @@ def fold_incidents(
     now: datetime | None = None,
     stale_after_gaps: float = DEFAULT_STALE_AFTER_GAPS,
     stale_floor_seconds: float = DEFAULT_STALE_FLOOR_SECONDS,
+    timelines: Mapping[str, Timeline] | None = None,
 ) -> IncidentFold:
     """Fold observed outcomes into incidents by the one lifecycle rule.
 
@@ -302,7 +242,11 @@ def fold_incidents(
     ``no_longer_observed``. ``now`` is the call time staleness is judged at,
     and an open incident ends ``stale`` once its opening source has not
     observed it for the larger of ``stale_after_gaps`` expected gaps and
-    ``stale_floor_seconds``.
+    ``stale_floor_seconds``. ``timelines``, keyed by source name, lays each
+    incident's coverage on its opening source's timeline (#1466), so a missed
+    run, a run with hooks or uploads off and a run that did not check the test
+    each read unobserved with their reason; a source with no timeline gets one
+    built from the runs it names, with no named heartbeat.
     """
 
     if close_after < 1:
@@ -316,12 +260,42 @@ def fold_incidents(
     for key, value in overrides.items():
         if value < 1:
             raise ValueError(f"close_after_by[{key!r}] must be at least 1")
-    moment = _utc(now) if now is not None else datetime.now(UTC)
+    moment = utc(now) if now is not None else datetime.now(UTC)
     current = None if current_subjects is None else set(current_subjects)
 
     observed = list(observations)
     histories = {history.name: history for history in sources}
+    laid = dict(timelines or {})
+    for name, timeline in laid.items():
+        if name != timeline.source:
+            raise ValueError(
+                f"timelines[{name!r}] is the timeline of {timeline.source!r}"
+            )
+        held = histories.get(name)
+        if held is None or not held.runs:
+            histories[name] = SourceHistory(
+                name=name,
+                runs=_heartbeat_runs(timeline),
+                retention_bound=(
+                    held.retention_bound
+                    if held is not None and held.retention_bound is not None
+                    else timeline.retention_bound
+                    if timeline.retention_bound != UNKNOWN
+                    else None
+                ),
+            )
     runs_by_source = _runs_by_source(observed, histories)
+    for name, runs in runs_by_source.items():
+        if name not in laid:
+            history = histories.get(name)
+            named = history is not None and bool(history.runs)
+            basis: HeartbeatBasis = "source_runs" if named else "observations"
+            laid[name] = build_timeline(
+                name,
+                Heartbeat(basis=basis, runs=tuple(runs)),
+                observed,
+                retention_bound=None if history is None else history.retention_bound,
+            )
     schedules = {
         name: _schedule([run.at for run in runs], name, "source", allowance)
         for name, runs in sorted(runs_by_source.items())
@@ -355,7 +329,8 @@ def fold_incidents(
                         key,
                         built,
                         by_source,
-                        runs_by_source,
+                        laid,
+                        items,
                         retention,
                         schedules,
                         current,
@@ -415,7 +390,8 @@ def _incident(
     key: IncidentKey,
     built: _Open,
     by_source: Mapping[str, list[Observation]],
-    runs_by_source: Mapping[str, list[RunRef]],
+    timelines: Mapping[str, Timeline],
+    items: list[Observation],
     retention: Mapping[str, ObservedPoint | Literal["unknown"]],
     schedules: Mapping[str, Schedule],
     current: set[Subject] | None,
@@ -444,12 +420,21 @@ def _incident(
         for index, o in enumerate(built.observations)
     )
     end_sequence = built.closed_by.sequence if built.closed_by is not None else None
-    coverage = _coverage(
-        opener,
-        by_source.get(opener, []),
-        runs_by_source.get(opener, []),
-        built.opening.sequence,
-        end_sequence,
+    timeline = timelines[opener]
+    coverage = Coverage(
+        source=opener,
+        heartbeat=timeline.heartbeat,
+        segments=window_segments(
+            timeline, by_source.get(opener, []), built.opening.sequence, end_sequence
+        ),
+    )
+    onset = next(
+        (
+            found
+            for found in subject_history(timeline, subject, signal, items).breaks
+            if found.through.sequence == built.opening.sequence
+        ),
+        None,
     )
 
     state: State = "closed" if built.closed_by is not None else "open"
@@ -481,6 +466,7 @@ def _incident(
         severity=latest.severity,
         opening_source=opener,
         coverage=coverage,
+        onset=onset,
         retention_bound=dict(retention),
         state=state,
         closed_by=_point(built.closed_by) if built.closed_by is not None else None,
@@ -541,45 +527,31 @@ def _retention(
     return bounds
 
 
-def _coverage(
-    source: str,
-    own: list[Observation],
-    runs: list[RunRef],
-    start: int,
-    end: int | None,
-) -> Coverage:
-    """The opening source's runs from the first failure to the close (or the
-    latest run it holds), each observed good, observed bad or unobserved."""
+def _run_unobserved(reason: str | None) -> RunUnobserved | None:
+    if reason == "hooks_off":
+        return "hooks_off"
+    if reason == "uploads_off":
+        return "uploads_off"
+    return None
 
-    outcome_at: dict[str, str] = {}
-    for observation in own:
-        if observation.outcome == "unobserved":
-            continue
-        previous = outcome_at.get(observation.run)
-        if previous != "bad":
-            outcome_at[observation.run] = observation.outcome
-    segments: list[CoverageSegment] = []
-    for run in runs:
-        if run.sequence < start or (end is not None and run.sequence > end):
-            continue
-        outcome = outcome_at.get(run.run)
-        state = (
-            "observed_bad"
-            if outcome == "bad"
-            else "observed_good"
-            if outcome == "good"
-            else "unobserved"
+
+def _heartbeat_runs(timeline: Timeline) -> tuple[RunRef, ...]:
+    """The timeline's heartbeat runs, as the runs its source holds."""
+
+    return tuple(
+        RunRef(
+            run=entry.run,
+            sequence=entry.sequence,
+            at=entry.at,
+            commit=None if entry.commit in (None, UNKNOWN) else entry.commit,
+            unobserved=_run_unobserved(entry.reason),
         )
-        if segments and segments[-1].state == state:
-            last = segments[-1]
-            segments[-1] = CoverageSegment(
-                state=state, from_run=last.from_run, to_run=run.run, runs=last.runs + 1
-            )
-        else:
-            segments.append(
-                CoverageSegment(state=state, from_run=run.run, to_run=run.run, runs=1)
-            )
-    return Coverage(source=source, segments=tuple(segments))
+        for entry in timeline.entries
+        if entry.kind == "run"
+        and entry.in_heartbeat
+        and entry.run is not None
+        and entry.sequence is not None
+    )
 
 
 def _schedule(
@@ -590,34 +562,44 @@ def _schedule(
 ) -> Schedule:
     """The median gap between dated points, or ``unknown`` with too few."""
 
-    dated = sorted({_utc(at) for at in times if at is not None})
-    if len(dated) < _MIN_SCHEDULE_POINTS:
-        return Schedule(basis="unknown", source=source, points=len(dated))
-    gaps = [
-        (later - earlier).total_seconds()
-        for earlier, later in itertools.pairwise(dated)
-    ]
-    median = float(statistics.median(gaps))
+    median, points = median_gap(times)
+    if median is None:
+        return Schedule(basis="unknown", source=source, points=points)
     return Schedule(
         basis="derived",
         series=series,
         source=source,
         median_gap_seconds=median,
-        points=len(dated),
+        points=points,
         allowance_seconds=max(allowance.gaps * median, allowance.floor_seconds),
     )
 
 
 def _latest_time(items: Iterable[Observation]) -> datetime | None:
-    dated = [_utc(o.at) for o in items if o.at is not None]
+    dated = [utc(o.at) for o in items if o.at is not None]
     return max(dated) if dated else None
 
 
-def _utc(moment: datetime) -> datetime:
-    """The instant in UTC; a time with no zone is read as UTC, as dbt writes
-    ``generated_at``. An aware time is converted, so two wall-clock times a
-    DST change repeats stay two instants."""
-
-    if moment.tzinfo is None:
-        return moment.replace(tzinfo=UTC)
-    return moment.astimezone(UTC)
+__all__ = [
+    "DEFAULT_CLOSE_AFTER",
+    "DEFAULT_STALE_AFTER_GAPS",
+    "DEFAULT_STALE_FLOOR_SECONDS",
+    "UNKNOWN",
+    "Break",
+    "Coverage",
+    "CoverageSegment",
+    "Incident",
+    "IncidentFold",
+    "IncidentObservation",
+    "Observation",
+    "ObservedPoint",
+    "Outcome",
+    "RunRef",
+    "RunUnobserved",
+    "Schedule",
+    "Signal",
+    "SourceHistory",
+    "State",
+    "Subject",
+    "fold_incidents",
+]
