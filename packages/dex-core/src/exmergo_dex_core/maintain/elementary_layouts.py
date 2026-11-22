@@ -66,6 +66,14 @@ COLUMN_MISSING = "elementary_column_missing"
 COLUMN_RETYPED = "elementary_column_retyped"
 CATALOG_TOO_LARGE = "elementary_catalog_too_large"
 
+#: The tables the reader reads, which every recorded release must lay out.
+TABLES: tuple[str, ...] = (
+    "elementary_test_results",
+    "dbt_invocations",
+    "test_result_rows",
+    "data_monitoring_metrics",
+)
+
 #: The most columns read from one table's catalog listing. The widest table at
 #: 0.26.1 declares 35, and ``on_schema_change: append_new_columns`` only adds
 #: the columns later releases declare, so a listing past this is not a table
@@ -109,6 +117,10 @@ _CATALOG_FAMILIES: Mapping[str, frozenset[str]] = {
             "UINT64",
             "UINT128",
             "UINT256",
+            # Databricks' type_name, where a column has no type_text.
+            "LONG",
+            "SHORT",
+            "BYTE",
         }
     ),
     "float": frozenset(
@@ -129,7 +141,10 @@ _CATALOG_FAMILIES: Mapping[str, frozenset[str]] = {
 
 #: Exact numeric types, an integer where their scale is absent or zero.
 #: Snowflake's catalog token ``FIXED`` carries no scale, and is how it lists
-#: every ``NUMBER``, ``bigint`` included.
+#: every ``NUMBER``, ``bigint`` included. So a scale the catalog does not show
+#: (Snowflake's token, a bare ``numeric`` on Postgres or Redshift) reads as an
+#: integer: an integer column retyped to such a decimal passes. The package
+#: declares no decimal column at 0.26.1.
 _EXACT_NUMERIC = frozenset({"NUMBER", "NUMERIC", "DECIMAL", "FIXED"})
 
 #: Wrappers that say nothing about the family (ClickHouse).
@@ -267,6 +282,12 @@ def _parse_release(release: str, raw: Mapping[str, Any]) -> ReleaseLayout:
         str(name): _parse_table(str(name), table)
         for name, table in raw["tables"].items()
     }
+    # A release recording fewer tables, or a table reading nothing, would pass
+    # a catalog that holds none of what the reader reads.
+    if missing := sorted(set(TABLES) - set(tables)):
+        raise ValueError(f"{release} records no layout for {missing}")
+    if empty := sorted(name for name, table in tables.items() if not table.reads):
+        raise ValueError(f"{release} reads no column of {empty}")
     return ReleaseLayout(release, tables)
 
 
@@ -280,6 +301,9 @@ def parse_layouts(text: str) -> Mapping[str, ReleaseLayout]:
     }
     if not layouts:
         raise ValueError("the layout file records no release")
+    keys = [release_key(release) for release in layouts]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"the layout file records one release twice: {list(layouts)}")
     return layouts
 
 
@@ -345,10 +369,9 @@ def type_family(data_type: str) -> str | None:
 
 def _listed(table: str, catalog: Catalog) -> list[ColumnMeta]:
     try:
-        listing = catalog(table)
+        return list(itertools.islice(catalog(table), MAX_CATALOG_COLUMNS + 1))
     except LookupError:
         return []
-    return list(itertools.islice(listing, MAX_CATALOG_COLUMNS + 1))
 
 
 def _check_table(
@@ -394,6 +417,8 @@ def check_layouts(
 
     layout = layout_for(release)
     selected = list(layout.tables) if tables is None else list(tables)
+    if not selected:
+        raise ValueError("no table to check: a check of nothing is not a pass")
     if unknown := [table for table in selected if table not in layout.tables]:
         raise ValueError(f"no recorded layout for {unknown}")
     checked: list[CheckedTable] = []
@@ -415,13 +440,27 @@ def adapter_catalog(adapter: Any, namespace: str) -> Catalog:
     names relations (``dev.main_elementary`` on DuckDB, whose relations are
     ``database.schema.name``). It reads the adapter's ``table_columns`` where
     it offers one (DuckDB, whose ``table_metadata`` also counts rows) and
-    ``table_metadata`` otherwise, which answers from the catalog alone.
+    ``table_metadata`` otherwise, which answers from the catalog alone. Each
+    relation is first found in ``list_objects()``, the adapter's scoped
+    inventory, and named as the inventory spells it.
     """
 
     columns = getattr(adapter, "table_columns", None)
+    listed: dict[str, str] = {}
 
     def listing(table: str) -> Iterable[ColumnMeta]:
-        identifier = f"{namespace}.{table}"
+        # Every adapter but DuckDB raises its own connection error for a
+        # relation outside its inventory, so the inventory is asked first, once,
+        # and a relation it does not list reads as missing. A namespace outside
+        # the configured scope therefore reads as every table missing.
+        if not listed:
+            listed.update(
+                (meta.identifier.casefold(), meta.identifier)
+                for meta in adapter.list_objects()
+            )
+        identifier = listed.get(f"{namespace}.{table}".casefold())
+        if identifier is None:
+            raise LookupError(f"{namespace}.{table}")
         if columns is not None:
             return columns(identifier)
         return adapter.table_metadata(identifier)[1]

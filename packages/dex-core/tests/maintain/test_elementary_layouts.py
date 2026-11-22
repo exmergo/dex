@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from exmergo_dex_core.adapters.base import ColumnMeta
+from exmergo_dex_core.adapters.base import ColumnMeta, ObjectMeta
+from exmergo_dex_core.errors import ConnectorError
 from exmergo_dex_core.maintain import elementary_layouts as layouts
 from exmergo_dex_core.maintain.elementary_layouts import (
     CATALOG_TOO_LARGE,
@@ -198,6 +199,7 @@ def test_dbt_invocations_run_times_are_strings_at_0_26_1():
         ("TEXT", "text"),
         ("STRING", "text"),
         ("BIGINT", "integer"),
+        ("LONG", "integer"),
         ("INT64", "integer"),
         ("Int32", "integer"),
         ("NUMBER(38,0)", "integer"),
@@ -294,11 +296,40 @@ def test_every_reader_release_is_one_the_fixture_runs():
     assert all(reader_status(release) == "supported" for release in READER_RELEASES)
 
 
-def _one_release(release: str, reads: str = "[id]") -> str:
-    return (
-        f'releases:\n  "{release}":\n    tables:\n      t:\n        source: s\n'
+def _release_block(release: str, reads: str = "[id]", tables=TABLES) -> str:
+    """One release laying out ``tables``, each with one column, ``id``."""
+
+    body = "".join(
+        f"      {table}:\n        source: s\n"
         f"        columns:\n          - [id, long_string]\n        reads: {reads}\n"
+        for table in tables
     )
+    return f'  "{release}":\n    tables:\n{body}'
+
+
+def _one_release(release: str, reads: str = "[id]", tables=TABLES) -> str:
+    return "releases:\n" + _release_block(release, reads, tables)
+
+
+def test_a_release_that_lays_out_fewer_tables_is_refused_on_load():
+    with pytest.raises(ValueError, match="no layout for"):
+        parse_layouts(_one_release("0.26.1", tables=TABLES[:3]))
+
+
+def test_a_table_that_reads_no_column_is_refused_on_load():
+    with pytest.raises(ValueError, match="reads no column"):
+        parse_layouts(_one_release("0.26.1", reads="[]"))
+
+
+def test_one_release_recorded_twice_is_refused_on_load():
+    twice = "releases:\n" + _release_block("0.26.1") + _release_block("v0.26.1")
+    with pytest.raises(ValueError, match="twice"):
+        parse_layouts(twice)
+
+
+def test_a_check_of_no_table_is_refused_rather_than_passing():
+    with pytest.raises(ValueError, match="no table to check"):
+        check_layouts(RELEASE, FakeCatalog(), tables=[])
 
 
 def test_a_layout_for_a_release_the_fixture_does_not_run_is_refused_on_load():
@@ -344,6 +375,46 @@ def test_a_table_the_catalog_lists_nothing_for_is_missing_never_clean():
     assert [(p.code, p.table, p.column) for p in error.problems] == [
         (TABLE_MISSING, "test_result_rows", None)
     ]
+
+
+class InventoryAdapter:
+    """An adapter shaped like every connector but DuckDB: ``table_metadata``
+    raises its connection error for a relation outside its inventory, and it
+    has no ``table_columns``."""
+
+    def __init__(self, present: dict[str, list[ColumnMeta]]) -> None:
+        self.present = present
+        self.inventory_reads = 0
+
+    def list_objects(self, *, include_views: bool = True) -> list[ObjectMeta]:
+        self.inventory_reads += 1
+        return [
+            ObjectMeta(identifier, "table", "ELEMENTARY", identifier, None, None, 0)
+            for identifier in self.present
+        ]
+
+    def table_metadata(self, identifier: str):
+        if identifier not in self.present:
+            raise ConnectorError(f"object '{identifier}' not found")
+        return None, self.present[identifier]
+
+
+def test_a_table_outside_an_adapter_s_inventory_reads_as_missing():
+    # Upper case, as Snowflake's inventory spells it, and one table absent.
+    present = {
+        f"DB.ELEMENTARY.{table.upper()}": _columns(table)
+        for table in TABLES
+        if table != "test_result_rows"
+    }
+    adapter = InventoryAdapter(present)
+
+    with pytest.raises(ElementaryLayoutError) as caught:
+        check_layouts(RELEASE, adapter_catalog(adapter, "db.elementary"))
+
+    assert [(p.code, p.table) for p in caught.value.problems] == [
+        (TABLE_MISSING, "test_result_rows")
+    ]
+    assert adapter.inventory_reads == 1
 
 
 def test_a_lookup_error_from_the_catalog_reads_as_a_missing_table():

@@ -1039,14 +1039,29 @@ def _results_read_back(warehouse: Path, tested: dict) -> dict[str, str]:
     for _, uid, _, status, failures, detected in results:
         assert status == statuses[uid][0], uid
         assert isinstance(detected, datetime)
-        if ".elementary." not in uid:
+        # Elementary counts its own tests' failures; dbt's count holds for the
+        # rest. The tests are the root project's, so the name says whose.
+        if not _node_name(uid).startswith("elementary_"):
             assert failures == statuses[uid][1], uid
     return {uid: result_id for result_id, uid, *_ in results}
 
 
-def _samples_and_metrics_read_back(warehouse: Path, sampled_result: str) -> None:
-    samples = _rows(warehouse, "elementary_test_results_id", "test_result_rows")
-    assert samples == [(sampled_result,)]
+def _node_name(unique_id: str) -> str:
+    """A test's name: ``test.<project>.<name>.<hash>`` without the rest."""
+
+    return unique_id.split(".")[2]
+
+
+def _samples_and_metrics_read_back(
+    warehouse: Path, result_ids: dict[str, str], sampled_result: str
+) -> None:
+    # The anomaly test writes every scored bucket here too, unsampled, so only
+    # the failing test's rows are counted; each row points at a result.
+    samples = _rows(
+        warehouse, "elementary_test_results_id, row_index", "test_result_rows"
+    )
+    assert {result_id for result_id, _ in samples} <= set(result_ids.values())
+    assert [i for r, i in samples if r == sampled_result] == [1]
 
     metrics = _rows(
         warehouse,
@@ -1107,7 +1122,7 @@ def test_the_reader_s_layouts_hold_on_the_fixture_and_its_rows_read_back(
     ran = _dbt_command(project, "run")
     tested = _dbt_command(project, "test")
     [unique] = [
-        r for r in tested["results"] if r["unique_id"].endswith(".unique_fct_id")
+        r for r in tested["results"] if _node_name(r["unique_id"]) == "unique_fct_id"
     ]
     assert (unique["status"], unique["failures"]) == ("fail", 1)
 
@@ -1117,6 +1132,8 @@ def test_the_reader_s_layouts_hold_on_the_fixture_and_its_rows_read_back(
     _built_layout_is_the_recorded_one(warehouse)
     _invocations_read_back(warehouse, ran, tested)
     result_ids = _results_read_back(warehouse, tested)
-    _samples_and_metrics_read_back(warehouse, result_ids[unique["unique_id"]])
+    _samples_and_metrics_read_back(
+        warehouse, result_ids, result_ids[unique["unique_id"]]
+    )
     _changed_layout_refuses(tmp_path, warehouse)
     assert not (tmp_path / "prod.duckdb").exists()
