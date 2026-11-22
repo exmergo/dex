@@ -274,6 +274,28 @@ def test_inventory_limit_and_all_are_no_ops_without_rank(duckdb_file: Path, caps
     assert data["elided_object_count"] == 0
 
 
+@pytest.mark.parametrize("bad_limit", ["0", "-5"])
+def test_inventory_limit_below_one_is_ignored_without_rank(
+    duckdb_file: Path, capsys, bad_limit
+):
+    # --limit is a no-op without --rank, so a non-positive value must not
+    # raise there: the unranked list is returned whole, as it always was.
+    payload = _run(
+        [
+            "explore",
+            "inventory",
+            "--limit",
+            bad_limit,
+            "--path",
+            str(duckdb_file),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 2
+    assert data["elided_object_count"] == 0
+
+
 def test_inventory_rank_honors_configured_ranking_hints(
     duckdb_file: Path, tmp_path: Path, capsys
 ):
