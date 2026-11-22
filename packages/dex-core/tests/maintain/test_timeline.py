@@ -464,6 +464,30 @@ def test_runs_only_the_observations_name_split_a_heartbeat_gap() -> None:
     assert found.missed_runs == 0 and found.reasons == ()
 
 
+def test_a_run_another_source_observed_splits_a_missed_interval() -> None:
+    # The opening source's heartbeat holds runs 1, 2, 3 and 6, so 3 to 6 is
+    # missed. Another source passed at run 5: only 3 to 5 can hold a missed
+    # run, and the break from 5 to 6 holds none.
+    runs = [_run(1), _run(2), _run(3), _run(6)]
+    observations = [_obs(3, "good"), _obs(5, "good", source=DBT), _obs(6, "bad")]
+    timeline = build_timeline(ELEMENTARY, _invocations(runs), observations)
+    history = subject_history(timeline, SUBJECT, Signal(), observations)
+    (found,) = history.breaks
+    assert found.after.run == "inv-5"  # type: ignore[union-attr]
+    assert (found.missed_runs, found.reasons) == (0, ())
+    missed = [s for s in history.segments if s.kind == "missed"]
+    assert [(s.after_run, s.before_run, s.runs) for s in missed] == [
+        ("inv-3", "inv-5", 1)
+    ]
+    fold = fold_incidents(
+        observations,
+        timelines={ELEMENTARY: timeline},
+        now=T0 + timedelta(hours=6, minutes=5),
+    )
+    onset = fold.incidents[0].onset
+    assert onset is not None and onset.missed_runs == 0
+
+
 def test_an_incident_without_a_timeline_names_no_heartbeat() -> None:
     observations = [_obs(1, "bad"), _obs(2, "bad")]
     (incident,) = fold_incidents(observations, now=T0 + timedelta(hours=2)).incidents

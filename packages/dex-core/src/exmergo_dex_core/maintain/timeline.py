@@ -304,7 +304,7 @@ def build_timeline(
                 before_sequence=later.sequence,
                 from_at=earlier.at,
                 to_at=later.at,
-                missed_runs=max(1, round(span / schedule.gap_seconds) - 1),
+                missed_runs=_missed_runs(span, schedule),
             )
 
     entries: list[TimelineEntry] = []
@@ -508,8 +508,76 @@ def _points(timeline: Timeline, items: Iterable[Observation]) -> list[_Point]:
         )
         state = "observed_bad" if outcome == "bad" else "observed_good"
         points.append(_Point("run", state, None, (float(sequence), 1), entry, point))
+    points = _split_missed(points, timeline.schedule)
     points.sort(key=lambda p: p.order)
     return points
+
+
+def _missed_runs(span_seconds: float, schedule: GapSchedule) -> int:
+    """The runs a span between two observed runs held, by the schedule."""
+
+    if (
+        schedule.missed_after_seconds is None
+        or not schedule.gap_seconds
+        or span_seconds <= schedule.missed_after_seconds
+    ):
+        return 0
+    return max(1, round(span_seconds / schedule.gap_seconds) - 1)
+
+
+def _split_missed(points: list[_Point], schedule: GapSchedule) -> list[_Point]:
+    """Split each missed interval at the runs another source observed inside
+    it: those runs happened, so only the stretches between them that the
+    schedule says held runs stay missed (#1466 review)."""
+
+    off_axis = sorted(
+        (p for p in points if p.kind == "run" and not p.entry.in_heartbeat),
+        key=lambda p: p.order,
+    )
+    if not off_axis:
+        return points
+    kept: list[_Point] = []
+    for p in points:
+        entry = p.entry
+        after, before = entry.after_sequence, entry.before_sequence
+        inside = (
+            [
+                q
+                for q in off_axis
+                if q.point is not None and after < q.point.sequence < before
+            ]
+            if p.kind == "missed" and after is not None and before is not None
+            else []
+        )
+        if not inside:
+            kept.append(p)
+            continue
+        bounds = [(after, entry.after_run, entry.from_at)]
+        bounds += [
+            (q.point.sequence, q.point.run, q.point.at) for q in inside if q.point
+        ]
+        bounds.append((before, entry.before_run, entry.to_at))
+        for (lo, lo_run, lo_at), (hi, hi_run, hi_at) in itertools.pairwise(bounds):
+            if lo_at is None or hi_at is None:
+                continue
+            count = _missed_runs((utc(hi_at) - utc(lo_at)).total_seconds(), schedule)
+            if count == 0:
+                continue
+            piece = entry.model_copy(
+                update={
+                    "after_run": lo_run,
+                    "before_run": hi_run,
+                    "after_sequence": lo,
+                    "before_sequence": hi,
+                    "from_at": lo_at,
+                    "to_at": hi_at,
+                    "missed_runs": count,
+                }
+            )
+            kept.append(
+                _Point("missed", "unobserved", p.reason, (float(hi or 0), 0), piece)
+            )
+    return kept
 
 
 def _segments(points: Iterable[_Point]) -> tuple[TimelineSegment, ...]:
