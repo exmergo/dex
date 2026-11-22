@@ -683,9 +683,9 @@ def test_a_release_above_the_newest_tested_is_unchecked_and_the_copy_stays_inert
     assert _executed(mutated) >= 1, "no mutant ran, so nothing was measured"
     assert footprint(before, duckdb_census(warehouse)) == {}
     assert any("elementary_release_untested" in w for w in mutated.warnings)
-    # The copy disables the package's models, which no release can undo; what
-    # its materialization then does is the release's, so it reads unknown.
-    assert picked and set(picked) == {"unknown"}
+    # The copy disables the package's models; what the package's materialization
+    # then does is the release's to say, so the copy also pins dbt's own.
+    assert picked and set(picked) == {"dbt"}
 
 
 @requires_elementary

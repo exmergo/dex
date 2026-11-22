@@ -1610,6 +1610,38 @@ def test_elementary_sampling_warning_when_declaring_model(
         assert not any("disable_test_samples" in w for w in warnings)
 
 
+@pytest.mark.parametrize(("release", "warns"), [("0.26.1", False), ("0.26.2", True)])
+def test_a_disabled_package_s_materialization_off_the_tested_releases_warns(
+    tmp_path: Path, release: str, warns: bool
+):
+    """The package's materialization is picked while its models are disabled.
+    On a tested release it hands each test to dbt's, so samples are not its to
+    take; on an untested one nothing says so, and the warning stays (#1445)."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    _write(tmp_path, "dbt_project.yml", project_yml(flag="false"))
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        f'name: elementary\nversion: "{release}"\n',
+    )
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="p",
+        profile_name="p",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in _project().items()
+        },
+        manifest=manifest(models="disabled", hooks="disabled"),
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+
+    assert any("elementary_release_untested" in w for w in warnings) is warns
+
+
 def test_elementary_sampling_warning_not_emitted_when_no_unsampled_tests_rendered(
     tmp_path: Path,
 ):

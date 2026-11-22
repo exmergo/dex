@@ -612,7 +612,8 @@ Runs `dbt build` against a dev target, with a cost preflight first.
   its test materialization's failed-row count and sample query
   (`elementary_test_extras`), none of which a compiled node shows. `data.unpriced`
   holds the record and a warning per kind names the work. On an Elementary
-  release outside the ones the fixture runs, or one Dex cannot read, its
+  release outside the range from the oldest release the fixture runs to the
+  newest, or one Dex cannot read, its
   `release_reason_code` (`elementary_release_untested` or
   `elementary_release_unknown`, #1445) says each kind is counted wherever it
   may run, and a warning names the release and the newest tested. Tell the user the

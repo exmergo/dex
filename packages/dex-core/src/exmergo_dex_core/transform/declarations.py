@@ -578,7 +578,10 @@ def _elementary_sampling_warning(
             if runtime.installed:
                 materialization = runtime.materialization
 
-    if materialization != "elementary":
+    # ``unknown``: the package's materialization is picked while the package is
+    # disabled, on a release Dex was not run against (#1445), so nothing says it
+    # hands the tests to dbt's.
+    if materialization not in ("elementary", "unknown"):
         return None
 
     below = _is_below_0_20(release)

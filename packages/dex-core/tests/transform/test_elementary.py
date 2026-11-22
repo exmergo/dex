@@ -1269,3 +1269,56 @@ def test_a_build_names_the_untested_release_and_lists_its_tests(tmp_path: Path):
     assert unchecked == {"test.shop.volume": "elementary_release_untested"}
     assert warning is not None
     assert MINOR_ABOVE in warning
+
+
+class _Copy:
+    """A stand-in for the mutation run's project copy: ``parse`` answers with
+    the manifest the copy's edits would give, and the override flag is written
+    into the copy's own ``dbt_project.yml``, where the resolver reads it."""
+
+    def __init__(self, root: Path) -> None:
+        self.shadow = root
+        self.models_off = False
+        _write(root, "dbt_project.yml", project_yml(flag="false"))
+
+    def parse(self) -> dict[str, Any]:
+        state = "disabled" if self.models_off else "enabled"
+        return manifest(models=state, hooks=state)
+
+    def disable_package_models(self, package: str):
+        self.models_off = True
+
+        def undo() -> None:
+            self.models_off = False
+
+        return undo
+
+    def set_project_flag(self, name: str, value: Any):
+        _write(self.shadow, "dbt_project.yml", project_yml(flag=str(value).lower()))
+        return lambda: _write(self.shadow, "dbt_project.yml", project_yml())
+
+
+@pytest.mark.parametrize(("release", "pinned"), [("0.26.1", False), ("0.26.2", True)])
+def test_the_mutation_copy_pins_dbt_s_materialization_off_the_tested_releases(
+    tmp_path: Path, release: str, pinned: bool
+):
+    """With the package's models disabled, a tested release's materialization
+    hands each test to dbt's, so the copy needs nothing more. On an untested
+    one nothing says so, and the copy sets dbt's override flag as well, so
+    dbt's own materialization runs whatever the release does (#1445)."""
+
+    from exmergo_dex_core.transform.commands import _quiet_elementary
+
+    copy = _Copy(tmp_path)
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        f'name: elementary\nversion: "{release}"\n',
+    )
+
+    _left_out, warnings = _quiet_elementary(copy)
+
+    text = (tmp_path / "dbt_project.yml").read_text(encoding="utf-8")
+    assert (f"{OVERRIDE_FLAG}: true" in text) is pinned
+    assert read(tmp_path, copy.parse()).materialization == "dbt"
+    assert any("elementary_release_untested" in w for w in warnings) is pinned

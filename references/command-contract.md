@@ -539,8 +539,9 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      compiled to its no-results query, package_disabled or
                                      compiled_to_no_results, or one judging the run against stored
                                      history dex did not measure, whenever the package is enabled,
-                                     history_unmeasured, #1308; on an Elementary release outside
-                                     the ones the fixture runs, a patch above the newest included,
+                                     history_unmeasured, #1308; on an Elementary release outside the
+                                     range from the oldest release the fixture runs to the newest (a
+                                     patch above the newest is outside it),
                                      every Elementary test its compiled SQL does not settle is
                                      elementary_release_untested, and elementary_release_unknown
                                      where the release cannot be read, #1445),
@@ -1753,8 +1754,9 @@ default, or a filter or operator after it is refused. A key naming a location
   `data.unpriced` holds the record (`work`, `hooks`, `monitoring_tests` with
   `days_back` and `days_back_source`, `monitoring_test_count`,
   `materialized_test_count`, `release`, `release_reason_code`), and one warning
-  per kind says what was left out. On an Elementary release outside the ones
-  the fixture runs, or one that cannot be read (#1445), `release_reason_code`
+  per kind says what was left out. On an Elementary release outside the range
+  from the oldest release the fixture runs to the newest, or one that cannot
+  be read (#1445), `release_reason_code`
   is `elementary_release_untested` or `elementary_release_unknown`, each kind
   is counted wherever it may run (hooks that would return early, the monitoring
   tests and the materialization's extras of a disabled package, and the
