@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -935,4 +936,216 @@ def test_the_offered_install_runs_nothing_of_the_package_on_dev(
 
     prod = read(project, _parsed(project, "prod"))
     assert (prod.enabled, prod.hooks) == (True, "run")
+    assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- the reader's table layouts (#1469) ---------------------------------------------
+
+
+def _rows(warehouse: Path, columns: str, table: str, where: str = "") -> list[tuple]:
+    """``columns`` of one of Elementary's tables, read-only. Every argument is a
+    literal in this file, never a value read from the warehouse."""
+
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(str(warehouse), read_only=True)
+    sql = f"select {columns} from {ELEMENTARY_SCHEMA}.{table} {where}"  # noqa: S608
+    try:
+        return con.execute(sql).fetchall()
+    finally:
+        con.close()
+
+
+def _built_columns(warehouse: Path, table: str) -> list[tuple]:
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(str(warehouse), read_only=True)
+    try:
+        return con.execute(
+            "select column_name, data_type from information_schema.columns "
+            "where table_schema = ? and table_name = ? order by ordinal_position",
+            [ELEMENTARY_SCHEMA, table],
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _dbt_command(project: Path, command: str) -> dict:
+    """Run ``command`` and return the run results it wrote."""
+
+    run_results = project / "target" / "run_results.json"
+    run_results.unlink(missing_ok=True)
+    project_args = ("--project-dir", str(project), "--profiles-dir", str(project))
+    log = dbt(command, *project_args, cwd=project, check=False)
+    assert run_results.exists(), f"dbt {command} wrote no run results:\n{log}"
+    return json.loads(run_results.read_text(encoding="utf-8"))
+
+
+def _layout_check(warehouse: Path, release: str | None):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.maintain.elementary_layouts import (
+        adapter_catalog,
+        check_layouts,
+    )
+
+    adapter = DuckDBAdapter(warehouse)
+    try:
+        catalog = adapter_catalog(adapter, f"dev.{ELEMENTARY_SCHEMA}")
+        return check_layouts(release, catalog)
+    finally:
+        adapter.close()
+
+
+def _built_layout_is_the_recorded_one(warehouse: Path) -> None:
+    """Every column the package built, in order and family, is the recorded one."""
+
+    from exmergo_dex_core.maintain.elementary_layouts import layout_for, type_family
+
+    for table, layout in layout_for(CURRENT_VERSION).tables.items():
+        built = _built_columns(warehouse, table)
+        assert [name for name, _ in built] == [name for name, _ in layout.columns]
+        for name, data_type in built:
+            assert type_family(data_type) == layout.family(name), (table, name)
+
+
+def _invocations_read_back(warehouse: Path, ran: dict, tested: dict) -> None:
+    invocations = _rows(
+        warehouse,
+        "invocation_id, command, elementary_version, run_started_at, created_at",
+        "dbt_invocations",
+    )
+    assert {(i, c) for i, c, *_ in invocations} == {
+        (ran["metadata"]["invocation_id"], "run"),
+        (tested["metadata"]["invocation_id"], "test"),
+    }
+    for _, _, version, started, created in invocations:
+        assert version == CURRENT_VERSION
+        # A string at 0.26.1, as the recorded layout says, and an ISO time.
+        assert isinstance(started, str)
+        assert datetime.fromisoformat(started)
+        assert isinstance(created, datetime)
+
+
+def _results_read_back(warehouse: Path, tested: dict) -> dict[str, str]:
+    """Each test's rows against dbt's own result; ``{test_unique_id: id}``."""
+
+    # Run results also hold the package's on-run-start and on-run-end
+    # operations, which write no test result.
+    statuses = {
+        r["unique_id"]: (r["status"], r["failures"])
+        for r in tested["results"]
+        if r["unique_id"].startswith("test.")
+    }
+    results = _rows(
+        warehouse,
+        "id, test_unique_id, invocation_id, status, failures, detected_at",
+        "elementary_test_results",
+    )
+    assert len({row[0] for row in results}) == len(results)
+    assert {row[2] for row in results} == {tested["metadata"]["invocation_id"]}
+    assert {row[1] for row in results} == set(statuses)
+    for _, uid, _, status, failures, detected in results:
+        assert isinstance(detected, datetime)
+        # Elementary counts its own tests' failures, and marks an anomaly row
+        # with none `pass` whatever dbt said (get_normalized_test_status,
+        # handle_tests_results.sql:62-76); dbt's status and count hold for the
+        # rest. The tests are the root project's, so the name says whose.
+        if _node_name(uid).startswith("elementary_"):
+            assert status in {statuses[uid][0], "pass"}, uid
+        else:
+            assert (status, failures) == statuses[uid], uid
+    return {uid: result_id for result_id, uid, *_ in results}
+
+
+def _node_name(unique_id: str) -> str:
+    """A test's name: ``test.<project>.<name>.<hash>`` without the rest."""
+
+    return unique_id.split(".")[2]
+
+
+def _samples_and_metrics_read_back(
+    warehouse: Path, result_ids: dict[str, str], sampled_result: str
+) -> None:
+    # The anomaly test writes every scored bucket here too, unsampled, so only
+    # the failing test's rows are counted; each row points at a result.
+    samples = _rows(
+        warehouse, "elementary_test_results_id, row_index", "test_result_rows"
+    )
+    assert {result_id for result_id, _ in samples} <= set(result_ids.values())
+    assert [i for r, i in samples if r == sampled_result] == [1]
+
+    metrics = _rows(
+        warehouse,
+        "id, bucket_start, bucket_end, bucket_duration_hours, metric_value",
+        "data_monitoring_metrics",
+        "where metric_name = 'row_count' and lower(full_table_name) like '%.fct'",
+    )
+    assert metrics
+    assert len({m[0] for m in metrics}) == len(metrics)
+    for _, start, end, hours, value in metrics:
+        assert hours == 24
+        assert end - start == timedelta(hours=24)
+        assert value >= 0
+
+
+def _changed_layout_refuses(tmp_path: Path, warehouse: Path) -> None:
+    """The other arm, on a copy of the same warehouse: a layout it does not know."""
+
+    from exmergo_dex_core.maintain.elementary_layouts import ElementaryLayoutError
+
+    changed = tmp_path / "changed" / "dev.duckdb"
+    changed.parent.mkdir()
+    shutil.copy(warehouse, changed)
+    _execute(
+        changed,
+        f"alter table {ELEMENTARY_SCHEMA}.dbt_invocations drop column created_at",
+        f"alter table {ELEMENTARY_SCHEMA}.elementary_test_results "
+        "alter detected_at type varchar",
+    )
+    with pytest.raises(ElementaryLayoutError) as caught:
+        _layout_check(changed, CURRENT_VERSION)
+    assert [(p.code, p.table, p.column) for p in caught.value.problems] == [
+        ("elementary_column_retyped", "elementary_test_results", "detected_at"),
+        ("elementary_column_missing", "dbt_invocations", "created_at"),
+    ]
+
+
+@requires_elementary
+def test_the_reader_s_layouts_hold_on_the_fixture_and_its_rows_read_back(
+    tmp_path: Path, installed_elementary: Path
+):
+    """#1469 at 0.26.1, on variant a, where Elementary's materialization handles
+    the tests. One duplicated key makes the grain's ``unique`` test fail on one
+    value, with its sampling switch removed so the sample is written. The
+    catalog check passes on what the package built, the built layout is the
+    recorded one column for column, and each table reads back to what the two
+    runs did. A copy with one column dropped and one retyped refuses."""
+
+    # Imported before any dbt run, so a reader that is absent fails here.
+    from exmergo_dex_core.maintain.elementary_layouts import READER_RELEASES
+    from exmergo_dex_core.transform.elementary import read
+
+    assert CURRENT_VERSION in READER_RELEASES
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    warehouse = tmp_path / "dev.duckdb"
+    _execute(
+        warehouse,
+        "insert into main.raw_orders select * from main.raw_orders where id = 1",
+    )
+    _strip_sampling_switch(project)
+    ran = _dbt_command(project, "run")
+    tested = _dbt_command(project, "test")
+    [unique] = [
+        r for r in tested["results"] if _node_name(r["unique_id"]) == "unique_fct_id"
+    ]
+    assert (unique["status"], unique["failures"]) == ("fail", 1)
+
+    manifest = json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+    check = _layout_check(warehouse, read(project, manifest).release)
+    assert check.release == CURRENT_VERSION
+    _built_layout_is_the_recorded_one(warehouse)
+    _invocations_read_back(warehouse, ran, tested)
+    result_ids = _results_read_back(warehouse, tested)
+    _samples_and_metrics_read_back(
+        warehouse, result_ids, result_ids[unique["unique_id"]]
+    )
+    _changed_layout_refuses(tmp_path, warehouse)
     assert not (tmp_path / "prod.duckdb").exists()

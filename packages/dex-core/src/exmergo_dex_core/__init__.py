@@ -87,6 +87,7 @@ _EXPORTS = {
     "DexError": "errors",
     "DialectDependencyError": "guards.dialect",
     "Document": "storage",
+    "ElementaryLayoutError": "maintain.elementary_layouts",
     "ExpectationError": "transform.expected_change",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
@@ -205,6 +206,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.dialect import DialectDependencyError
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
+    from .maintain.elementary_layouts import ElementaryLayoutError
     from .maintain.snapshot import Snapshot
     from .metric_views.dependency import MetricViewDependencyError
     from .metric_views.ossie_bridge import ConversionError
@@ -297,6 +299,7 @@ __all__ = [
     "DexError",
     "DialectDependencyError",
     "Document",
+    "ElementaryLayoutError",
     "ExpectationError",
     "ExploreStore",
     "FilesystemStore",
