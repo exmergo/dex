@@ -652,9 +652,12 @@ def test_a_release_above_the_newest_tested_is_unchecked_and_the_copy_stays_inert
         t.test: (t.models, t.reason_code)
         for t in result.completion.assurance.unchecked_tests or []
     }
-    assert listed == dict.fromkeys(
+    assert {name: listed.get(name) for name in ELEMENTARY_FCT_TESTS} == dict.fromkeys(
         ELEMENTARY_FCT_TESTS, (["fct"], "elementary_release_untested")
     )
+    assert {code for _, code in listed.values()} == {"elementary_release_untested"}
+    # dbt's own tests on fct still pass and still count.
+    assert "fct" in result.completion.assurance.asserted.names
     assert any(
         release in w and CURRENT_VERSION in w and "elementary_release_untested" in w
         for w in result.warnings
@@ -714,7 +717,10 @@ def test_an_unreadable_installed_project_file_reports_the_release_unknown(
     assert record.installed
     assert record.release is None
     assert record.release_reason_code == "elementary_release_unknown"
-    assert listed == dict.fromkeys(ELEMENTARY_FCT_TESTS, "elementary_release_unknown")
+    assert {name: listed.get(name) for name in ELEMENTARY_FCT_TESTS} == dict.fromkeys(
+        ELEMENTARY_FCT_TESTS, "elementary_release_unknown"
+    )
+    assert set(listed.values()) == {"elementary_release_unknown"}
     assert work.as_dict()["release_reason_code"] == "elementary_release_unknown"
     assert "elementary_release_unknown" in (record.release_warning() or "")
 
