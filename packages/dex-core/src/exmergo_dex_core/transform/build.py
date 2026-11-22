@@ -3055,16 +3055,21 @@ def _summarize(
         for result in results:
             status = str(result.get("status", "unknown"))
             unique_id = str(result.get("unique_id", ""))
-            nodes.append(
-                {
-                    "name": manifest_node_label(
-                        unique_id, manifest_nodes.get(unique_id)
-                    ),
-                    "unique_id": unique_id,
-                    "status": status,
-                    "execution_time": result.get("execution_time"),
-                }
-            )
+            node: dict[str, Any] = {
+                "name": manifest_node_label(unique_id, manifest_nodes.get(unique_id)),
+                "unique_id": unique_id,
+                "status": status,
+                "execution_time": result.get("execution_time"),
+            }
+            # dbt's count of failing rows for a test, so a consumer need not
+            # parse it out of the message (issue #1553). Only a number dbt
+            # recorded, a zero included; a test that never ran to a count (a
+            # compilation error) and every model leave it out. The failing rows
+            # and the message stay behind.
+            failures = result.get("failures")
+            if isinstance(failures, int) and not isinstance(failures, bool):
+                node["failures"] = failures
+            nodes.append(node)
             counts[status] = counts.get(status, 0) + 1
             # dbt-bigquery stamps per-node billing into adapter_response; free
             # adapters do not, so the key's absence means nothing to report.
