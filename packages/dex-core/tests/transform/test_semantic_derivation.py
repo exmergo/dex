@@ -1536,9 +1536,9 @@ def test_a_replacement_name_stays_clear_of_another_mart_in_the_plan(
     assert "name: world_output_daily_output_day\n" in models[other]["content"]
 
 
-def test_a_fallback_entity_name_never_takes_a_dimension_name_the_plan_holds():
-    """The foreign key's join name `record` is the primary entity's, so it falls
-    back to `readings`, a dimension another mart in the plan declares: numbered."""
+def test_a_foreign_key_whose_join_name_this_model_holds_is_not_derived():
+    """`id` references `fct_records.record_id`, whose entity `record` is also this
+    model's primary: no other name could join it, so it is left out and said so."""
     records = {
         "name": "records",
         "entities": [{"name": "record", "type": "primary", "expr": "record_id"}],
@@ -1557,21 +1557,15 @@ def test_a_fallback_entity_name_never_takes_a_dimension_name_the_plan_holds():
         declared,
         column_types={"read_at": ("date", None)},
         on_ref={"fct_records": [("models/marts/records.yml", records)]},
-        reserved={"dimension": {"readings"}},
     )
 
-    assert found.body["entities"][1] == {
-        "name": "readings_2",
-        "type": "foreign",
-        "expr": "id",
-    }
-    free = sd.derive(
-        "fct_readings",
-        declared,
-        column_types={"read_at": ("date", None)},
-        on_ref={"fct_records": [("models/marts/records.yml", records)]},
-    )
-    assert free.body["entities"][1]["name"] == "readings"
+    assert found.body["entities"] == [
+        {"name": "record", "type": "primary", "expr": "record_id"}
+    ]
+    assert any(
+        limitation.startswith("id: references fct_records.record_id, whose entity")
+        for limitation in found.limitations
+    ), found.limitations
 
 
 # Name order picks which mart of the cycle derives first: both orders.
@@ -2174,5 +2168,77 @@ def test_foreign_keys_that_only_reference_each_other_are_not_derived(
     models = envelope["data"]["semantic_proposal"]["models"]
     assert any(
         "references fct_betas.alpha_id" in limitation
+        for limitation in models["fct_alphas"]["limitations"]
+    ), models["fct_alphas"]
+
+
+def test_a_foreign_key_to_an_anchored_entity_this_model_holds_is_not_derived(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_betas.alpha_id` joins `fct_alphas`' primary `alpha`; `fct_alphas.beta_id`
+    references that column, so its entity would be `alpha`, the model's own
+    primary. It is left out rather than offered as a `beta_2` that joins nothing."""
+
+    def mart(model: str, grain: str, column: str, ref: str) -> dict:
+        return {
+            "model": model,
+            "description": f"One row per {grain}.",
+            "grain": [grain],
+            "columns": {
+                grain: {"role": "key"},
+                "event_date": {"role": "time"},
+                column: {"role": "foreign_key", "references": ref},
+                "amount": {"role": "measure", "aggregation": "sum"},
+            },
+        }
+
+    marts = [
+        mart("fct_alphas", "alpha_id", "beta_id", "fct_betas.alpha_id"),
+        mart("fct_betas", "beta_id", "alpha_id", "fct_alphas.alpha_id"),
+    ]
+    body = {
+        "edits": [
+            {
+                "path": f"models/marts/{m['model']}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select "
+                    + ", ".join(
+                        "current_date as event_date"
+                        if c == "event_date"
+                        else f"1 as {c}"
+                        for c in m["columns"]
+                    )
+                    + "\n"
+                ),
+            }
+            for m in marts
+        ],
+        "declarations": marts,
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "anchored",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert offered["fct_alphas"]["entities"] == [
+        {"name": "alpha", "type": "primary", "expr": "alpha_id"}
+    ]
+    assert {"name": "alpha", "type": "foreign", "expr": "alpha_id"} in (
+        offered["fct_betas"]["entities"]
+    )
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert any(
+        "whose entity 'alpha'" in limitation
         for limitation in models["fct_alphas"]["limitations"]
     ), models["fct_alphas"]

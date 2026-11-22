@@ -335,6 +335,16 @@ def derive(
             limitations.append(f"{name}: {reason}; the foreign key is not derived")
             reasons[f"columns.{name}"] = reason
             continue
+        if entity in used_names and joined is not None:
+            # the referenced column's entity is one this model already names, so
+            # no other name could join it: leave it out rather than offer one
+            reason = (
+                f"references {references}, whose entity '{entity}' this semantic "
+                "model already uses, so it cannot join it"
+            )
+            limitations.append(f"{name}: {reason}; the foreign key is not derived")
+            reasons[f"columns.{name}"] = reason
+            continue
         if entity in used_names:
             fallback = _entity_name(name, model)
             if fallback in incompatible | layer["entity"]:
