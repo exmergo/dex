@@ -392,8 +392,9 @@ jobs:
     # fork could spend.
     runs-on: ubuntu-latest
     # 30, not the 15 the other jobs take: the Elementary step below builds six
-    # variants at two package releases and took about 6.5 minutes alone in a
-    # local run, on top of the suite that already fit in 15.
+    # variants at two package releases, about 9.5 minutes on a hosted runner,
+    # and the whole job took about 13 (2026-11-22), leaving room for a third
+    # release.
     timeout-minutes: 30
     defaults:
       run:
@@ -476,7 +477,8 @@ jobs:
     # rather than in ci.yml because installing the package needs the network,
     # and pull requests stay deterministic (#1380).
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The file took about 15 minutes on a hosted runner (2026-11-22).
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/dex-core
