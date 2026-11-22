@@ -3596,6 +3596,11 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
         return [], []
     warnings: list[str] = []
     manifest = shadow.parse()
+    # The copy is made inert the same way on any release (#1445); a release
+    # dex was not run against is named rather than read as a known one.
+    release_warning = elementary_mod.read(root, manifest).release_warning()
+    if release_warning is not None:
+        warnings.append(release_warning)
     dependents = elementary_mod.package_model_dependents(manifest)
     disabled = False
     if dependents:
@@ -8081,6 +8086,9 @@ def _attach_completion(
     try:
         states = inputs.get("comparisons")
         diagnosed = _attach_prerequisites(result, inputs)
+        release_warning = _elementary_release_warning(inputs)
+        if release_warning is not None:
+            result.warnings.append(release_warning)
         result.completion = summarize_completion(
             result.evidence,
             result.verification,
@@ -8122,7 +8130,8 @@ def _attach_completion(
             result.warnings.append(
                 f"{unchecked} passing Elementary test(s) are not counted toward "
                 "any model's assurance (compiled to the package's no-results "
-                "query, or judged against history dex did not measure); they are "
+                "query, judged against history dex did not measure, or run by an "
+                "Elementary release dex was not run against); they are "
                 "under data.completion.assurance.unchecked_tests with a "
                 "reason_code, any past the list's cap counted in "
                 "data.completion.elided"
@@ -8143,6 +8152,28 @@ def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
     effort: an unreadable manifest leaves every test counted as it was.
     """
 
+    runtime = _elementary_runtime(inputs)
+    if runtime is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        return dict(elementary_mod.unchecked_tests(inputs["manifest"], runtime)) or None
+    return None
+
+
+def _elementary_release_warning(inputs: dict[str, Any]) -> str | None:
+    """The warning for an Elementary release dex was not run against (#1445),
+    ``None`` where the release is supported or the package is not installed."""
+
+    runtime = _elementary_runtime(inputs)
+    return runtime.release_warning() if runtime is not None else None
+
+
+def _elementary_runtime(inputs: dict[str, Any]) -> Any:
+    """What the installed Elementary package does for the build's target, read
+    from the build's own manifest; ``None`` where it cannot be read."""
+
     manifest = inputs.get("manifest")
     project = inputs.get("project")
     if not isinstance(manifest, dict) or project is None:
@@ -8150,8 +8181,7 @@ def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
     from . import elementary as elementary_mod
 
     with contextlib.suppress(Exception):
-        runtime = elementary_mod.read(project, manifest)
-        return dict(elementary_mod.unchecked_tests(manifest, runtime)) or None
+        return elementary_mod.read(project, manifest)
     return None
 
 

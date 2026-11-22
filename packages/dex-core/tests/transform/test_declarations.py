@@ -1523,6 +1523,26 @@ def test_only_a_model_walking_a_snapshots_versions_is_asked_for_history(sql, owe
             False,
             None,
         ),
+        # Above the newest release the fixture runs (#1445): that the flag is
+        # still read is not taken from the releases before it.
+        (
+            "0.26.2",
+            "elementary",
+            True,
+            (
+                "installed Elementary release 0.26.2 is newer than the newest "
+                "release dex was run against (0.26.1), so whether it honours "
+                "disable_test_samples is unchecked (elementary_release_untested); "
+                "set test_sample_row_count: 0 for the project to keep samples off "
+                "whatever it does"
+            ),
+        ),
+        (
+            "0.26.2",
+            "dbt",
+            False,
+            None,
+        ),
         (
             None,
             "elementary",

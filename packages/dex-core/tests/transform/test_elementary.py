@@ -20,12 +20,25 @@ from exmergo_dex_core.transform.elementary import (
     monitoring_tests,
     package_model_dependents,
     read,
-    resolve,
     unchecked_tests,
 )
+from exmergo_dex_core.transform.elementary import resolve as _resolve
+
+from .elementary_fixture import CURRENT_VERSION, LEGACY_VERSIONS, VERSIONS
 
 ROOT = "shop"
 ELEMENTARY_MAT = "macro.elementary.materialization_test_default"
+
+
+def resolve(built: dict[str, Any], text: str | None, **kwargs: Any):
+    """The resolver at a release the fixture runs, unless a case names another.
+
+    What a release Dex was not run against does to the record is its own
+    section below (#1445); every other case is about what it sets itself.
+    """
+
+    kwargs.setdefault("release", CURRENT_VERSION)
+    return _resolve(built, text, **kwargs)
 
 
 def _macro(package: str, name: str, *, depends: tuple[str, ...] = (), sql: str = ""):
@@ -671,11 +684,12 @@ def _built(models: str | None = "enabled", hooks: str | None = "enabled"):
     return built
 
 
-def _work(built, flag=False, vars_=None, selected=None):
+def _work(built, flag=False, vars_=None, selected=None, release=CURRENT_VERSION):
     from exmergo_dex_core.transform.elementary import unpriced_work
 
     text = project_yml(flag=flag, vars_=vars_)
-    return unpriced_work(resolve(built, text), built, text, selected=selected)
+    record = resolve(built, text, release=release)
+    return unpriced_work(record, built, text, selected=selected)
 
 
 def test_elementary_s_materialization_owes_all_three_kinds_of_work():
@@ -870,8 +884,8 @@ def _with_tests(built: dict[str, Any], compiled: dict[str, str | None]) -> dict:
     return built
 
 
-def _classified(built: dict[str, Any]) -> dict[str, str]:
-    record = resolve(built, project_yml())
+def _classified(built: dict[str, Any], **kwargs: Any) -> dict[str, str]:
+    record = resolve(built, project_yml(), **kwargs)
     return {
         uid.split(".")[2]: reason
         for uid, reason in unchecked_tests(built, record).items()
@@ -940,3 +954,318 @@ def test_a_project_without_the_package_has_no_unchecked_tests():
     built = manifest(elementary=False)
     built = _with_tests(built, {"not_null_fct_id": NO_RESULTS})
     assert unchecked_tests(built, resolve(built, project_yml())) == {}
+
+
+# --- the releases Dex was run against (#1445) ------------------------------------
+
+#: Every release the Elementary fixture installs.
+FIXTURE_RELEASES = {*VERSIONS, *LEGACY_VERSIONS}
+
+
+def _parts(release: str) -> list[int]:
+    return [int(part) for part in release.split(".")]
+
+
+def _newest() -> list[int]:
+    return max(_parts(r) for r in FIXTURE_RELEASES)
+
+
+def _oldest() -> list[int]:
+    return min(_parts(r) for r in FIXTURE_RELEASES)
+
+
+#: A patch above the newest release the fixture runs, a minor above it, and a
+#: minor below the oldest, each derived from the fixture so none goes stale.
+_NEWEST, _OLDEST = _newest(), _oldest()
+PATCH_ABOVE = f"{_NEWEST[0]}.{_NEWEST[1]}.{_NEWEST[2] + 1}"
+MINOR_ABOVE = f"{_NEWEST[0]}.{_NEWEST[1] + 1}.0"
+MINOR_BELOW = f"{_OLDEST[0]}.{_OLDEST[1] - 1}.0"
+UNTESTED = (PATCH_ABOVE, MINOR_ABOVE, MINOR_BELOW)
+
+
+def test_the_tested_releases_are_the_ones_the_fixture_runs():
+    """The range is derived from the fixture, so the two cannot drift apart: a
+    release added to the fixture, or dropped from it, fails here until the
+    engine's list says the same."""
+
+    from exmergo_dex_core.transform import elementary
+
+    assert sorted(elementary.TESTED_RELEASES) == sorted(FIXTURE_RELEASES)
+    assert _parts(elementary.NEWEST_TESTED) == _newest()
+    assert _parts(elementary.OLDEST_TESTED) == _oldest()
+    assert elementary.NEWEST_TESTED == CURRENT_VERSION
+
+
+@pytest.mark.parametrize(
+    ("release", "status"),
+    [
+        *[(r, "supported") for r in sorted(FIXTURE_RELEASES)],
+        # Inside the range: supported, with #1381's warning below 0.20.0.
+        ("0.20.0", "supported"),
+        ("0.18.1", "supported"),
+        ("v0.20.0", "supported"),
+        # A patch above the newest is untested too, and so is a prerelease of it.
+        (PATCH_ABOVE, "untested"),
+        (f"{PATCH_ABOVE}-rc.1", "untested"),
+        (MINOR_ABOVE, "untested"),
+        ("1.0.0", "untested"),
+        (MINOR_BELOW, "untested"),
+        (f"{'.'.join(map(str, _oldest()))}-rc.1", "untested"),
+        (None, "unknown"),
+        ("", "unknown"),
+        ("0.26", "unknown"),
+        ("unknown-build-42", "unknown"),
+        ("{{ var('elementary_version') }}", "unknown"),
+    ],
+)
+def test_a_release_is_supported_only_inside_the_tested_range(release, status):
+    from exmergo_dex_core.transform.elementary import release_status
+
+    assert release_status(release) == status
+
+
+@pytest.mark.parametrize("release", sorted(FIXTURE_RELEASES))
+def test_a_tested_release_carries_no_release_reason_code(release):
+    record = resolve(manifest(), project_yml(), release=release)
+
+    assert record.release_status == "supported"
+    assert record.release_reason_code is None
+    assert record.release_warning() is None
+    assert record.hooks == "run"
+
+
+@pytest.mark.parametrize("release", UNTESTED)
+def test_on_an_untested_release_what_the_hooks_do_is_unknown(release):
+    """Hooks that would run, or return early on the package's own enabled
+    check, are ``unknown``, and so is every upload they would perform."""
+
+    running = resolve(manifest(), project_yml(), release=release)
+    early = resolve(manifest(models="disabled"), project_yml(), release=release)
+
+    for record in (running, early):
+        assert record.release_status == "untested"
+        assert record.release_reason_code == "elementary_release_untested"
+        assert record.hooks == "unknown"
+        assert record.uploads == dict.fromkeys(UPLOAD_VARS, None)
+        assert any(release in note or "untested" in note for note in record.notes)
+
+
+def test_a_release_that_cannot_be_read_is_unknown():
+    record = resolve(manifest(), project_yml(), release=None)
+
+    assert record.release_status == "unknown"
+    assert record.release_reason_code == "elementary_release_unknown"
+    assert record.hooks == "unknown"
+
+
+@pytest.mark.parametrize("release", [*UNTESTED, None])
+def test_what_dbt_settles_is_read_on_any_release(release):
+    """Whether the package's models and hooks are enabled, and which ``test``
+    materialization dbt picks, are dbt's to say, not the release's."""
+
+    from exmergo_dex_core.transform.elementary import release_status
+
+    disabled = resolve(
+        manifest(models="disabled", hooks="disabled"), project_yml(), release=release
+    )
+    absent = resolve(manifest(hooks=None), project_yml(), release=release)
+    picked = resolve(manifest(), project_yml(flag="false"), release=release)
+    passed_over = resolve(manifest(), project_yml(flag="true"), release=release)
+
+    assert (disabled.enabled, disabled.hooks) == (False, "disabled")
+    assert not any(disabled.uploads.values())
+    assert absent.hooks == "absent"
+    assert (picked.materialization, picked.materialization_macro) == (
+        "elementary",
+        ELEMENTARY_MAT,
+    )
+    assert passed_over.materialization == "dbt"
+    assert disabled.release_status == release_status(release)
+
+
+@pytest.mark.parametrize("release", [*UNTESTED, None])
+def test_the_package_s_materialization_off_its_tested_releases_is_unknown(release):
+    """Where the package is disabled, its materialization hands each test to
+    dbt's on the releases Dex read; on another, nothing says it does."""
+
+    record = resolve(
+        manifest(models="disabled", hooks="disabled"),
+        project_yml(flag="false"),
+        release=release,
+    )
+
+    assert record.materialization_macro == ELEMENTARY_MAT
+    assert record.materialization == "unknown"
+
+
+def test_the_warning_names_the_release_read_and_the_newest_tested():
+    untested = resolve(manifest(), project_yml(), release=PATCH_ABOVE)
+    unknown = resolve(manifest(), project_yml(), release=None)
+
+    said = untested.release_warning()
+    assert said is not None
+    assert PATCH_ABOVE in said
+    assert CURRENT_VERSION in said
+    assert "elementary_release_untested" in said
+    said = unknown.release_warning()
+    assert said is not None
+    assert CURRENT_VERSION in said
+    assert "elementary_release_unknown" in said
+
+
+@pytest.mark.parametrize(
+    "own",
+    [
+        b'name: elementary\nversion: "0.26.1\n  - [',
+        b"\xff\xfename: elementary\n",
+        b"name: elementary\n",
+        b"name: elementary\nversion: \"{{ var('v') }}\"\n",
+    ],
+    ids=["invalid_yaml", "not_utf8", "no_version", "jinja_version"],
+)
+def test_read_reports_an_installed_project_file_it_cannot_read_as_unknown(
+    tmp_path: Path, own: bytes
+):
+    _write(tmp_path, "dbt_project.yml", project_yml())
+    path = tmp_path / "dbt_packages" / "elementary" / "dbt_project.yml"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(own)
+
+    record = read(tmp_path, manifest())
+
+    assert record.installed
+    assert record.release_status == "unknown"
+    assert record.release_reason_code == "elementary_release_unknown"
+
+
+def test_read_reports_a_release_above_the_newest_tested_as_untested(tmp_path: Path):
+    _write(tmp_path, "dbt_project.yml", project_yml())
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        f'name: elementary\nversion: "{PATCH_ABOVE}"\n',
+    )
+
+    record = read(tmp_path, manifest())
+
+    assert record.release == PATCH_ABOVE
+    assert record.release_reason_code == "elementary_release_untested"
+
+
+_EVERY_KIND = {
+    "volume": "select * from elementary_test_results_tmp where is_anomalous",
+    "changes": "select * from elementary_test_results_tmp",
+    "threshold": None,
+    "wrapped_volume": "select * from elementary_test_results_tmp",
+    "json": "select * from fct where not valid",
+    "collect": NO_RESULTS,
+    "with_context": "select * from fct where id is null",
+    "not_null_fct_id": "select id from fct where id is null",
+}
+
+
+@pytest.mark.parametrize(
+    ("release", "code"),
+    [
+        (PATCH_ABOVE, "elementary_release_untested"),
+        (MINOR_BELOW, "elementary_release_untested"),
+        (None, "elementary_release_unknown"),
+    ],
+)
+def test_off_its_tested_releases_no_elementary_test_is_read_as_checking(release, code):
+    """Every test that reaches the package's tests carries the release code,
+    the ones #1308's rule would let count included; a test whose compiled SQL
+    is the no-results query keeps that reason, which is read off its SQL, and
+    dbt's own test is never listed."""
+
+    built = _with_tests(_elementary_test_manifest(models="enabled"), _EVERY_KIND)
+
+    assert _classified(built, release=release) == {
+        **dict.fromkeys(
+            ("volume", "changes", "threshold", "wrapped_volume", "json"), code
+        ),
+        "with_context": code,
+        "collect": "compiled_to_no_results",
+    }
+
+
+def test_off_its_tested_releases_a_disabled_package_s_tests_carry_the_code():
+    built = _with_tests(
+        _elementary_test_manifest(models="disabled"),
+        {"volume": NO_RESULTS, "changes": None, "not_null_fct_id": None},
+    )
+
+    assert _classified(built, release=PATCH_ABOVE) == {
+        "volume": "package_disabled",
+        "changes": "elementary_release_untested",
+    }
+
+
+def test_off_its_tested_releases_the_work_is_counted_wherever_it_may_run():
+    """Variant a at an untested release: the hooks may run, the anomaly test's
+    default window is not taken from the releases Dex read, and every selected
+    test counts toward the extras, the package's own included."""
+
+    work = _work(_built(), release=PATCH_ABOVE)
+
+    assert work.codes == [
+        "elementary_hooks",
+        "elementary_monitoring_tests",
+        "elementary_test_extras",
+    ]
+    assert work.hooks_state == "unknown"
+    assert [(t.name, t.days_back, t.days_back_source) for t in work.gated_tests] == [
+        ("changes", None, None),
+        ("volume", None, "unknown"),
+    ]
+    assert work.extras_tests == ("changes", "not_null_fct_id", "volume")
+    record = work.as_dict()
+    assert (record["release"], record["release_reason_code"]) == (
+        PATCH_ABOVE,
+        "elementary_release_untested",
+    )
+    assert len(work.warnings()) == 4
+    assert PATCH_ABOVE in work.warnings()[-1]
+    assert CURRENT_VERSION in work.warnings()[-1]
+
+
+def test_off_its_tested_releases_a_disabled_package_still_owes_its_tests():
+    """Variant d at an untested release: dbt disabled the hooks, so they are no
+    work; that the monitoring tests and the materialization do nothing where
+    the package is disabled is the tested releases' behaviour, so both count."""
+
+    tested = _work(_built(models="disabled", hooks="disabled"))
+    untested = _work(_built(models="disabled", hooks="disabled"), release=PATCH_ABOVE)
+
+    assert tested.codes == []
+    assert untested.codes == ["elementary_monitoring_tests", "elementary_test_extras"]
+    assert not untested.hooks
+
+
+def test_a_build_names_the_untested_release_and_lists_its_tests(tmp_path: Path):
+    """The build's own reading (#1308's path): the record from the installed
+    files, its tests under the release code, and the warning beside them."""
+
+    from exmergo_dex_core.transform.commands import (
+        _elementary_release_warning,
+        _unchecked_tests,
+    )
+
+    _write(tmp_path, "dbt_project.yml", project_yml())
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        f'name: elementary\nversion: "{MINOR_ABOVE}"\n',
+    )
+    built = _with_tests(
+        _elementary_test_manifest(models="enabled"),
+        {"volume": "select 1", "not_null_fct_id": "select 1"},
+    )
+
+    inputs = {"manifest": built, "project": tmp_path}
+    unchecked = _unchecked_tests(inputs)
+    warning = _elementary_release_warning(inputs)
+
+    assert unchecked == {"test.shop.volume": "elementary_release_untested"}
+    assert warning is not None
+    assert MINOR_ABOVE in warning

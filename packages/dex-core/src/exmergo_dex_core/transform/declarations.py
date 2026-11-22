@@ -594,6 +594,16 @@ def _elementary_sampling_warning(
             "ignore disable_test_samples; upgrade the package to 0.20.0 or later, or "
             "set test_sample_row_count: 0 for the project"
         )
+    if elementary.release_status(release) == "untested":
+        # Above the newest release dex was run against (#1445): that it still
+        # reads the flag is not taken from the releases before it.
+        return (
+            f"installed Elementary release {release} is newer than the newest "
+            f"release dex was run against ({elementary.NEWEST_TESTED}), so whether "
+            "it honours disable_test_samples is unchecked "
+            f"({elementary.RELEASE_UNTESTED}); set test_sample_row_count: 0 for "
+            "the project to keep samples off whatever it does"
+        )
     return None
 
 
