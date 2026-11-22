@@ -1311,6 +1311,64 @@ def test_a_dimension_never_takes_the_name_of_a_foreign_entity():
     assert found.body["dimensions"][1]["expr"] == "daily_output_day"
 
 
+def test_a_replacement_name_never_takes_a_measure_name():
+    """The dimension moved aside for the foreign entity would be named
+    `readings_daily_output_day`, which a measure holds, so it takes a numbered name."""
+    declared = {
+        "grain": ["reading_id"],
+        "columns": {
+            "reading_id": {"role": "key"},
+            "read_at": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_daily.output_day",
+            },
+            "daily_output_day": {"role": "dimension"},
+            "readings_daily_output_day": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    parent = {
+        "name": "daily",
+        "entities": [
+            {"name": "daily_output_day", "type": "primary", "expr": "output_day"}
+        ],
+    }
+
+    found = sd.derive(
+        "fct_readings",
+        declared,
+        column_types={"read_at": ("date", None)},
+        on_ref={"fct_daily": [("models/marts/daily.yml", parent)]},
+    )
+
+    assert found.body["dimensions"][1] == {
+        "name": "readings_daily_output_day_2",
+        "type": "categorical",
+        "expr": "daily_output_day",
+    }
+    assert [m["name"] for m in found.body["measures"]] == ["readings_daily_output_day"]
+
+
+def test_a_time_grain_entity_never_takes_a_dimension_name_from_another_model():
+    """MetricFlow checks one element type per name across every semantic model, so
+    a dimension elsewhere in the layer holds the name as firmly as one here."""
+    other = {
+        "name": "calendar",
+        "dimensions": [{"name": "daily_output_day", "type": "categorical"}],
+    }
+
+    found = sd.derive(
+        "fct_daily",
+        {"grain": ["output_day"], "columns": {"output_day": {"role": "time"}}},
+        column_types={"output_day": ("date", None)},
+        on_ref={"dim_calendar": [("models/marts/calendar.yml", other)]},
+    )
+
+    assert found.body["entities"] == [
+        {"name": "daily_output_day_2", "type": "primary", "expr": "output_day"}
+    ]
+
+
 def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):

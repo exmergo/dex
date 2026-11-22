@@ -336,18 +336,28 @@ def derive(
             carried.extend(_carried_column(name, fields, described=True))
             time_columns.append(name)
 
-    # MetricFlow wants one element type per name. A foreign entity keeps the name
-    # the parent gave it, so a dimension of that name moves aside and keeps its
-    # column through `expr`; a grain column that is also a dimension (a time column
-    # grain) names its primary entity after the model instead (#1416).
+    # MetricFlow wants one element type per name, here and across the semantic
+    # layer. A foreign entity keeps the name the parent gave it, so a dimension of
+    # that name moves aside and keeps its column through `expr`; a grain column
+    # that is also a dimension (a time column grain) names its primary entity
+    # after the model instead (#1416). A replacement name also stays clear of this
+    # model's measures and of any name the layer gives another element type.
     stem = _LAYER_PREFIX.sub("", model).lower()
+    layer = _layer_names(on_ref)
+    measure_names = {n for n, f in columns.items() if f.get("role") == "measure"}
     foreign_names = {e["name"] for e in entities if e["type"] == "foreign"}
     dimension_name = {d["name"]: d["name"] for d in dimensions}
     for dimension in dimensions:
         column = dimension["name"]
         if column not in foreign_names:
             continue
-        taken = {d["name"] for d in dimensions} | {e["name"] for e in entities}
+        taken = (
+            {d["name"] for d in dimensions}
+            | {e["name"] for e in entities}
+            | measure_names
+            | layer["entity"]
+            | layer["measure"]
+        )
         renamed = _free_name(f"{stem}_{column}", taken)
         dimension["name"], dimension["expr"] = renamed, column
         dimension_name[column] = renamed
@@ -359,7 +369,12 @@ def derive(
     dimension_names = {d["name"] for d in dimensions}
     if primary in dimension_names:
         primary = _free_name(
-            f"{stem}_{grain[0]}", dimension_names | (used_names - {primary})
+            f"{stem}_{grain[0]}",
+            dimension_names
+            | (used_names - {primary})
+            | measure_names
+            | layer["dimension"]
+            | layer["measure"],
         )
         entities[0]["name"] = primary
         notes.append(
@@ -617,6 +632,27 @@ def _free_name(base: str, taken: set[str]) -> str:
         suffix += 1
         name = f"{base}_{suffix}"
     return name
+
+
+def _layer_names(
+    on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
+) -> dict[str, set[str]]:
+    """The entity, dimension and measure names the semantic layer already declares."""
+
+    names: dict[str, set[str]] = {"entity": set(), "dimension": set(), "measure": set()}
+    for found in on_ref.values():
+        for _path, entry in found:
+            for kind, key in (
+                ("entity", "entities"),
+                ("dimension", "dimensions"),
+                ("measure", "measures"),
+            ):
+                for element in entry.get(key) or []:
+                    if isinstance(element, dict) and isinstance(
+                        element.get("name"), str
+                    ):
+                        names[kind].add(element["name"])
+    return names
 
 
 def _entity_name(column: str, model: str) -> str:
