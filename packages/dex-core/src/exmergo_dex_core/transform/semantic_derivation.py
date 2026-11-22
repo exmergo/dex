@@ -299,6 +299,12 @@ def derive(
             "for both"
         )
 
+    # A name this model gives no join to (a fallback, or a reference nothing
+    # declares yet) is numbered off any dimension or measure name here, in the
+    # layer or in the plan; a joined name stays the parent's.
+    incompatible = (
+        dimension_columns | measure_names | layer["dimension"] | layer["measure"]
+    )
     used_names = {e["name"] for e in entities}
     for name, fields in columns.items():
         if fields.get("role") != "foreign_key" or name in grain:
@@ -306,11 +312,20 @@ def derive(
         entity, joined = _foreign_entity(name, fields.get("references"), on_ref)
         if entity in used_names:
             fallback = _entity_name(name, model)
+            if fallback in incompatible:
+                fallback = _free_name(fallback, incompatible | used_names)
             notes.append(
                 f"{name}: entity '{entity}' is already used in this semantic model, "
                 f"so it is named '{fallback}' instead and does not join on '{entity}'"
             )
             entity, joined = fallback, None
+        elif joined is None and entity in incompatible:
+            renamed = _free_name(entity, incompatible | used_names)
+            notes.append(
+                f"{name}: entity '{renamed}' instead of '{entity}', which names a "
+                "dimension or measure, and MetricFlow does not allow one name for both"
+            )
+            entity = renamed
         if entity in used_names:
             notes.append(f"{name}: no entity name free for it, so it is not derived")
             continue
@@ -1136,12 +1151,38 @@ class MetricFlowDerivation:
 
         derivations: list[Derivation] = []
         claimed: dict[str, str] = {}
-        # on_ref plus the parents derived so far, for foreign keys alone: the
-        # collision check keeps reading on_ref, the project as it stands.
+        # on_ref plus the plan's marts, for foreign keys alone: the collision
+        # check keeps reading on_ref, the project as it stands. Each mart first
+        # stands in as a draft holding its primary entity as the plan names it,
+        # so a foreign key joins its parent's final name even when the parent
+        # derives later or the references form a cycle; at its own turn the
+        # draft gives way to the derived body, or to nothing if it is rejected.
         foreign_ref = {model: list(found) for model, found in on_ref.items()}
         planned = _planned_names(request.declarations)
+        drafted: set[str] = set()
+        for declaration in request.declarations:
+            if declaration.model in on_ref:
+                continue
+            draft = derive(
+                declaration.model,
+                declaration.declared,
+                column_types=declaration.column_types,
+                on_ref=on_ref,
+                reserved=planned,
+            ).body
+            primary = [
+                e for e in (draft or {}).get("entities", []) if e["type"] == "primary"
+            ]
+            if primary:
+                foreign_ref[declaration.model] = [
+                    ("", {"name": draft["name"], "entities": primary})
+                ]
+                drafted.add(declaration.model)
         for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
+            if model in drafted:
+                del foreign_ref[model]
+                drafted.discard(model)
             derivation = derive(
                 model,
                 declaration.declared,

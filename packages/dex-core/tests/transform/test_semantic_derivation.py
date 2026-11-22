@@ -1534,3 +1534,121 @@ def test_a_replacement_name_stays_clear_of_another_mart_in_the_plan(
     assert "name: world_output_daily_output_day_2\n" in daily
     assert "name: world_output_daily_output_day\n" not in daily
     assert "name: world_output_daily_output_day\n" in models[other]["content"]
+
+
+def test_a_fallback_entity_name_never_takes_a_dimension_name_the_plan_holds():
+    """The foreign key's join name `record` is the primary entity's, so it falls
+    back to `readings`, a dimension another mart in the plan declares: numbered."""
+    records = {
+        "name": "records",
+        "entities": [{"name": "record", "type": "primary", "expr": "record_id"}],
+    }
+    declared = {
+        "grain": ["record_id"],
+        "columns": {
+            "record_id": {"role": "key"},
+            "id": {"role": "foreign_key", "references": "fct_records.record_id"},
+            "read_at": {"role": "time"},
+        },
+    }
+
+    found = sd.derive(
+        "fct_readings",
+        declared,
+        column_types={"read_at": ("date", None)},
+        on_ref={"fct_records": [("models/marts/records.yml", records)]},
+        reserved={"dimension": {"readings"}},
+    )
+
+    assert found.body["entities"][1] == {
+        "name": "readings_2",
+        "type": "foreign",
+        "expr": "id",
+    }
+    free = sd.derive(
+        "fct_readings",
+        declared,
+        column_types={"read_at": ("date", None)},
+        on_ref={"fct_records": [("models/marts/records.yml", records)]},
+    )
+    assert free.body["entities"][1]["name"] == "readings"
+
+
+# Name order picks which mart of the cycle derives first: both orders.
+@pytest.mark.parametrize("other", ["fct_snapshots", "fct_zz_snapshots"])
+def test_marts_that_reference_each_other_join_by_final_entity_names(
+    dbt_project_dir: Path, tmp_path: Path, capsys, other: str
+):
+    """Whichever mart of the cycle derives first, each foreign key joins the other
+    mart's final entity name; the snapshots mart never takes the daily mart's time
+    dimension name `output_day`."""
+    daily = {
+        **DAILY_MART,
+        "columns": {
+            **DAILY_MART["columns"],
+            "latest_snapshot_id": {
+                "role": "foreign_key",
+                "references": f"{other}.snapshot_id",
+            },
+        },
+    }
+    snapshots = {
+        "model": other,
+        "description": "One row per snapshot.",
+        "grain": ["snapshot_id"],
+        "columns": {
+            "snapshot_id": {"role": "key"},
+            "taken_at": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_world_output_daily.output_day",
+            },
+            "snapshot_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_world_output_daily.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as output_day, "
+                    "1.0 as output_total, 1 as latest_snapshot_id\n"
+                ),
+            },
+            {
+                "path": f"models/marts/{other}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as snapshot_id, cast('2024-01-01' as date) as "
+                    "taken_at, cast('2024-01-01' as date) as output_day_id, "
+                    "1.0 as snapshot_total\n"
+                ),
+            },
+        ],
+        "declarations": [daily, snapshots],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "cycle",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert (
+        "name: world_output_daily_output_day\n"
+        in (models["fct_world_output_daily"]["content"])
+    )
+    content = models[other]["content"]
+    assert "name: world_output_daily_output_day\n" in content
+    assert "expr: output_day_id\n" in content
+    assert "name: output_day\n" not in content
+    assert "name: snapshot\n" in models["fct_world_output_daily"]["content"]
