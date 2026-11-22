@@ -574,6 +574,14 @@ The seed gives the `dbt_dev` role a second schema, `dbt_dev_elementary`, for the
 package's models, so re-run the setup script on a container seeded before it
 existed.
 
+The reader of the package's tables supports fewer releases than the fixture
+runs: those with a recorded layout in
+`packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
+(0.26.1 today). Adding one means copying each table's columns from the
+package's model files at that release's tag, citing the file and lines, and
+adding a fixture case whose tables are read back to the run that wrote them.
+The loader refuses a release the fixture does not run.
+
 In CI both files run in the integration workflow
 (`.github/workflows/integration.yml`): on a push to `main` that matches the
 workflow's `paths` filter (any change under `packages/dex-core/`, for one), on the
