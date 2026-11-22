@@ -885,6 +885,20 @@ def _answered(names: set[str], evidence: BuildEvidence) -> set[str]:
     return answered
 
 
+def _answers_index(evidence: BuildEvidence) -> dict[str, set[str]]:
+    """Each model label to every name its node answers to.
+
+    One pass over the evidence, so expanding one failed label does not
+    rescan it for every label (#1499).
+    """
+
+    index: dict[str, set[str]] = {}
+    for node in evidence.nodes:
+        if node.unique_id.startswith("model.") or node.resource_type == "model":
+            index.setdefault(node.name, set()).update(node_answers(node))
+    return index
+
+
 def _bounded(text: str, limit: int = _MESSAGE) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
@@ -1044,14 +1058,24 @@ def summarize_completion(
     # A check names its model by label and a deliverable may be the file
     # stem: match both through every name the node answers to (#1499). The
     # names listed stay the deliverable names, whichever name the plan uses.
-    asserted_names = _answered(asserted, evidence)
-    failed_names = list(
-        dict.fromkeys(n for n in built_names if n in _answered(failed_checks, evidence))
-    )
+    # The failed labels are expanded once: _answered scans every evidence
+    # node, and the filters below would repeat that scan per deliverable
+    # and per label (5,000 built models x 10,000 nodes on a large build).
+    failed_answered = _answered(failed_checks, evidence)
+    answers_index = _answers_index(evidence)
+    # Failure takes precedence after alias expansion: a passing
+    # `dim_customers.v1` and a failing `dim_customers.v2` both expand to
+    # `dim_customers`, so the deliverable is failed, not asserted.
+    asserted_names = _answered(asserted, evidence) - failed_answered
+    failed_names = list(dict.fromkeys(n for n in built_names if n in failed_answered))
     failures_by_name: dict[str, list[FailedCheck]] = {}
     for label, checks in failures.items():
-        for name in _answered({label}, evidence):
-            failures_by_name.setdefault(name, checks)
+        for name in {label} | answers_index.get(label, set()):
+            # Accumulate, don't keep only the first version: two built
+            # versions can share one alias, and setdefault kept only the
+            # first version's checks. Each alias gets its own list, so the
+            # originals are never mutated.
+            failures_by_name.setdefault(name, []).extend(checks)
     statuses = Counter(n.status.lower() for n in evidence.nodes)
     completion = BuildCompletion(
         outcome=evidence.outcome.value,
