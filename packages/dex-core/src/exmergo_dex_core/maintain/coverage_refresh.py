@@ -306,6 +306,7 @@ def refresh(
 
     gate = None
     estimate: float | None = None
+    handshake_confirmed = False
     try:
         if paradigm is not Paradigm.FREE_LOCAL:
             batch.adapter = engine._adapter("maintain coverage")
@@ -355,6 +356,9 @@ def refresh(
                         *batch.price_notes,
                     ],
                 )
+                # Returning from the handshake means it ran and was
+                # confirmed; a refusal raises out of refresh instead.
+                handshake_confirmed = True
             gate = command_args.cost_gate(batch.adapter)
 
         exhausted = False
@@ -468,7 +472,11 @@ def refresh(
         paradigm=paradigm,
         estimate=estimate,
         ceiling=batch.ceiling,
-        handshake=("not_applicable" if paradigm is Paradigm.FREE_LOCAL else None),
+        handshake=(
+            "not_applicable"
+            if paradigm is Paradigm.FREE_LOCAL
+            else ("confirmed" if handshake_confirmed else None)
+        ),
     )
     engine._last_spend = batch.spend
     return block, warnings, batch.spend, cost
