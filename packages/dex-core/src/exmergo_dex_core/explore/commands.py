@@ -1474,6 +1474,7 @@ def relationships(
         examined,
         rels,
         observed_namespaces=observed_namespaces,
+        inventoried={meta.identifier for meta in metas},
     )
     # A package table a prior run cached outside this run's scope (an include
     # run over a wider --scope) has the joins among its kind carried forward
@@ -3130,6 +3131,7 @@ def map(
         examined,
         relationship_set,
         observed_namespaces=observed_namespaces,
+        inventoried={meta.identifier for meta in metas},
     )
     # A package table a prior run cached outside this run's scope (an include
     # run over a wider --scope) is carried forward below with the rank it had
@@ -3348,7 +3350,7 @@ def map(
         )
     if out_of_scope > 0:
         notes.append(
-            f"carried forward {out_of_scope} prior profile(s) for object(s) "
+            f"carried forward {out_of_scope} prior dataset(s) for object(s) "
             "outside this run's --scope/--dataset; the cache stays complete "
             "across every scope it has ever been mapped with, not just this one"
         )
@@ -5260,6 +5262,7 @@ def _carry_forward_relationships(
     relationships: list[Relationship],
     *,
     observed_namespaces: set[str] | None = None,
+    inventoried: set[str] | None = None,
 ) -> tuple[list[Relationship], int]:
     """Union back in any prior relationship this run could not possibly have
     regenerated or superseded: one with an endpoint outside ``examined`` (the
@@ -5276,6 +5279,9 @@ def _carry_forward_relationships(
     ``observed_namespaces`` (see `_compose_datasets`) excludes an edge whose
     endpoint is gone from the warehouse rather than merely out of scope, so a
     deleted relation's join does not resurrect either (issues #149, #984).
+    ``inventoried`` distinguishes a still-present object skipped by the rank
+    cutoff from a deleted one. Callers without an inventory retain the earlier
+    behavior of treating only examined objects as known to exist.
     """
 
     if prior is None or not prior.relationships:
@@ -5283,7 +5289,9 @@ def _carry_forward_relationships(
     existing = {_relationship_edge_key(rel) for rel in relationships}
 
     def dropped(identifier: str) -> bool:
-        if identifier in examined:
+        if identifier in examined or (
+            inventoried is not None and identifier in inventoried
+        ):
             return False
         ns = identifier.rpartition(".")[0].lower()
         return bool(observed_namespaces is not None and ns in observed_namespaces)
@@ -6014,7 +6022,8 @@ def _compose_datasets(
 ) -> tuple[list[Dataset], int, int, list[str]]:
     """Merge this run's profiles over the full inventory. Returns the composed
     datasets, how many prior profiles were carried forward within this run's
-    inventory, how many were carried forward from entirely outside it, and
+    inventory, how many prior datasets (including inventory-only entries) were
+    carried forward from entirely outside it, and
     which prior identifiers were dropped as gone rather than carried.
 
     An object not profiled this run reuses its prior profile wholesale (columns,
@@ -6041,9 +6050,7 @@ def _compose_datasets(
     """
 
     by_id = {d.identifier: d for d in profiled}
-    prior_by_id = (
-        {d.identifier: d for d in prior.datasets if d.columns} if prior else {}
-    )
+    prior_by_id = {d.identifier: d for d in prior.datasets} if prior else {}
     seen = {meta.identifier for meta in metas}
     datasets: list[Dataset] = []
     carried = 0
@@ -6051,7 +6058,7 @@ def _compose_datasets(
         ds = by_id.get(meta.identifier)
         if ds is None:
             previous = prior_by_id.get(meta.identifier)
-            if previous is not None:
+            if previous is not None and previous.columns:
                 ds = previous.model_copy(deep=True)
                 carried += 1
             else:
