@@ -1027,7 +1027,13 @@ def _invocations_read_back(warehouse: Path, ran: dict, tested: dict) -> None:
 def _results_read_back(warehouse: Path, tested: dict) -> dict[str, str]:
     """Each test's rows against dbt's own result; ``{test_unique_id: id}``."""
 
-    statuses = {r["unique_id"]: (r["status"], r["failures"]) for r in tested["results"]}
+    # Run results also hold the package's on-run-start and on-run-end
+    # operations, which write no test result.
+    statuses = {
+        r["unique_id"]: (r["status"], r["failures"])
+        for r in tested["results"]
+        if r["unique_id"].startswith("test.")
+    }
     results = _rows(
         warehouse,
         "id, test_unique_id, invocation_id, status, failures, detected_at",
@@ -1037,12 +1043,15 @@ def _results_read_back(warehouse: Path, tested: dict) -> dict[str, str]:
     assert {row[2] for row in results} == {tested["metadata"]["invocation_id"]}
     assert {row[1] for row in results} == set(statuses)
     for _, uid, _, status, failures, detected in results:
-        assert status == statuses[uid][0], uid
         assert isinstance(detected, datetime)
-        # Elementary counts its own tests' failures; dbt's count holds for the
+        # Elementary counts its own tests' failures, and marks an anomaly row
+        # with none `pass` whatever dbt said (get_normalized_test_status,
+        # handle_tests_results.sql:62-76); dbt's status and count hold for the
         # rest. The tests are the root project's, so the name says whose.
-        if not _node_name(uid).startswith("elementary_"):
-            assert failures == statuses[uid][1], uid
+        if _node_name(uid).startswith("elementary_"):
+            assert status in {statuses[uid][0], "pass"}, uid
+        else:
+            assert (status, failures) == statuses[uid], uid
     return {uid: result_id for result_id, uid, *_ in results}
 
 
@@ -1110,8 +1119,11 @@ def test_the_reader_s_layouts_hold_on_the_fixture_and_its_rows_read_back(
     recorded one column for column, and each table reads back to what the two
     runs did. A copy with one column dropped and one retyped refuses."""
 
+    # Imported before any dbt run, so a reader that is absent fails here.
+    from exmergo_dex_core.maintain.elementary_layouts import READER_RELEASES
     from exmergo_dex_core.transform.elementary import read
 
+    assert CURRENT_VERSION in READER_RELEASES
     project = elementary_project(tmp_path, "a", installed_elementary)
     warehouse = tmp_path / "dev.duckdb"
     _execute(
