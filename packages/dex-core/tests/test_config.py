@@ -381,3 +381,66 @@ def test_budget_paradigm_loads_and_is_carried_as_an_unknown_key_warning(
         ".dex/config.yml line 3: budget.paradigm is not a setting dex reads, so "
         "it is ignored"
     ]
+
+
+# --- production (#1462) -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "expected"),
+    [
+        ("bigquery", {"prod": " analytics ", "dev_dataset": "dev"}, "analytics"),
+        ("bigquery", {"prod": "proj.analytics"}, "proj.analytics"),
+        ("snowflake", {"prod": "ANALYTICS.MARTS"}, "ANALYTICS.MARTS"),
+        ("postgres", {"prod": "analytics"}, "analytics"),
+        ("duckdb", {"path": "w.duckdb", "prod": "main"}, "main"),
+    ],
+)
+def test_prod_is_spelled_in_each_connectors_own_namespace(connector, target, expected):
+    from exmergo_dex_core.config import DexConfig
+
+    config = DexConfig(connector=connector, **{connector: target})
+    assert getattr(config, connector).prod == expected
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "message"),
+    [
+        ("snowflake", {"prod": "MARTS"}, "DATABASE.SCHEMA"),
+        ("postgres", {"prod": "db.analytics"}, "a schema"),
+        ("bigquery", {"prod": "dev", "dev_dataset": "dev"}, "dev namespace"),
+        (
+            "snowflake",
+            {"prod": "DEV.S", "dev_database": "dev", "dev_schema": "s"},
+            "dev namespace",
+        ),
+        ("bigquery", {"prod": "a..b"}, "empty part"),
+    ],
+)
+def test_a_prod_no_command_could_read_is_refused(connector, target, message):
+    from exmergo_dex_core.config import DexConfig
+
+    with pytest.raises(ValueError, match=message):
+        DexConfig(connector=connector, **{connector: target})
+
+
+@pytest.mark.parametrize("value", ["dev", "ci", "CI"])
+def test_the_production_target_is_never_the_dev_target(value):
+    from exmergo_dex_core.config import DexConfig
+
+    with pytest.raises(ValueError, match="dev target"):
+        DexConfig(dbt_target="ci", dbt_prod_target=value)
+
+
+def test_prod_and_its_target_validate_through_config_validate(tmp_path):
+    from exmergo_dex_core.config_document import ConfigDocument
+
+    path = tmp_path / "config.yml"
+    path.write_text(
+        "connector: bigquery\nbigquery:\n  project: p\n  dev_dataset: dev\n"
+        "  prod: analytics\ndbt_prod_target: prod\n",
+        encoding="utf-8",
+    )
+    config = ConfigDocument.read(path).config()
+    assert config.bigquery.prod == "analytics"
+    assert config.dbt_prod_target == "prod"

@@ -39,6 +39,7 @@ bigquery:
     - bigquery-public-data.samples   # qualified names read another project
   location: EU                   # optional job-location override
   dev_dataset: dbt_dev           # where dbt dev builds write (never a source)
+  prod: analytics                # where models build in production (catalog metadata only)
   max_full_profile_bytes: null   # opt-in TABLESAMPLE threshold for huge tables
 budget:
   ceiling: 1000000000            # per-command bytes (1 GB); --budget overrides

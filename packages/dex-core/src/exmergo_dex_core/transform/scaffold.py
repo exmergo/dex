@@ -91,6 +91,12 @@ MACRO_ASSETS: dict[str, str] = {
         "declaration plan adds "
         "it where the project lacks it"
     ),
+    "dex_continuity": (
+        "the generic test a time column's declared continuity renders (#1461): "
+        "fails with the count of gaps, runs of empty buckets at the declared "
+        "grain between two buckets holding rows (per `by` key), never a date or "
+        "a key; a declaration plan adds it where the project lacks it"
+    ),
     "dex_join_coverage": (
         "the generic test an INNER join a declared references requires renders "
         "(#1456): fails with the count of the join's eligible driving rows that "

@@ -717,6 +717,13 @@ class RedshiftAdapter:
 
     # --- the RPU translation ------------------------------------------------------
 
+    def catalog_read_billed(self) -> bool:
+        """Whether a catalog read bills (#1462): on Serverless any statement,
+        a catalog query included, can wake the workgroup and bill its 60-second
+        minimum, so a plan does not read production sizes here unasked."""
+
+        return self._is_serverless()
+
     def _is_serverless(self) -> bool:
         return self.compute.get("kind") == "serverless"
 
@@ -811,6 +818,16 @@ class RedshiftAdapter:
             batches = max((len(scan_columns) + _COLUMN_BATCH - 1) // _COLUMN_BATCH, 1)
             per_table[identifier] = batches * self._scan_seconds(meta.byte_size)
         return sum(per_table.values()) + self._estimate_floor(), per_table
+
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        scan rate. What a generated test costs per production run, priced from
+        the production tables' catalog sizes; nothing this command bills (a
+        startup, wake or uptime charge) is added, since the run it prices is not
+        dex's."""
+
+        return self._scan_seconds(sum(int(b) for b in byte_sizes))
 
     def query_estimate(self, sql: str) -> float:
         """The heuristic estimate for one firewall-approved query: the summed

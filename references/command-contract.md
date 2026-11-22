@@ -1515,10 +1515,39 @@ default, or a filter or operator after it is refused. A key naming a location
   `maintain verify`. A listed `dex_freshness` whose claim the column's declared
   freshness no longer gives (its `max_lag` changed) is reported `stale`,
   `reason: freshness_changed`, with a warning, and is never removed; a change
-  of `basis` alone keeps the listed test, which behaves the same.
+  of `basis` alone keeps the listed test, which behaves the same. It renders
+  `dex_continuity` (#1461) under each column declaring `continuity` (the column
+  with role `time`, `{grain, by}`; `grain` one of `second`, `minute`, `hour`,
+  `day`, `week`, `month`, `quarter`, `year`, default `day`, `week` the ISO week;
+  `by` key columns, default none), tagged `dex_scheduled`, on every connector,
+  with `grain` and `by` as its arguments and the grain as its `variant`: it fails
+  with the number of gaps, a gap being a run of buckets at the grain holding no
+  row between two buckets holding rows, per value of the `by` columns, and
+  returns that count and never a date or a key. An edge is never a gap. Each
+  value is bucketed in UTC from its whole epoch seconds (calendar grains through
+  its UTC day's civil date), with no date spine; a column that is no date or
+  timestamp, and a grain finer than a day on a date, error the test. It has no
+  `maintain verify` twin: the parity harness holds it to fixture pairs stating
+  the exact failure count, on every connector it runs. A `by` column the model
+  provably does not output gives `column_not_output`; a `continuity` off a
+  `role: time` column, or `by` naming the time column, is refused. A listed
+  `dex_continuity` whose claim the declared grain or `by` no longer gives is
+  reported `stale`, `reason: continuity_changed`, with a warning, and is never
+  removed.
   The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
+  Each generated test the YAML holds once the plan lands (`added`,
+  `already_listed`, `listed_while_off`) carries a per-production-run `cost`
+  (#1462): `estimated`, with the `estimate` in the connector's unit and the
+  `relations` it reads, or `unknown` with a `reason` and never a guess.
+  `data.generated_tests.cost` holds the basis (`prod`, `paradigm`, `unit`,
+  `note`, `read_at`, each relation's `rows` and `bytes`) and `per_run`, the
+  `dex_every_run` and `dex_scheduled` totals apart, each `complete` only where
+  every test of the cadence was priced. A relation is the model's alias in
+  `<connector>.prod`, its custom schema as dbt names it there, a view read as
+  the tables its manifest lineage names (`through`); only catalog
+  metadata is read, unasked only where reading it is free.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

@@ -875,6 +875,16 @@ class DatabricksAdapter:
         total = sum(per_table.values()) + self._startup_floor()
         return total, per_table
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        pinned warehouse's scan rate. What a generated test costs per production
+        run, priced from the production tables' catalog sizes; nothing this
+        command bills (a startup, wake or uptime charge) is added, since the run
+        it prices is not dex's."""
+
+        return self._statement_seconds(sum(int(b) for b in byte_sizes))
+
     def query_estimate(self, sql: str) -> float:
         """The floor estimate for one firewall-approved query: the summed
         known sizes of every referenced table over the scan rate (the floor

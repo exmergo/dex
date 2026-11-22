@@ -120,6 +120,14 @@ class GeneratedTestKind:
     #: and of ``"1"``) would otherwise share a name, which dbt refuses, and a
     #: value from the data would sit in the node name.
     named_by_claim: bool = False
+    #: Whether the test's SQL reads the model it sits on (#1462). Every kind
+    #: does but :data:`JOIN_COVERAGE`, which reads the join's two inputs.
+    reads_model: bool = True
+    #: The arguments that name another relation the test's SQL reads, each a
+    #: ``ref()`` or ``source()`` call written as text (or ``None`` where the
+    #: plan could not name it), so a plan can say which tables a test reads
+    #: and price it from their production sizes (#1462).
+    relation_arguments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -470,6 +478,7 @@ register(
         _parent_population,
         macro=PARENT_POPULATION,
         dialects=ALL_CONNECTORS,
+        relation_arguments=("parent",),
     )
 )
 
@@ -602,6 +611,8 @@ register(
         macro=JOIN_COVERAGE,
         dialects=ALL_CONNECTORS,
         reads_joins=True,
+        reads_model=False,
+        relation_arguments=("child", "parent"),
     )
 )
 
@@ -777,6 +788,7 @@ register(
         dialects=ALL_CONNECTORS,
         reads_history=True,
         named_by_claim=True,
+        relation_arguments=("snapshot",),
     )
 )
 
@@ -822,6 +834,58 @@ register(
         EVERY_RUN,
         _declared_freshness,
         macro=FRESHNESS,
+        dialects=ALL_CONNECTORS,
+    )
+)
+
+CONTINUITY = "dex_continuity"
+
+
+def _declared_continuity(declaration: Any) -> list[Instance]:
+    """One column test per column declaring ``continuity`` (#1461): it fails with
+    the number of gaps in the column, a gap being a run of buckets at the
+    declared grain holding no row between two buckets that hold rows, for the
+    whole model or per value of the ``by`` columns. An edge is never a gap, so
+    the answer does not depend on today's date. The ``by`` columns go into the
+    test's columns, so a model that does not output one renders nothing
+    (:data:`COLUMN_NOT_OUTPUT`). Scheduled: the search reads every row."""
+
+    out: list[Instance] = []
+    for name, column in (getattr(declaration, "columns", None) or {}).items():
+        continuity = getattr(column, "continuity", None)
+        if continuity is None:
+            continue
+        grain = str(getattr(continuity.grain, "value", continuity.grain))
+        by = [str(key) for key in continuity.by]
+        arguments: dict[str, Any] = {"grain": grain}
+        if by:
+            arguments["by"] = list(by)
+        out.append(
+            Instance(
+                column=str(name),
+                field="continuity",
+                columns=(str(name), *sorted(by, key=str.lower)),
+                params={
+                    "check": CONTINUITY,
+                    "grain": grain,
+                    # Names, folded as claim_id folds a string (a list is
+                    # hashed as written), and sorted: the keys partition the
+                    # search, so `[a, b]` and `[b, a]` are one claim.
+                    "by": sorted(key.lower() for key in by),
+                },
+                arguments=arguments,
+                variant=grain,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        CONTINUITY,
+        SCHEDULED,
+        _declared_continuity,
+        macro=CONTINUITY,
         dialects=ALL_CONNECTORS,
     )
 )

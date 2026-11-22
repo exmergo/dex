@@ -68,6 +68,41 @@ build into already holds content, and warns naming the namespace and a few
 object names. A "could not check" note means no connection was reachable at init
 time.
 
+## Naming production
+
+Dex never builds in production, and never runs dbt there. A plan still has to
+say what production will do (what a generated test costs per run there, for
+example), so production is named once, in committed config, the way the dev
+target is:
+
+```yaml
+dbt_target: dev              # the dbt target dex builds on
+dbt_prod_target: prod        # the dbt target production runs use
+bigquery:
+  dev_dataset: dbt_dev       # where dev builds write
+  prod: analytics            # where the project's models build in production
+```
+
+- **`<connector>.prod`** is spelled in the connector's own namespace vocabulary,
+  as its dev namespace is: `dataset` or `project.dataset` on BigQuery,
+  `DATABASE.SCHEMA` on Snowflake, `catalog.schema` on Databricks and Trino, a
+  schema on Postgres, Redshift and DuckDB, a database on ClickHouse. It can
+  never equal the dev namespace.
+- **It is not a source allowlist.** Setting it never narrows or widens what
+  explore reads, it may overlap the allowlist (it usually does), and `--scope`
+  neither reaches nor drops it. Dex reads only its catalog metadata (names, row
+  counts, bytes), never a row, which is what committing it authorizes.
+- **`dbt_prod_target`** is never passed to dbt. Every guarded dbt call
+  (`transform build`, `compare`, `test --mutate`, `explore --target`,
+  `maintain verify --target`) refuses it by name, so a production target called
+  something that looks like nothing production (`analytics`) is refused as
+  `prod` is. It can never equal `dbt_target` or `dev`. Dex reads it where
+  production's naming uses the target name (the layered schemas
+  `<layer>_<target name>`).
+
+`dex config set bigquery.prod analytics` shows the diff and writes it on
+`--confirm`.
+
 ## Preparing the dev target
 
 Before the cost gate, and for free, `transform build` refuses two things and

@@ -223,6 +223,19 @@ GROUPS: dict[str, tuple[str, ...]] = {
             "test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness",
         ),
         f"{_T}test_freshness.py",
+        # What each generated test costs per production run (#1462).
+        f"{_T}test_generated_test_cost.py",
+    ),
+    # dex_continuity (#1461): its parity rows, its planted macros, and its own
+    # file, whose last cases each run a dbt build.
+    "transform-parity-continuity": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_continuity_rows_hold_and_the_plan_writes_their_macro",
+            "test_a_continuity_macro_counting_empty_buckets_fails_on_the_count",
+            "test_a_continuity_macro_counting_an_edge_fails_on_the_clean_fixture",
+        ),
+        f"{_T}test_continuity.py",
     ),
     "transform-e2e": (  # 148s
         f"{_T}test_package_repair_e2e.py",

@@ -28,8 +28,10 @@ connector (``GeneratedTestKind.dialects``) must render nothing there and say so
 under ``data.generated_tests``; the harness checks that instead (#1451).
 
 Adding a generated test (#1453 onward) adds a :class:`ParityRow` to
-:data:`ROWS`. ``freshness`` and continuity have no ``maintain verify`` check, so
-they are proved by their own acceptance pairs, not here. A dbt test a
+:data:`ROWS`. A test with no ``maintain verify`` twin (#1461: ``dex_continuity``)
+is a row with no codes and its own ``failures``: the violating fixture must fail
+the test with exactly that count and the clean one pass, on every dialect, and
+verify is not consulted for it. A dbt test a
 declaration renders unconditionally (``relationships`` from a ``references``,
 #1459) is a ``builtin`` row: no ``render_tests`` switch and no dialect list, the
 rest alike.
@@ -118,6 +120,10 @@ class ParityRow:
     #: built in the same selection; ``maintain verify`` is not pointed at it,
     #: since it judges models.
     snapshots: Mapping[str, Callable[[str], str]] = field(default_factory=dict)
+    #: The failures the violating fixture's test must report, for a test with
+    #: no ``maintain verify`` twin (#1461), whose ``codes`` are empty: the pair
+    #: is then judged on dbt's answer alone.
+    failures: int | None = None
 
     @property
     def label(self) -> str:
@@ -1031,6 +1037,136 @@ FRESHNESS_EMPTY = _freshness_row(
 )
 
 
+def _values(column: str, *rows: tuple[str, str]) -> str:
+    """A SELECT over ``rows`` as (region, ``column``), each value a SQL literal."""
+
+    (region, value), *rest = rows
+    lines = [f"select '{region}' as region, {value} as {column}"]
+    lines += [f"union all select '{r}', {v}" for r, v in rest]
+    return "\n".join(lines) + "\n"
+
+
+def _date(text: str) -> str:
+    return f"cast('{text}' as date)"
+
+
+def _ts(text: str) -> str:
+    return f"cast('{text}' as timestamp)"
+
+
+def _continuity_row(
+    name: str,
+    continuity: dict[str, Any],
+    column: str,
+    violating: tuple[tuple[str, str], ...],
+    clean: tuple[tuple[str, str], ...],
+    failures: int,
+) -> ParityRow:
+    return ParityRow(
+        test=gt.CONTINUITY,
+        name=name,
+        codes=frozenset(),
+        declaration={
+            "description": "Parity fixture: one row per order.",
+            "columns": {column: {"role": "time", "continuity": continuity}},
+        },
+        violating=lambda _null: _values(column, *violating),
+        clean=lambda _null: _values(column, *clean),
+        failures=failures,
+    )
+
+
+#: #1461: a date column searched by the day. The violating model misses the
+#: 3rd and the 5th and 6th: two gaps (five buckets are empty), so a macro
+#: counting empty buckets says 3. The clean model's data stops long before
+#: today and starts after the 1st: an edge is no gap.
+CONTINUITY_DAY = _continuity_row(
+    "dex_continuity_day",
+    {"grain": "day"},
+    "ordered_on",
+    violating=tuple(("a", _date(f"2024-03-0{d}")) for d in (1, 2, 4, 7)),
+    clean=tuple(("a", _date(f"2024-03-0{d}")) for d in (2, 3, 4, 5, 6)),
+    failures=2,
+)
+
+#: #1461: per key. In the violating model region b misses the 2nd, which
+#: region a has, so the whole table has no gap and b has one. In the clean
+#: model b starts on the 2nd: a key's own edge is no gap either.
+CONTINUITY_BY = _continuity_row(
+    "dex_continuity_by",
+    {"grain": "day", "by": ["region"]},
+    "ordered_at",
+    violating=(
+        ("a", _ts("2024-03-01 09:00:00")),
+        ("a", _ts("2024-03-02 09:00:00")),
+        ("a", _ts("2024-03-03 09:00:00")),
+        ("b", _ts("2024-03-01 23:59:59")),
+        ("b", _ts("2024-03-03 00:00:00")),
+    ),
+    clean=(
+        ("a", _ts("2024-03-01 09:00:00")),
+        ("a", _ts("2024-03-02 09:00:00")),
+        ("a", _ts("2024-03-03 09:00:00")),
+        ("b", _ts("2024-03-02 00:00:00")),
+        ("b", _ts("2024-03-03 23:59:59")),
+    ),
+    failures=1,
+)
+
+#: #1461: the ISO week starts on Monday, on every dialect. Sunday 7 January
+#: 2024 and Monday 15 January leave the ISO week of the 8th empty (a
+#: Sunday-start week would see none); Monday 8 January and Sunday 21 January
+#: sit in consecutive ISO weeks (a Sunday-start week would see one).
+CONTINUITY_WEEK = _continuity_row(
+    "dex_continuity_week",
+    {"grain": "week"},
+    "ordered_on",
+    violating=(("a", _date("2024-01-07")), ("a", _date("2024-01-15"))),
+    clean=(("a", _date("2024-01-08")), ("a", _date("2024-01-21"))),
+    failures=1,
+)
+
+#: #1461: a calendar grain across a year boundary. December and February
+#: leave January empty; the last hour of 2023 and the first of 2024 are two
+#: consecutive months, in UTC.
+CONTINUITY_MONTH = _continuity_row(
+    "dex_continuity_month",
+    {"grain": "month"},
+    "ordered_at",
+    violating=(
+        ("a", _ts("2023-12-15 12:00:00")),
+        ("a", _ts("2024-02-10 12:00:00")),
+        ("a", _ts("2024-03-01 00:00:00")),
+    ),
+    clean=(
+        ("a", _ts("2023-12-31 23:00:00")),
+        ("a", _ts("2024-01-01 01:00:00")),
+        ("a", _ts("2024-02-29 12:00:00")),
+    ),
+    failures=1,
+)
+
+#: #1461: a grain finer than a day, on a timestamp. 10:00 and 10:59:59 are one
+#: hour, and 12:00 leaves 11 empty; 10:59:59, 11:00:00 and 12:30 are three
+#: consecutive hours.
+CONTINUITY_HOUR = _continuity_row(
+    "dex_continuity_hour",
+    {"grain": "hour"},
+    "ordered_at",
+    violating=(
+        ("a", _ts("2024-03-01 10:00:00")),
+        ("a", _ts("2024-03-01 10:59:59")),
+        ("a", _ts("2024-03-01 12:00:00")),
+    ),
+    clean=(
+        ("a", _ts("2024-03-01 10:59:59")),
+        ("a", _ts("2024-03-01 11:00:00")),
+        ("a", _ts("2024-03-01 12:30:00")),
+    ),
+    failures=1,
+)
+
+
 #: Every row the harness runs, in the order the generated tests shipped.
 ROWS: tuple[ParityRow, ...] = (
     UNIQUE_COMBINATION,
@@ -1055,6 +1191,11 @@ ROWS: tuple[ParityRow, ...] = (
     FRESHNESS_STALE,
     FRESHNESS_AT_LIMIT,
     FRESHNESS_EMPTY,
+    CONTINUITY_DAY,
+    CONTINUITY_BY,
+    CONTINUITY_WEEK,
+    CONTINUITY_MONTH,
+    CONTINUITY_HOUR,
 )
 
 #: The finding codes no row may raise on a clean model, whichever row it is.
@@ -1374,13 +1515,27 @@ def _judge(
         uid = _test_uid(tests, model, row)
         result = results.get(uid or "", {})
         status = result.get("status")
+        where = f"{row.label} on {model}"
+        if row.failures is not None:
+            # No maintain verify twin (#1461): dbt's answer is the verdict.
+            failures = int(result.get("failures") or 0)
+            if should_fail and (status != "fail" or failures != row.failures):
+                report.disagreements.append(
+                    f"{where}: the test should fail on the violating fixture with "
+                    f"{row.failures} failure(s), dbt says {status!r} with {failures}"
+                )
+            elif not should_fail and status != "pass":
+                report.disagreements.append(
+                    f"{where}: the test should pass on the clean fixture, dbt "
+                    f"says {status!r}"
+                )
+            continue
         judged = row.judged(side)
         found = [
             f for f in findings if f["identifier"] == judged and f["code"] in row.codes
         ]
         test_failed = status == "fail"
         test_passed = status == "pass"
-        where = f"{row.label} on {model}"
         if should_fail:
             if not test_failed:
                 report.disagreements.append(

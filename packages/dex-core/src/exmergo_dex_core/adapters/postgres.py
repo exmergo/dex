@@ -642,6 +642,16 @@ class PostgresAdapter:
             per_table[identifier] = batches * self._scan_seconds(meta.byte_size)
         return sum(per_table.values()), per_table
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        scan rate. What a generated test costs per production run, priced from
+        the production tables' catalog sizes; nothing this command bills (a
+        startup, wake or uptime charge) is added, since the run it prices is not
+        dex's."""
+
+        return self._scan_seconds(sum(int(b) for b in byte_sizes))
+
     def query_estimate(self, sql: str) -> float:
         """The estimate for one firewall-approved query, from the free planner
         preflight (EXPLAIN knows about indexes, so a point lookup on a huge
