@@ -1642,16 +1642,36 @@ def test_marts_that_reference_each_other_join_by_final_entity_names(
     )
 
     assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
-    models = envelope["data"]["semantic_proposal"]["models"]
-    assert (
-        "name: world_output_daily_output_day\n"
-        in (models["fct_world_output_daily"]["content"])
+    offered = _offered(envelope)
+    daily_entities = offered["fct_world_output_daily"]["entities"]
+    snapshot_entities = offered[other]["entities"]
+    assert {
+        "name": "world_output_daily_output_day",
+        "type": "primary",
+        "expr": "output_day",
+    } in daily_entities
+    assert {"name": "snapshot", "type": "foreign", "expr": "latest_snapshot_id"} in (
+        daily_entities
     )
-    content = models[other]["content"]
-    assert "name: world_output_daily_output_day\n" in content
-    assert "expr: output_day_id\n" in content
-    assert "name: output_day\n" not in content
-    assert "name: snapshot\n" in models["fct_world_output_daily"]["content"]
+    assert {"name": "snapshot", "type": "primary", "expr": "snapshot_id"} in (
+        snapshot_entities
+    )
+    assert {
+        "name": "world_output_daily_output_day",
+        "type": "foreign",
+        "expr": "output_day_id",
+    } in snapshot_entities
+    assert "output_day" not in {e["name"] for e in snapshot_entities}
+
+
+def _offered(envelope: dict) -> dict[str, dict]:
+    """The semantic models the plan offers for adoption, by name."""
+
+    bodies = (
+        yaml.safe_load(d["content"])
+        for d in envelope["data"]["semantic_proposal"]["definitions"]
+    )
+    return {body["name"]: body for body in bodies}
 
 
 @pytest.mark.parametrize("other", ["fct_a_snapshots", "fct_snapshots"])
@@ -1817,3 +1837,199 @@ def test_two_settled_primary_names_never_meet(
     assert {"name": parent_primary, "type": "foreign", "expr": "parent_id"} in (
         child_entities
     )
+
+
+@pytest.mark.parametrize("other", ["fct_a_snapshots", "fct_snapshots"])
+def test_a_reference_to_a_non_grain_column_joins_the_same_name_in_a_cycle(
+    dbt_project_dir: Path, tmp_path: Path, capsys, other: str
+):
+    """`buyer_id` references the snapshots mart's `account_id`, which joins the
+    authored `customer` entity; the daily mart joins `customer` whichever mart of
+    the cycle derives first."""
+    _add_layer(dbt_project_dir)
+    daily = {
+        "model": "fct_daily",
+        "description": "One row per day.",
+        "grain": ["output_day"],
+        "columns": {
+            "output_day": {"role": "time"},
+            "buyer_id": {"role": "foreign_key", "references": f"{other}.account_id"},
+            "output_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    snapshots = {
+        "model": other,
+        "description": "One row per snapshot.",
+        "grain": ["snapshot_id"],
+        "columns": {
+            "snapshot_id": {"role": "key"},
+            "taken_at": {"role": "time"},
+            "account_id": {"role": "foreign_key", "references": "stg_customers.id"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_daily.output_day",
+            },
+            "snapshot_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_daily.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as output_day, "
+                    "1 as buyer_id, 1.0 as output_total\n"
+                ),
+            },
+            {
+                "path": f"models/marts/{other}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as snapshot_id, cast('2024-01-01' as date) as "
+                    "taken_at, 1 as account_id, cast('2024-01-01' as date) as "
+                    "output_day_id, 1.0 as snapshot_total\n"
+                ),
+            },
+        ],
+        "declarations": [daily, snapshots],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "cycle",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert {"name": "customer", "type": "foreign", "expr": "buyer_id"} in (
+        offered["fct_daily"]["entities"]
+    )
+    assert {"name": "customer", "type": "foreign", "expr": "account_id"} in (
+        offered[other]["entities"]
+    )
+
+
+def test_a_numbered_entity_never_takes_a_parent_join_name(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_output` settles `output_day_2`. In the child, `output_day_id` names a
+    dimension's name and is numbered before `parent_day_id`, which references
+    `fct_output.day_2`: the number skips `output_day_2`, which stays the join."""
+    parent = {
+        "model": "fct_output",
+        "description": "One row per day.",
+        "grain": ["day_2"],
+        "columns": {
+            "day_2": {"role": "time"},
+            "output_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    child = {
+        "model": "fct_child",
+        "description": "One row per child.",
+        "grain": ["child_id"],
+        "columns": {
+            "child_id": {"role": "key"},
+            "read_at": {"role": "time"},
+            "output_day": {"role": "dimension"},
+            "output_day_id": {"role": "foreign_key"},
+            "parent_day_id": {"role": "foreign_key", "references": "fct_output.day_2"},
+            "child_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_output.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as day_2, 1.0 as output_total\n"
+                ),
+            },
+            {
+                "path": "models/marts/fct_child.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as child_id, cast('2024-01-01' as date) as read_at, "
+                    "'x' as output_day, 1 as output_day_id, "
+                    "cast('2024-01-01' as date) as parent_day_id, 1.0 as child_total\n"
+                ),
+            },
+        ],
+        "declarations": [parent, child],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "numbered",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert {"name": "output_day_2", "type": "primary", "expr": "day_2"} in (
+        offered["fct_output"]["entities"]
+    )
+    child_entities = offered["fct_child"]["entities"]
+    assert {"name": "output_day_2", "type": "foreign", "expr": "parent_day_id"} in (
+        child_entities
+    )
+    (numbered,) = [e for e in child_entities if e["expr"] == "output_day_id"]
+    assert numbered["name"] not in {"output_day", "output_day_2"}
+
+
+def test_a_moved_dimension_never_takes_a_dimension_name_from_another_model():
+    """The time dimension moves aside for the foreign entity `output_day`; another
+    model's categorical dimension holds `readings_output_day`, so it is numbered and
+    the default time dimension follows it."""
+    parent = {
+        "name": "daily",
+        "entities": [{"name": "output_day", "type": "primary", "expr": "output_day"}],
+    }
+    other = {
+        "name": "calendar",
+        "dimensions": [{"name": "readings_output_day", "type": "categorical"}],
+    }
+    declared = {
+        "grain": ["reading_id"],
+        "columns": {
+            "reading_id": {"role": "key"},
+            "output_day": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_daily.output_day",
+            },
+            "reading_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+
+    found = sd.derive(
+        "fct_readings",
+        declared,
+        column_types={"output_day": ("date", None)},
+        on_ref={
+            "fct_daily": [("models/marts/daily.yml", parent)],
+            "dim_calendar": [("models/marts/calendar.yml", other)],
+        },
+    )
+
+    (dimension,) = found.body["dimensions"]
+    assert (dimension["name"], dimension["expr"]) == (
+        "readings_output_day_2",
+        "output_day",
+    )
+    assert found.body["defaults"] == {"agg_time_dimension": "readings_output_day_2"}

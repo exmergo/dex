@@ -308,7 +308,9 @@ def derive(
 
     # A name this model gives no join to (a fallback, or a reference nothing
     # declares yet) is numbered off any dimension or measure name here, in the
-    # layer or in the plan; a joined name stays the parent's.
+    # layer or in the plan; a joined name stays the parent's. A number, or a
+    # fallback that by definition joins nothing, also keeps clear of every entity
+    # name the layer and the plan use, so it never takes another mart's join name.
     incompatible = (
         dimension_columns | measure_names | layer["dimension"] | layer["measure"]
     )
@@ -319,15 +321,17 @@ def derive(
         entity, joined = _foreign_entity(name, fields.get("references"), on_ref)
         if entity in used_names:
             fallback = _entity_name(name, model)
-            if fallback in incompatible:
-                fallback = _free_name(fallback, incompatible | used_names)
+            if fallback in incompatible | layer["entity"]:
+                fallback = _free_name(
+                    fallback, incompatible | layer["entity"] | used_names
+                )
             notes.append(
                 f"{name}: entity '{entity}' is already used in this semantic model, "
                 f"so it is named '{fallback}' instead and does not join on '{entity}'"
             )
             entity, joined = fallback, None
         elif joined is None and entity in incompatible:
-            renamed = _free_name(entity, incompatible | used_names)
+            renamed = _free_name(entity, incompatible | layer["entity"] | used_names)
             notes.append(
                 f"{name}: entity '{renamed}' instead of '{entity}', which names a "
                 "dimension or measure, and MetricFlow does not allow one name for both"
@@ -409,6 +413,7 @@ def derive(
             | {e["name"] for e in entities}
             | measure_names
             | layer["entity"]
+            | layer["dimension"]
             | layer["measure"]
         )
         renamed = _free_name(f"{stem}_{column}", taken)
@@ -1159,14 +1164,27 @@ class MetricFlowDerivation:
         derivations: list[Derivation] = []
         claimed: dict[str, str] = {}
         # on_ref plus the plan's marts, for foreign keys alone: the collision
-        # check keeps reading on_ref, the project as it stands. Each mart first
-        # stands in as a draft holding its primary entity as the plan names it,
-        # so a foreign key joins its parent's final name even when the parent
-        # derives later or the references form a cycle; at its own turn the
-        # draft gives way to the derived body, or to nothing if it is rejected.
+        # check keeps reading on_ref, the project as it stands. Each mart stands
+        # in as a draft from a first pass: its settled primary entity, and the
+        # foreign entities that join the layer as it stands. Every foreign key in
+        # the plan resolves against those drafts and nothing derived later, so it
+        # joins the same name whatever order the plan derives in, cycles included.
+        # What an accepted body adds is reserved for the marts after it instead.
         foreign_ref = {model: list(found) for model, found in on_ref.items()}
-        planned = _planned_names(request.declarations)
-        drafted: set[str] = set()
+        authored = _layer_names(on_ref)["entity"]
+        # names settled or accepted so far, held for every mart after
+        held: dict[str, set[str]] = {
+            "entity": set(),
+            "dimension": set(),
+            "measure": set(),
+        }
+
+        def reserved_for(model: str) -> dict[str, set[str]]:
+            names = _planned_names(d for d in request.declarations if d.model != model)
+            for kind, more in held.items():
+                names[kind] |= more
+            return names
+
         settled: dict[str, str] = {}
         for declaration in request.declarations:
             if declaration.model in on_ref:
@@ -1176,30 +1194,28 @@ class MetricFlowDerivation:
                 declaration.declared,
                 column_types=declaration.column_types,
                 on_ref=on_ref,
-                reserved=planned,
+                reserved=reserved_for(declaration.model),
             ).body
-            primary = [
-                e for e in (draft or {}).get("entities", []) if e["type"] == "primary"
+            entities = [
+                e
+                for e in (draft or {}).get("entities", [])
+                if e["type"] == "primary" or e["name"] in authored
             ]
-            if primary:
+            if entities and entities[0]["type"] == "primary":
                 foreign_ref[declaration.model] = [
-                    ("", {"name": draft["name"], "entities": primary})
+                    ("", {"name": draft["name"], "entities": entities})
                 ]
-                drafted.add(declaration.model)
-                settled[declaration.model] = primary[0]["name"]
+                settled[declaration.model] = entities[0]["name"]
                 # a later draft keeps clear of it, so two settled names never meet
-                planned["entity"].add(primary[0]["name"])
+                held["entity"].add(entities[0]["name"])
         for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
-            if model in drafted:
-                del foreign_ref[model]
-                drafted.discard(model)
             derivation = derive(
                 model,
                 declaration.declared,
                 column_types=declaration.column_types,
-                on_ref=foreign_ref,
-                reserved=planned,
+                on_ref={m: found for m, found in foreign_ref.items() if m != model},
+                reserved=reserved_for(model),
                 primary_name=settled.get(model),
             )
             derivations.append(derivation)
@@ -1235,12 +1251,13 @@ class MetricFlowDerivation:
                 )
             if name and derivation.status != "failed":
                 # Reserve the name only for a derivation that stays in the plan,
-                # so one that is rejected here cannot refuse a later mart. Its
-                # entities are the ones a later foreign key joins by name.
+                # so one that is rejected here cannot refuse a later mart; the
+                # names its body adds are held for the marts derived after it.
                 claimed[name] = derivation.model
-                foreign_ref.setdefault(derivation.model, []).append(
-                    (derivation.path or "", derivation.body)
-                )
+                for kind, names in _layer_names(
+                    {model: [(derivation.path or "", derivation.body)]}
+                ).items():
+                    held[kind] |= names
 
         ready = [d for d in derivations if d.status == "proposed"]
         derived_edits = _spliced_edits(ready, files, edits)
