@@ -590,6 +590,83 @@ def test_apply_holds_a_written_file_to_the_strict_rules(tmp_path):
     assert read(tmp_path, ORDERS_FILE) == current.content
 
 
+def test_apply_refuses_compiled_only_content_at_apply_time(tmp_path):
+    """Apply re-validates like planning does: a Jinja template on disk, or
+    authored content only Cube's compiler can read, is refused before any
+    write. refusals_for alone passes both, because the loader returns early
+    for a template with no diagnostics (#1270)."""
+
+    from exmergo_dex_core.errors import ProjectError
+
+    templated = "model/generated.yml"
+    root = layered(tmp_path, templated, VIEWS_FILE)
+    put(
+        root,
+        templated,
+        "cubes:\n{% for t in tables %}\n  - name: {{ t }}\n{% endfor %}\n",
+    )
+    layer = CubeSemanticLayer(
+        tmp_path, [ORDERS_FILE, CUSTOMERS_FILE, templated, VIEWS_FILE]
+    )
+    current = layer.semantic_edit_view().files[templated]
+
+    with pytest.raises(ProjectError, match="compiled-only"):
+        layer.write_semantic_edits(
+            [
+                PlanEdit(
+                    path=templated,
+                    kind=EditKind.SEMANTIC_DOCUMENT,
+                    old_content_hash=current.sha256,
+                    new_content=dump(cube("plain")),
+                )
+            ]
+        )
+    assert read(tmp_path, templated).startswith("cubes:\n{% for t in tables %}")
+
+    # Authored content only Cube's compiler can read is refused too.
+    with pytest.raises(ProjectError, match="compiled-only"):
+        layer.write_semantic_edits(
+            [
+                PlanEdit(
+                    path=VIEWS_FILE,
+                    kind=EditKind.SEMANTIC_DOCUMENT,
+                    old_content_hash=None,
+                    new_content=dump(cube("child", extends="orders")),
+                )
+            ]
+        )
+    assert not (tmp_path / VIEWS_FILE).exists()
+
+
+def test_apply_writes_without_fchmod(tmp_path, monkeypatch):
+    """os.fchmod is Unix-only: where it is missing, the staged path is
+    chmodded instead and the apply still writes, keeping the target's mode
+    (#1270)."""
+
+    import os
+
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    layered(tmp_path)
+    target = tmp_path / ORDERS_FILE
+    target.chmod(0o640)
+    layer = CubeSemanticLayer(tmp_path, [ORDERS_FILE, CUSTOMERS_FILE])
+    current = layer.semantic_edit_view().files[ORDERS_FILE]
+    result = layer.write_semantic_edits(
+        [
+            PlanEdit(
+                path=ORDERS_FILE,
+                kind=EditKind.SEMANTIC_DOCUMENT,
+                old_content_hash=current.sha256,
+                new_content=dump(
+                    dict(ORDERS, description="One row per order, revised.")
+                ),
+            )
+        ]
+    )
+    assert result.written == [ORDERS_FILE]
+    assert target.stat().st_mode & 0o777 == 0o640
+
+
 def test_apply_keeps_the_file_mode(tmp_path):
     layered(tmp_path)
     target = tmp_path / ORDERS_FILE
