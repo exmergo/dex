@@ -27,6 +27,7 @@ from exmergo_dex_core.maintain.elementary_incidents import (
     read_elementary,
 )
 from exmergo_dex_core.maintain.elementary_layouts import (
+    CheckedTable,
     ElementaryLayoutError,
     layout_for,
 )
@@ -693,3 +694,158 @@ def test_a_severity_that_is_not_a_token_is_dropped_and_counted(tmp_path: Path):
     read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
     [only] = read.observations
     assert (only.severity, read.severities_unread) == (None, 1)
+
+
+# --- after the cold review -------------------------------------------------------
+
+
+def test_between_two_failures_in_one_run_the_worse_one_is_kept(tmp_path: Path):
+    """A warning on the lower id and a failure on the higher: the failure and
+    its severity are what the run reports, however the ids sort."""
+
+    runs = _hourly(1)
+    other = "test.shop.renamed_check.ghi789"
+    results = [
+        Result("a", "inv-1", TEST, "warn", severity="WARN"),
+        Result("b", "inv-1", other, "fail", severity="ERROR"),
+    ]
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, results))
+    read = _read(engine, claims={TEST: "c1", other: "c1"})
+    [only] = read.observations
+    assert (only.outcome, only.severity, only.test) == ("bad", "ERROR", other)
+
+
+def test_a_run_written_twice_with_only_its_insert_time_apart_is_one_run(
+    tmp_path: Path,
+):
+    path = _warehouse(tmp_path / "dev.duckdb", [Run("inv-1", START)] * 2, [])
+    con = duckdb.connect(str(path))
+    con.execute(
+        "UPDATE main_elementary.dbt_invocations SET created_at = ? "
+        "WHERE created_at = (SELECT max(created_at) FROM "
+        "main_elementary.dbt_invocations) AND rowid = 1",
+        [START + timedelta(hours=1)],
+    )
+    con.close()
+    _insert(path, [Result("r-1", "inv-1")], {"inv-1": START})
+    read = _read(_engine(path))
+    assert [ref.run for ref in read.history.runs] == ["inv-1"]
+
+
+def test_runs_starting_in_one_second_are_ordered_by_their_insert(tmp_path: Path):
+    runs = [Run("inv-b", START), Run("inv-a", START)]
+    path = _warehouse(tmp_path / "dev.duckdb", runs, [])
+    con = duckdb.connect(str(path))
+    con.execute(
+        "UPDATE main_elementary.dbt_invocations SET created_at = ? "
+        "WHERE invocation_id = 'inv-a'",
+        [START + timedelta(hours=2)],
+    )
+    con.close()
+    read = _read(_engine(path))
+    assert [ref.run for ref in read.history.runs] == ["inv-b", "inv-a"]
+
+
+def test_a_repeated_row_is_counted_once_in_every_counter(tmp_path: Path):
+    runs = _hourly(1)
+    results = [
+        Result("r-1", "inv-1", status="fail", severity="failed: 42 rows!"),
+        Result("r-1", "inv-1", status="fail", severity="failed: 42 rows!"),
+        Result("r-2", "inv-1", test=""),
+        Result("r-2", "inv-1", test=""),
+    ]
+    read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
+    assert (read.severities_unread, read.unattributed, read.duplicate_ids) == (1, 1, 1)
+
+
+def test_the_profile_estimate_is_the_whole_ask_of_the_call_that_profiled(
+    tmp_path: Path,
+):
+    """A connector's total can hold more than its per-table lines, so the
+    estimate reported is the ask itself."""
+
+    runs = _hourly(1)
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    asked: list[float] = []
+
+    def handshake(command, adapter, estimate, **kwargs):
+        asked.append(estimate)
+
+    plan = plan_read(engine, NAMESPACE, RELEASE)
+    original = reader.billed_handshake
+    try:
+        read = read_elementary(engine, plan, handshake=handshake)
+    finally:
+        assert reader.billed_handshake is original
+    assert isinstance(read.profile_estimate, float)
+    assert read.profile_estimate == asked[0]
+
+
+_TABLES = {
+    "snowflake": ("DEV", "MAIN_ELEMENTARY", str.upper),
+    "bigquery": ("proj", "main_elementary", str),
+    "postgres": ("dev", "main_elementary", str),
+    "duckdb": ("dev", "main_elementary", str),
+}
+
+
+def _sql(dialect: str, since: datetime | None) -> reader._Sql:
+    catalog, schema, case = _TABLES[dialect]
+    layout = layout_for(RELEASE)
+
+    def checked(table: str) -> CheckedTable:
+        reads = layout.tables[table].reads
+        return CheckedTable(table, {name: case(name) for name in reads})
+
+    return reader._Sql(
+        checked("dbt_invocations"),
+        checked("elementary_test_results"),
+        {
+            table: f"{catalog}.{schema}.{case(table)}"
+            for table in ("dbt_invocations", "elementary_test_results")
+        },
+        since,
+        dialect,
+    )
+
+
+def _schema(dialect: str) -> dict:
+    catalog, schema, case = _TABLES[dialect]
+    layout = layout_for(RELEASE)
+    return {
+        catalog: {
+            schema: {
+                case(table): {
+                    case(name): "VARCHAR" for name, _ in layout.tables[table].columns
+                }
+                for table in ("dbt_invocations", "elementary_test_results")
+            }
+        }
+    }
+
+
+@pytest.mark.parametrize("dialect", sorted(_TABLES))
+@pytest.mark.parametrize("since", [None, START], ids=["all", "since"])
+def test_every_statement_resolves_each_column_in_each_dialect(
+    dialect: str, since: datetime | None
+):
+    """sqlglot's resolver, given the catalog as each warehouse spells it,
+    finds every column every statement names."""
+
+    import sqlglot
+    from sqlglot.optimizer.qualify import qualify
+
+    sql = _sql(dialect, since)
+    for statement in (*sql.measure(), sql.invocations(), sql.results()):
+        qualify(
+            sqlglot.parse_one(statement, read=dialect),
+            schema=_schema(dialect),
+            dialect=dialect,
+            validate_qualify_columns=True,
+        )
+
+
+def test_the_window_is_a_timestamp_on_bigquery_never_a_datetime():
+    for statement in (*_sql("bigquery", START).measure(),):
+        assert "DATETIME" not in statement.upper()
+        assert "AS TIMESTAMP)" in statement.upper()

@@ -119,8 +119,15 @@ _OUTCOMES: Mapping[str, Outcome] = {
     "skipped": "unobserved",
 }
 
-#: Which outcome a run keeps when one subject and signal has several rows.
-_PRECEDENCE: Mapping[Outcome, int] = {"bad": 0, "good": 1, "unobserved": 2}
+#: Which row a run keeps when one subject and signal has several, by status:
+#: a failure over a warning over a pass over nothing, as dbt ranks severity.
+_PRECEDENCE: Mapping[str, int] = {
+    "fail": 0,
+    "error": 0,
+    "warn": 1,
+    "pass": 2,
+    "skipped": 3,
+}
 
 #: The ``test_type`` of a test that writes one row per column and metric.
 _ANOMALY = "anomaly_detection"
@@ -226,8 +233,9 @@ class ElementaryRead:
     #: needs before the firewall can judge a statement over them.
     first_read: bool
     profiled: tuple[str, ...]
-    #: What the profiling was priced at, in the connector's unit (0.0 where
-    #: profiling is free); ``None`` where nothing was profiled.
+    #: What the call that profiled was priced at, in the connector's unit: the
+    #: profiles and that call's three counts together, as one handshake asked
+    #: for them (0.0 where both are free). ``None`` where nothing was profiled.
     profile_estimate: float | None
     #: Whether ``since`` cut the read: the retention bound is then the window's
     #: oldest run, not the oldest the table holds.
@@ -260,20 +268,19 @@ class _Spend:
     """The handshake the runner calls, recorded and handed on."""
 
     delegate: Callable[..., None] | None
-    asks: list[dict[str, float]] = field(default_factory=list)
+    asks: list[float] = field(default_factory=list)
     profiled: list[str] = field(default_factory=list)
+    #: The estimate of each call that profiled. A connector's total can hold
+    #: more than its per-table lines (BigQuery reserves escalation floors), so
+    #: the whole ask is kept rather than the lines named for a table.
+    profiling_asks: list[float] = field(default_factory=list)
 
     def handshake(self, _command: str, adapter: Any, estimate: float, **kwargs) -> None:
-        self.asks.append(dict(kwargs.get("per_table") or {}))
+        self.asks.append(float(estimate))
         (self.delegate or billed_handshake)(COMMAND, adapter, estimate, **kwargs)
 
     def profile_estimate(self) -> float | None:
-        if not self.profiled:
-            return None
-        names = set(self.profiled)
-        return sum(
-            value for ask in self.asks for key, value in ask.items() if key in names
-        )
+        return float(sum(self.profiling_asks)) if self.profiled else None
 
 
 def plan_read(
@@ -383,7 +390,10 @@ def _table(identifier: str, alias: str) -> exp.Table:
     name, *namespace = reversed(parts)
     db = namespace[0] if namespace else None
     catalog = namespace[1] if len(namespace) > 1 else None
-    return exp.table_(name, db=db, catalog=catalog, quoted=True, alias=alias)
+    table = exp.table_(name, db=db, catalog=catalog, quoted=True)
+    # Quoted as the column references quote it: Snowflake folds an unquoted
+    # alias to upper case, and `"i"."col"` would then name nothing.
+    return exp.alias_(table, alias, table=True, quoted=True)
 
 
 @dataclass(frozen=True)
@@ -406,7 +416,11 @@ class _Sql:
         if self.since is None:
             return None
         moment = utc(self.since).replace(tzinfo=None).isoformat(sep=" ")
-        return column >= exp.cast(exp.Literal.string(moment), "timestamp")
+        # Elementary's created_at is the warehouse's plain timestamp type, which
+        # BigQuery calls TIMESTAMP and sqlglot's zoneless `timestamp` writes as
+        # DATETIME there, a type BigQuery will not compare with it.
+        kind = "timestamptz" if self.dialect == "bigquery" else "timestamp"
+        return column >= exp.cast(exp.Literal.string(moment), kind)
 
     def _from(self, table: str, alias: str) -> exp.Select:
         return exp.select().from_(_table(self.relations[table], alias))
@@ -470,7 +484,8 @@ def _limits(engine: Any, rows: int) -> QueryLimits:
     return QueryLimits(
         max_rows=rows,
         max_cell_chars=_CELL_CHARS,
-        max_payload_bytes=(rows + 1) * columns * (_CELL_CHARS + 16) + 1024,
+        # Six bytes a character covers JSON's \uXXXX escape of any character.
+        max_payload_bytes=(rows + 1) * columns * (_CELL_CHARS * 6 + 16) + 1024,
         timeout_seconds=engine.config.query.timeout_seconds,
     )
 
@@ -484,6 +499,7 @@ def _run(
 ) -> list[Any]:
     from ..explore.commands import _run_statements
 
+    asked = len(spend.asks)
     batch, shared = _run_statements(
         engine,
         [(sql, None) for sql in statements],
@@ -492,6 +508,9 @@ def _run(
         limits=limits,
         result_mode=engine.result_mode,
     )
+    if shared.profiled:
+        # A call that profiled is priced once, profiles and statements together.
+        spend.profiling_asks.extend(spend.asks[asked:])
     spend.profiled.extend(
         name for name in shared.profiled if name not in spend.profiled
     )
@@ -534,10 +553,13 @@ def _rows(
 ) -> list[list[Any]]:
     [answer] = _run(engine, adapter, [sql], _limits(engine, bound), spend)
     if answer.truncated or answer.row_count > bound:
+        # Truncated is the row cap, or rows the payload budget dropped; the
+        # budget is sized so that only an escaped cell far past any id's length
+        # could reach it, and either way part of the answer is gone.
         raise ElementaryReadError(
             READ_TOO_LARGE,
-            f"a read grew past its bound of {bound} rows after it was counted; "
-            "read again",
+            f"a read came back cut: it grew past its bound of {bound} rows after "
+            "it was counted, or its rows passed the payload budget; read again",
         )
     return [list(row) for row in answer.cells]
 
@@ -577,12 +599,30 @@ def _token(value: str | None) -> str:
     return value if value is not None and _TOKEN.match(value) else "an unreadable value"
 
 
+def _identity(invocation: _Invocation) -> tuple:
+    """What places a run: its start, commit and version. ``created_at`` is the
+    insert's own time, which a second write of the same run may differ in."""
+
+    return (invocation.started, invocation.commit, invocation.version)
+
+
+def _earlier(held: _Invocation, other: _Invocation) -> _Invocation:
+    if held.created is None:
+        return other
+    if other.created is None or held.created <= other.created:
+        return held
+    return other
+
+
 def _distinct(rows: Iterable[_Invocation]) -> list[_Invocation]:
     by_run: dict[str, _Invocation] = {}
     repeated = 0
     for invocation in rows:
         held = by_run.setdefault(invocation.run, invocation)
-        repeated += held != invocation
+        if _identity(held) != _identity(invocation):
+            repeated += 1
+        else:
+            by_run[invocation.run] = _earlier(held, invocation)
     if repeated:
         raise ElementaryReadError(
             INVOCATION_REPEATED,
@@ -663,6 +703,18 @@ class _Row:
     outcome: Outcome
     severity: str | None
     status: str
+    #: The row named a severity that is not a token, so it carries none.
+    severity_unread: bool = False
+
+
+def _severity(value: str | None) -> tuple[str | None, bool]:
+    """The severity token, and whether a severity was there and was not one."""
+
+    if value is None or not value.strip():
+        return None, False
+    if _SEVERITY.match(value.strip()):
+        return value.strip(), False
+    return None, True
 
 
 def _long(*values: str | None) -> bool:
@@ -677,10 +729,20 @@ class _Observations:
     claims: Mapping[str, str]
     duplicates: int = 0
     merged: int = 0
-    unattributed: int = 0
     unplaced: int = 0
-    severities_unread: int = 0
     _seen: dict[str, _Row] = field(default_factory=dict)
+    #: The ids of rows with no test id, and how many rows had no id at all:
+    #: a repeated id is one row, as it is everywhere else here.
+    _untested: set[str] = field(default_factory=set)
+    _no_id: int = 0
+
+    @property
+    def unattributed(self) -> int:
+        return self._no_id + len(self._untested)
+
+    @property
+    def severities_unread(self) -> int:
+        return sum(1 for row in self._seen.values() if row.severity_unread)
 
     def add(self, rows: Iterable[Sequence[Any]]) -> None:
         unknown: dict[str, int] = {}
@@ -706,8 +768,11 @@ class _Observations:
 
     def _row(self, raw: Sequence[Any], unknown: dict[str, int]) -> _Row | None:
         rid, run, test, column, kind, metric, status, severity = map(_text, raw)
-        if not rid or not test:
-            self.unattributed += 1
+        if not rid:
+            self._no_id += 1
+            return None
+        if not test:
+            self._untested.add(rid)
             return None
         if _long(rid, test, column, metric) or (run and len(run) > _MAX_RUN_CHARS):
             raise ElementaryReadError(
@@ -727,17 +792,8 @@ class _Observations:
             if anomaly
             else Signal()
         )
-        return _Row(
-            rid, run or "", test, signal, outcome, self._severity(severity), word
-        )
-
-    def _severity(self, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        if _SEVERITY.match(value.strip()):
-            return value.strip()
-        self.severities_unread += 1
-        return None
+        token, unread = _severity(severity)
+        return _Row(rid, run or "", test, signal, outcome, token, word, unread)
 
     def observations(self) -> tuple[Observation, ...]:
         placed = {run.run: (index, run) for index, run in enumerate(self.runs, start=1)}
@@ -751,7 +807,7 @@ class _Observations:
             held = kept.get(key)
             if held is not None:
                 self.merged += 1
-                if _PRECEDENCE[row.outcome] >= _PRECEDENCE[held.outcome]:
+                if _PRECEDENCE[row.status] >= _PRECEDENCE[held.status]:
                     continue
             kept[key] = row
         return tuple(
