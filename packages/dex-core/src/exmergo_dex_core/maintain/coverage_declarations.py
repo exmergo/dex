@@ -66,6 +66,8 @@ How each fact kind is judged (dbt test; maintain verify codes):
 - history: ``temporal_*``.
 - freshness (#1460): ``freshness_exceeded``, and dbt's ``dex_freshness`` where
   the column carries it.
+- continuity (#1461): dbt's ``dex_continuity`` where the column carries one at
+  the declared grain and ``by``; nothing in verify.
 """
 
 from __future__ import annotations
@@ -98,6 +100,7 @@ KINDS = (
     "additivity",
     "history",
     "freshness",
+    "continuity",
 )
 
 _CHECKED_UNITS = frozenset({"fraction", "percent"})
@@ -195,6 +198,27 @@ class _Tests:
                     return True
             except (TypeError, ValueError):
                 continue
+        return False
+
+    def continuity(self, model: str, column: str, declared: dict) -> bool:
+        """Whether a ``dex_continuity`` on ``column`` searches the declared grain
+        and ``by`` keys (#1461): a test left at another grain or other keys
+        searches other buckets, so it does not check the declaration."""
+
+        grain = str(declared.get("grain") or "day").lower()
+        raw = declared.get("by") or []
+        by = [_bare(str(k)) for k in (raw if isinstance(raw, list) else [raw])]
+        key = _bare(column)
+        for name, col, kwargs, _reads in self.by_model.get(model, []):
+            if _base(name) != "dex_continuity" or col != key:
+                continue
+            listed = kwargs.get("by") or []
+            listed = listed if isinstance(listed, list) else [listed]
+            if (
+                str(kwargs.get("grain") or "day").lower() == grain
+                and [_bare(str(k)) for k in listed] == by
+            ):
+                return True
         return False
 
     def combination(self, model: str, columns: list[str]) -> str | None:
@@ -932,6 +956,17 @@ def _model_facts(
                 ["freshness_exceeded"],
                 what=f"{freshness.get('max_lag')} {freshness.get('basis')}",
             )
+        continuity = dex.get("continuity")
+        if isinstance(continuity, dict):
+            found = (
+                ["dex_continuity"] if tests.continuity(uid, name, continuity) else []
+            )
+            keys = continuity.get("by") or []
+            keys = keys if isinstance(keys, list) else [keys]
+            what = str(continuity.get("grain") or "day")
+            if keys:
+                what += " by " + ", ".join(str(k) for k in keys)
+            add("continuity", name, found, [], what=what)
 
     population = model_dex.get("population")
     if isinstance(population, dict):

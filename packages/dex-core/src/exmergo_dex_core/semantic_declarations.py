@@ -275,6 +275,55 @@ class Freshness(_Strict):
         return lag_seconds(self.max_lag)
 
 
+class ContinuityGrain(str, Enum):
+    """The bucket a declared continuity searches for gaps in (#1461)."""
+
+    SECOND = "second"
+    MINUTE = "minute"
+    HOUR = "hour"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    QUARTER = "quarter"
+    YEAR = "year"
+
+
+#: The grains finer than a day, which a date column cannot be bucketed at.
+SUB_DAY_GRAINS: frozenset[str] = frozenset({"second", "minute", "hour"})
+
+
+class Continuity(_Strict):
+    """That a declared time column has no gap (#1461): no bucket at ``grain``
+    missing between two buckets holding rows, for the whole model or, with
+    ``by``, for each value of those columns. A gap at the edge of the data is
+    no gap, so the answer never depends on today's date (that is freshness's
+    question). ``week`` is the ISO week, starting Monday; every bucket is read
+    in UTC."""
+
+    grain: ContinuityGrain = ContinuityGrain.DAY
+    #: The key columns gaps are searched per value of, in the order written.
+    by: list[str] = []
+
+    @field_validator("by", mode="before")
+    @classmethod
+    def _keys(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise ValueError("by is a list of column names, for example [region]")
+        keys = [v.strip() for v in value]
+        if any(not key for key in keys):
+            raise ValueError("by names a column with an empty name")
+        seen: set[str] = set()
+        for key in keys:
+            if key.lower() in seen:
+                raise ValueError(f"by names '{key}' twice")
+            seen.add(key.lower())
+        return keys
+
+
 class ColumnDeclaration(_Strict):
     role: Role | None = None
     description: str | None = None
@@ -287,6 +336,8 @@ class ColumnDeclaration(_Strict):
     unit: str | None = None
     # How old the newest value may be, on a `time` column only (#1460).
     freshness: Freshness | None = None
+    # That the column has no gap at a grain, per key (#1461), on `time` only.
+    continuity: Continuity | None = None
 
 
 class Assumption(_Strict):
@@ -420,6 +471,7 @@ COLUMN_FIELDS = (
     "additivity",
     "unit",
     "freshness",
+    "continuity",
 )
 
 

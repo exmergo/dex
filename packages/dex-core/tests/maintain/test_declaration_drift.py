@@ -777,3 +777,25 @@ def test_a_loosened_freshness_is_high_drift_naming_the_field():
         )
         == []
     )
+
+
+def test_a_changed_continuity_is_high_drift_naming_the_field():
+    # A coarser grain or fewer keys stops a gap failing with the SQL untouched
+    # (#1461).
+    gapless = DECLARED_YML.replace(
+        "      - name: customer_id\n        tests: [not_null]\n",
+        "      - name: customer_id\n        tests: [not_null]\n"
+        "      - name: ordered_at\n        config:\n          meta:\n            dex:\n"
+        "              role: time\n"
+        "              continuity: {grain: day, by: [region]}\n",
+    )
+    coarser = gapless.replace("grain: day", "grain: month")
+
+    [finding] = _drift(gapless, coarser)
+    assert finding.code == "declaration_changed"
+    assert (finding.column, finding.data["field"]) == ("ordered_at", "continuity")
+    assert finding.severity == "high"
+    reordered = gapless.replace(
+        "{grain: day, by: [region]}", "{by: [region], grain: day}"
+    )
+    assert _drift(gapless, reordered) == []

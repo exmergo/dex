@@ -825,3 +825,54 @@ register(
         dialects=ALL_CONNECTORS,
     )
 )
+
+CONTINUITY = "dex_continuity"
+
+
+def _declared_continuity(declaration: Any) -> list[Instance]:
+    """One column test per column declaring ``continuity`` (#1461): it fails with
+    the number of gaps in the column, a gap being a run of buckets at the
+    declared grain holding no row between two buckets that hold rows, for the
+    whole model or per value of the ``by`` columns. An edge is never a gap, so
+    the answer does not depend on today's date. The ``by`` columns go into the
+    test's columns, so a model that does not output one renders nothing
+    (:data:`COLUMN_NOT_OUTPUT`). Scheduled: the search reads every row."""
+
+    out: list[Instance] = []
+    for name, column in (getattr(declaration, "columns", None) or {}).items():
+        continuity = getattr(column, "continuity", None)
+        if continuity is None:
+            continue
+        grain = str(getattr(continuity.grain, "value", continuity.grain))
+        by = [str(key) for key in continuity.by]
+        arguments: dict[str, Any] = {"grain": grain}
+        if by:
+            arguments["by"] = list(by)
+        out.append(
+            Instance(
+                column=str(name),
+                field="continuity",
+                columns=(str(name), *by),
+                params={
+                    "check": CONTINUITY,
+                    "grain": grain,
+                    # Names, folded as claim_id folds a string (a list is
+                    # hashed as written).
+                    "by": [key.lower() for key in by],
+                },
+                arguments=arguments,
+                variant=grain,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        CONTINUITY,
+        SCHEDULED,
+        _declared_continuity,
+        macro=CONTINUITY,
+        dialects=ALL_CONNECTORS,
+    )
+)

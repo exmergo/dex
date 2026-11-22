@@ -293,6 +293,46 @@ def test_a_freshness_is_checked_by_verify_and_by_its_generated_test() -> None:
     )
 
 
+def test_a_continuity_is_checked_by_its_generated_test_alone() -> None:
+    gapless = {"role": "time", "continuity": {"grain": "day", "by": ["region"]}}
+    manifest = _manifest(
+        [
+            _model("tested", columns={"ordered_at": gapless}),
+            _model("other_grain", columns={"ordered_at": gapless}),
+            _model("other_keys", columns={"ordered_at": gapless}),
+            _model("untested", columns={"ordered_at": gapless}),
+        ],
+        [
+            _test(
+                "dex_continuity",
+                "tested",
+                "ordered_at",
+                kwargs={"grain": "day", "by": ["Region"]},
+            ),
+            # Searching other buckets, or the whole table: not the declaration.
+            _test(
+                "dex_continuity",
+                "other_grain",
+                "ordered_at",
+                kwargs={"grain": "week", "by": ["region"]},
+            ),
+            _test(
+                "dex_continuity", "other_keys", "ordered_at", kwargs={"grain": "day"}
+            ),
+        ],
+    )
+    out = _run(manifest)
+    tested = _fact(out, "continuity", "ordered_at", model="tested")
+    assert (tested["checked_by"], tested["tests"], tested["verify"]) == (
+        "dbt_test",
+        ["dex_continuity"],
+        [],
+    )
+    for model in ("other_grain", "other_keys", "untested"):
+        fact = _fact(out, "continuity", "ordered_at", model=model)
+        assert fact["checked_by"] == "none", model
+
+
 def test_undeclared_model_is_counted_apart() -> None:
     manifest = _manifest(
         [

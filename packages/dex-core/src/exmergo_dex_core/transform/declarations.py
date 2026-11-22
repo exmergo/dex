@@ -824,6 +824,19 @@ def _check(
                 f"its SELECT list in {sql_path} does not produce; a grain names "
                 "columns of the model"
             )
+        for name, column in declaration.columns.items():
+            # A continuity's keys (#1461) are columns of the model too: a key
+            # it does not output is a typo or a column aggregated away, and the
+            # test would only error.
+            keys = column.continuity.by if column.continuity is not None else []
+            missing_keys = [k for k in keys if k.lower() not in produced]
+            if missing_keys:
+                raise DeclarationError(
+                    f"'{model}.{name}' declares continuity by "
+                    f"{', '.join(missing_keys)}, which its SELECT list in "
+                    f"{sql_path} does not produce; `by` names columns of the "
+                    "model"
+                )
 
     for name, column in declaration.columns.items():
         if column.references is not None:
@@ -835,20 +848,28 @@ def _check(
                 f"'{model}.{name}' is a foreign_key with no `references`, so no "
                 "relationships test was written for it"
             )
-        if column.freshness is not None:
-            _check_freshness(model, name, column, files)
-        elif (
-            column.role is not None
-            and column.role is not Role.TIME
-            and _yaml_column_dex(files, model, name).get("freshness")
+        for field in ("freshness", "continuity"):
+            if getattr(column, field) is not None:
+                _check_time_field(model, name, column, files, field)
+            elif (
+                column.role is not None
+                and column.role is not Role.TIME
+                and _yaml_column_dex(files, model, name).get(field)
+            ):
+                # The merge keeps the field the YAML already states, so a new
+                # role would leave it on a column that is no longer the time.
+                raise DeclarationError(
+                    f"'{model}.{name}' already declares {field}, which belongs on "
+                    "the column with role `time`, and this declaration makes its "
+                    f"role `{column.role.value}`; keep `role: time` on it, or "
+                    f"remove its {field} from the model's YAML first"
+                )
+        if column.continuity is not None and any(
+            key.lower() == name.lower() for key in column.continuity.by
         ):
-            # The merge keeps the freshness the YAML already states, so a new
-            # role would leave it on a column that is no longer the time.
             raise DeclarationError(
-                f"'{model}.{name}' already declares freshness, which belongs on "
-                f"the column with role `time`, and this declaration makes its role "
-                f"`{column.role.value}`; keep `role: time` on it, or remove its "
-                "freshness from the model's YAML first"
+                f"'{model}.{name}' declares continuity by itself; `by` names the "
+                "key columns gaps are searched per value of, never the time column"
             )
 
     if declaration.population is not None:
@@ -1313,13 +1334,14 @@ def _check_filters(
             )
 
 
-def _check_freshness(
-    model: str, name: str, column: Any, files: Mapping[str, str]
+def _check_time_field(
+    model: str, name: str, column: Any, files: Mapping[str, str], field: str
 ) -> None:
-    """Refuse a ``freshness`` on a column that is not the model's declared time
-    (#1460): the lag is read from the newest value of a timestamp, and a role
-    other than ``time`` says the column is something else. The role is this
-    declaration's, else the one the model's YAML already states."""
+    """Refuse a ``freshness`` (#1460) or ``continuity`` (#1461) on a column that
+    is not the model's declared time: each is read from the values of a date or
+    timestamp, and a role other than ``time`` says the column is something
+    else. The role is this declaration's, else the one the model's YAML already
+    states."""
 
     role = column.role.value if column.role is not None else None
     if role is None:
@@ -1328,9 +1350,9 @@ def _check_freshness(
         return
     stated = f"its role is `{role}`" if role else "it declares no role"
     raise DeclarationError(
-        f"'{model}.{name}' declares freshness, but {stated}; freshness belongs on "
+        f"'{model}.{name}' declares {field}, but {stated}; {field} belongs on "
         "the column with role `time` (the event's time or the load time), so "
-        "declare `role: time` on it or move the freshness to that column"
+        f"declare `role: time` on it or move the {field} to that column"
     )
 
 
@@ -1489,11 +1511,12 @@ def render(
                 generated.append(row)
             if notes is not None:
                 notes.append(_stale_note(row))
-    for row in _stale_freshness_tests(content, declaration.model, planned):
-        if generated is not None:
-            generated.append(row)
-        if notes is not None:
-            notes.append(_stale_note(row))
+    for test in (gt.FRESHNESS, gt.CONTINUITY):
+        for row in _stale_column_tests(content, declaration.model, planned, test):
+            if generated is not None:
+                generated.append(row)
+            if notes is not None:
+                notes.append(_stale_note(row))
     if history is not None:
         # A listed dex_temporal_contract the history no longer gives (#1458):
         # a policy, the snapshot, a measure or its column changed, or the
@@ -1760,6 +1783,13 @@ def _stale_note(row: Mapping[str, Any]) -> str:
             "changed); it still holds the column to the old lag, so remove it "
             "from the YAML"
         )
+    if row["test"] == gt.CONTINUITY:
+        return (
+            f"'{row['model']}.{row['column']}' lists a {gt.CONTINUITY} test (claim "
+            f"{row['claim']}) for a continuity it no longer declares (its grain or "
+            "its `by` columns changed); it still searches the old buckets, so "
+            "remove it from the YAML"
+        )
     if row["test"] == gt.TEMPORAL_CONTRACT:
         return (
             f"'{row['model']}' lists a {gt.TEMPORAL_CONTRACT} test (claim "
@@ -1909,22 +1939,31 @@ def _listed_entry(content: str | None, model: str) -> Mapping[str, Any] | None:
     return node if isinstance(node, Mapping) else None
 
 
-def _stale_freshness_tests(
-    content: str | None, model: str, planned: list[dict[str, Any]]
+#: The reason a listed column test is stale, and its cadence, per kind.
+_STALE_REASONS: Mapping[str, tuple[str, str]] = {
+    gt.FRESHNESS: ("freshness_changed", gt.EVERY_RUN),
+    gt.CONTINUITY: ("continuity_changed", gt.SCHEDULED),
+}
+
+
+def _stale_column_tests(
+    content: str | None, model: str, planned: list[dict[str, Any]], test: str
 ) -> list[dict[str, Any]]:
-    """The ``dex_freshness`` tests a column lists whose claim the declared
-    freshness no longer gives (#1460): its ``max_lag`` changed, so
-    the test still holds the column to the old lag. Each is a
-    ``data.generated_tests`` row with ``status: stale`` and ``reason:
-    freshness_changed``. Only the columns whose freshness this declaration
-    states are read: a column it says nothing about keeps what it lists."""
+    """The ``test`` tests a column lists whose claim the declaration no longer
+    gives: a ``dex_freshness`` whose ``max_lag`` changed (#1460), a
+    ``dex_continuity`` whose grain or ``by`` changed (#1461), so the test still
+    holds the column to the old fact. Each is a ``data.generated_tests`` row
+    with ``status: stale``, a ``reason`` and the kind's cadence
+    (:data:`_STALE_REASONS`). Only the
+    columns this declaration gives the kind are read: a column it says nothing
+    about keeps what it lists."""
 
     node = _listed_entry(content, model)
     if node is None:
         return []
     current: dict[str, list[Any]] = {}
     for g in planned:
-        if g["test"] == gt.FRESHNESS and g["column"] is not None:
+        if g["test"] == test and g["column"] is not None:
             current.setdefault(str(g["column"]).lower(), []).append(g["spec"])
     out: list[dict[str, Any]] = []
     for column in node.get("columns") or []:
@@ -1936,7 +1975,7 @@ def _stale_freshness_tests(
         claims = {claim_of(spec) for spec in specs}
         listed = column.get("data_tests") or column.get("tests") or []
         for item in listed if isinstance(listed, list) else []:
-            if _listed_name(item) != gt.FRESHNESS or not gt.is_generated(item):
+            if _listed_name(item) != test or not gt.is_generated(item):
                 continue
             # Matched as rendering matches a listed test: by claim, else by
             # arguments, so a basis-only change (same lag, a test that behaves
@@ -1949,11 +1988,11 @@ def _stale_freshness_tests(
                 {
                     "model": model,
                     "column": column["name"],
-                    "test": gt.FRESHNESS,
-                    "cadence": gt.EVERY_RUN,
+                    "test": test,
+                    "cadence": _STALE_REASONS[test][1],
                     "claim": claim_of(item),
                     "status": "stale",
-                    "reason": "freshness_changed",
+                    "reason": _STALE_REASONS[test][0],
                 }
             )
     return out
@@ -2073,10 +2112,14 @@ def _generated(
                 model, instance.field, instance.columns, dict(instance.params)
             )
             renders, reason = on, None if on else off_reason
-            # The model's columns the test reads: the one it sits under, or a
-            # model-level test's columns (a grain, a parent key; #1454).
-            reads = (
-                (instance.column,) if instance.column is not None else instance.columns
+            # The model's columns the test reads: the one it sits under, and
+            # the claim's columns (a grain, a parent key, #1454; a
+            # continuity's `by` keys, #1461).
+            reads = tuple(
+                dict.fromkeys(
+                    ((instance.column,) if instance.column is not None else ())
+                    + tuple(instance.columns)
+                )
             )
             if (
                 on
@@ -2393,6 +2436,8 @@ def _rendered_columns(
         }
         if column.freshness is not None:
             entry["dex"]["freshness"] = column.freshness.model_dump(mode="json")
+        if column.continuity is not None:
+            entry["dex"]["continuity"] = column.continuity.model_dump(mode="json")
         if column.null_rule is not None and column.null_rule.strip().lower() == "never":
             entry["tests"].append(
                 _unsampled(
