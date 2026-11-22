@@ -326,6 +326,43 @@ def test_plain_build_without_a_project_name_keeps_the_builds_own_order():
     assert completion.assurance.build_only.names[0] == "dbt_columns"
 
 
+def test_plan_build_keeps_the_plans_requirement_order_with_a_project_name():
+    # The plan requires the package model first and the project's own model
+    # second; the plain-build sort would flip them (#1506). A plan build's
+    # lists follow the plan's requirement order, not the project's own first.
+    nodes = [
+        *_package_models(),
+        BuildNode(unique_id=_uid("fct_orders"), name="fct_orders", status="success"),
+        BuildNode(
+            unique_id="test.elementary.not_null_data_monitoring_metrics_id.aaa",
+            name="not_null_data_monitoring_metrics_id",
+            resource_type="test",
+            status="pass",
+        ),
+        BuildNode(
+            unique_id="test.dex_test.not_null_fct_orders_id.bbb",
+            name="not_null_fct_orders_id",
+            resource_type="test",
+            status="pass",
+        ),
+    ]
+    graph = {
+        "test.elementary.not_null_data_monitoring_metrics_id.aaa": [
+            "model.elementary.data_monitoring_metrics"
+        ],
+        "test.dex_test.not_null_fct_orders_id.bbb": [_uid("fct_orders")],
+    }
+    evidence = _evidence(nodes, required=["data_monitoring_metrics", "fct_orders"])
+    completion = summarize_completion(
+        evidence, None, graph=graph, project_name="dex_test"
+    )
+    assert completion.assurance.basis == "required"
+    assert completion.assurance.asserted.names == [
+        "data_monitoring_metrics",
+        "fct_orders",
+    ]
+
+
 def test_a_satisfied_record_counts_as_asserted_and_obligations_are_counted():
     nodes = [BuildNode(unique_id=_uid(REPORT), name=REPORT, status="success")]
     evidence = _evidence(nodes, required=[REPORT])
