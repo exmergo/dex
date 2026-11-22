@@ -281,10 +281,11 @@ def _redshift_serverless(engine: Any, target: Any) -> bool:
     told without opening it: a pinned ``workgroup``, or an endpoint host from
     the environment, the committed target or a dbt profile that is a
     Serverless one (the same discovery the connection itself runs, which reads
-    no warehouse for those). A connection a host supplied is already open."""
+    no warehouse for those). A connection a host supplies carries no compute
+    facts, so it may be Serverless and is not opened unasked either."""
 
     if getattr(engine, "connection", None) is not None:
-        return False
+        return True
     if getattr(target, "workgroup", None):
         return True
     import os
@@ -310,8 +311,9 @@ def _billed(
         rows,
         cost,
         METADATA_READ_BILLED,
-        "reading this connector's catalog bills (a Redshift Serverless "
-        "workgroup wakes for it), and a plan does not spend unasked",
+        "reading this connector's catalog can bill (a Redshift Serverless "
+        "workgroup wakes for it, and a connection a host supplies may be one), "
+        "and a plan does not spend unasked",
         stale,
     )
 

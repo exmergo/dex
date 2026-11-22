@@ -877,3 +877,21 @@ def test_a_model_database_override_is_read_only_inside_the_allowlist(tmp_path: P
     assert row["cost"]["reason"] == test_cost.OUTSIDE_ALLOWLIST
     assert adapter.asked == []
     assert adapter.dev_reads == []
+
+
+def test_a_host_supplied_redshift_connection_is_not_opened(tmp_path):
+    """A host's connection carries no compute facts, so it may be Serverless."""
+
+    def never():
+        raise AssertionError("opened a connection")
+
+    engine = _engine("redshift", prod="analytics", host="c.redshift.amazonaws.com")
+    engine.connection = object()
+    report = {"tests": [row := _row()]}
+    test_cost.price(
+        engine,
+        report,
+        view=_view(tmp_path, _node("fct_orders")),
+        adapter_factory=never,
+    )
+    assert row["cost"]["reason"] == test_cost.METADATA_READ_BILLED
