@@ -104,7 +104,8 @@
           {
             "group": "Project quality",
             "pages": [
-              "reference/evaluation"
+              "reference/evaluation",
+              "reference/incidents"
             ]
           }
         ]
