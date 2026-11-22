@@ -58,7 +58,37 @@ def _warehouse(tmp_path: Path, rows: int | None) -> Path:
     return path
 
 
+def _manifest(tmp_path: Path) -> None:
+    """The manifest dbt would write for the project once ``fct_orders`` is
+    built: what names its production relation (its alias and custom schema)."""
+
+    target = tmp_path / "analytics" / "target"
+    target.mkdir(parents=True, exist_ok=True)
+    node = {
+        "name": "fct_orders",
+        "resource_type": "model",
+        "package_name": "dex_test",
+        "database": "dev",
+        "schema": "main",
+        "alias": "fct_orders",
+        "config": {"schema": None, "materialized": "table"},
+        "relation_name": '"dev"."main"."fct_orders"',
+        "depends_on": {"nodes": []},
+    }
+    (target / "manifest.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"project_name": "dex_test"},
+                "nodes": {"model.dex_test.fct_orders": node},
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _repo(tmp_path: Path, *, prod: str | None = "prod") -> Path:
+    _manifest(tmp_path)
     (tmp_path / ".dex").mkdir(exist_ok=True)
     lines = ["connector: duckdb", "duckdb:", f"  path: {tmp_path / 'dev.duckdb'}"]
     if prod:
@@ -396,14 +426,24 @@ def test_a_source_is_read_only_inside_the_allowlist(tmp_path: Path):
 
 def test_a_view_has_no_size_and_the_test_is_unknown(tmp_path: Path):
     adapter = _Adapter({"proj.analytics.fct_orders": (None, None, "view")})
-    _price(_engine(prod="analytics"), [row := _row()], adapter, _view(tmp_path, {}))
+    _price(
+        _engine(prod="analytics"),
+        [row := _row()],
+        adapter,
+        _view(tmp_path, _node("fct_orders")),
+    )
     assert row["cost"]["reason"] == test_cost.NO_SIZE_IN_METADATA
     assert "a view" in row["cost"]["detail"]
 
 
 def test_a_billed_catalog_is_not_read_unasked(tmp_path: Path):
     adapter = _Adapter({"proj.analytics.fct_orders": (1, 1, "table")}, billed=True)
-    _price(_engine(prod="analytics"), [row := _row()], adapter, _view(tmp_path, {}))
+    _price(
+        _engine(prod="analytics"),
+        [row := _row()],
+        adapter,
+        _view(tmp_path, _node("fct_orders")),
+    )
     assert row["cost"]["reason"] == test_cost.METADATA_READ_BILLED
     assert adapter.asked == []
 
@@ -411,7 +451,9 @@ def test_a_billed_catalog_is_not_read_unasked(tmp_path: Path):
 def test_an_unnamed_input_is_unknown(tmp_path: Path):
     adapter = _Adapter({"proj.analytics.fct_orders": (1, 1, "table")})
     row = _row(reads=[{"relation": None}])
-    _price(_engine(prod="analytics"), [row], adapter, _view(tmp_path, {}))
+    _price(
+        _engine(prod="analytics"), [row], adapter, _view(tmp_path, _node("fct_orders"))
+    )
     assert row["cost"]["reason"] == test_cost.RELATION_UNNAMED
 
 
@@ -435,9 +477,13 @@ def test_only_tests_that_run_in_production_are_priced(tmp_path: Path):
         _row(status="stale"),
         _row(status="listed_while_off"),
     ]
-    report, _ = _price(_engine(prod="analytics"), rows, adapter, _view(tmp_path, {}))
-    assert ["cost" in row for row in rows] == [False, False, True]
-    assert report["cost"]["per_run"][gt.EVERY_RUN]["tests"] == 1
+    report, _ = _price(
+        _engine(prod="analytics"), rows, adapter, _view(tmp_path, _node("fct_orders"))
+    )
+    # A stale test stays in the YAML and runs, so it counts, unpriced (#1462).
+    assert ["cost" in row for row in rows] == [False, True, True]
+    assert rows[1]["cost"]["reason"] == test_cost.STALE_TEST
+    assert report["cost"]["per_run"][gt.EVERY_RUN]["tests"] == 2
 
 
 def test_a_connection_that_cannot_open_leaves_every_test_unknown(tmp_path: Path):
@@ -448,7 +494,7 @@ def test_a_connection_that_cannot_open_leaves_every_test_unknown(tmp_path: Path)
     test_cost.price(
         _engine(prod="analytics"),
         report,
-        view=_view(tmp_path, {}),
+        view=_view(tmp_path, _node("fct_orders")),
         adapter_factory=boom,
     )
     assert row["cost"]["reason"] == test_cost.CONNECTION_UNAVAILABLE
@@ -497,13 +543,20 @@ def test_a_view_is_priced_on_the_tables_it_reads(tmp_path: Path):
         }
     )
     nodes = {
-        **_node("fct_orders", depends_on={"nodes": ["model.p.int_orders"]}),
+        **_node(
+            "fct_orders",
+            depends_on={"nodes": ["model.p.int_orders"]},
+            compiled_code="with __dbt__cte__int_orders as (select 1) "
+            "select * from __dbt__cte__int_orders",
+        ),
         **_node(
             "int_orders",
             config={"materialized": "ephemeral"},
             depends_on={"nodes": ["seed.p.raw_orders", "source.p.raw.payments"]},
+            compiled_code="select * from proj.dev.raw_orders "
+            "join proj.raw.payments using (order_id)",
         ),
-        **_node("raw_orders", kind="seed"),
+        **_node("raw_orders", kind="seed", relation_name="proj.dev.raw_orders"),
     }
     sources = {
         "source.p.raw.payments": {
@@ -513,6 +566,7 @@ def test_a_view_is_priced_on_the_tables_it_reads(tmp_path: Path):
             "database": "proj",
             "schema": "raw",
             "identifier": "payments",
+            "relation_name": "proj.raw.payments",
         }
     }
     report, warnings = _price(
@@ -543,3 +597,245 @@ def test_a_view_with_no_lineage_has_no_size(tmp_path: Path):
         _view(tmp_path, _node("fct_orders")),
     )
     assert row["cost"]["reason"] == test_cost.NO_SIZE_IN_METADATA
+
+
+# --- the review's cases ---------------------------------------------------------
+
+
+def test_a_model_the_manifest_does_not_hold_is_never_named_by_guess(tmp_path: Path):
+    adapter = _Adapter({"proj.analytics.fct_orders": (1, 1, "table")})
+    _price(_engine(prod="analytics"), [row := _row()], adapter, _view(tmp_path, {}))
+    assert row["cost"]["reason"] == test_cost.NOT_IN_MANIFEST
+    assert adapter.asked == []
+
+
+def test_a_view_whose_sql_reads_an_untracked_table_is_unknown(tmp_path: Path):
+    adapter = _Adapter(
+        {
+            "proj.analytics.fct_orders": (None, None, "view"),
+            "proj.analytics.raw_orders": (1, 1, "table"),
+        }
+    )
+    nodes = {
+        **_node(
+            "fct_orders",
+            depends_on={"nodes": ["seed.p.raw_orders"]},
+            compiled_code="select * from proj.dev.raw_orders "
+            "join proj.legacy.hardcoded using (id)",
+        ),
+        **_node("raw_orders", kind="seed", relation_name="proj.dev.raw_orders"),
+    }
+    _price(_engine(prod="analytics"), [row := _row()], adapter, _view(tmp_path, nodes))
+    assert row["cost"]["reason"] == test_cost.UNTRACKED_INPUT
+
+
+def test_a_view_dbt_never_compiled_is_unverified(tmp_path: Path):
+    adapter = _Adapter({"proj.analytics.fct_orders": (None, None, "view")})
+    nodes = {
+        **_node("fct_orders", depends_on={"nodes": ["seed.p.raw_orders"]}),
+        **_node("raw_orders", kind="seed"),
+    }
+    _price(_engine(prod="analytics"), [row := _row()], adapter, _view(tmp_path, nodes))
+    assert row["cost"]["reason"] == test_cost.LINEAGE_UNVERIFIED
+
+
+def test_a_literal_schema_outside_prod_and_the_allowlist_is_not_read(tmp_path: Path):
+    adapter = _Adapter({"proj.snapshots.orders_snap": (9, 90, "table")})
+    nodes = _node(
+        "orders_snap",
+        kind="snapshot",
+        schema="snapshots",
+        config={"target_schema": "snapshots"},
+    )
+    row = _row(reads=[{"relation": "ref('orders_snap')"}])
+    _price(
+        _engine(prod="analytics", project="proj", datasets=["raw"]),
+        [row],
+        adapter,
+        _view(tmp_path, nodes),
+    )
+    assert row["cost"]["reason"] == test_cost.OUTSIDE_ALLOWLIST
+    assert adapter.asked == []
+    assert adapter.dev_reads == []
+
+
+def test_a_package_qualified_ref_resolves_in_that_package(tmp_path: Path):
+    adapter = _Adapter(
+        {
+            "proj.analytics.orders": (1, 10, "table"),
+            "proj.analytics.pkg_orders": (1, 70, "table"),
+        }
+    )
+    package_node = _node("orders", alias="pkg_orders")
+    package_node["model.p.orders"]["package_name"] = "shopify"
+    nodes = {"model.shopify.orders": package_node["model.p.orders"], **_node("orders")}
+    row = _row(reads=[{"relation": "ref('shopify', 'orders')"}])
+    missing = _row(reads=[{"relation": "ref('stripe', 'orders')"}])
+    _price(_engine(prod="analytics"), [row, missing], adapter, _view(tmp_path, nodes))
+    assert row["cost"]["relations"] == ["proj.analytics.pkg_orders"]
+    assert missing["cost"]["reason"] == test_cost.NOT_IN_MANIFEST
+
+
+def test_a_stale_test_still_runs_and_keeps_its_cadence_partial(tmp_path: Path):
+    adapter = _Adapter({"proj.analytics.fct_orders": (1, 1, "table")})
+    rows = [_row(), _row(status="stale")]
+    report, warnings = _price(
+        _engine(prod="analytics"), rows, adapter, _view(tmp_path, _node("fct_orders"))
+    )
+    assert rows[1]["cost"]["reason"] == test_cost.STALE_TEST
+    assert report["cost"]["per_run"][gt.EVERY_RUN]["tests"] == 2
+    assert report["cost"]["per_run"][gt.EVERY_RUN]["complete"] is False
+    assert warnings
+
+
+def test_an_estimator_that_fails_on_one_test_prices_the_rest(tmp_path: Path):
+    class Flaky(_Adapter):
+        calls = 0
+
+        def size_estimate(self, byte_sizes):
+            Flaky.calls += 1
+            if Flaky.calls == 1:
+                raise RuntimeError("secret words")
+            return float(sum(byte_sizes))
+
+    adapter = Flaky(
+        {
+            "proj.analytics.fct_orders": (1, 5, "table"),
+            "proj.analytics.dim": (1, 7, "table"),
+        }
+    )
+    nodes = {**_node("fct_orders"), **_node("dim")}
+    rows = [_row(), _row(model="dim")]
+    report, _ = _price(_engine(prod="analytics"), rows, adapter, _view(tmp_path, nodes))
+    assert rows[0]["cost"]["reason"] == test_cost.ESTIMATE_FAILED
+    assert "secret" not in json.dumps(report)
+    assert rows[1]["cost"]["estimate"] == 7.0
+
+
+def test_redshift_serverless_is_not_connected_to_at_all(tmp_path: Path):
+    def never():
+        raise AssertionError("opened a connection")
+
+    report = {"tests": [row := _row()]}
+    test_cost.price(
+        _engine("redshift", workgroup="wg", prod="analytics"),
+        report,
+        view=_view(tmp_path, _node("fct_orders")),
+        adapter_factory=never,
+    )
+    assert row["cost"]["reason"] == test_cost.METADATA_READ_BILLED
+
+
+def test_bigquery_prod_is_compared_to_dev_as_a_full_address():
+    from exmergo_dex_core.config import BigQueryTarget
+
+    target = BigQueryTarget(
+        project="dev-project", dev_dataset="analytics", prod="prod-project.analytics"
+    )
+    assert target.prod == "prod-project.analytics"
+    with pytest.raises(ValueError, match="dev namespace"):
+        BigQueryTarget(project="p", dev_dataset="analytics", prod="p.analytics")
+
+
+def test_a_listed_test_is_priced_from_the_arguments_it_keeps():
+    """A listed test is left as written, so a parent a person changed under the
+    same claim is what it reads, not the declaration's."""
+
+    from exmergo_dex_core.transform.declarations import _report_rows
+
+    spec = {
+        "dex_parent_population": {
+            "arguments": {"parent": "ref('stg_customers')"},
+            "config": {"meta": {"dex": {"claim": "abc"}}},
+        }
+    }
+    planned = {
+        "model": "fct",
+        "column": None,
+        "test": "dex_parent_population",
+        "cadence": gt.SCHEDULED,
+        "claim": "abc",
+        "variant": None,
+        "enabled": True,
+        "off_reason": None,
+        "reads": [
+            {"model": "fct"},
+            {"relation": "ref('stg_customers')", "key": "parent"},
+        ],
+        "spec": spec,
+    }
+    content = (
+        "version: 2\nmodels:\n  - name: fct\n    data_tests:\n"
+        "      - dex_parent_population:\n"
+        "          arguments: {parent: \"ref('dim_customers')\"}\n"
+        "          config: {meta: {dex: {claim: abc}}}\n"
+    )
+    [row] = _report_rows(content, content, [planned])
+    assert row["status"] == "already_listed"
+    assert row.reads == [{"model": "fct"}, {"relation": "ref('dim_customers')"}]
+    [added] = _report_rows(None, content, [planned])
+    assert added.reads[1]["relation"] == "ref('stg_customers')"
+
+
+def test_bigquery_quoted_view_sql_is_read_in_its_own_dialect(tmp_path: Path):
+    adapter = _Adapter(
+        {
+            "proj.analytics.fct_orders": (None, None, "view"),
+            "my-proj.analytics.raw_orders": (1, 3, "table"),
+        }
+    )
+    nodes = {
+        **_node(
+            "fct_orders",
+            depends_on={"nodes": ["seed.p.raw_orders"]},
+            compiled_code="select * from `my-proj`.`dev`.`raw_orders`",
+        ),
+        **_node(
+            "raw_orders",
+            kind="seed",
+            database="my-proj",
+            relation_name="`my-proj`.`dev`.`raw_orders`",
+        ),
+    }
+    _price(_engine(prod="analytics"), [row := _row()], adapter, _view(tmp_path, nodes))
+    assert row["cost"]["status"] == "estimated", row["cost"]
+
+
+def test_a_placement_the_plan_changes_is_not_priced_from_the_manifest(tmp_path: Path):
+    """A plan that renames a model's alias builds it elsewhere than the
+    manifest says, so the old relation's size is not its cost."""
+
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+
+    (tmp_path / "models").mkdir()
+    (tmp_path / "models" / "fct_orders.sql").write_text(
+        "{{ config(alias='fct_orders') }}\nselect 1 as id\n", encoding="utf-8"
+    )
+    adapter = _Adapter({"proj.analytics.fct_orders": (1, 1, "table")})
+    renamed = PlanEdit(
+        path="models/fct_orders.sql",
+        kind=EditKind.MODEL_SQL,
+        new_content="{{ config(alias='orders') }}\nselect 1 as id\n",
+    )
+    unchanged = PlanEdit(
+        path="models/fct_orders.sql",
+        kind=EditKind.MODEL_SQL,
+        new_content="{{ config(alias='fct_orders') }}\nselect 2 as id\n",
+    )
+    view = _view(tmp_path, _node("fct_orders"))
+    for edit, expected in ((renamed, test_cost.PLACEMENT_CHANGED), (unchanged, None)):
+        report = {"tests": [row := _row()]}
+        test_cost.price(
+            _engine(prod="analytics"),
+            report,
+            view=view,
+            adapter_factory=lambda: adapter,
+            edits=[edit],
+        )
+        assert row["cost"].get("reason") == expected
+    project = PlanEdit(
+        path="dbt_project.yml",
+        kind=EditKind.PROJECT_YML,
+        new_content="name: p\nmodels:\n  p:\n    +schema: marts\n",
+    )
+    assert test_cost.placement_changes(tmp_path, [project]) == (frozenset(), True)

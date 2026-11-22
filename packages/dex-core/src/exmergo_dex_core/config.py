@@ -74,10 +74,14 @@ _PROD_SPELLING = {
 }
 
 
-def check_prod(connector: str, prod: str | None, dev: str | None) -> str | None:
+def check_prod(
+    connector: str, prod: str | None, dev: str | None, container: str | None = None
+) -> str | None:
     """Refuse a ``<connector>.prod`` no command could read (#1462): one spelled
     with the wrong number of parts, or naming the dev namespace, where dbt dev
-    builds write. Returns the value, stripped."""
+    builds write. ``container`` qualifies a bare name on either side (BigQuery's
+    ``project``), so two datasets of one name in different projects are told
+    apart and two spellings of one dataset are not. Returns the value, stripped."""
 
     if prod is None:
         return None
@@ -95,6 +99,11 @@ def check_prod(connector: str, prod: str | None, dev: str | None) -> str | None:
     if dev:
         dev_parts = [part.lower() for part in dev.split(".")]
         lowered = [part.lower() for part in parts]
+        if container:
+            if len(dev_parts) == 1:
+                dev_parts = [container.lower(), *dev_parts]
+            if len(lowered) == 1:
+                lowered = [container.lower(), *lowered]
         width = min(len(dev_parts), len(lowered))
         if dev_parts[-width:] == lowered[-width:]:
             raise ValueError(
@@ -153,7 +162,9 @@ class BigQueryTarget(BaseModel):
 
     @model_validator(mode="after")
     def _check_prod(self) -> BigQueryTarget:
-        self.prod = check_prod("bigquery", self.prod, self.dev_dataset)
+        self.prod = check_prod(
+            "bigquery", self.prod, self.dev_dataset, container=self.project
+        )
         return self
 
 

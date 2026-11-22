@@ -723,7 +723,9 @@ or `unknown` with a `reason` (`prod_unset`, `relation_not_found`,
 `no_size_in_metadata` for a view or a catalog that keeps no size,
 `custom_schema_naming` for a `generate_schema_name` Dex cannot reproduce for
 production, `prod_target_unset`, `outside_allowlist` for a source,
-`metadata_read_billed` on Redshift Serverless, `connection_unavailable`, ...),
+`metadata_read_billed` on Redshift Serverless, `not_in_manifest`,
+`untracked_input` for a view reading a relation its lineage does not name,
+`stale_test` for a listed test that still runs, `connection_unavailable`, ...),
 never a guess, and `data.generated_tests.cost` gives the basis (`prod`,
 `paradigm`, `unit`, `read_at`, each relation's `rows` and `bytes`, a `note` on
 what the number bounds) and `per_run`, the `dex_every_run` and `dex_scheduled`

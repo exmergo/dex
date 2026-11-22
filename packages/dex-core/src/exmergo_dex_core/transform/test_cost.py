@@ -67,6 +67,12 @@ RELATION_NOT_FOUND = "relation_not_found"
 NO_SIZE_IN_METADATA = "no_size_in_metadata"
 METADATA_UNREADABLE = "metadata_unreadable"
 LINEAGE_TOO_DEEP = "lineage_too_deep"
+STALE_TEST = "stale_test"
+NOT_IN_MANIFEST = "not_in_manifest"
+UNTRACKED_INPUT = "untracked_input"
+LINEAGE_UNVERIFIED = "lineage_unverified"
+ESTIMATE_FAILED = "estimate_failed"
+PLACEMENT_CHANGED = "placement_changed"
 
 #: How many views (or ephemeral models) deep a test's inputs are followed to
 #: the tables they read, so a long chain of views is priced on its tables and a
@@ -123,9 +129,6 @@ class Relation:
     node_id: str | None = None
     #: An ephemeral model builds no relation: it is read as what it reads.
     ephemeral: bool = False
-    #: Resolved by name, because the compiled manifest does not hold it (a
-    #: model this plan creates), so production's catalog likely does not either.
-    unbuilt: bool = False
 
     @property
     def key(self) -> str:
@@ -140,18 +143,34 @@ def price(
     *,
     view: Any = None,
     adapter_factory: Any = None,
+    edits: Sequence[Any] = (),
 ) -> list[str]:
     """Add ``cost`` to ``report`` (``data.generated_tests``) and to each row
     whose test runs in production, and return the warnings to relay.
 
     ``view`` is the project as dbt last parsed it (its manifest names each
     node's alias and custom schema); ``adapter_factory`` opens the connection,
-    by default the engine's own. Both are seams for tests."""
+    by default the engine's own. Both are seams for tests. ``edits`` are the
+    plan's, so a model whose alias, schema or database the plan changes is not
+    priced from the placement the manifest still names."""
 
     if not report:
         return []
-    rows = [row for row in report.get("tests") or [] if row.get("status") in RUNNING]
-    if not rows:
+    tests = report.get("tests") or []
+    rows = [row for row in tests if row.get("status") in RUNNING]
+    # A stale test stays in the YAML and runs as written, so it counts in its
+    # cadence's total; dex does not price a test the declaration no longer gives.
+    stale = [row for row in tests if row.get("status") == "stale"]
+    for row in stale:
+        row["cost"] = {
+            "status": "unknown",
+            "reason": STALE_TEST,
+            "detail": (
+                "the declaration no longer gives this listed test, which still runs "
+                "as written; dex does not price it"
+            ),
+        }
+    if not rows and not stale:
         return []
 
     config = engine.config
@@ -162,9 +181,16 @@ def price(
     prod = prod_target_scope(connector, target) if connector else None
     cost: dict[str, Any] = {"prod": prod, "read_at": None}
     report["cost"] = cost
+    if not rows:
+        cost["per_run"] = _per_run(stale)
+        cost["relations"] = []
+        return []
+    counted = rows + stale
 
     if not connector:
-        return _all_unknown(rows, cost, NO_CONNECTOR, "no connector is configured")
+        return _all_unknown(
+            rows, cost, NO_CONNECTOR, "no connector is configured", stale
+        )
     if prod is None:
         _all_unknown(
             rows,
@@ -172,6 +198,7 @@ def price(
             PROD_UNSET,
             f"{connector}.prod is not set, so dex does not know where the "
             "project's models build in production",
+            stale,
         )
         return [
             f"{len(rows)} generated test(s) run in production and are not priced: "
@@ -180,6 +207,10 @@ def price(
             "metadata, never its rows)"
         ]
 
+    if connector == "redshift" and getattr(target, "workgroup", None):
+        # Decided from the config, before any connection: opening one can
+        # resume a sleeping Serverless workgroup, which bills a wake.
+        return _billed(rows, cost, stale)
     try:
         adapter = (adapter_factory or (lambda: engine._adapter("transform plan")))()
     except Exception as exc:
@@ -188,9 +219,13 @@ def price(
             cost,
             CONNECTION_UNAVAILABLE,
             f"no connection could be opened ({type(exc).__name__})",
+            stale,
         )
     resolver = _Resolver(
         engine, connector, target, prod, view, container=_container(adapter)
+    )
+    resolver.changed, resolver.all_changed = placement_changes(
+        getattr(resolver.view, "root", None), edits
     )
     reads = {id(row): resolver.reads(row) for row in rows}
     paradigm = getattr(getattr(adapter, "paradigm", None), "value", None)
@@ -198,15 +233,13 @@ def price(
     cost["unit"] = _UNITS.get(paradigm or "")
     cost["note"] = _BASIS_NOTES.get(paradigm or "")
 
+    # Views are read through the lineage of the manifest dbt last wrote, which
+    # may be another target's: a view branching on target.name can read other
+    # relations in production (named in the docs, said here).
+    cost["lineage_parsed_for"] = resolver.manifest_target
     billed = getattr(adapter, "catalog_read_billed", None)
     if callable(billed) and billed():
-        return _all_unknown(
-            rows,
-            cost,
-            METADATA_READ_BILLED,
-            "reading this connector's catalog bills (a Redshift Serverless "
-            "workgroup wakes for it), and a plan does not spend unasked",
-        )
+        return _billed(rows, cost, stale)
 
     sizes, expansions = _read_lineage(
         adapter, connector, prod, resolver, [r for rs in reads.values() for r in rs]
@@ -218,11 +251,11 @@ def price(
     for row in rows:
         row["cost"] = _row_cost(reads[id(row)], sizes, expansions, estimator, relations)
     cost["relations"] = sorted(relations.values(), key=lambda r: r["relation"])
-    cost["per_run"] = _per_run(rows)
-    unknown = sum(1 for row in rows if row["cost"]["status"] == "unknown")
+    cost["per_run"] = _per_run(counted)
+    unknown = sum(1 for row in counted if row["cost"]["status"] == "unknown")
     if unknown:
         return [
-            f"{unknown} of {len(rows)} generated test(s) have no production cost "
+            f"{unknown} of {len(counted)} generated test(s) have no production cost "
             "estimate (data.generated_tests.tests[].cost.reason says why); the "
             "per-run totals under data.generated_tests.cost.per_run are partial"
         ]
@@ -230,13 +263,30 @@ def price(
 
 
 def _all_unknown(
-    rows: list[dict[str, Any]], cost: dict[str, Any], reason: str, detail: str
+    rows: list[dict[str, Any]],
+    cost: dict[str, Any],
+    reason: str,
+    detail: str,
+    stale: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     for row in rows:
         row["cost"] = {"status": "unknown", "reason": reason, "detail": detail}
-    cost["per_run"] = _per_run(rows)
+    cost["per_run"] = _per_run(rows + list(stale or []))
     cost["relations"] = []
     return []
+
+
+def _billed(
+    rows: list[dict[str, Any]], cost: dict[str, Any], stale: list[dict[str, Any]]
+) -> list[str]:
+    return _all_unknown(
+        rows,
+        cost,
+        METADATA_READ_BILLED,
+        "reading this connector's catalog bills (a Redshift Serverless "
+        "workgroup wakes for it), and a plan does not spend unasked",
+        stale,
+    )
 
 
 def _read_lineage(
@@ -274,9 +324,32 @@ def _read_lineage(
             if not (relation.ephemeral or is_view):
                 continue
             parents = resolver.parents(relation.node_id)
-            if parents:
-                expansions[relation.key] = parents
-                following.update({p.key: p for p in parents})
+            if not parents:
+                continue
+            tracked = resolver.tracked(relation.node_id)
+            if tracked is not True:
+                # The manifest's lineage is only what ref() and source() name: a
+                # view reading a relation by its literal name, or one dex cannot
+                # check, is not priced as though its inputs were all known.
+                sizes[relation.key] = {
+                    "relation": relation.identifier or relation.label,
+                    "kind": relation.kind,
+                    "object_type": "view" if is_view else "ephemeral",
+                    "reason": UNTRACKED_INPUT
+                    if tracked is False
+                    else LINEAGE_UNVERIFIED,
+                    "detail": (
+                        "its compiled SQL reads a relation its ref() and source() "
+                        "lineage does not name, so its inputs are not all known"
+                        if tracked is False
+                        else "dbt has not compiled it, so dex cannot check that its "
+                        "ref() and source() lineage is every relation it reads; a "
+                        "dev build compiles it"
+                    ),
+                }
+                continue
+            expansions[relation.key] = parents
+            following.update({p.key: p for p in parents})
         frontier = [r for r in following.values() if r.key not in expansions]
     return sizes, expansions
 
@@ -324,6 +397,10 @@ def _row_cost(
                 if unknown := walk(parent, depth + 1):
                     return unknown
             return None
+        if relation.key in sizes and relation.key != relation.identifier:
+            # An ephemeral model whose lineage could not be trusted.
+            size = sizes[relation.key]
+            return _unknown(size["reason"], size.get("detail"), relation.label)
         if relation.identifier is None:
             return _unknown(relation.reason, relation.detail, relation.label)
         size = sizes.get(relation.identifier)
@@ -335,14 +412,7 @@ def _row_cost(
             )
         relations[relation.identifier] = size
         if size.get("reason"):
-            detail = size.get("detail")
-            if size["reason"] == RELATION_NOT_FOUND and relation.unbuilt:
-                detail = (
-                    "no such relation in production's catalog: the compiled "
-                    "manifest does not hold this model yet, so it is likely new "
-                    "in this plan and not deployed"
-                )
-            return _unknown(size["reason"], detail, relation.identifier)
+            return _unknown(size["reason"], size.get("detail"), relation.identifier)
         tables[relation.identifier] = None
         return None
 
@@ -361,7 +431,17 @@ def _row_cost(
             **out,
         }
     byte_sizes = [sizes[name].get("bytes") or 0 for name in names]
-    return {"status": "estimated", "estimate": estimator(byte_sizes), **out}
+    try:
+        estimate = estimator(byte_sizes)
+    except Exception as exc:
+        # The type and never the words, as for every other failure here.
+        return {
+            "status": "unknown",
+            "reason": ESTIMATE_FAILED,
+            "detail": f"the connector could not price it ({type(exc).__name__})",
+            **out,
+        }
+    return {"status": "estimated", "estimate": estimate, **out}
 
 
 def _unknown(reason: str | None, detail: str | None, relation: str) -> dict[str, Any]:
@@ -506,6 +586,16 @@ class _Resolver:
         self.view = view
         manifest = getattr(view, "manifest", None) or {}
         self.nodes = _nodes_by_name(manifest)
+        self.packaged = {
+            (
+                str(node.get("package_name", "")).lower(),
+                str(node.get("name", "")).lower(),
+                str(node["version"]) if node.get("version") is not None else None,
+            ): node
+            for node in (manifest.get("nodes") or {}).values()
+            if node.get("resource_type") in ("model", "seed", "snapshot")
+        }
+        self.manifest_target = _parsed_for(manifest, prod)
         self.by_id: dict[str, Any] = {
             **(manifest.get("nodes") or {}),
             **(manifest.get("sources") or {}),
@@ -518,6 +608,10 @@ class _Resolver:
             for node in (manifest.get("sources") or {}).values()
         }
         self.naming = _schema_naming(view)
+        #: Models whose placement the plan changes, and whether it may change
+        #: every model's (a ``dbt_project.yml`` edit): set by :func:`price`.
+        self.changed: frozenset[str] = frozenset()
+        self.all_changed = False
 
     def reads(self, row: Mapping[str, Any]) -> list[Relation]:
         listed = getattr(row, "reads", None)
@@ -543,12 +637,62 @@ class _Resolver:
         if match := _REF.match(text):
             name = match["b"] or match["a"]
             version = match["v"]
-            return self.model(f"{name}.v{version}" if version else name)
+            label = f"{name}.v{version}" if version else name
+            if match["b"]:
+                # ref('pkg', 'name') resolves in that package only, as dbt
+                # resolves it, never to a same-named node elsewhere.
+                node = self.packaged.get((match["a"].lower(), name.lower(), version))
+                return self._from_node(label, node, self._id_of(node))
+            return self.model(label)
         return Relation(
             text,
             reason=RELATION_UNNAMED,
             detail="the input is not a plain ref() or source() dex can resolve",
         )
+
+    def _id_of(self, node: Any) -> str | None:
+        if node is None:
+            return None
+        return next((k for k, v in self.by_id.items() if v is node), None)
+
+    def tracked(self, node_id: str) -> bool | None:
+        """Whether the relations a view's (or an ephemeral model's) compiled
+        SQL reads are all ones its ``depends_on`` names: ``None`` where dbt has
+        not compiled it, so nothing can be checked."""
+
+        node = self.by_id.get(node_id) or {}
+        compiled = node.get("compiled_code")
+        if not compiled:
+            return None
+        named: set[str] = set()
+        for parent_id in (node.get("depends_on") or {}).get("nodes") or []:
+            parent = self.by_id.get(parent_id) or {}
+            relation = parent.get("relation_name")
+            if relation:
+                named.add(_bare(relation))
+        try:
+            import sqlglot
+            from sqlglot import expressions as exp
+
+            from ..adapters import get_dialect
+
+            parsed = sqlglot.parse_one(compiled, read=get_dialect(self.connector))
+        except Exception:
+            return None
+        if parsed is None:
+            return None
+        ctes = {cte.alias_or_name.lower() for cte in parsed.find_all(exp.CTE)}
+        for table in parsed.find_all(exp.Table):
+            name = table.name
+            if not name:
+                continue
+            if not table.db and name.lower() in ctes:
+                continue
+            bare = _bare(".".join(p for p in (table.catalog, table.db, name) if p))
+            if bare in named or any(n.endswith("." + bare) for n in named):
+                continue
+            return False
+        return True
 
     def parents(self, node_id: str) -> list[Relation]:
         """The relations a view or an ephemeral model reads, from its
@@ -611,9 +755,32 @@ class _Resolver:
         return self._from_node(label, node, node_id)
 
     def _from_node(self, label: str, node: Any, node_id: str | None) -> Relation:
-        relation = self._resolve(label, node)
         if node is None:
-            return replace(relation, unbuilt=True)
+            # Never named from the bare file name: a model's alias, schema and
+            # database are its config's, which only the manifest holds.
+            return Relation(
+                label,
+                reason=NOT_IN_MANIFEST,
+                detail=(
+                    "the compiled manifest does not hold this model (one this "
+                    "plan creates, or a project dbt has not parsed since), so its "
+                    "production relation is not known; a model not yet built is "
+                    "not in production either"
+                ),
+            )
+        if self.all_changed or str(node.get("name", "")).lower() in self.changed:
+            # The manifest names the placement before the plan: what the plan
+            # builds is only known once dbt parses it.
+            return Relation(
+                label,
+                reason=PLACEMENT_CHANGED,
+                detail=(
+                    "this plan changes where the model builds (its alias, schema "
+                    "or database, or dbt_project.yml), and the compiled manifest "
+                    "names where it built before"
+                ),
+            )
+        relation = self._resolve(label, node)
         ephemeral = ((node.get("config") or {}).get("materialized")) == "ephemeral"
         return replace(
             relation,
@@ -629,11 +796,13 @@ class _Resolver:
         custom = config.get("schema")
         resource = str((node or {}).get("resource_type") or "model")
         if resource == "snapshot" and config.get("target_schema"):
-            # A literal schema every target writes, production included.
+            # A literal schema every target writes, production included. It is
+            # not prod's, so committing prod does not authorize reading it: only
+            # the source allowlist does.
             schema = str(config["target_schema"])
             database = config.get("target_database") or (node or {}).get("database")
-            return Relation(
-                label, identifier=_identifier(self.connector, database, schema, alias)
+            return self._literal(
+                label, _identifier(self.connector, database, schema, alias)
             )
         prod_parts = self.prod.split(".")
         prod_schema = prod_parts[-1]
@@ -641,6 +810,10 @@ class _Resolver:
             prod_parts[0]
             if len(prod_parts) == 2
             else (node or {}).get("database") or self.container
+        )
+        literal_database = (
+            bool(config.get("database"))
+            and str(config["database"]).lower() != str(container or "").lower()
         )
         if config.get("database"):
             container = config["database"]
@@ -680,9 +853,28 @@ class _Resolver:
             )
         else:
             schema = prod_schema
-        return Relation(
-            label, identifier=_identifier(self.connector, container, schema, alias)
-        )
+        identifier = _identifier(self.connector, container, schema, alias)
+        if literal_database:
+            # A database the model's config names, not prod's.
+            return self._literal(label, identifier)
+        return Relation(label, identifier=identifier)
+
+    def _literal(self, label: str, identifier: str) -> Relation:
+        """A relation outside prod's namespaces, read only where the source
+        allowlist reaches it, as a source is."""
+
+        if not self._in_allowlist(identifier):
+            return Relation(
+                label,
+                kind="literal",
+                reason=OUTSIDE_ALLOWLIST,
+                detail=(
+                    "it builds outside prod's namespaces and the source allowlist, "
+                    "and prod authorizes reading only where the project's models "
+                    "build there"
+                ),
+            )
+        return Relation(label, identifier=identifier, kind="literal")
 
     def _in_allowlist(self, identifier: str) -> bool:
         from ..connect import source_scope
@@ -700,6 +892,100 @@ class _Resolver:
                 for entry in committed
             ]
         return scope_within(namespace, committed)
+
+
+def _bare(relation: str) -> str:
+    from ..dbt_project import strip_relation_quoting
+
+    return strip_relation_quoting(relation).lower()
+
+
+def _parsed_for(manifest: Mapping[str, Any], prod: str) -> str | None:
+    """Which target the manifest's lineage was read for, as far as its
+    relations say (dbt records no target name): ``production`` where a model
+    sits in ``prod``, ``another target`` where models sit elsewhere, ``None``
+    with no model to tell by. A view whose SQL branches on ``target.name`` can
+    read other relations in production than a manifest for another target names."""
+
+    wanted = prod.lower().split(".")[-1]
+    seen = False
+    for node in (manifest.get("nodes") or {}).values():
+        if node.get("resource_type") != "model" or not node.get("relation_name"):
+            continue
+        seen = True
+        parts = _bare(node["relation_name"]).split(".")
+        if len(parts) >= 2 and parts[-2] == wanted:
+            return "production"
+    return "another target" if seen else None
+
+
+_PLACEMENT = re.compile(r"""\b(alias|schema|database)\s*=\s*(['"])([^'"]*)\2""")
+_PLACEMENT_KEYS = ("alias", "schema", "database")
+
+
+def placement_changes(
+    root: str | Path | None, edits: Sequence[Any]
+) -> tuple[frozenset[str], bool]:
+    """The models whose alias, schema or database ``edits`` change, read from
+    each model's SQL ``config()`` and YAML ``config`` before and after, and
+    whether a ``dbt_project.yml`` edit may change any model's (#1462)."""
+
+    import yaml
+
+    changed: set[str] = set()
+    every = False
+    for edit in edits:
+        kind = str(getattr(getattr(edit, "kind", None), "value", ""))
+        path = str(getattr(edit, "path", ""))
+        before = None
+        if root is not None:
+            try:
+                before = (Path(root) / path).read_text(encoding="utf-8")
+            except OSError:
+                before = None
+        after = getattr(edit, "new_content", None)
+        if kind == "project_yml":
+            if _models_config(before) != _models_config(after):
+                every = True
+        elif kind == "model_sql" and path.endswith(".sql"):
+            if before is not None and _sql_placement(before) != _sql_placement(after):
+                changed.add(Path(path).stem.lower())
+        elif kind == "schema_yml":
+            old, new = _yaml_placements(before, yaml), _yaml_placements(after, yaml)
+            changed.update(
+                name for name in set(old) | set(new) if old.get(name) != new.get(name)
+            )
+    return frozenset(changed), every
+
+
+def _sql_placement(text: str | None) -> dict[str, str]:
+    return {m[1]: m[3] for m in _PLACEMENT.finditer(text or "")}
+
+
+def _models_config(text: str | None) -> Any:
+    import yaml
+
+    try:
+        loaded = yaml.safe_load(text or "") or {}
+    except yaml.YAMLError:
+        return object()  # unreadable: never equal, so read as changed
+    return loaded.get("models") if isinstance(loaded, Mapping) else None
+
+
+def _yaml_placements(text: str | None, yaml: Any) -> dict[str, dict[str, Any]]:
+    try:
+        loaded = yaml.safe_load(text or "") or {}
+    except yaml.YAMLError:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for entry in (loaded.get("models") if isinstance(loaded, Mapping) else None) or []:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+            continue
+        config = entry.get("config") if isinstance(entry.get("config"), Mapping) else {}
+        placed = {key: config[key] for key in _PLACEMENT_KEYS if key in config}
+        if placed:
+            out[entry["name"].lower()] = placed
+    return out
 
 
 def _container(adapter: Any) -> str | None:

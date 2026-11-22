@@ -519,7 +519,7 @@ def plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
-    _price_generated_tests(engine, result)
+    _price_generated_tests(engine, result, edits)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -967,7 +967,9 @@ def _generated_report(
     }
 
 
-def _price_generated_tests(engine: DexEngine, result: PlanResult) -> None:
+def _price_generated_tests(
+    engine: DexEngine, result: PlanResult, edits: list[PlanEdit]
+) -> None:
     """What each generated test the plan leaves in the YAML costs per
     production run (#1462), from production's catalog sizes, folded onto a
     plan that is already stored. Total for the reason row attribution is: the
@@ -977,7 +979,7 @@ def _price_generated_tests(engine: DexEngine, result: PlanResult) -> None:
     from .test_cost import price
 
     try:
-        result.warnings.extend(price(engine, result.generated_tests))
+        result.warnings.extend(price(engine, result.generated_tests, edits=edits))
     except Exception as exc:
         result.warnings.append(
             "could not estimate what the generated tests cost per production run "
@@ -8572,7 +8574,7 @@ def _semantic_plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
-    _price_generated_tests(engine, result)
+    _price_generated_tests(engine, result, edits)
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)
