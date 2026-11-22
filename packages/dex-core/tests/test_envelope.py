@@ -46,6 +46,7 @@ def test_an_unstamped_cost_claims_no_paradigm():
         "estimate_quality": None,
         "unit": None,
         "unpriced": None,
+        "handshake": None,
     }
 
 
