@@ -488,6 +488,18 @@ def test_a_run_another_source_observed_splits_a_missed_interval() -> None:
     assert onset is not None and onset.missed_runs == 0
 
 
+def test_an_undated_run_another_source_observed_keeps_the_interval() -> None:
+    runs = [_run(1), _run(2), _run(3), _run(6)]
+    undated = _obs(5, "good", source=DBT).model_copy(update={"at": None})
+    observations = [_obs(3, "good"), undated, _obs(6, "bad")]
+    timeline = build_timeline(ELEMENTARY, _invocations(runs), observations)
+    history = subject_history(timeline, SUBJECT, Signal(), observations)
+    missed = [s for s in history.segments if s.kind == "missed"]
+    assert [(s.after_run, s.before_run, s.runs) for s in missed] == [
+        ("inv-3", "inv-6", 2)
+    ]
+
+
 def test_an_incident_without_a_timeline_names_no_heartbeat() -> None:
     observations = [_obs(1, "bad"), _obs(2, "bad")]
     (incident,) = fold_incidents(observations, now=T0 + timedelta(hours=2)).incidents

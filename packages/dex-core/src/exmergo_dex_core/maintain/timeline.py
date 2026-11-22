@@ -544,7 +544,12 @@ def _split_missed(points: list[_Point], schedule: GapSchedule) -> list[_Point]:
             [
                 q
                 for q in off_axis
-                if q.point is not None and after < q.point.sequence < before
+                if q.point is not None
+                # An undated run cannot be placed in time, so it does not
+                # split the interval: the count stays an upper bound rather
+                # than vanishing.
+                and q.point.at is not None
+                and after < q.point.sequence < before
             ]
             if p.kind == "missed" and after is not None and before is not None
             else []
