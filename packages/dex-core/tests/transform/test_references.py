@@ -1248,6 +1248,9 @@ def test_a_package_statement_sqlglot_cannot_read_logs_nothing(project, caplog):
         "CREATE OR REPLACE ROLE IDENTIFIER($role)\n",
     )
     with caplog.at_level(logging.WARNING, logger="sqlglot"):
-        ReferenceIndex(load(project))
+        index = ReferenceIndex(load(project))
+        # Restored by the scan itself, not by caplog leaving the block.
+        assert logging.getLogger("sqlglot").level == logging.WARNING
     assert not [r for r in caplog.records if r.name.startswith("sqlglot")]
-    assert logging.getLogger("sqlglot").level == logging.NOTSET
+    # What sqlglot read as an opaque command hides its columns: a limit.
+    assert "dbt_packages/utils/macros/grants.sql" in index.column_unread

@@ -102,6 +102,27 @@ def sequence_item_span(content: str, item_start: int) -> tuple[int, int] | None:
     return line_start, block_end(content, line_start, indent_of(content, line_start))
 
 
+def after_node(content: str, node: yaml.Node) -> int:
+    """Where the line holding ``node``'s last scalar ends, past its newline.
+
+    PyYAML's ``end_mark`` on a block collection sits inside whatever follows it,
+    and :func:`block_end` stops at a comment written shallower than the entry's
+    content (``# note`` at column 0 between a key and its value). The last scalar
+    of the deepest last child is the one position that is always inside the
+    entry, so the line it ends on is the entry's last line.
+    """
+
+    while True:
+        if isinstance(node, yaml.MappingNode) and node.value:
+            node = node.value[-1][1]
+        elif isinstance(node, yaml.SequenceNode) and node.value:
+            node = node.value[-1]
+        else:
+            break
+    eol = content.find("\n", node.end_mark.index)
+    return len(content) if eol < 0 else eol + 1
+
+
 def uses_anchors_or_aliases(text: str) -> bool:
     """Does this YAML define an anchor or use an alias (a ``<<: *x`` merge too)?
 

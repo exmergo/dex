@@ -1173,6 +1173,12 @@ class ReferenceIndex:
             quiet.setLevel(level)
         if parsed is None:
             return
+        if any(isinstance(node, exp.Command) for node in parsed.walk()):
+            # sqlglot read a statement it does not know as an opaque command,
+            # so the columns inside it are invisible: a limit, not an answer.
+            self.limits.append(column_parse_limit(path))
+            self.column_unread.append(path)
+            return
 
         columns = {column.name for column in parsed.find_all(exp.Column) if column.name}
         columns |= {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}

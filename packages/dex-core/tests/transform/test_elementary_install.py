@@ -178,3 +178,35 @@ def test_install_edits_are_exactly_the_two_files(tmp_path):
         ("packages.yml", "packages_yml"),
         ("dbt_project.yml", "project_yml"),
     ]
+
+
+def test_a_comment_shallower_than_an_entry_does_not_split_it():
+    text = (
+        "packages:\n"
+        "  - package: dbt-labs/dbt_utils\n"
+        "# Keep this version pinned.\n"
+        "    version: 1.3.0\n"
+    )
+    packages, _ = install.install_texts(text, "packages.yml", "name: a\n", "dev")
+    assert yaml.safe_load(packages)["packages"] == [
+        {"package": "dbt-labs/dbt_utils", "version": "1.3.0"},
+        {"package": install.HUB_PACKAGE, "version": CURRENT_VERSION},
+    ]
+
+
+def test_set_nested_steps_over_a_comment_inside_an_indentless_sequence():
+    text = "name: a\nmodel-paths:\n- models\n# Additional model directory.\n- more\n"
+    out = set_nested(text, ["vars", "x"], 0)
+    assert yaml.safe_load(out)["model-paths"] == ["models", "more"]
+    assert yaml.safe_load(out)["vars"] == {"x": 0}
+
+
+def test_detect_reads_a_local_declaration_of_the_package(tmp_path):
+    report = install.detect(
+        _project(
+            tmp_path,
+            "packages:\n  - local: ../vendor/elementary\n",
+            installed="0.26.1",
+        )
+    )
+    assert report["declared"] and report["source"] == "local"

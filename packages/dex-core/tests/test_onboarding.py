@@ -728,3 +728,80 @@ def test_the_production_steps_name_the_configured_production_target(
     assert "dbt run --select elementary --target prod" in [
         step["command"] for step in result["data"]["next_steps"]
     ]
+
+
+def test_no_elementary_wins_over_a_recorded_choice_when_recovering(
+    tmp_path, capsys, duckdb_file
+):
+    code, result = run(
+        tmp_path,
+        capsys,
+        "analytics",
+        "--mode",
+        "new",
+        "--connector",
+        "duckdb",
+        "--path",
+        str(duckdb_file),
+    )
+    assert code == 0, result
+    (tmp_path / "analytics/packages.yml").unlink()
+    code, result = run(tmp_path, capsys, "--no-elementary")
+    assert code == 0, result
+    assert not (tmp_path / "analytics/packages.yml").exists()
+
+
+def test_an_installed_package_declared_in_an_unread_form_is_not_offered_again(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(
+        tmp_path,
+        duckdb_file,
+        packages="packages:\n  - tarball: https://example.com/elementary.tgz\n",
+        installed="0.26.1",
+    )
+    code, result = run(tmp_path, capsys)
+    assert code == 0, result
+    assert result["data"]["elementary"]["install"] == "present"
+    assert not _plans(tmp_path)
+
+
+def test_a_partly_applied_install_is_reused_by_its_effective_edits(
+    tmp_path, capsys, duckdb_file
+):
+    from exmergo_dex_core.transform.elementary_install import project_yml
+
+    _adoptable(tmp_path, duckdb_file)
+    project = tmp_path / "dbt_project.yml"
+    project.write_text(project_yml(project.read_text(), "dev"))
+    code, first = run(tmp_path, capsys)
+    assert code == 0, first
+    assert [d["path"] for d in first["data"]["elementary"]["plan_diffs"]] == [
+        "packages.yml"
+    ]
+    code, again = run(tmp_path, capsys)
+    assert code == 0, again
+    assert (
+        again["data"]["elementary"]["plan_id"] == first["data"]["elementary"]["plan_id"]
+    )
+    assert len(_plans(tmp_path)) == 1
+
+
+def test_an_install_plan_for_one_project_is_not_reused_for_another(
+    tmp_path, capsys, duckdb_file
+):
+    for name in ("one", "two"):
+        (tmp_path / name).mkdir()
+        _adoptable(tmp_path / name, duckdb_file)
+    code, first = run(tmp_path, capsys, "--project-dir", "one")
+    assert code == 0, first
+    code, second = run(tmp_path, capsys, "--project-dir", "two", "--confirm")
+    assert code == 0, second
+    assert second["data"]["project_dir"] == "two"
+    assert second["data"]["elementary"]["install"] == "planned"
+    assert (
+        second["data"]["elementary"]["plan_id"]
+        != first["data"]["elementary"]["plan_id"]
+    )
+    plans = [json.loads(p.read_text()) for p in _plans(tmp_path)]
+    assert sorted(p["project_dir"] for p in plans) == ["one", "two"]

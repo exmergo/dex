@@ -720,7 +720,7 @@ def set_nested(text: str, path: list[str], value: Any) -> str:
     key order and other line kept. A flow-style mapping on the path is refused,
     since rewriting it would reformat what a person wrote."""
 
-    from ..yaml_spans import before_trailing_blanks, block_end
+    from ..yaml_spans import after_node, before_trailing_blanks, block_end
 
     try:
         root = yaml.compose(text) if text.strip() else None
@@ -754,19 +754,15 @@ def set_nested(text: str, path: list[str], value: Any) -> str:
                 last_key, last_value = node.value[-1]
                 column = node.value[0][0].start_mark.column
                 start = _line_start(text, last_key.start_mark.index)
-                end = block_end(text, start, column)
-                # An indentless sequence (`model-paths:` then `- models` at the
-                # key's own column, as `yaml.safe_dump` writes it) belongs to
-                # the key although indentation says otherwise.
-                while (
-                    isinstance(last_value, yaml.SequenceNode)
-                    and not last_value.flow_style
-                    and end < len(text)
-                    and text[end:].startswith(" " * column + "-")
-                    and end < last_value.end_mark.index
-                ):
-                    end = block_end(text, end, column)
-                end = before_trailing_blanks(text, end)
+                # Indentation bounds the last entry, except where it reads
+                # wrong: an indentless sequence (`model-paths:` then `- models`
+                # at the key's own column, as `yaml.safe_dump` writes it), or a
+                # comment written shallower than the entry's content. The
+                # entry's last scalar is inside it either way.
+                end = max(
+                    before_trailing_blanks(text, block_end(text, start, column)),
+                    after_node(text, last_value),
+                )
             else:
                 column, end = 0, len(text)
             return insert(end, _block(path[depth:], value, column))

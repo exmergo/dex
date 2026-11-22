@@ -419,7 +419,8 @@ def initialize(
             resume=True,
             in_place=selected == ".",
             layered_schemas=state.get("layered_schemas", False),
-            elementary=state.get("elementary", False) is True,
+            elementary=elementary is not False
+            and state.get("elementary", False) is True,
         )
         recovered = {
             key: value
@@ -723,7 +724,9 @@ def _elementary(
                 },
                 *production,
             ]
-    elif report["declared"]:
+    elif report["declared"] or report["installed"]:
+        # Installed but declared in a form detection cannot name (a local path
+        # under another directory name, a tarball): never offer a second one.
         report["install"] = "present"
         if not report["installed"]:
             steps = [
@@ -799,8 +802,15 @@ def _store_install_plan(
     from .transform import elementary_install as install
     from .transform.commands import plan
 
-    edits = install.install_edits(project, dev_target)
+    edits = [
+        e
+        for e in install.install_edits(project, dev_target)
+        if _read(project / e.path) != e.new_content
+    ]
+    if not edits:
+        raise RequestError("the project already holds the install")
     wanted = {(e.path, e.new_content) for e in edits}
+    project_dir = _relative(root, project)
     with DexEngine(
         config=config,
         store=engine.store,
@@ -811,7 +821,8 @@ def _store_install_plan(
         for stored in check.store.list_plans():
             if (
                 stored.applied_at is None
-                and stored.intent == install.INTENT
+                and stored.intent == install.intent(project_dir)
+                and stored.project_dir == project_dir
                 and {(e.path, e.new_content) for e in stored.edits} == wanted
             ):
                 return stored.plan_id, [
@@ -819,7 +830,11 @@ def _store_install_plan(
                     for e in stored.edits
                 ]
         planned = plan(
-            check, install.INTENT, edits=edits, attribute_rows=False, no_parse=True
+            check,
+            install.intent(project_dir),
+            edits=edits,
+            attribute_rows=False,
+            no_parse=True,
         )
     return str(planned.plan_id), list(planned.diffs)
 

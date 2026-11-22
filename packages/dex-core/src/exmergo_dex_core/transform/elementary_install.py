@@ -57,6 +57,16 @@ SCHEMA = "elementary"
 #: the plan the first one stored instead of storing another.
 INTENT = f"install the Elementary package ({HUB_PACKAGE} {INSTALL_RELEASE})"
 
+
+def intent(project_dir: str) -> str:
+    """The install plan's intent for the project at ``project_dir`` (relative
+    to the repository root). A plan id hashes the intent and the edits and not
+    the project, so two projects with identical files would otherwise store
+    one plan under one id, the second overwriting the first."""
+
+    return INTENT if project_dir in {"", "."} else f"{INTENT} in {project_dir}"
+
+
 #: The package's own name: its models' ``package_name``, and the key under
 #: ``models:`` that configures them.
 PACKAGE = "elementary"
@@ -68,8 +78,10 @@ class InstallRefusedError(RequestError):
 
 
 def _is_elementary(entry: Any) -> bool:
-    return (entry.source == "hub" and entry.name == HUB_PACKAGE) or (
-        entry.source == "git" and GIT_REPOSITORY in entry.name
+    return (
+        (entry.source == "hub" and entry.name == HUB_PACKAGE)
+        or (entry.source == "git" and GIT_REPOSITORY in entry.name)
+        or (entry.source == "local" and entry.install_name == PACKAGE)
     )
 
 
@@ -139,7 +151,7 @@ def _append_package(text: str | None, filename: str) -> str:
     mapping, is refused, since rewriting it would reformat what a person wrote.
     """
 
-    from ..yaml_spans import before_trailing_blanks, block_end, sequence_item_span
+    from ..yaml_spans import after_node, before_trailing_blanks, sequence_item_span
 
     def refuse(why: str) -> InstallRefusedError:
         return InstallRefusedError(
@@ -186,7 +198,9 @@ def _append_package(text: str | None, filename: str) -> str:
     if first is None or last is None:
         raise refuse("writes a package entry on a line it shares")
     column = len(text[first[0] :]) - len(text[first[0] :].lstrip(" "))
-    end = before_trailing_blanks(text, block_end(text, last[0], column))
+    # After the last entry's last line, which a comment written shallower than
+    # its keys cannot cut short.
+    end = after_node(text, value.value[-1])
     prefix = text[:end]
     if prefix and not prefix.endswith("\n"):
         prefix += "\n"
