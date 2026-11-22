@@ -125,7 +125,21 @@ def test_two_passing_rows_in_one_run_are_one_pass() -> None:
     series = [_obs(1, "bad"), _obs(2, "good"), _obs(2, "good")]
     fold = fold_incidents(series, now=_now(2))
     assert [i.state for i in fold.incidents] == ["open"]
-    assert [o.outcome for o in fold.incidents[0].observations] == ["bad", "good"]
+    assert [o.outcome for o in fold.incidents[0].observations] == [
+        "bad",
+        "good",
+        "good",
+    ]
+
+
+def test_every_failing_row_in_one_run_stays_on_the_incident() -> None:
+    warn = _obs(1, "bad", test="t1", severity="warn")
+    error = _obs(1, "bad", test="t2", severity="error")
+    for series in ([warn, error], [error, warn]):
+        (incident,) = fold_incidents(series, now=_now(1)).incidents
+        assert incident.tests == ("t1", "t2")
+        assert len(incident.observations) == 2
+        assert incident.severity == "error"
 
 
 def test_a_run_that_failed_is_not_also_counted_as_a_pass() -> None:
@@ -394,6 +408,15 @@ def _opener_tie() -> list[Observation]:
 def test_a_tie_between_undeclared_sources_is_refused() -> None:
     with pytest.raises(FoldInputError) as refused:
         fold_incidents(_opener_tie(), now=_now(8))
+    assert refused.value.code == "opener_tie_undeclared"
+    assert refused.value.sources == (DBT, ELEMENTARY)
+
+
+def test_a_tie_with_one_undeclared_source_is_refused() -> None:
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(
+            _opener_tie(), sources=[SourceHistory(name=ELEMENTARY)], now=_now(8)
+        )
     assert refused.value.code == "opener_tie_undeclared"
     assert refused.value.sources == (DBT, ELEMENTARY)
 

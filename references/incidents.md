@@ -65,7 +65,8 @@ A source has one outcome for a subject and signal in each run. Where it holds
 more than one row for that run (two tests carrying one claim, or an adapter that
 did not deduplicate), a failure wins over a pass, as on the coverage timeline.
 So `N` counts runs: two passing rows in one run are one pass, and a run that
-failed is never also counted as a pass.
+failed is never also counted as a pass. Every row is still kept on the
+incident, so its tests and its latest severity are as the sources wrote them.
 
 ### One invocation order for every source
 
@@ -80,8 +81,8 @@ adapters have to number every source's runs from one series.
 
 Where more than one source fails in the run that opens an incident, the source
 named first in `sources` opens it. The order of `sources` is the only precedence:
-source names are never compared. A tie between sources that `sources` does not
-name is refused, with `code` `opener_tie_undeclared`, rather than settled by an
+source names are never compared. A tie that involves any source `sources` does not
+name is refused, even where another tied source is named,, with `code` `opener_tie_undeclared`, rather than settled by an
 order nobody declared.
 
 The choice matters, because only the opening source's passes close an incident.

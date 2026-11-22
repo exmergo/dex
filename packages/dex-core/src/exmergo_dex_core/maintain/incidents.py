@@ -431,29 +431,38 @@ def _check_run_sequences(
             hold(entry.run, entry.sequence, name)
 
 
-def _order(observation: Observation) -> tuple[int, int, str]:
+def _order(observation: Observation) -> tuple[int, int, str, str]:
     """Invocation order; within one run a failure is read before a pass, so a
     source that disagrees in the same run is evidence, not the opener. The
-    source name only keeps the order stable: which source opens a tie is
+    source and test names only keep the order stable: which source opens a tie is
     :func:`_opener`'s, by the declared precedence."""
 
     rank = _OUTCOME_RANK[observation.outcome]
-    return (observation.sequence, rank, observation.source)
+    return (observation.sequence, rank, observation.source, observation.test)
 
 
-def _per_run(items: Iterable[Observation]) -> list[Observation]:
-    """One outcome per source per run, in invocation order: a failure over a
-    pass over nothing, as the timeline merges a run (``timeline._merge``).
+def _first_per_source(failures: list[Observation]) -> list[Observation]:
+    """Each source's first failure in one run: the candidates to open it."""
 
-    Two rows for one key in one run (two tests carrying one claim, or an
-    adapter that did not deduplicate) are one observed run, so ``N`` counts
-    runs, and a run that failed is never also counted as a pass.
-    """
+    kept: dict[str, Observation] = {}
+    for observation in failures:
+        kept.setdefault(observation.source, observation)
+    return list(kept.values())
 
-    kept: dict[tuple[str, int], Observation] = {}
-    for observation in sorted(items, key=_order):
-        kept.setdefault((observation.source, observation.sequence), observation)
-    return sorted(kept.values(), key=_order)
+
+def _counts_as_pass(
+    observation: Observation, failed: set[str], counted: set[str]
+) -> bool:
+    """Whether an opening-source pass adds to ``N``: once per run, and never in
+    a run the same source failed (a failure over a pass, as
+    ``timeline._merge`` merges a run). Two rows for one key in one run (two
+    tests carrying one claim, or an adapter that did not deduplicate) are
+    one observed run, so ``N`` counts runs. Every row is still recorded."""
+
+    if observation.source in failed or observation.source in counted:
+        return False
+    counted.add(observation.source)
+    return True
 
 
 def _opener(
@@ -487,12 +496,15 @@ def _walk(
     built: list[_Open] = []
     current: _Open | None = None
     seen_good = False
-    for _, run in itertools.groupby(_per_run(items), key=lambda o: o.sequence):
+    ordered = sorted(items, key=_order)
+    for _, run in itertools.groupby(ordered, key=lambda o: o.sequence):
         outcomes = list(run)
         failures = [o for o in outcomes if o.outcome == "bad"]
+        failed = {o.source for o in failures}
+        counted: set[str] = set()
         if failures:
             if current is None:
-                opening = _opener(failures, precedence)
+                opening = _opener(_first_per_source(failures), precedence)
                 current = _Open(opening=opening, first_known=seen_good)
                 failures = [opening, *(o for o in failures if o is not opening)]
             current.observations.extend(failures)
@@ -504,6 +516,8 @@ def _walk(
             current.observations.append(observation)
             if observation.source != current.opening.source:
                 current.evidence.add(len(current.observations) - 1)
+                continue
+            if not _counts_as_pass(observation, failed, counted):
                 continue
             current.streak += 1
             if current.streak >= threshold:
