@@ -1427,10 +1427,110 @@ def test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan(
     assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
     models = envelope["data"]["semantic_proposal"]["models"]
     assert models["fct_world_output_daily"]["status"] in ("proposed", "unvalidated")
+    # the child's dimension holds the parent's first-choice name, so the parent's
+    # entity is numbered and the child joins by that name, its dimension untouched
+    assert (
+        "name: world_output_daily_output_day_2\n"
+        in models["fct_world_output_daily"]["content"]
+    )
     content = models["fct_readings"]["content"]
-    assert "name: world_output_daily_output_day" in content
+    assert "name: world_output_daily_output_day_2\n" in content
+    assert "expr: output_day_id\n" in content
     assert "name: output_day\n" not in content
-    # a dimension of the parent's entity name moves aside, keeping its column
     assert content.count("name: world_output_daily_output_day\n") == 1
-    assert "name: readings_world_output_daily_output_day\n" in content
-    assert "expr: world_output_daily_output_day\n" in content
+    assert "readings_world_output_daily_output_day" not in content
+
+
+def test_a_foreign_key_joins_by_a_name_the_primary_entity_gave_up():
+    """The primary entity's first-choice name `output_day` is the calendar's entity:
+    the primary takes its replacement first, so the foreign key still joins."""
+    calendar = {
+        "name": "calendar",
+        "entities": [{"name": "output_day", "type": "primary", "expr": "calendar_key"}],
+    }
+    declared = {
+        "grain": ["output_day"],
+        "columns": {
+            "output_day": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_calendar.calendar_key",
+            },
+        },
+    }
+
+    found = sd.derive(
+        "fct_daily",
+        declared,
+        column_types={"output_day": ("date", None)},
+        on_ref={"fct_calendar": [("models/marts/calendar.yml", calendar)]},
+    )
+
+    assert found.body["entities"] == [
+        {"name": "daily_output_day", "type": "primary", "expr": "output_day"},
+        {"name": "output_day", "type": "foreign", "expr": "output_day_id"},
+    ]
+    (dimension,) = found.body["dimensions"]
+    assert (dimension["name"], dimension["expr"]) == (
+        "daily_output_day_2",
+        "output_day",
+    )
+    assert found.body["defaults"] == {"agg_time_dimension": "daily_output_day_2"}
+
+
+# The plan derives marts in name order, so one name sorts before the daily mart
+# and one after: both declaration orders.
+@pytest.mark.parametrize("other", ["fct_calendar", "fct_zz_calendar"])
+def test_a_replacement_name_stays_clear_of_another_mart_in_the_plan(
+    dbt_project_dir: Path, tmp_path: Path, capsys, other: str
+):
+    """An unrelated mart in the same plan has a dimension named the way the daily
+    mart's entity would be; the entity is numbered whichever mart derives first."""
+    calendar = {
+        "model": other,
+        "description": "One row per calendar key.",
+        "grain": ["day_key"],
+        "columns": {
+            "day_key": {"role": "key"},
+            "world_output_daily_output_day": {"role": "dimension"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_world_output_daily.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as output_day, "
+                    "1.0 as output_total\n"
+                ),
+            },
+            {
+                "path": f"models/marts/{other}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as day_key, 'x' as world_output_daily_output_day\n"
+                ),
+            },
+        ],
+        "declarations": [DAILY_MART, calendar],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "calendar",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    daily = models["fct_world_output_daily"]["content"]
+    assert "name: world_output_daily_output_day_2\n" in daily
+    assert "name: world_output_daily_output_day\n" not in daily
+    assert "name: world_output_daily_output_day\n" in models[other]["content"]

@@ -211,6 +211,7 @@ def derive(
     *,
     column_types: Mapping[str, tuple[str | None, str | None]],
     on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
+    reserved: Mapping[str, set[str]] | None = None,
 ) -> Derivation:
     """The semantic model ``declared`` states, with every gap named.
 
@@ -219,6 +220,8 @@ def derive(
     where the SQL truncates the column to one. ``on_ref`` is
     :func:`semantic_models_by_ref` over the project as it will read, which is how
     a foreign key finds the entity name the model it references already uses.
+    ``reserved`` is :func:`_planned_names` over the plan's declarations, the names
+    the marts derived alongside this one will give each element type.
     """
 
     derivation = Derivation(model=model)
@@ -257,6 +260,43 @@ def derive(
         limitations.append(
             "the declaration states no grain, so there is no primary entity. "
             "Declare the grain and plan again"
+        )
+
+    # MetricFlow wants one element type per name, here and across the semantic
+    # layer (#1416). A grain column that is also a dimension (a time column grain)
+    # names its primary entity after the model, settled before the foreign keys so
+    # their duplicate check reads the final name; a dimension of a foreign entity's
+    # name moves aside further down. A replacement name stays clear of this model's
+    # elements, of the entities its foreign keys join by, and of any name the layer
+    # or another mart in the plan gives another element type.
+    stem = _LAYER_PREFIX.sub("", model).lower()
+    layer = _layer_names(on_ref, reserved)
+    measure_names = {n for n, f in columns.items() if f.get("role") == "measure"}
+    dimension_columns = {
+        n
+        for n, f in columns.items()
+        if f.get("role") == "dimension"
+        or (f.get("role") == "time" and column_types.get(n, (None, None))[0] != "other")
+    }
+    if primary is not None and primary in dimension_columns:
+        joins_by = {
+            _foreign_entity(n, f.get("references"), on_ref)[0]
+            for n, f in columns.items()
+            if f.get("role") == "foreign_key" and n not in grain
+        }
+        primary = _free_name(
+            f"{stem}_{grain[0]}",
+            dimension_columns
+            | measure_names
+            | joins_by
+            | layer["dimension"]
+            | layer["measure"],
+        )
+        entities[0]["name"] = primary
+        notes.append(
+            f"{grain[0]}: the primary entity is named '{primary}' because the "
+            "column is also a dimension, and MetricFlow does not allow one name "
+            "for both"
         )
 
     used_names = {e["name"] for e in entities}
@@ -336,15 +376,6 @@ def derive(
             carried.extend(_carried_column(name, fields, described=True))
             time_columns.append(name)
 
-    # MetricFlow wants one element type per name, here and across the semantic
-    # layer. A foreign entity keeps the name the parent gave it, so a dimension of
-    # that name moves aside and keeps its column through `expr`; a grain column
-    # that is also a dimension (a time column grain) names its primary entity
-    # after the model instead (#1416). A replacement name also stays clear of this
-    # model's measures and of any name the layer gives another element type.
-    stem = _LAYER_PREFIX.sub("", model).lower()
-    layer = _layer_names(on_ref)
-    measure_names = {n for n, f in columns.items() if f.get("role") == "measure"}
     foreign_names = {e["name"] for e in entities if e["type"] == "foreign"}
     dimension_name = {d["name"]: d["name"] for d in dimensions}
     for dimension in dimensions:
@@ -365,22 +396,6 @@ def derive(
             f"{column}: the dimension is named '{renamed}' because the foreign "
             "entity of the same name joins by it, and MetricFlow does not allow "
             "one name for both"
-        )
-    dimension_names = {d["name"] for d in dimensions}
-    if primary in dimension_names:
-        primary = _free_name(
-            f"{stem}_{grain[0]}",
-            dimension_names
-            | (used_names - {primary})
-            | measure_names
-            | layer["dimension"]
-            | layer["measure"],
-        )
-        entities[0]["name"] = primary
-        notes.append(
-            f"{grain[0]}: the primary entity is named '{primary}' because the "
-            "column is also a dimension, and MetricFlow does not allow one name "
-            "for both"
         )
 
     agg_time = dimension_name[time_columns[0]] if time_columns else None
@@ -636,8 +651,10 @@ def _free_name(base: str, taken: set[str]) -> str:
 
 def _layer_names(
     on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
+    reserved: Mapping[str, set[str]] | None = None,
 ) -> dict[str, set[str]]:
-    """The entity, dimension and measure names the semantic layer already declares."""
+    """The entity, dimension and measure names the semantic layer already declares,
+    with the ones ``reserved`` holds for the rest of the plan."""
 
     names: dict[str, set[str]] = {"entity": set(), "dimension": set(), "measure": set()}
     for found in on_ref.values():
@@ -652,6 +669,30 @@ def _layer_names(
                         element.get("name"), str
                     ):
                         names[kind].add(element["name"])
+    for kind, held in (reserved or {}).items():
+        names[kind] |= held
+    return names
+
+
+def _planned_names(declarations: Iterable[Any]) -> dict[str, set[str]]:
+    """The element names the plan's declarations ask for before any rename, so a
+    replacement chosen for one mart stays clear of them whichever mart derives
+    first."""
+
+    names: dict[str, set[str]] = {"entity": set(), "dimension": set(), "measure": set()}
+    for declaration in declarations:
+        declared = declaration.declared
+        grain = [g for g in declared.get("grain") or [] if isinstance(g, str)]
+        if len(grain) == 1:
+            names["entity"].add(_entity_name(grain[0], declaration.model))
+        for name, fields in (declared.get("columns") or {}).items():
+            role = fields.get("role") if isinstance(fields, dict) else None
+            if role in ("dimension", "time"):
+                names["dimension"].add(name)
+            elif role == "measure":
+                names["measure"].add(name)
+            elif role == "foreign_key":
+                names["entity"].add(_entity_name(name, name))
     return names
 
 
@@ -1098,6 +1139,7 @@ class MetricFlowDerivation:
         # on_ref plus the parents derived so far, for foreign keys alone: the
         # collision check keeps reading on_ref, the project as it stands.
         foreign_ref = {model: list(found) for model, found in on_ref.items()}
+        planned = _planned_names(request.declarations)
         for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
             derivation = derive(
@@ -1105,6 +1147,7 @@ class MetricFlowDerivation:
                 declaration.declared,
                 column_types=declaration.column_types,
                 on_ref=foreign_ref,
+                reserved=planned,
             )
             derivations.append(derivation)
             if derivation.body is None or derivation.status == "skipped":
