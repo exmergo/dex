@@ -20,7 +20,7 @@ from typing import Any, TypeVar
 
 from .adapters.base import Adapter
 from .config import CONFIG_FILE
-from .envelope import Cost
+from .envelope import Cost, Paradigm
 from .guards.cost_guard import (
     SUGGESTED_SESSION_CEILING_MULTIPLE,
     UPTIME_LINE,
@@ -104,7 +104,16 @@ def preflight_cost(adapter: Adapter) -> Cost:
     """
 
     gate = cost_gate(adapter)
-    return gate.cost() if gate is not None else Cost(paradigm=adapter.paradigm)
+    if gate is not None:
+        return gate.cost()
+    # No gate means the connector cannot bill: on FREE_LOCAL the handshake
+    # is not applicable, and the cost says so instead of leaving it blank.
+    return Cost(
+        paradigm=adapter.paradigm,
+        handshake=(
+            "not_applicable" if adapter.paradigm is Paradigm.FREE_LOCAL else None
+        ),
+    )
 
 
 def _estimate_payload(
