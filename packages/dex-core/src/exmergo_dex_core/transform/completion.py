@@ -1036,14 +1036,18 @@ def summarize_completion(
     build ran them in: on a plain build with a package enabled, the package's
     models otherwise fill the capped list and the project's own unasserted
     model is cut off (#1500). The count is unchanged; only the order moves.
-    Without it, the order is the build's own, as before.
+    Without it, the order is the build's own, as before. On a plan build
+    (``deliverables.coverage == "known"``) the lists follow the plan's
+    requirement order instead, and the sort does not apply (#1506).
     """
 
     from .scope_gate import accepted_key
 
     graph = graph or {}
     deliverables, built_names, causes = _deliverables(evidence, graph)
-    if project_name:
+    if project_name and deliverables.coverage != "known":
+        # A plan build's names follow the plan's requirement order; sorting
+        # the project's own models first would break that order (#1506).
         # A name is the project's own when any built model of that name
         # carries the project's package: a project override of a package model
         # keeps the package model's name, and it is the project's to act on.
