@@ -76,6 +76,16 @@ def test_the_checker_fails_a_skip_and_names_the_case_and_its_reason(tmp_path: Pa
     assert result.stdout.startswith("::error::")
 
 
+def test_the_checker_fails_an_expected_failure_and_says_so(tmp_path: Path):
+    xfail = (
+        '<testcase classname="tests.t" name="test_known" time="0">'
+        '<skipped type="pytest.xfail" message="known bug"/></testcase>'
+    )
+    result = _check(_report(tmp_path, PASSED, xfail))
+    assert result.returncode == 1
+    assert "tests.t::test_known is an expected failure: known bug" in result.stdout
+
+
 def test_the_checker_reads_every_report_it_is_given(tmp_path: Path):
     clean = _report(tmp_path, PASSED, name="clean.xml")
     gated = _report(tmp_path, SKIPPED, name="gated.xml")
@@ -125,7 +135,8 @@ def test_each_fixture_file_runs_once_with_its_variable_and_a_skip_check(
     runners = [
         (job, step)
         for _, job, step in _steps(workflow)
-        if file in str(step.get("run", "")) and "--ignore" not in str(step["run"])
+        if file in str(step.get("run", ""))
+        and f"--ignore={file}" not in str(step["run"])
     ]
     assert len(runners) == 1, f"{file} should run in exactly one step"
     job, step = runners[0]
@@ -135,6 +146,22 @@ def test_each_fixture_file_runs_once_with_its_variable_and_a_skip_check(
     report = run.split("--junitxml", 1)[1].split()[0]
     assert f"check_no_skips.py {report}" in run
     assert run.index("pytest") < run.index("check_no_skips.py")
+
+
+def test_the_variable_is_set_only_on_the_two_fixture_steps(workflow: dict):
+    """A step that collects a fixture file without naming it (`pytest tests`)
+    would run it a second time, and outside the skip check, if it had the
+    variable; so nothing but the two named steps may set it."""
+
+    assert ENV not in (workflow.get("env") or {})
+    holders = []
+    for _, job, step in _steps(workflow):
+        assert ENV not in (job.get("env") or {})
+        if ENV in (step.get("env") or {}):
+            holders.append(step["run"])
+    assert len(holders) == len(FILES)
+    for file in FILES:
+        assert sum(file in run for run in holders) == 1
 
 
 def test_the_general_postgres_suite_leaves_the_elementary_file_to_its_step(

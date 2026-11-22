@@ -391,7 +391,7 @@ jobs:
     # container, so there is nothing to authenticate against and nothing a
     # fork could spend.
     runs-on: ubuntu-latest
-    # 30, not the 15 the other jobs take: the Elementary step below builds six
+    # 30, double the usual 15: the Elementary step below builds six
     # variants at two package releases, about 9.5 minutes on a hosted runner,
     # and the whole job took about 13 (2026-11-22), leaving room for a third
     # release.
@@ -468,7 +468,7 @@ jobs:
         run: |
           uv run pytest tests/integration/test_postgres_elementary.py -q -m postgres \
             --junitxml "$RUNNER_TEMP/elementary-postgres.xml"
-          python3 ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-postgres.xml"
+          uv run python ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-postgres.xml"
 
   elementary_duckdb:
     # The Elementary fixture's own file, on local DuckDB at the releases that
@@ -498,7 +498,7 @@ jobs:
         run: |
           uv run pytest tests/transform/test_elementary_fixture.py -q \
             --junitxml "$RUNNER_TEMP/elementary-duckdb.xml"
-          python3 ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-duckdb.xml"
+          uv run python ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-duckdb.xml"
 
   cube:
     # No repository gate and no environment: a governed Cube query (#913) is

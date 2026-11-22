@@ -9,7 +9,10 @@ a skip as a pass. In a CI step that exists to run such a suite, a dropped
 variable, a missing executable or an absent extra would then read as green
 while nothing ran. This reads the JUnit XML pytest wrote (`--junitxml`) and
 exits 1 when any test case was skipped, naming each one with its reason, or
-when the files hold no test case at all. It exits 0 otherwise.
+when the files hold no test case at all. It exits 0 otherwise. pytest writes an
+expected failure (`xfail`) as a skip too, so one fails the check as well, named
+as an expected failure rather than as a skip: in such a step a known failure is
+something to fix or to move out, not to carry.
 
 Standard library only, so CI runs it without installing anything.
 """
@@ -42,7 +45,12 @@ def check(paths: list[Path]) -> list[str]:
                 part for part in (case.get("classname"), case.get("name")) if part
             )
             reason = skipped.get("message") or "no reason given"
-            problems.append(f"{path}: {name} was skipped: {reason}")
+            what = (
+                "is an expected failure"
+                if skipped.get("type") == "pytest.xfail"
+                else "was skipped"
+            )
+            problems.append(f"{path}: {name} {what}: {reason}")
     if ran == 0 and not problems:
         problems.append(f"no test case in {', '.join(map(str, paths))}")
     return problems
