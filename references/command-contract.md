@@ -1537,6 +1537,17 @@ default, or a filter or operator after it is refused. A key naming a location
   The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
+  Each generated test the YAML holds once the plan lands (`added`,
+  `already_listed`, `listed_while_off`) carries a per-production-run `cost`
+  (#1462): `estimated`, with the `estimate` in the connector's unit and the
+  `relations` it reads, or `unknown` with a `reason` and never a guess.
+  `data.generated_tests.cost` holds the basis (`prod`, `paradigm`, `unit`,
+  `note`, `read_at`, each relation's `rows` and `bytes`) and `per_run`, the
+  `dex_every_run` and `dex_scheduled` totals apart, each `complete` only where
+  every test of the cadence was priced. A relation is the model's alias in
+  `<connector>.prod`, its custom schema as dbt names it there, a view read as
+  the tables its manifest lineage names (`through`); only catalog
+  metadata is read, unasked only where reading it is free.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

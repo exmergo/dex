@@ -267,6 +267,83 @@ nothing, rather than a test whose answer nothing has held to `maintain verify`'s
 and the plan says `dialect_unsupported`; `maintain verify` still checks the fact
 there.
 
+#### What a generated test costs per production run
+
+A generated test runs where Dex never connects, so the plan says what each one
+costs per production run before anyone applies it. Every test the YAML holds
+once the plan lands (`added`, `already_listed` and `listed_while_off`) gets a
+`cost`, and so does a `stale` one, which stays in the YAML and runs as written
+(unknown, `stale_test`, so its cadence total stays partial). A listed test is
+priced from the arguments it keeps in the YAML, not the declaration's:
+
+```json
+{"status": "estimated", "estimate": 52428800.0,
+ "relations": ["my-project.analytics.fct_orders"]}
+```
+
+or, where a size cannot be read, `{"status": "unknown", "reason": ..., "relation": ...}`.
+The estimate is built from the relations the test reads (the model it sits on,
+plus a parent, a snapshot or a join's two inputs for the kinds that read them)
+and their sizes in production's catalog. The connector prices one statement
+over those sizes the way it prices any statement: bytes on BigQuery, seconds
+on the compute-time and database-load connectors, nothing on DuckDB.
+
+Production is the connector's `prod` namespace, `<connector>.prod` in
+`.dex/config.yml` (see [Naming production](init-and-dev-target.md#naming-production)).
+Each model is read as its alias there. Its custom schema is named as dbt names
+it in production: `<prod>_<custom>` under dbt's default, and `<custom>_<target>`
+under the override `transform init --layered-schemas` scaffolds, which needs
+`dbt_prod_target`. A source is read where it is declared, and only where the
+source allowlist reaches. A view, and an ephemeral model, keeps no size: a test
+over one scans what it reads, so it is followed through the compiled
+manifest's lineage down to tables, and the views it passed through are listed
+under the row's `through`. That lineage is what `ref()` and `source()` name, so
+a view is followed only where its compiled SQL reads nothing else. A model the
+compiled manifest does not hold is never named by guess, and
+`ref('package', 'model')` resolves in that package only. A relation outside
+prod's namespaces (a snapshot's literal `target_schema`, a model's own
+`database`) is read only where the source allowlist reaches it. Dex reads
+catalog metadata only (row counts and bytes), never a row.
+
+`data.generated_tests.cost` gives the basis and the totals:
+
+| Field | Meaning |
+|---|---|
+| `prod` | the production namespace the plan read |
+| `paradigm`, `unit` | the connector's cost paradigm and the estimate's unit (`bytes`, `seconds`, or `null` on DuckDB) |
+| `note` | what the number bounds: an upper bound on BigQuery, which bills only the columns read; a heuristic at the pinned warehouse's scan rate elsewhere |
+| `read_at` | when the sizes were read |
+| `lineage_parsed_for` | whether the manifest a view's lineage came from was parsed for `production` or `another target` (a view whose SQL branches on `target.name` can read other relations in production) |
+| `relations[]` | each relation read: `relation`, `kind`, `object_type`, `rows`, `bytes`, or its `reason` |
+| `per_run` | per cadence, `dex_every_run` and `dex_scheduled` apart: `tests`, `estimated`, `unknown`, `estimate` (the sum of the estimated ones) and `complete` |
+
+A total with `complete: false` leaves out the tests it could not price, so it is
+a floor. An unknown estimate says why, and Dex never guesses one:
+
+| `reason` | Meaning |
+|---|---|
+| `prod_unset` | `<connector>.prod` is not set, so Dex does not know where production is |
+| `relation_not_found` | production's catalog has no such relation (a model this plan creates, not yet deployed) |
+| `no_size_in_metadata` | the catalog keeps no byte size: a view whose lineage the manifest does not hold, or Databricks, whose sizes only a billed `DESCRIBE DETAIL` reads |
+| `custom_schema_naming` | the project's own `generate_schema_name` decides production's schema, and Dex does not run it |
+| `prod_target_unset` | the layered naming needs the production target's name: set `dbt_prod_target` |
+| `outside_allowlist` | a source outside the source allowlist; `prod` authorizes only where the project's models build |
+| `not_in_manifest` | the compiled manifest does not hold the model (one this plan creates, or a project dbt has not parsed since), so its production name is not known |
+| `untracked_input`, `lineage_unverified` | a view whose compiled SQL reads a relation its lineage does not name, or one dbt has not compiled, so its inputs are not all known (a dev build compiles it) |
+| `placement_changed` | this plan changes where the model builds (its alias, schema or database, or `dbt_project.yml`), so the compiled manifest's placement is not what production will read |
+| `stale_test` | a listed test the declaration no longer gives, which still runs as written |
+| `relation_unnamed`, `relation_unresolved` | an input the plan could not name, or a source the compiled manifest does not hold |
+| `metadata_read_billed` | the catalog read itself bills (Redshift Serverless wakes its workgroup), so a plan does not read it unasked |
+| `metadata_unreadable`, `connection_unavailable`, `no_size_estimator`, `estimate_failed`, `lineage_too_deep` | the read or the price failed (its exception type in `detail`), no connection opened, the connector prices nothing from sizes, or the views ran more than 12 deep |
+
+Reading the catalog is free on DuckDB, BigQuery (the table API), Snowflake
+(`SHOW`), Postgres, Redshift provisioned, ClickHouse and Trino. Databricks'
+free listing carries no size, and Redshift Serverless bills a wake, so both
+report the estimate unknown rather than spend. A Serverless endpoint is told apart
+before any connection, from `redshift.workgroup` or the endpoint host, and a
+Redshift connection a host supplies, whose compute Dex cannot tell, is not
+opened either.
+
 #### `dex_unique_combination`: a composite grain
 
 A declared `grain` of two or more columns (`grain: [order_id, line_number]`)

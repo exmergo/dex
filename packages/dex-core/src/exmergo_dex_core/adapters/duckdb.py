@@ -10,6 +10,7 @@ deterministic in CI.
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 
 from ..envelope import Paradigm
@@ -256,6 +257,21 @@ class DuckDBAdapter:
             [schema, schema],
         )
         return sorted(str(name) for (name,) in rows)
+
+    def catalog_meta(self, identifier: str) -> ObjectMeta:
+        """One relation's catalog entry (#1462): DuckDB's own row estimate and
+        no byte size, reading no row, unlike :meth:`table_metadata`'s exact
+        count. ``LookupError`` where the file holds no such relation."""
+
+        meta = self._get_object(identifier)
+        if meta is None:
+            raise LookupError(identifier)
+        return meta
+
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """Nothing bills on DuckDB (#1462): every statement is free."""
+
+        return 0.0
 
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
         """exact row count and column metadata for one object."""

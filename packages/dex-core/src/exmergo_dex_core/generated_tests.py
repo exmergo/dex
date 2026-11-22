@@ -120,6 +120,14 @@ class GeneratedTestKind:
     #: and of ``"1"``) would otherwise share a name, which dbt refuses, and a
     #: value from the data would sit in the node name.
     named_by_claim: bool = False
+    #: Whether the test's SQL reads the model it sits on (#1462). Every kind
+    #: does but :data:`JOIN_COVERAGE`, which reads the join's two inputs.
+    reads_model: bool = True
+    #: The arguments that name another relation the test's SQL reads, each a
+    #: ``ref()`` or ``source()`` call written as text (or ``None`` where the
+    #: plan could not name it), so a plan can say which tables a test reads
+    #: and price it from their production sizes (#1462).
+    relation_arguments: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -470,6 +478,7 @@ register(
         _parent_population,
         macro=PARENT_POPULATION,
         dialects=ALL_CONNECTORS,
+        relation_arguments=("parent",),
     )
 )
 
@@ -602,6 +611,8 @@ register(
         macro=JOIN_COVERAGE,
         dialects=ALL_CONNECTORS,
         reads_joins=True,
+        reads_model=False,
+        relation_arguments=("child", "parent"),
     )
 )
 
@@ -777,6 +788,7 @@ register(
         dialects=ALL_CONNECTORS,
         reads_history=True,
         named_by_claim=True,
+        relation_arguments=("snapshot",),
     )
 )
 

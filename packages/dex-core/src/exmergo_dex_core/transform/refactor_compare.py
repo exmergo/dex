@@ -280,7 +280,9 @@ def _compare(
     project = repo_root / stored.project_dir
     config = engine.config
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     connector = engine.connector or config.connector
     if not connector:
         raise ValueError(

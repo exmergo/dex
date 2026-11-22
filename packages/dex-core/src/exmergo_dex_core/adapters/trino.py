@@ -736,6 +736,19 @@ class TrinoAdapter:
             )
         return sum(per_table.values()), per_table
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        scan rate. What a generated test costs per production run, priced from
+        the production tables' catalog sizes; nothing this command bills (a
+        startup, wake or uptime charge) is added, since the run it prices is not
+        dex's."""
+
+        return max(
+            sum(int(b) for b in byte_sizes) / _SCAN_BYTES_PER_SECOND,
+            _MIN_STATEMENT_SECONDS,
+        )
+
     def query_estimate(self, sql: str) -> float:
         """The estimate for one firewall-approved query, from the free
         non-executing EXPLAIN (TYPE IO), which prices the statement after

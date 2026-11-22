@@ -149,6 +149,44 @@ def test_configured_prod_target_is_still_refused(
     assert envelope["status"] == "error"
 
 
+def test_the_declared_production_target_is_refused_by_name(
+    dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
+):
+    """`dbt_prod_target` (#1462) is refused even where its name looks like
+    nothing production and the allowlist of dev targets would take it."""
+
+    dex_dir = tmp_path / ".dex"
+    dex_dir.mkdir()
+    (dex_dir / "config.yml").write_text(
+        "dbt_target: ci\ndbt_prod_target: analytics\n", encoding="utf-8"
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "analytics",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1
+    assert "dbt_prod_target" in envelope["errors"][0]
+
+
+def test_the_guard_refuses_the_production_target_before_the_configured_one():
+    from exmergo_dex_core.transform.build import (
+        ProdTargetRefusedError,
+        assert_dev_target,
+    )
+
+    with pytest.raises(ProdTargetRefusedError, match="dbt_prod_target"):
+        assert_dev_target("Analytics", "analytics", prod="analytics")
+    assert assert_dev_target("ci", "ci", prod="analytics") == "ci"
+
+
 def test_non_dev_target_is_refused(
     dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
 ):

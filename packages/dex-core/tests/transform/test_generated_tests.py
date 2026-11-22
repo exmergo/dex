@@ -598,6 +598,9 @@ def test_the_plan_lists_each_generated_test_with_its_tag(
     assert report["render_tests"] == ["dex_every_run"]
     assert report["counts"] == {"added": 1, "not_rendered": 2}
     [added] = [t for t in report["tests"] if t["status"] == "added"]
+    # The cost a test runs at in production (#1462): unknown here, since the
+    # config names no `prod` namespace.
+    assert added.pop("cost")["reason"] == "prod_unset"
     assert added == {
         "model": "fct_lines",
         "column": None,

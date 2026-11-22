@@ -1548,6 +1548,16 @@ def render(
     return text
 
 
+class GeneratedRow(dict):  # type: ignore[type-arg]
+    """A ``data.generated_tests`` row that also knows, off the record, which
+    relations its test reads (#1462): ``reads``, as :func:`_generated` names
+    them. A dict as far as any reader or the envelope can tell, so the row's
+    public shape is unchanged; the plan's cost estimate reads ``reads`` and
+    a row that lost it (a copy) is read as reading its own model."""
+
+    reads: list[dict[str, Any]] | None = None
+
+
 def _report_rows(
     content: str | None, text: str, planned: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1556,7 +1566,19 @@ def _report_rows(
 
     rows: list[dict[str, Any]] = []
     for g in planned:
-        row = {key: g[key] for key in ("model", "column", "test", "cadence", "claim")}
+        row = GeneratedRow(
+            {key: g[key] for key in ("model", "column", "test", "cadence", "claim")}
+        )
+        row.reads = g.get("reads")
+        retained = _listed_test(content, g)
+        if retained is not None and row.reads is not None:
+            # Left as written, so it reads what its own arguments name, which a
+            # person may have changed under the same claim (#1462).
+            arguments = _arguments_of(retained)
+            row.reads = [
+                read if "model" in read else {"relation": arguments.get(read["key"])}
+                for read in row.reads
+            ]
         if g.get("variant") is not None:
             row["variant"] = g["variant"]
         # Read at the test's own place, matched the way rendering matches,
@@ -2152,6 +2174,16 @@ def _generated(
                     "variant": instance.variant,
                     "enabled": renders,
                     "off_reason": reason,
+                    # The relations the test's SQL reads (#1462): the model
+                    # it sits on, as itself, and each relation argument as the
+                    # ref()/source() text it renders (None where unnamed).
+                    "reads": (
+                        ([{"model": model}] if kind.reads_model else [])
+                        + [
+                            {"relation": instance.arguments.get(key), "key": key}
+                            for key in kind.relation_arguments
+                        ]
+                    ),
                     "spec": generated_spec(
                         kind.name,
                         cadence=kind.cadence,
@@ -2171,12 +2203,20 @@ def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
     model's entry (or the version's item, for a label), then the column it sits
     under, matched by :func:`_is_listed`."""
 
+    return _listed_test(content, test) is not None
+
+
+def _listed_test(content: str | None, test: Mapping[str, Any]) -> Any:
+    """The entry ``content`` lists for the generated ``test`` where it belongs,
+    as :func:`_listed_at` matches it, or ``None``. A listed test is left as
+    written, so what it reads is what this entry says (#1462)."""
+
     if not content:
-        return False
+        return None
     try:
         loaded = yaml.safe_load(content)
     except yaml.YAMLError:
-        return False
+        return None
     base, version = mv.split_label(test["model"])
     entries = loaded.get("models") if isinstance(loaded, Mapping) else None
     node: Any = next(
@@ -2210,9 +2250,11 @@ def _listed_at(content: str | None, test: Mapping[str, Any]) -> bool:
             None,
         )
     if not isinstance(node, Mapping):
-        return False
+        return None
     listed = node.get("data_tests") or node.get("tests") or []
-    return isinstance(listed, list) and _is_listed(test["spec"], listed)
+    if not isinstance(listed, list):
+        return None
+    return _matching(test["spec"], listed)
 
 
 def _render_version(
@@ -3080,6 +3122,16 @@ def _claim_earlier_renders(text: str, locate: Any, specs: list[Any]) -> str:
 
 def _node_value(node: Any) -> Any:
     return yaml.safe_load(yaml.serialize(node))
+
+
+def _matching(spec: Any, listed: list[Any]) -> Any:
+    """The item of ``listed`` that :func:`_is_listed` matches ``spec`` to, or
+    ``None``."""
+
+    for test in listed:
+        if _is_listed(spec, [test]):
+            return test
+    return None
 
 
 def _is_listed(spec: Any, listed: list[Any]) -> bool:
