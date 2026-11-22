@@ -1164,13 +1164,14 @@ class MetricFlowDerivation:
         derivations: list[Derivation] = []
         claimed: dict[str, str] = {}
         # on_ref plus the plan's marts, for foreign keys alone: the collision
-        # check keeps reading on_ref, the project as it stands. Each mart stands
-        # in as a draft from a first pass: its settled primary entity, and the
-        # foreign entities that join the layer as it stands. Every foreign key in
-        # the plan resolves against those drafts and nothing derived later, so it
-        # joins the same name whatever order the plan derives in, cycles included.
-        # What an accepted body adds is reserved for the marts after it instead.
-        foreign_ref = {model: list(found) for model, found in on_ref.items()}
+        # check keeps reading on_ref, the project as it stands. A first pass
+        # settles each mart's primary entity name; further passes, with those
+        # names fixed, add every foreign entity that joins a known entity (the
+        # layer's or another draft's) until the drafts stop changing, so a child
+        # can join a parent column that is itself a foreign key. Every foreign key
+        # in the plan resolves against those drafts and nothing derived later, so
+        # it joins the same name whatever order the plan derives in, cycles
+        # included. What an accepted body adds is reserved for the marts after it.
         authored = _layer_names(on_ref)["entity"]
         # names settled or accepted so far, held for every mart after
         held: dict[str, set[str]] = {
@@ -1185,29 +1186,65 @@ class MetricFlowDerivation:
                 names[kind] |= more
             return names
 
+        planned_marts = [d for d in request.declarations if d.model not in on_ref]
         settled: dict[str, str] = {}
-        for declaration in request.declarations:
-            if declaration.model in on_ref:
-                continue
-            draft = derive(
+        drafts: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for declaration in planned_marts:
+            body = derive(
                 declaration.model,
                 declaration.declared,
                 column_types=declaration.column_types,
                 on_ref=on_ref,
                 reserved=reserved_for(declaration.model),
             ).body
-            entities = [
-                e
-                for e in (draft or {}).get("entities", [])
-                if e["type"] == "primary" or e["name"] in authored
+            primary = [
+                e for e in (body or {}).get("entities", []) if e["type"] == "primary"
             ]
-            if entities and entities[0]["type"] == "primary":
-                foreign_ref[declaration.model] = [
-                    ("", {"name": draft["name"], "entities": entities})
+            if primary:
+                drafts[declaration.model] = [
+                    ("", {"name": body["name"], "entities": primary})
                 ]
-                settled[declaration.model] = entities[0]["name"]
+                settled[declaration.model] = primary[0]["name"]
                 # a later draft keeps clear of it, so two settled names never meet
-                held["entity"].add(entities[0]["name"])
+                held["entity"].add(primary[0]["name"])
+        for _ in planned_marts:  # a chain of n marts settles in n passes at most
+            known = authored | {
+                e["name"]
+                for found in drafts.values()
+                for _path, entry in found
+                for e in entry["entities"]
+            }
+            refined: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            for declaration in planned_marts:
+                if declaration.model not in drafts:
+                    continue
+                body = derive(
+                    declaration.model,
+                    declaration.declared,
+                    column_types=declaration.column_types,
+                    on_ref={
+                        **on_ref,
+                        **{m: d for m, d in drafts.items() if m != declaration.model},
+                    },
+                    reserved=reserved_for(declaration.model),
+                    primary_name=settled[declaration.model],
+                ).body
+                if body is None:
+                    refined[declaration.model] = drafts[declaration.model]
+                    continue
+                entities = [
+                    e
+                    for e in body.get("entities", [])
+                    if e["type"] == "primary" or e["name"] in known
+                ]
+                refined[declaration.model] = [
+                    ("", {"name": body["name"], "entities": entities})
+                ]
+            if refined == drafts:
+                break
+            drafts = refined
+        foreign_ref = {model: list(found) for model, found in on_ref.items()}
+        foreign_ref.update(drafts)
         for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
             derivation = derive(

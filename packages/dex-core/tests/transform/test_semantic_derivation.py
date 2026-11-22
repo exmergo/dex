@@ -2033,3 +2033,74 @@ def test_a_moved_dimension_never_takes_a_dimension_name_from_another_model():
         "output_day",
     )
     assert found.body["defaults"] == {"agg_time_dimension": "readings_output_day_2"}
+
+
+def test_a_foreign_key_joins_a_parent_column_that_is_itself_a_planned_foreign_key(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_returns.buyer_id` references `fct_orders.customer_id`, which joins the
+    planned `fct_customers` entity `customer`: the returns mart joins `customer`
+    too, not a `buyer` fallback that joins nothing."""
+
+    def mart(model: str, grain: str, **foreign: str) -> dict:
+        return {
+            "model": model,
+            "description": f"One row per {grain}.",
+            "grain": [grain],
+            "columns": {
+                grain: {"role": "key"},
+                "happened_at": {"role": "time"},
+                **{
+                    column: {"role": "foreign_key", "references": ref}
+                    for column, ref in foreign.items()
+                },
+                "amount": {"role": "measure", "aggregation": "sum"},
+            },
+        }
+
+    marts = [
+        mart("fct_customers", "customer_id"),
+        mart("fct_orders", "order_id", customer_id="fct_customers.customer_id"),
+        mart("fct_returns", "return_id", buyer_id="fct_orders.customer_id"),
+    ]
+    body = {
+        "edits": [
+            {
+                "path": f"models/marts/{m['model']}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select "
+                    + ", ".join(
+                        f"1 as {c}"
+                        if c != "happened_at"
+                        else "current_date as happened_at"
+                        for c in m["columns"]
+                    )
+                    + "\n"
+                ),
+            }
+            for m in marts
+        ],
+        "declarations": marts,
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "chain",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert {"name": "customer", "type": "foreign", "expr": "customer_id"} in (
+        offered["fct_orders"]["entities"]
+    )
+    assert {"name": "customer", "type": "foreign", "expr": "buyer_id"} in (
+        offered["fct_returns"]["entities"]
+    )
