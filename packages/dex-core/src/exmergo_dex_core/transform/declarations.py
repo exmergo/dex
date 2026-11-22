@@ -1597,6 +1597,8 @@ def _report_rows(
         else:
             row["status"] = "not_rendered"
             row["reason"] = g["off_reason"]
+            if g["off_reason"] == gt.COLUMN_NOT_OUTPUT:
+                row["missing_columns"] = list(g.get("missing_columns") or [])
         rows.append(row)
     return rows
 
@@ -2156,11 +2158,12 @@ def _generated(
                     + tuple(instance.columns)
                 )
             )
-            if (
-                on
-                and outputs is not None
-                and any(column.lower() not in outputs for column in reads)
-            ):
+            missing = (
+                [column for column in reads if column.lower() not in outputs]
+                if on and outputs is not None
+                else []
+            )
+            if missing:
                 renders, reason = False, gt.COLUMN_NOT_OUTPUT
             if instance.withheld is not None:
                 # A fact only maintain verify judges, as a question (#1455).
@@ -2175,6 +2178,7 @@ def _generated(
                     "variant": instance.variant,
                     "enabled": renders,
                     "off_reason": reason,
+                    "missing_columns": missing,
                     # The relations the test's SQL reads (#1462): the model
                     # it sits on, as itself, and each relation argument as the
                     # ref()/source() text it renders (None where unnamed).

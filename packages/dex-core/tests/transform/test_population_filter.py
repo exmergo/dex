@@ -308,6 +308,7 @@ def test_the_plan_that_renders_it_writes_its_macro_as_a_diff(
     assert planned["status"] == "ok", planned["errors"]
     assert f"macros/{NAME}.sql" in planned["data"]["paths"]
     assert planned["data"]["generated_tests"]["counts"] == {"added": 1}
+    assert not [w for w in planned["warnings"] if "is not rendered" in w]
 
 
 def test_a_plan_on_a_rollup_without_the_column_says_why_and_writes_no_macro(
@@ -323,6 +324,13 @@ def test_a_plan_on_a_rollup_without_the_column_says_why_and_writes_no_macro(
     assert not any(p.startswith("macros/") for p in planned["data"]["paths"])
     [row] = planned["data"]["generated_tests"]["tests"]
     assert (row["status"], row["reason"]) == ("not_rendered", gt.COLUMN_NOT_OUTPUT)
+    assert row["missing_columns"] == ["status"]
+    # The reviewer reading the warnings learns the requested check is missing
+    # (#1552): the model, the test kind and the column.
+    assert (
+        f"fct_orders: the {NAME} test was requested but is not rendered, "
+        "because the model does not output status"
+    ) in planned["warnings"]
 
 
 def test_a_plan_with_the_switch_off_writes_no_macro(
@@ -332,6 +340,20 @@ def test_a_plan_with_the_switch_off_writes_no_macro(
 
     assert planned["status"] == "ok", planned["errors"]
     assert not any(p.startswith("macros/") for p in planned["data"]["paths"])
+    assert not [w for w in planned["warnings"] if "is not rendered" in w]
+
+
+def test_a_plan_with_the_switch_off_on_a_rollup_does_not_warn(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    planned = _plan(
+        _repo(tmp_path, "false"),
+        capsys,
+        "select 'emea' as region, 3 as orders\n",
+    )
+
+    assert planned["status"] == "ok", planned["errors"]
+    assert not [w for w in planned["warnings"] if "is not rendered" in w]
 
 
 def test_transform_macro_lists_it(dbt_project_dir: Path, tmp_path: Path, capsys):

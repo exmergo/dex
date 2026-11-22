@@ -519,6 +519,7 @@ def plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    result.warnings.extend(_withheld_test_warnings(generated_tests))
     _price_generated_tests(engine, result, edits)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
@@ -966,6 +967,27 @@ def _generated_report(
         "counts": counts,
         "tests": generated,
     }
+
+
+def _withheld_test_warnings(generated: dict[str, Any] | None) -> list[str]:
+    """A warning for each generated test the plan asked for and withheld
+    because the model does not output a column it reads (#1552). The row under
+    ``data.generated_tests`` says ``not_rendered`` and why, but a reviewer
+    reading the warnings would otherwise not learn that a check they turned on
+    is missing. A kind switched off gives no such row, so it gives no warning."""
+
+    from .. import generated_tests as gt
+
+    warnings: list[str] = []
+    for row in (generated or {}).get("tests") or []:
+        if row.get("reason") != gt.COLUMN_NOT_OUTPUT:
+            continue
+        columns = ", ".join(row.get("missing_columns") or []) or "a column it reads"
+        warnings.append(
+            f"{row['model']}: the {row['test']} test was requested but is not "
+            f"rendered, because the model does not output {columns}"
+        )
+    return warnings
 
 
 def _price_generated_tests(

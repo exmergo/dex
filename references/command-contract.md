@@ -1434,7 +1434,12 @@ default, or a filter or operator after it is refused. A key naming a location
   is a non-fatal `unknown_test_kind` config problem. Each kind states the
   connectors it supports (every one `maintain verify` runs its matching check
   on); elsewhere it renders nothing and is `not_rendered` with
-  `reason: dialect_unsupported` (#1451). This release renders
+  `reason: dialect_unsupported` (#1451). A test reading a column the model's
+  SQL provably does not output is `not_rendered` with
+  `reason: column_not_output`, its row naming the columns under
+  `missing_columns`, and the plan adds a warning naming the model, the test
+  and those columns, so a reviewer learns the requested check is missing
+  (#1552); a kind switched off gives no such warning. This release renders
   `dex_unique_combination` for a declared grain of two or more columns (#1452),
   on every connector: its `failures` count equals `grain_broken`'s
   `duplicate_count`, a NULL grain value counts as a value, and the test returns

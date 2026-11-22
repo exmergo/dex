@@ -667,7 +667,8 @@ reads them from the model's SQL (#1456), each agreeing with
 macro as a `macro_sql` diff; a kind renders only on the connectors it states,
 and is `not_rendered` with `reason: dialect_unsupported` elsewhere (#1451), and
 a test reading a column the model provably does not output is `not_rendered`
-with `reason: column_not_output`. A column declared `unit: percent` renders no
+with `reason: column_not_output`, its row naming them under `missing_columns`
+and the plan warning with the model, the test and the columns (#1552). A column declared `unit: percent` renders no
 test and is `not_rendered` with `reason: heuristic_only`: `maintain verify`
 flags a percent whose values all sit within 0 to 1 as a question, which correct
 small percentages answer too, so only `maintain verify` asks it. A required
