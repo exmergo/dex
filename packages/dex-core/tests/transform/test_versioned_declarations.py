@@ -317,6 +317,31 @@ def test_a_shared_grain_needs_every_version_to_produce_it():
         _declare([{"model": "dim_teams", "grain": ["team_id"]}], files)
 
 
+def test_a_shared_continuity_needs_every_version_to_produce_its_keys():
+    # #1461: a continuity on the shared entry renders a test every version
+    # inherits, so a key only v1 produces would fail v2's test to compile.
+    files = _files()
+    files["models/marts/dim_teams.sql"] = (
+        "select team_id, team_label, created_at from {{ ref('stg_teams') }}\n"
+    )
+    files["models/marts/dim_teams_v2.sql"] = (
+        "select team_id, team_label as display_label, created_at\n"
+        "from {{ ref('stg_teams') }}\n"
+    )
+
+    def shared(by):
+        return [
+            {
+                "model": "dim_teams",
+                "columns": {"created_at": {"role": "time", "continuity": {"by": by}}},
+            }
+        ]
+
+    with pytest.raises(d.DeclarationError, match="not every version produces"):
+        _declare(shared(["team_label"]), files)
+    _declare(shared(["team_id"]), files)
+
+
 # --- reading it back --------------------------------------------------------------
 
 

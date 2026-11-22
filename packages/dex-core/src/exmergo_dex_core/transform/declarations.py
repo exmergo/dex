@@ -999,6 +999,18 @@ def _version_target(
             f"applies to every version, but not every version produces "
             f"{', '.join(missing_grain)}; declare the grain on each version"
         )
+    for name, column in declaration.columns.items():
+        # A shared continuity's test is inherited by every version (#1461), so
+        # each of its keys must be a column every version produces.
+        keys = column.continuity.by if column.continuity is not None else []
+        missing_keys = [k for k in keys if every is not None and k.lower() not in every]
+        if missing_keys:
+            raise DeclarationError(
+                f"'{model}' is versioned, and a continuity declared on its shared "
+                f"entry applies to every version, but not every version produces "
+                f"{', '.join(missing_keys)}; declare '{name}''s continuity on each "
+                "version"
+            )
     return (versioned.yaml_path, union, [])
 
 
