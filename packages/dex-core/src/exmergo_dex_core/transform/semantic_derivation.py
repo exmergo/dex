@@ -212,6 +212,7 @@ def derive(
     column_types: Mapping[str, tuple[str | None, str | None]],
     on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
     reserved: Mapping[str, set[str]] | None = None,
+    primary_name: str | None = None,
 ) -> Derivation:
     """The semantic model ``declared`` states, with every gap named.
 
@@ -222,6 +223,8 @@ def derive(
     a foreign key finds the entity name the model it references already uses.
     ``reserved`` is :func:`_planned_names` over the plan's declarations, the names
     the marts derived alongside this one will give each element type.
+    ``primary_name`` is the primary entity name the plan already settled for this
+    mart, used as given so the foreign keys of other marts that join it match.
     """
 
     derivation = Derivation(model=model)
@@ -267,8 +270,9 @@ def derive(
     # names its primary entity after the model, settled before the foreign keys so
     # their duplicate check reads the final name; a dimension of a foreign entity's
     # name moves aside further down. A replacement name stays clear of this model's
-    # elements, of the entities its foreign keys join by, and of any name the layer
-    # or another mart in the plan gives another element type.
+    # elements, of the entities its foreign keys join by, of every entity name the
+    # layer or the plan already uses (so it joins nothing by accident), and of any
+    # name they give another element type.
     stem = _LAYER_PREFIX.sub("", model).lower()
     layer = _layer_names(on_ref, reserved)
     measure_names = {n for n, f in columns.items() if f.get("role") == "measure"}
@@ -279,19 +283,22 @@ def derive(
         or (f.get("role") == "time" and column_types.get(n, (None, None))[0] != "other")
     }
     if primary is not None and primary in dimension_columns:
-        joins_by = {
-            _foreign_entity(n, f.get("references"), on_ref)[0]
-            for n, f in columns.items()
-            if f.get("role") == "foreign_key" and n not in grain
-        }
-        primary = _free_name(
-            f"{stem}_{grain[0]}",
-            dimension_columns
-            | measure_names
-            | joins_by
-            | layer["dimension"]
-            | layer["measure"],
-        )
+        if primary_name is None:
+            joins_by = {
+                _foreign_entity(n, f.get("references"), on_ref)[0]
+                for n, f in columns.items()
+                if f.get("role") == "foreign_key" and n not in grain
+            }
+            primary_name = _free_name(
+                f"{stem}_{grain[0]}",
+                dimension_columns
+                | measure_names
+                | joins_by
+                | layer["entity"]
+                | layer["dimension"]
+                | layer["measure"],
+            )
+        primary = primary_name
         entities[0]["name"] = primary
         notes.append(
             f"{grain[0]}: the primary entity is named '{primary}' because the "
@@ -1160,6 +1167,7 @@ class MetricFlowDerivation:
         foreign_ref = {model: list(found) for model, found in on_ref.items()}
         planned = _planned_names(request.declarations)
         drafted: set[str] = set()
+        settled: dict[str, str] = {}
         for declaration in request.declarations:
             if declaration.model in on_ref:
                 continue
@@ -1178,6 +1186,7 @@ class MetricFlowDerivation:
                     ("", {"name": draft["name"], "entities": primary})
                 ]
                 drafted.add(declaration.model)
+                settled[declaration.model] = primary[0]["name"]
         for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
             if model in drafted:
@@ -1189,6 +1198,7 @@ class MetricFlowDerivation:
                 column_types=declaration.column_types,
                 on_ref=foreign_ref,
                 reserved=planned,
+                primary_name=settled.get(model),
             )
             derivations.append(derivation)
             if derivation.body is None or derivation.status == "skipped":

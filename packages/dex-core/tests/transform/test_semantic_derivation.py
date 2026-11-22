@@ -1652,3 +1652,94 @@ def test_marts_that_reference_each_other_join_by_final_entity_names(
     assert "expr: output_day_id\n" in content
     assert "name: output_day\n" not in content
     assert "name: snapshot\n" in models["fct_world_output_daily"]["content"]
+
+
+@pytest.mark.parametrize("other", ["fct_a_snapshots", "fct_snapshots"])
+def test_a_settled_primary_name_holds_whichever_mart_derives_first(
+    dbt_project_dir: Path, tmp_path: Path, capsys, other: str
+):
+    """The snapshots mart's grain column is `daily_output_day`, the daily mart's
+    first-choice entity name, and the two reference each other. The daily entity
+    takes `daily_output_day_2` in the plan's first pass and keeps it, so each
+    foreign key joins the other mart in either order."""
+    daily = {
+        "model": "fct_daily",
+        "description": "One row per day.",
+        "grain": ["output_day"],
+        "columns": {
+            "output_day": {"role": "time"},
+            "b_id": {
+                "role": "foreign_key",
+                "references": f"{other}.daily_output_day",
+            },
+            "output_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    snapshots = {
+        "model": other,
+        "description": "One row per snapshot.",
+        "grain": ["daily_output_day"],
+        "columns": {
+            "daily_output_day": {"role": "key"},
+            "taken_at": {"role": "time"},
+            "output_day_id": {
+                "role": "foreign_key",
+                "references": "fct_daily.output_day",
+            },
+            "snapshot_total": {"role": "measure", "aggregation": "sum"},
+        },
+    }
+    body = {
+        "edits": [
+            {
+                "path": "models/marts/fct_daily.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select cast('2024-01-01' as date) as output_day, "
+                    "1 as b_id, 1.0 as output_total\n"
+                ),
+            },
+            {
+                "path": f"models/marts/{other}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select 1 as daily_output_day, cast('2024-01-01' as date) as "
+                    "taken_at, cast('2024-01-01' as date) as output_day_id, "
+                    "1.0 as snapshot_total\n"
+                ),
+            },
+        ],
+        "declarations": [daily, snapshots],
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "settled",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    daily_body = yaml.safe_load(models["fct_daily"]["content"])
+    snapshots_body = yaml.safe_load(models[other]["content"])
+    daily_entities = {e["name"]: e for e in daily_body["entities"]}
+    snapshot_entities = {e["name"]: e for e in snapshots_body["entities"]}
+    assert daily_entities["daily_output_day_2"]["type"] == "primary"
+    assert snapshot_entities["daily_output_day"]["type"] == "primary"
+    # each foreign key joins the other mart's primary entity by name
+    assert snapshot_entities["daily_output_day_2"] == {
+        "name": "daily_output_day_2",
+        "type": "foreign",
+        "expr": "output_day_id",
+    }
+    assert daily_entities["daily_output_day"] == {
+        "name": "daily_output_day",
+        "type": "foreign",
+        "expr": "b_id",
+    }
