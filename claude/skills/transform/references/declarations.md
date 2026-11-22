@@ -107,9 +107,11 @@ dbt_project_evaluator recognise a primary key by them. On failure they return
 the failing values. So on a column marked as personal data (`contains_pii`,
 `pii`, `is_pii` or `pii_category` under its `config.meta`, including the mark a
 plan stamps on a model it creates), each one the plan adds also carries
-`config: {store_failures: false}`. A test's own config beats the project's
-`store_failures` setting and dbt's `--store-failures` flag, so no failing value
-is copied into an audit table. A `not_null` or `unique` that the scaffold or
+`config: {store_failures: false, store_failures_as: ephemeral}`. dbt applies
+`store_failures_as` last, over `store_failures` at every level, so the test's own
+`ephemeral` is what beats a project's `+store_failures_as: table`, its
+`store_failures` setting and dbt's `--store-failures` flag: no failing value is
+copied into an audit table. A `not_null` or `unique` that the scaffold or
 `maintain reconcile` adds to such a column gets the same setting. Two copies
 stay out of reach: Elementary's samples on a release before 0.20.0, which
 ignores the flag above (the plan warns), and the temporary table Elementary's

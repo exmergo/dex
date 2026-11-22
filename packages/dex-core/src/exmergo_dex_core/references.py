@@ -1164,24 +1164,37 @@ class ReferenceIndex:
         level = quiet.level
         quiet.setLevel(logging.ERROR)
         try:
-            parsed = sqlglot.parse_one(blanked)
+            statements = [tree for tree in sqlglot.parse(blanked) if tree is not None]
         except Exception:
             self.limits.append(column_parse_limit(path))
             self.column_unread.append(path)
             return
         finally:
             quiet.setLevel(level)
-        if parsed is None:
+        if not statements:
             return
-        if any(isinstance(node, exp.Command) for node in parsed.walk()):
+        if any(
+            isinstance(node, exp.Command) for tree in statements for node in tree.walk()
+        ):
             # sqlglot read a statement it does not know as an opaque command,
             # so the columns inside it are invisible: a limit, not an answer.
+            # Every statement is checked, since a file can hold several.
             self.limits.append(column_parse_limit(path))
             self.column_unread.append(path)
             return
 
-        columns = {column.name for column in parsed.find_all(exp.Column) if column.name}
-        columns |= {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}
+        columns = {
+            column.name
+            for tree in statements
+            for column in tree.find_all(exp.Column)
+            if column.name
+        }
+        columns |= {
+            alias.alias
+            for tree in statements
+            for alias in tree.find_all(exp.Alias)
+            if alias.alias
+        }
         columns.discard(JINJA_PLACEHOLDER)
         if not columns:
             return

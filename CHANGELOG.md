@@ -94,9 +94,10 @@ pending fragments into a new section below. See
   dbt, its packages and tools such as dbt_project_evaluator read by name. On a
   column whose `config.meta` marks personal data, including the mark a plan
   stamps on a model it creates, each one a declaration, the scaffold or
-  `maintain reconcile` adds also carries `config: {store_failures: false}`, so a
-  failure's values are not copied into an audit table, whatever the project's
-  `store_failures` setting or dbt's `--store-failures` flag. A test the column
+  `maintain reconcile` adds also carries `config: {store_failures: false,
+  store_failures_as: ephemeral}`, so a failure's values are not copied into an
+  audit table, whatever the project's `store_failures` or `store_failures_as`
+  setting or dbt's `--store-failures` flag. A test the column
   already lists is kept as written. ([#1546](https://github.com/exmergo/dex/pull/1546))
 
 ### Fixed

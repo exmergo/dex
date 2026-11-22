@@ -2,8 +2,9 @@
 
 The built-ins stay dbt's own `unique`, `not_null` and `relationships`; on a
 column marked as personal data each one a plan adds also carries
-`config.store_failures: false`, so a failure's values are not copied into an
-audit table. A test the column listed before the plan is kept as written.
+`store_failures: false` and `store_failures_as: ephemeral` under its config,
+so a failure's values are not copied into an audit table. A test the column
+listed before the plan is kept as written.
 """
 
 from __future__ import annotations
@@ -79,6 +80,15 @@ def _config(test: dict) -> dict:
     return body["config"]
 
 
+def _stores_none(config: dict) -> bool:
+    # `store_failures_as` is applied last by dbt and beats a project's
+    # `+store_failures_as: table`; `store_failures` covers an older dbt.
+    return (
+        config.get("store_failures") is False
+        and config.get("store_failures_as") == "ephemeral"
+    )
+
+
 def test_the_built_ins_on_a_personal_column_store_no_failures():
     [declaration] = parse_declarations([DECLARATION])
 
@@ -89,7 +99,7 @@ def test_the_built_ins_on_a_personal_column_store_no_failures():
     assert [next(iter(t)) for t in email] == ["unique", "not_null"]
     for test in email:
         config = _config(test)
-        assert config["store_failures"] is False
+        assert _stores_none(config)
         # The sampling flag and the claim stay beside it.
         assert config["meta"]["disable_test_samples"] is True
         assert config["meta"]["dex"]["claim"]
@@ -126,7 +136,7 @@ def test_a_mark_the_same_plan_writes_counts():
     out = _harden(unmarked, stamped)
 
     for test in _columns(out)["email"]["data_tests"]:
-        assert _config(test)["store_failures"] is False
+        assert _stores_none(_config(test))
 
 
 def test_a_flow_style_list_gains_the_key_on_its_own_item():
@@ -143,7 +153,7 @@ def test_a_flow_style_list_gains_the_key_on_its_own_item():
     # The listed `not_null` is someone's and stays bare; the added `unique` is
     # hardened.
     assert tests[0] == "not_null"
-    assert _config(tests[1])["store_failures"] is False
+    assert _stores_none(_config(tests[1]))
 
 
 def test_someone_s_own_test_is_not_touched():
@@ -180,7 +190,7 @@ models:
     [version] = yaml.safe_load(out)["models"][0]["versions"]
     [email] = version["columns"]
     for test in email["data_tests"]:
-        assert _config(test)["store_failures"] is False
+        assert _stores_none(_config(test))
 
 
 def test_the_hardened_render_is_still_dex_s_to_move():
@@ -202,7 +212,7 @@ def test_reconcile_adds_a_hardened_test_to_a_personal_column():
     assert span is not None
     out = splice(PERSONAL, [span])
     [test] = _columns(out)["email"]["data_tests"]
-    assert _config(test)["store_failures"] is False
+    assert _stores_none(_config(test))
 
     plain = column_tests(PERSONAL, "dim_users", "team_id")
     assert plain is not None and not plain.personal
@@ -231,6 +241,47 @@ def test_the_scaffold_hardens_a_personal_key():
     columns = _columns(_model_yaml(dataset), "stg_users")
 
     for test in columns["email"]["data_tests"]:
-        assert _config(test)["store_failures"] is False
+        assert _stores_none(_config(test))
     [test] = columns["plan"]["data_tests"]
     assert "store_failures" not in _config(test)
+
+
+def test_a_rendered_relationships_test_on_a_personal_column_is_hardened():
+    marked = PERSONAL.replace(
+        "      - name: team_id\n",
+        "      - name: team_id\n        config:\n          meta:\n"
+        "            contains_pii: true\n",
+    )
+    [declaration] = parse_declarations([DECLARATION])
+
+    out = _harden(marked, render(marked, declaration))
+
+    tests = {next(iter(t)): t for t in _columns(out)["team_id"]["data_tests"]}
+    relationships = tests["relationships"]
+    assert _stores_none(_config(relationships))
+    # The arguments Dex rendered stay as they were.
+    assert relationships["relationships"]["arguments"]["field"] == "team_id"
+
+
+def test_an_aliased_sibling_does_not_stop_the_added_test_from_being_hardened():
+    prior = PERSONAL.replace(
+        "            pii_category: email\n",
+        "            pii_category: email\n"
+        "        data_tests:\n"
+        "          - &kept\n"
+        "            accepted_values:\n"
+        "              arguments:\n"
+        "                values: [a]\n",
+    ).replace(
+        "      - name: team_id\n",
+        "      - name: team_id\n        data_tests:\n          - *kept\n",
+    )
+    [declaration] = parse_declarations([{"model": "dim_users", "grain": ["email"]}])
+
+    out = _harden(prior, render(prior, declaration))
+
+    tests = {next(iter(t)): t for t in _columns(out)["email"]["data_tests"]}
+    assert _stores_none(_config(tests["unique"]))
+    # The aliased sibling is someone's and is left as written.
+    assert "&kept" in out and "*kept" in out
+    assert "config" not in tests["accepted_values"]["accepted_values"]

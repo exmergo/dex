@@ -393,11 +393,12 @@ def _refuse_incomplete(
         name.rpartition(".")[2] if kind == "column" else name, kind
     )
     limits = list(dict.fromkeys([*index.limits, *query_limits]))
-    if retirement and kind == "var":
-        # A var read is found by the Jinja scan, which read every one of these
-        # files; a column-parse limit bounds only the column reads the
-        # retirement checks itself, from compiled SQL, and reports as partial
-        # where it cannot (#1172). Every other limit still refuses.
+    if kind != "column":
+        # A model, var, macro, seed, snapshot or source is found by the Jinja
+        # scan, which read every one of these files; a column-parse limit
+        # bounds only column reads. A var retirement checks its column reads
+        # itself, from compiled SQL, and reports as partial where it cannot
+        # (#1172). Every other limit still refuses.
         column = {column_parse_limit(path) for path in index.column_unread}
         limits = [limit for limit in limits if limit not in column]
     if limits:

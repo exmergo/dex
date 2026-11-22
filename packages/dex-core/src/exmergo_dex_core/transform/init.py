@@ -240,6 +240,11 @@ def prepare_project(
         files = {
             rel: content for rel, content in files.items() if not (root / rel).exists()
         }
+        if (root / f"{project_prefix}dependencies.yml").is_file():
+            # The project moved its package list to dependencies.yml, and dbt
+            # refuses `packages:` declared in both files: never recreate
+            # packages.yml beside it.
+            files.pop(f"{project_prefix}packages.yml", None)
 
     config.connector = connector
     config.dbt_project_dir = project_dir

@@ -1670,6 +1670,18 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
     )
 
 
+NO_STORED_FAILURES: dict[str, Any] = {
+    "store_failures": False,
+    "store_failures_as": "ephemeral",
+}
+"""The config a test on a personal-data column carries (#1463). dbt applies
+``store_failures_as`` after the configs merge and lets it override
+``store_failures`` at every level, so a project's ``+store_failures_as: table``
+would store the failures despite ``store_failures: false``; the test's own
+``ephemeral`` is the more specific setting and wins. ``store_failures: false``
+stays for a dbt that predates ``store_failures_as``."""
+
+
 def _unsampled(
     name: str, *, claim: str | None = None, personal: bool = False, **body: Any
 ) -> dict[str, Any]:
@@ -1688,16 +1700,19 @@ def _unsampled(
     fact (one the scaffold or ``maintain reconcile`` adds) carries none.
 
     ``personal`` is for a column marked as personal data (#1463): the test also
-    carries ``store_failures: false``. The built-ins stay dbt's own, which every
-    tool reads by name, so a failure still returns the failing values; a test's
-    own config beats the project's ``store_failures`` and dbt's
-    ``--store-failures`` flag, so none of them is copied into an audit table.
+    carries :data:`NO_STORED_FAILURES`. The built-ins stay dbt's own, which
+    every tool reads by name, so a failure still returns the failing values. A
+    test's own ``store_failures`` beats the project's and dbt's
+    ``--store-failures`` flag, but not a ``store_failures_as`` set anywhere,
+    which dbt applies last; the test's own ``store_failures_as: ephemeral`` is
+    the most specific of those, so none of the values is copied into an audit
+    table.
     """
 
     meta: dict[str, Any] = {"disable_test_samples": True}
     if claim is not None:
         meta["dex"] = {CLAIM_KEY: claim}
-    config: dict[str, Any] = {"store_failures": False} if personal else {}
+    config: dict[str, Any] = dict(NO_STORED_FAILURES) if personal else {}
     return {name: {**body, "config": {**config, "meta": meta}}}
 
 
@@ -1728,8 +1743,8 @@ def generated_spec(
 
 def is_unsampled_render(test: Any, name: str) -> bool:
     """Whether a parsed test entry is exactly the test Dex renders as ``name``,
-    with or without a claim id, and with or without the ``store_failures:
-    false`` a column marked as personal data adds (#1463): the shape Dex may
+    with or without a claim id, and with or without the config that stores no
+    failures a column marked as personal data adds (#1463): the shape Dex may
     move, remove or claim."""
 
     unclaimed = without_claim(test)

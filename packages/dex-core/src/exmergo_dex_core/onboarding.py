@@ -798,9 +798,18 @@ def _store_install_plan(
     after the plan is applied. Every structural gate still runs.
     """
 
+    from .edits import content_hash
     from .engine import DexEngine
     from .transform import elementary_install as install
     from .transform.commands import plan
+
+    def _pin(path: Path) -> str | None:
+        """The hash apply holds a stored edit's file to, or ``None`` if absent."""
+
+        # Read as apply reads it, so the two hashes agree byte for byte.
+        if not path.is_file():
+            return None
+        return content_hash(path.read_text(encoding="utf-8"))
 
     edits = [
         e
@@ -824,6 +833,9 @@ def _store_install_plan(
                 and stored.intent == install.intent(project_dir)
                 and stored.project_dir == project_dir
                 and {(e.path, e.new_content) for e in stored.edits} == wanted
+                and all(
+                    _pin(project / e.path) == e.old_content_hash for e in stored.edits
+                )
             ):
                 return stored.plan_id, [
                     file_diff(e.path, _read(project / e.path), e.new_content)

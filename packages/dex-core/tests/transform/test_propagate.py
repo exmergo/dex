@@ -791,3 +791,35 @@ class TestYamlVarPropagation:
         assert "var(''dept_enabled'')" in edits["dbt_project.yml"]
         assert "using_department" not in edits["dbt_project.yml"]
         assert result.sites["var_call"] == 1
+
+
+class TestColumnParseLimit:
+    """A statement the column scan reads as an opaque command bounds column
+    reads only: a rename of anything else is still found by the Jinja scan."""
+
+    @pytest.fixture
+    def opaque(self, project: Path) -> Path:
+        # The opaque statement comes second: the scan has to read every one.
+        _write(
+            project / "models/marts/mart_c.sql",
+            "select order_id from {{ ref('int_orders') }};\n"
+            "CREATE POLICY p ON t USING (owner_id = current_user)\n",
+        )
+        return project
+
+    def test_a_later_opaque_statement_is_a_column_parse_limit(self, opaque: Path):
+        from exmergo_dex_core.references import ReferenceIndex, column_parse_limit
+
+        index = ReferenceIndex(load(opaque), scan_packages=False)
+
+        assert "models/marts/mart_c.sql" in index.column_unread
+        assert column_parse_limit("models/marts/mart_c.sql") in index.limits
+
+    def test_a_column_rename_is_still_refused(self, opaque: Path):
+        with pytest.raises(PropagationRefusedError, match="cannot promise"):
+            _propagate(opaque, "column", "stg_orders.order_id", "order_key")
+
+    def test_a_model_rename_is_not_blocked_by_it(self, opaque: Path):
+        result = _propagate(opaque, "model", "mart_b", "mart_bee")
+
+        assert "models/marts/mart_bee.sql" in {edit.path for edit in result.edits}

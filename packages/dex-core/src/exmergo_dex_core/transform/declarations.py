@@ -73,6 +73,7 @@ from .package_overrides import (
 from .package_targets import find_package_target
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
+    NO_STORED_FAILURES,
     RewriteError,
     _mapping,
     _pair_span,
@@ -2602,16 +2603,9 @@ def _compose(text: str) -> Any:
         ) from exc
 
 
-def _carries_anchor(root: Any, node: Any) -> bool:
-    """True when the subtree is aliased: used more than once.
-
-    PyYAML resolves an alias to the anchored node object itself, so a node
-    that appears more than once in the document is an aliased one: a restyle
-    re-renders the subtree from its parsed value, which would drop the
-    anchor and break a reference written elsewhere (#1203). Such a mapping
-    keeps refusing, with the reason named; an anchor that nothing aliases
-    does not, because no reference can break.
-    """
+def _visit_counts(root: Any) -> dict[int, int]:
+    """How many times each node of ``root`` is reached: more than once is an
+    aliased node."""
 
     counts: dict[int, int] = {}
 
@@ -2632,6 +2626,21 @@ def _carries_anchor(root: Any, node: Any) -> bool:
                 count(item, seen)
 
     count(root, set())
+    return counts
+
+
+def _carries_anchor(root: Any, node: Any) -> bool:
+    """True when the subtree is aliased: used more than once.
+
+    PyYAML resolves an alias to the anchored node object itself, so a node
+    that appears more than once in the document is an aliased one: a restyle
+    re-renders the subtree from its parsed value, which would drop the
+    anchor and break a reference written elsewhere (#1203). Such a mapping
+    keeps refusing, with the reason named; an anchor that nothing aliases
+    does not, because no reference can break.
+    """
+
+    counts = _visit_counts(root)
 
     def carries(current: Any, seen: set[int]) -> bool:
         if id(current) in seen:
@@ -2920,7 +2929,7 @@ def keep_no_failures_on_personal_columns(
                 if (
                     name not in _BUILTIN_TESTS
                     or claim_of(item) is None
-                    or not is_unsampled_render(item, name)
+                    or not is_unsampled_render(_without_generated_arguments(item), name)
                     or _keeps_no_failures(item)
                     or (earlier is not None and name in earlier.names)
                 ):
@@ -2984,32 +2993,65 @@ def _listed_tests(
     return out
 
 
+def _without_generated_arguments(test: Any) -> Any:
+    """A rendered ``relationships`` test without the ``arguments`` Dex wrote
+    for it (``to`` and ``field``, both text), so it compares with the
+    argument-free render. Any other argument shape is left in, and the test
+    then is not Dex's render."""
+
+    if not isinstance(test, Mapping) or len(test) != 1:
+        return test
+    [(name, body)] = test.items()
+    if name != "relationships" or not isinstance(body, Mapping):
+        return test
+    arguments = body.get("arguments")
+    if (
+        not isinstance(arguments, Mapping)
+        or set(arguments) != {"to", "field"}
+        or not all(isinstance(value, str) for value in arguments.values())
+    ):
+        return test
+    return {name: {key: value for key, value in body.items() if key != "arguments"}}
+
+
 def _keeps_no_failures(test: Any) -> bool:
     if not isinstance(test, Mapping) or len(test) != 1:
         return False
     body = next(iter(test.values()))
     config = body.get("config") if isinstance(body, Mapping) else None
-    return isinstance(config, Mapping) and config.get("store_failures") is False
+    return isinstance(config, Mapping) and all(
+        config.get(key) == value for key, value in NO_STORED_FAILURES.items()
+    )
 
 
 def _keep_no_failures(text: str, locate: Any, index: int) -> str:
-    """``text`` with ``store_failures: false`` first in the config of the
-    located column's ``index``-th test. A test whose YAML is aliased elsewhere
-    is left as it is: the key would reach the other test through the alias."""
+    """``text`` with the keys that store no failures (``store_failures: false``
+    and ``store_failures_as: ephemeral``) first in the config of the located
+    column's ``index``-th test. A test whose YAML is shared with another
+    (aliased itself, or reached through an aliased column entry or list) is
+    left as it is: the keys would reach the other test through the alias. An
+    alias on a sibling test does not stop it."""
 
     root = _compose(text)
-    found = _child(locate(root), "data_tests") or _child(locate(root), "tests")
+    entry = locate(root)
+    found = _child(entry, "data_tests") or _child(entry, "tests")
     if found is None or not isinstance(found[1], yaml.SequenceNode):
         return text
     listed = found[1]
-    if index >= len(listed.value) or _carries_anchor(root, listed):
+    if index >= len(listed.value):
         return text
     item = listed.value[index]
+    counts = _visit_counts(root)
+    if any(counts.get(id(node), 0) > 1 for node in (entry, listed)) or _carries_anchor(
+        root, item
+    ):
+        return text
     if not isinstance(item, yaml.MappingNode) or len(item.value) != 1:
         return text
     [(name, body)] = _node_value(item).items()
     config = dict(body.get("config") or {})
-    hardened = {name: {**body, "config": {"store_failures": False, **config}}}
+    missing = {k: v for k, v in NO_STORED_FAILURES.items() if k not in config}
+    hardened = {name: {**body, "config": {**missing, **config}}}
     [(_name_node, body_node)] = item.value
     if listed.flow_style or item.flow_style:
         return splice(text, [(*_span(item), _flow(hardened))])
@@ -3026,7 +3068,10 @@ def _keep_no_failures(text: str, locate: Any, index: int) -> str:
     if text[line_start : first.start_mark.index].strip():
         return text
     indent = " " * first.start_mark.column
-    return splice(text, [(line_start, line_start, f"{indent}store_failures: false\n")])
+    lines = "".join(
+        f"{indent}{key}: {json.dumps(value)}\n" for key, value in missing.items()
+    )
+    return splice(text, [(line_start, line_start, lines)])
 
 
 def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:

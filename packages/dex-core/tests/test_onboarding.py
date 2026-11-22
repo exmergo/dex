@@ -805,3 +805,50 @@ def test_an_install_plan_for_one_project_is_not_reused_for_another(
     )
     plans = [json.loads(p.read_text()) for p in _plans(tmp_path)]
     assert sorted(p["project_dir"] for p in plans) == ["one", "two"]
+
+
+def test_recovery_does_not_recreate_packages_yml_beside_dependencies_yml(
+    tmp_path, capsys, duckdb_file
+):
+    code, result = run(
+        tmp_path,
+        capsys,
+        "analytics",
+        "--mode",
+        "new",
+        "--connector",
+        "duckdb",
+        "--path",
+        str(duckdb_file),
+    )
+    assert code == 0, result
+    # The project moved its package list: dbt refuses `packages:` in both.
+    (tmp_path / "analytics/packages.yml").rename(
+        tmp_path / "analytics/dependencies.yml"
+    )
+    code, result = run(tmp_path, capsys)
+    assert code == 0, result
+    assert not (tmp_path / "analytics/packages.yml").exists()
+    assert "packages" in yaml.safe_load(
+        (tmp_path / "analytics/dependencies.yml").read_text()
+    )
+
+
+def test_an_install_plan_pinned_to_an_older_file_is_not_reused(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(tmp_path, duckdb_file)
+    project = tmp_path / "dbt_project.yml"
+    project.write_text(project.read_text() + "vars:\n  test_sample_row_count: 1\n")
+    code, first = run(tmp_path, capsys)
+    assert code == 0, first
+    # Both versions of the file propose the same `0`, but the stored plan's
+    # pin is the earlier file, which apply would refuse.
+    project.write_text(project.read_text().replace("count: 1", "count: 2"))
+    code, again = run(tmp_path, capsys)
+    assert code == 0, again
+    plan_id = again["data"]["elementary"]["plan_id"]
+    assert plan_id != first["data"]["elementary"]["plan_id"]
+    assert main(["--repo-root", str(tmp_path), "transform", "apply", plan_id]) == 0
+    capsys.readouterr()
+    assert yaml.safe_load(project.read_text())["vars"]["test_sample_row_count"] == 0

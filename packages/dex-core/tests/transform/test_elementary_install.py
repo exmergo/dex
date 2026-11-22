@@ -210,3 +210,28 @@ def test_detect_reads_a_local_declaration_of_the_package(tmp_path):
         )
     )
     assert report["declared"] and report["source"] == "local"
+
+
+def test_a_flow_list_inside_the_last_entry_keeps_its_closing_bracket():
+    text = (
+        "packages:\n"
+        "  - package: dbt-labs/dbt_utils\n"
+        "    version: [\n"
+        '      ">=1.0.0",\n'
+        '      "<2.0.0"\n'
+        "    ]\n"
+    )
+    packages, _ = install.install_texts(text, "packages.yml", "name: a\n", "dev")
+    assert yaml.safe_load(packages)["packages"] == [
+        {"package": "dbt-labs/dbt_utils", "version": [">=1.0.0", "<2.0.0"]},
+        {"package": install.HUB_PACKAGE, "version": CURRENT_VERSION},
+    ]
+
+
+def test_set_nested_does_not_skip_the_line_after_a_block_scalar():
+    text = "vars:\n  note: |\n    text\nmodels:\n  app:\n    +materialized: view\n"
+    out = set_nested(text, ["vars", "test_sample_row_count"], 0)
+    assert yaml.safe_load(out) == {
+        "vars": {"note": "text\n", "test_sample_row_count": 0},
+        "models": {"app": {"+materialized": "view"}},
+    }
