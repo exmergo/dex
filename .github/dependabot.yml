@@ -25,9 +25,10 @@ updates:
           - "*"
 
   # The engine's Python dependencies (#795), read from packages/dex-core's
-  # pyproject.toml and uv.lock. Weekly, and never a major: a major is a
-  # migration (DuckDB 2.0 changed the relation API, #797) and gets its own
-  # issue rather than an automatic pull request.
+  # pyproject.toml and uv.lock. Weekly majors are migration proposals, held
+  # apart from routine updates so a new release is visible before migration.
+  # Only direct dependencies are updated: adapter-bounded transitive majors
+  # must move with their owning adapter, not in independent proposals.
   #
   # Grouped by what has to move together rather than one PR per package. The
   # dbt stack is coupled through its adapters (dbt-databricks bounds dbt-core,
@@ -35,13 +36,14 @@ updates:
   # alone resolves to nothing or to an untested combination. Developer tools
   # are separate so a formatter bump never rides in with a runtime change.
   # Bounds dex holds deliberately (sqlglot <31, duckdb <3, the Snowflake
-  # connector <5, MetricFlow's single minor) still bind: Dependabot proposes lock
-  # updates inside them and a range change only when a ceiling is widened by hand.
+  # connector <5, MetricFlow's single minor) are widened in a proposal when
+  # necessary, with CI and maintainer review deciding whether it can land.
   #
-  # Every PR here is `no-changelog`: exmergo-dex-core is a library, so users
+  # Lock-only PRs need no changelog: exmergo-dex-core is a library, so users
   # resolve from pyproject.toml's ranges, never from uv.lock, and a lock-only
   # bump changes what CI runs and nothing a user installs. A bump that moves a
-  # user-facing pin (motley-slayer, below) gets its fragment when it is migrated.
+  # user-facing range or pin gets its fragment and loses the no-changelog label
+  # when it is migrated, including proposals in the majors group.
   # Without the label every PR here failed the changelog check until a
   # maintainer added it by hand.
   - package-ecosystem: "uv"
@@ -53,17 +55,25 @@ updates:
       - "no-changelog"
     cooldown:
       default-days: 3
-      semver-major-days: 14
-    ignore:
-      - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
+      semver-major-days: 0
+    allow:
+      - dependency-type: "direct"
+    versioning-strategy: "increase-if-necessary"
     groups:
+      majors:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "ruff"
+          - "towncrier"
+          - "pytest"
+        update-types: ["major"]
       # motley-slayer is one exact release, held equal to SLAYER_VERSION by a
       # test, so its PR fails CI on purpose: it is the weekly notice that a
       # migration is due (format version, goldens, schema_drift entry points),
       # never a routine merge. It used to be ignored outright, and the pin fell
       # six minors behind in a month (1.2.0 to 1.8.2) before anyone noticed.
-      # First, because a dependency joins the first group that matches it.
+      # Non-major updates stay here; majors join the migration group above.
       slayer:
         patterns:
           - "motley-slayer"
