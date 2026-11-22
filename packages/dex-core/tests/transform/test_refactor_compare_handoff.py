@@ -177,6 +177,13 @@ def test_the_offer_names_the_expect_key_value_not_holds(accounts):
     intended = planned.data()["refactor_comparison_offer"]["intended_change"]
     assert '"key": "unchanged"' in intended
     assert "that the key holds" not in intended
+    # The new guidance itself, not only the example that already contained
+    # `"key": "unchanged"`: removing the guidance line must fail this test.
+    assert (
+        '"key": "unchanged" (or "any" when the key may stop being unique)'
+        in intended
+    )
+    assert '"added": "none"|"any"|{"where": "<predicate>"}' in intended
 
 
 def test_the_inner_join_extraction_is_different_and_recorded(accounts):
