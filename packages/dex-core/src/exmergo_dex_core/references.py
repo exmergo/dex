@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import logging
 from collections import defaultdict, deque
 from io import StringIO
 from pathlib import Path
@@ -1155,12 +1156,21 @@ class ReferenceIndex:
             return
 
         blanked = blank_jinja(content)
+        # sqlglot logs a warning for each statement it falls back to parsing as
+        # a bare command (an installed package's grant or user-creation macro,
+        # say), and that warning would reach stderr once per file scanned.
+        # A statement it cannot read is already accounted for below.
+        quiet = logging.getLogger("sqlglot")
+        level = quiet.level
+        quiet.setLevel(logging.ERROR)
         try:
             parsed = sqlglot.parse_one(blanked)
         except Exception:
             self.limits.append(column_parse_limit(path))
             self.column_unread.append(path)
             return
+        finally:
+            quiet.setLevel(level)
         if parsed is None:
             return
 

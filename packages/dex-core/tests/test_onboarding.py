@@ -445,12 +445,19 @@ def test_tty_adoption_from_relative_root(tmp_path, capsys, monkeypatch, duckdb_f
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
-    monkeypatch.setattr(
-        "builtins.input", lambda: pytest.fail("adoption reprompted for a known path")
-    )
-    code, result = run(".", capsys)
+    answers = iter(["no"])
+    monkeypatch.setattr("builtins.input", lambda: next(answers))
+    code = main(["--repo-root", ".", "init"])
+    output = capsys.readouterr()
+    result = json.loads(output.out)
     assert code == 0, result
     assert result["data"]["mode"] == "adopt"
+    # The one question an adoption asks for a known path is the Elementary
+    # install (#1464); declining it stores no plan.
+    assert output.err.count("(yes/no)") == 1
+    assert "Elementary package" in output.err
+    assert result["data"]["elementary"]["install"] == "declined"
+    assert not list((tmp_path / ".dex").glob("plans/*"))
 
 
 def test_discovery_resolves_a_symlinked_root(tmp_path, symlinks):
@@ -497,3 +504,227 @@ def test_invalid_existing_project_metadata_is_actionable_before_writes(
     assert "dbt_project.yml" in result["errors"][0]
     assert not (tmp_path / ".dex/config.yml").exists()
     assert not (tmp_path / "README.md").exists()
+
+
+# --- the Elementary install (#1464) --------------------------------------------
+
+
+def _adoptable(root, duckdb_file, *, packages=None, installed=None):
+    (root / "dbt_project.yml").write_text(
+        "name: authored\nprofile: authored\n# kept as written\n"
+    )
+    (root / "profiles.yml").write_text(
+        yaml.safe_dump(
+            {
+                "authored": {
+                    "target": "dev",
+                    "outputs": {"dev": {"type": "duckdb", "path": str(duckdb_file)}},
+                }
+            }
+        )
+    )
+    if packages is not None:
+        (root / "packages.yml").write_text(packages)
+    if installed is not None:
+        package = root / "dbt_packages/elementary"
+        package.mkdir(parents=True)
+        (package / "dbt_project.yml").write_text(
+            f"name: elementary\nversion: {installed}\n"
+        )
+
+
+def _plans(root):
+    return sorted((root / ".dex/plans").glob("*.json"))
+
+
+@pytest.mark.parametrize("mode", ["new", "demo"])
+def test_a_new_project_declares_elementary_in_its_own_diff(
+    tmp_path, capsys, duckdb_file, mode
+):
+    from exmergo_dex_core.transform.elementary_install import INSTALL_RELEASE
+
+    args = ["analytics", "--mode", mode]
+    if mode == "new":
+        args += ["--connector", "duckdb", "--path", str(duckdb_file)]
+    code, result = run(tmp_path, capsys, *args)
+    assert code == 0, result
+    packages = yaml.safe_load((tmp_path / "analytics/packages.yml").read_text())
+    assert packages == {
+        "packages": [
+            {"package": "elementary-data/elementary", "version": INSTALL_RELEASE}
+        ]
+    }
+    project = yaml.safe_load((tmp_path / "analytics/dbt_project.yml").read_text())
+    assert project["models"]["elementary"] == {
+        "+schema": "elementary",
+        "+enabled": "{{ target.name != 'dev' }}",
+    }
+    assert project["vars"] == {"test_sample_row_count": 0}
+    assert {d["path"] for d in result["diffs"]} >= {
+        "analytics/packages.yml",
+        "analytics/dbt_project.yml",
+    }
+    elementary = result["data"]["elementary"]
+    assert elementary["install"] == "written"
+    assert elementary["declared"] and not elementary["installed"]
+    commands = [step["command"] for step in result["data"]["next_steps"]]
+    assert "dex transform deps" in commands
+    assert "dbt run --select elementary --target <production target>" in commands
+    assert not _plans(tmp_path)
+    # A resumed setup reproduces the choice rather than revisiting it.
+    assert json.loads((tmp_path / ".dex/setup.json").read_text())["elementary"]
+
+
+def test_no_elementary_leaves_a_new_project_without_the_package(
+    tmp_path, capsys, duckdb_file
+):
+    code, result = run(
+        tmp_path,
+        capsys,
+        "analytics",
+        "--mode",
+        "new",
+        "--connector",
+        "duckdb",
+        "--path",
+        str(duckdb_file),
+        "--no-elementary",
+    )
+    assert code == 0, result
+    assert not (tmp_path / "analytics/packages.yml").exists()
+    project = yaml.safe_load((tmp_path / "analytics/dbt_project.yml").read_text())
+    assert "models" not in project and "vars" not in project
+    assert result["data"]["elementary"]["install"] == "declined"
+    assert not any(
+        "elementary" in step["command"] for step in result["data"]["next_steps"]
+    )
+
+
+def test_adopting_a_project_without_elementary_stores_the_install_plan(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(tmp_path, duckdb_file)
+    before = (tmp_path / "dbt_project.yml").read_text()
+    code, result = run(tmp_path, capsys)
+    assert code == 0, result
+    elementary = result["data"]["elementary"]
+    assert elementary["declared"] is False and elementary["installed"] is False
+    assert elementary["install"] == "planned"
+    assert [d["path"] for d in elementary["plan_diffs"]] == [
+        "packages.yml",
+        "dbt_project.yml",
+    ]
+    # Init changed neither file; the plan holds them.
+    assert (tmp_path / "dbt_project.yml").read_text() == before
+    assert not (tmp_path / "packages.yml").exists()
+    [stored] = _plans(tmp_path)
+    plan = json.loads(stored.read_text())
+    assert plan["plan_id"] == elementary["plan_id"]
+    assert [(e["path"], e["kind"]) for e in plan["edits"]] == [
+        ("packages.yml", "packages_yml"),
+        ("dbt_project.yml", "project_yml"),
+    ]
+    commands = [step["command"] for step in result["data"]["next_steps"]]
+    assert f"dex transform apply {elementary['plan_id']}" in commands
+
+    # A second init finds the plan it stored rather than storing another.
+    code, again = run(tmp_path, capsys)
+    assert code == 0, again
+    assert again["data"]["elementary"]["plan_id"] == elementary["plan_id"]
+    assert len(again["data"]["elementary"]["plan_diffs"]) == 2
+    assert len(_plans(tmp_path)) == 1
+
+    # The plan is one that changes what runs.
+    code = main(
+        ["--repo-root", str(tmp_path), "transform", "classify", elementary["plan_id"]]
+    )
+    classified = json.loads(capsys.readouterr().out)
+    assert code == 0, classified
+    by_path = {c["path"]: c for c in classified["data"]["classifications"]}
+    assert by_path["packages.yml"]["artifact_class"] == "executable"
+    assert [s["signal"] for s in by_path["packages.yml"]["signals"]] == [
+        "dependency_hub"
+    ]
+
+    # Applied, the project declares the package and keeps what was written.
+    code = main(
+        ["--repo-root", str(tmp_path), "transform", "apply", elementary["plan_id"]]
+    )
+    applied = json.loads(capsys.readouterr().out)
+    assert code == 0, applied
+    assert "# kept as written" in (tmp_path / "dbt_project.yml").read_text()
+    code, after = run(tmp_path, capsys)
+    assert code == 0, after
+    assert after["data"]["elementary"]["install"] == "present"
+    assert after["data"]["elementary"]["declared"] is True
+    assert "dex transform deps" in [
+        step["command"] for step in after["data"]["next_steps"]
+    ]
+
+
+def test_declining_on_an_existing_project_stores_no_plan(tmp_path, capsys, duckdb_file):
+    _adoptable(tmp_path, duckdb_file)
+    code, result = run(tmp_path, capsys, "--no-elementary")
+    assert code == 0, result
+    assert result["data"]["elementary"]["install"] == "declined"
+    assert result["data"]["elementary"]["plan_id"] is None
+    assert not _plans(tmp_path)
+    assert any(
+        step["command"] == "dex init" and "--no-elementary" in step["purpose"]
+        for step in result["data"]["next_steps"]
+    )
+
+
+def test_a_project_with_elementary_installed_reports_its_release(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(
+        tmp_path,
+        duckdb_file,
+        packages="packages:\n  - package: elementary-data/elementary\n"
+        "    version: 0.23.0\n",
+        installed="0.23.0",
+    )
+    code, result = run(tmp_path, capsys)
+    assert code == 0, result
+    elementary = result["data"]["elementary"]
+    assert elementary["install"] == "present"
+    assert elementary["installed"] is True
+    assert elementary["release"] == "0.23.0"
+    assert not _plans(tmp_path)
+    assert not any(
+        "elementary" in step["command"] or step["command"] == "dex transform deps"
+        for step in result["data"]["next_steps"]
+    )
+
+
+def test_an_unwritable_packages_file_offers_nothing_and_says_why(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(
+        tmp_path,
+        duckdb_file,
+        packages="packages: [{package: dbt-labs/dbt_utils, version: 1.3.0}]\n",
+    )
+    code, result = run(tmp_path, capsys)
+    assert code == 0, result
+    elementary = result["data"]["elementary"]
+    assert elementary["install"] == "not_offered"
+    assert "by hand" in elementary["reason"]
+    assert not _plans(tmp_path)
+
+
+def test_the_production_steps_name_the_configured_production_target(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(tmp_path, duckdb_file)
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex/config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {duckdb_file}\ndbt_prod_target: prod\n"
+    )
+    code, result = run(tmp_path, capsys, "--confirm")
+    assert code == 0, result
+    assert result["data"]["elementary"]["install"] == "planned"
+    assert "dbt run --select elementary --target prod" in [
+        step["command"] for step in result["data"]["next_steps"]
+    ]

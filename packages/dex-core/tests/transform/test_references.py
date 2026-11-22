@@ -1234,3 +1234,20 @@ def test_single_quoted_yaml_scalar_with_doubled_quotes_resolves_var(tmp_path):
 
     report = find_references(view, ["schema_suffix"], kind="var", index=index)
     assert report.completeness == "incomplete"
+
+
+def test_a_package_statement_sqlglot_cannot_read_logs_nothing(project, caplog):
+    """An installed package's grant or user-creation macro (Elementary ships
+    Snowflake ones) is parsed as a bare command, and sqlglot's warning for
+    that must not reach stderr once per file the index scans."""
+
+    import logging
+
+    _write(
+        project / "dbt_packages" / "utils" / "macros" / "grants.sql",
+        "CREATE OR REPLACE ROLE IDENTIFIER($role)\n",
+    )
+    with caplog.at_level(logging.WARNING, logger="sqlglot"):
+        ReferenceIndex(load(project))
+    assert not [r for r in caplog.records if r.name.startswith("sqlglot")]
+    assert logging.getLogger("sqlglot").level == logging.NOTSET

@@ -693,6 +693,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "layered_schemas": "layered_schemas",
             "in_place": "in_place",
             "no_interactive": _TRANSLATED,
+            "no_elementary": _TRANSLATED,
         },
     },
     ("connect", "test"): {"method": "connect_test", "args": {}},

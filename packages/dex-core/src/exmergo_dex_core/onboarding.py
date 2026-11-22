@@ -61,6 +61,9 @@ class SetupResult(Result):
     problems: list[str] = Field(default_factory=list)
     connection: dict[str, Any] = Field(default_factory=dict)
     failure_reason: env.Reason | None = None
+    # The Elementary package on the selected project (#1464): what it declares
+    # and installs, and what init did about it. None with no dbt project.
+    elementary: dict[str, Any] | None = None
 
     def data(self) -> dict[str, Any]:
         return self.model_dump(
@@ -254,7 +257,15 @@ def initialize(
     no_agent_instructions: bool = False,
     layered_schemas: bool = False,
     in_place: bool = False,
+    elementary: bool | None = None,
 ) -> SetupResult:
+    """Set up Dex in the repository (see the module docstring).
+
+    ``elementary`` decides the Elementary install (#1464): ``None`` offers it,
+    declared in a project init creates and as a stored ``transform`` plan in one
+    it adopts; ``False`` (``--no-elementary``) leaves both out.
+    """
+
     require_allowed(engine.result_mode, "init")
     from .transform.init import VALID_CONNECTORS, prepare_project, sanitize_project_name
 
@@ -408,6 +419,7 @@ def initialize(
             resume=True,
             in_place=selected == ".",
             layered_schemas=state.get("layered_schemas", False),
+            elementary=state.get("elementary", False) is True,
         )
         recovered = {
             key: value
@@ -480,6 +492,13 @@ def initialize(
     config = DexConfig.model_validate(raw)
     files: dict[str, str] = dict(recovered)
     fresh = mode in {"new", "demo"} and not facts["projects"]
+    # A project init creates declares the package unless declined. A setup
+    # resumed from a record written before the choice existed keeps without it.
+    fresh_elementary = (
+        elementary
+        if elementary is not None
+        else state.get("elementary", not state) is True
+    )
     if fresh:
         project_name = name or state.get("project_name") or root.name
         scaffold = prepare_project(
@@ -492,6 +511,7 @@ def initialize(
             project=engine.project,
             config=config,
             resume=bool(state),
+            elementary=fresh_elementary,
         )
         files.update(scaffold.files)
         config = scaffold.config
@@ -530,6 +550,10 @@ def initialize(
         "layered_schemas": layered_schemas or state.get("layered_schemas", False),
         "agent_files": chosen_agents,
     }
+    if fresh:
+        state_data["elementary"] = fresh_elementary
+    elif "elementary" in state:
+        state_data["elementary"] = state["elementary"]
     files[STATE] = json.dumps(state_data, indent=2) + "\n"
     if (
         before is not None
@@ -589,6 +613,15 @@ def initialize(
             else "explicit follow-up: explore the configured source scope",
         }
     ]
+    if result.project_dir is not None:
+        _elementary(
+            engine,
+            config,
+            root,
+            result,
+            created=fresh,
+            wanted=fresh_elementary if fresh else elementary is not False,
+        )
     if result.problems:
         result.next_steps.insert(
             0,
@@ -643,6 +676,152 @@ def initialize(
     else:
         _write(root, "README.md", readme, result)
     return result
+
+
+def _elementary(
+    engine: DexEngine,
+    config: DexConfig,
+    root: Path,
+    result: SetupResult,
+    *,
+    created: bool,
+    wanted: bool,
+) -> None:
+    """Report the Elementary package on the selected project, and offer it.
+
+    A project init created already holds the install in its own diff when it
+    was wanted. A project it adopted gets the two edits as a stored
+    ``transform`` plan, through the path every ``transform`` command stores
+    plans by, and is never changed by init itself. One that already declares
+    the package gets its release reported and nothing offered.
+    """
+
+    from .transform import elementary_install as install
+
+    project = root / str(result.project_dir)
+    dev_target = config.dbt_target or "dev"
+    report: dict[str, Any] = install.detect(project) | {
+        "dev_target": dev_target,
+        "install": "not_offered",
+        "plan_id": None,
+    }
+    result.elementary = report
+    steps: list[dict[str, str]] = []
+    production = install.production_steps(getattr(config, "dbt_prod_target", None))
+    if created:
+        report["install"] = "written" if wanted else "declined"
+        if wanted:
+            report["release_pinned"] = install.INSTALL_RELEASE
+            steps = [
+                {
+                    "command": "dex transform deps",
+                    "purpose": (
+                        "install the declared dbt packages, the Elementary package "
+                        "included (reaches the dbt package hub); dbt cannot parse "
+                        "the project until it runs"
+                    ),
+                },
+                *production,
+            ]
+    elif report["declared"]:
+        report["install"] = "present"
+        if not report["installed"]:
+            steps = [
+                {
+                    "command": "dex transform deps",
+                    "purpose": (
+                        "install the declared dbt packages: the project declares "
+                        "the Elementary package and it is not installed"
+                    ),
+                }
+            ]
+    elif not wanted:
+        report["install"] = "declined"
+        steps = [
+            {
+                "command": "dex init",
+                "purpose": (
+                    "run again without --no-elementary to store a plan that "
+                    "installs the Elementary package"
+                ),
+            }
+        ]
+    else:
+        try:
+            plan_id, diffs = _store_install_plan(
+                engine, config, root, project, dev_target
+            )
+        except Exception as exc:
+            report["reason"] = env.redact(str(exc))
+        else:
+            report.update(
+                install="planned",
+                plan_id=plan_id,
+                release_pinned=install.INSTALL_RELEASE,
+                plan_diffs=diffs,
+            )
+            steps = [
+                {
+                    "command": f"dex transform apply {plan_id}",
+                    "purpose": (
+                        "review the stored plan (packages and dbt_project.yml), "
+                        "then apply it to install the Elementary package; init "
+                        "changed neither file"
+                    ),
+                },
+                {
+                    "command": "dex transform deps",
+                    "purpose": (
+                        "after applying: install the package (reaches the dbt "
+                        "package hub); dbt cannot parse the project until it runs"
+                    ),
+                },
+                *production,
+            ]
+    result.next_steps.extend(steps)
+
+
+def _store_install_plan(
+    engine: DexEngine,
+    config: DexConfig,
+    root: Path,
+    project: Path,
+    dev_target: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Store the install as a ``transform`` plan, or find the one stored before.
+
+    Stored without dbt's parse: dbt refuses to parse a project declaring a
+    package that is not installed, and installing is ``transform deps``'s to do
+    after the plan is applied. Every structural gate still runs.
+    """
+
+    from .engine import DexEngine
+    from .transform import elementary_install as install
+    from .transform.commands import plan
+
+    edits = install.install_edits(project, dev_target)
+    wanted = {(e.path, e.new_content) for e in edits}
+    with DexEngine(
+        config=config,
+        store=engine.store,
+        repo_root=root,
+        connection=engine.connection,
+        session_ceiling_cap=engine.session_ceiling_cap,
+    ) as check:
+        for stored in check.store.list_plans():
+            if (
+                stored.applied_at is None
+                and stored.intent == install.INTENT
+                and {(e.path, e.new_content) for e in stored.edits} == wanted
+            ):
+                return stored.plan_id, [
+                    file_diff(e.path, _read(project / e.path), e.new_content)
+                    for e in stored.edits
+                ]
+        planned = plan(
+            check, install.INTENT, edits=edits, attribute_rows=False, no_parse=True
+        )
+    return str(planned.plan_id), list(planned.diffs)
 
 
 def _project_name(project: Path) -> str:
