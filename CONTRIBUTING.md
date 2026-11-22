@@ -572,7 +572,19 @@ DEX_TEST_ELEMENTARY=1 \
 
 The seed gives the `dbt_dev` role a second schema, `dbt_dev_elementary`, for the
 package's models, so re-run the setup script on a container seeded before it
-existed. No CI job sets `DEX_TEST_ELEMENTARY`, so neither file runs there.
+existed.
+
+In CI both files run in the integration workflow
+(`.github/workflows/integration.yml`): on a push to `main` that matches the
+workflow's `paths` filter (any change under `packages/dex-core/`, for one), on the
+weekly schedule and on a manual dispatch, never on a pull request, since
+installing the package needs the network. The Postgres file runs in its own step
+of the `postgres` job and the DuckDB file in the `elementary_duckdb` job, each
+with `DEX_TEST_ELEMENTARY=1` on that step. Because a skip counts as a pass, each
+step then runs `scripts/check_no_skips.py` over the JUnit report pytest wrote,
+which fails the step on any skipped case (an expected failure, `xfail`,
+included) or an empty run, so a dropped variable fails rather than reading as
+green.
 
 ## Agent evals (`evals/`)
 
