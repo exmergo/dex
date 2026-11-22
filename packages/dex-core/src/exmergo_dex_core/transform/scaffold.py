@@ -699,7 +699,10 @@ def _model_yaml(dataset: Dataset) -> str:
             tests = ["not_null"]
         if tests:
             rendered = [
-                yaml.safe_dump(_unsampled(name), default_flow_style=True).strip()
+                yaml.safe_dump(
+                    _unsampled(name, personal=column.pii is not None),
+                    default_flow_style=True,
+                ).strip()
                 for name in tests
             ]
             lines.append(f"        data_tests: [{', '.join(rendered)}]")

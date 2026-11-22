@@ -117,6 +117,7 @@ def prepare_project(
     project: str | None = None,
     config: DexConfig | None = None,
     resume: bool = False,
+    elementary: bool = False,
 ) -> ProjectScaffold:
     """Render a fresh dbt project skeleton and record the choices in config.
 
@@ -135,6 +136,12 @@ def prepare_project(
     ``project`` is the explicit BigQuery project (the CLI's ``--project``). It
     wins over a configured or discovered one, and both the rendered profile and
     the saved config carry it, so the choice is stated once and stays ambient.
+
+    ``elementary`` also declares the Elementary package in ``packages.yml`` and
+    configures it in ``dbt_project.yml``, disabled on the ``dev`` target, so the
+    install shows in the scaffold's own diff (#1464, see
+    :mod:`.elementary_install`). ``dex init`` asks for it; ``transform init``
+    does not.
     """
 
     root = Path(repo_root)
@@ -198,14 +205,22 @@ def prepare_project(
         raise InitError(str(exc)) from exc
     profiles_text = render_profile(project_name, path, config, root, project_dir)
 
+    project_text = _project_yaml(project_name, layered_schemas=layered_schemas)
+    packages_text: str | None = None
+    if elementary:
+        from .elementary_install import install_texts
+
+        packages_text, project_text = install_texts(
+            None, "packages.yml", project_text, "dev"
+        )
     files: dict[str, str] = {
-        f"{project_prefix}{PROJECT_FILE}": _project_yaml(
-            project_name, layered_schemas=layered_schemas
-        ),
+        f"{project_prefix}{PROJECT_FILE}": project_text,
         f"{project_prefix}{PROFILES_FILE}": profiles_text,
         f"{project_prefix}models/staging/.gitkeep": "",
         f"{project_prefix}models/marts/.gitkeep": "",
     }
+    if packages_text is not None:
+        files[f"{project_prefix}packages.yml"] = packages_text
     if layered_schemas:
         from .scaffold import macro_edit
 
@@ -225,6 +240,11 @@ def prepare_project(
         files = {
             rel: content for rel, content in files.items() if not (root / rel).exists()
         }
+        if (root / f"{project_prefix}dependencies.yml").is_file():
+            # The project moved its package list to dependencies.yml, and dbt
+            # refuses `packages:` declared in both files: never recreate
+            # packages.yml beside it.
+            files.pop(f"{project_prefix}packages.yml", None)
 
     config.connector = connector
     config.dbt_project_dir = project_dir

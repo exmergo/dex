@@ -903,6 +903,7 @@ def _declare(
     drafts, draft_warnings = _draft(engine, view, edits, [d.model for d in parsed])
     warnings.extend(draft_warnings)
     edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
+    edits = declarations_mod.keep_no_failures_on_personal_columns(view, edits)
     return (
         edits,
         warnings,

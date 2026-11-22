@@ -278,6 +278,28 @@ dex init [<name>]                -> complete project setup: new dbt-backed Dex p
                                      runs builds, or chooses budgets during setup.
                                      data.readiness separates configuration, connection,
                                      build_prerequisites, and build (unchecked).
+                                     data.elementary reports the Elementary package on
+                                     the selected project (declared, declared_in,
+                                     declared_version, source, installed, release, read
+                                     from the repository with no dbt parse) and `install`:
+                                     `written` (a project init creates declares it in
+                                     packages.yml and configures it in dbt_project.yml,
+                                     in its own diff), `planned` (a project init adopts
+                                     gets the same two edits as a stored transform plan,
+                                     plan_id and plan_diffs, never written by init; a
+                                     rerun reports the same unapplied plan), `present`
+                                     (already declared: its release, nothing offered),
+                                     `declined` (--no-elementary, or "no" to the TTY
+                                     question) or `not_offered` (a file written in a form
+                                     an in-place edit would reformat, with the reason).
+                                     The install pins elementary-data/elementary 0.26.1,
+                                     sets models.elementary +schema: elementary and
+                                     +enabled: "{{ target.name != '<dev target>' }}" (so
+                                     a dev build runs none of its models or hooks) and
+                                     vars.test_sample_row_count: 0. next_steps add
+                                     `dex transform deps` and, as the user's to run,
+                                     `dbt deps` and `dbt run --select elementary --target
+                                     <dbt_prod_target>` on production (#1464).
 dex transform init "<name>"       -> legacy bootstrap of a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their

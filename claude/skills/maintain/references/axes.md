@@ -408,10 +408,19 @@ Needs no baseline. The classes of finding:
     checked, and what stayed unchecked apart. `no_history_observed` and every
     `unchecked` reason are not clean: see the transform skill's `declarations.md`,
     "Temporal contracts".
+  - `freshness_exceeded` (high on a `capture` basis, medium on `business`), for
+    a time column declaring `freshness` (#1460): its newest value trails the
+    warehouse's clock by more than `max_lag`, read in one statement as whole
+    epoch seconds, or it holds no value at all (`reason: no_rows` or
+    `all_null`), since no rows is not fresh. Each declared freshness has a
+    record under `data.freshness` (`satisfied`, `contradicted`, or `unchecked`
+    with `not_temporal`, `column_missing`, `probe_refused` or `scan_offered`).
+    A `business` time can be legitimately old after a quiet period or a
+    backfill, which the finding says; a `capture` time cannot.
 
   `null_rule: never` is not checked here: it renders as a `not_null` test.
   `data.suppressed` names `unit`, `additivity`, `population`,
-  `parent_population` and `temporal` whenever one
+  `parent_population`, `temporal` and `freshness` whenever one
   did not run: nothing declares it, the relation is empty, the column is all
   NULL or aggregated away, too few observations to call, or the scan is
   offered.
@@ -576,8 +585,8 @@ one coverage number.
 - **Declarations.** `data.declarations.facts` holds one record per declared fact
   on the selected models: `fact` (`grain`, `key`, `foreign_key`, `references`,
   `null_rule`, `population_filter`, `population_parent`, `population_rule`,
-  `unit`, `additivity`, `history`), `column`, and `checked_by`: `dbt_test` (the
-  generic `tests` that assert it run on every `dbt build`), `dex_verify` (the
+  `unit`, `additivity`, `history`, `freshness`, `continuity`), `column`, and
+  `checked_by`: `dbt_test` (the generic `tests` that assert it run on every `dbt build`), `dex_verify` (the
   `verify` finding codes that can judge it on `maintain verify` or
   `transform build --verify`; that verify *can* judge it, not that it ran), `both`, `none`,
   or `prose` for a population stated only as a rule, which nothing can run.

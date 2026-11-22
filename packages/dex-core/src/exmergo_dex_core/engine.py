@@ -1486,8 +1486,12 @@ class DexEngine:
         no_agent_instructions: bool = False,
         layered_schemas: bool = False,
         in_place: bool = False,
+        elementary: bool | None = None,
     ) -> SetupResult:
-        """Set up Dex, adopt an existing project, and verify its connection."""
+        """Set up Dex, adopt an existing project, and verify its connection.
+
+        ``elementary=False`` leaves the Elementary install out (#1464).
+        """
         from .onboarding import initialize
 
         return initialize(
@@ -1501,6 +1505,7 @@ class DexEngine:
             no_agent_instructions=no_agent_instructions,
             layered_schemas=layered_schemas,
             in_place=in_place,
+            elementary=elementary,
         )
 
     def init_project(

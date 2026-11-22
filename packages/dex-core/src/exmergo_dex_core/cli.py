@@ -728,6 +728,11 @@ def _build_parser() -> argparse.ArgumentParser:
                 action="store_true",
                 help="scaffold dbt in the current directory",
             )
+            gp.add_argument(
+                "--no-elementary",
+                action="store_true",
+                help="leave the Elementary package out of the project or plan",
+            )
         if group == "demo":
             # Positional rather than --path: --path names the warehouse dex
             # reads, everywhere, and this is the one command that writes one.
