@@ -43,6 +43,7 @@ from sqlglot import expressions as exp
 from .. import model_versions as mv
 from ..dbt_project import jinja_regions, metric_inputs, physical_column
 from ..errors import DexError
+from ..guards.pii_meta import entry_meta, says_pii
 from ..references import blank_jinja
 from ..yaml_items import dump_items
 from ..yaml_spans import (
@@ -1586,6 +1587,9 @@ class ColumnTests:
     entry_span: tuple[int, int]
     bullet_indent: str
     flow: bool
+    #: The column is marked as personal data, so a test dex adds to it keeps no
+    #: stored failures (#1463).
+    personal: bool = False
 
 
 def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
@@ -1617,6 +1621,7 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
     bullet_indent = line[: len(line) - len(line.lstrip(" "))]
 
     node = _column_node(root, model, column)
+    personal = node is not None and says_pii(entry_meta(_construct(node)))
     for key in ("tests", "data_tests"):
         listed = dict(_mapping(node, spans=True)) if node is not None else {}
         found = next((v for k, v in listed.items() if k[0] == key), None)
@@ -1649,6 +1654,7 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
             entry_span=entry_span,
             bullet_indent=bullet_indent,
             flow=bool(getattr(found, "flow_style", False)),
+            personal=personal,
         )
     return ColumnTests(
         key=None,
@@ -1660,10 +1666,13 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
         entry_span=entry_span,
         bullet_indent=bullet_indent,
         flow=False,
+        personal=personal,
     )
 
 
-def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str, Any]:
+def _unsampled(
+    name: str, *, claim: str | None = None, personal: bool = False, **body: Any
+) -> dict[str, Any]:
     """A rendered test that tells Elementary to keep no sample of its failing rows.
 
     A failing ``not_null``, ``unique`` or ``relationships`` test returns key
@@ -1677,12 +1686,19 @@ def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str,
     ``claim`` is the id of the declared fact the test checks (#1448), written
     beside the flag as ``config.meta.dex.claim``. A test that checks no declared
     fact (one the scaffold or ``maintain reconcile`` adds) carries none.
+
+    ``personal`` is for a column marked as personal data (#1463): the test also
+    carries ``store_failures: false``. The built-ins stay dbt's own, which every
+    tool reads by name, so a failure still returns the failing values; a test's
+    own config beats the project's ``store_failures`` and dbt's
+    ``--store-failures`` flag, so none of them is copied into an audit table.
     """
 
     meta: dict[str, Any] = {"disable_test_samples": True}
     if claim is not None:
         meta["dex"] = {CLAIM_KEY: claim}
-    return {name: {**body, "config": {"meta": meta}}}
+    config: dict[str, Any] = {"store_failures": False} if personal else {}
+    return {name: {**body, "config": {**config, "meta": meta}}}
 
 
 def generated_spec(
@@ -1712,9 +1728,12 @@ def generated_spec(
 
 def is_unsampled_render(test: Any, name: str) -> bool:
     """Whether a parsed test entry is exactly the test Dex renders as ``name``,
-    with or without a claim id: the shape Dex may move, remove or claim."""
+    with or without a claim id, and with or without the ``store_failures:
+    false`` a column marked as personal data adds (#1463): the shape Dex may
+    move, remove or claim."""
 
-    return without_claim(test) == _unsampled(name)
+    unclaimed = without_claim(test)
+    return unclaimed in (_unsampled(name), _unsampled(name, personal=True))
 
 
 def prevailing_test_key(content: str) -> str:
@@ -1775,7 +1794,8 @@ def column_tests_span(
 
     name = added[0]
     # Every test dex adds carries the unsampled flag a declaration renders.
-    flow = yaml.safe_dump(_unsampled(name), default_flow_style=True).strip()
+    spec = _unsampled(name, personal=current.personal)
+    flow = yaml.safe_dump(spec, default_flow_style=True).strip()
     if current.key is None:
         field_indent = current.bullet_indent + "  "
         at = before_trailing_blanks(content, current.entry_span[1])
@@ -1794,7 +1814,7 @@ def column_tests_span(
     start = content.rfind("\n", 0, last[0]) + 1
     indent = indent_of(content, start)
     at = block_end(content, start, indent)
-    return (at, at, dump_items([_unsampled(name)], indent))
+    return (at, at, dump_items([spec], indent))
 
 
 def _column_node(root: Any, model: str, column: str) -> Any:

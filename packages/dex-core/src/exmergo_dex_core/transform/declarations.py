@@ -2878,6 +2878,157 @@ def _has_sampling_flag(spec: Any) -> bool:
     return False
 
 
+_BUILTIN_TESTS = ("unique", "not_null", "relationships")
+
+
+def keep_no_failures_on_personal_columns(
+    view: DbtProjectView, edits: list[PlanEdit]
+) -> list[PlanEdit]:
+    """``edits`` with ``store_failures: false`` on each built-in test a
+    declaration added to a column marked as personal data (#1463).
+
+    Run after the PII stamps (#1100), so a mark the same plan writes counts. A
+    rendered ``unique``, ``not_null`` or ``relationships`` stays dbt's own
+    test, which every tool reads by name; on a column marked as personal data
+    its config also turns off stored failures, which would otherwise copy the
+    failing values into an audit table. Only a test this plan adds and Dex
+    rendered (its exact shape, with a claim) changes: a test the column listed
+    before the plan, or anyone's own configuration, is kept as written.
+    """
+
+    from .rewrite import is_unsampled_render
+
+    out: list[PlanEdit] = []
+    for edit in edits:
+        content = edit.new_content
+        if (
+            edit.kind is not EditKind.SCHEMA_YML
+            or edit.op is not EditOp.UPSERT
+            or not content
+        ):
+            out.append(edit)
+            continue
+        source = view.files.get(edit.path)
+        before = _listed_tests(source.content if source is not None else None)
+        text = content
+        for (model, version, column), tests in _listed_tests(content).items():
+            if not tests.personal:
+                continue
+            earlier = before.get((model, version, column))
+            for index, item in enumerate(tests.items):
+                name = _listed_name(item)
+                if (
+                    name not in _BUILTIN_TESTS
+                    or claim_of(item) is None
+                    or not is_unsampled_render(item, name)
+                    or _keeps_no_failures(item)
+                    or (earlier is not None and name in earlier.names)
+                ):
+                    continue
+                if version is None:
+                    locate = _column_locator(model, column)
+                else:
+                    locate = _version_column_locator(model, version, column)
+                text = _keep_no_failures(text, locate, index)
+        out.append(
+            edit if text == content else edit.model_copy(update={"new_content": text})
+        )
+    return out
+
+
+class _ListedTests:
+    def __init__(self, personal: bool, items: list[Any]) -> None:
+        self.personal = personal
+        self.items = items
+        self.names = {_listed_name(item) for item in items}
+
+
+def _listed_tests(
+    text: str | None,
+) -> dict[tuple[str, str | None, str], _ListedTests]:
+    """Each column's tests in a schema file, keyed by model, version (``None``
+    for the model's own columns) and column, with whether it is marked as
+    personal data."""
+
+    from ..guards.pii_meta import says_pii
+
+    if not text:
+        return {}
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return {}
+    out: dict[tuple[str, str | None, str], _ListedTests] = {}
+
+    def read(model: str, version: str | None, columns: Any) -> None:
+        for column in columns if isinstance(columns, list) else []:
+            if not isinstance(column, Mapping) or not isinstance(
+                column.get("name"), str
+            ):
+                continue
+            listed = column.get("data_tests") or column.get("tests") or []
+            out[(model, version, column["name"])] = _ListedTests(
+                says_pii(entry_meta(dict(column))),
+                listed if isinstance(listed, list) else [],
+            )
+
+    models = data.get("models") if isinstance(data, Mapping) else None
+    for entry in models if isinstance(models, list) else []:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("name"), str):
+            continue
+        read(entry["name"], None, entry.get("columns"))
+        versions = entry.get("versions")
+        for item in versions if isinstance(versions, list) else []:
+            if isinstance(item, Mapping) and item.get("v") is not None:
+                read(entry["name"], str(item["v"]), item.get("columns"))
+    return out
+
+
+def _keeps_no_failures(test: Any) -> bool:
+    if not isinstance(test, Mapping) or len(test) != 1:
+        return False
+    body = next(iter(test.values()))
+    config = body.get("config") if isinstance(body, Mapping) else None
+    return isinstance(config, Mapping) and config.get("store_failures") is False
+
+
+def _keep_no_failures(text: str, locate: Any, index: int) -> str:
+    """``text`` with ``store_failures: false`` first in the config of the
+    located column's ``index``-th test. A test whose YAML is aliased elsewhere
+    is left as it is: the key would reach the other test through the alias."""
+
+    root = _compose(text)
+    found = _child(locate(root), "data_tests") or _child(locate(root), "tests")
+    if found is None or not isinstance(found[1], yaml.SequenceNode):
+        return text
+    listed = found[1]
+    if index >= len(listed.value) or _carries_anchor(root, listed):
+        return text
+    item = listed.value[index]
+    if not isinstance(item, yaml.MappingNode) or len(item.value) != 1:
+        return text
+    [(name, body)] = _node_value(item).items()
+    config = dict(body.get("config") or {})
+    hardened = {name: {**body, "config": {"store_failures": False, **config}}}
+    [(_name_node, body_node)] = item.value
+    if listed.flow_style or item.flow_style:
+        return splice(text, [(*_span(item), _flow(hardened))])
+    if isinstance(body_node, yaml.MappingNode) and body_node.flow_style:
+        return splice(text, [(*_span(body_node), _flow(hardened[name]))])
+    config_found = _child(body_node, "config")
+    if config_found is None or not isinstance(config_found[1], yaml.MappingNode):
+        return text
+    config_node = config_found[1]
+    if config_node.flow_style or not config_node.value:
+        return splice(text, [(*_span(config_node), _flow(hardened[name]["config"]))])
+    first = config_node.value[0][0]
+    line_start = text.rfind("\n", 0, first.start_mark.index) + 1
+    if text[line_start : first.start_mark.index].strip():
+        return text
+    indent = " " * first.start_mark.column
+    return splice(text, [(line_start, line_start, f"{indent}store_failures: false\n")])
+
+
 def _add_tests(text: str, locate: Any, specs: list[Any]) -> tuple[str, bool]:
     """Add the tests ``specs`` names to the located column, keeping its own.
 
