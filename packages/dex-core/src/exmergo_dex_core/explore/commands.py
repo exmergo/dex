@@ -365,7 +365,9 @@ def inventory(
     with the rest. An unranked call lists every object, theirs included.
     """
 
-    if limit is not None and limit < 1:
+    # --limit is a no-op without --rank (an unranked list is returned whole),
+    # so a non-positive value there is ignored, not refused.
+    if rank and limit is not None and limit < 1:
         raise ValueError(
             f"--limit {limit} is below 1; --limit widens the ranked list to "
             "N objects, so it must be at least 1"
