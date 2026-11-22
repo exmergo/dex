@@ -3028,7 +3028,7 @@ def _keep_no_failures(text: str, locate: Any, index: int) -> str:
     """``text`` with the keys that store no failures (``store_failures: false``
     and ``store_failures_as: ephemeral``) first in the config of the located
     column's ``index``-th test. A test whose YAML is shared with another
-    (aliased itself, or reached through an aliased column entry or list) is
+    (aliased itself, or reached through any aliased node above it) is
     left as it is: the keys would reach the other test through the alias. An
     alias on a sibling test does not stop it."""
 
@@ -3041,10 +3041,10 @@ def _keep_no_failures(text: str, locate: Any, index: int) -> str:
     if index >= len(listed.value):
         return text
     item = listed.value[index]
-    counts = _visit_counts(root)
-    if any(counts.get(id(node), 0) > 1 for node in (entry, listed)) or _carries_anchor(
-        root, item
-    ):
+    # More than one path to the test means an alias shares it or a node above
+    # it (the column entry, its list, a whole `columns:` block); an anchor
+    # inside it would carry the keys to another test.
+    if _paths(root, item) > 1 or _carries_anchor(root, item):
         return text
     if not isinstance(item, yaml.MappingNode) or len(item.value) != 1:
         return text

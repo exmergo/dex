@@ -285,3 +285,13 @@ def test_an_aliased_sibling_does_not_stop_the_added_test_from_being_hardened():
     # The aliased sibling is someone's and is left as written.
     assert "&kept" in out and "*kept" in out
     assert "config" not in tests["accepted_values"]["accepted_values"]
+
+
+def test_a_test_shared_through_an_aliased_columns_block_is_left_alone():
+    # Model `dim_people` reuses the whole columns block of `dim_users`, so its
+    # tests are the same YAML: hardening one would edit both.
+    prior = PERSONAL.replace("    columns:\n", "    columns: &cols\n", 1)
+    [declaration] = parse_declarations([{"model": "dim_users", "grain": ["email"]}])
+    shared = render(prior, declaration) + "  - name: dim_people\n    columns: *cols\n"
+
+    assert _harden(prior, shared) == shared
