@@ -306,8 +306,8 @@ def fold_incidents(
     declared = list(sources)
     histories = {history.name: history for history in declared}
     precedence: dict[str, int] = {}
-    for rank, history in enumerate(declared):
-        precedence.setdefault(history.name, rank)
+    for rank, declared_source in enumerate(declared):
+        precedence.setdefault(declared_source.name, rank)
     laid = dict(timelines or {})
     _check_run_sequences(observed, declared, laid)
     for name, timeline in laid.items():
