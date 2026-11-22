@@ -72,7 +72,7 @@ from .timeline import (
     Timeline,
     TimelineSegment,
     build_timeline,
-    subject_history,
+    place_break,
     window_segments,
 )
 
@@ -428,14 +428,7 @@ def _incident(
             timeline, by_source.get(opener, []), built.opening.sequence, end_sequence
         ),
     )
-    onset = next(
-        (
-            found
-            for found in subject_history(timeline, subject, signal, items).breaks
-            if found.through.sequence == built.opening.sequence
-        ),
-        None,
-    )
+    onset = place_break(timeline, items, built.opening.sequence)
 
     state: State = "closed" if built.closed_by is not None else "open"
     ended_reason: Literal["removed", "stale"] | None = None

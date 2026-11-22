@@ -286,7 +286,9 @@ def build_timeline(
     )
     missed_before: dict[str, TimelineEntry] = {}
     if schedule.missed_after_seconds is not None and schedule.gap_seconds:
-        dated = [(e, utc(e.at)) for e in beats if e.at is not None]
+        # Gaps are located over every dated run, so a run an observation names
+        # splits a heartbeat interval rather than being counted as missed.
+        dated = [(e, utc(e.at)) for e in ordered if e.at is not None]
         for (earlier, early_at), (later, late_at) in itertools.pairwise(dated):
             span = (late_at - early_at).total_seconds()
             if span <= schedule.missed_after_seconds:
@@ -595,6 +597,54 @@ def _breaks(points: Iterable[_Point]) -> tuple[Break, ...]:
     return tuple(breaks)
 
 
+def place_break(
+    timeline: Timeline,
+    observations: Iterable[Observation],
+    through: int,
+) -> Break | None:
+    """The break whose failure is the run at sequence ``through``.
+
+    ``after`` is the latest observed pass from any source before it, even in a
+    run another source failed: the lifecycle closes an incident on the opening
+    source's passes alone, so a merged run can hide the pass that ended the
+    previous incident. ``observations`` are one subject and signal's.
+    """
+
+    items = list(observations)
+    goods = [o for o in items if o.outcome == "good" and o.sequence < through]
+    after_seq = max((o.sequence for o in goods), default=None)
+    points = _points(timeline, items)
+    by_seq = {
+        p.point.sequence: p.point
+        for p in points
+        if p.kind == "run" and p.point is not None
+    }
+    through_point = by_seq.get(through)
+    if through_point is None:
+        return None
+    low = (float("-inf"), -1) if after_seq is None else (float(after_seq), 1)
+    high = (float(through), 1)
+    unobserved = missed = 0
+    reasons: set[str] = set()
+    for p in points:
+        if not low < p.order < high or p.state != "unobserved":
+            continue
+        if p.kind == "missed":
+            missed += p.entry.missed_runs or 0
+        elif p.kind == "run":
+            unobserved += 1
+        if p.reason is not None:
+            reasons.add(p.reason)
+    after = by_seq.get(after_seq) if after_seq is not None else None
+    return Break(
+        after=after if after is not None else UNKNOWN,
+        through=through_point,
+        unobserved_runs=unobserved,
+        missed_runs=missed,
+        reasons=tuple(sorted(reasons)),  # type: ignore[arg-type]
+    )
+
+
 def subject_history(
     timeline: Timeline,
     subject: Subject,
@@ -703,6 +753,7 @@ __all__ = [
     "Upload",
     "build_timeline",
     "choose_heartbeat",
+    "place_break",
     "subject_histories",
     "subject_history",
     "window_segments",

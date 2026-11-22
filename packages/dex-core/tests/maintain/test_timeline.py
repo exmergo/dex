@@ -429,6 +429,41 @@ def test_an_incidents_coverage_is_laid_on_the_timeline() -> None:
     assert incident.onset.through.run == "inv-2"
 
 
+def test_an_onset_follows_the_lifecycle_not_the_merged_run() -> None:
+    # close_after=1. Run 2: another source fails while the opening source
+    # passes, which closes the first incident; run 3 opens a second one. The
+    # merged history reads run 2 bad, yet the second onset is after run 2.
+    observations = [
+        _obs(1, "bad"),
+        _obs(2, "bad", source=DBT),
+        _obs(2, "good"),
+        _obs(3, "bad"),
+    ]
+    timeline = build_timeline(ELEMENTARY, _invocations([_run(n) for n in (1, 2, 3)]))
+    fold = fold_incidents(
+        observations,
+        timelines={ELEMENTARY: timeline},
+        close_after=1,
+        now=T0 + timedelta(hours=3, minutes=5),
+    )
+    second = [i for i in fold.incidents if i.opening_source == ELEMENTARY][-1]
+    assert second.first_observed != UNKNOWN
+    assert second.onset is not None
+    assert second.onset.after.run == "inv-2"  # type: ignore[union-attr]
+    assert second.onset.through.run == "inv-3"
+
+
+def test_runs_only_the_observations_name_split_a_heartbeat_gap() -> None:
+    # Heartbeat holds runs 1, 2, 3 and 6; runs 4 and 5 were observed anyway.
+    observations = [_obs(n, "good") for n in range(1, 6)] + [_obs(6, "bad")]
+    runs = [_run(1), _run(2), _run(3), _run(6)]
+    timeline, history = _history(runs, observations)
+    assert not [e for e in timeline.entries if e.kind == "missed"]
+    (found,) = history.breaks
+    assert found.after.run == "inv-5"  # type: ignore[union-attr]
+    assert found.missed_runs == 0 and found.reasons == ()
+
+
 def test_an_incident_without_a_timeline_names_no_heartbeat() -> None:
     observations = [_obs(1, "bad"), _obs(2, "bad")]
     (incident,) = fold_incidents(observations, now=T0 + timedelta(hours=2)).incidents
