@@ -177,6 +177,36 @@ def test_a_grain_and_a_key_set_are_each_their_own_claim():
     assert claim({"grain": "week"}) != daily
     assert claim({"by": ["region"]}) != daily
     assert claim({"by": ["Region"]}) == claim({"by": ["region"]})
+    assert claim({"by": ["region", "channel"]}) == claim({"by": ["channel", "region"]})
+
+
+def test_reordered_keys_keep_the_listed_test_and_report_nothing_stale():
+    content = _render(_declared({"by": ["region", "channel"]}), True)
+    generated: list = []
+    again = _render(
+        _declared({"by": ["channel", "region"]}),
+        True,
+        generated=generated,
+        content=content,
+    )
+    assert len(_tests(again)) == 1
+    assert [g["status"] for g in generated] == ["already_listed"]
+
+
+@pytest.mark.parametrize("key", ["dex_bucket", "dex_epoch", "dex_y", "dex_month"])
+@pytest.mark.parametrize("grain", ["day", "month"])
+def test_a_key_named_like_a_column_the_test_computes_does_not_collide(key, grain):
+    duckdb = pytest.importorskip("duckdb")
+    sql = _sql([("ts", "TIMESTAMP"), (key, "VARCHAR")], grain, [key])
+    con = duckdb.connect()
+    con.execute(f'create table t ("{key}" varchar, ts timestamp)')
+    con.execute(
+        "insert into t values ('a', timestamp '2024-01-01'), "
+        "('a', timestamp '2024-03-01'), ('b', timestamp '2024-01-01')"
+    )
+    # Key a misses February (a month) and the 2nd to the 29th of February's
+    # days alike: one gap either way; key b has one bucket.
+    assert int(con.execute(sql).fetchall()[0][0]) == 1
 
 
 def test_rendering_again_adds_nothing():

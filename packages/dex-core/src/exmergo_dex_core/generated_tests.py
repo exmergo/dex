@@ -852,13 +852,14 @@ def _declared_continuity(declaration: Any) -> list[Instance]:
             Instance(
                 column=str(name),
                 field="continuity",
-                columns=(str(name), *by),
+                columns=(str(name), *sorted(by, key=str.lower)),
                 params={
                     "check": CONTINUITY,
                     "grain": grain,
                     # Names, folded as claim_id folds a string (a list is
-                    # hashed as written).
-                    "by": [key.lower() for key in by],
+                    # hashed as written), and sorted: the keys partition the
+                    # search, so `[a, b]` and `[b, a]` are one claim.
+                    "by": sorted(key.lower() for key in by),
                 },
                 arguments=arguments,
                 variant=grain,

@@ -295,12 +295,17 @@ def test_a_freshness_is_checked_by_verify_and_by_its_generated_test() -> None:
 
 def test_a_continuity_is_checked_by_its_generated_test_alone() -> None:
     gapless = {"role": "time", "continuity": {"grain": "day", "by": ["region"]}}
+    two_keys = {
+        "role": "time",
+        "continuity": {"grain": "day", "by": ["region", "channel"]},
+    }
     manifest = _manifest(
         [
             _model("tested", columns={"ordered_at": gapless}),
             _model("other_grain", columns={"ordered_at": gapless}),
             _model("other_keys", columns={"ordered_at": gapless}),
             _model("untested", columns={"ordered_at": gapless}),
+            _model("reordered", columns={"ordered_at": two_keys}),
         ],
         [
             _test(
@@ -319,6 +324,13 @@ def test_a_continuity_is_checked_by_its_generated_test_alone() -> None:
             _test(
                 "dex_continuity", "other_keys", "ordered_at", kwargs={"grain": "day"}
             ),
+            # The same two keys in another order: the same partitions.
+            _test(
+                "dex_continuity",
+                "reordered",
+                "ordered_at",
+                kwargs={"grain": "day", "by": ["channel", "region"]},
+            ),
         ],
     )
     out = _run(manifest)
@@ -328,6 +340,8 @@ def test_a_continuity_is_checked_by_its_generated_test_alone() -> None:
         ["dex_continuity"],
         [],
     )
+    reordered = _fact(out, "continuity", "ordered_at", model="reordered")
+    assert reordered["checked_by"] == "dbt_test"
     for model in ("other_grain", "other_keys", "untested"):
         fact = _fact(out, "continuity", "ordered_at", model=model)
         assert fact["checked_by"] == "none", model

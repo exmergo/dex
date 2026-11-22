@@ -207,7 +207,8 @@ class _Tests:
 
         grain = str(declared.get("grain") or "day").lower()
         raw = declared.get("by") or []
-        by = [_bare(str(k)) for k in (raw if isinstance(raw, list) else [raw])]
+        # The keys partition the search, so their order does not matter.
+        by = sorted(_bare(str(k)) for k in (raw if isinstance(raw, list) else [raw]))
         key = _bare(column)
         for name, col, kwargs, _reads in self.by_model.get(model, []):
             if _base(name) != "dex_continuity" or col != key:
@@ -216,7 +217,7 @@ class _Tests:
             listed = listed if isinstance(listed, list) else [listed]
             if (
                 str(kwargs.get("grain") or "day").lower() == grain
-                and [_bare(str(k)) for k in listed] == by
+                and sorted(_bare(str(k)) for k in listed) == by
             ):
                 return True
         return False

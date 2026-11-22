@@ -96,12 +96,17 @@
         ~ "be searched for gaps by the " ~ grain ~ "; declare a grain of a day or more"
     ) }}
 {%- endif -%}
+{#- Each key is read once, under an alias of Dex's own, so a key named like a
+    column the test computes (`dex_bucket`, `dex_epoch`) cannot collide. -#}
 {%- set key_names = [] -%}
+{%- set key_reads = [] -%}
 {%- for pair in resolved[1:] -%}
-    {%- do key_names.append(pair[0]) -%}
+    {%- do key_names.append('dex_key_' ~ loop.index) -%}
+    {%- do key_reads.append(pair[0] ~ ' as dex_key_' ~ loop.index) -%}
 {%- endfor -%}
 {%- set key_list = key_names | join(', ') -%}
 {%- set carry = (key_list ~ ', ') if key_names else '' -%}
+{%- set read = (key_reads | join(', ') ~ ', ') if key_reads else '' -%}
 {%- set div = adapter.dispatch('dex_continuity_floordiv') -%}
 {%- set epoch = adapter.dispatch('dex_continuity_epoch')(name, kind) -%}
 {%- if grain == 'second' -%}
@@ -134,9 +139,9 @@ from (
             select distinct {{ carry }}{{ bucket }} as dex_bucket
             from (
 {%- if grain in ('month', 'quarter', 'year') %}
-                {{ dex_continuity_civil(model, name, epoch, carry) }}
+                {{ dex_continuity_civil(model, name, epoch, carry, read) }}
 {%- else %}
-                select {{ carry }}{{ epoch }} as dex_epoch
+                select {{ read }}{{ epoch }} as dex_epoch
                 from {{ model }}
                 where {{ name }} is not null
 {%- endif %}
@@ -151,7 +156,7 @@ where dex_gaps > 0
 {#- The civil year and month of each value's UTC day, from its days since the
     epoch (H. Hinnant's days-to-civil), one step per subquery so each column is
     computed once. Every division is a floor division of whole numbers. -#}
-{% macro dex_continuity_civil(model, name, epoch, carry) -%}
+{% macro dex_continuity_civil(model, name, epoch, carry, read) -%}
 {%- set div = adapter.dispatch('dex_continuity_floordiv') -%}
 select {{ carry }}dex_y + case when dex_m <= 2 then 1 else 0 end as dex_year,
     dex_m as dex_month
@@ -169,7 +174,7 @@ from (
                 from (
                     select {{ carry }}dex_z, {{ div('dex_z', 146097) }} as dex_era
                     from (
-                        select {{ carry }}{{ div(epoch, 86400) }} + 719468 as dex_z
+                        select {{ read }}{{ div(epoch, 86400) }} + 719468 as dex_z
                         from {{ model }}
                         where {{ name }} is not null
                     ) as dex_days
