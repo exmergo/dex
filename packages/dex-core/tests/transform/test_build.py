@@ -4794,10 +4794,18 @@ def test_a_build_message_masks_a_value_that_spans_a_line_break():
 
 def _write_elementary_artifacts(project: Path) -> None:
     """A pricing compile's artifacts for a project with Elementary enabled: its
-    hooks declared, an anomaly test and dbt's own test selected (#1309)."""
+    hooks declared, an anomaly test and dbt's own test selected (#1309). The
+    package is installed at a release the fixture runs, so the release decides
+    nothing here (#1445)."""
 
+    from .elementary_fixture import CURRENT_VERSION
     from .test_elementary import _built
 
+    installed = project / "dbt_packages" / "elementary" / "dbt_project.yml"
+    installed.parent.mkdir(parents=True, exist_ok=True)
+    installed.write_text(
+        f'name: elementary\nversion: "{CURRENT_VERSION}"\n', encoding="utf-8"
+    )
     built = _built()
     built["nodes"]["model.shop.fct"].update(
         compiled_code="select 1", config={"materialized": "table"}
