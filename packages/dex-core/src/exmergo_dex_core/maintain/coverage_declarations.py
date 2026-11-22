@@ -64,6 +64,8 @@ How each fact kind is judged (dbt test; maintain verify codes):
   (``transform plan`` flags a SUM over a semi- or non-additive column, verify
   does not).
 - history: ``temporal_*``.
+- freshness (#1460): ``freshness_exceeded``, and dbt's ``dex_freshness`` where
+  the column carries it.
 """
 
 from __future__ import annotations
@@ -95,6 +97,7 @@ KINDS = (
     "unit",
     "additivity",
     "history",
+    "freshness",
 )
 
 _CHECKED_UNITS = frozenset({"fraction", "percent"})
@@ -170,6 +173,29 @@ class _Tests:
             _base(name) == test and col == key
             for name, col, _kwargs, _reads in self.by_model.get(model, [])
         )
+
+    def freshness(self, model: str, column: str, declared: dict) -> bool:
+        """Whether a ``dex_freshness`` on ``column`` holds the declared lag
+        (#1460): a test left at an older, looser lag permits data the
+        declaration forbids, so it does not check it."""
+
+        from ..semantic_declarations import lag_seconds
+
+        try:
+            seconds = lag_seconds(str(declared.get("max_lag")))
+        except ValueError:
+            return False
+        key = _bare(column)
+        for name, col, kwargs, _reads in self.by_model.get(model, []):
+            if _base(name) != "dex_freshness" or col != key:
+                continue
+            limit = kwargs.get("max_lag_seconds")
+            try:
+                if limit is not None and int(limit) == seconds:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def combination(self, model: str, columns: list[str]) -> str | None:
         wanted = {_bare(c) for c in columns}
@@ -895,6 +921,16 @@ def _model_facts(
                 [],
                 ["additivity_contradicted"] if additivity == "additive" else [],
                 what=_lower(additivity),
+            )
+        freshness = dex.get("freshness")
+        if isinstance(freshness, dict) and freshness.get("max_lag"):
+            found = ["dex_freshness"] if tests.freshness(uid, name, freshness) else []
+            add(
+                "freshness",
+                name,
+                found,
+                ["freshness_exceeded"],
+                what=f"{freshness.get('max_lag')} {freshness.get('basis')}",
             )
 
     population = model_dex.get("population")

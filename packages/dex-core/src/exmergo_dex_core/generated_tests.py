@@ -779,3 +779,49 @@ register(
         named_by_claim=True,
     )
 )
+
+FRESHNESS = "dex_freshness"
+
+
+def _declared_freshness(declaration: Any) -> list[Instance]:
+    """One column test per column declaring ``freshness`` (#1460): it fails when
+    the column's newest value trails the warehouse's clock by more than
+    ``max_lag``, or when the column holds no value at all, as ``maintain
+    verify``'s ``freshness_exceeded`` does. The lag goes into the claim in
+    seconds, so ``360m`` and ``6h`` are one fact; the basis goes in too, since a
+    business time and a capture time are different claims, but not into the
+    test's arguments, because the test fails alike on both."""
+
+    out: list[Instance] = []
+    for name, column in (getattr(declaration, "columns", None) or {}).items():
+        freshness = getattr(column, "freshness", None)
+        if freshness is None:
+            continue
+        seconds = int(freshness.max_lag_seconds)
+        basis = getattr(freshness.basis, "value", freshness.basis)
+        out.append(
+            Instance(
+                column=str(name),
+                field="freshness",
+                columns=(str(name),),
+                params={
+                    "check": FRESHNESS,
+                    "max_lag_seconds": seconds,
+                    "basis": str(basis),
+                },
+                arguments={"max_lag_seconds": seconds},
+                variant=str(basis),
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        FRESHNESS,
+        EVERY_RUN,
+        _declared_freshness,
+        macro=FRESHNESS,
+        dialects=ALL_CONNECTORS,
+    )
+)

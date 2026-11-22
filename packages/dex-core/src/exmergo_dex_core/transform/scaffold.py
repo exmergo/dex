@@ -83,6 +83,14 @@ MACRO_ASSETS: dict[str, str] = {
         "with the count of rows whose value sits below 0 or above 1, never a "
         "value; a declaration plan adds it where the project lacks it"
     ),
+    "dex_freshness": (
+        "the generic test a time column's declared freshness renders (#1460): "
+        "fails with one row when the column's newest value trails the "
+        "warehouse's clock by more than max_lag, or when it holds no value, "
+        "counting rows within the limit and never computing the newest value; a "
+        "declaration plan adds "
+        "it where the project lacks it"
+    ),
     "dex_join_coverage": (
         "the generic test an INNER join a declared references requires renders "
         "(#1456): fails with the count of the join's eligible driving rows that "

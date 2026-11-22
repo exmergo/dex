@@ -472,9 +472,10 @@ def test_generated_tests_agree_with_maintain_verify_live(
     # One build prices every row's fixtures and tests, each statement at
     # BigQuery's 10 MB billing minimum, so the budget grows with the rows as
     # the per-node connectors' does: 44 statements priced 461 MB (#1457). The
-    # temporal rows (#1458) add a snapshot, five models and two tests a side.
+    # temporal rows (#1458) add a snapshot, five models and two tests a side,
+    # and the freshness rows (#1460) six models, six tests and three probes.
     report = assert_generated_test_parity(
-        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 10
+        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 12
     )
 
     from google.cloud import bigquery

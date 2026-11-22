@@ -770,6 +770,11 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      entity counts, one data.temporal_contracts record per contract;
                                      unchecked with snapshot_not_ancestor or lineage_unavailable where
                                      the manifest does not show the model descending from it),
+                                     freshness_exceeded (a time column's declared freshness: its
+                                     newest value trails the warehouse's clock by more than max_lag,
+                                     or it holds no value; lag in seconds, never a value, one
+                                     data.freshness record per declared column; high on a capture
+                                     basis, medium on business; #1460),
                                      population_delta (a built model declaring no parent, against the
                                      parent dex drafts for it: orphan_keys, missing_parents, empty_rows,
                                      one data.population_delta record per model, needs_decision listed
@@ -1484,7 +1489,26 @@ default, or a filter or operator after it is refused. A key naming a location
   `dbt_project.yml`), `snapshot_config_unread` (the plan's own reason: that
   config, or `snapshot_meta_column_names`, is an expression), then
   `policy_missing`; `column_not_output` as for every kind. The `population` and
-  `time_provenance` assertions render no test. The plan writes each
+  `time_provenance` assertions render no test. It renders `dex_freshness`
+  (#1460) under each column declaring `freshness` (the column with role
+  `time`), tagged `dex_every_run`, on every connector, with `max_lag_seconds`
+  as its one argument and the basis as its `data.generated_tests` `variant`
+  (part of the claim, not an argument): it fails with one row when the column's
+  newest value trails the warehouse's clock by more than the lag, or when the
+  column holds no value (an empty model, a column NULL on every row). It counts
+  the rows within the limit, never computing the newest value or the lag, and
+  returns `1` and the limit, so dbt's `failures` equals `freshness_exceeded`'s
+  `stale`. `maintain verify` reports the lag in seconds, except on a column that
+  looks like personal data, which it judges by the same count with the lag
+  withheld (`lag_withheld`). Both sides read the warehouse's clock
+  in one statement, as whole epoch seconds with a timestamp carrying no time
+  zone read as UTC, so a value exactly at the limit passes; a column that is no
+  date or timestamp errors the test and is `unchecked` (`not_temporal`) in
+  `maintain verify`. A listed `dex_freshness` whose claim the column's declared
+  freshness no longer gives (its `max_lag` changed) is reported `stale`,
+  `reason: freshness_changed`, with a warning, and is never removed; a change
+  of `basis` alone keeps the listed test, which behaves the same.
+  The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
 - `transform plan` reports the **row-population consequence** of an edit to a
@@ -1960,7 +1984,10 @@ default, or a filter or operator after it is refused. A key naming a location
   checked twice. A declared `population.parent` is held to the parent's keys
   (`parent_population_missing`, `parent_population_unexpected`, #857), and a
   declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
-  per contract under `data.verification.temporal_contracts`). A built model that
+  per contract under `data.verification.temporal_contracts`), and a time
+  column's declared `freshness` to the warehouse's clock (`freshness_exceeded`,
+  #1460, one record per declared column under `data.verification.freshness`). A
+  built model that
   declares no parent is measured against the parent dex drafts for it (#1228):
   orphan keys, missing parents and rows whose child columns are all NULL or zero
   (a sign of no child, not proof), one record per drafted model under
@@ -1968,7 +1995,7 @@ default, or a filter or operator after it is refused. A key naming a location
   `completion.obligations.needs_decision` where the counts ask which rows belong.
   Only the plan's models with `--for-plan`, at most 25 without. Every class that
   did not run is named in `suppressed` (`grain`, `unit`, `additivity`,
-  `population`, `parent_population`, `temporal`); `population_delta` never is,
+  `population`, `parent_population`, `temporal`, `freshness`); `population_delta` never is,
   since each model it considered has its own record.
 
   **Join coverage.** Every equality join the built models write is measured as

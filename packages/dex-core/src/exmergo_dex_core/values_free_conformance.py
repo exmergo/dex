@@ -467,6 +467,7 @@ _FACT_KINDS = (
     "unit",
     "additivity",
     "history",
+    "freshness",
 )
 _CHECKERS = ("dbt_test", "dex_verify", "both", "none", "prose")
 

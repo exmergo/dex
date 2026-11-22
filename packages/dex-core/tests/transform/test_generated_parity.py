@@ -16,6 +16,9 @@ from pathlib import Path
 
 import pytest
 from transform.generated_parity import (
+    FRESHNESS_AT_LIMIT,
+    FRESHNESS_EMPTY,
+    FRESHNESS_STALE,
     JOIN_COVERAGE_FILTERED,
     JOIN_COVERAGE_INNER,
     JOIN_COVERAGE_LEFT,
@@ -732,4 +735,95 @@ def test_a_temporal_macro_returning_a_flag_fails_the_harness(
         "maintain verify counts 2",
         f"{TEMPORAL_TRANSITIONS.label} on {clean}: the test should pass on the "
         "clean fixture, dbt says 'fail'",
+    ]
+
+
+# --- dex_freshness (#1460) -------------------------------------------------------
+
+FRESHNESS_ROWS = (FRESHNESS_STALE, FRESHNESS_AT_LIMIT, FRESHNESS_EMPTY)
+
+#: No rows read as fresh: an empty model passes.
+EMPTY_IS_FRESH = """select 1 as dex_violating_rows
+from (
+    select cast(floor(epoch(current_timestamp)) as bigint)
+        - cast(floor(epoch(max({{ column_name }}))) as bigint) as dex_lag
+    from {{ model }}
+) as dex_newest
+where dex_lag > {{ max_lag_seconds }}"""
+
+#: The limit read as exclusive: a value exactly at it fails.
+LIMIT_EXCLUSIVE = """select 1 as dex_violating_rows
+from (
+    select count({{ column_name }}) as dex_values,
+        cast(floor(epoch(current_timestamp)) as bigint)
+        - cast(floor(epoch(max({{ column_name }}))) as bigint) as dex_lag
+    from {{ model }}
+) as dex_newest
+where dex_values = 0 or dex_lag >= {{ max_lag_seconds }}"""
+
+FRESHNESS_SIGNATURE = "model, column_name, max_lag_seconds"
+
+
+def test_the_freshness_rows_agree_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=FRESHNESS_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in FRESHNESS_ROWS]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_freshness.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["variant"], t["status"])
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.FRESHNESS
+    )
+    assert rows == sorted(
+        (row.model(side), "capture", "added")
+        for row in FRESHNESS_ROWS
+        for side in ("violating", "clean")
+    )
+
+
+def test_a_freshness_macro_reading_an_empty_model_as_fresh_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(FRESHNESS_EMPTY,),
+        extra_edits=[
+            _planted("duckdb", EMPTY_IS_FRESH, gt.FRESHNESS, FRESHNESS_SIGNATURE)
+        ],
+    )
+
+    violating = FRESHNESS_EMPTY.model("violating")
+    assert report.disagreements == [
+        f"{FRESHNESS_EMPTY.label} on {violating}: the test should fail on the "
+        "violating fixture, dbt says 'pass'"
+    ]
+
+
+def test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(FRESHNESS_AT_LIMIT,),
+        extra_edits=[
+            _planted("duckdb", LIMIT_EXCLUSIVE, gt.FRESHNESS, FRESHNESS_SIGNATURE)
+        ],
+    )
+
+    clean = FRESHNESS_AT_LIMIT.model("clean")
+    assert report.disagreements == [
+        f"{FRESHNESS_AT_LIMIT.label} on {clean}: the test should pass on the "
+        "clean fixture, dbt says 'fail'"
     ]
