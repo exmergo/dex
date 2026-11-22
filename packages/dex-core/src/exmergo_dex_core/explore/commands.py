@@ -887,7 +887,9 @@ def profile(
     if target is not None:
         from ..transform.build import assert_dev_target
 
-        assert_dev_target(target, engine.config.dbt_target)
+        assert_dev_target(
+            target, engine.config.dbt_target, prod=engine.config.dbt_prod_target
+        )
         reads_dev_target = True
     mode = engine.resolve_result_mode(result_mode)
     values_free = mode is ResultMode.VALUES_FREE
@@ -1865,7 +1867,9 @@ def _reads_dev_target(engine: DexEngine, target: str | None) -> bool:
         return False
     from ..transform.build import assert_dev_target
 
-    assert_dev_target(target, engine.config.dbt_target)
+    assert_dev_target(
+        target, engine.config.dbt_target, prod=engine.config.dbt_prod_target
+    )
     return True
 
 

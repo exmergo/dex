@@ -1066,7 +1066,9 @@ def verify(
     if target is not None:
         from ..transform.build import assert_dev_target
 
-        assert_dev_target(target, engine.config.dbt_target)
+        assert_dev_target(
+            target, engine.config.dbt_target, prod=engine.config.dbt_prod_target
+        )
         reads_dev_target = True
 
     manifest_target: str | None = None

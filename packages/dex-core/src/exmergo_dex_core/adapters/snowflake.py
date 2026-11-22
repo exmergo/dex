@@ -1727,6 +1727,18 @@ class SnowflakeAdapter:
             per_table[identifier] = batches * self._scan_seconds(meta.byte_size)
         return sum(per_table.values()), per_table
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        pinned warehouse's scan rate, as relations_estimate prices them. What a
+        generated test costs per production run, priced from the production
+        tables' catalog sizes; nothing this command bills (a startup, wake or
+        uptime charge) is added, since the run it prices is not dex's."""
+
+        with contextlib.suppress(Exception):
+            self._warehouse()  # the size factor; a free SHOW WAREHOUSES
+        return self._scan_seconds(sum(int(b) for b in byte_sizes))
+
     def query_estimate(self, sql: str) -> float:
         """The heuristic estimate for one firewall-approved query: the summed
         bytes of every referenced table over the scan rate. Like

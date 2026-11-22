@@ -223,6 +223,8 @@ GROUPS: dict[str, tuple[str, ...]] = {
             "test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness",
         ),
         f"{_T}test_freshness.py",
+        # What each generated test costs per production run (#1462).
+        f"{_T}test_generated_test_cost.py",
     ),
     # dex_continuity (#1461): its parity rows, its planted macros, and its own
     # file, whose last cases each run a dbt build.

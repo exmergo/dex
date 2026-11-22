@@ -1317,6 +1317,17 @@ class BigQueryAdapter:
             reserved += 1  # distinct_combination_counts
         return reserved
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): the summed bytes, each
+        table raised to the 10 MB minimum BigQuery bills per table a query
+        references. An upper bound: BigQuery bills only the columns a statement
+        reads. What a generated test costs per production run, priced from the
+        production tables' catalog sizes; nothing this command bills (a startup,
+        wake or uptime charge) is added, since the run it prices is not dex's."""
+
+        return float(sum(max(int(b), _MIN_BILLED_BYTES) for b in byte_sizes))
+
     def query_estimate(self, sql: str) -> float:
         """The dry-run byte estimate for one firewall-approved query, floored to
         what BigQuery will actually bill (the per-referenced-table minimum), so

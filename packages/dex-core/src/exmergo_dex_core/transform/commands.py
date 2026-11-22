@@ -519,6 +519,7 @@ def plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    _price_generated_tests(engine, result)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -964,6 +965,24 @@ def _generated_report(
         "counts": counts,
         "tests": generated,
     }
+
+
+def _price_generated_tests(engine: DexEngine, result: PlanResult) -> None:
+    """What each generated test the plan leaves in the YAML costs per
+    production run (#1462), from production's catalog sizes, folded onto a
+    plan that is already stored. Total for the reason row attribution is: the
+    estimate is commentary on the plan, so a defect in it is a warning naming
+    the exception type and never a plan that fails to exist."""
+
+    from .test_cost import price
+
+    try:
+        result.warnings.extend(price(engine, result.generated_tests))
+    except Exception as exc:
+        result.warnings.append(
+            "could not estimate what the generated tests cost per production run "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
 
 
 def _stamp_pii(
@@ -2854,7 +2873,7 @@ def test_mutations(
     store = engine.store
     repo_root = engine.require_repo_root("running mutation coverage")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(target, config.dbt_target, prod=config.dbt_prod_target)
     connector = engine.connector or config.connector
     effective = config.model_copy(update={"connector": connector})
     paradigm = paradigm_for(connector, effective)
@@ -6162,7 +6181,9 @@ def build(
         )
     # Ahead of the install: a prod target must not get as far as a reinstall.
     assert_dev_target(
-        target or engine.config.dbt_target or "dev", engine.config.dbt_target
+        target or engine.config.dbt_target or "dev",
+        engine.config.dbt_target,
+        prod=engine.config.dbt_prod_target,
     )
     project = engine.project_dir()
     if not has_package_spec(project):
@@ -6327,7 +6348,7 @@ def _build_project(
     config = engine.config
     repo_root = engine.require_repo_root("building the dbt project")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(target, config.dbt_target, prod=config.dbt_prod_target)
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
     connector = engine.connector or config.connector
 
@@ -6381,6 +6402,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
+            prod_target=config.dbt_prod_target,
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -6515,6 +6537,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
+            prod_target=config.dbt_prod_target,
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -8545,6 +8568,7 @@ def _semantic_plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    _price_generated_tests(engine, result)
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)

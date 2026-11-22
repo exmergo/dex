@@ -325,7 +325,9 @@ def compile_models(
         return {}, broker
     project = Path(engine.project_dir()).resolve()
     target = engine.config.dbt_target or "dev"
-    assert_dev_target(target, engine.config.dbt_target)
+    assert_dev_target(
+        target, engine.config.dbt_target, prod=engine.config.dbt_prod_target
+    )
     connector = engine.connector or engine.config.connector
     dialect = get_dialect(connector)
     try:

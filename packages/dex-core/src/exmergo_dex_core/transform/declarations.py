@@ -1548,6 +1548,16 @@ def render(
     return text
 
 
+class GeneratedRow(dict):  # type: ignore[type-arg]
+    """A ``data.generated_tests`` row that also knows, off the record, which
+    relations its test reads (#1462): ``reads``, as :func:`_generated` names
+    them. A dict as far as any reader or the envelope can tell, so the row's
+    public shape is unchanged; the plan's cost estimate reads ``reads`` and
+    a row that lost it (a copy) is read as reading its own model."""
+
+    reads: list[dict[str, Any]] | None = None
+
+
 def _report_rows(
     content: str | None, text: str, planned: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -1556,7 +1566,10 @@ def _report_rows(
 
     rows: list[dict[str, Any]] = []
     for g in planned:
-        row = {key: g[key] for key in ("model", "column", "test", "cadence", "claim")}
+        row = GeneratedRow(
+            {key: g[key] for key in ("model", "column", "test", "cadence", "claim")}
+        )
+        row.reads = g.get("reads")
         if g.get("variant") is not None:
             row["variant"] = g["variant"]
         # Read at the test's own place, matched the way rendering matches,
@@ -2152,6 +2165,16 @@ def _generated(
                     "variant": instance.variant,
                     "enabled": renders,
                     "off_reason": reason,
+                    # The relations the test's SQL reads (#1462): the model
+                    # it sits on, as itself, and each relation argument as the
+                    # ref()/source() text it renders (None where unnamed).
+                    "reads": (
+                        ([{"model": model}] if kind.reads_model else [])
+                        + [
+                            {"relation": instance.arguments.get(key)}
+                            for key in kind.relation_arguments
+                        ]
+                    ),
                     "spec": generated_spec(
                         kind.name,
                         cadence=kind.cadence,

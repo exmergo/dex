@@ -49,9 +49,81 @@ class Budget(BaseModel):
     session_ceiling_declined: bool = False
 
 
+#: How many dot-separated parts each connector's ``prod`` is spelled with
+#: (#1462): the same vocabulary its dev namespace uses.
+PROD_PARTS: dict[str, tuple[int, ...]] = {
+    "duckdb": (1,),
+    "bigquery": (1, 2),
+    "snowflake": (2,),
+    "databricks": (2,),
+    "postgres": (1,),
+    "redshift": (1,),
+    "clickhouse": (1,),
+    "trino": (2,),
+}
+
+_PROD_SPELLING = {
+    "duckdb": "a schema of the file, such as main",
+    "bigquery": "dataset or project.dataset",
+    "snowflake": "DATABASE.SCHEMA",
+    "databricks": "catalog.schema",
+    "postgres": "a schema",
+    "redshift": "a schema",
+    "clickhouse": "a database",
+    "trino": "catalog.schema",
+}
+
+
+def check_prod(connector: str, prod: str | None, dev: str | None) -> str | None:
+    """Refuse a ``<connector>.prod`` no command could read (#1462): one spelled
+    with the wrong number of parts, or naming the dev namespace, where dbt dev
+    builds write. Returns the value, stripped."""
+
+    if prod is None:
+        return None
+    value = prod.strip()
+    parts = value.split(".")
+    if not value or any(not part.strip() for part in parts):
+        raise ValueError(
+            f"{connector}.prod is empty or has an empty part; spell it as "
+            f"{_PROD_SPELLING[connector]}"
+        )
+    if len(parts) not in PROD_PARTS[connector]:
+        raise ValueError(
+            f"{connector}.prod is spelled as {_PROD_SPELLING[connector]}, got '{value}'"
+        )
+    if dev:
+        dev_parts = [part.lower() for part in dev.split(".")]
+        lowered = [part.lower() for part in parts]
+        width = min(len(dev_parts), len(lowered))
+        if dev_parts[-width:] == lowered[-width:]:
+            raise ValueError(
+                f"{connector}.prod names the dev namespace ('{dev}'), where dbt "
+                "dev builds write; prod is where the project's models build in "
+                "production, and the two never share a namespace"
+            )
+    return value
+
+
+def _pair(container: str | None, schema: str | None) -> str | None:
+    """A two-part dev namespace, or ``None`` until both parts are set."""
+
+    return f"{container}.{schema}" if container and schema else None
+
+
 class DuckDBTarget(BaseModel):
     # A local DuckDB file, or a directory of Parquet/CSV. Opened read-only.
     path: str
+    #: Where this project's models build in production (#1462), spelled as a schema
+    #: of the file (``main``). Not a source allowlist: dex reads only its catalog
+    #: metadata (names, row counts, bytes), never its rows, and never builds there.
+    #: See ``connect.prod_target_scope``.
+    prod: str | None = None
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> DuckDBTarget:
+        self.prod = check_prod("duckdb", self.prod, None)
+        return self
 
 
 class BigQueryTarget(BaseModel):
@@ -72,7 +144,17 @@ class BigQueryTarget(BaseModel):
     location: str | None = None
     datasets: list[str] = Field(default_factory=list)
     dev_dataset: str | None = None
+    #: Where this project's models build in production (#1462), spelled as
+    #: ``dataset`` or ``project.dataset``. Not a source allowlist: dex reads only
+    #: its catalog metadata (names, row counts, bytes), never its rows, and never
+    #: builds there. See ``connect.prod_target_scope``.
+    prod: str | None = None
     max_full_profile_bytes: int | None = None
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> BigQueryTarget:
+        self.prod = check_prod("bigquery", self.prod, self.dev_dataset)
+        return self
 
 
 class SnowflakeTarget(BaseModel):
@@ -106,9 +188,21 @@ class SnowflakeTarget(BaseModel):
     databases: list[str] = Field(default_factory=list)
     dev_database: str | None = None
     dev_schema: str | None = None
+    #: Where this project's models build in production (#1462), spelled as
+    #: ``DATABASE.SCHEMA``. Not a source allowlist: dex reads only its catalog
+    #: metadata (names, row counts, bytes), never its rows, and never builds there.
+    #: See ``connect.prod_target_scope``.
+    prod: str | None = None
     max_full_profile_bytes: int | None = None
     credit_price_usd: float | None = None
     suspend_after_command: bool = False
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> SnowflakeTarget:
+        self.prod = check_prod(
+            "snowflake", self.prod, _pair(self.dev_database, self.dev_schema)
+        )
+        return self
 
 
 class DatabricksTarget(BaseModel):
@@ -140,8 +234,20 @@ class DatabricksTarget(BaseModel):
     catalogs: list[str] = Field(default_factory=list)
     dev_catalog: str | None = None
     dev_schema: str | None = None
+    #: Where this project's models build in production (#1462), spelled as
+    #: ``catalog.schema``. Not a source allowlist: dex reads only its catalog
+    #: metadata (names, row counts, bytes), never its rows, and never builds there.
+    #: See ``connect.prod_target_scope``.
+    prod: str | None = None
     max_full_profile_bytes: int | None = None
     dbu_price_usd: float | None = None
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> DatabricksTarget:
+        self.prod = check_prod(
+            "databricks", self.prod, _pair(self.dev_catalog, self.dev_schema)
+        )
+        return self
 
 
 class PostgresTarget(BaseModel):
@@ -169,7 +275,17 @@ class PostgresTarget(BaseModel):
     user: str | None = None
     schemas: list[str] = Field(default_factory=list)
     dev_schema: str | None = None
+    #: Where this project's models build in production (#1462), spelled as a schema.
+    #: Not a source allowlist: dex reads only its catalog metadata (names, row
+    #: counts, bytes), never its rows, and never builds there. See
+    #: ``connect.prod_target_scope``.
+    prod: str | None = None
     max_full_profile_bytes: int | None = None
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> PostgresTarget:
+        self.prod = check_prod("postgres", self.prod, self.dev_schema)
+        return self
 
 
 class RedshiftTarget(BaseModel):
@@ -207,7 +323,17 @@ class RedshiftTarget(BaseModel):
     user: str | None = None
     schemas: list[str] = Field(default_factory=list)
     dev_schema: str | None = None
+    #: Where this project's models build in production (#1462), spelled as a schema.
+    #: Not a source allowlist: dex reads only its catalog metadata (names, row
+    #: counts, bytes), never its rows, and never builds there. See
+    #: ``connect.prod_target_scope``.
+    prod: str | None = None
     rpu_price_usd: float | None = None
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> RedshiftTarget:
+        self.prod = check_prod("redshift", self.prod, self.dev_schema)
+        return self
 
 
 class ClickHouseTarget(BaseModel):
@@ -243,6 +369,11 @@ class ClickHouseTarget(BaseModel):
     secure: bool | None = None
     databases: list[str] = Field(default_factory=list)
     dev_database: str | None = None
+    #: Where this project's models build in production (#1462), spelled as a
+    #: database. Not a source allowlist: dex reads only its catalog metadata (names,
+    #: row counts, bytes), never its rows, and never builds there. See
+    #: ``connect.prod_target_scope``.
+    prod: str | None = None
     deployment: str = "self_hosted"
     compute_unit_price_usd: float | None = None
     max_full_profile_bytes: int | None = None
@@ -267,6 +398,11 @@ class ClickHouseTarget(BaseModel):
                 "database-seconds and would never spend this number. Remove "
                 "it, or set deployment: cloud"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> ClickHouseTarget:
+        self.prod = check_prod("clickhouse", self.prod, self.dev_database)
         return self
 
 
@@ -313,6 +449,11 @@ class TrinoTarget(BaseModel):
     catalogs: list[str] = Field(default_factory=list)
     dev_catalog: str | None = None
     dev_schema: str | None = None
+    #: Where this project's models build in production (#1462), spelled as
+    #: ``catalog.schema``. Not a source allowlist: dex reads only its catalog
+    #: metadata (names, row counts, bytes), never its rows, and never builds there.
+    #: See ``connect.prod_target_scope``.
+    prod: str | None = None
     deployment: str = "self_hosted"
     credit_price_usd: float | None = None
     max_full_profile_bytes: int | None = None
@@ -346,6 +487,12 @@ class TrinoTarget(BaseModel):
                     "uptime, which a self-hosted declaration would never count; "
                     "set deployment: galaxy"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _check_prod(self) -> TrinoTarget:
+        dev = _pair(self.dev_catalog, self.dev_schema)
+        self.prod = check_prod("trino", self.prod, dev)
         return self
 
 
@@ -1571,6 +1718,13 @@ class DexConfig(BaseModel):
     clickhouse: ClickHouseTarget | None = None
     trino: TrinoTarget | None = None
     dbt_target: str | None = None
+    # The dbt target the project's production runs use (#1462, #1481): the
+    # production counterpart of `dbt_target`, beside each connector's `prod`
+    # namespace. dex never runs dbt against it: every guarded dbt call refuses
+    # it by name, even where the name looks like nothing production. It is read
+    # where dex has to say what production does (the layered schema naming
+    # `<layer>_<target name>`), never passed to dbt.
+    dbt_prod_target: str | None = None
     # Which format owns the source of truth. Defaults to dbt, so a repo that
     # selects nothing behaves exactly as it did before this setting existed.
     project: ProjectConfig = Field(default_factory=ProjectConfig)
@@ -1644,6 +1798,28 @@ class DexConfig(BaseModel):
     # reviewed and wants profiled despite the default exclusion. Re-applied on
     # every profile, same durability rationale as pii_overrides.
     blob_overrides: list[BlobOverride] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_prod_target(self) -> DexConfig:
+        """``dbt_prod_target`` names production, so it can never also be the
+        target dex builds on (#1462): equal to ``dbt_target``, or to ``dev``
+        (the target dex builds on when ``dbt_target`` is unset), it would make
+        every guarded build refuse itself, or name the dev target as prod."""
+
+        prod = self.dbt_prod_target
+        if prod is None:
+            return self
+        prod = prod.strip()
+        if not prod:
+            raise ValueError("dbt_prod_target is empty; name the production dbt target")
+        if prod.lower() == (self.dbt_target or "dev").lower() or prod.lower() == "dev":
+            raise ValueError(
+                f"dbt_prod_target '{prod}' is the dev target dex builds on "
+                f"(dbt_target: {self.dbt_target or 'dev'}); name the target the "
+                "project's production runs use"
+            )
+        self.dbt_prod_target = prod
+        return self
 
 
 def config_path(repo_root: Path | str = ".") -> Path | None:
