@@ -120,6 +120,7 @@ def _listed(project: Path, *argv: str) -> set[str]:
         str(project),
         *argv,
         cwd=project,
+        stderr=False,
     )
     return {line.strip() for line in out.splitlines() if line.strip()}
 
