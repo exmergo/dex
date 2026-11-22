@@ -337,6 +337,9 @@ def fold_incidents(
     ranked: list[tuple[tuple[int, str, str, str, str], Incident]] = []
     for key, items in series.items():
         threshold = overrides.get(key, close_after)
+        by_source: dict[str, list[Observation]] = {}
+        for observation in sorted(items, key=_order):
+            by_source.setdefault(observation.source, []).append(observation)
         for built in _walk(sorted(items, key=_order), threshold):
             subject, signal = key
             ranked.append(
@@ -351,7 +354,7 @@ def fold_incidents(
                     _incident(
                         key,
                         built,
-                        items,
+                        by_source,
                         runs_by_source,
                         retention,
                         schedules,
@@ -411,7 +414,7 @@ def _walk(items: list[Observation], threshold: int) -> list[_Open]:
 def _incident(
     key: IncidentKey,
     built: _Open,
-    items: list[Observation],
+    by_source: Mapping[str, list[Observation]],
     runs_by_source: Mapping[str, list[RunRef]],
     retention: Mapping[str, ObservedPoint | Literal["unknown"]],
     schedules: Mapping[str, Schedule],
@@ -443,7 +446,7 @@ def _incident(
     end_sequence = built.closed_by.sequence if built.closed_by is not None else None
     coverage = _coverage(
         opener,
-        [o for o in items if o.source == opener],
+        by_source.get(opener, []),
         runs_by_source.get(opener, []),
         built.opening.sequence,
         end_sequence,
@@ -453,10 +456,7 @@ def _incident(
     ended_reason: Literal["removed", "stale"] | None = None
     schedule: Schedule | None = None
     if state == "open":
-        own = sorted(
-            (o for o in items if o.source == opener and o.outcome != "unobserved"),
-            key=_order,
-        )
+        own = [o for o in by_source.get(opener, []) if o.outcome != "unobserved"]
         schedule = _schedule([o.at for o in own], opener, "subject", allowance)
         if schedule.basis == "unknown":
             schedule = schedules.get(opener, schedule)
@@ -614,6 +614,10 @@ def _latest_time(items: Iterable[Observation]) -> datetime | None:
 
 
 def _utc(moment: datetime) -> datetime:
-    """A time with no zone is read as UTC, as dbt writes ``generated_at``."""
+    """The instant in UTC; a time with no zone is read as UTC, as dbt writes
+    ``generated_at``. An aware time is converted, so two wall-clock times a
+    DST change repeats stay two instants."""
 
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import ValidationError
@@ -202,6 +203,23 @@ def test_the_staleness_floor_is_settable() -> None:
     assert fold.incidents[0].state == "no_longer_observed"
     with pytest.raises(ValueError, match="stale_floor_seconds"):
         fold_incidents([], stale_floor_seconds=-1)
+
+
+def test_a_dst_repeated_wall_clock_hour_stays_two_instants() -> None:
+    zone = ZoneInfo("America/Los_Angeles")
+    times = [
+        datetime(2020, 11, 1, 0, 30, tzinfo=zone),
+        datetime(2020, 11, 1, 1, 30, tzinfo=zone),
+        datetime(2020, 11, 1, 1, 30, fold=1, tzinfo=zone),
+    ]
+    series = [
+        _obs(n, "bad").model_copy(update={"at": at})
+        for n, at in enumerate(times, start=1)
+    ]
+    fold = fold_incidents(series, now=datetime(2020, 11, 2, 12, tzinfo=UTC))
+    incident = fold.incidents[0]
+    assert incident.schedule is not None and incident.schedule.points == 3
+    assert incident.state == "no_longer_observed"
 
 
 def test_too_little_history_never_ends_an_incident_for_staleness() -> None:
