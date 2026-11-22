@@ -600,6 +600,80 @@ def test_build_ignores_a_stale_run_results_json_from_a_prior_invocation(
     assert envelope["data"]["counts"] == {}
 
 
+def test_build_nodes_carry_dbts_numeric_test_failure_count(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    """Issue #1553: a test's failing-row count is on its node, a supplied zero
+    included, and absent where dbt recorded none."""
+
+    target_dir = dex_target(dbt_project_dir)
+    run_results = json.dumps(
+        {
+            "results": [
+                {
+                    "unique_id": "model.dex_test.stg_customers",
+                    "status": "success",
+                    "execution_time": 1.0,
+                    "failures": None,
+                },
+                {
+                    "unique_id": "test.dex_test.dex_referenced_key_orders.3249b83c15",
+                    "status": "fail",
+                    "execution_time": 0.2,
+                    "failures": 152,
+                    "message": "Got 152 results, configured to fail if != 0",
+                },
+                {
+                    "unique_id": "test.dex_test.not_null_stg_customers_id.a1b2c3d4e5",
+                    "status": "pass",
+                    "execution_time": 0.1,
+                    "failures": 0,
+                },
+                {
+                    "unique_id": "test.dex_test.dex_unit_range_orders.f00dfeed00",
+                    "status": "error",
+                    "execution_time": 0.0,
+                    "failures": None,
+                    "message": "Compilation Error in test dex_unit_range_orders",
+                },
+            ]
+        }
+    )
+    _fake_runner_factory(
+        monkeypatch,
+        returncode=1,
+        run_results_json=(target_dir / "run_results.json", run_results),
+    )
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "build",
+            "--target",
+            "dev",
+            "--confirm",
+        ],
+        capsys,
+    )
+    assert rc == 1, envelope
+    nodes = {
+        node["unique_id"].split(".")[2]: node for node in envelope["data"]["nodes"]
+    }
+    assert nodes["dex_referenced_key_orders"]["failures"] == 152
+    assert nodes["not_null_stg_customers_id"]["failures"] == 0
+    assert "failures" not in nodes["dex_unit_range_orders"]
+    assert "failures" not in nodes["stg_customers"]
+    # The count is the only thing taken: no rows and no message on the node.
+    assert set(nodes["dex_referenced_key_orders"]) == {
+        "name",
+        "unique_id",
+        "status",
+        "execution_time",
+        "failures",
+    }
+
+
 def test_missing_dev_db_with_sources_is_an_actionable_error(
     dbt_project_dir: Path, tmp_path: Path, capsys, forbid_dbt
 ):

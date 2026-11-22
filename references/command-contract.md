@@ -1773,7 +1773,11 @@ default, or a filter or operator after it is refused. A key naming a location
   `name`. The two are distinct because a generic test's id ends in a content
   hash, so a name taken from the last segment reads as `3249b83c15`; a green
   build reporting seventeen warning tests has to be able to say which
-  seventeen.
+  seventeen. A test node also carries `failures`, dbt's count of failing rows,
+  whenever dbt recorded one (a passing test's `0` included), so a consumer can
+  report it without parsing the message. It is absent when dbt recorded no
+  count, as for a test that failed to compile, and on every model. The failing
+  rows themselves and dbt's message are never copied into it.
 - **`transform build`'s `success` is dbt's exit code, and `data.outcome` is what
   the run established.** The two are not the same question and the gap between
   them is not small: a build whose `--select` matched no nodes at all exits zero,
