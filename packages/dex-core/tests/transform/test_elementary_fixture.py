@@ -1149,3 +1149,106 @@ def test_the_reader_s_layouts_hold_on_the_fixture_and_its_rows_read_back(
     )
     _changed_layout_refuses(tmp_path, warehouse)
     assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- the incident reader (#1471) --------------------------------------------------
+
+#: dbt's test statuses as the reader maps them, the same mapping as #1468's.
+_READER_OUTCOMES = {
+    "pass": "good",
+    "fail": "bad",
+    "error": "bad",
+    "warn": "bad",
+    "skipped": "unobserved",
+}
+
+
+def _claims(project: Path) -> dict[str, str]:
+    """Each test's claim id, from the manifest the last command wrote."""
+
+    manifest = json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+    claims = {}
+    for unique_id, node in manifest["nodes"].items():
+        claim = (node.get("config", {}).get("meta", {}).get("dex") or {}).get("claim")
+        if unique_id.startswith("test.") and claim:
+            claims[unique_id] = claim
+    return claims
+
+
+@requires_elementary
+@pytest.mark.parametrize("variant", ["a", "b"])
+def test_the_incident_reader_reads_each_run_the_package_recorded(
+    tmp_path: Path, installed_elementary: Path, variant: str
+):
+    """#1471 at 0.26.1. Variant a runs the tests through Elementary's
+    materialization and b through dbt's, and both runs are observed. One
+    ``dbt run`` and two ``dbt test`` give three runs in start order, one
+    sequence each. Every test dbt ran in a test run is one observation per
+    signal with dbt's outcome, the ``dbt run`` observes nothing, and no
+    statement the reader sent reads a sampled row."""
+
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.maintain.elementary_incidents import (
+        SOURCE,
+        plan_read,
+        read_elementary,
+    )
+    from exmergo_dex_core.maintain.incidents import fold_incidents
+    from exmergo_dex_core.transform.elementary import read
+
+    project = elementary_project(tmp_path, variant, installed_elementary)
+    warehouse = tmp_path / "dev.duckdb"
+    _execute(
+        warehouse,
+        "insert into main.raw_orders select * from main.raw_orders where id = 1",
+    )
+    runs = [_dbt_command(project, command) for command in ("run", "test", "test")]
+    manifest = json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+    release = read(project, manifest).release
+    claims = _claims(project)
+
+    engine = DexEngine(connector="duckdb", path=str(warehouse))
+    plan = plan_read(engine, f"dev.{ELEMENTARY_SCHEMA}", release)
+    first = read_elementary(engine, plan, claims=claims)
+    assert first.first_read
+    assert first.profile_estimate == 0.0
+    assert [ref.run for ref in first.history.runs] == [
+        r["metadata"]["invocation_id"] for r in runs
+    ]
+    assert [ref.sequence for ref in first.history.runs] == [1, 2, 3]
+    assert first.measure.results_without_invocation == 0
+    assert first.duplicate_ids == 0
+
+    ran = runs[0]["metadata"]["invocation_id"]
+    assert not [o for o in first.observations if o.run == ran]
+    for tested in runs[1:]:
+        invocation = tested["metadata"]["invocation_id"]
+        held = [o for o in first.observations if o.run == invocation]
+        for result in tested["results"]:
+            uid = result["unique_id"]
+            if not uid.startswith("test."):
+                continue
+            mine = [o for o in held if o.test == uid]
+            assert mine, (variant, uid)
+            assert {o.source for o in mine} == {SOURCE}
+            if "anomalies" not in uid:
+                [only] = mine
+                assert only.signal.column is None and only.signal.metric is None
+                assert only.outcome == _READER_OUTCOMES[result["status"]], uid
+
+    fold = fold_incidents(first.observations, sources=[first.history])
+    unique = [
+        i
+        for i in fold.incidents
+        if any(_node_name(t) == "unique_fct_id" for t in i.tests)
+    ]
+    assert [i.state for i in unique] == ["open"]
+
+    second = read_elementary(engine, plan, claims=claims)
+    assert (second.first_read, second.profile_estimate) == (False, None)
+    assert second.observations == first.observations
+    for entry in engine.store._queries:
+        sql = entry["sql"].lower()
+        for column in ("result_rows", "test_results_description", "test_params"):
+            assert column not in sql, (column, entry["decision"])
+    assert not (tmp_path / "prod.duckdb").exists()

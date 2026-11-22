@@ -129,6 +129,9 @@ releases:
           - command
           - elementary_version
           - target_name
+          # The commit each run records, which the incident reader (#1471)
+          # carries on every run it reads.
+          - git_sha
       test_result_rows:
         # models/edr/run_results/test_result_rows.sql:25-36, a literal
         # empty_table list.
