@@ -104,6 +104,17 @@ one, and a key it leaves out is kept. `population` merges one level further, so
 adding a `parent` keeps the `rule` and `filters` declared earlier. Every byte outside the keys above, comments
 included, stays where it was.
 
+A project that declared its models before the flag was added has bare
+`not_null`, `unique` and `relationships` tests. Dex cannot tell those from tests
+a person wrote, so declaring again leaves them bare, and they get neither the
+flag nor a claim. To bring one up to date, delete the test and declare again:
+Dex renders it with the flag and its claim. Or add the flag by hand under the
+test's `config.meta`, as above, and the next declaration adds the claim,
+provided the test is otherwise exactly what Dex renders. Do not
+write it as a top-level `meta`: Dex reads that as your own configuration, and
+`maintain reconcile` then no longer removes that `not_null` when the column
+starts accepting NULLs.
+
 ### The claim each test checks
 
 Each test a declaration renders names the declared fact it checks, the
