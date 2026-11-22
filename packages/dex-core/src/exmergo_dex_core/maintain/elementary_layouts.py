@@ -24,9 +24,11 @@ release's tag, before the first query touches it:
   A column that is gone is ``elementary_column_missing`` and one in another
   family is ``elementary_column_retyped``, each naming the table and the
   column.
-- **A bounded read.** The catalog is another system's output, so each table's
-  listing is read up to :data:`MAX_CATALOG_COLUMNS` columns and refused past it
-  (``elementary_catalog_too_large``) without reading the rest.
+- **A bounded check.** The catalog is another system's output, so the check
+  reads at most :data:`MAX_CATALOG_COLUMNS` plus one of a table's columns and
+  refuses a table with more (``elementary_catalog_too_large``). That bounds the
+  check, not the connector: every adapter's ``table_columns``,
+  ``table_metadata`` and ``list_objects`` fetches its whole answer first.
 
 A catalog check sees names and types. It cannot see a column that kept both and
 changed its meaning, which is why each release here also has a fixture whose
@@ -291,10 +293,22 @@ def _parse_release(release: str, raw: Mapping[str, Any]) -> ReleaseLayout:
     return ReleaseLayout(release, tables)
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """A safe loader that refuses a key written twice in one mapping, at any
+    level. YAML keeps the second, so a second release, table or column block
+    would otherwise replace the first before any check could see it."""
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False):
+        keys = [self.construct_object(key, deep=deep) for key, _ in node.value]
+        if repeated := sorted({str(k) for k in keys if keys.count(k) > 1}):
+            raise ValueError(f"the layout file writes a key twice: {repeated}")
+        return super().construct_mapping(node, deep=deep)
+
+
 def parse_layouts(text: str) -> Mapping[str, ReleaseLayout]:
     """The layouts a file holds, by release, refusing a malformed one."""
 
-    raw = yaml.safe_load(text)
+    raw = yaml.load(text, Loader=_UniqueKeyLoader)  # noqa: S506 (a SafeLoader)
     layouts = {
         str(release): _parse_release(str(release), body)
         for release, body in raw["releases"].items()
@@ -355,6 +369,10 @@ def type_family(data_type: str) -> str | None:
     text = " ".join(data_type.split()).upper()
     while match := _WRAPPERS.match(text):
         text = match.group(1).strip()
+    # A list of any type (Postgres and DuckDB write `TIMESTAMP[]`) is no
+    # family, whatever it is a list of.
+    if "[" in text:
+        return None
     if text.startswith("TIMESTAMP"):
         return "timestamp"
     base = re.split(r"[(<]", text, maxsplit=1)[0].strip()

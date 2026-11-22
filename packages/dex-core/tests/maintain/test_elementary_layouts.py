@@ -223,6 +223,23 @@ def test_a_catalog_type_falls_in_one_family_or_none(spelling: str, family: str |
     assert type_family(spelling) == family
 
 
+def test_a_timestamp_list_refuses_where_a_timestamp_is_recorded():
+    check_layouts(
+        RELEASE,
+        FakeCatalog().retype("elementary_test_results", "detected_at", "TIMESTAMP"),
+    )
+    for listed in ("TIMESTAMP[]", "timestamp with time zone[]"):
+        error = _refusal(
+            FakeCatalog().retype("elementary_test_results", "detected_at", listed)
+        )
+        [problem] = error.problems
+        assert (problem.code, problem.column, problem.found) == (
+            COLUMN_RETYPED,
+            "detected_at",
+            listed,
+        )
+
+
 def test_a_type_in_no_family_refuses_rather_than_passing():
     error = _refusal(
         FakeCatalog().retype("elementary_test_results", "failures", "VARIANT")
@@ -240,7 +257,16 @@ def _patch_above(release: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "release", [_patch_above(NEWEST_TESTED), "0.27.0", "1.0.0", "0.23.0", "0.16.4"]
+    "release",
+    [
+        _patch_above(NEWEST_TESTED),
+        "0.27.0",
+        "1.0.0",
+        "0.23.0",
+        "0.16.4",
+        # A prerelease of the recorded release is another release.
+        "0.26.1-rc.1",
+    ],
 )
 def test_a_release_outside_the_reader_s_range_refuses_without_querying_the_catalog(
     release: str,
@@ -319,6 +345,19 @@ def test_a_release_that_lays_out_fewer_tables_is_refused_on_load():
 def test_a_table_that_reads_no_column_is_refused_on_load():
     with pytest.raises(ValueError, match="reads no column"):
         parse_layouts(_one_release("0.26.1", reads="[]"))
+
+
+def test_a_key_written_twice_is_refused_on_load_not_overwritten():
+    # YAML keeps the second of two equal keys, so the duplicate never reaches
+    # a check on the parsed mapping: the loader refuses it, at every level.
+    release = "releases:\n" + _release_block("0.26.1") + _release_block("0.26.1")
+    with pytest.raises(ValueError, match="twice"):
+        parse_layouts(release)
+    table = _one_release("0.26.1").replace(
+        "        source: s\n", "        source: s\n        source: s\n", 1
+    )
+    with pytest.raises(ValueError, match="twice"):
+        parse_layouts(table)
 
 
 def test_one_release_recorded_twice_is_refused_on_load():
