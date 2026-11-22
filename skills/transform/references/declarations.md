@@ -46,6 +46,7 @@ exist.
 | `unit` | `currency:<ISO code>`, `fraction` (0 to 1), `percent` (0 to 100), `count`, or a plain unit such as `days` |
 | `null_rule` | `never`, or a sentence saying what NULL means in this column |
 | `freshness` | on the column with role `time` only: `{"max_lag": "<n><unit>", "basis": "business" \| "capture"}`, how far the column's newest value may trail the warehouse's clock ([below](#freshness-how-old-the-newest-row-may-be)). `max_lag` is a whole number and one of `s`, `m`, `h`, `d`, `w` (`30m`, `6h`, `2d`), written back in its largest unit (`360m` is `6h`); `basis` is `business` where the column is the event's own time and `capture` where it is when the row was loaded |
+| `continuity` | on the column with role `time` only: `{"grain": "<grain>", "by": ["<column>", ...]}`, that the column has no gap ([below](#continuity-no-gap-in-the-time-column)). `grain` is `second`, `minute`, `hour`, `day` (the default), `week` (ISO, starting Monday), `month`, `quarter` or `year`; `by` names the key columns gaps are searched per value of, and is empty by default (the whole model) |
 | `references` | `<model>.<column>`, a model, seed or snapshot the project has, or one an installed package has (a package's staging model, say) where the project defines none of that name |
 | `population.parent` | `{"model": <model, seed or snapshot, the project's or an installed package's>, "key": {<output column>: <parent column>, ...}}`: the entity the model holds one row per. Use it when every parent should be in the model (a parent with no children included), so verification counts the parents missing from it, and the plan warns when the SQL is driven from a relation unrelated to it (`check: population_parent`). A population that only has a `rule` is `prose` under `population_contract`: nothing can run it |
 | `evidence` | `request` (what the request settles), `contract` (what the project's declared columns, tests or metric filters settle), `precedent` (how sibling models decide the same thing), `data` (what profiling showed about the data, never the intended population or NULL policy), `default` (the conventional analytics-engineering choice, including a reasonable choice where wording leaves the question open). Name `request` or `contract` only when that source settles the choice: "per account" alone does not say whether accounts without events belong, so that choice is a `default` |
@@ -76,7 +77,7 @@ the models that read it.
 | `references`, whatever the `role` | a `relationships` test (`arguments: {to, field}`): every non-null value exists in the parent, and `maintain verify` holds a join the model makes into that parent to the same claim, on a LEFT join too (#1459) |
 | a fact a generated test checks, where `declarations.render_tests` turns it on | that generated test, tagged with its cadence ([below](#generated-tests-an-opt-in-switch-and-a-cadence-tag)) |
 | `grain`, `population`, `assumptions` | model `config.meta.dex` |
-| `role`, `null_rule`, `aggregation`, `additivity`, `unit`, `references`, `freshness` | column `config.meta.dex` |
+| `role`, `null_rule`, `aggregation`, `additivity`, `unit`, `references`, `freshness`, `continuity` | column `config.meta.dex` |
 
 A PII stamp is not a declaration field and never needs one: on a model the plan
 creates, every column that carries a flagged input through gets
@@ -167,16 +168,17 @@ The three tests above are the **built-ins**. They always render. A **generated
 test** is one Dex writes for a declared fact the built-ins cannot check: a
 composite grain, a population filter, a parent's population, a fraction's
 range, an INNER join's coverage, a referenced key's uniqueness, a history's
-measures, a time column's freshness. Each kind arrives with its own issue (#1452
-onward); this release renders eight,
+measures, a time column's freshness and its continuity. Each kind arrives with
+its own issue (#1452 onward); this release renders nine,
 [`dex_unique_combination`](#dex_unique_combination-a-composite-grain),
 [`dex_population_filter`](#dex_population_filter-a-population-filter),
 [`dex_parent_population`](#dex_parent_population-a-parents-population),
 [`dex_unit_range`](#dex_unit_range-a-fraction),
 [`dex_join_coverage`](#dex_join_coverage-a-join-a-references-requires),
 [`dex_referenced_key`](#dex_referenced_key-a-key-a-references-names),
-[`dex_temporal_contract`](#dex_temporal_contract-a-historys-measures) and
-[`dex_freshness`](#dex_freshness-a-time-columns-freshness). The switch
+[`dex_temporal_contract`](#dex_temporal_contract-a-historys-measures),
+[`dex_freshness`](#dex_freshness-a-time-columns-freshness) and
+[`dex_continuity`](#dex_continuity-gaps-in-a-time-column). The switch
 and the tag below are what every kind follows. Generated tests run in the
 project's production runs. Dex does not run those and the project pays for them,
 so two rules hold:
@@ -732,6 +734,47 @@ reports nothing stale. A column the model's SQL provably does not output renders
 `macros/dex_freshness.sql` (the [shipped macro](macros.md#dex_freshness)) as a
 `macro_sql` diff where neither the project nor the plan defines the test.
 
+#### `dex_continuity`: gaps in a time column
+
+A column declaring [`continuity`](#continuity-no-gap-in-the-time-column) renders
+`dex_continuity` under it, tagged `dex_scheduled`, with the grain and the keys as
+its arguments:
+
+```yaml
+columns:
+  - name: ordered_at
+    config:
+      meta:
+        dex:
+          role: time
+          continuity: {grain: day, by: [region]}
+    data_tests:
+      - dex_continuity:
+          arguments: {grain: day, by: [region]}
+          config:
+            tags: [dex_scheduled]
+            meta: {disable_test_samples: true, dex: {claim: <id>}}
+```
+
+It fails with the number of gaps, and returns that count and never a date or a
+key. It has no `maintain verify` twin: the parity harness holds it to its own
+fixture pairs on every connector instead, each stating the exact failure count.
+
+- **Scheduled**, because the search reads every row: one scan of the model and a
+  sort over its distinct (key, bucket) pairs. No date spine is built.
+- **A key the model's SQL provably does not output** renders no test
+  (`column_not_output`), as does the time column itself.
+- **A column that is no date or timestamp errors** rather than passing, and so
+  does a grain finer than a day on a date column.
+
+A test the plan rendered is never removed. Where a column's `grain` or `by`
+changes, the listed test for the old ones is reported `stale`
+(`reason: continuity_changed`) with a warning, beside the test the new claim
+renders: remove it from the YAML, since it keeps searching the old buckets. Its
+macro reaches the project as the others' do: `macros/dex_continuity.sql` (the
+[shipped macro](macros.md#dex_continuity)) as a `macro_sql` diff where neither
+the project nor the plan defines the test.
+
 ### A versioned model
 
 A model with native dbt versions has one YAML entry with a `versions:` list.
@@ -1205,6 +1248,45 @@ other declared facts on a metered connector. With `declarations.render_tests` on
 it also renders [`dex_freshness`](#dex_freshness-a-time-columns-freshness).
 `maintain semantic` reports a changed `freshness` as high-severity declaration
 drift, since a looser lag silences an alert with the SQL untouched.
+
+### Continuity: no gap in the time column
+
+A table can be fresh and still miss whole days, or miss one key on some days. A
+model's time column may say it has no gap (#1461):
+
+```json
+"columns": {"ordered_at": {"role": "time",
+                           "continuity": {"grain": "day", "by": ["region"]}}}
+```
+
+- **A gap is a run of empty buckets between two buckets holding rows.** With
+  `by`, the search runs per value of those columns, so a region missing the 2nd
+  that the other regions have is a gap for that region. Five empty days in a row
+  are one gap; the count is of runs, not of empty buckets.
+- **An edge is never a gap.** Data that starts late or stops early has no gap
+  there, so the answer never depends on today's date. Whether data stopped too
+  long ago is [freshness](#freshness-how-old-the-newest-row-may-be)'s question:
+  declare both on the column for both answers.
+- **Declared, never assumed.** A time column with no `continuity` renders no
+  test: plenty of correct models have empty days (no orders on a Sunday), so
+  the field is the author's claim that this one does not.
+- **Buckets are read in UTC.** A timestamp with no time zone is read as UTC and a
+  date as its UTC midnight, as freshness reads them. Each bucket is a whole
+  number computed from the value's epoch seconds (calendar grains through its UTC
+  day's civil date), so no warehouse's session time zone or week-start setting
+  changes the answer; `week` is the ISO week, starting Monday. A grain finer
+  than a day on a date column is an error.
+- **NULL times are left out**; a NULL `by` value is a key of its own.
+- **On the time column only**, as freshness: a `continuity` on a column whose
+  role is anything but `time` is refused naming the fix, and so is a `by` naming
+  the time column.
+
+Nothing in `maintain verify` checks it: the generated test,
+[`dex_continuity`](#dex_continuity-gaps-in-a-time-column), is the only check, so
+it is listed in `maintain coverage` as `dbt_test` where the column carries one at
+the declared grain and keys, else `none`. `maintain semantic` reports a changed
+`continuity` as high-severity declaration drift, since a coarser grain or fewer
+keys stops a gap failing with the SQL untouched.
 
 ### Measured against a drafted parent
 

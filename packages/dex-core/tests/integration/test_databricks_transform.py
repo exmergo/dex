@@ -289,5 +289,7 @@ def test_generated_tests_agree_with_maintain_verify_live(
         capsys,
         tmp_path,
         connector="databricks",
-        budget=DBX_MAX_SECONDS * 48,  # the freshness rows (#1460) add six tests
+        # The freshness rows (#1460) add six tests, the continuity rows (#1461)
+        # ten models and ten tests.
+        budget=DBX_MAX_SECONDS * 64,
     )

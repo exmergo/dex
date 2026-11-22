@@ -70,6 +70,7 @@ _COLUMN_FIELDS = (
     "unit",
     "references",
     "freshness",
+    "continuity",
 )
 
 

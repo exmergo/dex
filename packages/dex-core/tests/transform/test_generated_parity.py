@@ -16,6 +16,11 @@ from pathlib import Path
 
 import pytest
 from transform.generated_parity import (
+    CONTINUITY_BY,
+    CONTINUITY_DAY,
+    CONTINUITY_HOUR,
+    CONTINUITY_MONTH,
+    CONTINUITY_WEEK,
     FRESHNESS_AT_LIMIT,
     FRESHNESS_EMPTY,
     FRESHNESS_STALE,
@@ -826,4 +831,129 @@ def test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness(
     assert report.disagreements == [
         f"{FRESHNESS_AT_LIMIT.label} on {clean}: the test should pass on the "
         "clean fixture, dbt says 'fail'"
+    ]
+
+
+# --- dex_continuity (#1461): no maintain verify twin, dbt's count is the verdict --
+
+CONTINUITY_ROWS = (
+    CONTINUITY_DAY,
+    CONTINUITY_BY,
+    CONTINUITY_WEEK,
+    CONTINUITY_MONTH,
+    CONTINUITY_HOUR,
+)
+
+#: The day's buckets as DuckDB numbers them, for a planted macro.
+_DAYS = """select distinct
+            cast(floor(epoch(cast({{ column_name }} as timestamp)) / 86400) as bigint)
+                as dex_bucket
+        from {{ model }}
+        where {{ column_name }} is not null"""
+
+#: Counts the empty buckets, not the runs of them.
+COUNTS_BUCKETS = f"""select dex_gaps
+from (
+    select coalesce(sum(dex_bucket - dex_previous - 1), 0) as dex_gaps
+    from (
+        select dex_bucket, lag(dex_bucket) over (order by dex_bucket) as dex_previous
+        from ({_DAYS}) as dex_buckets
+    ) as dex_steps
+    where dex_bucket - dex_previous > 1
+) as dex_continuity
+where dex_gaps > 0"""  # noqa: S608 - a fixture macro
+
+#: Reads the bucket before the data's first as empty: an edge counted as a gap.
+COUNTS_THE_EDGE = f"""select dex_gaps
+from (
+    select count(*) as dex_gaps
+    from (
+        select dex_bucket,
+            coalesce(lag(dex_bucket) over (order by dex_bucket), dex_bucket - 2)
+                as dex_previous
+        from ({_DAYS}) as dex_buckets
+    ) as dex_steps
+    where dex_bucket - dex_previous > 1
+) as dex_continuity
+where dex_gaps > 0"""  # noqa: S608 - a fixture macro
+
+CONTINUITY_SIGNATURE = "model, column_name, grain, by"
+
+
+def test_the_continuity_rows_hold_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=CONTINUITY_ROWS,
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in CONTINUITY_ROWS]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_continuity.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["variant"], t["cadence"], t["status"])
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.CONTINUITY
+    )
+    assert rows == sorted(
+        (
+            row.model(side),
+            row.declaration["columns"][next(iter(row.declaration["columns"]))][
+                "continuity"
+            ]["grain"],
+            gt.SCHEDULED,
+            "added",
+        )
+        for row in CONTINUITY_ROWS
+        for side in ("violating", "clean")
+    )
+
+
+def test_a_continuity_macro_counting_empty_buckets_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(CONTINUITY_DAY,),
+        extra_edits=[
+            _planted("duckdb", COUNTS_BUCKETS, gt.CONTINUITY, CONTINUITY_SIGNATURE)
+        ],
+    )
+
+    violating = CONTINUITY_DAY.model("violating")
+    assert report.disagreements == [
+        f"{CONTINUITY_DAY.label} on {violating}: the test should fail on the "
+        "violating fixture with 2 failure(s), dbt says 'fail' with 3"
+    ]
+
+
+def test_a_continuity_macro_counting_an_edge_fails_on_the_clean_fixture(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(CONTINUITY_DAY,),
+        extra_edits=[
+            _planted("duckdb", COUNTS_THE_EDGE, gt.CONTINUITY, CONTINUITY_SIGNATURE)
+        ],
+    )
+
+    clean = CONTINUITY_DAY.model("clean")
+    violating = CONTINUITY_DAY.model("violating")
+    assert report.disagreements == [
+        f"{CONTINUITY_DAY.label} on {violating}: the test should fail on the "
+        "violating fixture with 2 failure(s), dbt says 'fail' with 3",
+        f"{CONTINUITY_DAY.label} on {clean}: the test should pass on the clean "
+        "fixture, dbt says 'fail'",
     ]
