@@ -69,8 +69,14 @@ A second development target, such as a CI target, runs the package too until you
 widen the condition by hand (`target.name not in ['dev', 'ci']`).
 
 Dex builds only on dev, so production is yours: after `transform deps` installs
-the package locally, run `dbt deps` and then `dbt run --select elementary --target
-<production target>` once where production runs, to create the package's tables.
+the package locally, run these once where production runs, to create the
+package's tables:
+
+```bash
+dbt deps
+dbt run --select elementary --target <production target>
+```
+
 From then on its hooks run on every production run and upload results, which is
 work those runs did not do before. `init`'s `next_steps` list these commands.
 

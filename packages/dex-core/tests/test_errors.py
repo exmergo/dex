@@ -75,6 +75,9 @@ def test_every_refusal_the_engine_defines_roots_on_dex_error():
 # CacheRequiredError and NoBaselineError stayed unreachable long enough for
 # someone embedding the engine to have to match on prose instead.
 INTERNAL_REFUSALS = {
+    # Caught before a caller sees it: `dex init` reports the Elementary install
+    # as `not_offered` with the refusal's words as its `reason` (#1464).
+    "InstallRefusedError",
     # Caught before a caller sees it: a retirement tree that does not compile
     # becomes `compile_unavailable` records (#1170).
     "CompileUnavailableError",
