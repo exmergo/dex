@@ -207,9 +207,9 @@ def price(
             "metadata, never its rows)"
         ]
 
-    if connector == "redshift" and getattr(target, "workgroup", None):
-        # Decided from the config, before any connection: opening one can
-        # resume a sleeping Serverless workgroup, which bills a wake.
+    if connector == "redshift" and _redshift_serverless(engine, target):
+        # Decided before any connection: opening one can resume a sleeping
+        # Serverless workgroup, which bills a wake.
         return _billed(rows, cost, stale)
     try:
         adapter = (adapter_factory or (lambda: engine._adapter("transform plan")))()
@@ -274,6 +274,33 @@ def _all_unknown(
     cost["per_run"] = _per_run(rows + list(stale or []))
     cost["relations"] = []
     return []
+
+
+def _redshift_serverless(engine: Any, target: Any) -> bool:
+    """Whether the Redshift connection the engine would open is Serverless,
+    told without opening it: a pinned ``workgroup``, or an endpoint host from
+    the environment, the committed target or a dbt profile that is a
+    Serverless one (the same discovery the connection itself runs, which reads
+    no warehouse for those). A connection a host supplied is already open."""
+
+    if getattr(engine, "connection", None) is not None:
+        return False
+    if getattr(target, "workgroup", None):
+        return True
+    import os
+
+    from ..config import RedshiftTarget
+    from ..connect import resolve_redshift_connection
+
+    try:
+        _params, _method, compute = resolve_redshift_connection(
+            target or RedshiftTarget(),
+            os.environ,
+            getattr(engine, "repo_root", None) or ".",
+        )
+    except Exception:
+        return False  # nothing resolves, so nothing opens either
+    return bool(compute) and compute.get("kind") == "serverless"
 
 
 def _billed(

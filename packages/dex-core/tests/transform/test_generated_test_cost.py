@@ -712,20 +712,6 @@ def test_an_estimator_that_fails_on_one_test_prices_the_rest(tmp_path: Path):
     assert rows[1]["cost"]["estimate"] == 7.0
 
 
-def test_redshift_serverless_is_not_connected_to_at_all(tmp_path: Path):
-    def never():
-        raise AssertionError("opened a connection")
-
-    report = {"tests": [row := _row()]}
-    test_cost.price(
-        _engine("redshift", workgroup="wg", prod="analytics"),
-        report,
-        view=_view(tmp_path, _node("fct_orders")),
-        adapter_factory=never,
-    )
-    assert row["cost"]["reason"] == test_cost.METADATA_READ_BILLED
-
-
 def test_bigquery_prod_is_compared_to_dev_as_a_full_address():
     from exmergo_dex_core.config import BigQueryTarget
 
@@ -839,3 +825,41 @@ def test_a_placement_the_plan_changes_is_not_priced_from_the_manifest(tmp_path: 
         new_content="name: p\nmodels:\n  p:\n    +schema: marts\n",
     )
     assert test_cost.placement_changes(tmp_path, [project]) == (frozenset(), True)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"host": "wg.123.us-east-1.redshift-serverless.amazonaws.com", "dbname": "d"},
+        {"workgroup": "wg"},
+    ],
+)
+def test_a_serverless_endpoint_is_told_apart_before_connecting(tmp_path, target):
+    def never():
+        raise AssertionError("opened a connection")
+
+    report = {"tests": [row := _row()]}
+    test_cost.price(
+        _engine("redshift", prod="analytics", **target),
+        report,
+        view=_view(tmp_path, _node("fct_orders")),
+        adapter_factory=never,
+    )
+    assert row["cost"]["reason"] == test_cost.METADATA_READ_BILLED
+
+
+def test_a_provisioned_endpoint_is_read(tmp_path):
+    adapter = _Adapter({"proj.analytics.fct_orders": (1, 4, "table")})
+    report = {"tests": [row := _row()]}
+    test_cost.price(
+        _engine(
+            "redshift",
+            prod="analytics",
+            host="c.abc.us-east-1.redshift.amazonaws.com",
+            dbname="d",
+        ),
+        report,
+        view=_view(tmp_path, _node("fct_orders")),
+        adapter_factory=lambda: adapter,
+    )
+    assert row["cost"]["status"] == "estimated"
