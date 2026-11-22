@@ -741,3 +741,73 @@ def test_explore_diagram_and_relationships_on_the_fixture_leave_the_package_out(
         "Elementary" in n and ELEMENTARY_SCHEMA in n and "`explore relationships`" in n
         for n in related.notes
     )
+
+
+# --- the install dex init offers (#1464) -------------------------------------------
+
+
+def _with_install_applied(project: Path, installed: Path) -> Path:
+    """``project`` stripped of the package, with the install ``dex init`` offers
+    written in its place, then the package installed as ``transform deps``
+    would from the lockfile the fixture's installer resolved."""
+
+    from exmergo_dex_core.transform.elementary_install import install_edits
+
+    (project / "packages.yml").unlink()
+    (project / "package-lock.yml").unlink()
+    shutil.rmtree(project / "dbt_packages")
+    authored = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+    authored.pop("models")
+    (project / "dbt_project.yml").write_text(
+        yaml.safe_dump(authored, sort_keys=False), encoding="utf-8"
+    )
+    for edit in install_edits(project, "dev"):
+        (project / edit.path).write_text(edit.new_content, encoding="utf-8")
+    shutil.copy(installed / "package-lock.yml", project / "package-lock.yml")
+    shutil.copytree(installed / "dbt_packages", project / "dbt_packages")
+    return project
+
+
+@requires_elementary
+def test_the_offered_install_runs_nothing_of_the_package_on_dev(
+    tmp_path: Path, installed_elementary: Path
+):
+    """Both dbt and the resolver read the rendered ``+enabled`` string as a
+    boolean per target: parsed for ``dev`` the package and its hooks are
+    disabled, and a dev build creates none of its relations; parsed for
+    ``prod``, never built, they are back."""
+
+    from exmergo_dex_core.transform.elementary import read
+    from exmergo_dex_core.transform.elementary_install import INSTALL_RELEASE
+
+    project = _with_install_applied(
+        elementary_project(tmp_path, "a", installed_elementary), installed_elementary
+    )
+    dev = read(project, _parsed(project, "dev"))
+    assert dev.installed and dev.release == INSTALL_RELEASE
+    assert (dev.enabled, dev.hooks, dev.materialization) == (False, "disabled", "dbt")
+
+    warehouse = tmp_path / "dev.duckdb"
+    before = duckdb_census(warehouse)
+    dbt(
+        "build",
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(project),
+        "--target",
+        "dev",
+        cwd=project,
+        check=False,
+    )
+    results = json.loads((project / "target" / "run_results.json").read_text("utf-8"))
+    assert not [
+        r["unique_id"] for r in results["results"] if ".elementary." in r["unique_id"]
+    ]
+    created = footprint(before, duckdb_census(warehouse))
+    assert not [rel for rel in created if rel[0] == ELEMENTARY_SCHEMA]
+    assert created  # the project's own models did build
+
+    prod = read(project, _parsed(project, "prod"))
+    assert (prod.enabled, prod.hooks) == (True, "run")
+    assert not (tmp_path / "prod.duckdb").exists()

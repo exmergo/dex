@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import logging
 from collections import defaultdict, deque
 from io import StringIO
 from pathlib import Path
@@ -1155,17 +1156,45 @@ class ReferenceIndex:
             return
 
         blanked = blank_jinja(content)
+        # sqlglot logs a warning for each statement it falls back to parsing as
+        # a bare command (an installed package's grant or user-creation macro,
+        # say), and that warning would reach stderr once per file scanned.
+        # A statement it cannot read is already accounted for below.
+        quiet = logging.getLogger("sqlglot")
+        level = quiet.level
+        quiet.setLevel(logging.ERROR)
         try:
-            parsed = sqlglot.parse_one(blanked)
+            statements = [tree for tree in sqlglot.parse(blanked) if tree is not None]
         except Exception:
             self.limits.append(column_parse_limit(path))
             self.column_unread.append(path)
             return
-        if parsed is None:
+        finally:
+            quiet.setLevel(level)
+        if not statements:
+            return
+        if any(
+            isinstance(node, exp.Command) for tree in statements for node in tree.walk()
+        ):
+            # sqlglot read a statement it does not know as an opaque command,
+            # so the columns inside it are invisible: a limit, not an answer.
+            # Every statement is checked, since a file can hold several.
+            self.limits.append(column_parse_limit(path))
+            self.column_unread.append(path)
             return
 
-        columns = {column.name for column in parsed.find_all(exp.Column) if column.name}
-        columns |= {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}
+        columns = {
+            column.name
+            for tree in statements
+            for column in tree.find_all(exp.Column)
+            if column.name
+        }
+        columns |= {
+            alias.alias
+            for tree in statements
+            for alias in tree.find_all(exp.Alias)
+            if alias.alias
+        }
         columns.discard(JINJA_PLACEHOLDER)
         if not columns:
             return

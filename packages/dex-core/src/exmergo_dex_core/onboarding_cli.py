@@ -40,6 +40,7 @@ def cmd_init(args: argparse.Namespace, engine) -> env.Envelope:
     interactive = not args.no_interactive and sys.stdin.isatty() and sys.stderr.isatty()
     name, mode, project_dir = args.name, args.mode, args.project_dir
     agent_files = args.agent_file
+    elementary = False if getattr(args, "no_elementary", False) else None
     root = Path(engine.repo_root).resolve()
     try:
         if interactive:
@@ -110,6 +111,22 @@ def cmd_init(args: argparse.Namespace, engine) -> env.Envelope:
                         args.target or (config.dbt_target if config else None),
                     ).type
             if (
+                existing_project
+                and elementary is None
+                and mode != "explore"
+                and (root / existing_project / "dbt_project.yml").is_file()
+            ):
+                from .transform.elementary_install import detect
+
+                declared = True
+                with contextlib.suppress(Exception):
+                    declared = detect(root / existing_project)["declared"]
+                if not declared and _ask(
+                    "Store a plan that installs the Elementary package? (yes/no)",
+                    "yes",
+                ).lower() not in {"yes", "y"}:
+                    elementary = False
+            if (
                 connector == "duckdb"
                 and mode != "demo"
                 and not engine.path
@@ -175,6 +192,7 @@ def cmd_init(args: argparse.Namespace, engine) -> env.Envelope:
             "no_agent_instructions": args.no_agent_instructions,
             "layered_schemas": args.layered_schemas,
             "in_place": args.in_place,
+            "elementary": elementary,
         }
         result = engine.initialize(name, **kwargs)
         if interactive and result.pending_confirmation:
