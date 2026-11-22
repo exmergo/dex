@@ -1393,6 +1393,10 @@ class CostGate:
             if self.paradigm is not Paradigm.FREE_LOCAL and (
                 not self.confirmed or (ceiling is not None and needed > ceiling)
             ):
+                # The phase needs a new confirmation: the cost it carries
+                # must say "required", not repeat the earlier handshake's
+                # "confirmed" (already "required" when never confirmed).
+                cost.handshake = "required"
                 raise ConfirmationRequiredError(cost)
             self._note_calibrated_admission(needed)
             self._reserve_to(needed)
