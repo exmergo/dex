@@ -1163,18 +1163,23 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="also read the configured hosted semantic layer's catalog",
                     )
                 # Ranking leaves the Elementary dbt package's own tables out by
-                # default (#1311); this ranks them with the rest. Spends nothing
-                # on inventory; on map it can make them worth profiling, so the
-                # usual handshake prices them like any other object.
-                if group == "explore" and name in {"inventory", "map"}:
+                # default (#1311), and so do the diagram and relationship
+                # inference (#1494); this brings them back. Spends nothing on
+                # inventory or diagram; on map and relationships it makes them
+                # worth profiling, so the usual handshake prices them like any
+                # other object.
+                include_elementary_help = {
+                    "inventory": "rank the Elementary package's own tables too",
+                    "map": "rank the Elementary package's own tables too",
+                    "relationships": "profile the Elementary package's own tables too",
+                    "diagram": "draw the Elementary package's own tables too",
+                }
+                if group == "explore" and name in include_elementary_help:
                     sp.add_argument(
                         "--include-elementary",
                         action="store_true",
                         default=argparse.SUPPRESS,
-                        help=(
-                            "rank the Elementary package's own tables too "
-                            "(left out by default)"
-                        ),
+                        help=f"{include_elementary_help[name]} (left out by default)",
                     )
                 # transform init takes the project name; plan the intent; apply
                 # the plan id; macro the shipped-macro name (none lists them).

@@ -726,6 +726,7 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "refresh": "refresh",
             "use_project": "use_project",
             "use_hosted_semantic_layer": "use_hosted_semantic_layer",
+            "include_elementary": "include_elementary",
         },
     },
     ("explore", "map"): {
@@ -741,7 +742,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "include_elementary": "include_elementary",
         },
     },
-    ("explore", "diagram"): {"method": "diagram", "args": {"full": "full"}},
+    ("explore", "diagram"): {
+        "method": "diagram",
+        "args": {"full": "full", "include_elementary": "include_elementary"},
+    },
     ("explore", "query"): {
         "method": ("query", "query_batch", "query_across"),
         "args": {

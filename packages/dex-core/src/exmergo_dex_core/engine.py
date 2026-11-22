@@ -1137,6 +1137,7 @@ class DexEngine:
         refresh: bool = False,
         use_project: bool = False,
         use_hosted_semantic_layer: bool = False,
+        include_elementary: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> RelationshipsResult:
         from .explore import commands as explore
@@ -1151,6 +1152,7 @@ class DexEngine:
             refresh=refresh,
             use_project=use_project,
             use_hosted_semantic_layer=use_hosted_semantic_layer,
+            include_elementary=include_elementary,
             result_mode=mode,
         )
 
@@ -1287,21 +1289,31 @@ class DexEngine:
         )
 
     def diagram(
-        self, *, full: bool = False, result_mode: ResultMode | str | None = None
+        self,
+        *,
+        full: bool = False,
+        include_elementary: bool = False,
+        result_mode: ResultMode | str | None = None,
     ) -> DiagramResult:
         """The cached map as a Mermaid ER diagram. Reads the store, nothing else.
 
         Free on every connector and the one explore method that opens no
         connection at all, so a host holding a populated store can call it with
         no credential in play. See :mod:`~.explore.diagram` for what the
-        rendered cardinalities are and are not allowed to claim.
+        rendered cardinalities are and are not allowed to claim. The Elementary
+        package's own tables are left out unless ``include_elementary`` (#1494).
         """
 
         from .explore import commands as explore
 
         mode = self.resolve_result_mode(result_mode)
         return call_withholding(
-            mode, explore.diagram, self, full=full, result_mode=mode
+            mode,
+            explore.diagram,
+            self,
+            full=full,
+            include_elementary=include_elementary,
+            result_mode=mode,
         )
 
     # The two semantic methods import from `explore.semantic.commands`, not from

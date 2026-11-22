@@ -663,3 +663,81 @@ def test_explore_map_on_the_fixture_ranks_no_elementary_table(
     ]
     assert any("Elementary" in n and ELEMENTARY_SCHEMA in n for n in result.notes)
     assert result.profiled_count == len(own_tables)
+
+
+@requires_elementary
+@pytest.mark.parametrize("include", [True, False], ids=["included", "default"])
+def test_explore_diagram_and_relationships_on_the_fixture_leave_the_package_out(
+    tmp_path: Path, installed_elementary: Path, include: bool
+):
+    """#1494's acceptance on the real package, variant e. After an include map
+    filled the cache with the package's profiles, a default `diagram --full`
+    draws none of them and says so, and `relationships` profiles none of them;
+    with `include_elementary` both take them with the rest. `elementary_runs`,
+    the project's own model in the same warehouse, is drawn and profiled either
+    way."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    project = elementary_project(tmp_path, "e", installed_elementary)
+    _engine(project).build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+    built = duckdb_census(warehouse)
+    package_tables = {name for schema, name, _ in built if schema == ELEMENTARY_SCHEMA}
+    own_tables = {name for schema, name, _ in built if schema == "main"}
+    assert "elementary_runs" in own_tables
+
+    def engine(root: Path) -> DexEngine:
+        root.mkdir()
+        return DexEngine(
+            connector="duckdb",
+            path=str(warehouse),
+            config=DexConfig(connector="duckdb"),
+            store=FilesystemStore(root),
+            repo_root=root,
+        )
+
+    def schema_of(identifier: str) -> str:
+        return identifier.split(".")[-2]
+
+    drawing = engine(tmp_path / "drawing")
+    drawing.map(include_elementary=True, full=True)
+    diagram = drawing.diagram(full=True, include_elementary=include)
+    drawn = set(diagram.entities.values())
+    drawn_package = {i for i in drawn if schema_of(i) == ELEMENTARY_SCHEMA}
+    drawn_own = {i.split(".")[-1] for i in drawn if schema_of(i) == "main"}
+    assert "elementary_runs" in drawn_own
+
+    related = engine(tmp_path / "relating").relationships(include_elementary=include)
+    endpoints = {r.from_dataset for r in related.relationships} | {
+        r.to_dataset for r in related.relationships
+    }
+    if include:
+        # The package's thirty-odd tables and the project's three fit under the
+        # diagram's 40-entity cap, so every one of them is drawn.
+        assert drawn_package == {
+            f"dev.{ELEMENTARY_SCHEMA}.{name}" for name in package_tables
+        }
+        assert diagram.elided_entity_count == 0
+        assert diagram.excluded.count == 0
+        assert related.profiled_count == len(own_tables) + len(package_tables)
+        assert any(schema_of(i) == ELEMENTARY_SCHEMA for i in endpoints)
+        assert related.excluded.count == 0
+        return
+    assert not drawn_package
+    assert diagram.excluded.reason == "elementary"
+    assert diagram.excluded.count == len(package_tables)
+    assert any(
+        "Elementary" in n and ELEMENTARY_SCHEMA in n and "`explore diagram`" in n
+        for n in diagram.notes
+    )
+    assert related.profiled_count == len(own_tables)
+    assert not any(schema_of(i) == ELEMENTARY_SCHEMA for i in endpoints)
+    assert related.excluded.reason == "elementary"
+    assert related.excluded.count == len(package_tables)
+    assert any(
+        "Elementary" in n and ELEMENTARY_SCHEMA in n and "`explore relationships`" in n
+        for n in related.notes
+    )
