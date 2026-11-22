@@ -500,6 +500,21 @@ def test_an_undated_run_another_source_observed_keeps_the_interval() -> None:
     ]
 
 
+def test_a_run_dated_outside_the_interval_keeps_it() -> None:
+    # Another source's clock put run 5 after run 6's time.
+    runs = [_run(1), _run(2), _run(3), _run(6)]
+    skewed = _obs(5, "good", source=DBT).model_copy(
+        update={"at": T0 + timedelta(hours=9)}
+    )
+    observations = [_obs(3, "good"), skewed, _obs(6, "bad")]
+    timeline = build_timeline(ELEMENTARY, _invocations(runs), observations)
+    history = subject_history(timeline, SUBJECT, Signal(), observations)
+    missed = [s for s in history.segments if s.kind == "missed"]
+    assert [(s.after_run, s.before_run, s.runs) for s in missed] == [
+        ("inv-3", "inv-6", 2)
+    ]
+
+
 def test_an_incident_without_a_timeline_names_no_heartbeat() -> None:
     observations = [_obs(1, "bad"), _obs(2, "bad")]
     (incident,) = fold_incidents(observations, now=T0 + timedelta(hours=2)).incidents

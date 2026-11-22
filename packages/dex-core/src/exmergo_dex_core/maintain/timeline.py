@@ -525,6 +525,12 @@ def _missed_runs(span_seconds: float, schedule: GapSchedule) -> int:
     return max(1, round(span_seconds / schedule.gap_seconds) - 1)
 
 
+def _within(moment: datetime, start: datetime | None, end: datetime | None) -> bool:
+    if start is None or end is None:
+        return False
+    return utc(start) < utc(moment) < utc(end)
+
+
 def _split_missed(points: list[_Point], schedule: GapSchedule) -> list[_Point]:
     """Split each missed interval at the runs another source observed inside
     it: those runs happened, so only the stretches between them that the
@@ -550,6 +556,9 @@ def _split_missed(points: list[_Point], schedule: GapSchedule) -> list[_Point]:
                 # than vanishing.
                 and q.point.at is not None
                 and after < q.point.sequence < before
+                # Sources stamp time with different clocks: a run dated
+                # outside the interval cannot be placed in it either.
+                and _within(q.point.at, entry.from_at, entry.to_at)
             ]
             if p.kind == "missed" and after is not None and before is not None
             else []
