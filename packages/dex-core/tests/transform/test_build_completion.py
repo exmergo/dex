@@ -1135,6 +1135,80 @@ def test_a_versioned_deliverable_named_by_its_file_stem_reports_its_failed_check
     assert completion.assurance.build_only.count == 0
 
 
+def test_a_failed_version_does_not_also_assert_the_shared_base_name():
+    """A passing ``dim_customers.v1`` and a failing ``dim_customers.v2`` both
+    expand to ``dim_customers``: failure takes precedence after alias
+    expansion, so the deliverable is failed, not asserted (#1499)."""
+
+    v1 = "model.dex_test.dim_customers.v1"
+    v2 = "model.dex_test.dim_customers.v2"
+    pass_test = "test.dex_test.not_null_dim_customers_v1_id.1"
+    fail_test = "test.dex_test.not_null_dim_customers_v2_id.2"
+    nodes = [
+        BuildNode(unique_id=v1, name="dim_customers.v1", status="success"),
+        BuildNode(unique_id=v2, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=pass_test,
+            name="not_null_dim_customers_v1_id",
+            resource_type="test",
+            status="pass",
+        ),
+        BuildNode(
+            unique_id=fail_test,
+            name="not_null_dim_customers_v2_id",
+            resource_type="test",
+            status="fail",
+        ),
+    ]
+    completion = summarize_completion(
+        _evidence(nodes, required=["dim_customers"]),
+        None,
+        graph={pass_test: [v1], fail_test: [v2]},
+    )
+    assert completion.assurance.failed_checks.names == ["dim_customers"]
+    assert [c.name for c in completion.assurance.failed_checks.checks] == [
+        "not_null_dim_customers_v2_id"
+    ]
+    assert completion.assurance.asserted.names == []
+    assert completion.assurance.build_only.count == 0
+
+
+def test_two_failing_versions_share_one_alias_and_keep_both_checks():
+    """Both built versions fail: their checks accumulate under the shared
+    alias instead of the first version's checks standing alone (#1499)."""
+
+    v1 = "model.dex_test.dim_customers.v1"
+    v2 = "model.dex_test.dim_customers.v2"
+    fail_test_v1 = "test.dex_test.not_null_dim_customers_v1_id.1"
+    fail_test_v2 = "test.dex_test.not_null_dim_customers_v2_id.2"
+    nodes = [
+        BuildNode(unique_id=v1, name="dim_customers.v1", status="success"),
+        BuildNode(unique_id=v2, name="dim_customers.v2", status="success"),
+        BuildNode(
+            unique_id=fail_test_v1,
+            name="not_null_dim_customers_v1_id",
+            resource_type="test",
+            status="fail",
+        ),
+        BuildNode(
+            unique_id=fail_test_v2,
+            name="not_null_dim_customers_v2_id",
+            resource_type="test",
+            status="fail",
+        ),
+    ]
+    completion = summarize_completion(
+        _evidence(nodes, required=["dim_customers"]),
+        None,
+        graph={fail_test_v1: [v1], fail_test_v2: [v2]},
+    )
+    assert completion.assurance.failed_checks.names == ["dim_customers"]
+    assert [c.name for c in completion.assurance.failed_checks.checks] == [
+        "not_null_dim_customers_v1_id",
+        "not_null_dim_customers_v2_id",
+    ]
+
+
 def test_the_warning_counts_the_unchecked_tests_the_cap_cut(monkeypatch):
     from exmergo_dex_core.transform import commands
 
