@@ -5,7 +5,8 @@ truth**, on two axes: the transformation project, which is dbt, and the semantic
 layer, which is dbt's own or a native format that owns its definitions in files
 beside it. dex reads whichever are present, reasons over them together with
 warehouse introspection, and writes changes back as reviewable diffs. The only
-state dex keeps of its own is a non-canonical cache under `.dex/`.
+state dex keeps of its own lives under `.dex/`: derived observations alongside
+configuration, a chosen baseline, and operational history.
 
 ## Why dbt, not a dex-native model
 
@@ -47,8 +48,9 @@ See [`semantic-layer.md`](semantic-layer.md).
 
 ## The `.dex/` cache (not canonical)
 
-`.dex/` holds only what the repository has no home for, and it is a cache that
-informs proposals, never the source of truth:
+The exploration cache informs proposals and never owns model definitions.
+Other files under `.dex/` hold decisions and history that cannot be recovered
+by re-reading the current warehouse:
 
 ```
 .dex/
@@ -84,9 +86,58 @@ informs proposals, never the source of truth:
                   recur here are candidates for promotion to named commands.
 ```
 
-Delete `.dex/` and nothing canonical is lost: dex re-derives the cache from the
-repository and the warehouse. The cache types live in `cache.py`; secrets never live
-here. PII is recorded as `(column, category, confidence)` with no example values.
+Do not delete `.dex/` to resolve a cache conflict: that also discards configuration,
+the baseline and spend history. Dex can re-derive exploration observations from
+the repository and the warehouse, but cannot reconstruct those decisions or past
+events. The cache types live in `cache.py`; secrets never live here. PII is
+recorded as `(column, category, confidence)` with no example values.
+
+### Merging branches that both refreshed Dex
+
+For the default filesystem backend, use this classification when resolving a
+merge. A regenerable output is only current after its producer succeeds against
+the merged inputs; selecting either branch's copy alone does not refresh it.
+
+| Path under `.dex/` | Role and resolution |
+| --- | --- |
+| `config.yml` | Authored configuration. Merge targets, limits, ranking hints and PII overrides intentionally; no refresh command reconstructs them. |
+| `cache.json` | Derived exploration observations. Regenerate with `dex explore map --refresh`; use `--full` when the intended refresh must cover objects below the rank cutoff. Keep the scheduled job's connector, scope, project and inclusion flags. A narrow run carries older observations outside its scope, so it cannot refresh the whole cache. |
+| `drift.json` | Latest derived drift report. Regenerate with `dex maintain check` after rebuilding and mapping, against the agreed snapshot. |
+| `review/refresh/*.json` | Command envelopes saved by a project's refresh job, not a separate engine store. Re-run that job and capture each command's output at its original path, for example `transform build --verify`, `explore map` and `maintain check`. |
+| `snapshot.json` | The team's chosen comparison baseline. Preserve the agreed baseline; create a new one with `dex maintain snapshot` only when deliberately accepting a new reference. Rebaselining to resolve a conflict hides the changes `maintain check` should report. |
+| `plans/*.json` | Proposed edits and review history. Preserve needed plans; deliberately run `dex transform plan` again when the merged source invalidates a proposal. A new plan does not recreate its old review history. |
+| `mutations/*.json` | Latest mutation-test evidence per model. Re-run the same `dex transform test --mutate` invocation against the merged project if this evidence is required. |
+| `queries.jsonl`, `spend.jsonl` | Append-only decisions and billing history. Preserve recorded events; neither mapping nor drift detection recreates them. Discarding spend history also loses the ledger used by budget checks. |
+| `cache.lock`, `spend.lock` | Local runtime lock files. Keep them out of Git; do not remove or replace a lock while a process may hold it. |
+| `dex.db`, `dex.db-journal` | SQLite backend state, which includes history and baselines as well as the cache. Keep it local; do not treat the database as a disposable JSON output or resolve it with a text merge. See [storage](storage.md). |
+
+A safe refresh merge follows this order:
+
+1. Wait for local refresh writers to finish. Merge the dbt and semantic source
+   files, ingestion inputs and `.dex/config.yml`, and preserve the agreed
+   snapshot and operational history.
+2. Resolve only the conflicting derived outputs (`cache.json`, `drift.json`,
+   and the job's `review/refresh/*.json`) by taking one complete side as a
+   temporary starting point. Do not hand-merge profile fields or apply this
+   choice to the whole `.dex/` directory.
+3. Run the project's scheduled refresh pipeline over the merged inputs: ingest,
+   build on its configured **dev** target, map, then check. Use the same flags,
+   budget and confirmation rules as that job. Force fresh profiles with
+   `explore map --refresh`, and cover every namespace and object the committed
+   cache is meant to describe (`--full` bypasses the rank cutoff, not scope or
+   source allowlists). Regenerate the captured review envelopes too.
+4. Inspect the command statuses, refused or skipped work, cache scope and drift
+   findings. A failed build or partial map is not a complete refresh. Review and
+   stage the regenerated outputs only after they describe the merged warehouse;
+   do not take a new snapshot merely to make the findings disappear.
+
+For projects with scheduled refreshes, prefer keeping `cache.json`, `drift.json`
+and refresh envelopes as CI artifacts or local outputs rather than committing
+them on every run. If the team needs versioned observations, commit them only
+after that regeneration step. The [README's commit guidance](../README.md#what-to-commit-in-dex)
+still applies to values in caches and snapshots. Avoid a blanket `.gitattributes`
+`merge=ours` rule: it can silently accept stale observations and discard
+configuration or history, and it does not run the refresh pipeline.
 
 The layout above is the CLI's choice, not the engine's. Where this state lands is
 a backend behind the `Store` protocol, injected at the entry point: the CLI picks

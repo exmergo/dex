@@ -411,6 +411,13 @@ the same caution. `.dex/spend.jsonl` is the billed-command ledger: byte
 counts, job ids and statement hashes only, never SQL values or credentials,
 but it is local spend history, so there is no reason to commit it.
 
+With a scheduled refresh, prefer keeping `cache.json`, `drift.json` and captured
+refresh envelopes as CI artifacts or local outputs. If the team commits these
+observations, resolve conflicts by regenerating them after merging the source
+and rebuilding the dev warehouse. See [merging branches that both refreshed Dex](references/canonical-model.md#merging-branches-that-both-refreshed-dex)
+for the file-by-file classification and workflow; do not discard the whole
+`.dex/` directory or silently take one branch's stale outputs.
+
 ### What Dex will never do
 
 - **Write to your source data.** Dex's own SQL is SELECT-only. The only data writes are the dbt builds you confirm, on a dev target.
