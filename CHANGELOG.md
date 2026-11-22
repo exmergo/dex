@@ -14,6 +14,114 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.18.4] - 2026-11-22
+
+### Added
+
+- `transform plan` renders `dex_referenced_key` under the parent column a declared
+  `references` names, in the parent's YAML entry, where
+  `declarations.render_tests` turns it on: a count-only uniqueness test, tagged
+  `dex_every_run`, that fails with the rows repeating a non-NULL key, so a join to
+  that key cannot multiply rows unnoticed. A parent whose one-column grain or
+  `unique` test already covers the column renders none (`covered_by_builtin`), and
+  a parent with no YAML entry, a seed, a snapshot or a package's model renders
+  none (`parent_undeclared`, `parent_in_package`). `transform declare <parent>`
+  proposes it where nothing else is owed. ([#1534](https://github.com/exmergo/dex/pull/1534))
+- `transform plan` renders `dex_temporal_contract` for each measure a declared
+  `history` names, where `declarations.render_tests` turns it on: a count-only
+  model-level test, tagged `dex_scheduled`, that fails with the entities whose
+  column disagrees with what the snapshot's versions and the declared policy give,
+  the same count `maintain verify`'s `temporal_transition_count_mismatch`,
+  `temporal_latest_transition_mismatch` or `temporal_first_attainment_mismatch`
+  states. A measure `maintain verify` would leave unchecked renders none, with its
+  reason: `snapshot_not_ancestor`, `lineage_unavailable`, `hard_delete_records`,
+  `policy_missing`, or `snapshot_config_unread` where the snapshot's config is an
+  expression. `transform declare` proposes it for a history declared before the
+  switch was on. ([#1535](https://github.com/exmergo/dex/pull/1535))
+- **A declaration can say how fresh a model's data should be.** The column with
+  role `time` takes `freshness: {max_lag: 6h, basis: business|capture}`.
+  `maintain verify` and `transform build --verify` read the column's newest value
+  against the warehouse's own clock and raise `freshness_exceeded` where it trails
+  by more than `max_lag`, or where the column holds no value (no rows is not
+  fresh): high on a `capture` basis, medium on `business`, which a backfill can
+  leave legitimately old. Each declared freshness gets a `data.freshness` record.
+  With `declarations.render_tests` on it also renders `dex_freshness`, a
+  count-only column test tagged `dex_every_run` that fails on the same columns on
+  every connector, and the plan writes its macro as a reviewable diff. dbt's own
+  `freshness` covers sources only; this one covers a model's data. A changed
+  `freshness` is high-severity declaration drift in `maintain semantic`, and
+  `maintain coverage` lists it as a declared fact. ([#1537](https://github.com/exmergo/dex/pull/1537))
+- **A declaration can say its time column has no gap.** The column with role
+  `time` takes `continuity: {grain: day, by: [region]}`, at a grain from `second`
+  to `year` (`week` is the ISO week), for the whole model or per value of the `by`
+  columns. With `declarations.render_tests` on it renders `dex_continuity`, a
+  count-only column test tagged `dex_scheduled` that fails with the number of
+  gaps: runs of empty buckets between two buckets holding rows. An edge is never a
+  gap, so the answer does not depend on today's date. Buckets are read in UTC from
+  each value's epoch seconds, with no date spine, the same on every connector. A
+  changed `continuity` is high-severity declaration drift in `maintain semantic`,
+  and `maintain coverage` lists it as a declared fact. ([#1539](https://github.com/exmergo/dex/pull/1539))
+- **A plan says what each generated test costs per production run.** Generated
+  tests run in production, where Dex never connects, so every one a plan leaves in
+  the YAML now carries a `cost`: an estimate in the connector's unit, built from
+  the relations the test reads (a view followed to the tables it reads) and their
+  sizes in production's catalog, or
+  `unknown` with the reason. `data.generated_tests.cost.per_run` totals the
+  `dex_every_run` and `dex_scheduled` tests apart, and says when a total is
+  partial. Production is named in committed config: `<connector>.prod`, the
+  namespace the project's models build into there (spelled as the dev namespace
+  is, never equal to it), and `dbt_prod_target`, the production dbt target. `prod`
+  is not a source allowlist: explore reads exactly what it read before, and Dex
+  reads only `prod`'s catalog metadata, never a row. Every guarded dbt call now
+  refuses `dbt_prod_target` by name, including a name the hard production
+  denylist misses. ([#1542](https://github.com/exmergo/dex/pull/1542))
+- **`dex init` installs the Elementary package.** Every project init creates or
+  adopts is read for the package (declared, installed, release) under
+  `data.elementary`, from the repository alone. A project init creates declares
+  it in `packages.yml` (pinned to 0.26.1) and configures it in `dbt_project.yml`
+  (disabled on the dev target, schema `elementary`, `test_sample_row_count: 0`),
+  shown in init's own diff. A project init adopts gets the same two edits as a
+  stored `transform` plan to review and apply, and init changes neither file. A
+  project that already declares it gets its release reported. `--no-elementary`,
+  or "no" to the terminal question, leaves it out. The next steps name
+  `dex transform deps` and the production commands that are yours to run. ([#1546](https://github.com/exmergo/dex/pull/1546))
+
+### Changed
+
+- **`explore diagram` and `explore relationships` leave the Elementary package's own tables out, as `explore map` does.** Where a project installs `elementary-data/elementary`, `explore inventory --rank` and `explore map` already left the package's metadata tables out of ranking by their signature. The diagram still drew every one a cache held a profile for (after a `map --include-elementary` or a hand-run `explore profile`), and relationship inference profiled the whole inventory, package tables included, and inferred the joins among them, at a cost on a metered connector. Both now apply the same rule, with the same recogniser: `explore diagram` reads the signature over the cache's identifiers, names only, so it stays free, and draws none of the package's tables, `--full` included, with none of them counted as an elided entity (an edge onto one is counted in `elided_edge_count`, and connects nothing, so a project table whose only join is onto one is drawn only with `--full`); the signature has to be in the cache, so a lone package table profiled by hand into a cache only `explore relationships` has written, which holds no entry for the tables it left out (a `map` keeps their inventory entries, and no later write drops them), is drawn by `--full` until `explore map` writes the rest. `explore relationships` leaves them out before anything is priced or profiled, so its estimate prices none of them and no join among them is inferred, while a profile of one the cache already holds is left as it is and the joins among them an earlier `--include-elementary` run cached are dropped from the cache, as on `map` (carried from outside a narrower `--scope`, they stay in the cache and out of `data.relationships`, and `carried_relationship_count` counts only the carried joins the list reports). Only the package's own tables are left out, so a project table sharing their schema is still drawn and profiled. Each command reports `data.excluded` in the shape `map` does, always present, and a note names the namespaces and the way back: `--include-elementary` on either command draws or profiles them with the rest (#1494). ([#1538](https://github.com/exmergo/dex/pull/1538))
+- **A rendered `unique`, `not_null` or `relationships` on a column marked as
+  personal data stores no failures.** The built-ins stay dbt's own tests, which
+  dbt, its packages and tools such as dbt_project_evaluator read by name. On a
+  column whose `config.meta` marks personal data, including the mark a plan
+  stamps on a model it creates, each one a declaration, the scaffold or
+  `maintain reconcile` adds also carries `config: {store_failures: false}`, so a
+  failure's values are not copied into an audit table, whatever the project's
+  `store_failures` setting or dbt's `--store-failures` flag. A test the column
+  already lists is kept as written. ([#1546](https://github.com/exmergo/dex/pull/1546))
+
+### Fixed
+
+- `maintain verify`'s temporal contract check runs on ClickHouse: its statement
+  read each entity's previous version with `lag()`, which ClickHouse does not
+  have, and now uses `lagInFrame` over an explicit frame with a NULL default, as
+  the cumulative detector already did. ([#1535](https://github.com/exmergo/dex/pull/1535))
+- **A declaration renders into an entry whose lists are written indentless.** A
+  `schema.yml` written by PyYAML's `safe_dump` puts a list's dashes at its key's
+  own column, and `transform plan` refused to write a declaration into a model
+  whose `data_tests:` list was written that way ("does not parse as YAML:
+  ParserError"). The declaration now renders into the entry, a test it adds to
+  an indentless list keeps the list indentless, and the rest of the file is kept
+  as written. The same holds for an indentless `columns:` list and a column's
+  indentless `data_tests:` list. ([#1495](https://github.com/exmergo/dex/issues/1495)) ([#1536](https://github.com/exmergo/dex/pull/1536))
+- **`transform repair` no longer breaks a `dbt_project.yml` that ends in an
+  indentless list.** Writing `+enabled: false` after a last key such as
+  `model-paths:` followed by `- models` at the same column (the form Dex's own
+  scaffold writes) inserted the new key between the key and its list. And
+  `transform build --verify` no longer prints a sqlglot warning to stderr for each
+  installed package statement it cannot read, such as the Snowflake grant macros
+  the Elementary package ships. ([#1546](https://github.com/exmergo/dex/pull/1546))
+
+
 ## [1.18.3] - 2026-11-21
 
 ### Added
