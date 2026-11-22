@@ -2104,3 +2104,75 @@ def test_a_foreign_key_joins_a_parent_column_that_is_itself_a_planned_foreign_ke
     assert {"name": "customer", "type": "foreign", "expr": "buyer_id"} in (
         offered["fct_returns"]["entities"]
     )
+
+
+def test_foreign_keys_that_only_reference_each_other_are_not_derived(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """`fct_alphas.beta_id` references `fct_betas.alpha_id`, which references
+    `fct_alphas.beta_id` back: neither column has an entity to join, so neither
+    foreign entity is offered under a name that joins nothing."""
+
+    def mart(model: str, grain: str, column: str, ref: str) -> dict:
+        return {
+            "model": model,
+            "description": f"One row per {grain}.",
+            "grain": [grain],
+            "columns": {
+                grain: {"role": "key"},
+                "event_date": {"role": "time"},
+                column: {"role": "foreign_key", "references": ref},
+                "amount": {"role": "measure", "aggregation": "sum"},
+            },
+        }
+
+    marts = [
+        mart("fct_alphas", "alpha_id", "beta_id", "fct_betas.alpha_id"),
+        mart("fct_betas", "beta_id", "alpha_id", "fct_alphas.beta_id"),
+    ]
+    body = {
+        "edits": [
+            {
+                "path": f"models/marts/{m['model']}.sql",
+                "kind": "model_sql",
+                "content": (
+                    "select "
+                    + ", ".join(
+                        "current_date as event_date"
+                        if c == "event_date"
+                        else f"1 as {c}"
+                        for c in m["columns"]
+                    )
+                    + "\n"
+                ),
+            }
+            for m in marts
+        ],
+        "declarations": marts,
+    }
+    rc, envelope = _run(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "transform",
+            "plan",
+            "cycle",
+            "--edits-file",
+            _payload(tmp_path, body),
+        ],
+        capsys,
+    )
+
+    assert rc == 0 and envelope["status"] == "ok", json.dumps(envelope)[:1500]
+    offered = _offered(envelope)
+    assert offered["fct_alphas"]["entities"] == [
+        {"name": "alpha", "type": "primary", "expr": "alpha_id"}
+    ]
+    assert offered["fct_betas"]["entities"] == [
+        {"name": "beta", "type": "primary", "expr": "beta_id"}
+    ]
+    models = envelope["data"]["semantic_proposal"]["models"]
+    assert any(
+        "references fct_betas.alpha_id" in limitation
+        for limitation in models["fct_alphas"]["limitations"]
+    ), models["fct_alphas"]

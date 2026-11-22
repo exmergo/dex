@@ -29,7 +29,7 @@ cannot parse breaks every dbt command in the project.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
@@ -213,6 +213,7 @@ def derive(
     on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
     reserved: Mapping[str, set[str]] | None = None,
     primary_name: str | None = None,
+    drafted: Collection[str] = (),
 ) -> Derivation:
     """The semantic model ``declared`` states, with every gap named.
 
@@ -225,6 +226,8 @@ def derive(
     the marts derived alongside this one will give each element type.
     ``primary_name`` is the primary entity name the plan already settled for this
     mart, used as given so the foreign keys of other marts that join it match.
+    ``drafted`` names the marts ``on_ref`` holds as plan drafts: a reference to
+    one of their columns that carries no entity has nothing to join, ever.
     """
 
     derivation = Derivation(model=model)
@@ -318,7 +321,20 @@ def derive(
     for name, fields in columns.items():
         if fields.get("role") != "foreign_key" or name in grain:
             continue
-        entity, joined = _foreign_entity(name, fields.get("references"), on_ref)
+        references = fields.get("references")
+        entity, joined = _foreign_entity(name, references, on_ref)
+        if (
+            joined is None
+            and isinstance(references, str)
+            and references.rsplit(".", 1)[0] in drafted
+        ):
+            reason = (
+                f"references {references}, a column the plan derives with no "
+                "entity, so no name can join it"
+            )
+            limitations.append(f"{name}: {reason}; the foreign key is not derived")
+            reasons[f"columns.{name}"] = reason
+            continue
         if entity in used_names:
             fallback = _entity_name(name, model)
             if fallback in incompatible | layer["entity"]:
@@ -1207,13 +1223,14 @@ class MetricFlowDerivation:
                 settled[declaration.model] = primary[0]["name"]
                 # a later draft keeps clear of it, so two settled names never meet
                 held["entity"].add(primary[0]["name"])
-        for _ in planned_marts:  # a chain of n marts settles in n passes at most
-            known = authored | {
-                e["name"]
-                for found in drafts.values()
-                for _path, entry in found
-                for e in entry["entities"]
-            }
+        # Only names anchored in an entity that exists either way, the layer's or
+        # a settled primary, enter a draft: a pair of foreign keys that reference
+        # each other with no such anchor never enters, so the drafts only gain
+        # entities and settle. If they still have not settled by the pass limit,
+        # the plan joins primary entities alone rather than a half-settled state.
+        anchored = authored | set(settled.values())
+        primaries = dict(drafts)
+        for _ in range(2 * len(planned_marts) + 2):
             refined: dict[str, list[tuple[str, dict[str, Any]]]] = {}
             for declaration in planned_marts:
                 if declaration.model not in drafts:
@@ -1228,6 +1245,7 @@ class MetricFlowDerivation:
                     },
                     reserved=reserved_for(declaration.model),
                     primary_name=settled[declaration.model],
+                    drafted=set(drafts),
                 ).body
                 if body is None:
                     refined[declaration.model] = drafts[declaration.model]
@@ -1235,7 +1253,7 @@ class MetricFlowDerivation:
                 entities = [
                     e
                     for e in body.get("entities", [])
-                    if e["type"] == "primary" or e["name"] in known
+                    if e["type"] == "primary" or e["name"] in anchored
                 ]
                 refined[declaration.model] = [
                     ("", {"name": body["name"], "entities": entities})
@@ -1243,6 +1261,8 @@ class MetricFlowDerivation:
             if refined == drafts:
                 break
             drafts = refined
+        else:
+            drafts = primaries
         foreign_ref = {model: list(found) for model, found in on_ref.items()}
         foreign_ref.update(drafts)
         for declaration in _parents_first(request.declarations):
@@ -1254,6 +1274,7 @@ class MetricFlowDerivation:
                 on_ref={m: found for m, found in foreign_ref.items() if m != model},
                 reserved=reserved_for(model),
                 primary_name=settled.get(model),
+                drafted=set(drafts),
             )
             derivations.append(derivation)
             if derivation.body is None or derivation.status == "skipped":
