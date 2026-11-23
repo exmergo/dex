@@ -62,6 +62,7 @@ from ..semantic_declarations import Population as Population
 from ..semantic_declarations import PopulationFilter as PopulationFilter
 from ..semantic_declarations import Role as Role
 from ..semantic_declarations import parse_declarations as parse_declarations
+from . import monitors as monitors_mod
 from .claims import CLAIM_KEY, claim_id, claim_of, without_claim
 from .history_reading import history_reader
 from .join_reading import read_model_joins
@@ -623,6 +624,8 @@ def apply_declarations(
     render_tests: bool | list[str] = False,
     generated: list[dict[str, Any]] | None = None,
     dialect: str | None = None,
+    monitors: Any = None,
+    monitor_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Validate ``declarations`` and render them into the plan's edits.
 
@@ -635,6 +638,8 @@ def apply_declarations(
     collects one row per generated test the declarations give, rendered or not
     (see :func:`render`). ``dialect`` is the configured connector, which decides
     whether a kind that names its dialects renders at all (#1451).
+    ``monitors`` and ``monitor_rows`` are the vendor monitors' gate and rows
+    (#1482; see :func:`render`); a gate that stays closed adds one warning.
     """
 
     files = post_change_files(view, edits)
@@ -679,6 +684,8 @@ def apply_declarations(
                     files, view.model_paths, declaration.model, dialect
                 ),
                 history=history,
+                monitors=monitors,
+                monitor_rows=monitor_rows,
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -726,6 +733,10 @@ def apply_declarations(
         warn = _elementary_sampling_warning(view, files)
         if warn is not None and warn not in warnings:
             warnings.append(warn)
+    if monitors is not None and monitors.closed_reason is not None:
+        closed = monitors.warning()
+        if closed is not None and closed not in warnings:
+            warnings.append(closed)
 
     return merged, warnings
 
@@ -1476,6 +1487,8 @@ def render(
     outputs: frozenset[str] | None = None,
     joins: Any = None,
     history: Any = None,
+    monitors: Any = None,
+    monitor_rows: list[dict[str, Any]] | None = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1508,11 +1521,42 @@ def render(
     reported ``stale``, with a note, for a reviewer to remove. ``history``
     reads a declared ``history`` block's snapshot for ``dex_temporal_contract``
     (#1458; see :func:`_generated`).
+
+    ``monitors`` is the gate ``monitors.vendor`` opens (#1482; see
+    :mod:`.monitors`), or ``None`` where it is unset: the vendor's monitors the
+    declaration gives render as model-level tests in the same pass as the
+    generated tests, and ``monitor_rows`` collects one ``data.monitors`` row
+    per monitor, written or not.
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
+    watched: list[dict[str, Any]] = []
+    if monitors is not None:
+        to_write, rows = monitors_mod.decide(
+            content, _effective(text, declaration), monitors, outputs
+        )
+        watched = [
+            {"model": declaration.model, "column": None, "spec": m.spec()}
+            for m in to_write
+        ]
+        if monitor_rows is not None:
+            monitor_rows.extend(rows)
+        if notes is not None:
+            notes.extend(
+                monitors_mod.stale_note(row)
+                for row in rows
+                if row["status"] == monitors_mod.STALE
+            )
     if not gt.kinds():
         # No kind registered: nothing to generate, so no entry to read back.
+        if watched:
+            text = _render(
+                text,
+                Declaration(model=declaration.model),
+                notes,
+                flagged_tests,
+                watched,
+            )
         return text
     planned = _generated(
         _effective(text, declaration),
@@ -1522,7 +1566,7 @@ def render(
         joins,
         history=history,
     )
-    on = [g for g in planned if g["enabled"]]
+    on = [g for g in planned if g["enabled"]] + watched
     if on:
         # Rendered on their own, after the facts: a bare declaration of the
         # model writes no key, so this pass adds the generated tests only.
@@ -3353,6 +3397,10 @@ def _is_listed(spec: Any, listed: list[Any]) -> bool:
     one model (two population filters), so its name alone says nothing.
     """
 
+    if monitors_mod.is_monitor(spec):
+        # A vendor monitor (#1482): its name, without the vendor's namespace,
+        # and the timestamp column it watches.
+        return any(monitors_mod.matches(spec, test) for test in listed)
     name = _spec_name(spec)
     if not gt.is_generated(spec):
         return any(_listed_name(test) == name for test in listed)
@@ -3532,12 +3580,20 @@ def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str,
 
     Read from ``config.meta.dex.assumptions`` rather than from any payload, so a
     plan, the apply that writes it and a later build all report the same list.
+    Each vendor monitor Dex wrote from a declaration (#1482) is an entry too,
+    read from the test's own ``config.meta.dex.monitor``: it names the
+    ``monitor`` and the declaration ``field`` and carries no ``column``.
     """
 
     out: list[dict[str, Any]] = []
     for label, entry in _entries(files, set(models)):
         dex = entry_meta(entry).get(DEX_META_KEY)
+        # The vendor monitors Dex wrote from the declaration (#1482), each
+        # with the field it came from, read from the tests themselves, after
+        # the model's own assumptions.
+        monitored = monitors_mod.decisions(label, entry)
         if not isinstance(dex, dict):
+            out.extend(monitored)
             continue
         for assumption in dex.get("assumptions") or []:
             if not isinstance(assumption, dict):
@@ -3561,6 +3617,7 @@ def decisions(files: Mapping[str, str], models: Iterable[str]) -> list[dict[str,
                     ),
                 }
             )
+        out.extend(monitored)
     return out
 
 

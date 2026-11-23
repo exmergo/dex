@@ -776,6 +776,40 @@ class DeclarationsConfig(BaseModel):
         return value
 
 
+MONITOR_VENDORS = ("elementary",)
+
+
+class MonitorsConfig(BaseModel):
+    """Which observability vendor's monitors a declaration also writes.
+
+    ``vendor``: unset by default, so a plan writes no monitor and a project that
+    sets nothing sees no change. ``elementary`` writes the Elementary dbt
+    package's own tests from a model's declaration, in the same YAML entry and
+    the same plan as the declaration: a column declared with role ``time``
+    becomes the ``timestamp_column`` of ``elementary.volume_anomalies`` and
+    ``elementary.freshness_anomalies``. A monitor is written only where the
+    package is installed (or the same plan adds it) and where the repository's
+    ``dbt_project.yml`` shows the package enabled on ``dbt_prod_target``; where
+    it is disabled there, or that cannot be read, nothing is written and the
+    plan says which. Dex chooses no training setting (sensitivity,
+    ``days_back``, seasonality): each stays the package's default. Unsetting it
+    writes no new monitor and removes none already in the YAML.
+    """
+
+    vendor: str | None = None
+
+    @field_validator("vendor", mode="before")
+    @classmethod
+    def _check_vendor(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, str) or value.strip() not in MONITOR_VENDORS:
+            raise ValueError(
+                f"monitors.vendor must be one of {', '.join(MONITOR_VENDORS)}"
+            )
+        return value.strip()
+
+
 class TransformConfig(BaseModel):
     """Where the project's layers live, for what ``transform plan`` derives.
 
@@ -1771,6 +1805,9 @@ class DexConfig(BaseModel):
     # Whether a declaration renders Dex's generated tests beside the built-ins
     # (issue #1449). Off by default: they run in the project's production runs.
     declarations: DeclarationsConfig = Field(default_factory=DeclarationsConfig)
+    # Which vendor's monitors a declaration also writes (issue #1482). Unset
+    # by default: a plan writes no monitor.
+    monitors: MonitorsConfig = Field(default_factory=MonitorsConfig)
     query: QueryLimits = Field(default_factory=QueryLimits)
     # Opt-in tightening for a guarded build in a sandbox. Off by default, so an
     # interactive build behaves exactly as it did before this existed.
