@@ -39,6 +39,7 @@ from typing import Any
 from .. import model_scope
 from .. import model_versions as mv
 from . import declarations as declarations_mod
+from . import pii_tags
 from .declarations import Declaration, DeclarationError
 from .rewrite import RewriteError
 
@@ -224,6 +225,9 @@ def propose(
     # The project as each accepted proposal leaves it, so two models declared in
     # one shared file are rendered one after the other, the way the plan will.
     rendered = dict(files)
+    # The Elementary PII tag a model's personal-data columns owe (#1487), on
+    # the same gate as the monitors, or ``None`` where none is written.
+    tag_name = _pii_tag(monitors, files)
 
     for index, model in enumerate(order):
         given = by_model.get(model.lower())
@@ -251,6 +255,7 @@ def propose(
             and not supplied_fields
             and not _owes_generated_tests(model, rendered, view, render_tests, dialect)
             and not _owes_monitors(model, rendered, view, monitors, dialect)
+            and not _owes_pii_tags(model, rendered, tag_name)
         ):
             # Whether anything would have been proposed had nothing been declared
             # yet: that separates a model already complete from one dex has no
@@ -313,6 +318,12 @@ def propose(
                 }
             )
             continue
+        tagged: list[dict[str, Any]] = []
+        if tag_name is not None:
+            text, tag_row = pii_tags.tag_entry(text, model, tag_name)
+            tagged = [
+                c for c in (tag_row or {}).get("columns", []) if c["status"] == "added"
+            ]
         if text == rendered.get(path) and not referenced:
             outcome.skipped.append(_why_nothing(model, entry, complete=True))
             continue
@@ -348,6 +359,19 @@ def propose(
                 "monitors": {
                     "value": watched,
                     "evidence": "declared facts; monitors.vendor",
+                },
+            }
+        if tagged:
+            # The Elementary tag each personal-data column owes, which
+            # `monitors.vendor` turns on (#1487): not a measured fact either.
+            fields = {
+                **fields,
+                "pii_tags": {
+                    "value": {
+                        "tag": tag_name,
+                        "columns": [c["column"] for c in tagged],
+                    },
+                    "evidence": "PII marks; monitors.vendor",
                 },
             }
         outcome.proposals.append(
@@ -499,6 +523,33 @@ def _owes_generated_tests(
     except (RewriteError, DeclarationError):
         return False
     return any(row["status"] == "added" for row in referenced)
+
+
+def _pii_tag(monitors: Any, files: Mapping[str, str]) -> str | None:
+    """The tag a personal-data column owes, or ``None`` where the gate
+    writes none (#1487)."""
+
+    from .monitors import ELEMENTARY, NOT_INSTALLED
+
+    if (
+        monitors is None
+        or monitors.vendor != ELEMENTARY
+        or monitors.package == NOT_INSTALLED
+    ):
+        return None
+    return pii_tags.project_tag(files.get("dbt_project.yml"))[0]
+
+
+def _owes_pii_tags(model: str, files: Mapping[str, str], tag_name: str | None) -> bool:
+    """Whether a model with no fact left to propose still owes its personal-data
+    columns the Elementary tag (#1487)."""
+
+    if tag_name is None:
+        return False
+    path = declarations_mod.schema_path(files, model)
+    return path is not None and pii_tags.owes(
+        files.get(path), model, files.get("dbt_project.yml")
+    )
 
 
 def _owes_monitors(

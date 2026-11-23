@@ -419,6 +419,153 @@ def test_a_failing_rendered_test_leaves_no_sample_of_its_rows(
     assert sampled() == 1
 
 
+# --- the PII tags (#1487) ------------------------------------------------------------
+
+#: A model with one personal-data column. The addresses are synthetic, built from
+#: the customer number on a reserved domain: no real person's data.
+CONTACTS_SQL = """select
+    id,
+    cid,
+    'customer' || cast(cid as varchar) || '@example.invalid' as email
+from {{ ref('stg_orders') }}
+"""
+
+#: ``email`` marked as an earlier Dex stamped it, before it wrote any tag, and
+#: three failing tests: one on the marked column (one value outside the list),
+#: one on an unmarked column of the same model (the ids ``fct`` drops), and one
+#: on a column of a model with nothing marked (the cancelled status).
+CONTACTS_YML = """version: 2
+models:
+  - name: stg_contacts
+    columns:
+      - name: id
+        data_tests:
+          - relationships:
+              name: contacts_id_in_fct
+              to: ref('fct')
+              field: id
+      - name: email
+        config:
+          meta:
+            contains_pii: true
+            pii_category: email
+        data_tests:
+          - accepted_values:
+              name: contacts_email_values
+              values: ['customer1@example.invalid', 'customer2@example.invalid',
+                       'customer3@example.invalid', 'customer4@example.invalid']
+  - name: stg_orders
+    columns:
+      - name: status
+        data_tests:
+          - accepted_values:
+              name: orders_status_values
+              values: ['placed']
+"""
+
+_PII_TESTS = ("contacts_email_values", "contacts_id_in_fct", "orders_status_values")
+
+
+def _pii_engine(tmp_path: Path, project: Path):
+    from exmergo_dex_core.config import DexConfig, MonitorsConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    return DexEngine(
+        connector="duckdb",
+        repo_root=str(project.parent),
+        store=FilesystemStore(project.parent),
+        config=DexConfig(
+            connector="duckdb",
+            dbt_target="dev",
+            dbt_project_dir=project.name,
+            dbt_prod_target="prod",
+            monitors=MonitorsConfig(vendor="elementary"),
+        ),
+    )
+
+
+def _strip_model_tag(project: Path) -> None:
+    """Drop the model tag the plan wrote on ``stg_contacts``, keeping the column
+    tag: what the plan would write without :func:`pii_tags._tag_model`."""
+
+    path = project / "models" / "contacts.yml"
+    schema = yaml.safe_load(path.read_text(encoding="utf-8"))
+    [entry] = [m for m in schema["models"] if m["name"] == "stg_contacts"]
+    assert entry["config"].pop("tags") == ["pii"]
+    if not entry["config"]:
+        entry.pop("config")
+    path.write_text(yaml.safe_dump(schema, sort_keys=False), encoding="utf-8")
+
+
+@requires_elementary
+@pytest.mark.parametrize("version", VERSIONS)
+def test_a_failing_test_on_a_column_dex_tags_leaves_no_sample_of_its_rows(
+    tmp_path: Path, elementary_installs: Callable[[str], Path], version: str
+):
+    """#1487, on variant a, where Elementary's materialization handles the
+    project's own tests. Before the plan each failing test copies rows into
+    ``test_result_rows``. After it, the test on the column Dex marks keeps none,
+    and the test on a model Dex marks nothing on still keeps its row. The model
+    tag also zeroes the test on the same model's unmarked column; with that tag
+    stripped by hand and the column tag kept, that test samples again."""
+
+    project = elementary_project(tmp_path, "a", elementary_installs(version))
+    (project / "models" / "stg_contacts.sql").write_text(CONTACTS_SQL, "utf-8")
+    (project / "models" / "contacts.yml").write_text(CONTACTS_YML, "utf-8")
+    warehouse = tmp_path / "dev.duckdb"
+    project_args = ("--project-dir", str(project), "--profiles-dir", str(project))
+    dbt("run", *project_args, cwd=project)
+    rows = (ELEMENTARY_SCHEMA, "test_result_rows", "BASE TABLE")
+    run_results = project / "target" / "run_results.json"
+
+    def sampled() -> dict[str, int]:
+        out: dict[str, int] = {}
+        for name in _PII_TESTS:
+            before = duckdb_census(warehouse)
+            run_results.unlink(missing_ok=True)
+            log = dbt("test", *project_args, "--select", name, cwd=project, check=False)
+            [result] = json.loads(run_results.read_text(encoding="utf-8"))["results"]
+            # Only a completed failure measures sampling: an errored test keeps
+            # no sample either.
+            assert result["status"] == "fail" and result["failures"] >= 1, (
+                f"{name} is meant to fail:\n{log}"
+            )
+            was, now = footprint(before, duckdb_census(warehouse)).get(rows, (0, 0))
+            out[name] = now - was
+        return out
+
+    before = sampled()
+    assert before["contacts_email_values"] == 1
+    assert before["contacts_id_in_fct"] >= 1
+    assert before["orders_status_values"] == 1
+
+    engine = _pii_engine(tmp_path, project)
+    planned = engine.plan(
+        "tag the contacts model's personal data for Elementary",
+        declarations=[{"model": "stg_contacts", "description": "One row per order."}],
+        attribute_rows=False,
+    )
+    assert planned.pii_tags is not None, planned.warnings
+    assert planned.pii_tags["switch"]["status"] == "added"
+    assert planned.pii_tags["rule"] == "model_and_column_tags"
+    engine.apply(planned.plan_id)
+    project_yml = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+    assert project_yml["vars"]["disable_samples_on_pii_tags"] is True
+
+    after = sampled()
+    assert after["contacts_email_values"] == 0
+    assert after["orders_status_values"] == 1
+    # The model tag's trade: the same model's unmarked column keeps no sample.
+    assert after["contacts_id_in_fct"] == 0
+
+    _strip_model_tag(project)
+    column_only = sampled()
+    assert column_only["contacts_email_values"] == 0
+    assert column_only["orders_status_values"] == 1
+    assert column_only["contacts_id_in_fct"] == before["contacts_id_in_fct"]
+
+
 # --- the resolver (#1305) ---------------------------------------------------------
 
 #: What the resolver reads for each variant on ``dev``: whether the package is

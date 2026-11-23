@@ -1645,6 +1645,34 @@ default, or a filter or operator after it is refused. A key naming a location
   `field` and no `column`, so it settles no change-scope entry. Monitors are not
   generated tests: `declarations.render_tests` does not govern them and no
   per-run estimate prices them.
+- The same setting writes Elementary's **PII tag** (#1487). With
+  `monitors.vendor: elementary` and the package installed (or added by the
+  plan), every plan, with or without a declaration, tags each column a model it
+  writes marks as PII in its YAML (any key a reader accepts, at any confidence)
+  in `config.meta.tags`, the model in `config.tags` (both appended to tags
+  already there), and adds `disable_samples_on_pii_tags: true` under `vars:` in
+  `dbt_project.yml` as a `project_yml` edit, so the project's own tests keep no
+  sample of those columns. The tag is `pii`, or the first entry of the
+  project's `pii_tags` (a block scoped to `elementary` wins over the root).
+  Written models are those whose SQL the plan writes, those it declares and
+  those whose YAML entry it changes; `transform declare` proposes a model whose
+  only owed change is the tag (`fields.pii_tags`). A `false` under `pii`,
+  `contains_pii` or `is_pii` wins over a `pii_category` beside it, a tag in any
+  place the package reads (`tags`, `config.tags`, `meta.tags`,
+  `config.meta.tags`, any case) is `already_tagged`, a column with a top-level
+  `meta` and no `config.meta` is `not_written` (`top_level_meta`), and a switch
+  the project sets is kept as written (`set_off_by_project`, `unread`, each
+  warned). A warning states that every test on a tagged model, the project's
+  own included, keeps no sample of its failing rows, and another says where the
+  installed release reads less. `data.pii_tags` holds `vendor`, `tag`,
+  `tag_source` (`default`, `pii_tags`), `switch` (`var`, `status`: `added`,
+  `already_on`, `set_off_by_project`, `unread`, `not_written`; `path`),
+  `release`, `rule` (`none` before 0.19.2, `model_tags_only` from 0.19.2 to
+  0.19.4, which read no column's `config.meta.tags`, `model_and_column_tags`
+  from 0.20.0, `unknown`), `sampling`, `counts` and `models[]` (`model`,
+  `path`, `model_tag`, `columns[]` with `column`, `version`, `status`,
+  `reason`), and is absent where the setting is unset, the package is not
+  installed, or no written model has a marked column.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

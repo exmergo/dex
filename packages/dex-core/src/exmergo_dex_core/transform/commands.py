@@ -354,6 +354,7 @@ def plan(
         pii_metadata,
         generated_tests,
         monitors_report,
+        pii_tags_report,
     ) = _declare(engine, edits, declarations)
     edits = declared
 
@@ -526,6 +527,7 @@ def plan(
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
     result.monitors = monitors_report
+    result.pii_tags = pii_tags_report
     _price_generated_tests(engine, result, edits)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
@@ -843,6 +845,7 @@ def _declare(
     Any,
     dict[str, Any] | None,
     dict[str, Any] | None,
+    dict[str, Any] | None,
 ]:
     """Render the payload's declarations into ``edits``, draft what the cache
     already knows about each model, and warn where intent is missing.
@@ -858,7 +861,9 @@ def _declare(
     switch's setting and each generated test the declarations give, rendered or
     not, or ``None`` where they give none. The sixth is ``data.monitors``
     (#1482): the vendor monitors the declarations give, or ``None`` where
-    ``monitors.vendor`` is unset or nothing was declared.
+    ``monitors.vendor`` is unset or nothing was declared. The seventh is
+    ``data.pii_tags`` (#1487): the Elementary PII tags written on the models
+    the plan writes, or ``None`` where none was owed.
     """
 
     from ..dbt_project import load as load_project
@@ -871,7 +876,7 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}, None, None, None
+        return edits, [], {}, None, None, None, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
@@ -924,6 +929,10 @@ def _declare(
     warnings.extend(draft_warnings)
     edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
     edits = declarations_mod.keep_no_failures_on_personal_columns(view, edits)
+    edits, tag_notes, pii_tags_report = _tag_pii(
+        engine, view, edits, [d.model for d in parsed]
+    )
+    warnings.extend(tag_notes)
     return (
         edits,
         warnings,
@@ -935,7 +944,23 @@ def _declare(
             if monitor_gate is not None
             else None
         ),
+        pii_tags_report,
     )
+
+
+def _tag_pii(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], declared: list[str]
+) -> tuple[list[PlanEdit], list[str], dict[str, Any] | None]:
+    """Tag the personal-data columns of the models the plan writes for
+    Elementary's PII sampling rule (#1487), after the PII stamps so a mark the
+    same plan writes is tagged too. Gated as the vendor monitors are: nothing
+    where ``monitors.vendor`` is unset or the package is not installed."""
+
+    from . import pii_tags
+
+    if engine.config.monitors.vendor is None:
+        return edits, [], None
+    return pii_tags.tag(view, edits, _monitor_gate(engine, edits), declared)
 
 
 def _monitors() -> Any:
@@ -8617,6 +8642,7 @@ def _semantic_plan(
         pii_metadata,
         generated_tests,
         monitors_report,
+        pii_tags_report,
     ) = _declare(engine, edits, declarations)
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
     # caller's call about their own YAML, not about YAML dex wrote for them.
@@ -8683,6 +8709,7 @@ def _semantic_plan(
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
     result.monitors = monitors_report
+    result.pii_tags = pii_tags_report
     _price_generated_tests(engine, result, edits)
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)

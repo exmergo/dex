@@ -473,7 +473,12 @@ fetches the engine's dependencies from PyPI or your configured index.
    writes when the project sets `monitors.vendor`, filtered to the declared
    population, or why none was written (the package missing, disabled or
    unknown on `dbt_prod_target`, or a filter it cannot write); never set that
-   setting unasked either (`${CLAUDE_SKILL_DIR}/references/declarations.md`). When the user
+   setting unasked either (`${CLAUDE_SKILL_DIR}/references/declarations.md`).
+   Relay `data.pii_tags` where present: the same setting tags each
+   personal-data column and its model for Elementary and turns on
+   `disable_samples_on_pii_tags`, so every test on a tagged model, the
+   project's own included, keeps no sample of its failing rows; say so, and
+   relay the `rule` where the installed release reads less than both tags. When the user
    wants models that already exist declared, run `transform declare <models>`
    (none selects every model, 25 per plan). It proposes only what each model's
    YAML does not state and lists every model it skipped; relay `data.skipped`
