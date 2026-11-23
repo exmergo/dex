@@ -7,13 +7,18 @@ hand, in two places, lets the two drift. With ``monitors.vendor`` set in
 vendor's own tests into the same YAML entry, in the same plan and diff, parsed
 by dbt before the plan is stored.
 
-One vendor today, the Elementary dbt package, and one mapping row: a column
-declared with role ``time`` becomes the ``timestamp_column`` of
-``elementary.volume_anomalies`` and ``elementary.freshness_anomalies``.
-``freshness_anomalies`` cannot run without one (the package lists it under
-``mandatory_params``), and ``volume_anomalies`` without one counts the whole
-table once per run, trained only on run history, which is a different monitor
-from the one a time column gives, so neither is written without it.
+One vendor today, the Elementary dbt package, and two mapping rows:
+
+* a column declared with role ``time`` becomes the ``timestamp_column`` of
+  ``elementary.volume_anomalies`` and ``elementary.freshness_anomalies``.
+  ``freshness_anomalies`` cannot run without one (the package lists it under
+  ``mandatory_params``), and ``volume_anomalies`` without one counts the whole
+  table once per run, trained only on run history, which is a different
+  monitor from the one a time column gives, so neither is written without it;
+* the declaration's ``population.filters`` become the ``where_expression`` of
+  every monitor the model gets (#1483), so the monitors measure the rows the
+  model promises and a row outside them bends no training history
+  (:func:`where_expression`).
 
 What this module never does:
 
@@ -46,7 +51,8 @@ from typing import Any
 
 import yaml
 
-from ..semantic_declarations import Declaration, Role
+from ..errors import RequestError
+from ..semantic_declarations import Declaration, PopulationFilter, Role
 from .plans import PlanEdit
 
 #: The vendors this release writes monitors for (``monitors.vendor``).
@@ -79,6 +85,14 @@ PACKAGE_NOT_INSTALLED = "package_not_installed"
 PRODUCTION_DISABLED = "production_disabled"
 PRODUCTION_UNKNOWN = "production_unknown"
 DECLARATION_CHANGED = "declaration_changed"
+# Why a model's population filters could not be written as a where_expression
+# (#1483), so no monitor was written for it: one written without the filter
+# would measure rows the model does not promise.
+FILTER_COLUMN_NOT_OUTPUT = "filter_column_not_output"
+FILTER_UNWRITABLE = "filter_unwritable"
+
+#: The declaration field a ``where_expression`` is written from.
+FILTER_FIELD = "population.filters"
 
 # How the package's production setting was read.
 ENABLED = "enabled"
@@ -309,6 +323,299 @@ def production_enabled(
     return (ENABLED if holds else DISABLED), TARGET_EXPRESSION, text
 
 
+# --- the population filter as a where_expression (#1483) ---------------------
+
+#: Connectors whose identifiers are quoted with backticks; every other one
+#: quotes with double quotes, as its dbt adapter's ``quote`` does.
+_BACKTICK_DIALECTS = frozenset({"bigquery", "databricks", "spark", "clickhouse"})
+
+#: Connectors where a backslash starts an escape sequence in a string literal,
+#: so a backslash is doubled and a quote written ``\'``: the rule the
+#: ``dex_population_filter_literal`` macro applies. ClickHouse doubles the
+#: backslash and the quote. Every other connector doubles the quote alone.
+_BACKSLASH_DIALECTS = frozenset(
+    {"bigquery", "snowflake", "databricks", "spark", "redshift"}
+)
+
+_PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: Words no supported warehouse accepts unquoted as a column name. A column
+#: spelled as one was created quoted, so it is written quoted.
+_RESERVED = frozenset(
+    """
+    all and any as asc between both by case cast check collate column
+    constraint create cross current_date current_time current_timestamp
+    current_user default desc distinct else end except exists false fetch for
+    foreign from full grant group having in inner intersect into is join
+    lateral leading left like limit natural not null offset on or order outer
+    primary qualify references right select some table then to trailing true
+    union unique user using when where window with
+    """.split()  # noqa: SIM905
+)
+
+#: Snowflake's own reserved words, which replace :data:`_RESERVED` there:
+#: those its reserved-keywords page reserves outright, those it bars as a
+#: column name or a column reference (``case``, ``true``, ``current_date``,
+#: ``constraint``, ...), and ``asc`` and ``desc``, which the page's prose
+#: reserves. Snowflake folds an unquoted name to upper case, so quoting a word
+#: it does not reserve (``user``, ``limit``) would name another column. A
+#: column spelled as one of these was created quoted, in a case dex cannot
+#: know, so it is written only where the entry marks it ``quote: true``.
+_SNOWFLAKE_RESERVED = frozenset(
+    """
+    all alter and any as asc between by case cast check column connect
+    constraint create current current_date current_time current_timestamp
+    current_user delete desc distinct drop else exists false following for
+    from grant group having ilike in increment insert intersect into is like
+    localtime localtimestamp minus not null of on or order qualify regexp
+    revoke rlike row rows sample select set some start table tablesample then
+    to trigger true try_cast union unique update values when whenever where
+    window with
+    """.split()  # noqa: SIM905
+)
+
+#: BigQuery's reserved keywords, as its lexical-structure reference lists
+#: them, which replace :data:`_RESERVED` there: a column spelled as one has
+#: to be backtick-quoted (``range``, ``partition``, ``interval``, ``rows``).
+#: BigQuery matches a quoted name case-insensitively, so quoting is safe.
+_BIGQUERY_RESERVED = frozenset(
+    """
+    all and any array as asc assert_rows_modified at between by case cast
+    collate contains create cross cube current default define desc distinct
+    else end enum escape except exclude exists extract false fetch following
+    for from full graph_table group grouping groups hash having if ignore in
+    inner intersect interval into is join lateral left like limit lookup merge
+    natural new no not null nulls of on or order outer over partition preceding
+    proto qualify range recursive respect right rollup rows select set some
+    struct tablesample then to treat true unbounded union unnest using when
+    where window with within
+    """.split()  # noqa: SIM905
+)
+
+_RESERVED_BY_DIALECT = {
+    "snowflake": _SNOWFLAKE_RESERVED,
+    "bigquery": _BIGQUERY_RESERVED,
+}
+
+_JINJA = ("{{", "{%", "{#")
+
+
+class FilterUnwritableError(RequestError):
+    """A population filter dex cannot write as a ``where_expression``.
+
+    ``reason`` is the ``not_rendered`` reason every monitor of the model takes.
+    Never leaves :func:`planned`, which turns it into that reason.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+
+
+def _identifier(column: str, dialect: str | None, *, quote: bool) -> str:
+    """``column`` spelled the way the model's adapter reads it.
+
+    Written as declared, unquoted, which is how dbt and every test it runs
+    name a column, unless it has to be quoted: the YAML entry says ``quote:
+    true``, or the name is not a plain identifier or is a reserved word. Then
+    it is quoted the way the connector's adapter quotes it (backticks on
+    BigQuery, Databricks and ClickHouse, double quotes elsewhere), which needs
+    the connector to be known. Unquoted, Snowflake folds the name to upper
+    case, as it folded the column's own name when dbt created it, so on
+    Snowflake only its own reserved words count, and one of those without
+    ``quote: true`` is unwritable: its case is unknowable. BigQuery reads its
+    own reserved words too, which it matches case-insensitively quoted.
+    """
+
+    if any(mark in column for mark in _JINJA):
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            f"the filter column '{column}' holds a Jinja delimiter, which dbt "
+            "would render",
+        )
+    reserved = _RESERVED_BY_DIALECT.get(dialect or "", _RESERVED)
+    plain = bool(_PLAIN_IDENTIFIER.match(column))
+    if not quote and plain and column.lower() not in reserved:
+        return column
+    if not quote and plain and dialect == "snowflake":
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            f"the filter column '{column}' is a Snowflake reserved word, so it was "
+            "created quoted, in a case dex cannot know: mark the column "
+            "`quote: true` in the model's YAML",
+        )
+    if dialect is None:
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            f"the filter column '{column}' has to be quoted, and no connector is "
+            "configured to say how",
+        )
+    mark = "`" if dialect in _BACKTICK_DIALECTS else '"'
+    if mark in column:
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            f"the filter column '{column}' holds the quote character {mark}",
+        )
+    return f"{mark}{column}{mark}"
+
+
+def _text_literal(text: str, dialect: str | None) -> str:
+    """``text`` as a single-quoted string literal on ``dialect``.
+
+    A line break is refused on every connector: BigQuery's single-quoted
+    strings cannot hold one even escaped, and one written raw would also break
+    the line the YAML holds the expression on.
+    """
+
+    if "\n" in text or "\r" in text:
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            "a filter value holds a line break, which a single-quoted literal "
+            "cannot hold on every connector",
+        )
+    if "'" not in text and "\\" not in text:
+        return f"'{text}'"
+    if dialect is None:
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            "a filter value holds a quote or a backslash, whose escaping depends on "
+            "the connector, and no connector is configured",
+        )
+    if dialect in _BACKSLASH_DIALECTS:
+        return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    if dialect == "clickhouse":
+        return "'" + text.replace("\\", "\\\\").replace("'", "''") + "'"
+    return "'" + text.replace("'", "''") + "'"
+
+
+def _literals(values: list[Any], dialect: str | None) -> str:
+    """The values as SQL literals, comma-joined, typed as declared.
+
+    Text is a quoted string, a number itself and a boolean ``TRUE`` or
+    ``FALSE``, with no cast of the column: the literals' type is the column's
+    type as the declaration states it. ``maintain verify`` and the
+    ``dex_population_filter`` test read the column's type at run time and
+    cast it to text where they must; a ``where_expression`` is fixed text
+    written at plan time, so declare the values in the column's type. A list
+    in another type (``includes: [1, 2]`` on a text column) can fail in the
+    warehouse, or, where the warehouse converts implicitly (DuckDB matches
+    ``'01'`` in a text column against ``1``), change which rows the monitor
+    counts. A list mixing text with numbers or booleans states no one type, so
+    it is unwritable.
+    """
+
+    import math
+
+    texts = [isinstance(v, str) for v in values]
+    if any(texts) and not all(texts):
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            "a filter list mixes text with numbers or booleans, so it states no "
+            "one type to compare the column with: quote every value, or none",
+        )
+    out: list[str] = []
+    for value in values:
+        if isinstance(value, bool):
+            out.append("TRUE" if value else "FALSE")
+        elif isinstance(value, (int, float)):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise FilterUnwritableError(
+                    FILTER_UNWRITABLE, f"the filter value {value} is not a SQL number"
+                )
+            out.append(str(value))
+        else:
+            out.append(_text_literal(str(value), dialect))
+    joined = ", ".join(out)
+    if any(mark in joined for mark in _JINJA):
+        # dbt renders a test argument as Jinja: a value holding a Jinja
+        # delimiter would run as code rather than be compared as text.
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            "a filter value holds a Jinja delimiter, which dbt would render",
+        )
+    return joined
+
+
+def _condition(
+    entry: PopulationFilter,
+    declaration: Declaration,
+    dialect: str | None,
+    quoted: frozenset[str],
+) -> list[str]:
+    column = _identifier(entry.column, dialect, quote=entry.column.lower() in quoted)
+    out: list[str] = []
+    if entry.includes:
+        # `in` drops a NULL row, as the declaration's includes does: a NULL is
+        # outside every list.
+        out.append(f"{column} in ({_literals(entry.includes, dialect)})")
+    if entry.excludes:
+        condition = f"{column} not in ({_literals(entry.excludes, dialect)})"
+        declared = next(
+            (
+                c
+                for name, c in declaration.columns.items()
+                if name.lower() == entry.column.lower()
+            ),
+            None,
+        )
+        never_null = (
+            declared is not None
+            and (declared.null_rule or "").strip().lower() == "never"
+        )
+        if not never_null:
+            # `not in` drops a NULL row, which an excludes keeps: a NULL is no
+            # excluded value. The disjunction is parenthesised because
+            # Elementary splices the expression after its own time-bucket
+            # filter with a bare `and`.
+            condition = f"({condition} or {column} is null)"
+        out.append(condition)
+    return out
+
+
+def where_expression(
+    declaration: Declaration,
+    dialect: str | None,
+    outputs: frozenset[str] | None = None,
+    quoted: frozenset[str] = frozenset(),
+) -> str | None:
+    """The ``where_expression`` ``declaration``'s ``population.filters`` give,
+    or ``None`` where it declares none.
+
+    ``includes: [a, b]`` is ``<column> in ('a', 'b')`` and ``excludes`` is
+    ``<column> not in (...)``, written ``(<column> not in (...) or <column> is
+    null)`` unless the column declares ``null_rule: never``, since ``not in``
+    drops the NULL rows an excludes keeps. Several filters join with ``and``.
+
+    Every part that holds an ``or`` is parenthesised, so the expression reads
+    the same wherever it is spliced: Elementary's table monitors read it as
+    ``where <expression>``, and, with a ``timestamp_column``, as ``where
+    <timestamp> >= <bucket start> and <expression>`` (``table_monitoring_query``
+    at the package's e3ab23d8), with no parentheses of its own.
+
+    The values are the declaration's authored text, never read from data (a
+    filter on a column that looks like personal data is refused before this
+    runs). ``quoted`` names the columns the YAML entry marks ``quote: true``.
+    Raises :class:`FilterUnwritableError` where the filter cannot be written: its
+    column is not one the model outputs (``outputs``, where known), or it
+    needs a quoting or an escaping rule and no connector names one.
+    """
+
+    population = declaration.population
+    if population is None:
+        return None
+    parts: list[str] = []
+    for entry in population.filters:
+        if not (entry.includes or entry.excludes):
+            continue
+        if outputs is not None and entry.column.lower() not in outputs:
+            raise FilterUnwritableError(
+                FILTER_COLUMN_NOT_OUTPUT,
+                f"the filter column '{entry.column}' is not a column the model outputs",
+            )
+        parts.extend(_condition(entry, declaration, dialect, quoted))
+    return " and ".join(parts) or None
+
+
 @dataclass
 class Monitor:
     """One monitor a declaration gives, written or not."""
@@ -319,10 +626,17 @@ class Monitor:
     field: str | None
     withheld: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
+    #: The ``where_expression`` the population filters give (#1483).
+    where_expression: str | None = None
 
     def __post_init__(self) -> None:
         if not self.arguments and self.timestamp_column is not None:
             self.arguments = {"timestamp_column": self.timestamp_column}
+        if self.where_expression is not None and self.withheld is None:
+            self.arguments = {
+                **self.arguments,
+                "where_expression": self.where_expression,
+            }
 
     @property
     def name(self) -> str:
@@ -335,7 +649,10 @@ class Monitor:
 
         [(_, rendered)] = _unsampled(self.name).items()
         meta = dict(rendered["config"]["meta"])
-        meta["dex"] = {MARKER: {"vendor": ELEMENTARY, "from": self.field}}
+        marker: dict[str, Any] = {"vendor": ELEMENTARY, "from": self.field}
+        if "where_expression" in self.arguments:
+            marker["filter"] = FILTER_FIELD
+        meta["dex"] = {MARKER: marker}
         return {
             self.name: {
                 "arguments": dict(self.arguments),
@@ -344,7 +661,12 @@ class Monitor:
         }
 
 
-def planned(declaration: Declaration, outputs: frozenset[str] | None) -> list[Monitor]:
+def planned(
+    declaration: Declaration,
+    outputs: frozenset[str] | None,
+    dialect: str | None = None,
+    quoted: frozenset[str] = frozenset(),
+) -> list[Monitor]:
     """Every monitor ``declaration`` (as the entry states it) gives.
 
     One time column gives a ``volume_anomalies`` and a
@@ -352,6 +674,12 @@ def planned(declaration: Declaration, outputs: frozenset[str] | None) -> list[Mo
     each, and a ``volume_anomalies`` withheld as ``ambiguous_time_column``,
     since it takes one. None gives both withheld as ``no_time_column``. A time
     column the model's SQL provably does not output is ``column_not_output``.
+
+    Each monitor written carries the ``where_expression`` the population
+    filters give (:func:`where_expression`), on ``dialect``. Where they cannot
+    be written, every monitor is withheld with the reason
+    (``filter_column_not_output`` or ``filter_unwritable``) rather than
+    written without the filter.
     """
 
     model = declaration.model
@@ -363,6 +691,12 @@ def planned(declaration: Declaration, outputs: frozenset[str] | None) -> list[Mo
             Monitor(model, test, None, None, withheld=NO_TIME_COLUMN)
             for test in (VOLUME, FRESHNESS)
         ]
+    unwritable: str | None = None
+    where: str | None = None
+    try:
+        where = where_expression(declaration, dialect, outputs, quoted)
+    except FilterUnwritableError as exc:
+        unwritable = exc.reason
 
     def field_of(column: str) -> str:
         return f"columns.{column}.role: time"
@@ -370,17 +704,31 @@ def planned(declaration: Declaration, outputs: frozenset[str] | None) -> list[Mo
     def withheld(column: str) -> str | None:
         if outputs is not None and column.lower() not in outputs:
             return COLUMN_NOT_OUTPUT
-        return None
+        return unwritable
 
     out: list[Monitor] = []
     if len(times) == 1:
         out.append(
-            Monitor(model, VOLUME, times[0], field_of(times[0]), withheld(times[0]))
+            Monitor(
+                model,
+                VOLUME,
+                times[0],
+                field_of(times[0]),
+                withheld(times[0]),
+                where_expression=where,
+            )
         )
     else:
         out.append(Monitor(model, VOLUME, None, None, withheld=AMBIGUOUS_TIME_COLUMN))
     out.extend(
-        Monitor(model, FRESHNESS, column, field_of(column), withheld(column))
+        Monitor(
+            model,
+            FRESHNESS,
+            column,
+            field_of(column),
+            withheld(column),
+            where_expression=where,
+        )
         for column in times
     )
     return out
@@ -424,7 +772,7 @@ def _test_name(test: Any) -> str:
     return ""
 
 
-def _timestamp_of(test: Any) -> str | None:
+def _argument_of(test: Any, name: str) -> str | None:
     if not isinstance(test, Mapping) or len(test) != 1:
         return None
     body = next(iter(test.values()))
@@ -432,24 +780,44 @@ def _timestamp_of(test: Any) -> str | None:
         return None
     nested = body.get("arguments")
     value = (
-        nested.get("timestamp_column")
-        if isinstance(nested, Mapping) and "timestamp_column" in nested
-        else body.get("timestamp_column")
+        nested.get(name)
+        if isinstance(nested, Mapping) and name in nested
+        else body.get(name)
     )
     return str(value) if value is not None else None
+
+
+def _timestamp_of(test: Any) -> str | None:
+    return _argument_of(test, "timestamp_column")
+
+
+def _where_of(test: Any) -> str | None:
+    return _argument_of(test, "where_expression")
+
+
+def _arguments_of(test: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for name in ("timestamp_column", "where_expression"):
+        value = _argument_of(test, name)
+        if value is not None:
+            out[name] = value
+    return out
 
 
 def matches(spec: Any, listed: Any) -> bool:
     """Whether ``listed`` is already the monitor ``spec`` would write.
 
     The test's name is compared without the ``elementary.`` namespace. A
-    monitor Dex wrote matches only on the same ``timestamp_column``, so one
-    left on a column the declaration moved is stale rather than current. A
+    monitor Dex wrote matches only on the same ``timestamp_column`` and the
+    same ``where_expression`` (#1483), so one left on a column the declaration
+    moved, or on a population it no longer declares, is stale rather than
+    current. A
     hand-written ``volume_anomalies`` matches whatever its arguments, since a
     second volume monitor on one model would count its rows twice; a
     hand-written ``freshness_anomalies`` matches on the same
     ``timestamp_column``, since freshness on another column is another
-    monitor.
+    monitor. A hand-written monitor's ``where_expression`` is its author's
+    choice and never compared.
     """
 
     if _bare(_test_name(spec)).lower() != _bare(_test_name(listed)).lower():
@@ -458,7 +826,7 @@ def matches(spec: Any, listed: Any) -> bool:
     theirs = _timestamp_of(listed)
     same = (ours or "").lower() == (theirs or "").lower()
     if is_monitor(listed):
-        return same
+        return same and (_where_of(spec) or "") == (_where_of(listed) or "")
     if _bare(_test_name(spec)).lower() == VOLUME:
         return True
     return same
@@ -468,14 +836,38 @@ def entry_tests(content: str | None, model: str) -> list[Any]:
     """The model-level tests ``content`` lists for ``model`` (a version label
     reads that version as dbt builds it)."""
 
+    node = _entry(content, model)
+    if not isinstance(node, Mapping):
+        return []
+    listed = node.get("data_tests") or node.get("tests") or []
+    return list(listed) if isinstance(listed, list) else []
+
+
+def quoted_columns(content: str | None, model: str) -> frozenset[str]:
+    """The columns ``content``'s entry for ``model`` marks ``quote: true``,
+    lower-cased: dbt quotes those, so the ``where_expression`` does too."""
+
+    node = _entry(content, model)
+    columns = node.get("columns") if isinstance(node, Mapping) else None
+    return frozenset(
+        str(c["name"]).lower()
+        for c in columns or []
+        if isinstance(c, Mapping)
+        and c.get("name") is not None
+        and c.get("quote") is True
+    )
+
+
+def _entry(content: str | None, model: str) -> Any:
+
     from .. import model_versions as mv
 
     if not content:
-        return []
+        return None
     try:
         loaded = yaml.safe_load(content)
     except yaml.YAMLError:
-        return []
+        return None
     base, version = mv.split_label(model)
     entries = loaded.get("models") if isinstance(loaded, Mapping) else None
     node: Any = next(
@@ -496,10 +888,7 @@ def entry_tests(content: str | None, model: str) -> list[Any]:
             None,
         )
         node = mv.effective_entry(node, item) if item is not None else None
-    if not isinstance(node, Mapping):
-        return []
-    listed = node.get("data_tests") or node.get("tests") or []
-    return list(listed) if isinstance(listed, list) else []
+    return node if isinstance(node, Mapping) else None
 
 
 def decide(
@@ -507,16 +896,19 @@ def decide(
     declaration: Declaration,
     the_gate: Gate,
     outputs: frozenset[str] | None,
+    dialect: str | None = None,
 ) -> tuple[list[Monitor], list[dict[str, Any]]]:
     """The monitors to write into ``content`` for ``declaration`` (the effective
-    one), and a provisional row per monitor; :func:`finish` settles ``added``
-    against the rendered text."""
+    one), and a row per monitor. ``dialect`` is the configured connector, which
+    decides how a ``where_expression`` quotes and escapes (#1483)."""
 
     listed = entry_tests(content, declaration.model)
+    quoted = quoted_columns(content, declaration.model)
     closed = the_gate.closed_reason
     to_write: list[Monitor] = []
     rows: list[dict[str, Any]] = []
-    for monitor in planned(declaration, outputs):
+    gives = planned(declaration, outputs, dialect, quoted)
+    for monitor in gives:
         row: dict[str, Any] = {
             "model": monitor.model,
             "test": monitor.name,
@@ -537,34 +929,81 @@ def decide(
             row["status"] = ADDED
             to_write.append(monitor)
         rows.append(row)
-    planned_specs = [
-        m.spec() for m in planned(declaration, outputs) if m.withheld is None
-    ]
+    planned_specs = [m.spec() for m in gives if m.withheld is None]
     for test in listed:
         if not is_monitor(test):
             continue
         if any(matches(spec, test) for spec in planned_specs):
             continue
         marker = marker_of(test) or {}
-        rows.append(
-            {
-                "model": declaration.model,
-                "test": _test_name(test),
-                "column": _timestamp_of(test),
-                "arguments": (
-                    {"timestamp_column": _timestamp_of(test)}
-                    if _timestamp_of(test) is not None
-                    else {}
-                ),
-                "field": marker.get("from"),
-                "status": STALE,
-                "reason": DECLARATION_CHANGED,
-            }
+        # The same test on the same time column is one the population moved
+        # (#1483): only its where_expression is out of date. Read from every
+        # monitor the declaration gives, withheld ones included, so a filter
+        # dex cannot write still reads as the population moving, not the time
+        # column, and the note keeps the old monitor.
+        same_time = any(
+            m.timestamp_column is not None
+            and m.test.lower() == _bare(_test_name(test)).lower()
+            and m.timestamp_column.lower() == (_timestamp_of(test) or "").lower()
+            for m in gives
         )
+        stale: dict[str, Any] = {
+            "model": declaration.model,
+            "test": _test_name(test),
+            "column": _timestamp_of(test),
+            "arguments": _arguments_of(test),
+            "field": marker.get("from"),
+            "status": STALE,
+            "reason": DECLARATION_CHANGED,
+            "changed": "where_expression" if same_time else "timestamp_column",
+        }
+        if same_time:
+            # Whether the monitor the population now gives is on the model
+            # (written by this plan, already listed, or hand-written), or was
+            # held back (a closed gate): only then is the stale one redundant.
+            current = next(
+                (
+                    r
+                    for r in rows
+                    if r.get("status") != STALE
+                    and _bare(str(r["test"])).lower() == _bare(stale["test"]).lower()
+                    and (r.get("column") or "").lower()
+                    == (stale["column"] or "").lower()
+                ),
+                None,
+            )
+            stale["replacement"] = (
+                {"status": current["status"], "reason": current.get("reason")}
+                if current is not None
+                else {"status": NOT_RENDERED, "reason": None}
+            )
+        rows.append(stale)
     return to_write, rows
 
 
+#: The replacement statuses under which the current monitor is on the model.
+_REPLACED = (ADDED, ALREADY_LISTED, HAND_WRITTEN)
+
+
 def stale_note(row: Mapping[str, Any]) -> str:
+    if row.get("changed") == "where_expression":
+        replacement = row.get("replacement") or {}
+        lead = (
+            f"'{row['model']}' lists {row['test']} on {row.get('column')}, written "
+            "by dex with a where_expression the declared population.filters no "
+            "longer give"
+        )
+        if replacement.get("status") in _REPLACED:
+            return (
+                f"{lead}; the current one is listed beside it and dex leaves this "
+                "one in place: remove it, since two such monitors on one model each "
+                "count its rows"
+            )
+        why = replacement.get("reason") or "it was not written"
+        return (
+            f"{lead}; dex did not write the current one ({why}), so keep this one "
+            "until it can be written, then remove it"
+        )
     return (
         f"'{row['model']}' lists {row['test']} on "
         f"{row.get('column') or 'no timestamp column'}, written by dex from "
@@ -614,21 +1053,27 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
             continue
         name = _test_name(test)
         timestamp = _timestamp_of(test)
+        where = _where_of(test)
         source = marker.get("from")
+        chosen = [
+            f"{key}: {value}"
+            for key, value in (
+                ("timestamp_column", timestamp),
+                ("where_expression", where),
+            )
+            if value is not None
+        ]
+        sources = [s for s in (source, marker.get("filter")) if isinstance(s, str)]
         out.append(
             {
                 "model": label,
                 "decision": f"Monitor {name}",
-                "chosen": (
-                    f"timestamp_column: {timestamp}"
-                    if timestamp is not None
-                    else "the package's defaults"
-                ),
+                "chosen": "; ".join(chosen) or "the package's defaults",
                 "evidence": "contract",
                 "detail": (
-                    f"written from {source}; training settings are the "
-                    "package's defaults"
-                    if source
+                    f"written from {' and '.join(sources)}; training settings are "
+                    "the package's defaults"
+                    if sources
                     else "written by dex from the model's declaration"
                 ),
                 "monitor": name,

@@ -250,7 +250,7 @@ def propose(
             not fields
             and not supplied_fields
             and not _owes_generated_tests(model, rendered, view, render_tests, dialect)
-            and not _owes_monitors(model, rendered, view, monitors)
+            and not _owes_monitors(model, rendered, view, monitors, dialect)
         ):
             # Whether anything would have been proposed had nothing been declared
             # yet: that separates a model already complete from one dex has no
@@ -336,7 +336,7 @@ def propose(
                 },
             }
         watched = [
-            {k: row[k] for k in ("test", "column", "field")}
+            {k: row[k] for k in ("test", "column", "arguments", "field")}
             for row in monitor_rows
             if row["status"] == "added"
         ]
@@ -502,7 +502,11 @@ def _owes_generated_tests(
 
 
 def _owes_monitors(
-    model: str, files: Mapping[str, str], view: Any, monitors: Any
+    model: str,
+    files: Mapping[str, str],
+    view: Any,
+    monitors: Any,
+    dialect: str | None = None,
 ) -> bool:
     """Whether the model's declaration gives a vendor monitor its YAML does not
     list yet, with the gate open (#1482): a model declared before
@@ -520,6 +524,7 @@ def _owes_monitors(
             files.get(path),
             Declaration(model=model),
             outputs=declarations_mod.model_outputs(files, view.model_paths, model),
+            dialect=dialect,
             monitors=monitors,
             monitor_rows=rows,
         )

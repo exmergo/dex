@@ -78,6 +78,10 @@ INTERNAL_REFUSALS = {
     # Caught before a caller sees it: `dex init` reports the Elementary install
     # as `not_offered` with the refusal's words as its `reason` (#1464).
     "InstallRefusedError",
+    # Caught before a caller sees it: a population filter dex cannot write as a
+    # monitor's where_expression becomes the `not_rendered` reason of the
+    # model's monitors in `data.monitors` (#1483).
+    "FilterUnwritableError",
     # Caught before a caller sees it: a retirement tree that does not compile
     # becomes `compile_unavailable` records (#1170).
     "CompileUnavailableError",

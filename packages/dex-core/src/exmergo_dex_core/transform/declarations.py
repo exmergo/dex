@@ -1533,7 +1533,7 @@ def render(
     watched: list[dict[str, Any]] = []
     if monitors is not None:
         to_write, rows = monitors_mod.decide(
-            content, _effective(text, declaration), monitors, outputs
+            content, _effective(text, declaration), monitors, outputs, dialect
         )
         watched = [
             {"model": declaration.model, "column": None, "spec": m.spec()}
