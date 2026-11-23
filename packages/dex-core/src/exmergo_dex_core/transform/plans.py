@@ -1441,7 +1441,7 @@ def _plan_id(
         "edits": [e.model_dump(mode="json") for e in edits],
     }
     if project_dir is not None:
-        norm = str(project_dir).replace("\\", "/").strip()
+        norm = str(project_dir).replace("\\", "/")
         if norm.startswith("./"):
             norm = norm[2:]
         payload["project_dir"] = norm or "."

@@ -2483,3 +2483,21 @@ def test_legacy_stored_plans_can_be_read_and_applied(tmp_path: Path):
         res_nested = engine.apply("plegacynest")
     assert res_nested.written == ["models/nested_model.sql"]
     assert (tmp_path / "nested" / "models" / "nested_model.sql").exists()
+
+
+def test_plan_id_distinguishes_whitespace_in_project_dir():
+    """Project identity preserves directory whitespace distinctions."""
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit, _plan_id
+
+    edits = [
+        PlanEdit(
+            path="models/mart.sql",
+            new_content="select 1 as id\n",
+            op=EditOp.UPSERT,
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+    pid1 = _plan_id("intent", edits, project_dir="analytics")
+    pid2 = _plan_id("intent", edits, project_dir=" analytics")
+    assert pid1 != pid2
