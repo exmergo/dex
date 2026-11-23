@@ -40,6 +40,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from .. import dbt_tests
+from ..manifest_paths import posix
 
 #: The resource types inventoried, and the section each one is reported in.
 SECTIONS: dict[str, str] = {
@@ -157,7 +158,7 @@ def _names_for(resource: _Resource) -> set[str]:
     node = resource.node
     names = {resource.label.lower(), str(node.get("name") or "").lower()}
     if resource.resource_type == "model" and node.get("version") not in (None, ""):
-        stem = PurePosixPath(str(node.get("original_file_path") or "")).stem
+        stem = PurePosixPath(posix(node.get("original_file_path"))).stem
         if stem:
             names.add(stem.lower())
     if resource.resource_type == "source":
@@ -560,7 +561,7 @@ def _record(
     }
     path = node.get("original_file_path")
     if path:
-        record["path"] = str(path)
+        record["path"] = posix(path)
     if resource.resource_type == "model":
         materialized = _materialized(node)
         record["materialized"] = materialized

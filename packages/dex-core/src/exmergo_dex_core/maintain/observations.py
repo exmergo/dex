@@ -17,8 +17,9 @@ from __future__ import annotations
 import itertools
 import re
 import statistics
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -44,6 +45,31 @@ CommitBasis = Literal["git_sha", "orchestrator", "unknown"]
 COMMIT_PATTERN = r"^[0-9a-fA-F]{4,64}$"
 
 _COMMIT = re.compile(COMMIT_PATTERN)
+
+#: dbt's test statuses, lowercased, as every source maps them (#1468, #1471):
+#: a pass is observed good; a failure, an error and a warning are observed bad
+#: (a warning keeps its severity); a skipped test is unobserved, never good.
+DBT_OUTCOMES: Mapping[str, Outcome] = MappingProxyType(
+    {
+        "pass": "good",
+        "fail": "bad",
+        "error": "bad",
+        "warn": "bad",
+        "skipped": "unobserved",
+    }
+)
+
+#: Which status a run keeps when one subject and signal has several there: a
+#: failure over a warning over a pass over nothing, as dbt ranks severity.
+DBT_PRECEDENCE: Mapping[str, int] = MappingProxyType(
+    {
+        "fail": 0,
+        "error": 0,
+        "warn": 1,
+        "pass": 2,
+        "skipped": 3,
+    }
+)
 
 #: Fewest dated points a schedule is derived from (two gaps).
 MIN_SCHEDULE_POINTS = 3

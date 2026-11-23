@@ -277,6 +277,82 @@ break counts the unobserved runs, the missed runs and their reasons. Where no
 observed pass precedes the failure, the break is after `unknown`. An incident's
 `onset` is the break at its first failure.
 
+## Sources
+
+Each source has an adapter that turns what it recorded into observations and a
+run history (a `SourceHistory`: its runs and the oldest point it still holds).
+An adapter opens and closes no incident: `fold_incidents` does that, by the one
+rule above, whichever source the observations came from.
+
+### dbt run results
+
+`exmergo_dex_core.maintain.run_results_incidents` reads the test results in the
+`run_results.json` dbt writes, under the source name `dbt_run_results`. It needs
+no warehouse connection and no Elementary package, so it works on every dbt
+project. `read_run_results(project_dir, manifest)` finds the file and reads it;
+`observe_run_results(document, manifest)` maps a document already parsed.
+
+- **Which run.** The newest `run_results.json` a building dbt command left
+  (`build`, `test`, `run`, `seed`, `snapshot`) that holds a test result, in
+  the project's target path or dex's isolated build directory, each with the
+  `cold/` directory beside it. A later `dbt run` or `dbt seed` holds no test
+  result, so it observes nothing; it is passed over, with a note, rather than
+  hiding the failures of the build before it. A `compile`, `parse` or `ls`
+  writes the file too, where `success` means compiled, so it is never read.
+  The runs in those directories are separate invocations, often against
+  separate targets, and are not stitched into one history.
+- **One invocation, so no known start.** The file holds one invocation, which
+  is the source's whole history and its retention bound. Every interval before
+  it is unobserved, and every incident read from it alone has `first_observed:
+  unknown`. The run read is never reported as the start of a failure.
+- **A run the project did not log is refused.** When the dbt logs beside the
+  file do not name its invocation, the file came from somewhere else (copied
+  artifacts, another checkout), and nothing is read from it. With no log to
+  check, it is read, and a note says so.
+- **Only current tests.** A result is observed only for a test (or unit test)
+  the current manifest still has, enabled. A result for one since removed or
+  disabled is counted and dropped. A test the run did not reach has no
+  observation, so the timeline reads that run as one that did not check it.
+- **Statuses.** `pass` is observed good. `fail`, `error` (`runtime error` on
+  older dbt releases) and `warn` are observed bad. `skipped` is unobserved,
+  never good. A status outside those is counted and gives no observation.
+- **Subject and severity.** The subject is the test's claim id where its
+  manifest node carries one in `config.meta.dex.claim`, else its `unique_id`;
+  `manifest_claims` in `exmergo_dex_core.transform.claims` reads the claims from
+  a manifest. The signal is always empty, since dbt writes one result per test.
+  A warning carries severity `warn`; a failure or an error carries the token
+  the test's `config.severity` sets, where it is one.
+- **No commit.** `run_results.json` records none, so every run's commit is
+  `unknown`.
+
+Both take a keyword `sequence`, the run's place in invocation order (1 by
+default). Folded beside another source that observed the same invocation
+(Elementary's `dbt_invocations` carries dbt's `invocation_id`), the caller
+passes the place that source gave it, since the fold refuses one run at two
+places.
+
+`read_run_results` returns a `status` of `read`, `missing` (`no_run_results`:
+no building run on disk; `no_test_results`: none of them ran a test) or
+`refused` (`unlogged_invocation`, or
+`no_invocation_id` for a file that names no invocation, since a run id is never
+invented), with the run it found, the counts of what it dropped, and notes
+naming each. From a result row it reads `unique_id` and `status` and nothing
+else: never `message`, `compiled_code`, `failures`, `adapter_response` or
+`relation_name`.
+
+### Elementary's tables
+
+`exmergo_dex_core.maintain.elementary_incidents` reads `dbt_invocations` and
+`elementary_test_results`, under the source name `elementary`, where the project
+installs the Elementary package. It holds both tables to the release's recorded
+layout before writing a statement, sends every statement through the query
+firewall, the source allowlist and the cost handshake, and reads ids, status and
+severity tokens, an anomaly test's column and metric, each run's times and
+commit, and counts. It maps dbt's statuses as the run-results adapter does.
+Unlike `run_results.json`, the tables hold many invocations, so an incident read
+from them has a known start wherever an observed pass precedes its first
+failure.
+
 ## No value crosses into an incident
 
 An incident, a timeline and a history carry ids, statuses, counts, times and

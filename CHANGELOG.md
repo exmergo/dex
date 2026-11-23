@@ -14,6 +14,222 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.18.5] - 2026-11-23
+
+### Added
+
+- **Test failures fold into incidents by one rule, whatever their source.**
+  `exmergo_dex_core.maintain.incidents` adds an `Incident` value type and
+  `fold_incidents`, which turns the outcomes every test-result source records into
+  incidents: an observed failure opens or extends one, two consecutive passes from
+  the source that opened it close it (set per check), an unobserved run neither
+  opens nor closes one, a check that stopped running ends `no_longer_observed`
+  against a schedule derived from its history, and a source that disagrees is
+  attached as evidence. A first failure no source holds a pass before is reported
+  `unknown`. Incidents carry ids, statuses and times, never a value from the data.
+  The command that returns them comes in a later release. ([#1556](https://github.com/exmergo/dex/pull/1556))
+- **A coverage timeline that never reads an unobserved interval as good.**
+  `exmergo_dex_core.maintain.timeline` lays one source's runs out in invocation
+  order on a named heartbeat (`dbt_invocations`, else the orchestrator's run
+  history, else the `maintain snapshot` series, and it says which and why), and
+  marks every interval that recorded no outcome as unobserved with its reason: a
+  gap longer than the expected schedule allows, a run with Elementary's hooks or
+  test uploads off, a missed snapshot, the time before retention, or a run that
+  did not check the test. Each run carries its commit, or `unknown`. Per test, the
+  history gives the last verified run and each break, after the last observed
+  pass up to and including the first observed failure, widened by any unobserved
+  interval between them. Incidents now carry their coverage on that timeline and
+  their `onset` break. ([#1561](https://github.com/exmergo/dex/pull/1561))
+- **The Elementary reader holds the package's tables to a recorded layout, and refuses one it does not know.**
+  Dex reads `elementary_test_results`, `dbt_invocations`, `test_result_rows` and
+  `data_monitoring_metrics` as evidence, and their columns can change between
+  releases without the package calling it a breaking change.
+  `exmergo_dex_core.maintain.elementary_layouts` records each table's columns at
+  Elementary 0.26.1, copied from the package's model files at that tag, and
+  checks the warehouse's catalog before a read touches the tables:
+
+  - A release with no recorded layout is refused with `elementary_release_untested`
+    (or `elementary_release_unknown` where none can be read), before the catalog
+    is asked. The reader's releases are held to the ones the Elementary fixture
+    runs, so they can be fewer and never more.
+  - A column the reader uses that is gone is `elementary_column_missing`, one in
+    another type family is `elementary_column_retyped`, and a table the catalog
+    lists nothing for is `elementary_table_missing`, each naming the table and the
+    column. A catalog listing past 500 columns is refused as
+    `elementary_catalog_too_large`.
+
+  The refusal is `ElementaryLayoutError`, importable from `exmergo_dex_core`. No
+  command reads the tables yet: the incident reader (#1471) and
+  `dex maintain incidents` (#1472) build on this check.
+
+  ([#1562](https://github.com/exmergo/dex/pull/1562))
+- **The engine reads test outcomes from Elementary's tables as incident observations.**
+  `exmergo_dex_core.maintain.elementary_incidents` reads `dbt_invocations` and
+  `elementary_test_results` in the schema the package writes, and returns the
+  observations and run history `fold_incidents` and `build_timeline` take. It
+  selects ids, status and severity tokens, an anomaly test's column and metric,
+  each run's times, commit and package version, and counts. It never selects a
+  sampled row or a value a test failed on.
+
+  - `plan_read` holds both tables to the release's recorded layout before writing
+    a statement, and refuses where the layout check refuses.
+  - `read_elementary` sends every statement through the query firewall, the
+    source allowlist, the cost handshake and the query ledger, as `explore query`
+    does. The first read on a fresh cache profiles the two tables and reports
+    `first_read` with what the profiling was priced at.
+  - One call reads at most 2,000 invocations and 100,000 result rows. It counts
+    first and refuses past either bound (`elementary_read_too_large`) before it
+    reads a row. `since` reads a later window.
+  - Result rows are deduplicated on `id`, and each run gets one place in the
+    order, by `run_started_at` and never by `created_at` alone. A result whose
+    run has no `dbt_invocations` row is counted and not observed.
+  - It refuses, each with its own code: an empty history, an invocation with no
+    readable start, an invocation written twice with different starts, a run
+    written by a release other than the one checked, a status it does not map,
+    one result id holding two records, and an id too long to hold.
+
+  The refusal is `ElementaryReadError`, importable from `exmergo_dex_core` with no
+  extra installed. No command calls the reader yet: `dex maintain incidents`
+  (#1472) builds on it.
+
+  A profile of the package's own models no longer computes or caches a value
+  domain, minimum or maximum for `test_results_description`, `test_results_query`
+  or `test_params`, the text columns that can quote a value (a result message,
+  compiled SQL, a test's arguments). This holds for every profile, whether
+  `explore profile`, `explore map` or the one a query triggers, and a cache
+  written before it drops those values when loaded. `explore query` still projects
+  the three columns under the cache's PII flags.
+
+  ([#1564](https://github.com/exmergo/dex/pull/1564))
+- **A declared time column writes the Elementary monitors that watch it, behind a new `monitors.vendor` setting.**
+  With `monitors.vendor: elementary` in `.dex/config.yml`, a plan that renders a
+  declaration also writes `elementary.volume_anomalies` and
+  `elementary.freshness_anomalies` into the model's YAML entry, each with the
+  column declared `role: time` as its `timestamp_column`, in the same plan and
+  diff as the declaration. Several time columns give a freshness monitor on each
+  and no volume monitor; no time column gives neither. Dex chooses no training
+  setting: sensitivity, `days_back` and seasonality stay the package's defaults.
+
+  - A monitor is written only where the package is installed and the repository's
+    `dbt_project.yml` enables it on the production target, read with `target.name`
+    replaced by `dbt_prod_target`. Disabled, or not readable, and nothing is
+    written; a warning says which.
+  - A monitor the project wrote by hand is reported `hand_written` and never
+    touched, and one Dex wrote that the declaration no longer gives is reported
+    `stale` and never removed.
+  - `data.monitors` reports the package and production reading and one row per
+    monitor, and each monitor Dex wrote is a `data.decisions` entry naming the
+    declaration field it came from, read back from the YAML. `transform declare`
+    writes the monitors an earlier declaration owes.
+
+  Unset (the default), nothing changes. The rest of #1444's mapping rows build on
+  this setting.
+
+  ([#1565](https://github.com/exmergo/dex/pull/1565))
+- **A break's commit range is read from the repository's history, not from run order.**
+  Each run on the coverage timeline now carries where its commit came from: the
+  invocation's `git_sha`, else the commit the orchestrator records for the run,
+  else `unknown`. Given the repository's history (`GitHistory` for a local
+  checkout, `MappedHistory` for a commit graph held in memory), each break and
+  each incident's `onset` also carries `commits`: the commits the first failing
+  commit has that no earlier passing ancestor commit has, as `git bisect` would
+  search them. A passing run whose commit descends from the failing one (a
+  rollback, or a branch deployed in turn) is left out of the bound, and the range
+  says the run order disagreed. Two commits on diverged branches are reported as
+  `not_ordered`, and a failing commit that passed before as `same_commit`, with
+  no commit in the range. A commit is a hexadecimal object name and nothing else. ([#1568](https://github.com/exmergo/dex/pull/1568))
+- **The engine reads test outcomes from dbt's `run_results.json` as incident observations.**
+  `exmergo_dex_core.maintain.run_results_incidents` turns the test results in the
+  newest `run_results.json` a dbt `build`, `test`, `run`, `seed` or `snapshot`
+  left into the observations and run history `fold_incidents` and
+  `build_timeline` take, under the source name `dbt_run_results`. It needs no
+  warehouse connection and no Elementary package.
+
+  - A later run that ran no test (a `dbt run`, a `dbt seed`) is passed over, with
+    a note, so it does not hide the failures of the build before it. Runs that
+    never tested read `missing` (`no_test_results`), not clean.
+  - One invocation is all the file holds, so every incident read from it alone
+    has `first_observed: unknown`, and every interval before the run is
+    unobserved.
+  - `pass` is observed good; `fail`, `error` and `warn` are observed bad, a
+    warning keeping severity `warn`; `skipped` is unobserved, never good.
+  - Only a test the current manifest still has, enabled, is observed. A test
+    carrying a claim id in `config.meta.dex.claim` is keyed by it.
+  - A `compile`, `parse` or `ls` is never read. A run no dbt log beside the file
+    names is refused (`unlogged_invocation`), and a file naming no invocation is
+    refused (`no_invocation_id`).
+  - From a result row it reads the test's id and status only, never its message,
+    compiled SQL or failure count.
+
+  `exmergo_dex_core.transform.claims.manifest_claims` reads each test's claim id
+  from a compiled manifest. No command calls the adapter yet: `dex maintain
+  incidents` builds on it.
+
+  ([#1570](https://github.com/exmergo/dex/pull/1570))
+
+### Changed
+
+- **Dex states the Elementary releases it supports, and reports a result it cannot vouch for on any other release as unchecked.**
+  The supported range is the releases the Elementary fixture runs, from the oldest
+  to the newest (0.15.2 to 0.26.1 today), and the engine's list is held to the
+  fixture's by a test. On a release outside it, a patch above the newest included,
+  or one Dex cannot read from the installed package's `dbt_project.yml`, Dex no
+  longer acts on what the package does as if the release were one it knows:
+
+  - `transform build` lists every passing Elementary test whose compiled SQL is
+    not the package's no-results query under
+    `data.completion.assurance.unchecked_tests` with `elementary_release_untested`
+    or `elementary_release_unknown`, so none counts toward a model's assurance,
+    and a warning names the release read and the newest tested.
+  - The unpriced Elementary work (#1309) is counted wherever it may run, a default
+    `days_back` is `unknown`, and `data.unpriced` carries `release` and
+    `release_reason_code`.
+  - The #1381 sampling warning also fires above the newest tested release.
+  - A mutation run still makes the copy inert the same way, and warns.
+
+  A consumer that reads `assurance.unchecked_tests` reason codes or `data.unpriced`
+  sees the two new codes and fields only on a release outside the range.
+
+  ([#1560](https://github.com/exmergo/dex/pull/1560))
+
+### Fixed
+
+- **`fold_incidents` counts the passes that close an incident by run, and refuses
+  input it cannot order.** Two rows for one test in one run counted as two passes,
+  so an incident could close after a single passing run, and a run that both
+  failed and passed counted toward the close. Each source now has one outcome per
+  run, a failure over a pass, as the coverage timeline already merges a run.
+
+  A run id that carries two `sequence` values, or a `sequence` that carries two
+  run ids, across the observations, the sources' runs and the timelines is refused
+  with a `FoldInputError` (`run_sequence_conflict` or `sequence_run_conflict`),
+  rather than read in an order that sets one source's outcomes against another's
+  wrongly. Where two sources fail in the run that opens an incident, the source
+  named first in `sources` opens it; a tie that involves a source `sources` does
+  not name is refused (`opener_tie_undeclared`). Before, the
+  alphabetically first source opened it, which could leave an incident that no
+  source could close. ([#1563](https://github.com/exmergo/dex/pull/1563))
+- **Windows: manifest paths and CRLF files no longer break plan matching.**
+  dbt writes a node's `original_file_path` and `patch_path` with backslashes on
+  Windows, and the engine compared them with the forward-slash paths a plan
+  names, so some results came out wrong on Windows:
+
+  - `transform build --verify --for-plan` measured no downstream impact
+    (`no_rewritten_model`) and did not attribute findings on new models.
+  - `transform remove var` with a `retirement` contract read column coverage as
+    `partial` and missed reads that a macro emits.
+  - A `toggle` contract missed macro reads and reported a test's file with
+    backslashes.
+  - `package_entry` paths were shown with backslashes.
+
+  Every manifest path is now read with `/`. A git `HEAD` baseline committed with
+  CRLF line endings now matches its recorded hash. A `transform repair` override
+  drafted from a CRLF package file is restated with LF, so its build is no
+  longer reported `stale`.
+
+  ([#1570](https://github.com/exmergo/dex/pull/1570))
+
+
 ## [1.18.4] - 2026-11-22
 
 ### Added

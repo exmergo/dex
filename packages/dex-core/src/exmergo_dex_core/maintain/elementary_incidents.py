@@ -87,6 +87,8 @@ from .elementary_refusals import (
 )
 from .incidents import SourceHistory
 from .observations import (
+    DBT_OUTCOMES,
+    DBT_PRECEDENCE,
     SEVERITY_PATTERN,
     Observation,
     ObservedPoint,
@@ -112,24 +114,10 @@ MAX_INVOCATIONS = 2000
 MAX_RESULT_ROWS = 100_000
 
 
-#: dbt's test statuses, as Elementary lowers them, mapped as #1468 maps dbt's.
-_OUTCOMES: Mapping[str, Outcome] = {
-    "pass": "good",
-    "fail": "bad",
-    "error": "bad",
-    "warn": "bad",
-    "skipped": "unobserved",
-}
-
-#: Which row a run keeps when one subject and signal has several, by status:
-#: a failure over a warning over a pass over nothing, as dbt ranks severity.
-_PRECEDENCE: Mapping[str, int] = {
-    "fail": 0,
-    "error": 0,
-    "warn": 1,
-    "pass": 2,
-    "skipped": 3,
-}
+#: dbt's test statuses, as Elementary lowers them, mapped as #1468 maps dbt's,
+#: and the row a run keeps when one subject and signal has several.
+_OUTCOMES = DBT_OUTCOMES
+_PRECEDENCE = DBT_PRECEDENCE
 
 #: The ``test_type`` of a test that writes one row per column and metric.
 _ANOMALY = "anomaly_detection"

@@ -11,6 +11,7 @@ writing the authored bytes or nothing at all, and nothing ever deployed.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -512,6 +513,7 @@ def test_apply_holds_a_written_file_to_the_strict_rules(tmp_path):
     assert read(tmp_path, ORDERS_FILE) == current.content
 
 
+@pytest.mark.skipif(os.name != "posix", reason="mode bits are synthetic on Windows")
 def test_apply_keeps_the_file_mode(tmp_path):
     layered(tmp_path)
     target = tmp_path / ORDERS_FILE

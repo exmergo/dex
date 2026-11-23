@@ -1010,7 +1010,11 @@ def draft(
 
     package = str(node.get("package_name") or unique_id.split(".")[1])
     name = str(node.get("name") or unique_id.split(".")[-1])
-    raw = str(node.get("raw_code") or "")
+    # LF, as every file the plan writes is read back: dbt keeps a package file's
+    # CRLF in ``raw_code`` (a Windows checkout), and restated as it stands the
+    # override would read back with doubled line breaks and never match the
+    # hash its plan recorded.
+    raw = str(node.get("raw_code") or "").replace("\r\n", "\n")
     if not raw.strip():
         raise RepairRefusedError(
             f"the manifest holds no SQL for {package}.{name}; build the project "

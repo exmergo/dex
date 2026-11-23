@@ -475,9 +475,10 @@ def test_generated_tests_agree_with_maintain_verify_live(
     # temporal rows (#1458) add a snapshot, five models and two tests a side,
     # the freshness rows (#1460) six models, six tests and three probes, and
     # the continuity rows (#1461) ten models and ten tests: the build prices
-    # 2.0 GB (#1461).
+    # 2.11 GB, just over twenty times the per-query cap, so the budget keeps
+    # four statements' worth of headroom over it.
     report = assert_generated_test_parity(
-        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 20
+        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 24
     )
 
     from google.cloud import bigquery

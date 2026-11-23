@@ -976,8 +976,12 @@ def _loaded_at(expression: str, *, view: bool = False, empty: bool = False):
 
     def render(_null: str) -> str:
         head = "{{ config(materialized='view') }}\n" if view else ""
-        tail = " where 1 = 0" if empty else ""
-        return f"{head}select 1 as id, {expression} as loaded_at{tail}\n"
+        row = f"select 1 as id, {expression} as loaded_at"
+        if empty:
+            # Filtered from a derived table: BigQuery refuses a WHERE on a
+            # SELECT with no FROM, which every other dialect accepts.
+            row = f"select * from ({row}) as fixture where 1 = 0"  # noqa: S608
+        return f"{head}{row}\n"
 
     return render
 
