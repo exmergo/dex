@@ -181,13 +181,19 @@ def observe_run_results(
     manifest: Mapping[str, Any],
     *,
     claims: Mapping[str, str] | None = None,
+    sequence: int = 1,
 ) -> ObservedRun | None:
     """Turn one parsed ``run_results.json`` into observations and a history.
 
     ``manifest`` is the project's current compiled manifest: it decides which
     tests still exist and carries each one's claim and severity. ``claims``
-    stands in for the claims read from it. Returns ``None`` where the document
-    names no usable ``invocation_id``. Pure: reads nothing but its arguments.
+    stands in for the claims read from it. ``sequence`` is the run's place in
+    invocation order: alone the run is the only one, and folded beside another
+    source that observed the same invocation (Elementary's ``dbt_invocations``
+    carries dbt's ``invocation_id``), the caller passes the place that source
+    gave it, since the fold refuses one run at two places. Returns ``None``
+    where the document names no usable ``invocation_id``. Pure: reads nothing
+    but its arguments.
     """
 
     invocation = _invocation(document)
@@ -251,7 +257,7 @@ def observe_run_results(
                 outcome=DBT_OUTCOMES[status],
                 source=SOURCE,
                 run=invocation,
-                sequence=1,
+                sequence=sequence,
                 at=at,
                 severity=severity,
             )
@@ -259,7 +265,7 @@ def observe_run_results(
     observations.sort(key=lambda o: (o.subject.kind, o.subject.key, o.test))
     history = SourceHistory(
         name=SOURCE,
-        runs=(RunRef(run=invocation, sequence=1, at=at),),
+        runs=(RunRef(run=invocation, sequence=sequence, at=at),),
         retention_bound=ObservedPoint(run=invocation, at=at, source=SOURCE),
     )
     return ObservedRun(
@@ -301,6 +307,7 @@ def read_run_results(
     manifest: Mapping[str, Any],
     *,
     claims: Mapping[str, str] | None = None,
+    sequence: int = 1,
 ) -> RunResultsRead:
     """Read the newest building run that tested as the ``dbt_run_results`` source.
 
@@ -310,6 +317,8 @@ def read_run_results(
 
     ``manifest`` is the project's current compiled manifest. ``claims`` stands
     in for the claim ids read from it (:func:`~..transform.claims.manifest_claims`).
+    ``sequence`` is the run's place in invocation order, as
+    :func:`observe_run_results` takes it.
     """
 
     project = Path(project_dir).absolute()
@@ -359,7 +368,9 @@ def read_run_results(
                 "checkout) and no test outcome is read from it",
             ),
         )
-    observed = observe_run_results(newest.document, manifest, claims=claims)
+    observed = observe_run_results(
+        newest.document, manifest, claims=claims, sequence=sequence
+    )
     if observed is None:
         return RunResultsRead(
             status="refused",

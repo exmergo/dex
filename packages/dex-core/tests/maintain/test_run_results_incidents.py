@@ -556,3 +556,74 @@ def test_runs_that_never_tested_are_missing_not_clean(project: Path) -> None:
     read = rr.read_run_results(project, _manifest())
     assert (read.status, read.reason_code) == ("missing", "no_test_results")
     assert read.history is None
+
+
+# --- folded beside another source -------------------------------------------------
+
+
+def _elementary_side(sequence: int):
+    from exmergo_dex_core.maintain.incidents import SourceHistory
+    from exmergo_dex_core.maintain.observations import Observation, RunRef
+
+    runs = (RunRef(run="00000000-0000-0000-0000-000000000000", sequence=1),) + (
+        (RunRef(run=INV_A, sequence=sequence),) if sequence != 1 else ()
+    )
+    observation = Observation(
+        subject=Subject.of(NOT_NULL),
+        test=NOT_NULL,
+        outcome="good",
+        source="elementary",
+        run="00000000-0000-0000-0000-000000000000",
+        sequence=1,
+    )
+    return [observation], SourceHistory(name="elementary", runs=runs)
+
+
+def test_the_same_invocation_at_the_place_another_source_gave_it_folds() -> None:
+    observed = rr.observe_run_results(
+        _document({NOT_NULL: "fail"}), _manifest(), sequence=2
+    )
+    assert observed is not None
+    assert {o.sequence for o in observed.observations} == {2}
+    assert [r.sequence for r in observed.history.runs] == [2]
+    others, history = _elementary_side(2)
+    fold = fold_incidents(
+        [*others, *observed.observations],
+        sources=[history, observed.history],
+        now=NOW,
+    )
+    [incident] = fold.incidents
+    # An observed pass now precedes the failure, so its start is known.
+    assert incident.first_observed != "unknown"
+
+
+def test_one_invocation_at_two_places_is_refused_by_the_fold() -> None:
+    from exmergo_dex_core.maintain.incidents import FoldInputError
+
+    observed = _observe({NOT_NULL: "fail"})  # sequence 1 by default
+    others, history = _elementary_side(2)
+    with pytest.raises(FoldInputError):
+        fold_incidents(
+            [*others, *observed.observations],
+            sources=[history, observed.history],
+            now=NOW,
+        )
+
+
+def test_read_run_results_takes_the_sequence(project: Path) -> None:
+    _write(project / "target", _document({NOT_NULL: "fail"}))
+    _log(project, INV_A)
+    read = rr.read_run_results(project, _manifest(), sequence=7)
+    assert read.history is not None and read.history.runs[0].sequence == 7
+    assert {o.sequence for o in read.observations} == {7}
+
+
+def test_a_unit_test_claim_is_read_from_the_unit_tests_section() -> None:
+    manifest = _manifest()
+    manifest["unit_tests"][UNIT] = {
+        "resource_type": "unit_test",
+        "config": {"enabled": True, "meta": {"dex": {"claim": "u1"}}},
+    }
+    assert manifest_claims(manifest)[UNIT] == "u1"
+    [only] = _observe({UNIT: "fail"}, manifest).observations
+    assert only.subject == Subject(kind="claim", key="u1")

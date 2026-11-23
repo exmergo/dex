@@ -88,6 +88,8 @@ def claim_of(test: Any) -> str | None:
 def manifest_claims(manifest: Mapping[str, Any]) -> dict[str, str]:
     """Each test's claim id in a compiled manifest, keyed by its ``unique_id``.
 
+    Data tests are read from ``nodes`` and unit tests from ``unit_tests``.
+
     The manifest twin of :func:`claim_of`: a node's ``config.meta.dex.claim``,
     else the top-level ``meta`` spelling dbt still merges in. A test that
     carries no claim is left out. Incident sources key a subject by it (#1468,
@@ -95,12 +97,21 @@ def manifest_claims(manifest: Mapping[str, Any]) -> dict[str, str]:
     """
 
     claims: dict[str, str] = {}
-    nodes = manifest.get("nodes") if isinstance(manifest, Mapping) else None
-    if not isinstance(nodes, Mapping):
+    if not isinstance(manifest, Mapping):
         return claims
-    for unique_id, node in nodes.items():
-        if not isinstance(node, Mapping) or node.get("resource_type") != "test":
-            continue
+    entries: list[tuple[Any, Mapping[str, Any]]] = []
+    nodes = manifest.get("nodes")
+    for unique_id, node in nodes.items() if isinstance(nodes, Mapping) else ():
+        if isinstance(node, Mapping) and node.get("resource_type") == "test":
+            entries.append((unique_id, node))
+    # Unit tests sit in their own section, with resource_type unit_test.
+    unit_tests = manifest.get("unit_tests")
+    for unique_id, node in (
+        unit_tests.items() if isinstance(unit_tests, Mapping) else ()
+    ):
+        if isinstance(node, Mapping):
+            entries.append((unique_id, node))
+    for unique_id, node in entries:
         config = node.get("config")
         for meta in (
             config.get("meta") if isinstance(config, Mapping) else None,

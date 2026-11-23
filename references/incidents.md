@@ -325,6 +325,12 @@ project. `read_run_results(project_dir, manifest)` finds the file and reads it;
 - **No commit.** `run_results.json` records none, so every run's commit is
   `unknown`.
 
+Both take a keyword `sequence`, the run's place in invocation order (1 by
+default). Folded beside another source that observed the same invocation
+(Elementary's `dbt_invocations` carries dbt's `invocation_id`), the caller
+passes the place that source gave it, since the fold refuses one run at two
+places.
+
 `read_run_results` returns a `status` of `read`, `missing` (`no_run_results`:
 no building run on disk; `no_test_results`: none of them ran a test) or
 `refused` (`unlogged_invocation`, or
