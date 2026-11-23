@@ -1,0 +1,15 @@
+**`dex maintain incidents` returns the incidents the run history holds for the selected models' tests.**
+It reads Elementary's tables (`dbt_invocations` and `elementary_test_results`)
+where the package is installed and uploading, and dbt's `run_results.json`, and
+folds both through the one incident lifecycle rule. Elementary is read over the
+newest 20 invocations by default (`--invocations <n>`, up to 2000): a run count,
+so the price does not depend on the schedule. Every statement goes through the
+query firewall and the source allowlist, and the whole read is priced before
+anything runs, so on a billed connector the first call answers
+`needs_confirmation` and reads nothing. `data.sources` reports each source as
+`read`, `missing` or `refused` with a reason code. A schema outside the
+committed allowlist is refused before any connection opens, with the
+`dex config set` that adds it. With no package, the next steps name the install
+`dex init` offers. `data.window` names the invocations read, `data.price` the
+estimate and what it settled at, and each incident carries its coverage and
+retention bound. `DexEngine.incidents()` returns the same result.

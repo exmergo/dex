@@ -795,7 +795,7 @@ _TABLES = {
 }
 
 
-def _sql(dialect: str, since: datetime | None) -> reader._Sql:
+def _sql(dialect: str, since: datetime | None, last: int | None = None) -> reader._Sql:
     catalog, schema, case = _TABLES[dialect]
     layout = layout_for(RELEASE)
 
@@ -812,6 +812,7 @@ def _sql(dialect: str, since: datetime | None) -> reader._Sql:
         },
         since,
         dialect,
+        last,
     )
 
 
@@ -832,16 +833,18 @@ def _schema(dialect: str) -> dict:
 
 @pytest.mark.parametrize("dialect", sorted(_TABLES))
 @pytest.mark.parametrize("since", [None, START], ids=["all", "since"])
+@pytest.mark.parametrize("last", [None, 20], ids=["any-count", "last-20"])
 def test_every_statement_resolves_each_column_in_each_dialect(
-    dialect: str, since: datetime | None
+    dialect: str, since: datetime | None, last: int | None
 ):
     """sqlglot's resolver, given the catalog as each warehouse spells it,
-    finds every column every statement names."""
+    finds every column every statement names, the run-count window's
+    subqueries (#1472) included."""
 
     import sqlglot
     from sqlglot.optimizer.qualify import qualify
 
-    sql = _sql(dialect, since)
+    sql = _sql(dialect, since, last)
     for statement in (*sql.measure(), sql.invocations(), sql.results()):
         qualify(
             sqlglot.parse_one(statement, read=dialect),
@@ -1092,3 +1095,39 @@ def test_a_valid_id_with_no_test_id_is_still_unattributed(tmp_path: Path):
     results = [Result("r-1", "inv-1"), Result("r" * 512, "inv-1", test="")]
     read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
     assert (len(read.observations), read.unattributed) == (1, 1)
+
+
+# --- a run-count window (#1472) ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "last", [0, reader.MAX_INVOCATIONS + 1, 2.0, True], ids=["0", "past", "f", "b"]
+)
+def test_a_run_count_outside_the_bound_is_refused_before_the_catalog(
+    tmp_path: Path, last
+):
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", _hourly(1), []))
+    with pytest.raises(ValueError, match="last must be"):
+        plan_read(engine, NAMESPACE, RELEASE, last=last)
+
+
+def test_the_newest_runs_are_read_and_older_ones_are_not(tmp_path: Path):
+    runs = _hourly(5)
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    read = read_elementary(engine, plan_read(engine, NAMESPACE, RELEASE, last=3))
+
+    assert [ref.run for ref in read.history.runs] == ["inv-3", "inv-4", "inv-5"]
+    assert [ref.sequence for ref in read.history.runs] == [1, 2, 3]
+    assert {o.run for o in read.observations} == {"inv-3", "inv-4", "inv-5"}
+    assert (read.measure.invocations, read.measure.result_rows) == (3, 3)
+    assert read.windowed is True
+    assert read.history.retention_bound.run == "inv-3"
+
+
+def test_a_run_count_past_the_table_reads_it_whole_and_says_so(tmp_path: Path):
+    runs = _hourly(2)
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    read = read_elementary(engine, plan_read(engine, NAMESPACE, RELEASE, last=20))
+
+    assert len(read.history.runs) == 2
+    assert read.windowed is False

@@ -15,6 +15,7 @@ baseline; correctness checks do not.
 | Is the project correct now? | `dex maintain verify` | No |
 | Which models, columns and sources have tests? Did they pass last run? How strong are they? What checks each declared fact? | `dex maintain coverage` | No |
 | Which mutation scores are out of date, and refresh them | `dex maintain coverage --mutate` | No |
+| Which tests are failing, since when, and are they still? | `dex maintain incidents` | No |
 | What changed since the baseline? | `dex maintain check` | Yes |
 | What edits would reconcile the drift? | `dex maintain reconcile` | Yes |
 

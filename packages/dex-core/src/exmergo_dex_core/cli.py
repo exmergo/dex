@@ -120,6 +120,9 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # coverage: which resources the dbt tests reach, from the manifest
         # alone (#1280); free and connectionless, no baseline required.
         "coverage",
+        # incidents: the run history of the tests, from Elementary's tables
+        # and dbt's run results (#1472); a bounded read, priced first.
+        "incidents",
     ],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
@@ -569,6 +572,14 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "tests read, and what checks each declared fact. Free; reads the "
         "manifest, run results and .dex/ only. --mutate refreshes stale and "
         "missing scores in one batch, behind one cost handshake.",
+    ),
+    ("maintain", "incidents"): (
+        "list the test incidents the run history holds",
+        "Fold test outcomes from Elementary's tables and dbt's run results into "
+        "incidents: open, closed or no longer observed, each with its coverage "
+        "and retention bound. Reads the newest 20 invocations by default "
+        "(--invocations widens it), priced first on billed connectors; never "
+        "reads past the source allowlist.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -1721,6 +1732,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "semantic",
                     "verify",
                     "coverage",
+                    "incidents",
                 }:
                     sp.add_argument(
                         "objects",
@@ -1729,7 +1741,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help=(
                             "model names: repeated, comma-separated or "
                             "space-separated (default: all)"
-                            if name == "verify"
+                            if name in {"verify", "incidents"}
                             else "model, source.table, snapshot or seed names "
                             "(default: all)"
                             if name == "coverage"
@@ -1771,6 +1783,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         help=(
                             "dbt dev target --mutate runs against; "
                             "prod-looking targets are refused"
+                        ),
+                    )
+                if group == "maintain" and name == "incidents":
+                    sp.add_argument(
+                        "--invocations",
+                        type=int,
+                        default=None,
+                        metavar="N",
+                        help=(
+                            "read the newest N invocations of Elementary's "
+                            "tables (default 20, at most 2000)"
                         ),
                     )
                 if group == "maintain" and name == "reconcile":
@@ -1909,9 +1932,14 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # depend on the very connector it deliberately does not touch.
         # `coverage` reads a parsed manifest and nothing else (#1280).
         # `--mutate` is the one part of it that runs dbt against the warehouse.
+        # `incidents` reads dbt's run results from files, and opens a connection
+        # only for Elementary's tables, whose reader asks for the sql extra
+        # itself and reports the source refused where it is missing (#1472).
         connectionless = (
-            args.subcommand == "coverage" and not getattr(args, "mutate", False)
-        ) or (args.subcommand == "snapshot" and getattr(args, "project_only", False))
+            (args.subcommand == "coverage" and not getattr(args, "mutate", False))
+            or (args.subcommand == "snapshot" and getattr(args, "project_only", False))
+            or args.subcommand == "incidents"
+        )
         if not connectionless:
             ensure_dialect_available()
         from .maintain import commands as maintain_cmds
@@ -1926,6 +1954,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "reconcile": maintain_cmds.cmd_reconcile,
             "verify": maintain_cmds.cmd_verify,
             "coverage": maintain_cmds.cmd_coverage,
+            "incidents": maintain_cmds.cmd_incidents,
         }
         return handlers[args.subcommand](args, engine)
 
