@@ -42,6 +42,8 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..manifest_paths import patch_file, posix
+
 #: The sweep history, written beside ``dex_previous_build.json``.
 HISTORY = "dex_verify_history.json"
 
@@ -70,7 +72,14 @@ _AXIS_CLASSES: dict[str, frozenset[str]] = {
     # Read per code below: one axis, several classes, and a sweep routinely
     # suppresses some of them ("nothing declares a unit") while running others.
     "declaration": frozenset(
-        {"unit", "additivity", "population", "parent_population", "temporal"}
+        {
+            "unit",
+            "additivity",
+            "population",
+            "parent_population",
+            "temporal",
+            "freshness",
+        }
     ),
 }
 
@@ -86,6 +95,7 @@ _CODE_CLASSES: tuple[tuple[str, frozenset[str]], ...] = (
     ("temporal_", frozenset({"temporal"})),
     ("no_entity_comparable", frozenset({"temporal"})),
     ("policy_missing", frozenset({"temporal"})),
+    ("freshness_exceeded", frozenset({"freshness"})),
 )
 
 
@@ -224,6 +234,7 @@ _RECORD_AXES = (
     ("join_coverage", "join_contract"),
     ("parent_population", "declaration"),
     ("temporal_contracts", "declaration"),
+    ("freshness", "declaration"),
     ("population_delta", "declaration"),
 )
 
@@ -368,11 +379,11 @@ def plan_reach(edits: Iterable[Any], manifest: Mapping[str, Any] | None) -> Reac
         label_of[str(unique_id)] = label
         path = node.get("original_file_path")
         if isinstance(path, str):
-            by_file.setdefault(PurePosixPath(path).as_posix(), []).append(unique_id)
+            by_file.setdefault(posix(path), []).append(unique_id)
         patch = node.get("patch_path")
         if isinstance(patch, str):
             # `p://models/schema.yml`: the package, then the file.
-            by_patch.setdefault(patch.split("://", 1)[-1], []).append(unique_id)
+            by_patch.setdefault(patch_file(patch), []).append(unique_id)
     reach.labels = set(label_of.values())
 
     roots: set[str] = set()

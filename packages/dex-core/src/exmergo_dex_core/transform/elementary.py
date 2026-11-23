@@ -80,7 +80,83 @@ DEFAULTS: Mapping[str, bool] = {"edr_cli_run": False} | dict.fromkeys(
 )
 
 Hooks = Literal["run", "return_early", "disabled", "absent", "unknown"]
-Materialization = Literal["elementary", "dbt"]
+Materialization = Literal["elementary", "dbt", "unknown"]
+
+#: Every release of the package Dex has been run against: the releases the
+#: Elementary fixture installs (``VERSIONS`` and ``LEGACY_VERSIONS`` in
+#: ``tests/transform/elementary_fixture.py``, which a test holds to this set),
+#: so the two cannot drift apart. The supported range runs from the oldest of
+#: them to the newest (#1445).
+TESTED_RELEASES: tuple[str, ...] = ("0.15.2", "0.16.4", "0.23.0", "0.26.1")
+
+#: Where the installed release falls: ``supported`` inside the tested range,
+#: ``untested`` outside it (a patch above the newest included), and ``unknown``
+#: where no release can be read.
+ReleaseStatus = Literal["supported", "untested", "unknown"]
+
+#: The reason code each result that depends on the release carries where the
+#: release is not ``supported``.
+RELEASE_UNTESTED = "elementary_release_untested"
+RELEASE_UNKNOWN = "elementary_release_unknown"
+RELEASE_REASON_CODES: Mapping[str, str] = {
+    "untested": RELEASE_UNTESTED,
+    "unknown": RELEASE_UNKNOWN,
+}
+
+_RELEASE = re.compile(
+    r"v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?"
+)
+
+ReleaseKey = tuple[int, int, int, int, str]
+
+
+def release_key(release: str | None) -> ReleaseKey | None:
+    """``release`` as a key that orders releases, ``None`` where it is none.
+
+    A ``major.minor.patch`` version, with an optional ``v``, prerelease and
+    build label; a prerelease orders before its release. Anything else, Jinja
+    included, is no release.
+    """
+
+    match = _RELEASE.fullmatch(str(release or "").strip())
+    if match is None:
+        return None
+    major, minor, patch, prerelease = match.groups()
+    return (
+        int(major),
+        int(minor),
+        int(patch),
+        0 if prerelease else 1,
+        prerelease or "",
+    )
+
+
+def _tested_key(release: str) -> ReleaseKey:
+    key = release_key(release)
+    if key is None:
+        raise ValueError(f"{release!r} in TESTED_RELEASES is not a release")
+    return key
+
+
+OLDEST_TESTED = min(TESTED_RELEASES, key=_tested_key)
+NEWEST_TESTED = max(TESTED_RELEASES, key=_tested_key)
+
+
+def release_status(release: str | None) -> ReleaseStatus:
+    """Where ``release`` falls against the releases Dex was run against.
+
+    Inside the range from :data:`OLDEST_TESTED` to :data:`NEWEST_TESTED` is
+    ``supported``. Outside it is ``untested``, a patch above the newest too:
+    Dex never takes a release's behaviour from its neighbours, and adding one
+    to the fixture is what makes it tested.
+    """
+
+    key = release_key(release)
+    if key is None:
+        return "unknown"
+    if _tested_key(OLDEST_TESTED) <= key <= _tested_key(NEWEST_TESTED):
+        return "supported"
+    return "untested"
 
 
 @dataclass(frozen=True)
@@ -106,6 +182,16 @@ class ElementaryRuntime:
     package's materialization hands each test straight to dbt's
     (``materialize_test``, read at 0.16.4 and 0.26.1). ``notes`` says why a field
     is ``unknown``.
+
+    ``release_status`` says whether the installed release is one Dex was run
+    against (:func:`release_status`; ``None`` where the package is not
+    installed). Where it is not ``supported``, what the package does is not
+    taken from the releases Dex read (#1445): ``hooks`` that would run or
+    return early are ``unknown``, so are the uploads they would perform, and
+    so is the materialization where the package's is picked and the package is
+    not enabled. What dbt itself settles (whether the package's models and
+    hooks are enabled, and which materialization it picks) is read as on any
+    release.
     """
 
     installed: bool
@@ -118,6 +204,35 @@ class ElementaryRuntime:
         default_factory=lambda: dict.fromkeys(UPLOAD_VARS, False)
     )
     notes: tuple[str, ...] = ()
+    release_status: ReleaseStatus | None = None
+
+    @property
+    def release_reason_code(self) -> str | None:
+        """The reason code a release-dependent result carries, ``None`` where the
+        release is supported or the package is not installed."""
+
+        return RELEASE_REASON_CODES.get(self.release_status or "")
+
+    def release_warning(self) -> str | None:
+        """One sentence naming the release read and the newest Dex was run
+        against, where the release is not supported; ``None`` otherwise."""
+
+        code = self.release_reason_code
+        if code is None:
+            return None
+        tested = f"{OLDEST_TESTED} to {NEWEST_TESTED}"
+        read_as = (
+            f"the installed Elementary release is {self.release}, outside the "
+            f"releases dex was run against ({tested})"
+            if code == RELEASE_UNTESTED
+            else "dex could not read the installed Elementary release "
+            f"(the releases dex was run against are {tested})"
+        )
+        return (
+            f"{read_as}; the package's compatibility work still runs, and each "
+            "result that depends on what the release does is unchecked with "
+            f"reason code {code}"
+        )
 
 
 def not_installed() -> ElementaryRuntime:
@@ -352,6 +467,8 @@ def resolve(
     adapter = str((manifest.get("metadata") or {}).get("adapter_type") or "")
     if installed_packages is None:
         installed_packages = names - {root, "dbt", f"dbt_{adapter}"}
+    status = release_status(release)
+    supported = status == "supported"
     notes: list[str] = []
 
     models, _ = _elementary_entries(manifest, "model")
@@ -360,51 +477,28 @@ def resolve(
     picked = _materialization(
         manifest, root, installed_packages, _override_flag(project)
     )
-    materialization: Materialization = (
-        "elementary"
-        if enabled and picked and _is_elementary_materialization(manifest, picked)
-        else "dbt"
-    )
+    materialization: Materialization = "dbt"
+    if picked and _is_elementary_materialization(manifest, picked):
+        if enabled:
+            materialization = "elementary"
+        elif not supported:
+            # Where the package is not enabled, its materialization hands each
+            # test to dbt's on every release Dex read; on another it may not.
+            materialization = "unknown"
+            notes.append(
+                f"the installed Elementary release is {status}, so whether its "
+                "test materialization hands each test to dbt's is not known"
+            )
 
-    operations, disabled_operations = _elementary_entries(manifest, "operation")
-    edr_cli_run = var_value("edr_cli_run", project, cli_vars)
-    hooks: Hooks
-    if operations:
-        # The enabled check comes first because, from 0.20.0, the hooks make it
-        # before they read `edr_cli_run`, so that var cannot matter there.
-        if not enabled and _hooks_check_enabled(manifest):
-            hooks = "return_early"
-        elif edr_cli_run is None:
-            hooks = "unknown"
-            notes.append("edr_cli_run is not a boolean the repository can read")
-        elif edr_cli_run:
-            hooks = "return_early"
-        else:
-            hooks = "run"
-    elif disabled_operations:
-        hooks = "disabled"
-    else:
-        hooks = "absent"
-
-    # An upload exists only where the release's own on_run_end reads its var:
-    # 0.15.2 has no freshness upload, 0.16.4 and 0.26.1 have all five.
-    end_sql = str(
-        ((manifest.get("macros") or {}).get(f"macro.{PACKAGE}.on_run_end") or {}).get(
-            "macro_sql"
+    hooks = _hooks(manifest, enabled, var_value("edr_cli_run", project, cli_vars))
+    if hooks == "unknown":
+        notes.append("edr_cli_run is not a boolean the repository can read")
+    if not supported and hooks in ("run", "return_early"):
+        hooks = "unknown"
+        notes.append(
+            f"the installed Elementary release is {status}, so what its run hooks "
+            "do is not read from the releases dex was run against"
         )
-        or ""
-    )
-    uploads: dict[str, bool | None] = {}
-    for upload, name in UPLOAD_VARS.items():
-        if end_sql and name not in end_sql:
-            uploads[upload] = False
-        elif hooks == "run":
-            off = var_value(name, project, cli_vars)
-            uploads[upload] = None if off is None else not off
-        elif hooks == "unknown":
-            uploads[upload] = None
-        else:
-            uploads[upload] = False
 
     return ElementaryRuntime(
         installed=True,
@@ -413,9 +507,64 @@ def resolve(
         hooks=hooks,
         materialization=materialization,
         materialization_macro=picked,
-        uploads=uploads,
+        uploads=_uploads(manifest, hooks, project, cli_vars, supported=supported),
         notes=tuple(notes),
+        release_status=status,
     )
+
+
+def _hooks(
+    manifest: Mapping[str, Any], enabled: bool, edr_cli_run: bool | None
+) -> Hooks:
+    """What the package's run hooks do, as the releases Dex read do it."""
+
+    operations, disabled_operations = _elementary_entries(manifest, "operation")
+    if not operations:
+        return "disabled" if disabled_operations else "absent"
+    # The enabled check comes first because, from 0.20.0, the hooks make it
+    # before they read `edr_cli_run`, so that var cannot matter there.
+    if not enabled and _hooks_check_enabled(manifest):
+        return "return_early"
+    if edr_cli_run is None:
+        return "unknown"
+    return "return_early" if edr_cli_run else "run"
+
+
+def _uploads(
+    manifest: Mapping[str, Any],
+    hooks: Hooks,
+    project: Mapping[str, Any],
+    cli_vars: Mapping[str, Any] | None,
+    *,
+    supported: bool,
+) -> dict[str, bool | None]:
+    """Which uploads ``on_run_end`` performs, each ``None`` where unknown.
+
+    An upload exists only where the release's own ``on_run_end`` reads its var:
+    0.15.2 has no freshness upload, 0.16.4 and 0.26.1 have all five. On a
+    release that is not supported, hooks that may run may upload anything.
+    """
+
+    end_sql = str(
+        ((manifest.get("macros") or {}).get(f"macro.{PACKAGE}.on_run_end") or {}).get(
+            "macro_sql"
+        )
+        or ""
+    )
+    uploads: dict[str, bool | None] = {}
+    for upload, name in UPLOAD_VARS.items():
+        if hooks == "unknown" and not supported:
+            uploads[upload] = None
+        elif end_sql and name not in end_sql:
+            uploads[upload] = False
+        elif hooks == "run":
+            off = var_value(name, project, cli_vars)
+            uploads[upload] = None if off is None else not off
+        elif hooks == "unknown":
+            uploads[upload] = None
+        else:
+            uploads[upload] = False
+    return uploads
 
 
 #: The resource types a manifest keeps outside ``nodes`` that can refer to a
@@ -584,12 +733,20 @@ class UnpricedWork:
       and query a sample of them. Only where dbt picks that materialization and
       the package is enabled. The package's anomaly and schema-change tests
       collect their own rows and are not among them.
+
+    ``release_reason`` is the record's
+    :attr:`~ElementaryRuntime.release_reason_code` (#1445): where the release is
+    not supported, each kind is counted wherever it may run, and nothing the
+    releases Dex read settle (a default window, a test that collects its own
+    rows) is taken from them.
     """
 
     hooks: bool = False
     hooks_state: str | None = None
     gated_tests: tuple[GatedTest, ...] = ()
     extras_tests: tuple[str, ...] = ()
+    release: str | None = None
+    release_reason: str | None = None
 
     @property
     def codes(self) -> list[str]:
@@ -622,6 +779,8 @@ class UnpricedWork:
             ],
             "monitoring_test_count": len(self.gated_tests),
             "materialized_test_count": len(self.extras_tests),
+            "release": self.release,
+            "release_reason_code": self.release_reason,
         }
 
     def warnings(self) -> list[str]:
@@ -660,6 +819,18 @@ class UnpricedWork:
                 "one it can count the failed rows and query a sample of them, "
                 "statements no compiled node shows; neither is priced, so the "
                 "estimate is a floor"
+            )
+        if out and self.release_reason is not None:
+            out.append(
+                "the Elementary release installed "
+                + (
+                    f"({self.release}) is not one dex was run against"
+                    if self.release_reason == RELEASE_UNTESTED
+                    else "could not be read"
+                )
+                + f" (the newest dex was run against is {NEWEST_TESTED}), so this "
+                "work is listed wherever it may run, with reason code "
+                f"{self.release_reason}"
             )
         return out
 
@@ -810,19 +981,23 @@ def unpriced_work(
       the record only says where the package is enabled.
 
     A project without the package, or one that disables it for the target,
-    gets an empty record.
+    gets an empty record. On a release that is not supported, the monitoring
+    tests are counted where the package is disabled too (that they check
+    nothing there is the tested releases' behaviour), an anomaly test's default
+    window is ``unknown``, and every selected test counts toward the extras.
     """
 
     if not runtime.installed:
         return UnpricedWork()
     project = _project_config(project_yml)
     hooks = runtime.hooks in ("run", "unknown")
+    supported = runtime.release_reason_code is None
 
     def chosen(uid: str) -> bool:
         return selected is None or uid in selected
 
     gated: list[GatedTest] = []
-    if runtime.enabled:
+    if runtime.enabled or not supported:
         for uid, node in sorted(
             _monitoring_test_nodes(manifest).items(),
             key=lambda item: str(item[1].get("name")),
@@ -832,16 +1007,18 @@ def unpriced_work(
             days, source = _days_back(
                 node, project, cli_vars, _tested_node(manifest, node)
             )
+            if source == "default" and not supported:
+                days, source = None, "unknown"
             gated.append(GatedTest(str(node.get("name")), days, source))
 
     extras: list[str] = []
-    if runtime.materialization == "elementary":
+    if runtime.materialization in ("elementary", "unknown"):
         extras = sorted(
             str(node.get("name"))
             for uid, node in (manifest.get("nodes") or {}).items()
             if node.get("resource_type") == "test"
             and chosen(str(uid))
-            and not _collects_own_rows(node)
+            and not (supported and _collects_own_rows(node))
         )
 
     return UnpricedWork(
@@ -849,6 +1026,8 @@ def unpriced_work(
         hooks_state=runtime.hooks if hooks else None,
         gated_tests=tuple(gated),
         extras_tests=tuple(extras),
+        release=runtime.release,
+        release_reason=runtime.release_reason_code,
     )
 
 
@@ -892,9 +1071,14 @@ HISTORY_TESTS = frozenset(
     )
 )
 
-#: Why a passing Elementary test checked nothing (#1308), by reason code.
+#: Why a passing Elementary test checked nothing (#1308), by reason code, or
+#: why its pass is not read at all (#1445).
 UncheckedReason = Literal[
-    "package_disabled", "compiled_to_no_results", "history_unmeasured"
+    "package_disabled",
+    "compiled_to_no_results",
+    "history_unmeasured",
+    "elementary_release_untested",
+    "elementary_release_unknown",
 ]
 
 UNCHECKED_REASONS: Mapping[str, str] = {
@@ -911,6 +1095,14 @@ UNCHECKED_REASONS: Mapping[str, str] = {
         "the test judges this run against what earlier runs stored in the "
         "Elementary schema, and passes where that history is missing; dex does "
         "not measure how much history the target holds"
+    ),
+    RELEASE_UNTESTED: (
+        "the installed Elementary release is not one dex was run against, so "
+        "what the test checks is not read from the releases dex knows"
+    ),
+    RELEASE_UNKNOWN: (
+        "dex could not read the installed Elementary release, so what the test "
+        "checks is not read from the releases dex knows"
     ),
 }
 
@@ -942,12 +1134,19 @@ def unchecked_tests(
     3. Where the package is enabled, a test that reaches one of
        :data:`HISTORY_TESTS` is ``history_unmeasured``.
 
+    Steps 2 and 3, and what a test the rule leaves out checks, are read off the
+    releases Dex was run against. Where the installed release is not
+    supported, every test step 1 does not settle carries the record's
+    :attr:`~ElementaryRuntime.release_reason_code` instead (#1445), so no
+    Elementary test counts toward a model's assurance.
+
     A caller holds a failed test to its failure: only a pass is read as nothing
     checked. Nothing here opens a connection or counts the history.
     """
 
     if not runtime.installed:
         return {}
+    release_code = runtime.release_reason_code
     macros = manifest.get("macros") or {}
     found: dict[str, UncheckedReason] = {}
     for uid, node in (manifest.get("nodes") or {}).items():
@@ -963,6 +1162,10 @@ def unchecked_tests(
             found[str(uid)] = (
                 "compiled_to_no_results" if runtime.enabled else "package_disabled"
             )
+        elif release_code == RELEASE_UNTESTED:
+            found[str(uid)] = "elementary_release_untested"
+        elif release_code == RELEASE_UNKNOWN:
+            found[str(uid)] = "elementary_release_unknown"
         elif not runtime.enabled:
             if compiled is None and any(
                 "is_elementary_enabled" in str((macros.get(m) or {}).get("macro_sql"))
@@ -985,7 +1188,7 @@ def read(
     The release is the ``version`` in the installed package's own
     ``dbt_project.yml``, under ``packages-install-path``. A package installed
     from git or a local path carries one too; where none can be read it is
-    ``None``.
+    ``None``, and the record's ``release_status`` is ``unknown``.
     """
 
     from .package_overrides import _installed

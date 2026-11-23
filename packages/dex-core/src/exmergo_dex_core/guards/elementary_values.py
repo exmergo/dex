@@ -13,6 +13,14 @@ Three columns are not, and nothing in the column itself says so:
   ``metrics_anomaly_score`` view over it: the raw values of the dimension a
   ``dimension_anomalies`` test groups by.
 
+Three more text columns can quote a value, though they do not hold rows:
+``test_results_description`` (a test's result message), ``test_results_query``
+(its compiled SQL, literals included) and ``test_params`` (its arguments, an
+``accepted_values`` list among them). A profile reads none of their values
+(#1471), so no minimum, maximum or value domain of them is computed or cached.
+The query firewall does not hold them: projecting one still follows the cache's
+PII flags, as any other column does.
+
 A relation in that schema that is not one of the package's models can hold
 more: with ``tests_use_temp_tables`` its test materialization writes a test's
 whole result to a table there (``macros/edr/materializations/test/test.sql``).
@@ -82,6 +90,13 @@ ROW_VALUE_COLUMNS = frozenset({"result_row", "result_rows"})
 #: values, and the one that names which dimension each row's value belongs to.
 DIMENSION_VALUE_COLUMN = "dimension_value"
 
+#: Columns of the documented models whose text can quote a value: a result
+#: message, compiled SQL, a test's arguments. A profile withholds their values;
+#: the firewall does not hold them.
+QUOTING_COLUMNS = frozenset(
+    {"test_results_description", "test_results_query", "test_params"}
+)
+
 SCHEMA_NAME = "elementary"
 
 
@@ -145,8 +160,9 @@ def withheld_columns(identifier: str, columns: Iterable[str]) -> set[str]:
     """The columns whose values a profile of this relation never reads.
 
     Every column of a protected relation; on a documented model, the row-value
-    columns and ``dimension_value``. Their minimum, maximum and value domain
-    are values, so none is computed or cached.
+    columns, ``dimension_value`` and the columns that can quote a value
+    (:data:`QUOTING_COLUMNS`). Their minimum, maximum and value domain are
+    values, so none is computed or cached.
     """
 
     names = list(columns)
@@ -157,4 +173,5 @@ def withheld_columns(identifier: str, columns: Iterable[str]) -> set[str]:
         for name in names
         if row_value_column(identifier, name)
         or dimension_value_column(identifier, name)
+        or (documented(identifier) and name.lower() in QUOTING_COLUMNS)
     }

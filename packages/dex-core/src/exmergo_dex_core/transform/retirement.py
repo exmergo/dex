@@ -32,6 +32,7 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ..dbt_project import DbtProjectView, jinja_calls
 from ..errors import PrerequisiteError
+from ..manifest_paths import posix
 from ..semantic_declarations import Assumption, _Strict
 from .plans import EditKind, EditOp, PlanEdit
 
@@ -1090,8 +1091,7 @@ def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
         )
         return any(
             (macros.get(uid) or {}).get("package_name") == project
-            and str((macros.get(uid) or {}).get("original_file_path") or "")
-            == macro_path
+            and posix((macros.get(uid) or {}).get("original_file_path")) == macro_path
             for uid in reached
         )
 
@@ -1104,7 +1104,7 @@ def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
                 for uid, n in nodes.items()
                 if uid.startswith("model.")
                 and n.get("package_name") == project
-                and str(n.get("original_file_path") or "") == path
+                and posix(n.get("original_file_path")) == path
             ),
             None,
         )
@@ -1116,7 +1116,7 @@ def _failed_callers(branch: Any, project: str, macro_path: str) -> list[str]:
         if not uid.startswith(f"model.{project}."):
             continue
         for node in entries if isinstance(entries, list) else [entries]:
-            path = str(node.get("original_file_path") or "")
+            path = posix(node.get("original_file_path"))
             if path and path not in out and calls(node):
                 out.append(path)
     return out

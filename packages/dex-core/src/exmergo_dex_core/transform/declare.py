@@ -204,12 +204,15 @@ def propose(
     cap: int,
     render_tests: bool | list[str] = False,
     dialect: str | None = None,
+    monitors: Any = None,
 ) -> Outcome:
     """Each model's proposal, or the reason it has none, up to ``cap`` proposals.
 
     ``draft`` returns one model's ``drafted``/``declared``/``missing`` entry for
     the project as it stands. ``supplied`` is the payload's own declarations,
     which win field by field over anything drafted and are considered first.
+    ``monitors`` is the vendor monitors' gate (#1482), or ``None``: a model
+    declared before ``monitors.vendor`` was set still owes its monitors.
     """
 
     files = {path: source.content for path, source in view.files.items()}
@@ -247,6 +250,7 @@ def propose(
             not fields
             and not supplied_fields
             and not _owes_generated_tests(model, rendered, view, render_tests, dialect)
+            and not _owes_monitors(model, rendered, view, monitors)
         ):
             # Whether anything would have been proposed had nothing been declared
             # yet: that separates a model already complete from one dex has no
@@ -270,6 +274,7 @@ def propose(
                     declaration, rendered, view, cache=None, pii_overrides=None
                 )
             generated: list[dict[str, Any]] = []
+            monitor_rows: list[dict[str, Any]] = []
             text = declarations_mod.render(
                 rendered.get(path),
                 declaration,
@@ -282,6 +287,20 @@ def propose(
                 joins=declarations_mod.read_model_joins(
                     rendered, view.model_paths, model, dialect
                 ),
+                history=declarations_mod.history_reader(view, rendered),
+                monitors=monitors,
+                monitor_rows=monitor_rows,
+            )
+            # The tests a references implies on its parent (#1457), which the
+            # plan renders into the parent's entry: owed by this model as a
+            # parent, or as a child naming one.
+            referenced = declarations_mod.render_referenced_keys(
+                {**rendered, path: text},
+                view,
+                [model],
+                render_tests=render_tests,
+                dialect=dialect,
+                generated=generated,
             )
         except (RewriteError, DeclarationError) as exc:
             if given is not None and isinstance(exc, DeclarationError):
@@ -294,12 +313,15 @@ def propose(
                 }
             )
             continue
-        if text == rendered.get(path):
+        if text == rendered.get(path) and not referenced:
             outcome.skipped.append(_why_nothing(model, entry, complete=True))
             continue
         rendered[path] = text
+        rendered.update(referenced)
         added = [
             {k: row[k] for k in ("test", "column", "cadence", "claim")}
+            # A test on another model (the parent a references names) says so.
+            | ({"model": row["model"]} if row["model"] != model else {})
             for row in generated
             if row["status"] == "added"
         ]
@@ -311,6 +333,21 @@ def propose(
                 "generated_tests": {
                     "value": added,
                     "evidence": "declared facts; declarations.render_tests",
+                },
+            }
+        watched = [
+            {k: row[k] for k in ("test", "column", "field")}
+            for row in monitor_rows
+            if row["status"] == "added"
+        ]
+        if watched:
+            # The vendor monitors the declared time column implies, which
+            # `monitors.vendor` turns on (#1482).
+            fields = {
+                **fields,
+                "monitors": {
+                    "value": watched,
+                    "evidence": "declared facts; monitors.vendor",
                 },
             }
         outcome.proposals.append(
@@ -441,10 +478,54 @@ def _owes_generated_tests(
             joins=declarations_mod.read_model_joins(
                 files, view.model_paths, model, dialect
             ),
+            history=declarations_mod.history_reader(view, files),
         )
     except (RewriteError, DeclarationError):
         return False
-    return any(row["status"] == "added" for row in generated)
+    if any(row["status"] == "added" for row in generated):
+        return True
+    # What other models' references imply about this one (#1457): a parent
+    # declared before the switch was on owes the test on its referenced key.
+    referenced: list[dict[str, Any]] = []
+    try:
+        declarations_mod.render_referenced_keys(
+            files,
+            view,
+            [model],
+            render_tests=render_tests,
+            dialect=dialect,
+            generated=referenced,
+        )
+    except (RewriteError, DeclarationError):
+        return False
+    return any(row["status"] == "added" for row in referenced)
+
+
+def _owes_monitors(
+    model: str, files: Mapping[str, str], view: Any, monitors: Any
+) -> bool:
+    """Whether the model's declaration gives a vendor monitor its YAML does not
+    list yet, with the gate open (#1482): a model declared before
+    ``monitors.vendor`` was set, which has no fact left to propose."""
+
+    if monitors is None or not monitors.open:
+        return False
+    sql_path = declarations_mod.model_sql_path(files, view.model_paths, model)
+    path = declarations_mod.schema_path(files, model)
+    if path is None or sql_path is None:
+        return False
+    rows: list[dict[str, Any]] = []
+    try:
+        declarations_mod.render(
+            files.get(path),
+            Declaration(model=model),
+            outputs=declarations_mod.model_outputs(files, view.model_paths, model),
+            monitors=monitors,
+            monitor_rows=rows,
+        )
+    except (RewriteError, DeclarationError):
+        return False
+    return any(row["status"] == "added" for row in rows)
 
 
 def _merge(

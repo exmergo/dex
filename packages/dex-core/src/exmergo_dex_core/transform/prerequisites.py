@@ -33,6 +33,7 @@ from typing import Any
 import yaml
 
 from ..edits import EditOp
+from ..manifest_paths import posix
 from .plans import EditKind, PlanEdit
 
 #: The edit kinds that can change any node's result, wherever they sit.
@@ -108,7 +109,7 @@ def _required_names(unique_id: str, node: Any) -> set[str]:
         names.add(f"{parts[2]}_{parts[3]}".lower())
     path = node.get("original_file_path") if isinstance(node, Mapping) else None
     if path:
-        names.add(PurePosixPath(str(path)).stem.lower())
+        names.add(PurePosixPath(posix(path)).stem.lower())
     return names
 
 
@@ -198,8 +199,8 @@ def _package_entry(node: Mapping[str, Any], install_dir: str | None) -> str | No
     if not package or not path:
         return None
     if install_dir:
-        return f"{install_dir.rstrip('/')}/{package}/{path}"
-    return patch
+        return f"{install_dir.rstrip('/')}/{package}/{posix(path)}"
+    return f"{package}://{posix(path)}"
 
 
 def _override_option(
@@ -428,7 +429,7 @@ def diagnose(
         if owner == "package":
             entry["package"] = package
         if node is not None and node.get("original_file_path"):
-            entry["path"] = node["original_file_path"]
+            entry["path"] = posix(node["original_file_path"])
         if message:
             entry["message"] = message[:_MESSAGE]
         if owner != "unknown":

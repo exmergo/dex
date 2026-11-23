@@ -37,6 +37,7 @@ from typing import Any
 
 from .. import model_versions as mv
 from ..dbt_project import DbtProjectView, jinja_regions, strip_relation_quoting
+from ..manifest_paths import node_file
 from .plans import EditKind, EditOp, PlanEdit, PlanError
 
 #: The model versions need: dbt added them in 1.5.
@@ -63,7 +64,7 @@ def _manifest_path(node: Mapping[str, Any]) -> str:
     ``models/dim_teams_v2.sql`` a version entry records.
     """
 
-    return str(node.get("original_file_path") or "").replace("\\", "/")
+    return node_file(node)
 
 
 def _files(view: DbtProjectView) -> dict[str, str]:

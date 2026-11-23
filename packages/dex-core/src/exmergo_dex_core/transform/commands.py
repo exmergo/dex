@@ -42,6 +42,7 @@ from ..dbt_tests import unit_test_overrides as _unit_test_overrides
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
 from ..errors import DexError, RequestError, UndeclaredPopulationChangeError
+from ..manifest_paths import posix
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
@@ -346,9 +347,14 @@ def plan(
 
     toggle_stated = _parse_toggle(engine, edits, toggle)
 
-    declared, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
-        engine, edits, declarations
-    )
+    (
+        declared,
+        declaration_notes,
+        drafts,
+        pii_metadata,
+        generated_tests,
+        monitors_report,
+    ) = _declare(engine, edits, declarations)
     edits = declared
 
     if not edits:
@@ -519,6 +525,8 @@ def plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    result.monitors = monitors_report
+    _price_generated_tests(engine, result, edits)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -828,7 +836,14 @@ def _keep_one_entry(
 
 def _declare(
     engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
-) -> tuple[list[PlanEdit], list[str], dict[str, Any], Any, dict[str, Any] | None]:
+) -> tuple[
+    list[PlanEdit],
+    list[str],
+    dict[str, Any],
+    Any,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     """Render the payload's declarations into ``edits``, draft what the cache
     already knows about each model, and warn where intent is missing.
 
@@ -841,7 +856,9 @@ def _declare(
     or declares, its ``drafted``, ``declared`` and ``missing`` parts (see
     :mod:`.drafting`). The fifth is ``data.generated_tests`` (#1449): the
     switch's setting and each generated test the declarations give, rendered or
-    not, or ``None`` where they give none.
+    not, or ``None`` where they give none. The sixth is ``data.monitors``
+    (#1482): the vendor monitors the declarations give, or ``None`` where
+    ``monitors.vendor`` is unset or nothing was declared.
     """
 
     from ..dbt_project import load as load_project
@@ -854,12 +871,14 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}, None, None
+        return edits, [], {}, None, None, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
     generated: list[dict[str, Any]] = []
     render_tests = engine.config.declarations.render_tests
+    monitor_rows: list[dict[str, Any]] = []
+    monitor_gate = _monitor_gate(engine, edits) if parsed else None
     if parsed:
         cache = None
         if any(d.population and d.population.filters for d in parsed):
@@ -884,6 +903,8 @@ def _declare(
             render_tests=render_tests,
             generated=generated,
             dialect=_dialect(engine),
+            monitors=monitor_gate,
+            monitor_rows=monitor_rows,
         )
         warnings.extend(rendered_warnings)
         edits = _with_generated_macros(view, edits, generated)
@@ -902,12 +923,36 @@ def _declare(
     drafts, draft_warnings = _draft(engine, view, edits, [d.model for d in parsed])
     warnings.extend(draft_warnings)
     edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
+    edits = declarations_mod.keep_no_failures_on_personal_columns(view, edits)
     return (
         edits,
         warnings,
         drafts,
         pii_metadata,
         _generated_report(render_tests, generated),
+        (
+            _monitors().report(monitor_gate, monitor_rows)
+            if monitor_gate is not None
+            else None
+        ),
+    )
+
+
+def _monitors() -> Any:
+    from . import monitors
+
+    return monitors
+
+
+def _monitor_gate(engine: DexEngine, edits: list[PlanEdit]) -> Any:
+    """The vendor monitors' gate (#1482) for the project as ``edits`` leave
+    it, or ``None`` where ``monitors.vendor`` is unset."""
+
+    return _monitors().gate(
+        engine.project_dir(),
+        edits,
+        engine.config.monitors.vendor,
+        engine.config.dbt_prod_target,
     )
 
 
@@ -964,6 +1009,26 @@ def _generated_report(
         "counts": counts,
         "tests": generated,
     }
+
+
+def _price_generated_tests(
+    engine: DexEngine, result: PlanResult, edits: list[PlanEdit]
+) -> None:
+    """What each generated test the plan leaves in the YAML costs per
+    production run (#1462), from production's catalog sizes, folded onto a
+    plan that is already stored. Total for the reason row attribution is: the
+    estimate is commentary on the plan, so a defect in it is a warning naming
+    the exception type and never a plan that fails to exist."""
+
+    from .test_cost import price
+
+    try:
+        result.warnings.extend(price(engine, result.generated_tests, edits=edits))
+    except Exception as exc:
+        result.warnings.append(
+            "could not estimate what the generated tests cost per production run "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
 
 
 def _stamp_pii(
@@ -2235,6 +2300,7 @@ def declare(
             return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
         return drafts.get(model), warnings
 
+    monitor_gate = _monitor_gate(engine, [])
     outcome = declare_mod.propose(
         view,
         selection.models,
@@ -2243,6 +2309,7 @@ def declare(
         cap=cap,
         render_tests=engine.config.declarations.render_tests,
         dialect=_dialect(engine),
+        monitors=monitor_gate,
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2265,6 +2332,12 @@ def declare(
             "nothing to propose, so no plan was stored; every selected model is "
             "listed under `skipped` with the reason"
         )
+        # A model whose only owed change is a monitor reads `complete` when the
+        # gate is closed, so the reason no monitor was written is said here
+        # (#1482); a stored plan carries it in its own warnings.
+        closed = monitor_gate.warning() if monitor_gate is not None else None
+        if closed is not None:
+            notes.append(closed)
         return DeclareResult(notes=notes, **common)
 
     payload = [
@@ -2378,7 +2451,7 @@ def _failed_package_node(
         )
     unique_id, node = failed[0]
     if node.get("package_name") == root:
-        path = node.get("original_file_path") or name
+        path = posix(node.get("original_file_path")) or name
         raise RepairRefusedError(
             f"the project owns {name} ({path}), so it is repaired with an ordinary "
             "`dex transform plan` on that file, not an override"
@@ -2854,7 +2927,9 @@ def test_mutations(
     store = engine.store
     repo_root = engine.require_repo_root("running mutation coverage")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     connector = engine.connector or config.connector
     effective = config.model_copy(update={"connector": connector})
     paradigm = paradigm_for(connector, effective)
@@ -3549,7 +3624,10 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
        package's needs the cache its stripped ``on_run_start`` builds and fails
        every test without it (measured on the fixture's variant e at 0.26.1),
        so it cannot be left to run. Where a root-project materialization still
-       hands the tests to the package's, the run is refused.
+       hands the tests to the package's, the run is refused. On a release Dex
+       was not run against (#1445) the flag is set with the models disabled
+       too, since only the tested releases show their materialization handing
+       each test to dbt's there.
     3. Each monitoring test is kept out of every run, the baseline included:
        with the package disabled it checks nothing, and with it enabled it
        reads and writes the package's history. Each is returned with its
@@ -3562,7 +3640,6 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
 
     from . import elementary as elementary_mod
     from .build import DbtRunError
-    from .mutation import MutationError
     from .package_overrides import _installed
 
     root = getattr(shadow, "shadow", None)
@@ -3572,6 +3649,11 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
         return [], []
     warnings: list[str] = []
     manifest = shadow.parse()
+    # The copy is made inert the same way on any release (#1445); a release
+    # dex was not run against is named rather than read as a known one.
+    release_warning = elementary_mod.read(root, manifest).release_warning()
+    if release_warning is not None:
+        warnings.append(release_warning)
     dependents = elementary_mod.package_model_dependents(manifest)
     disabled = False
     if dependents:
@@ -3596,28 +3678,16 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
                 "copy, so they stay enabled; the tests run under dbt's own test "
                 "materialization and its monitoring tests are left out instead"
             )
-    if not disabled:
-        undo = shadow.set_project_flag(elementary_mod.OVERRIDE_FLAG, True)
-        try:
-            manifest = shadow.parse()
-        except DbtRunError as exc:
-            # dbt 1.12.5 refuses `flags:` in dbt_project.yml beside a legacy
-            # `config:` block in profiles.yml, among others.
-            undo()
-            raise MutationError(
-                "the Elementary package stays enabled in this project's copy, so "
-                "dex sets dbt's require_explicit_package_overrides_for_builtin_"
-                "materializations there to run the tests under dbt's own test "
-                f"materialization, and dbt would not parse the copy with it: {exc}"
-            ) from exc
-        if elementary_mod.read(root, manifest).materialization == "elementary":
-            raise MutationError(
-                "the Elementary package stays enabled in this project's copy, and "
-                "a test materialization in the project still hands every test to "
-                "Elementary's, which needs the run hooks a mutation run cannot "
-                "fire. Measuring would write to the dev target or fail every "
-                "test, so dex does not run it"
-            )
+    # With the package disabled, its materialization hands each test to dbt's
+    # on every release dex read; on another (#1445) nothing says it does, so
+    # dbt's own is pinned as it is where the package stays enabled.
+    if not disabled or elementary_mod.read(root, manifest).materialization == "unknown":
+        why = (
+            "the Elementary package stays enabled in this project's copy"
+            if not disabled
+            else "the installed Elementary release is not one dex was run against"
+        )
+        manifest = _pin_dbt_test_materialization(shadow, root, why)
     code = "elementary_disabled" if disabled else "elementary_history"
     left_out = [
         {
@@ -3629,6 +3699,37 @@ def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
         for name, reads in elementary_mod.monitoring_tests(manifest).items()
     ]
     return left_out, warnings
+
+
+def _pin_dbt_test_materialization(shadow, root: Path, why: str) -> dict:
+    """Set dbt's override flag in the copy so its own ``test`` materialization
+    runs, and return the manifest; refuse where dbt will not parse the copy
+    with it, or where the project still hands the tests to Elementary's."""
+
+    from . import elementary as elementary_mod
+    from .build import DbtRunError
+    from .mutation import MutationError
+
+    undo = shadow.set_project_flag(elementary_mod.OVERRIDE_FLAG, True)
+    try:
+        manifest = shadow.parse()
+    except DbtRunError as exc:
+        # dbt 1.12.5 refuses `flags:` in dbt_project.yml beside a legacy
+        # `config:` block in profiles.yml, among others.
+        undo()
+        raise MutationError(
+            f"{why}, so dex sets dbt's require_explicit_package_overrides_for_"
+            "builtin_materializations there to run the tests under dbt's own test "
+            f"materialization, and dbt would not parse the copy with it: {exc}"
+        ) from exc
+    if elementary_mod.read(root, manifest).materialization != "dbt":
+        raise MutationError(
+            f"{why}, and a test materialization in the project still hands "
+            "every test to Elementary's, which needs the run hooks a mutation "
+            "run cannot fire. Measuring would write to the dev target or fail "
+            "every test, so dex does not run it"
+        )
+    return manifest
 
 
 def _left_out_of(
@@ -4779,7 +4880,7 @@ class _DownstreamTests:
         root = shadow.shadow
         try:
             for uid in closure.eligible:
-                path = (nodes.get(uid) or {}).get("original_file_path") or ""
+                path = posix((nodes.get(uid) or {}).get("original_file_path"))
                 text = (root / path).read_text(encoding="utf-8")
                 shadow.write(path, text + "\n" + mutation_mod.EPHEMERAL_HEADER + "\n")
                 originals[path] = text
@@ -6162,7 +6263,9 @@ def build(
         )
     # Ahead of the install: a prod target must not get as far as a reinstall.
     assert_dev_target(
-        target or engine.config.dbt_target or "dev", engine.config.dbt_target
+        target or engine.config.dbt_target or "dev",
+        engine.config.dbt_target,
+        prod=getattr(engine.config, "dbt_prod_target", None),
     )
     project = engine.project_dir()
     if not has_package_spec(project):
@@ -6327,7 +6430,9 @@ def _build_project(
     config = engine.config
     repo_root = engine.require_repo_root("building the dbt project")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
     connector = engine.connector or config.connector
 
@@ -6381,6 +6486,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
+            prod_target=getattr(config, "dbt_prod_target", None),
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -6515,6 +6621,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
+            prod_target=getattr(config, "dbt_prod_target", None),
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -8051,6 +8158,9 @@ def _attach_completion(
     try:
         states = inputs.get("comparisons")
         diagnosed = _attach_prerequisites(result, inputs)
+        release_warning = _elementary_release_warning(inputs)
+        if release_warning is not None:
+            result.warnings.append(release_warning)
         result.completion = summarize_completion(
             result.evidence,
             result.verification,
@@ -8092,7 +8202,8 @@ def _attach_completion(
             result.warnings.append(
                 f"{unchecked} passing Elementary test(s) are not counted toward "
                 "any model's assurance (compiled to the package's no-results "
-                "query, or judged against history dex did not measure); they are "
+                "query, judged against history dex did not measure, or run by an "
+                "Elementary release dex was not run against); they are "
                 "under data.completion.assurance.unchecked_tests with a "
                 "reason_code, any past the list's cap counted in "
                 "data.completion.elided"
@@ -8113,6 +8224,28 @@ def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
     effort: an unreadable manifest leaves every test counted as it was.
     """
 
+    runtime = _elementary_runtime(inputs)
+    if runtime is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        return dict(elementary_mod.unchecked_tests(inputs["manifest"], runtime)) or None
+    return None
+
+
+def _elementary_release_warning(inputs: dict[str, Any]) -> str | None:
+    """The warning for an Elementary release dex was not run against (#1445),
+    ``None`` where the release is supported or the package is not installed."""
+
+    runtime = _elementary_runtime(inputs)
+    return runtime.release_warning() if runtime is not None else None
+
+
+def _elementary_runtime(inputs: dict[str, Any]) -> Any:
+    """What the installed Elementary package does for the build's target, read
+    from the build's own manifest; ``None`` where it cannot be read."""
+
     manifest = inputs.get("manifest")
     project = inputs.get("project")
     if not isinstance(manifest, dict) or project is None:
@@ -8120,8 +8253,7 @@ def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
     from . import elementary as elementary_mod
 
     with contextlib.suppress(Exception):
-        runtime = elementary_mod.read(project, manifest)
-        return dict(elementary_mod.unchecked_tests(manifest, runtime)) or None
+        return elementary_mod.read(project, manifest)
     return None
 
 
@@ -8159,7 +8291,7 @@ def _incremental_replay_inputs(
             continue
         if (node.get("config") or {}).get("materialized") != "incremental":
             continue
-        path = str(node.get("original_file_path") or "")
+        path = posix(node.get("original_file_path"))
         if not path or not any(
             path == candidate or candidate.endswith("/" + path) for candidate in edited
         ):
@@ -8478,9 +8610,14 @@ def _semantic_plan(
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
     # and before the parse below, so dbt reads the layer and the models together.
-    edits, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
-        engine, edits, declarations
-    )
+    (
+        edits,
+        declaration_notes,
+        drafts,
+        pii_metadata,
+        generated_tests,
+        monitors_report,
+    ) = _declare(engine, edits, declarations)
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
     # caller's call about their own YAML, not about YAML dex wrote for them.
     derived = _derive_semantic(engine, view, edits)
@@ -8545,6 +8682,8 @@ def _semantic_plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    result.monitors = monitors_report
+    _price_generated_tests(engine, result, edits)
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)

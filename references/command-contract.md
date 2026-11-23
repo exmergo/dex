@@ -181,6 +181,10 @@ dex explore profile <objects>     -> column profiles + PII flags + candidate key
 dex explore relationships         -> inferred + declared joins with confidences + inference notes
                                      (declared covers both a relationships test and a join the
                                      semantic layer declares; `semantic_join_count` splits them)
+  [--include-elementary]             the Elementary dbt package's own tables are left out of
+                                     profiling and inference (#1494): not priced, no join among
+                                     them inferred, named in data.excluded with a note; this
+                                     profiles them with the rest
 dex explore map [--detail]        -> write/update the .dex cache, and return the map:
                                      per top-ranked object its grain, key, notable
                                      columns, PII flags and data-quality findings,
@@ -200,6 +204,10 @@ dex explore diagram               -> the cached map as a Mermaid erDiagram, in `
                                      joined objects with their grain/key/join/PII columns
                                      (--full for every eligible object and column); every
                                      elision is counted in notes; dex writes no file
+  [--include-elementary]             the Elementary dbt package's own tables are left out
+                                     (#1494), recognised over the cache's identifiers, so the
+                                     command stays free; named in data.excluded with a note;
+                                     this draws them
 dex explore query "<SELECT ...>"  -> firewall-approved SELECTs, capped and row-major
   [more...] | --sql-file <path>      (variadic: one call answers several questions; a file takes
   [--across <ds,ds>]                 one statement per line or semicolon-separated statements;
@@ -270,6 +278,28 @@ dex init [<name>]                -> complete project setup: new dbt-backed Dex p
                                      runs builds, or chooses budgets during setup.
                                      data.readiness separates configuration, connection,
                                      build_prerequisites, and build (unchecked).
+                                     data.elementary reports the Elementary package on
+                                     the selected project (declared, declared_in,
+                                     declared_version, source, installed, release, read
+                                     from the repository with no dbt parse) and `install`:
+                                     `written` (a project init creates declares it in
+                                     packages.yml and configures it in dbt_project.yml,
+                                     in its own diff), `planned` (a project init adopts
+                                     gets the same two edits as a stored transform plan,
+                                     plan_id and plan_diffs, never written by init; a
+                                     rerun reports the same unapplied plan), `present`
+                                     (already declared: its release, nothing offered),
+                                     `declined` (--no-elementary, or "no" to the TTY
+                                     question) or `not_offered` (a file written in a form
+                                     an in-place edit would reformat, with the reason).
+                                     The install pins elementary-data/elementary 0.26.1,
+                                     sets models.elementary +schema: elementary and
+                                     +enabled: "{{ target.name != '<dev target>' }}" (so
+                                     a dev build runs none of its models or hooks) and
+                                     vars.test_sample_row_count: 0. next_steps add
+                                     `dex transform deps` and, as the user's to run,
+                                     `dbt deps` and `dbt run --select elementary --target
+                                     <dbt_prod_target>` on production (#1464).
 dex transform init "<name>"       -> legacy bootstrap of a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their
@@ -509,7 +539,12 @@ dex transform build --target dev  -> cost preflight FIRST; runs only with --conf
                                      compiled to its no-results query, package_disabled or
                                      compiled_to_no_results, or one judging the run against stored
                                      history dex did not measure, whenever the package is enabled,
-                                     history_unmeasured, #1308),
+                                     history_unmeasured, #1308; on an Elementary release outside the
+                                     range from the oldest release the fixture runs to the newest (a
+                                     patch above the newest is outside it),
+                                     every Elementary test its compiled SQL does not settle is
+                                     elementary_release_untested, and elementary_release_unknown
+                                     where the release cannot be read, #1445),
                                      what verification
                                      ran and suppressed, the declared obligations by status, and where the
                                      full evidence is, so a truncated read still has the answer.
@@ -770,6 +805,11 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      entity counts, one data.temporal_contracts record per contract;
                                      unchecked with snapshot_not_ancestor or lineage_unavailable where
                                      the manifest does not show the model descending from it),
+                                     freshness_exceeded (a time column's declared freshness: its
+                                     newest value trails the warehouse's clock by more than max_lag,
+                                     or it holds no value; lag in seconds, never a value, one
+                                     data.freshness record per declared column; high on a capture
+                                     basis, medium on business; #1460),
                                      population_delta (a built model declaring no parent, against the
                                      parent dex drafts for it: orphan_keys, missing_parents, empty_rows,
                                      one data.population_delta record per model, needs_decision listed
@@ -1456,9 +1496,118 @@ default, or a filter or operator after it is refused. A key naming a location
   filter that does not transpile is `join_shape_unsupported`; SQL holding other
   Jinja, or not parsing, is `join_unread`, once per declared `references`; and a
   listed `dex_join_coverage` whose join the SQL no longer writes is reported
-  `stale` (`reason: join_not_in_model`) with a warning, and never removed. The plan writes each
+  `stale` (`reason: join_not_in_model`) with a warning, and never removed. It
+  renders `dex_referenced_key` (#1457) under each parent column a `references`
+  names, in the **parent's** YAML entry, tagged `dex_every_run`, on every
+  connector: the references read are every one in the project as the plan
+  leaves it whose child or parent the plan declares, one test per parent column
+  however many children name it, its `data.generated_tests` row carrying the
+  parent as `model` and the children under `referenced_by`. It fails with the
+  count of rows repeating a non-NULL key (rows beyond the first of each), NULLs
+  being no key, and returns that count and never a key. A parent whose declared
+  grain is exactly that column, or whose column already lists `unique`, renders
+  nothing, `covered_by_builtin`; a project model with no `models:` entry, a seed
+  or a snapshot renders nothing, `parent_undeclared` (Dex does not create an
+  entry to hold a test); a package's model, or an override its package
+  documents, renders nothing, `parent_in_package`. `maintain verify` holds the
+  same fact only through its consequence, `row_fanout` on a child joining the
+  parent, which has other causes, so the parity harness holds the two in that
+  direction alone. `transform declare <parent>` proposes the test where the
+  parent owes nothing else. It renders `dex_temporal_contract` (#1458) for each
+  measure a declared `history` names, a model-level test tagged `dex_scheduled`
+  on every connector, its `data.generated_tests` row naming the measure as
+  `variant`: it fails with the count of entities whose column disagrees with the
+  value the snapshot's versions and the declared policy give, derived and
+  excluded as `maintain verify` derives and excludes them, so each count is the
+  `mismatched_entities` of one `temporal_*_mismatch` finding, and returns that
+  count and never a key. A measure verify would leave unchecked renders nothing,
+  with verify's reason, in verify's order: `snapshot_not_ancestor` (the model's
+  `ref()` lineage as the plan leaves it does not reach the snapshot),
+  `lineage_unavailable` (an unresolved `ref()`, a macro that may read a
+  relation, or a node the graph cannot read), `hard_delete_records` (the
+  snapshot's `hard_deletes: new_record`, from its `config()`, YAML entry or
+  `dbt_project.yml`), `snapshot_config_unread` (the plan's own reason: that
+  config, or `snapshot_meta_column_names`, is an expression), then
+  `policy_missing`; `column_not_output` as for every kind. The `population` and
+  `time_provenance` assertions render no test. It renders `dex_freshness`
+  (#1460) under each column declaring `freshness` (the column with role
+  `time`), tagged `dex_every_run`, on every connector, with `max_lag_seconds`
+  as its one argument and the basis as its `data.generated_tests` `variant`
+  (part of the claim, not an argument): it fails with one row when the column's
+  newest value trails the warehouse's clock by more than the lag, or when the
+  column holds no value (an empty model, a column NULL on every row). It counts
+  the rows within the limit, never computing the newest value or the lag, and
+  returns `1` and the limit, so dbt's `failures` equals `freshness_exceeded`'s
+  `stale`. `maintain verify` reports the lag in seconds, except on a column that
+  looks like personal data, which it judges by the same count with the lag
+  withheld (`lag_withheld`). Both sides read the warehouse's clock
+  in one statement, as whole epoch seconds with a timestamp carrying no time
+  zone read as UTC, so a value exactly at the limit passes; a column that is no
+  date or timestamp errors the test and is `unchecked` (`not_temporal`) in
+  `maintain verify`. A listed `dex_freshness` whose claim the column's declared
+  freshness no longer gives (its `max_lag` changed) is reported `stale`,
+  `reason: freshness_changed`, with a warning, and is never removed; a change
+  of `basis` alone keeps the listed test, which behaves the same. It renders
+  `dex_continuity` (#1461) under each column declaring `continuity` (the column
+  with role `time`, `{grain, by}`; `grain` one of `second`, `minute`, `hour`,
+  `day`, `week`, `month`, `quarter`, `year`, default `day`, `week` the ISO week;
+  `by` key columns, default none), tagged `dex_scheduled`, on every connector,
+  with `grain` and `by` as its arguments and the grain as its `variant`: it fails
+  with the number of gaps, a gap being a run of buckets at the grain holding no
+  row between two buckets holding rows, per value of the `by` columns, and
+  returns that count and never a date or a key. An edge is never a gap. Each
+  value is bucketed in UTC from its whole epoch seconds (calendar grains through
+  its UTC day's civil date), with no date spine; a column that is no date or
+  timestamp, and a grain finer than a day on a date, error the test. It has no
+  `maintain verify` twin: the parity harness holds it to fixture pairs stating
+  the exact failure count, on every connector it runs. A `by` column the model
+  provably does not output gives `column_not_output`; a `continuity` off a
+  `role: time` column, or `by` naming the time column, is refused. A listed
+  `dex_continuity` whose claim the declared grain or `by` no longer gives is
+  reported `stale`, `reason: continuity_changed`, with a warning, and is never
+  removed.
+  The plan writes each
   kind's generic test macro as a `macro_sql` diff where the project defines none; a `macro_sql` file may hold
   `{% test %}` blocks beside its macros, as dbt reads them from macro paths.
+  Each generated test the YAML holds once the plan lands (`added`,
+  `already_listed`, `listed_while_off`) carries a per-production-run `cost`
+  (#1462): `estimated`, with the `estimate` in the connector's unit and the
+  `relations` it reads, or `unknown` with a `reason` and never a guess.
+  `data.generated_tests.cost` holds the basis (`prod`, `paradigm`, `unit`,
+  `note`, `read_at`, each relation's `rows` and `bytes`) and `per_run`, the
+  `dex_every_run` and `dex_scheduled` totals apart, each `complete` only where
+  every test of the cadence was priced. A relation is the model's alias in
+  `<connector>.prod`, its custom schema as dbt names it there, a view read as
+  the tables its manifest lineage names (`through`); only catalog
+  metadata is read, unasked only where reading it is free.
+- A declaration also writes an observability vendor's **monitors** where
+  `monitors.vendor` in `.dex/config.yml` names one (#1482; unset by default,
+  `elementary` the one vendor). A column declared with role `time` becomes the
+  `timestamp_column` of `elementary.volume_anomalies` and
+  `elementary.freshness_anomalies`, model-level tests in the same YAML entry
+  and plan as the declaration, each with no training setting of Dex's choosing
+  and carrying `config.meta.dex.monitor` (`vendor`, `from`: the declaration
+  field) and the `dex_monitor` tag. Several time columns give a
+  `freshness_anomalies` on each and no `volume_anomalies`
+  (`ambiguous_time_column`); none gives neither (`no_time_column`). Nothing is
+  written unless the package is installed (or the plan adds it) and the
+  repository's `dbt_project.yml` enables `models: elementary` on the production
+  target, read with `target.name` replaced by `dbt_prod_target`: a literal, an
+  absent setting (enabled) or a test of `target.name` against literals is read,
+  and anything else, or a per-target test with no `dbt_prod_target`, is
+  `unknown`. Disabled or unknown, each monitor is `not_rendered`
+  (`package_not_installed`, `production_disabled`, `production_unknown`) and one
+  warning says why. A hand-written monitor of the same test (and, for
+  freshness, the same `timestamp_column`) is `hand_written` and left as
+  written; one Dex wrote that the declaration no longer gives is `stale` and
+  never removed. `data.monitors` holds `vendor`, `package` (`status`,
+  `release`), `production` (`status`, `reason`, `prod_target`, `expression`),
+  `counts` and `monitors[]` (`model`, `test`, `column`, `arguments`, `field`,
+  `status`, `reason`), and is absent when the setting is unset. Each monitor Dex
+  wrote is a `data.decisions` entry read back from the YAML, with `monitor` and
+  `field` and no `column`, so it settles no change-scope entry. Monitors are not
+  generated tests: `declarations.render_tests` does not govern them and no
+  per-run estimate prices them.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it
@@ -1637,7 +1786,15 @@ default, or a filter or operator after it is refused. A key naming a location
   which can count each selected test's failed rows and query a sample of them),
   `data.unpriced` holds the record (`work`, `hooks`, `monitoring_tests` with
   `days_back` and `days_back_source`, `monitoring_test_count`,
-  `materialized_test_count`), and one warning per kind says what was left out.
+  `materialized_test_count`, `release`, `release_reason_code`), and one warning
+  per kind says what was left out. On an Elementary release outside the range
+  from the oldest release the fixture runs to the newest, or one that cannot
+  be read (#1445), `release_reason_code`
+  is `elementary_release_untested` or `elementary_release_unknown`, each kind
+  is counted wherever it may run (hooks that would return early, the monitoring
+  tests and the materialization's extras of a disabled package, and the
+  package's own tests among the extras), a default `days_back` is `unknown`,
+  and one more warning names the release and the newest tested.
   A project without the package gets none of it and `cost.unpriced: null`. One
   that disables the package for the target gets no monitoring test or test
   extra, and its hooks are named only where they still run: dbt disables them
@@ -1932,7 +2089,10 @@ default, or a filter or operator after it is refused. A key naming a location
   checked twice. A declared `population.parent` is held to the parent's keys
   (`parent_population_missing`, `parent_population_unexpected`, #857), and a
   declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
-  per contract under `data.verification.temporal_contracts`). A built model that
+  per contract under `data.verification.temporal_contracts`), and a time
+  column's declared `freshness` to the warehouse's clock (`freshness_exceeded`,
+  #1460, one record per declared column under `data.verification.freshness`). A
+  built model that
   declares no parent is measured against the parent dex drafts for it (#1228):
   orphan keys, missing parents and rows whose child columns are all NULL or zero
   (a sign of no child, not proof), one record per drafted model under
@@ -1940,7 +2100,7 @@ default, or a filter or operator after it is refused. A key naming a location
   `completion.obligations.needs_decision` where the counts ask which rows belong.
   Only the plan's models with `--for-plan`, at most 25 without. Every class that
   did not run is named in `suppressed` (`grain`, `unit`, `additivity`,
-  `population`, `parent_population`, `temporal`); `population_delta` never is,
+  `population`, `parent_population`, `temporal`, `freshness`); `population_delta` never is,
   since each model it considered has its own record.
 
   **Join coverage.** Every equality join the built models write is measured as
@@ -2568,7 +2728,35 @@ each list capped at 25 with the rest counted in `elided_namespaces` and
 from `data.skipped`, which is the rank cutoff's. A note names the namespaces and
 the way back. The tables stay readable: an unranked `explore inventory` lists
 them, `explore profile` and `explore query` read them as any other, and
-`--include-elementary` ranks them with the rest. Objects skipped on a
+`--include-elementary` ranks them with the rest. `explore diagram` and
+`explore relationships` apply the same rule (#1494), by the same signature.
+The diagram reads it over the cache's identifiers, names only, so it stays free:
+a cache an `--include-elementary` map filled with the package's profiles, or a
+hand-run `explore profile` added one beside the inventory entries `map` keeps
+for them, still draws none of them, `--full` included. A left-out object is never
+counted as an elided entity; an edge onto one is dropped as any edge whose
+endpoint is not drawn, counted in `elided_edge_count`, and connects nothing, so a
+project table whose only join is onto one is isolated and drawn only with
+`--full`. The signature has to be in the cache to read: a cache only
+`explore relationships` has written holds no entry for the tables it left out (a
+`map` keeps their inventory entries, and no later write drops them), so a lone
+package table profiled by hand into it is below the signature and `--full` draws
+it, with nothing excluded, until an `explore map` writes the rest.
+Relationship inference leaves them out before anything is priced or profiled:
+none is profiled, a metered connector's estimate prices none, and no join among
+them (their shared `unique_id` columns) is inferred; a profile of one the cache
+already holds is left as it is, read by nothing, and the joins among them an
+earlier `--include-elementary` run cached are dropped from the cache, as on
+`map`, where this run listed their namespace. Carried forward from outside a
+narrower `--scope` instead, the tables are recognised among the carried profiles,
+as `map` recognises them, and the joins stay in the cache and out of
+`data.relationships`; `carried_relationship_count` counts only the carried joins
+the list reports, so it agrees with `inferred_count`, which is derived from the
+list. Only the package's own tables are left out, so a project
+table sharing their schema is still drawn and profiled. Each command reports `data.excluded` in the shape `map`
+does, always present, with a note naming the namespaces and `--include-elementary`
+as the way back: on `diagram` it draws them, on `relationships` it profiles them
+and infers joins among them. Objects skipped on a
 re-map carry their prior profiles forward (`carried_forward_count`), each
 stamped with its own `profiled_at`. A selected object whose cached profile is
 still fresh (same connector, schema unchanged, profiled within

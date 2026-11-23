@@ -24,6 +24,13 @@ production one being explored. The names are the union of the package's models
 at releases 0.15.2, 0.16.4, 0.23.0 and 0.26.1, read from each release's
 ``models/`` tree.
 
+``explore diagram`` and ``explore relationships`` apply the same rule (#1494):
+the diagram reads the signature over the cache's identifiers (so it has to be
+there: a lone package table profiled into a cache holding no other entry of the
+package's is below it) and draws none of the package's tables, and relationship
+inference neither profiles them nor infers joins among them, so a metered
+connector's estimate prices none of them.
+
 Leaving a table out of ranking hides nothing: it stays in an unranked
 ``explore inventory``, and ``explore profile`` and ``explore query`` read it as
 they read any other table.
@@ -201,8 +208,20 @@ def recognise(
 MAX_NOTE_NAMESPACES = MAX_NAMESPACES
 
 
-def note(found: ElementaryTables, *, command: str) -> str:
-    """The sentence ``notes`` carries when ranking left Elementary's tables out."""
+def note(
+    found: ElementaryTables,
+    *,
+    command: str,
+    left_out_of: str = "the ranking",
+    why: str = "their size says nothing about the project's own tables",
+    way_back: str = "rank them with the rest",
+) -> str:
+    """The sentence ``notes`` carries when a command left Elementary's tables out.
+
+    ``left_out_of``, ``why`` and ``way_back`` say what the command did without
+    them and what ``--include-elementary`` does: ranking's words by default, the
+    diagram's and relationship inference's where those commands call (#1494).
+    """
 
     names = sorted(found.namespaces)
     where = ", ".join(names[:MAX_NOTE_NAMESPACES])
@@ -210,10 +229,9 @@ def note(found: ElementaryTables, *, command: str) -> str:
         where += f", and {len(names) - MAX_NOTE_NAMESPACES} more namespace(s)"
     count = len(found.identifiers)
     return (
-        f"left {count} table(s) of the Elementary dbt package out of the ranking "
-        f"(in {where}): the package writes them on every run, so their size says "
-        "nothing about the project's own tables. data.excluded names them. They "
-        "stay readable: `explore inventory` without --rank lists them, and "
-        "`explore profile` and `explore query` read them. Pass "
-        f"--include-elementary to rank them with the rest in `{command}`"
+        f"left {count} table(s) of the Elementary dbt package out of {left_out_of} "
+        f"(in {where}): the package writes them on every run, so {why}. "
+        "data.excluded names them. They stay readable: `explore inventory` "
+        "without --rank lists them, and `explore profile` and `explore query` "
+        f"read them. Pass --include-elementary to {way_back} in `{command}`"
     )

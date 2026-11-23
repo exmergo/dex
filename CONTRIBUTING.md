@@ -149,7 +149,21 @@ both fixtures `not_rendered` with that reason, that no test builds, and that
 (`dex_join_coverage`'s LEFT-join row, `covered_by_builtin`, is held the same
 way). A kind whose instances read the model's SQL (`dex_join_coverage`, which
 reads its joins) sets `GeneratedTestKind.reads_joins` and takes the joins the
-plan read beside the declaration. A kind that
+plan read beside the declaration. A kind whose test sits on another model
+than the one declaring the fact (`dex_referenced_key`, on the parent a
+`references` names) sets `GeneratedTestKind.on_parent`; its row declares the
+children with `declared_fixtures`, names the fixture `maintain verify`'s finding
+sits on with `finding_on`, and, where the finding follows from the violation but
+not the reverse (a repeated parent key fans a child out; a fan-out has other
+causes), sets `directional`, so the clean fixture need only pass the test. A
+model the build skips because a parent fixture's test failed is built again on
+its own before `maintain verify` reads it. A kind whose instances read what
+the plan read of a snapshot (`dex_temporal_contract`, from a declared
+`history`) sets `GeneratedTestKind.reads_history` and takes a
+`HistoryReading` beside the declaration; its row builds the snapshot its
+fixtures read with `snapshots`, written under `snapshots/dex_parity/`, built in
+the first pass only and reported under `ParityReport.snapshots` so a connector's
+cleanup drops them as tables. A kind that
 does not support a connector declares it (`GeneratedTestKind.dialects`), and the
 harness then checks that the plan renders nothing there.
 
@@ -558,7 +572,27 @@ DEX_TEST_ELEMENTARY=1 \
 
 The seed gives the `dbt_dev` role a second schema, `dbt_dev_elementary`, for the
 package's models, so re-run the setup script on a container seeded before it
-existed. No CI job sets `DEX_TEST_ELEMENTARY`, so neither file runs there.
+existed.
+
+The reader of the package's tables supports fewer releases than the fixture
+runs: those with a recorded layout in
+`packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
+(0.26.1 today). Adding one means copying each table's columns from the
+package's model files at that release's tag, citing the file and lines, and
+adding a fixture case whose tables are read back to the run that wrote them.
+The loader refuses a release the fixture does not run.
+
+In CI both files run in the integration workflow
+(`.github/workflows/integration.yml`): on a push to `main` that matches the
+workflow's `paths` filter (any change under `packages/dex-core/`, for one), on the
+weekly schedule and on a manual dispatch, never on a pull request, since
+installing the package needs the network. The Postgres file runs in its own step
+of the `postgres` job and the DuckDB file in the `elementary_duckdb` job, each
+with `DEX_TEST_ELEMENTARY=1` on that step. Because a skip counts as a pass, each
+step then runs `scripts/check_no_skips.py` over the JUnit report pytest wrote,
+which fails the step on any skipped case (an expected failure, `xfail`,
+included) or an empty run, so a dropped variable fails rather than reading as
+green.
 
 ## Agent evals (`evals/`)
 

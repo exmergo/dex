@@ -2,8 +2,8 @@ name: OS canaries (Windows, macOS)
 
 # A weekly run of the tier-1 unit tests on Windows (#487, part 4). Windows is
 # not a claimed platform, so this is not a required check and does not run per
-# pull request: the suite takes a quarter of an hour on a Windows workstation,
-# and a Windows leg on every pull request would be the slowest job in CI and
+# pull request: the suite takes over an hour on a hosted Windows runner, and a
+# Windows leg on every pull request would be the slowest job in CI and
 # would add Windows-only flakiness (file locking on temp directories, DuckDB
 # file handles, subprocess differences) as a merge blocker. A weekly run still
 # catches the class of regression #264 and #487 were (a platform separator in
@@ -32,15 +32,33 @@ permissions:
   contents: read
 
 jobs:
-  # The whole suite in one job: a weekly canary has no merge to unblock, so it
-  # does not need ci.yml's parallel groups or their coverage gate.
+  # The groups ci.yml splits the suite into (tests/ci_groups.py), read the same
+  # way so a group cannot be missing here. One job per group and system: the
+  # whole suite in one job outgrew its bound (Windows ran past ninety minutes on
+  # 2026-11-23, macOS took eighty), and a hung group now fails alone instead of
+  # hiding every result behind a cancelled job. Each system's gate below proves
+  # its groups still ran the whole suite between them.
+  test-groups:
+    runs-on: ubuntu-latest
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: groups
+        run: echo "groups=$(python3 scripts/check_test_groups.py matrix)" >> "$GITHUB_OUTPUT"
+
   windows:
+    name: windows (${{ matrix.group }})
+    needs: test-groups
     runs-on: windows-latest
-    # The full suite took just under eighteen minutes on a Windows workstation
-    # with every extra installed; a hosted runner is slower. A bound well above
-    # that, so a hung test fails the run rather than holding a runner for the
-    # six-hour default.
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.test-groups.outputs.groups) }}
+    # A group is cut to about three minutes of tests on Linux; a hosted Windows
+    # runner is several times slower, so a bound well above that, which still
+    # fails a hung test long before the six-hour default.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: packages/dex-core
@@ -63,12 +81,29 @@ jobs:
           python-version: "3.14"
       - name: Sync (duckdb + bigquery + snowflake + databricks + postgres + redshift + clickhouse + trino + dev extras)
         run: uv sync --locked --extra duckdb --extra bigquery --extra snowflake --extra databricks --extra postgres --extra redshift --extra clickhouse --extra trino --extra dev --python 3.14
-      - name: Tier-1 unit tests
-        run: uv run --no-sync pytest -q
+      - name: Tier-1 unit tests (${{ matrix.group }})
+        run: >-
+          uv run --no-sync pytest -q
+          --ci-group ${{ matrix.group }}
+          --ci-group-report "${{ runner.temp }}/os-canary-windows-${{ matrix.group }}.json"
+      - name: Upload the group report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: os-canary-windows-${{ matrix.group }}
+          path: ${{ runner.temp }}/os-canary-windows-${{ matrix.group }}.json
+          if-no-files-found: error
+          retention-days: 3
 
   macos:
+    name: macos (${{ matrix.group }})
+    needs: test-groups
     runs-on: macos-latest
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.test-groups.outputs.groups) }}
+    timeout-minutes: 45
     env:
       # A version request alone can select the runner's Homebrew Python. Its
       # OpenSSL 4 build has no ssl.PROTOCOL_TLSv1, which Snowflake 4.8.0's
@@ -104,5 +139,44 @@ jobs:
 
           print("Snowflake connector import: OK", flush=True)
           PY
-      - name: Tier-1 unit tests
-        run: uv run --no-sync pytest -q
+      - name: Tier-1 unit tests (${{ matrix.group }})
+        run: >-
+          uv run --no-sync pytest -q
+          --ci-group ${{ matrix.group }}
+          --ci-group-report "${{ runner.temp }}/os-canary-macos-${{ matrix.group }}.json"
+      - name: Upload the group report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: os-canary-macos-${{ matrix.group }}
+          path: ${{ runner.temp }}/os-canary-macos-${{ matrix.group }}.json
+          if-no-files-found: error
+          retention-days: 3
+
+  # Per system, the check ci.yml's `tests` gate makes: every group reported,
+  # and together they ran every test a single `pytest` would have, once each.
+  # Separate per system because the reports are keyed by Python version, which
+  # both systems share. always() so a failed or cancelled group fails the gate
+  # rather than skipping it.
+  gate:
+    name: ${{ matrix.os }} (whole suite)
+    needs: [windows, macos]
+    if: always()
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows, macos]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: os-canary-${{ matrix.os }}-*
+          path: os-canary-reports
+      - name: Every group ran, and together they ran the whole suite
+        run: python3 scripts/check_test_groups.py verify os-canary-reports
+      - name: Every group passed
+        if: needs[matrix.os].result != 'success'
+        run: |
+          echo "${{ matrix.os }} groups finished with: ${{ needs[matrix.os].result }}"
+          exit 1

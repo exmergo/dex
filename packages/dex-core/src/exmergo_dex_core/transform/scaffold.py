@@ -83,11 +83,36 @@ MACRO_ASSETS: dict[str, str] = {
         "with the count of rows whose value sits below 0 or above 1, never a "
         "value; a declaration plan adds it where the project lacks it"
     ),
+    "dex_freshness": (
+        "the generic test a time column's declared freshness renders (#1460): "
+        "fails with one row when the column's newest value trails the "
+        "warehouse's clock by more than max_lag, or when it holds no value, "
+        "counting rows within the limit and never computing the newest value; a "
+        "declaration plan adds "
+        "it where the project lacks it"
+    ),
+    "dex_continuity": (
+        "the generic test a time column's declared continuity renders (#1461): "
+        "fails with the count of gaps, runs of empty buckets at the declared "
+        "grain between two buckets holding rows (per `by` key), never a date or "
+        "a key; a declaration plan adds it where the project lacks it"
+    ),
     "dex_join_coverage": (
         "the generic test an INNER join a declared references requires renders "
         "(#1456): fails with the count of the join's eligible driving rows that "
         "find no parent row, never a key; a declaration plan adds it where the "
         "project lacks it"
+    ),
+    "dex_referenced_key": (
+        "the generic test a column another model references renders on the "
+        "parent (#1457): fails with the count of rows repeating a non-NULL key, "
+        "never a key; a declaration plan adds it where the project lacks it"
+    ),
+    "dex_temporal_contract": (
+        "the generic test a declared history renders per measure (#1458): fails "
+        "with the count of entities whose column disagrees with what the "
+        "snapshot's versions and the declared policy give, never a key; a "
+        "declaration plan adds it where the project lacks it"
     ),
 }
 
@@ -674,7 +699,10 @@ def _model_yaml(dataset: Dataset) -> str:
             tests = ["not_null"]
         if tests:
             rendered = [
-                yaml.safe_dump(_unsampled(name), default_flow_style=True).strip()
+                yaml.safe_dump(
+                    _unsampled(name, personal=column.pii is not None),
+                    default_flow_style=True,
+                ).strip()
                 for name in tests
             ]
             lines.append(f"        data_tests: [{', '.join(rendered)}]")

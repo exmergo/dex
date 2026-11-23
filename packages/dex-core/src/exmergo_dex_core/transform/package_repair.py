@@ -720,7 +720,7 @@ def set_nested(text: str, path: list[str], value: Any) -> str:
     key order and other line kept. A flow-style mapping on the path is refused,
     since rewriting it would reformat what a person wrote."""
 
-    from ..yaml_spans import before_trailing_blanks, block_end
+    from ..yaml_spans import after_node, before_trailing_blanks, block_end
 
     try:
         root = yaml.compose(text) if text.strip() else None
@@ -751,10 +751,18 @@ def set_nested(text: str, path: list[str], value: Any) -> str:
         )
         if found is None:
             if node.value:
-                last_key = node.value[-1][0]
+                last_key, last_value = node.value[-1]
                 column = node.value[0][0].start_mark.column
                 start = _line_start(text, last_key.start_mark.index)
-                end = before_trailing_blanks(text, block_end(text, start, column))
+                # Indentation bounds the last entry, except where it reads
+                # wrong: an indentless sequence (`model-paths:` then `- models`
+                # at the key's own column, as `yaml.safe_dump` writes it), or a
+                # comment written shallower than the entry's content. The
+                # entry's last scalar is inside it either way.
+                end = max(
+                    before_trailing_blanks(text, block_end(text, start, column)),
+                    after_node(text, last_value),
+                )
             else:
                 column, end = 0, len(text)
             return insert(end, _block(path[depth:], value, column))
@@ -1002,7 +1010,11 @@ def draft(
 
     package = str(node.get("package_name") or unique_id.split(".")[1])
     name = str(node.get("name") or unique_id.split(".")[-1])
-    raw = str(node.get("raw_code") or "")
+    # LF, as every file the plan writes is read back: dbt keeps a package file's
+    # CRLF in ``raw_code`` (a Windows checkout), and restated as it stands the
+    # override would read back with doubled line breaks and never match the
+    # hash its plan recorded.
+    raw = str(node.get("raw_code") or "").replace("\r\n", "\n")
     if not raw.strip():
         raise RepairRefusedError(
             f"the manifest holds no SQL for {package}.{name}; build the project "

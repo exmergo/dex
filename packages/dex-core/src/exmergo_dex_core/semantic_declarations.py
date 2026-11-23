@@ -210,6 +210,120 @@ class History(_Strict):
         return {k.strip(): v.strip() for k, v in value.items()}
 
 
+#: The units a freshness ``max_lag`` may be written in, with their seconds,
+#: largest first so a normalized lag names the largest unit that divides it.
+LAG_UNITS: tuple[tuple[str, int], ...] = (
+    ("w", 604800),
+    ("d", 86400),
+    ("h", 3600),
+    ("m", 60),
+    ("s", 1),
+)
+_LAG = re.compile(r"^\s*([0-9]+)\s*([a-zA-Z]+)\s*$")
+
+
+def lag_seconds(value: str) -> int:
+    """The seconds a ``max_lag`` such as ``6h`` states. Refuses anything but a
+    positive whole number followed by one of :data:`LAG_UNITS`."""
+
+    match = _LAG.match(value) if isinstance(value, str) else None
+    units = dict(LAG_UNITS)
+    if match is None or match.group(2).lower() not in units:
+        raise ValueError(
+            f"max_lag '{value}' is not a lag; write a whole number and a unit, "
+            "s, m, h, d or w (for example 30m, 6h or 2d)"
+        )
+    amount = int(match.group(1))
+    if amount <= 0:
+        raise ValueError(f"max_lag '{value}' must be longer than zero")
+    return amount * units[match.group(2).lower()]
+
+
+def normalized_lag(seconds: int) -> str:
+    """``seconds`` in the largest unit that divides it: ``21600`` is ``6h``."""
+
+    for unit, size in LAG_UNITS:
+        if seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"  # pragma: no cover - a second divides every whole number
+
+
+class Freshness(_Strict):
+    """How old the newest value of a declared time column may be (#1460).
+
+    ``max_lag`` is the longest the newest row may trail the warehouse's clock,
+    ``basis`` whether the column is the event's own time (``business``, which a
+    backfill can leave legitimately old) or when the row was loaded
+    (``capture``, which nothing excuses). The lag is normalized to the largest
+    unit that divides it, so ``360m`` and ``6h`` are one declaration."""
+
+    max_lag: str
+    basis: TimeProvenance
+
+    @field_validator("max_lag", mode="before")
+    @classmethod
+    def _lag(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError(
+                "max_lag is a whole number and a unit, s, m, h, d or w, written as "
+                "text (for example '6h')"
+            )
+        return normalized_lag(lag_seconds(value))
+
+    @property
+    def max_lag_seconds(self) -> int:
+        return lag_seconds(self.max_lag)
+
+
+class ContinuityGrain(str, Enum):
+    """The bucket a declared continuity searches for gaps in (#1461)."""
+
+    SECOND = "second"
+    MINUTE = "minute"
+    HOUR = "hour"
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    QUARTER = "quarter"
+    YEAR = "year"
+
+
+#: The grains finer than a day, which a date column cannot be bucketed at.
+SUB_DAY_GRAINS: frozenset[str] = frozenset({"second", "minute", "hour"})
+
+
+class Continuity(_Strict):
+    """That a declared time column has no gap (#1461): no bucket at ``grain``
+    missing between two buckets holding rows, for the whole model or, with
+    ``by``, for each value of those columns. A gap at the edge of the data is
+    no gap, so the answer never depends on today's date (that is freshness's
+    question). ``week`` is the ISO week, starting Monday; every bucket is read
+    in UTC."""
+
+    grain: ContinuityGrain = ContinuityGrain.DAY
+    #: The key columns gaps are searched per value of, in the order written.
+    by: list[str] = []
+
+    @field_validator("by", mode="before")
+    @classmethod
+    def _keys(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+            raise ValueError("by is a list of column names, for example [region]")
+        keys = [v.strip() for v in value]
+        if any(not key for key in keys):
+            raise ValueError("by names a column with an empty name")
+        seen: set[str] = set()
+        for key in keys:
+            if key.lower() in seen:
+                raise ValueError(f"by names '{key}' twice")
+            seen.add(key.lower())
+        return keys
+
+
 class ColumnDeclaration(_Strict):
     role: Role | None = None
     description: str | None = None
@@ -220,6 +334,10 @@ class ColumnDeclaration(_Strict):
     additivity: Additivity | None = None
     # `currency:<ISO code>`, `fraction`, `percent`, `count`, or a plain unit.
     unit: str | None = None
+    # How old the newest value may be, on a `time` column only (#1460).
+    freshness: Freshness | None = None
+    # That the column has no gap at a grain, per key (#1461), on `time` only.
+    continuity: Continuity | None = None
 
 
 class Assumption(_Strict):
@@ -352,6 +470,8 @@ COLUMN_FIELDS = (
     "aggregation",
     "additivity",
     "unit",
+    "freshness",
+    "continuity",
 )
 
 

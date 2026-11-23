@@ -264,6 +264,10 @@ class RelationshipsResult(Result):
     with different columns; see :class:`DeclaredRelationshipConflict`. Empty is
     the positive statement that every declaration touching the same two
     datasets agreed.
+
+    ``excluded`` names the Elementary package's own tables inference left out,
+    neither profiled nor joined (#1494), in the shape ``map`` reports them;
+    always present, so ``count: 0`` says nothing was left out.
     """
 
     relationships: list[Relationship] = Field(default_factory=list)
@@ -273,6 +277,7 @@ class RelationshipsResult(Result):
     cache_hit_count: int = 0
     carried_relationship_count: int = 0
     conflicts: list[DeclaredRelationshipConflict] = Field(default_factory=list)
+    excluded: ExcludedObjects = Field(default_factory=ExcludedObjects)
     cache_path: str = ""
     updated_at: str = ""
 
@@ -286,6 +291,7 @@ class RelationshipsResult(Result):
             "cache_hit_count": self.cache_hit_count,
             "carried_relationship_count": self.carried_relationship_count,
             "conflicts": [c.model_dump(mode="json") for c in self.conflicts],
+            "excluded": self.excluded.model_dump(mode="json"),
             "cache_path": self.cache_path,
             "updated_at": self.updated_at,
         }
@@ -410,6 +416,10 @@ class DiagramResult(Result):
     elided_entity_count: int = 0
     elided_column_count: int = 0
     elided_edge_count: int = 0
+    #: The Elementary package's tables the diagram left out (#1494), in the
+    #: shape ``map`` reports them; always present, so ``count: 0`` is the
+    #: positive statement that nothing was left out.
+    excluded: ExcludedObjects = Field(default_factory=ExcludedObjects)
     full: bool = False
     updated_at: str = ""
 
@@ -432,6 +442,7 @@ class DiagramResult(Result):
             "elided_entity_count": self.elided_entity_count,
             "elided_column_count": self.elided_column_count,
             "elided_edge_count": self.elided_edge_count,
+            "excluded": self.excluded.model_dump(mode="json"),
             "full": self.full,
             "updated_at": self.updated_at,
         }

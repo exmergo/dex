@@ -887,7 +887,11 @@ def profile(
     if target is not None:
         from ..transform.build import assert_dev_target
 
-        assert_dev_target(target, engine.config.dbt_target)
+        assert_dev_target(
+            target,
+            engine.config.dbt_target,
+            prod=getattr(engine.config, "dbt_prod_target", None),
+        )
         reads_dev_target = True
     mode = engine.resolve_result_mode(result_mode)
     values_free = mode is ResultMode.VALUES_FREE
@@ -1116,6 +1120,7 @@ def relationships(
     refresh: bool = False,
     use_project: bool = False,
     use_hosted_semantic_layer: bool = False,
+    include_elementary: bool = False,
     result_mode: ResultMode | None = None,
 ) -> RelationshipsResult:
     """Infer joins across every object in scope, optionally probing them.
@@ -1130,6 +1135,18 @@ def relationships(
     independent opt-in phase with the same priced-after-the-fact shape,
     which runs after ``verify`` so at most one checkpoint is ever pending at
     once.
+
+    The Elementary dbt package's own tables are left out (#1494), recognised by
+    the signature ranking uses (#1311, :mod:`.elementary`): not profiled, not
+    priced, and not in the set inference reads, so no join among them (their
+    shared ``unique_id`` columns) is inferred. A profile of one the cache already
+    holds is left as it is, read by nothing here, and the joins among them an
+    earlier ``--include-elementary`` run cached are dropped from the cache, as on
+    ``map``: an unexamined endpoint in a namespace this run listed reads as gone.
+    Carried forward from outside a narrower ``--scope`` instead, they are
+    recognised too (``recognise(..., cached=...)``, as ``map`` does) and kept in
+    the cache but out of ``data.relationships``. ``data.excluded`` names the
+    tables and a note says so; ``include_elementary`` profiles them with the rest.
 
     In values-free mode the profiles it scans are written without their values;
     the relationships it reports never carried any.
@@ -1164,11 +1181,21 @@ def relationships(
     # See map()'s identical computation: tells carry-forward "out of this
     # run's scope" apart from "gone from the warehouse" (issues #149, #984).
     observed_namespaces = _compute_observed_namespaces(metas, prior, adapter)
+    # The package's tables are left out before anything is priced or profiled
+    # (#1494). `metas` stays whole for the scope bookkeeping above, which asks
+    # what the warehouse holds rather than what this run reads.
+    elementary = (
+        elementary_mod.ElementaryTables()
+        if include_elementary
+        else elementary_mod.recognise(metas)
+    )
+    left_out = elementary.lowered
+    inferable = [m for m in metas if m.identifier.lower() not in left_out]
     # Skip re-scanning objects whose cached profile is still fresh (same
     # connector, schema unchanged, within the freshness window); only the stale
     # remainder is estimated, confirmed, and profiled below.
     stale, fresh_reused = _split_fresh_stale(
-        [m.identifier for m in metas],
+        [m.identifier for m in inferable],
         prior,
         connector,
         adapter,
@@ -1452,6 +1479,33 @@ def relationships(
         rels,
         observed_namespaces=observed_namespaces,
     )
+    # A package table a prior run cached outside this run's scope (an include
+    # run over a wider --scope) has the joins among its kind carried forward
+    # above, into the cache, as map carries them; recognise it too, so they stay
+    # out of the reported set, as on map, where only the objects in view carry
+    # edges. Only namespaces this run did not observe: an edge onto an absent
+    # object in an observed one the carry-forward itself dropped (see map).
+    if reusable is not None and not include_elementary:
+        listed = {m.identifier.lower() for m in metas}
+        out_of_scope_cached = [
+            d.identifier
+            for d in reusable.datasets
+            if d.identifier.lower() not in listed
+            and d.identifier.rpartition(".")[0].lower() not in observed_namespaces
+        ]
+        if out_of_scope_cached:
+            elementary = elementary_mod.recognise(metas, cached=out_of_scope_cached)
+            left_out = elementary.lowered
+    # What the envelope reports; the cache below keeps `rels` whole. The carried
+    # count answers for the reported list, as `inferred_count` does: a package
+    # join carried from outside the scope stays in the cache and out of
+    # `data.relationships`, so it is not counted, else the count and the list
+    # would disagree. The carried edges are the tail `_carry_forward_relationships`
+    # appended.
+    reported = _without_endpoints(rels, left_out)
+    if carried_relationships and left_out:
+        carried_edges = rels[len(rels) - carried_relationships :]
+        carried_relationships = len(_without_endpoints(carried_edges, left_out))
     notes = _relationship_notes(datasets, declared, inferred, defs)
     notes.extend(declared_notes)
     notes.extend(native_edge_notes)
@@ -1511,6 +1565,19 @@ def relationships(
             f"reused {len(fresh_reused)} fresh cached profile(s) (schema "
             f"unchanged, profiled within {window:g}h); pass --refresh to force "
             "re-profiling"
+        )
+    if elementary:
+        notes.append(
+            elementary_mod.note(
+                elementary,
+                command="explore relationships",
+                left_out_of="inference",
+                why=(
+                    "the joins among them are the package's own, and profiling "
+                    "them says nothing about the project's tables"
+                ),
+                way_back="profile them and infer joins among them",
+            )
         )
     if verify_pending is not None:
         notes.append(
@@ -1580,13 +1647,14 @@ def relationships(
     )
 
     result = RelationshipsResult(
-        relationships=rels,
+        relationships=reported,
         declared_count=len(declared),
         semantic_join_count=len(semantic_edges),
         profiled_count=len(profiled),
         cache_hit_count=len(fresh_reused),
         carried_relationship_count=carried_relationships,
         conflicts=relationship_conflicts,
+        excluded=elementary.excluded(),
         cache_path=locator,
         updated_at=now.isoformat(),
         notes=notes,
@@ -1611,6 +1679,7 @@ def cmd_relationships(args: argparse.Namespace, engine: DexEngine) -> env.Envelo
             refresh=getattr(args, "refresh", False),
             use_project=getattr(args, "use_project", False),
             use_hosted_semantic_layer=getattr(args, "use_hosted_semantic_layer", False),
+            include_elementary=getattr(args, "include_elementary", False),
         )
     )
 
@@ -1800,7 +1869,11 @@ def _reads_dev_target(engine: DexEngine, target: str | None) -> bool:
         return False
     from ..transform.build import assert_dev_target
 
-    assert_dev_target(target, engine.config.dbt_target)
+    assert_dev_target(
+        target,
+        engine.config.dbt_target,
+        prod=getattr(engine.config, "dbt_prod_target", None),
+    )
     return True
 
 
@@ -1823,6 +1896,7 @@ def _run_statements(
     adapter: Adapter | None = None,
     handshake: Callable[..., None] | None = None,
     reads_dev_target: bool = False,
+    limits: QueryLimits | None = None,
 ) -> tuple[list[_Statement], _Batch]:
     """Drive every statement of one call through the firewall and the warehouse.
 
@@ -1840,6 +1914,11 @@ def _run_statements(
     ``auto_profile: false`` in config) restores the strict prerequisite, and on
     that path nothing here touches the connection before the firewall has spoken.
 
+    ``limits`` replaces ``query`` in config for this call's result caps, for an
+    engine reader whose bounds are its own rather than an agent's context
+    (the Elementary incident reader, #1471). The firewall, the allowlist, the
+    profile on demand, the cost handshake and the ledger are unchanged by it.
+
     Every decision, allowed or refused, lands in the query ledger, one entry per
     statement whatever the call carried.
 
@@ -1853,7 +1932,7 @@ def _run_statements(
 
     store = engine.store
     config = engine.config
-    limits = config.query
+    limits = config.query if limits is None else limits
     now = datetime.now(UTC)
     at = now.isoformat()
     cache = readable_cache(store)
@@ -3091,12 +3170,7 @@ def map(
     # A join to a table ranking leaves out (one an earlier include run or a
     # hand-run profile cached) must not count toward connectivity: its degree
     # would set the scale every rankable object is normalised against.
-    rankable_relationships = [
-        rel
-        for rel in relationship_set
-        if rel.from_dataset.lower() not in left_out
-        and rel.to_dataset.lower() not in left_out
-    ]
+    rankable_relationships = _without_endpoints(relationship_set, left_out)
     final_scores = rank_mod.rank(rankable, rankable_relationships, hints, orphaned)
     # After inference, so it saw the same profiles in either mode.
     if values_free:
@@ -3690,7 +3764,11 @@ def _null_drop_note(
 
 
 def diagram(
-    engine: DexEngine, *, full: bool = False, result_mode: ResultMode | None = None
+    engine: DexEngine,
+    *,
+    full: bool = False,
+    include_elementary: bool = False,
+    result_mode: ResultMode | None = None,
 ) -> DiagramResult:
     """Serialize the cached map as a Mermaid ER diagram.
 
@@ -3707,6 +3785,20 @@ def diagram(
 
     It draws no column value in any mode (see :mod:`.diagram`), so values-free
     mode changes nothing here but the stamp on the result.
+
+    The Elementary dbt package's own tables are left out (#1494), as ranking
+    leaves them out (#1311): the signature is read over the cache's identifiers,
+    names only, so a cache an ``--include-elementary`` map filled with the
+    package's profiles still draws none of them, ``--full`` included, and so
+    does one where a hand-run ``explore profile`` added a profile beside the
+    inventory entries a ``map`` keeps for them. The signature has to be in the
+    cache to read: a cache only ``explore relationships`` has written holds no
+    entry for the tables it left out (a ``map`` keeps their inventory entries,
+    and no later write drops them), so a single package table profiled by hand
+    into it is a lone name, below :data:`.elementary.MIN_SIGNATURE`, and
+    ``--full`` draws it until an ``explore map`` writes the rest.
+    ``data.excluded`` names them and a note says so; ``include_elementary``
+    draws them with the rest. Free, as the command is.
     """
 
     mode = engine.resolve_result_mode(result_mode)
@@ -3717,17 +3809,47 @@ def diagram(
             "map to draw"
         )
 
-    rendered = diagram_mod.render_er_mermaid(cache, full=full)
+    elementary = (
+        elementary_mod.ElementaryTables()
+        if include_elementary
+        else elementary_mod.recognise((), cached=[d.identifier for d in cache.datasets])
+    )
+    left_out = elementary.lowered
+    rendered = diagram_mod.render_er_mermaid(cache, full=full, excluded=left_out)
     if not rendered.entity_count:
-        if not full and cache.ranked_datasets(profiled_only=True, connected_only=False):
+        profiled = [
+            d
+            for d in cache.ranked_datasets(profiled_only=True, connected_only=False)
+            if d.identifier.lower() not in left_out
+        ]
+        if not full and profiled:
             raise CacheRequiredError(
                 "the exploration cache holds profiled objects but no edges: "
                 "run `explore diagram --full` to draw the unjoined objects"
+            )
+        if elementary:
+            raise CacheRequiredError(
+                "the exploration cache holds no object that can be drawn apart "
+                f"from {len(elementary.identifiers)} table(s) of the Elementary dbt "
+                "package, left out by default: pass --include-elementary to draw "
+                "them, or run `explore map` (or `explore profile <object>`) so the "
+                "project's own objects carry profiles and inferred joins"
             )
         raise CacheRequiredError(
             "the exploration cache holds no object that can be drawn: run "
             "`explore map` (or `explore profile <object>`) so objects carry "
             "profiles and inferred joins"
+        )
+    notes = list(rendered.notes)
+    if elementary:
+        notes.append(
+            elementary_mod.note(
+                elementary,
+                command="explore diagram",
+                left_out_of="the diagram",
+                why="they say nothing about the project's own model",
+                way_back="draw them with the rest",
+            )
         )
     return DiagramResult(
         mermaid=rendered.mermaid,
@@ -3737,16 +3859,23 @@ def diagram(
         elided_entity_count=rendered.elided_entity_count,
         elided_column_count=rendered.elided_column_count,
         elided_edge_count=rendered.elided_edge_count,
+        excluded=elementary.excluded(),
         full=full,
         updated_at=cache.provenance.updated_at or "",
-        notes=rendered.notes,
+        notes=notes,
         result_mode=mode,
     )
 
 
 def cmd_diagram(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     try:
-        return to_envelope(diagram(engine, full=getattr(args, "full", False)))
+        return to_envelope(
+            diagram(
+                engine,
+                full=getattr(args, "full", False),
+                include_elementary=getattr(args, "include_elementary", False),
+            )
+        )
     except (CacheRequiredError, CacheUnreadableError, ValueError) as exc:
         return env.error_for(exc)
 
@@ -5184,6 +5313,28 @@ def _carry_forward_relationships(
     if not carried:
         return relationships, 0
     return relationships + carried, len(carried)
+
+
+def _without_endpoints(
+    relationships: list[Relationship], left_out: frozenset[str]
+) -> list[Relationship]:
+    """``relationships`` less every edge with an endpoint in ``left_out``.
+
+    ``left_out`` holds lowered identifiers (the Elementary package's tables,
+    :attr:`.elementary.ElementaryTables.lowered`), and each endpoint is lowered
+    to meet them, as the cache's own edge key is case-blind: a Snowflake listing
+    spells them in upper case. ``map`` ranks with the result and ``relationships``
+    reports it, while each keeps the whole set in the cache.
+    """
+
+    if not left_out:
+        return relationships
+    return [
+        rel
+        for rel in relationships
+        if rel.from_dataset.lower() not in left_out
+        and rel.to_dataset.lower() not in left_out
+    ]
 
 
 def _carry_forward_overlap_edges(

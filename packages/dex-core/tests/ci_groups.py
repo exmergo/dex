@@ -194,6 +194,49 @@ GROUPS: dict[str, tuple[str, ...]] = {
         ),
         f"{_T}test_join_coverage_render.py",
     ),
+    # dex_referenced_key (#1457): its parity row and its own file.
+    "transform-parity-referenced": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_referenced_key_row_agrees_and_renders_on_the_parent",
+            "test_a_macro_counting_null_keys_fails_the_harness_on_the_clean_parent",
+        ),
+        f"{_T}test_referenced_key.py",
+    ),
+    # dex_temporal_contract (#1458): its parity rows and its own file, whose
+    # macro cases each run a dbt build.
+    "transform-parity-temporal": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_temporal_rows_agree_and_the_plan_writes_their_macro",
+            "test_a_temporal_macro_returning_a_flag_fails_the_harness",
+        ),
+        f"{_T}test_temporal_contract_render.py",
+    ),
+    # dex_freshness (#1460): its parity rows and its own file, whose macro
+    # cases each run a dbt build.
+    "transform-parity-freshness": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_freshness_rows_agree_and_the_plan_writes_their_macro",
+            "test_a_freshness_macro_reading_an_empty_model_as_fresh_fails_the_harness",
+            "test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness",
+        ),
+        f"{_T}test_freshness.py",
+        # What each generated test costs per production run (#1462).
+        f"{_T}test_generated_test_cost.py",
+    ),
+    # dex_continuity (#1461): its parity rows, its planted macros, and its own
+    # file, whose last cases each run a dbt build.
+    "transform-parity-continuity": (
+        *_tests(
+            "test_generated_parity.py",
+            "test_the_continuity_rows_hold_and_the_plan_writes_their_macro",
+            "test_a_continuity_macro_counting_empty_buckets_fails_on_the_count",
+            "test_a_continuity_macro_counting_an_edge_fails_on_the_clean_fixture",
+        ),
+        f"{_T}test_continuity.py",
+    ),
     "transform-e2e": (  # 148s
         f"{_T}test_package_repair_e2e.py",
         f"{_T}test_test_only_plan_e2e.py",

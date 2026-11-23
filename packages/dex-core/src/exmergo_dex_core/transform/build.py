@@ -108,13 +108,24 @@ class DbtRunError(DexError):
     pass
 
 
-def assert_dev_target(target: str, configured: str | None = None) -> str:
+def assert_dev_target(
+    target: str, configured: str | None = None, *, prod: str | None = None
+) -> str:
     """Refuse anything that is not an explicit dev target.
 
     The denylist is checked first and wins even over the configured target, so
-    configuration alone can never route a build at production.
+    configuration alone can never route a build at production. ``prod`` is the
+    project's own production target (``dbt_prod_target``, #1462), refused by
+    name before anything else, so a production target whose name looks like
+    nothing production (``analytics``) is refused too.
     """
 
+    if prod and target.lower() == prod.lower():
+        raise ProdTargetRefusedError(
+            f"target '{target}' is the production target (dbt_prod_target in "
+            ".dex/config.yml); dex never initiates prod-target execution "
+            "(builds are dev-target only)"
+        )
     if target.lower() in _PROD_TARGET_NAMES:
         raise ProdTargetRefusedError(
             f"target '{target}' looks like production; dex never initiates "
@@ -135,6 +146,7 @@ def build(
     *,
     target: str,
     configured_target: str | None = None,
+    prod_target: str | None = None,
     select: str | None = None,
     ceiling: float | None = None,
     confirmed: bool = False,
@@ -201,7 +213,7 @@ def build(
     reason; without it the build runs as it always has.
     """
 
-    assert_dev_target(target, configured_target)
+    assert_dev_target(target, configured_target, prod=prod_target)
 
     if project_dir is None:
         raise DbtRunError("no dbt project directory resolved for the build")
@@ -2456,8 +2468,8 @@ def _assert_compiled_functions(
 
     try:
         paths = artifact_paths(artifacts)
-        results = json.loads(paths.run_results.read_text())
-        manifest = json.loads(paths.manifest.read_text())
+        results = json.loads(paths.run_results.read_text(encoding="utf-8"))
+        manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
         selected = results["results"]
         nodes = manifest["nodes"]
         if not isinstance(selected, list) or not isinstance(nodes, dict):

@@ -1176,6 +1176,19 @@ class Adapter(Protocol):
       an object missing from this run's inventory was looked for and is gone
       from the warehouse (dropped), versus lived outside a narrowed ``--scope``
       or allowlist and must be carried forward untouched (#111, #149).
+    - ``size_estimate(byte_sizes)``: one statement scanning tables of these
+      byte sizes, in the paradigm's unit, with none of this command's own
+      overhead (#1462). How a plan prices a generated test per production run
+      from catalog sizes alone. Absent, the test's estimate is unknown
+      (``no_size_estimator``); DuckDB's is ``0.0``, since nothing bills.
+    - ``catalog_meta(identifier)``: one relation's :class:`ObjectMeta` from the
+      catalog, reading no row, raising ``LookupError`` where there is none.
+      Offered where ``table_metadata`` counts rows (DuckDB); absent,
+      ``table_metadata`` answers it.
+    - ``catalog_read_billed()``: ``True`` where reading a relation's catalog
+      metadata bills (Redshift Serverless wakes its workgroup, with a 60-second
+      minimum), so a plan reports a production size as unknown rather than
+      spend unasked. Absent reads as free.
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".

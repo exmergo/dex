@@ -147,6 +147,10 @@ def analyze(
 
     by_model: dict[str, list[Mapping[str, Any]]] = {}
     for assumption in assumptions:
+        if assumption.get("monitor") is not None:
+            # A vendor monitor's decision (#1482) records where a monitor came
+            # from; it is no assumption about which rows the model holds.
+            continue
         model = assumption.get("model")
         if isinstance(model, str):
             by_model.setdefault(model.lower(), []).append(assumption)

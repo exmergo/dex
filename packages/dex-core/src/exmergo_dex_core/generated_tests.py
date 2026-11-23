@@ -101,6 +101,67 @@ class GeneratedTestKind:
     #: (:class:`~.transform.join_reading.ModelJoins`), or ``None`` where the
     #: caller read nothing, which gives no instance at all.
     reads_joins: bool = False
+    #: Whether the kind checks a fact about a model that another model's
+    #: declaration implies (#1457: a ``references`` implies its parent column
+    #: is unique). Such a kind gives nothing for a model's own declaration: it
+    #: is called as ``instances(parent_declaration, references)``, ``references``
+    #: being the :class:`ParentReferences` the project's declarations point at
+    #: the parent, and its tests render into the parent's YAML entry.
+    on_parent: bool = False
+    #: Whether :attr:`instances` also reads what the plan read of a declared
+    #: ``history`` block's snapshot (#1458): it is then called as
+    #: ``instances(declaration, reading)``, ``reading`` being a
+    #: :class:`HistoryReading`, or ``None`` where the caller read nothing,
+    #: which gives no instance at all.
+    reads_history: bool = False
+    #: Whether each test carries a dbt ``name`` built from its claim,
+    #: ``<kind>_<claim>`` (#1458), rather than the name dbt builds from its
+    #: arguments: two claims whose arguments stringify alike (a target of ``1``
+    #: and of ``"1"``) would otherwise share a name, which dbt refuses, and a
+    #: value from the data would sit in the node name.
+    named_by_claim: bool = False
+    #: Whether the test's SQL reads the model it sits on (#1462). Every kind
+    #: does but :data:`JOIN_COVERAGE`, which reads the join's two inputs.
+    reads_model: bool = True
+    #: The arguments that name another relation the test's SQL reads, each a
+    #: ``ref()`` or ``source()`` call written as text (or ``None`` where the
+    #: plan could not name it), so a plan can say which tables a test reads
+    #: and price it from their production sizes (#1462).
+    relation_arguments: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class HistoryReading:
+    """What a plan read, statically, of a declared ``history`` block's snapshot
+    (#1458): the facts ``maintain verify`` reads from the manifest instead.
+
+    ``lineage`` is ``descends`` where the model's ``ref()`` ancestors hold the
+    snapshot, ``not_ancestor`` where they provably do not (``other_snapshots``
+    names the snapshots they do hold), and ``unknown`` where something on the
+    way could hide it (``why`` says what). ``hard_deletes`` and ``valid_from``
+    are the snapshot's config (``valid_from`` is ``dbt_valid_from`` unless
+    ``snapshot_meta_column_names`` renames it); ``config_unread`` names a
+    config key written as an expression the plan cannot read."""
+
+    lineage: str
+    why: str | None = None
+    other_snapshots: tuple[str, ...] = ()
+    hard_deletes: str | None = None
+    valid_from: str = "dbt_valid_from"
+    config_unread: str | None = None
+
+
+@dataclass(frozen=True)
+class ParentReferences:
+    """What the project's declarations say about one parent (#1457).
+
+    ``columns`` maps each of the parent's columns a ``references`` names (as
+    the first declaration spelled it) to the ``child.column`` pairs naming it,
+    sorted. ``unique_tested`` are the parent's columns, folded to lower case,
+    that already list dbt's ``unique`` test, which asserts the same fact."""
+
+    columns: Mapping[str, tuple[str, ...]]
+    unique_tested: frozenset[str] = frozenset()
 
 
 _KINDS: dict[str, GeneratedTestKind] = {}
@@ -189,12 +250,41 @@ JOIN_UNREAD = "join_unread"
 #: The required join is a LEFT join to the whole parent: it keeps every
 #: unmatched row, so the
 #: ``relationships`` (or ``not_null``) test the declaration already renders
-#: counts the same rows on the model's output.
+#: counts the same rows on the model's output. Also the reason a referenced
+#: parent column renders no ``dex_referenced_key`` (#1457): the parent's
+#: one-column grain, or a ``unique`` test already listed on the column, asserts
+#: it.
 COVERED_BY_BUILTIN = "covered_by_builtin"
 #: The required join is a shape this release does not render (a key compared
 #: through a conversion, a grouped side, a RIGHT or FULL join, a side that is
 #: no ``ref()`` or ``source()``, a filter that does not carry into the dialect).
 JOIN_SHAPE_UNSUPPORTED = "join_shape_unsupported"
+
+#: The reasons a referenced parent column renders no ``dex_referenced_key``
+#: (#1457). The parent has no YAML entry under ``models:`` (a model nobody
+#: documented, a seed, a snapshot), and Dex does not create one to hold a test.
+PARENT_UNDECLARED = "parent_undeclared"
+#: The parent is an installed package's model, or a project override of one its
+#: package documents, whose YAML entry is the package's: Dex never edits it.
+PARENT_IN_PACKAGE = "parent_in_package"
+
+#: The reasons a declared ``history`` measure renders no
+#: ``dex_temporal_contract`` (#1458), each the reason ``maintain verify`` leaves
+#: the same measure unchecked with. The declaration leaves out a policy the
+#: measure's value depends on, and none is assumed.
+POLICY_MISSING = "policy_missing"
+#: The model's ``ref()`` lineage does not reach the declared snapshot.
+SNAPSHOT_NOT_ANCESTOR = "snapshot_not_ancestor"
+#: Whether the model reaches the declared snapshot could not be read.
+LINEAGE_UNAVAILABLE = "lineage_unavailable"
+#: The snapshot writes hard-delete records, versions that are no observation.
+HARD_DELETE_RECORDS = "hard_delete_records"
+#: The plan's own reason, with no ``maintain verify`` twin (verify reads the
+#: compiled config): the snapshot's ``hard_deletes`` or
+#: ``snapshot_meta_column_names`` is written as an expression the plan cannot
+#: read, so it cannot tell whether the shape is supported or which column
+#: orders the versions.
+SNAPSHOT_CONFIG_UNREAD = "snapshot_config_unread"
 
 
 def off_reason(setting: bool | list[str]) -> str:
@@ -388,6 +478,7 @@ register(
         _parent_population,
         macro=PARENT_POPULATION,
         dialects=ALL_CONNECTORS,
+        relation_arguments=("parent",),
     )
 )
 
@@ -520,5 +611,281 @@ register(
         macro=JOIN_COVERAGE,
         dialects=ALL_CONNECTORS,
         reads_joins=True,
+        reads_model=False,
+        relation_arguments=("child", "parent"),
+    )
+)
+
+REFERENCED_KEY = "dex_referenced_key"
+
+
+def _referenced_keys(declaration: Any, references: Any) -> list[Instance]:
+    """One column test per parent column a ``references`` names (#1457): a
+    join to a key that is not unique multiplies rows, so the column the join
+    reads is held unique on the parent, the model the claim is about. Where the
+    parent declares that column as its whole grain, or the column already lists
+    dbt's ``unique``, that test asserts the same fact, and this one is listed
+    and withheld (:data:`COVERED_BY_BUILTIN`).
+
+    ``references`` is a :class:`ParentReferences`, or ``None`` (nothing points
+    at the model), which gives nothing."""
+
+    if not isinstance(references, ParentReferences):
+        return []
+    grain = [str(c).lower() for c in (getattr(declaration, "grain", None) or [])]
+    out: list[Instance] = []
+    for column in references.columns:
+        folded = column.lower()
+        covered = grain == [folded] or folded in references.unique_tested
+        out.append(
+            Instance(
+                column=column,
+                field="referenced_key",
+                columns=(column,),
+                params={"check": REFERENCED_KEY},
+                withheld=COVERED_BY_BUILTIN if covered else None,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        REFERENCED_KEY,
+        EVERY_RUN,
+        _referenced_keys,
+        macro=REFERENCED_KEY,
+        dialects=ALL_CONNECTORS,
+        on_parent=True,
+    )
+)
+
+TEMPORAL_CONTRACT = "dex_temporal_contract"
+#: The measures a ``history`` block can declare, in the order verify reports.
+TEMPORAL_MEASURES: tuple[str, ...] = (
+    "transition_count",
+    "latest_target_transition_at",
+    "first_target_at",
+)
+#: The policies each measure's expected value depends on (#1027). ``time``
+#: means ``time.provenance``. ``maintain verify`` reads the same table, so the
+#: measures it leaves ``policy_missing`` are the ones that render no test.
+TEMPORAL_POLICY_OWED: Mapping[str, tuple[str, ...]] = {
+    "transition_count": ("initial_observation", "null_status"),
+    "latest_target_transition_at": ("initial_observation", "null_status", "time"),
+    "first_target_at": ("time",),
+}
+
+
+def policy_owed(history: Any, measure: str) -> list[str]:
+    """The policies ``history`` leaves out that ``measure`` depends on, as
+    ``maintain verify`` names them (``time.provenance`` for the time)."""
+
+    owed: list[str] = []
+    for name in TEMPORAL_POLICY_OWED[measure]:
+        if name == "time":
+            time = getattr(history, "time", None)
+            if time is None or getattr(time, "provenance", None) is None:
+                owed.append("time.provenance")
+        elif getattr(history, name, None) is None:
+            owed.append(name)
+    return owed
+
+
+def _enum(value: Any) -> str | None:
+    return None if value is None else str(getattr(value, "value", value))
+
+
+def _temporal_contracts(declaration: Any, reading: Any) -> list[Instance]:
+    """One model-level test per measure a declared ``history`` names (#1458):
+    it fails with the number of entities whose column disagrees with what the
+    snapshot's versions and the declared policy give, ``maintain verify``'s
+    ``mismatched_entities`` for that measure's finding. One test per measure,
+    so each failure count is one finding's count.
+
+    A measure ``maintain verify`` would leave unchecked is listed and withheld
+    with verify's reason, checked in verify's order: the snapshot is not an
+    ancestor, the lineage cannot be read, the snapshot writes hard-delete
+    records, then a policy the measure depends on is missing. ``reading``
+    ``None`` (nothing read) gives nothing."""
+
+    history = getattr(declaration, "history", None)
+    if history is None or not isinstance(reading, HistoryReading):
+        return []
+    from .model_versions import ref_call
+
+    measures = getattr(history, "measures", None)
+    time = getattr(history, "time", None)
+    entity = {str(out): str(snap) for out, snap in history.entity.items()}
+    out: list[Instance] = []
+    for measure in TEMPORAL_MEASURES:
+        column = getattr(measures, measure, None)
+        if column is None:
+            continue
+        withheld: str | None = None
+        if reading.lineage == "not_ancestor":
+            withheld = SNAPSHOT_NOT_ANCESTOR
+        elif reading.lineage != "descends":
+            withheld = LINEAGE_UNAVAILABLE
+        elif reading.hard_deletes == "new_record":
+            withheld = HARD_DELETE_RECORDS
+        elif reading.config_unread is not None:
+            withheld = SNAPSHOT_CONFIG_UNREAD
+        elif policy_owed(history, measure):
+            withheld = POLICY_MISSING
+        policies = {
+            "initial_observation": _enum(history.initial_observation),
+            "null_status": _enum(history.null_status),
+            "time_column": str(time.column) if time is not None else None,
+            "provenance": _enum(getattr(time, "provenance", None)),
+        }
+        params: dict[str, Any] = {
+            "check": TEMPORAL_CONTRACT,
+            "measure": measure,
+            "snapshot": str(history.snapshot),
+            # Names, folded as claim_id folds a string (a list is hashed as
+            # written).
+            "entity": [[o.lower(), s.lower()] for o, s in entity.items()],
+            "status_column": str(history.status.column),
+            # A value from the data, whose case is part of the fact.
+            "target": [history.status.target],
+            "order_column": reading.valid_from,
+            **{k: v for k, v in policies.items() if v is not None},
+        }
+        arguments: dict[str, Any] = {}
+        if withheld is None:
+            arguments = {
+                "snapshot": ref_call(str(history.snapshot)),
+                "entity": dict(entity),
+                "status_column": str(history.status.column),
+                "target": history.status.target,
+                "measure": measure,
+                "measure_column": str(column),
+                **{k: v for k, v in policies.items() if v is not None},
+            }
+            if reading.valid_from.lower() != "dbt_valid_from":
+                arguments["order_column"] = reading.valid_from
+        out.append(
+            Instance(
+                column=None,
+                field="history",
+                columns=(*entity, str(column)),
+                params=params,
+                arguments=arguments,
+                variant=measure,
+                withheld=withheld,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        TEMPORAL_CONTRACT,
+        SCHEDULED,
+        _temporal_contracts,
+        macro=TEMPORAL_CONTRACT,
+        dialects=ALL_CONNECTORS,
+        reads_history=True,
+        named_by_claim=True,
+        relation_arguments=("snapshot",),
+    )
+)
+
+FRESHNESS = "dex_freshness"
+
+
+def _declared_freshness(declaration: Any) -> list[Instance]:
+    """One column test per column declaring ``freshness`` (#1460): it fails when
+    the column's newest value trails the warehouse's clock by more than
+    ``max_lag``, or when the column holds no value at all, as ``maintain
+    verify``'s ``freshness_exceeded`` does. The lag goes into the claim in
+    seconds, so ``360m`` and ``6h`` are one fact; the basis goes in too, since a
+    business time and a capture time are different claims, but not into the
+    test's arguments, because the test fails alike on both."""
+
+    out: list[Instance] = []
+    for name, column in (getattr(declaration, "columns", None) or {}).items():
+        freshness = getattr(column, "freshness", None)
+        if freshness is None:
+            continue
+        seconds = int(freshness.max_lag_seconds)
+        basis = getattr(freshness.basis, "value", freshness.basis)
+        out.append(
+            Instance(
+                column=str(name),
+                field="freshness",
+                columns=(str(name),),
+                params={
+                    "check": FRESHNESS,
+                    "max_lag_seconds": seconds,
+                    "basis": str(basis),
+                },
+                arguments={"max_lag_seconds": seconds},
+                variant=str(basis),
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        FRESHNESS,
+        EVERY_RUN,
+        _declared_freshness,
+        macro=FRESHNESS,
+        dialects=ALL_CONNECTORS,
+    )
+)
+
+CONTINUITY = "dex_continuity"
+
+
+def _declared_continuity(declaration: Any) -> list[Instance]:
+    """One column test per column declaring ``continuity`` (#1461): it fails with
+    the number of gaps in the column, a gap being a run of buckets at the
+    declared grain holding no row between two buckets that hold rows, for the
+    whole model or per value of the ``by`` columns. An edge is never a gap, so
+    the answer does not depend on today's date. The ``by`` columns go into the
+    test's columns, so a model that does not output one renders nothing
+    (:data:`COLUMN_NOT_OUTPUT`). Scheduled: the search reads every row."""
+
+    out: list[Instance] = []
+    for name, column in (getattr(declaration, "columns", None) or {}).items():
+        continuity = getattr(column, "continuity", None)
+        if continuity is None:
+            continue
+        grain = str(getattr(continuity.grain, "value", continuity.grain))
+        by = [str(key) for key in continuity.by]
+        arguments: dict[str, Any] = {"grain": grain}
+        if by:
+            arguments["by"] = list(by)
+        out.append(
+            Instance(
+                column=str(name),
+                field="continuity",
+                columns=(str(name), *sorted(by, key=str.lower)),
+                params={
+                    "check": CONTINUITY,
+                    "grain": grain,
+                    # Names, folded as claim_id folds a string (a list is
+                    # hashed as written), and sorted: the keys partition the
+                    # search, so `[a, b]` and `[b, a]` are one claim.
+                    "by": sorted(key.lower() for key in by),
+                },
+                arguments=arguments,
+                variant=grain,
+            )
+        )
+    return out
+
+
+register(
+    GeneratedTestKind(
+        CONTINUITY,
+        SCHEDULED,
+        _declared_continuity,
+        macro=CONTINUITY,
+        dialects=ALL_CONNECTORS,
     )
 )

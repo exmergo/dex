@@ -253,9 +253,14 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
     tmp_path: Path,
     elementary_installs: Callable[[str], Path],
     target: PostgresTarget,
+    dev_dsn: str,
 ):
     """At 0.16.4 variant a, declaring a model with a single-column grain warns that
     Elementary ignores disable_test_samples; at 0.26.1 and on variant b, none (#1381).
+
+    The three builds share the dev schemas, so each starts from empty ones: a
+    0.16.4 build over 0.26.1's tables fails migrating them, since 0.16.4 drops a
+    column a view 0.26.1 built still reads.
     """
 
     # Variant a at 0.16.4: Elementary's materialization runs tests and ignores flag
@@ -271,6 +276,7 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
     assert any("0.16.4" in w for w in result_016.warnings)
 
     # Variant a at 0.26.1: Elementary honors disable_test_samples, so no warning
+    _empty(dev_dsn, target)
     project_026 = elementary_project(
         tmp_path / "a_026", "a", elementary_installs(CURRENT_VERSION), postgres=target
     )
@@ -282,6 +288,7 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
     assert not any("disable_test_samples" in w for w in result_026.warnings)
 
     # Variant b at 0.16.4: dbt's materialization runs tests, so no warning
+    _empty(dev_dsn, target)
     project_b = elementary_project(
         tmp_path / "b_016", "b", elementary_installs("0.16.4"), postgres=target
     )

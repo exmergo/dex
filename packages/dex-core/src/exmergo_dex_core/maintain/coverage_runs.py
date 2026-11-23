@@ -40,8 +40,9 @@ from ..transform.artifact_runtime import BuildingRun, building_runs, run_is_logg
 STATUSES: tuple[str, ...] = ("pass", "fail", "warn", "error", "skipped", "not_run")
 
 #: dbt's own statuses, normalized to the ones above. ``runtime error`` is the
-#: spelling older releases wrote for an error.
-_STATUS_MAP = {
+#: spelling older releases wrote for an error. Shared with the incident adapter
+#: over the same files (:mod:`.run_results_incidents`, #1468).
+DBT_STATUSES: dict[str, str] = {
     "pass": "pass",
     "fail": "fail",
     "warn": "warn",
@@ -75,7 +76,9 @@ def counts(statuses_for_resource: Iterable[str]) -> dict[str, int]:
     return tally
 
 
-def _parse_time(stamp: str) -> datetime | None:
+def parse_time(stamp: str) -> datetime | None:
+    """dbt's ``generated_at`` as a UTC time, or ``None`` where unreadable."""
+
     if not stamp:
         return None
     try:
@@ -85,7 +88,7 @@ def _parse_time(stamp: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
-def _current_tests(manifest: dict[str, Any]) -> set[str]:
+def current_tests(manifest: dict[str, Any]) -> set[str]:
     """Enabled test and unit test ids in the manifest the caller inventories."""
 
     ids: set[str] = set()
@@ -129,7 +132,7 @@ def last_run(
         "artifact": newest.artifact,
         "cold": newest.cold,
     }
-    when = _parse_time(newest.generated_at)
+    when = parse_time(newest.generated_at)
     if when is not None:
         moment = now or datetime.now(UTC)
         if moment.tzinfo is None:
@@ -160,7 +163,7 @@ def last_run(
             "run_results.json; its statuses are attributed as read"
         )
 
-    current = _current_tests(manifest)
+    current = current_tests(manifest)
     dropped = 0
     unrecognized = 0
     for row in newest.document.get("results") or []:
@@ -172,7 +175,7 @@ def last_run(
         if unique_id not in current:
             dropped += 1
             continue
-        status = _STATUS_MAP.get(str(row.get("status") or "").strip().lower())
+        status = DBT_STATUSES.get(str(row.get("status") or "").strip().lower())
         if status is None:
             unrecognized += 1
             continue

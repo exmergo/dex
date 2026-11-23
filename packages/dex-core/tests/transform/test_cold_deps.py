@@ -509,7 +509,7 @@ def test_an_install_path_outside_the_project_is_refused_untouched(
     config["packages-install-path"] = (
         str(outside)
         if spelling == "absolute"
-        else f"{'../' * 40}{outside.relative_to('/')}"
+        else f"{'../' * 40}{outside.relative_to(outside.anchor).as_posix()}"
     )
     (project / "dbt_project.yml").write_text(yaml.safe_dump(config, sort_keys=False))
 

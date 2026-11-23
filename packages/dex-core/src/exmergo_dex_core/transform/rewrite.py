@@ -43,6 +43,7 @@ from sqlglot import expressions as exp
 from .. import model_versions as mv
 from ..dbt_project import jinja_regions, metric_inputs, physical_column
 from ..errors import DexError
+from ..guards.pii_meta import entry_meta, says_pii
 from ..references import blank_jinja
 from ..yaml_items import dump_items
 from ..yaml_spans import (
@@ -1586,6 +1587,9 @@ class ColumnTests:
     entry_span: tuple[int, int]
     bullet_indent: str
     flow: bool
+    #: The column is marked as personal data, so a test dex adds to it keeps no
+    #: stored failures (#1463).
+    personal: bool = False
 
 
 def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
@@ -1617,6 +1621,7 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
     bullet_indent = line[: len(line) - len(line.lstrip(" "))]
 
     node = _column_node(root, model, column)
+    personal = node is not None and says_pii(entry_meta(_construct(node)))
     for key in ("tests", "data_tests"):
         listed = dict(_mapping(node, spans=True)) if node is not None else {}
         found = next((v for k, v in listed.items() if k[0] == key), None)
@@ -1649,6 +1654,7 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
             entry_span=entry_span,
             bullet_indent=bullet_indent,
             flow=bool(getattr(found, "flow_style", False)),
+            personal=personal,
         )
     return ColumnTests(
         key=None,
@@ -1660,10 +1666,25 @@ def column_tests(content: str, model: str, column: str) -> ColumnTests | None:
         entry_span=entry_span,
         bullet_indent=bullet_indent,
         flow=False,
+        personal=personal,
     )
 
 
-def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str, Any]:
+NO_STORED_FAILURES: dict[str, Any] = {
+    "store_failures": False,
+    "store_failures_as": "ephemeral",
+}
+"""The config a test on a personal-data column carries (#1463). dbt applies
+``store_failures_as`` after the configs merge and lets it override
+``store_failures`` at every level, so a project's ``+store_failures_as: table``
+would store the failures despite ``store_failures: false``; the test's own
+``ephemeral`` is the more specific setting and wins. ``store_failures: false``
+stays for a dbt that predates ``store_failures_as``."""
+
+
+def _unsampled(
+    name: str, *, claim: str | None = None, personal: bool = False, **body: Any
+) -> dict[str, Any]:
     """A rendered test that tells Elementary to keep no sample of its failing rows.
 
     A failing ``not_null``, ``unique`` or ``relationships`` test returns key
@@ -1677,16 +1698,31 @@ def _unsampled(name: str, *, claim: str | None = None, **body: Any) -> dict[str,
     ``claim`` is the id of the declared fact the test checks (#1448), written
     beside the flag as ``config.meta.dex.claim``. A test that checks no declared
     fact (one the scaffold or ``maintain reconcile`` adds) carries none.
+
+    ``personal`` is for a column marked as personal data (#1463): the test also
+    carries :data:`NO_STORED_FAILURES`. The built-ins stay dbt's own, which
+    every tool reads by name, so a failure still returns the failing values. A
+    test's own ``store_failures`` beats the project's and dbt's
+    ``--store-failures`` flag, but not a ``store_failures_as`` set anywhere,
+    which dbt applies last; the test's own ``store_failures_as: ephemeral`` is
+    the most specific of those, so none of the values is copied into an audit
+    table.
     """
 
     meta: dict[str, Any] = {"disable_test_samples": True}
     if claim is not None:
         meta["dex"] = {CLAIM_KEY: claim}
-    return {name: {**body, "config": {"meta": meta}}}
+    config: dict[str, Any] = dict(NO_STORED_FAILURES) if personal else {}
+    return {name: {**body, "config": {**config, "meta": meta}}}
 
 
 def generated_spec(
-    name: str, *, cadence: str, claim: str, arguments: Mapping[str, Any] | None = None
+    name: str,
+    *,
+    cadence: str,
+    claim: str,
+    arguments: Mapping[str, Any] | None = None,
+    test_name: str | None = None,
 ) -> dict[str, Any]:
     """A generated test as a declaration renders it (#1449).
 
@@ -1694,18 +1730,25 @@ def generated_spec(
     plus the kind's cadence as a dbt tag, under ``config`` where dbt reads a
     test's tags, so ``dbt build --select tag:dex_scheduled`` selects it. The
     generic test's arguments go under ``arguments:``, dbt's spelling from 1.10.
+    ``test_name`` is the dbt test ``name``, where the kind names its tests
+    rather than letting dbt build a name from the arguments (#1458).
     """
 
     [(_, rendered)] = _unsampled(name, claim=claim).items()
-    body: dict[str, Any] = {"arguments": dict(arguments)} if arguments else {}
+    body: dict[str, Any] = {"name": test_name} if test_name else {}
+    if arguments:
+        body["arguments"] = dict(arguments)
     return {name: {**body, "config": {"tags": [cadence], **rendered["config"]}}}
 
 
 def is_unsampled_render(test: Any, name: str) -> bool:
     """Whether a parsed test entry is exactly the test Dex renders as ``name``,
-    with or without a claim id: the shape Dex may move, remove or claim."""
+    with or without a claim id, and with or without the config that stores no
+    failures a column marked as personal data adds (#1463): the shape Dex may
+    move, remove or claim."""
 
-    return without_claim(test) == _unsampled(name)
+    unclaimed = without_claim(test)
+    return unclaimed in (_unsampled(name), _unsampled(name, personal=True))
 
 
 def prevailing_test_key(content: str) -> str:
@@ -1766,7 +1809,8 @@ def column_tests_span(
 
     name = added[0]
     # Every test dex adds carries the unsampled flag a declaration renders.
-    flow = yaml.safe_dump(_unsampled(name), default_flow_style=True).strip()
+    spec = _unsampled(name, personal=current.personal)
+    flow = yaml.safe_dump(spec, default_flow_style=True).strip()
     if current.key is None:
         field_indent = current.bullet_indent + "  "
         at = before_trailing_blanks(content, current.entry_span[1])
@@ -1785,7 +1829,7 @@ def column_tests_span(
     start = content.rfind("\n", 0, last[0]) + 1
     indent = indent_of(content, start)
     at = block_end(content, start, indent)
-    return (at, at, dump_items([_unsampled(name)], indent))
+    return (at, at, dump_items([spec], indent))
 
 
 def _column_node(root: Any, model: str, column: str) -> Any:
@@ -1823,11 +1867,40 @@ def _entry_span(content: str, node: Any) -> tuple[int, int]:
 
 
 def _pair_span(content: str, key_span: tuple[int, int], _value: Any) -> tuple[int, int]:
-    """A mapping entry's span, by the same indentation rule as a sequence item."""
+    """A mapping entry's span, by the same indentation rule as a sequence item.
+
+    A block sequence value may be written indentless, its dashes at the key's
+    own column (PyYAML's ``safe_dump`` default). Those items belong to the pair,
+    so the span runs on over every dash line at the key's column, and over the
+    comments at that column between two of them (#1495). A key
+    sharing its line with a bullet is measured from the bullet's column, where
+    a dash line is the next item of the outer list, so it is left as it was.
+    """
 
     line_start = content.rfind("\n", 0, key_span[0]) + 1
     indent = len(content[line_start:]) - len(content[line_start:].lstrip(" "))
-    return (line_start, block_end(content, line_start, indent))
+    end = block_end(content, line_start, indent)
+    if key_span[0] - line_start != indent:
+        return (line_start, end)
+    while True:
+        # Comments and blank lines at the key's column between two items belong
+        # to the list; after its last item they are left to what follows.
+        at = end
+        while at < len(content):
+            newline = content.find("\n", at)
+            line = content[at : len(content) if newline < 0 else newline]
+            if line.strip() and not (
+                indent_of(content, at) == indent and line.lstrip(" ").startswith("#")
+            ):
+                break
+            at += len(line) + 1
+        if not (
+            at < len(content)
+            and indent_of(content, at) == indent
+            and re.match(r"-(\s|$)", content[at + indent :])
+        ):
+            return (line_start, end)
+        end = block_end(content, at, indent)
 
 
 def narrow_quotes(content: str, span: tuple[int, int]) -> tuple[int, int]:

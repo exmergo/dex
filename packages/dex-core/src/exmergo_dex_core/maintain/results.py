@@ -177,6 +177,8 @@ class VerifyResult(Result):
     parent_population: list[dict] | None = None
     #: One record per declared ``history`` temporal contract (#1027).
     temporal_contracts: list[dict] | None = None
+    #: One record per declared ``freshness`` on a time column (#1460).
+    freshness: list[dict] | None = None
     #: One record per declared grain key (#1223): ``proven``, ``broken``,
     #: ``not_applicable``, ``unchecked`` or ``not_planned``, each with a
     #: ``reason`` code where it was not judged. ``None`` when the grain class
@@ -210,6 +212,8 @@ class VerifyResult(Result):
             payload["parent_population"] = self.parent_population
         if self.temporal_contracts:
             payload["temporal_contracts"] = self.temporal_contracts
+        if self.freshness:
+            payload["freshness"] = self.freshness
         if self.target is not None:
             payload["target"] = self.target
         if self.judged_namespace is not None:

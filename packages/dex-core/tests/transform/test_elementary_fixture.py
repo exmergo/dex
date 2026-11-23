@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,7 @@ def _listed(project: Path, *argv: str) -> set[str]:
         str(project),
         *argv,
         cwd=project,
+        stderr=False,
     )
     return {line.strip() for line in out.splitlines() if line.strip()}
 
@@ -474,6 +476,8 @@ def test_the_resolver_reads_what_each_variant_does_on_dev(
 
     assert record.installed
     assert record.release == version
+    # Acceptance, first case (#1445): a release the fixture runs is supported.
+    assert (record.release_status, record.release_reason_code) == ("supported", None)
     assert (record.enabled, record.hooks, record.materialization) == RESOLVED[variant]
     assert (record.materialization == "elementary") is BEHAVIOUR[variant][0]
     assert not (tmp_path / "prod.duckdb").exists()
@@ -601,6 +605,128 @@ def test_an_elementary_test_that_checked_nothing_asserts_no_model(
     assert any("unchecked_tests" in line for line in result.warnings)
 
 
+# --- a release Dex was not run against (#1445) -----------------------------------
+
+
+def _installed_project_file(project: Path) -> Path:
+    return project / "dbt_packages" / "elementary" / "dbt_project.yml"
+
+
+def _patch_above_newest() -> str:
+    """A patch release above the newest the fixture runs, which the fixture's own
+    constants decide, so the case moves with them."""
+
+    major, minor, patch = (int(part) for part in CURRENT_VERSION.split("."))
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def _set_installed_release(project: Path, release: str) -> None:
+    """Edit the installed package's own ``version``, and nothing else, so dbt and
+    the package's code are those of the release the fixture installed."""
+
+    path = _installed_project_file(project)
+    own = yaml.safe_load(path.read_text("utf-8"))
+    own["version"] = release
+    path.write_text(yaml.safe_dump(own, sort_keys=False), "utf-8")
+
+
+@requires_elementary
+def test_a_release_above_the_newest_tested_is_unchecked_and_the_copy_stays_inert(
+    tmp_path: Path, installed_elementary: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Acceptance, second case: the package at a patch above the newest release
+    the fixture runs. A build lists each Elementary test under
+    ``elementary_release_untested`` and counts none toward a model, the estimate
+    record carries the code, the warning names the release and the newest
+    tested, and a mutation run still leaves the dev warehouse as it found it."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+    from exmergo_dex_core.transform.elementary import read, unpriced_work
+
+    release = _patch_above_newest()
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    _set_installed_release(project, release)
+    engine = _engine(project)
+
+    result = engine.build(target="dev")
+
+    listed = {
+        t.test: (t.models, t.reason_code)
+        for t in result.completion.assurance.unchecked_tests or []
+    }
+    assert {name: listed.get(name) for name in ELEMENTARY_FCT_TESTS} == dict.fromkeys(
+        ELEMENTARY_FCT_TESTS, (["fct"], "elementary_release_untested")
+    )
+    assert {code for _, code in listed.values()} == {"elementary_release_untested"}
+    # dbt's own tests on fct still pass and still count.
+    assert "fct" in result.completion.assurance.asserted.names
+    assert any(
+        release in w and CURRENT_VERSION in w and "elementary_release_untested" in w
+        for w in result.warnings
+    )
+    manifest = _parsed(project, "dev")
+    record = read(project, manifest)
+    work = unpriced_work(record, manifest, (project / "dbt_project.yml").read_text())
+    assert (record.release, record.hooks) == (release, "unknown")
+    assert work.as_dict()["release_reason_code"] == "elementary_release_untested"
+
+    picked: list[str] = []
+    test = ShadowRun.test
+
+    def recording(self, select, **kwargs):
+        picked.append(read(self.shadow, self.manifest()).materialization)
+        return test(self, select, **kwargs)
+
+    monkeypatch.setattr(ShadowRun, "test", recording)
+    warehouse = tmp_path / "dev.duckdb"
+    before = duckdb_census(warehouse)
+    mutated = engine.test_mutations("fct")
+
+    assert _executed(mutated) >= 1, "no mutant ran, so nothing was measured"
+    assert footprint(before, duckdb_census(warehouse)) == {}
+    assert any("elementary_release_untested" in w for w in mutated.warnings)
+    # The copy disables the package's models; what the package's materialization
+    # then does is the release's to say, so the copy also pins dbt's own.
+    assert picked and set(picked) == {"dbt"}
+
+
+@requires_elementary
+def test_an_unreadable_installed_project_file_reports_the_release_unknown(
+    tmp_path: Path, installed_elementary: Path
+):
+    """Acceptance, third case: the manifest dbt parsed for ``dev``, read after
+    the installed package's ``dbt_project.yml`` stopped being readable. Every
+    result that rests on the release carries ``elementary_release_unknown``."""
+
+    from exmergo_dex_core.transform.elementary import (
+        read,
+        unchecked_tests,
+        unpriced_work,
+    )
+
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    manifest = _parsed(project, "dev")
+    _installed_project_file(project).write_bytes(b"\xff\xfe version: [")
+
+    record = read(project, manifest)
+    nodes = manifest["nodes"]
+    listed = {
+        nodes[uid]["name"]: code
+        for uid, code in unchecked_tests(manifest, record).items()
+    }
+    work = unpriced_work(record, manifest, (project / "dbt_project.yml").read_text())
+
+    assert record.installed
+    assert record.release is None
+    assert record.release_reason_code == "elementary_release_unknown"
+    assert {name: listed.get(name) for name in ELEMENTARY_FCT_TESTS} == dict.fromkeys(
+        ELEMENTARY_FCT_TESTS, "elementary_release_unknown"
+    )
+    assert set(listed.values()) == {"elementary_release_unknown"}
+    assert work.as_dict()["release_reason_code"] == "elementary_release_unknown"
+    assert "elementary_release_unknown" in (record.release_warning() or "")
+
+
 # --- explore ranking leaves the package's tables out (#1311) ---------------------
 
 
@@ -663,3 +789,466 @@ def test_explore_map_on_the_fixture_ranks_no_elementary_table(
     ]
     assert any("Elementary" in n and ELEMENTARY_SCHEMA in n for n in result.notes)
     assert result.profiled_count == len(own_tables)
+
+
+@requires_elementary
+@pytest.mark.parametrize("include", [True, False], ids=["included", "default"])
+def test_explore_diagram_and_relationships_on_the_fixture_leave_the_package_out(
+    tmp_path: Path, installed_elementary: Path, include: bool
+):
+    """#1494's acceptance on the real package, variant e. After an include map
+    filled the cache with the package's profiles, a default `diagram --full`
+    draws none of them and says so, and `relationships` profiles none of them;
+    with `include_elementary` both take them with the rest. `elementary_runs`,
+    the project's own model in the same warehouse, is drawn and profiled either
+    way."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    project = elementary_project(tmp_path, "e", installed_elementary)
+    _engine(project).build(target="dev")
+    warehouse = tmp_path / "dev.duckdb"
+    built = duckdb_census(warehouse)
+    package_tables = {name for schema, name, _ in built if schema == ELEMENTARY_SCHEMA}
+    own_tables = {name for schema, name, _ in built if schema == "main"}
+    assert "elementary_runs" in own_tables
+
+    def engine(root: Path) -> DexEngine:
+        root.mkdir()
+        return DexEngine(
+            connector="duckdb",
+            path=str(warehouse),
+            config=DexConfig(connector="duckdb"),
+            store=FilesystemStore(root),
+            repo_root=root,
+        )
+
+    def schema_of(identifier: str) -> str:
+        return identifier.split(".")[-2]
+
+    drawing = engine(tmp_path / "drawing")
+    drawing.map(include_elementary=True, full=True)
+    diagram = drawing.diagram(full=True, include_elementary=include)
+    drawn = set(diagram.entities.values())
+    drawn_package = {i for i in drawn if schema_of(i) == ELEMENTARY_SCHEMA}
+    drawn_own = {i.split(".")[-1] for i in drawn if schema_of(i) == "main"}
+    assert "elementary_runs" in drawn_own
+
+    related = engine(tmp_path / "relating").relationships(include_elementary=include)
+    endpoints = {r.from_dataset for r in related.relationships} | {
+        r.to_dataset for r in related.relationships
+    }
+    if include:
+        # The package's thirty-odd tables and the project's three fit under the
+        # diagram's 40-entity cap, so every one of them is drawn.
+        assert drawn_package == {
+            f"dev.{ELEMENTARY_SCHEMA}.{name}" for name in package_tables
+        }
+        assert diagram.elided_entity_count == 0
+        assert diagram.excluded.count == 0
+        assert related.profiled_count == len(own_tables) + len(package_tables)
+        assert any(schema_of(i) == ELEMENTARY_SCHEMA for i in endpoints)
+        assert related.excluded.count == 0
+        return
+    assert not drawn_package
+    assert diagram.excluded.reason == "elementary"
+    assert diagram.excluded.count == len(package_tables)
+    assert any(
+        "Elementary" in n and ELEMENTARY_SCHEMA in n and "`explore diagram`" in n
+        for n in diagram.notes
+    )
+    assert related.profiled_count == len(own_tables)
+    assert not any(schema_of(i) == ELEMENTARY_SCHEMA for i in endpoints)
+    assert related.excluded.reason == "elementary"
+    assert related.excluded.count == len(package_tables)
+    assert any(
+        "Elementary" in n and ELEMENTARY_SCHEMA in n and "`explore relationships`" in n
+        for n in related.notes
+    )
+
+
+# --- the install dex init offers (#1464) -------------------------------------------
+
+
+def _with_install_applied(project: Path, installed: Path) -> Path:
+    """``project`` stripped of the package, with the install ``dex init`` offers
+    written in its place, then the package installed as ``transform deps``
+    would from the lockfile the fixture's installer resolved."""
+
+    from exmergo_dex_core.transform.elementary_install import install_edits
+
+    (project / "packages.yml").unlink()
+    (project / "package-lock.yml").unlink()
+    shutil.rmtree(project / "dbt_packages")
+    authored = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+    authored.pop("models")
+    (project / "dbt_project.yml").write_text(
+        yaml.safe_dump(authored, sort_keys=False), encoding="utf-8"
+    )
+    for edit in install_edits(project, "dev"):
+        (project / edit.path).write_text(edit.new_content, encoding="utf-8")
+    shutil.copy(installed / "package-lock.yml", project / "package-lock.yml")
+    shutil.copytree(installed / "dbt_packages", project / "dbt_packages")
+    return project
+
+
+@requires_elementary
+def test_the_offered_install_runs_nothing_of_the_package_on_dev(
+    tmp_path: Path, installed_elementary: Path
+):
+    """Both dbt and the resolver read the rendered ``+enabled`` string as a
+    boolean per target: parsed for ``dev`` the package and its hooks are
+    disabled, and a dev build creates none of its relations; parsed for
+    ``prod``, never built, they are back."""
+
+    from exmergo_dex_core.transform.elementary import read
+    from exmergo_dex_core.transform.elementary_install import INSTALL_RELEASE
+
+    project = _with_install_applied(
+        elementary_project(tmp_path, "a", installed_elementary), installed_elementary
+    )
+    dev = read(project, _parsed(project, "dev"))
+    assert dev.installed and dev.release == INSTALL_RELEASE
+    assert (dev.enabled, dev.hooks, dev.materialization) == (False, "disabled", "dbt")
+
+    warehouse = tmp_path / "dev.duckdb"
+    before = duckdb_census(warehouse)
+    dbt(
+        "build",
+        "--project-dir",
+        str(project),
+        "--profiles-dir",
+        str(project),
+        "--target",
+        "dev",
+        cwd=project,
+        check=False,
+    )
+    results = json.loads((project / "target" / "run_results.json").read_text("utf-8"))
+    assert not [
+        r["unique_id"] for r in results["results"] if ".elementary." in r["unique_id"]
+    ]
+    created = footprint(before, duckdb_census(warehouse))
+    assert not [rel for rel in created if rel[0] == ELEMENTARY_SCHEMA]
+    assert created  # the project's own models did build
+
+    prod = read(project, _parsed(project, "prod"))
+    assert (prod.enabled, prod.hooks) == (True, "run")
+    assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- the reader's table layouts (#1469) ---------------------------------------------
+
+
+def _rows(warehouse: Path, columns: str, table: str, where: str = "") -> list[tuple]:
+    """``columns`` of one of Elementary's tables, read-only. Every argument is a
+    literal in this file, never a value read from the warehouse."""
+
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(str(warehouse), read_only=True)
+    sql = f"select {columns} from {ELEMENTARY_SCHEMA}.{table} {where}"  # noqa: S608
+    try:
+        return con.execute(sql).fetchall()
+    finally:
+        con.close()
+
+
+def _built_columns(warehouse: Path, table: str) -> list[tuple]:
+    duckdb = pytest.importorskip("duckdb")
+    con = duckdb.connect(str(warehouse), read_only=True)
+    try:
+        return con.execute(
+            "select column_name, data_type from information_schema.columns "
+            "where table_schema = ? and table_name = ? order by ordinal_position",
+            [ELEMENTARY_SCHEMA, table],
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _dbt_command(project: Path, command: str) -> dict:
+    """Run ``command`` and return the run results it wrote."""
+
+    run_results = project / "target" / "run_results.json"
+    run_results.unlink(missing_ok=True)
+    project_args = ("--project-dir", str(project), "--profiles-dir", str(project))
+    log = dbt(command, *project_args, cwd=project, check=False)
+    assert run_results.exists(), f"dbt {command} wrote no run results:\n{log}"
+    return json.loads(run_results.read_text(encoding="utf-8"))
+
+
+def _layout_check(warehouse: Path, release: str | None):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.maintain.elementary_layouts import (
+        adapter_catalog,
+        check_layouts,
+    )
+
+    adapter = DuckDBAdapter(warehouse)
+    try:
+        catalog = adapter_catalog(adapter, f"dev.{ELEMENTARY_SCHEMA}")
+        return check_layouts(release, catalog)
+    finally:
+        adapter.close()
+
+
+def _built_layout_is_the_recorded_one(warehouse: Path) -> None:
+    """Every column the package built, in order and family, is the recorded one."""
+
+    from exmergo_dex_core.maintain.elementary_layouts import layout_for, type_family
+
+    for table, layout in layout_for(CURRENT_VERSION).tables.items():
+        built = _built_columns(warehouse, table)
+        assert [name for name, _ in built] == [name for name, _ in layout.columns]
+        for name, data_type in built:
+            assert type_family(data_type) == layout.family(name), (table, name)
+
+
+def _invocations_read_back(warehouse: Path, ran: dict, tested: dict) -> None:
+    invocations = _rows(
+        warehouse,
+        "invocation_id, command, elementary_version, run_started_at, created_at",
+        "dbt_invocations",
+    )
+    assert {(i, c) for i, c, *_ in invocations} == {
+        (ran["metadata"]["invocation_id"], "run"),
+        (tested["metadata"]["invocation_id"], "test"),
+    }
+    for _, _, version, started, created in invocations:
+        assert version == CURRENT_VERSION
+        # A string at 0.26.1, as the recorded layout says, and an ISO time.
+        assert isinstance(started, str)
+        assert datetime.fromisoformat(started)
+        assert isinstance(created, datetime)
+
+
+def _results_read_back(warehouse: Path, tested: dict) -> dict[str, str]:
+    """Each test's rows against dbt's own result; ``{test_unique_id: id}``."""
+
+    # Run results also hold the package's on-run-start and on-run-end
+    # operations, which write no test result.
+    statuses = {
+        r["unique_id"]: (r["status"], r["failures"])
+        for r in tested["results"]
+        if r["unique_id"].startswith("test.")
+    }
+    results = _rows(
+        warehouse,
+        "id, test_unique_id, invocation_id, status, failures, detected_at",
+        "elementary_test_results",
+    )
+    assert len({row[0] for row in results}) == len(results)
+    assert {row[2] for row in results} == {tested["metadata"]["invocation_id"]}
+    assert {row[1] for row in results} == set(statuses)
+    for _, uid, _, status, failures, detected in results:
+        assert isinstance(detected, datetime)
+        # Elementary counts its own tests' failures, and marks an anomaly row
+        # with none `pass` whatever dbt said (get_normalized_test_status,
+        # handle_tests_results.sql:62-76); dbt's status and count hold for the
+        # rest. The tests are the root project's, so the name says whose.
+        if _node_name(uid).startswith("elementary_"):
+            assert status in {statuses[uid][0], "pass"}, uid
+        else:
+            assert (status, failures) == statuses[uid], uid
+    return {uid: result_id for result_id, uid, *_ in results}
+
+
+def _node_name(unique_id: str) -> str:
+    """A test's name: ``test.<project>.<name>.<hash>`` without the rest."""
+
+    return unique_id.split(".")[2]
+
+
+def _samples_and_metrics_read_back(
+    warehouse: Path, result_ids: dict[str, str], sampled_result: str
+) -> None:
+    # The anomaly test writes every scored bucket here too, unsampled, so only
+    # the failing test's rows are counted; each row points at a result.
+    samples = _rows(
+        warehouse, "elementary_test_results_id, row_index", "test_result_rows"
+    )
+    assert {result_id for result_id, _ in samples} <= set(result_ids.values())
+    assert [i for r, i in samples if r == sampled_result] == [1]
+
+    metrics = _rows(
+        warehouse,
+        "id, bucket_start, bucket_end, bucket_duration_hours, metric_value",
+        "data_monitoring_metrics",
+        "where metric_name = 'row_count' and lower(full_table_name) like '%.fct'",
+    )
+    assert metrics
+    assert len({m[0] for m in metrics}) == len(metrics)
+    for _, start, end, hours, value in metrics:
+        assert hours == 24
+        assert end - start == timedelta(hours=24)
+        assert value >= 0
+
+
+def _changed_layout_refuses(tmp_path: Path, warehouse: Path) -> None:
+    """The other arm, on a copy of the same warehouse: a layout it does not know."""
+
+    from exmergo_dex_core.maintain.elementary_layouts import ElementaryLayoutError
+
+    changed = tmp_path / "changed" / "dev.duckdb"
+    changed.parent.mkdir()
+    shutil.copy(warehouse, changed)
+    _execute(
+        changed,
+        f"alter table {ELEMENTARY_SCHEMA}.dbt_invocations drop column created_at",
+        f"alter table {ELEMENTARY_SCHEMA}.elementary_test_results "
+        "alter detected_at type varchar",
+    )
+    with pytest.raises(ElementaryLayoutError) as caught:
+        _layout_check(changed, CURRENT_VERSION)
+    assert [(p.code, p.table, p.column) for p in caught.value.problems] == [
+        ("elementary_column_retyped", "elementary_test_results", "detected_at"),
+        ("elementary_column_missing", "dbt_invocations", "created_at"),
+    ]
+
+
+@requires_elementary
+def test_the_reader_s_layouts_hold_on_the_fixture_and_its_rows_read_back(
+    tmp_path: Path, installed_elementary: Path
+):
+    """#1469 at 0.26.1, on variant a, where Elementary's materialization handles
+    the tests. One duplicated key makes the grain's ``unique`` test fail on one
+    value, with its sampling switch removed so the sample is written. The
+    catalog check passes on what the package built, the built layout is the
+    recorded one column for column, and each table reads back to what the two
+    runs did. A copy with one column dropped and one retyped refuses."""
+
+    # Imported before any dbt run, so a reader that is absent fails here.
+    from exmergo_dex_core.maintain.elementary_layouts import READER_RELEASES
+    from exmergo_dex_core.transform.elementary import read
+
+    assert CURRENT_VERSION in READER_RELEASES
+    project = elementary_project(tmp_path, "a", installed_elementary)
+    warehouse = tmp_path / "dev.duckdb"
+    _execute(
+        warehouse,
+        "insert into main.raw_orders select * from main.raw_orders where id = 1",
+    )
+    _strip_sampling_switch(project)
+    ran = _dbt_command(project, "run")
+    tested = _dbt_command(project, "test")
+    [unique] = [
+        r for r in tested["results"] if _node_name(r["unique_id"]) == "unique_fct_id"
+    ]
+    assert (unique["status"], unique["failures"]) == ("fail", 1)
+
+    manifest = json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+    check = _layout_check(warehouse, read(project, manifest).release)
+    assert check.release == CURRENT_VERSION
+    _built_layout_is_the_recorded_one(warehouse)
+    _invocations_read_back(warehouse, ran, tested)
+    result_ids = _results_read_back(warehouse, tested)
+    _samples_and_metrics_read_back(
+        warehouse, result_ids, result_ids[unique["unique_id"]]
+    )
+    _changed_layout_refuses(tmp_path, warehouse)
+    assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- the incident reader (#1471) --------------------------------------------------
+
+#: dbt's test statuses as the reader maps them, the same mapping as #1468's.
+_READER_OUTCOMES = {
+    "pass": "good",
+    "fail": "bad",
+    "error": "bad",
+    "warn": "bad",
+    "skipped": "unobserved",
+}
+
+
+def _claims(project: Path) -> dict[str, str]:
+    """Each test's claim id, from the manifest the last command wrote."""
+
+    manifest = json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+    claims = {}
+    for unique_id, node in manifest["nodes"].items():
+        claim = (node.get("config", {}).get("meta", {}).get("dex") or {}).get("claim")
+        if unique_id.startswith("test.") and claim:
+            claims[unique_id] = claim
+    return claims
+
+
+@requires_elementary
+@pytest.mark.parametrize("variant", ["a", "b"])
+def test_the_incident_reader_reads_each_run_the_package_recorded(
+    tmp_path: Path, installed_elementary: Path, variant: str
+):
+    """#1471 at 0.26.1. Variant a runs the tests through Elementary's
+    materialization and b through dbt's, and both runs are observed. One
+    ``dbt run`` and two ``dbt test`` give three runs in start order, one
+    sequence each. Every test dbt ran in a test run is one observation per
+    signal with dbt's outcome, the ``dbt run`` observes nothing, and no
+    statement the reader sent reads a sampled row."""
+
+    from exmergo_dex_core import DexEngine
+    from exmergo_dex_core.maintain.elementary_incidents import (
+        SOURCE,
+        plan_read,
+        read_elementary,
+    )
+    from exmergo_dex_core.maintain.incidents import fold_incidents
+    from exmergo_dex_core.transform.elementary import read
+
+    project = elementary_project(tmp_path, variant, installed_elementary)
+    warehouse = tmp_path / "dev.duckdb"
+    _execute(
+        warehouse,
+        "insert into main.raw_orders select * from main.raw_orders where id = 1",
+    )
+    runs = [_dbt_command(project, command) for command in ("run", "test", "test")]
+    manifest = json.loads((project / "target" / "manifest.json").read_text("utf-8"))
+    release = read(project, manifest).release
+    claims = _claims(project)
+
+    engine = DexEngine(connector="duckdb", path=str(warehouse))
+    plan = plan_read(engine, f"dev.{ELEMENTARY_SCHEMA}", release)
+    first = read_elementary(engine, plan, claims=claims)
+    assert first.first_read
+    assert first.profile_estimate == 0.0
+    assert [ref.run for ref in first.history.runs] == [
+        r["metadata"]["invocation_id"] for r in runs
+    ]
+    assert [ref.sequence for ref in first.history.runs] == [1, 2, 3]
+    assert first.measure.results_without_invocation == 0
+    assert first.duplicate_ids == 0
+
+    ran = runs[0]["metadata"]["invocation_id"]
+    assert not [o for o in first.observations if o.run == ran]
+    for tested in runs[1:]:
+        invocation = tested["metadata"]["invocation_id"]
+        held = [o for o in first.observations if o.run == invocation]
+        for result in tested["results"]:
+            uid = result["unique_id"]
+            if not uid.startswith("test."):
+                continue
+            mine = [o for o in held if o.test == uid]
+            assert mine, (variant, uid)
+            assert {o.source for o in mine} == {SOURCE}
+            if "anomalies" not in uid:
+                [only] = mine
+                assert only.signal.column is None and only.signal.metric is None
+                assert only.outcome == _READER_OUTCOMES[result["status"]], uid
+
+    fold = fold_incidents(first.observations, sources=[first.history])
+    unique = [
+        i
+        for i in fold.incidents
+        if any(_node_name(t) == "unique_fct_id" for t in i.tests)
+    ]
+    assert [i.state for i in unique] == ["open"]
+
+    second = read_elementary(engine, plan, claims=claims)
+    assert (second.first_read, second.profile_estimate) == (False, None)
+    assert second.observations == first.observations
+    for entry in engine.store._queries:
+        sql = entry["sql"].lower()
+        for column in ("result_rows", "test_results_description", "test_params"):
+            assert column not in sql, (column, entry["decision"])
+    assert not (tmp_path / "prod.duckdb").exists()

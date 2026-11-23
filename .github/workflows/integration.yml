@@ -45,6 +45,9 @@ name: Integration
 #   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
 #   fork-runnable by construction, kept here for pattern parity with the other
 #   connectors rather than as a cost decision.
+#   Elementary: no setup. The fixture's two files run in a step of the postgres
+#   job and in the elementary_duckdb job, installing the package from the dbt
+#   package hub; neither needs an account.
 #   ClickHouse: the exhaustive suite remains a free, keyless, fork-runnable
 #   container started by scripts/setup_clickhouse_dev.sh. A separate narrow
 #   ClickHouse Cloud job uses the protected clickhouse-cloud-integration
@@ -77,6 +80,7 @@ on:
       - "scripts/setup_clickhouse_cloud_ci.sh"
       - "scripts/postgres_seed.sql"
       - "scripts/check_container_hardening.sh"
+      - "scripts/check_no_skips.py"
       - "scripts/trino*"
       - "scripts/trino/**"
       - "scripts/cube/**"
@@ -251,7 +255,11 @@ jobs:
   databricks:
     if: github.repository == 'exmergo/dex'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not the usual 15: the suite took ten minutes on 2026-11-23 and ran
+    # past fifteen later that day once the generated-test parity harness grew
+    # (temporal, freshness and continuity rows), with warehouse cold starts
+    # on top. Every statement stays capped by STATEMENT_TIMEOUT.
+    timeout-minutes: 25
     # The environment carries the Databricks variables and, via its deployment
     # branch policy (main only), refuses this job to a workflow modified on a
     # branch before the token is minted. The Databricks-side pin mirrors it:
@@ -387,7 +395,11 @@ jobs:
     # container, so there is nothing to authenticate against and nothing a
     # fork could spend.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 30, double the usual 15: the Elementary step below builds six
+    # variants at two package releases, about 9.5 minutes on a hosted runner,
+    # and the whole job took about 13 (2026-11-22), leaving room for a third
+    # release.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/dex-core
@@ -444,7 +456,53 @@ jobs:
       - name: Sync (postgres + duckdb + slayer + dev extras)
         run: uv sync --extra postgres --extra duckdb --extra slayer --extra dev
       - name: Live Postgres integration suite
-        run: uv run pytest tests/integration -q -m postgres
+        run: >-
+          uv run pytest tests/integration -q -m postgres
+          --ignore=tests/integration/test_postgres_elementary.py
+      # The Elementary fixture at the package releases most installs pin
+      # (LEGACY_VERSIONS in tests/transform/elementary_fixture.py, which is where
+      # a release is added). Its own step, with DEX_TEST_ELEMENTARY on the step
+      # rather than the job, so the suite above never runs it a second time. The
+      # file skips itself without the variable, and pytest counts a skip as a
+      # pass, so check_no_skips.py fails the step on any skip rather than
+      # letting a dropped variable read as green.
+      - name: Elementary fixture on Postgres
+        env:
+          DEX_TEST_ELEMENTARY: "1"
+        run: |
+          uv run pytest tests/integration/test_postgres_elementary.py -q -m postgres \
+            --junitxml "$RUNNER_TEMP/elementary-postgres.xml"
+          uv run python ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-postgres.xml"
+
+  elementary_duckdb:
+    # The Elementary fixture's own file, on local DuckDB at the releases that
+    # carry DuckDB macros. It needs no service and no account, only the dbt
+    # package hub, so like postgres it has no repository gate. It is here
+    # rather than in ci.yml because installing the package needs the network,
+    # and pull requests stay deterministic (#1380).
+    runs-on: ubuntu-latest
+    # The file took about 15 minutes on a hosted runner (2026-11-22).
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Sync (duckdb + dev extras)
+        run: uv sync --extra duckdb --extra dev
+      # As on Postgres: the file skips itself without the variable, so any skip
+      # fails the step.
+      - name: Elementary fixture on DuckDB
+        env:
+          DEX_TEST_ELEMENTARY: "1"
+        run: |
+          uv run pytest tests/transform/test_elementary_fixture.py -q \
+            --junitxml "$RUNNER_TEMP/elementary-duckdb.xml"
+          uv run python ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-duckdb.xml"
 
   cube:
     # No repository gate and no environment: a governed Cube query (#913) is

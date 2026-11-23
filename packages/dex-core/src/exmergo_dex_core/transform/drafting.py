@@ -64,6 +64,8 @@ _COLUMN_FIELDS = (
     "additivity",
     "unit",
     "references",
+    "freshness",
+    "continuity",
 )
 
 _INTEGER_TYPES = ("int", "integer", "bigint", "smallint", "tinyint", "hugeint")

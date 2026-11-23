@@ -475,3 +475,10 @@ def test_generated_tests_agree_with_maintain_verify_live(
                     sql.Identifier("dbt_dev", name)
                 )
             )
+        # The temporal rows' snapshots (#1458) are tables.
+        for name in report.snapshots:
+            con.execute(
+                sql.SQL("drop table if exists {} cascade").format(
+                    sql.Identifier("dbt_dev", name)
+                )
+            )

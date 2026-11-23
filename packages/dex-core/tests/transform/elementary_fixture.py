@@ -215,11 +215,14 @@ def add_failing_tests(project: Path) -> None:
     )
 
 
-def dbt(*argv: str, cwd: Path, check: bool = True) -> str:
+def dbt(*argv: str, cwd: Path, check: bool = True, stderr: bool = True) -> str:
     """Run dbt itself, outside Dex, and return what it printed.
 
     ``check=False`` also returns the output of a run that exited nonzero, for a
     command that is meant to fail (``dbt test`` over a failing test).
+    ``stderr=False`` returns stdout alone, for output read line by line as data
+    (``dbt ls``): an interpreter warning dbt's dependencies print on stderr,
+    such as pydantic's on Python 3.14, is not a line of it.
     """
 
     executable = shutil.which("dbt")
@@ -232,7 +235,7 @@ def dbt(*argv: str, cwd: Path, check: bool = True) -> str:
     )
     if check and done.returncode:
         raise RuntimeError(f"dbt {' '.join(argv)} failed:\n{done.stdout}{done.stderr}")
-    return done.stdout + done.stderr
+    return done.stdout + (done.stderr if stderr else "")
 
 
 @pytest.fixture(scope="session")

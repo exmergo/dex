@@ -263,6 +263,95 @@ def test_units_and_additivity() -> None:
     assert _fact(out, "additivity", "rate")["checked_by"] == "none"
 
 
+def test_a_freshness_is_checked_by_verify_and_by_its_generated_test() -> None:
+    fresh = {"role": "time", "freshness": {"max_lag": "6h", "basis": "capture"}}
+    manifest = _manifest(
+        [
+            _model("tested", columns={"loaded_at": fresh}),
+            _model("untested", columns={"loaded_at": fresh}),
+        ],
+        [
+            _test(
+                "dex_freshness",
+                "tested",
+                "loaded_at",
+                kwargs={"max_lag_seconds": 21600},
+            ),
+            # Left at an older, looser lag: permits what the declaration forbids.
+            _test(
+                "dex_freshness",
+                "untested",
+                "loaded_at",
+                kwargs={"max_lag_seconds": 86400},
+            ),
+        ],
+    )
+    out = _run(manifest)
+    tested = _fact(out, "freshness", "loaded_at", model="tested")
+    assert (tested["checked_by"], tested["tests"], tested["verify"]) == (
+        "both",
+        ["dex_freshness"],
+        ["freshness_exceeded"],
+    )
+    assert _fact(out, "freshness", "loaded_at", model="untested")["checked_by"] == (
+        "dex_verify"
+    )
+
+
+def test_a_continuity_is_checked_by_its_generated_test_alone() -> None:
+    gapless = {"role": "time", "continuity": {"grain": "day", "by": ["region"]}}
+    two_keys = {
+        "role": "time",
+        "continuity": {"grain": "day", "by": ["region", "channel"]},
+    }
+    manifest = _manifest(
+        [
+            _model("tested", columns={"ordered_at": gapless}),
+            _model("other_grain", columns={"ordered_at": gapless}),
+            _model("other_keys", columns={"ordered_at": gapless}),
+            _model("untested", columns={"ordered_at": gapless}),
+            _model("reordered", columns={"ordered_at": two_keys}),
+        ],
+        [
+            _test(
+                "dex_continuity",
+                "tested",
+                "ordered_at",
+                kwargs={"grain": "day", "by": ["Region"]},
+            ),
+            # Searching other buckets, or the whole table: not the declaration.
+            _test(
+                "dex_continuity",
+                "other_grain",
+                "ordered_at",
+                kwargs={"grain": "week", "by": ["region"]},
+            ),
+            _test(
+                "dex_continuity", "other_keys", "ordered_at", kwargs={"grain": "day"}
+            ),
+            # The same two keys in another order: the same partitions.
+            _test(
+                "dex_continuity",
+                "reordered",
+                "ordered_at",
+                kwargs={"grain": "day", "by": ["channel", "region"]},
+            ),
+        ],
+    )
+    out = _run(manifest)
+    tested = _fact(out, "continuity", "ordered_at", model="tested")
+    assert (tested["checked_by"], tested["tests"], tested["verify"]) == (
+        "dbt_test",
+        ["dex_continuity"],
+        [],
+    )
+    reordered = _fact(out, "continuity", "ordered_at", model="reordered")
+    assert reordered["checked_by"] == "dbt_test"
+    for model in ("other_grain", "other_keys", "untested"):
+        fact = _fact(out, "continuity", "ordered_at", model=model)
+        assert fact["checked_by"] == "none", model
+
+
 def test_undeclared_model_is_counted_apart() -> None:
     manifest = _manifest(
         [

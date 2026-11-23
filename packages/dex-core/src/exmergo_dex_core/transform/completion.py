@@ -93,6 +93,7 @@ _RECORD_KINDS = (
     "join_coverage",
     "parent_population",
     "temporal_contracts",
+    "freshness",
     "population_delta",
     "retirement",
     "toggle",
@@ -194,8 +195,11 @@ class UncheckedTest(BaseModel):
     ``reason_code`` is ``package_disabled`` (an Elementary test that compiled
     to the package's no-results query because its models are disabled for the
     target), ``compiled_to_no_results`` (the same query with the package
-    enabled) or ``history_unmeasured`` (an Elementary test that judges this
-    run against history earlier runs stored, which dex does not measure).
+    enabled), ``history_unmeasured`` (an Elementary test that judges this
+    run against history earlier runs stored, which dex does not measure), or
+    ``elementary_release_untested`` and ``elementary_release_unknown`` (an
+    Elementary test run by a release outside the ones dex was run against, or
+    one dex could not read, #1445).
     """
 
     test: str

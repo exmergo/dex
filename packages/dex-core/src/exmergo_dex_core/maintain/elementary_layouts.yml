@@ -1,0 +1,186 @@
+# The layout of each Elementary table Dex reads as evidence, per release (#1469).
+#
+# One file, loaded by the reader (maintain/elementary_layouts.py), its tests and
+# the demo, so the three cannot disagree. Each release here is one the reader
+# supports, and each must also be one the Elementary fixture runs
+# (TESTED_RELEASES in transform/elementary.py): the loader refuses a release
+# that is not.
+#
+# `columns` is every column the model declares, in the package's own order and
+# with the package's own type name, copied from the model files at the release
+# tag. The package builds each table from an `empty_table` list of
+# (name, type) pairs and casts each column with `empty_column`
+# (macros/edr/system/system_utils/empty_table.sql:148-222), which maps
+# `boolean`, `timestamp`, `int`, `bigint`, `float` and `long_string` to the
+# adapter's type and every other name to the adapter's string type. Only those
+# names and `string` are recorded here, and the loader refuses any other, so a
+# misspelled name never reads as text.
+#
+# `reads` is the columns the reader uses. Only those are held to the catalog:
+# each must be there, in its type family. The rest are recorded so the demo can
+# build the table as the package does. None of `reads` holds a sampled row or a
+# value a test failed on (`result_rows`, `result_row`, `dimension_value`,
+# `source_value`, `test_results_description` and `test_results_query` are left
+# out on purpose).
+
+releases:
+  "0.26.1":
+    # elementary-data/dbt-data-reliability, tag 0.26.1, commit
+    # 3f8e79b357123ed70f7c4b0e74490dd5177a7cbb.
+    tables:
+      elementary_test_results:
+        # models/edr/run_results/elementary_test_results.sql:24 calls
+        # empty_elementary_test_results(),
+        # macros/edr/system/system_utils/empty_table.sql:1-36.
+        source: macros/edr/system/system_utils/empty_table.sql:1-36
+        columns:
+          - [id, long_string]
+          - [data_issue_id, string]
+          - [test_execution_id, long_string]
+          - [test_unique_id, long_string]
+          - [model_unique_id, long_string]
+          - [invocation_id, string]
+          - [detected_at, timestamp]
+          - [created_at, timestamp]
+          - [database_name, string]
+          - [schema_name, string]
+          - [table_name, string]
+          - [column_name, string]
+          - [test_type, string]
+          - [test_sub_type, string]
+          - [test_results_description, long_string]
+          - [owners, string]
+          - [tags, string]
+          - [test_results_query, long_string]
+          - [other, string]
+          - [test_name, long_string]
+          - [test_params, long_string]
+          - [severity, string]
+          - [status, string]
+          - [failures, bigint]
+          - [test_short_name, string]
+          - [test_alias, string]
+          - [result_rows, long_string]
+          - [failed_row_count, bigint]
+        reads:
+          - id
+          - test_execution_id
+          - test_unique_id
+          - model_unique_id
+          - invocation_id
+          - detected_at
+          - created_at
+          - column_name
+          - test_type
+          - test_sub_type
+          - severity
+          - status
+          - failures
+          - failed_row_count
+      dbt_invocations:
+        # models/edr/dbt_artifacts/dbt_invocations.sql:18 calls
+        # get_dbt_invocations_empty_table_query(),
+        # macros/edr/dbt_artifacts/upload_dbt_invocation.sql:282-326.
+        # run_started_at, run_completed_at and generated_at are strings at this
+        # release, not timestamps: only created_at is a timestamp.
+        source: macros/edr/dbt_artifacts/upload_dbt_invocation.sql:282-326
+        columns:
+          - [invocation_id, long_string]
+          - [job_id, long_string]
+          - [job_name, long_string]
+          - [job_run_id, long_string]
+          - [run_started_at, string]
+          - [run_completed_at, string]
+          - [generated_at, string]
+          - [created_at, timestamp]
+          - [command, string]
+          - [dbt_version, string]
+          - [elementary_version, string]
+          - [full_refresh, boolean]
+          - [invocation_vars, long_string]
+          - [vars, long_string]
+          - [target_name, string]
+          - [target_database, string]
+          - [target_schema, string]
+          - [target_profile_name, string]
+          - [threads, int]
+          - [selected, long_string]
+          - [yaml_selector, long_string]
+          - [project_id, string]
+          - [project_name, string]
+          - [env, string]
+          - [env_id, string]
+          - [cause_category, string]
+          - [cause, long_string]
+          - [pull_request_id, string]
+          - [git_sha, string]
+          - [orchestrator, string]
+          - [dbt_user, string]
+          - [job_url, string]
+          - [job_run_url, string]
+          - [account_id, string]
+          - [target_adapter_specific_fields, long_string]
+        reads:
+          - invocation_id
+          - run_started_at
+          - run_completed_at
+          - generated_at
+          - created_at
+          - command
+          - elementary_version
+          - target_name
+          # The commit each run records, which the incident reader (#1471)
+          # carries on every run it reads.
+          - git_sha
+      test_result_rows:
+        # models/edr/run_results/test_result_rows.sql:25-36, a literal
+        # empty_table list.
+        source: models/edr/run_results/test_result_rows.sql:25-36
+        columns:
+          - [elementary_test_results_id, long_string]
+          - [result_row, long_string]
+          - [detected_at, timestamp]
+          - [created_at, timestamp]
+          - [row_index, int]
+          - [test_type, string]
+        reads:
+          - elementary_test_results_id
+          - detected_at
+          - created_at
+          - row_index
+      data_monitoring_metrics:
+        # models/edr/data_monitoring/data_monitoring/data_monitoring_metrics.sql:26
+        # calls empty_data_monitoring_metrics(), which dispatches:
+        # default__ at macros/edr/system/system_utils/empty_table.sql:74-95
+        # (created_at appended, with_created_at defaulting to true), and a
+        # ClickHouse variant at :97-118 that wraps the same names in Nullable().
+        source: macros/edr/system/system_utils/empty_table.sql:74-95
+        columns:
+          - [id, string]
+          - [full_table_name, string]
+          - [column_name, string]
+          - [metric_name, string]
+          - [metric_type, string]
+          - [metric_value, float]
+          - [source_value, string]
+          - [bucket_start, timestamp]
+          - [bucket_end, timestamp]
+          - [bucket_duration_hours, int]
+          - [updated_at, timestamp]
+          - [dimension, string]
+          - [dimension_value, string]
+          - [metric_properties, string]
+          - [created_at, timestamp]
+        reads:
+          - id
+          - full_table_name
+          - column_name
+          - metric_name
+          - metric_type
+          - metric_value
+          - bucket_start
+          - bucket_end
+          - bucket_duration_hours
+          - updated_at
+          - dimension
+          - created_at

@@ -98,6 +98,10 @@ class PlanResult(Result):
     # `already_listed`) or not (`not_rendered` with a reason,
     # `listed_while_off`). Absent when the declarations give none.
     generated_tests: dict[str, Any] | None = None
+    # The vendor monitors the plan's declarations give (#1482): what gated
+    # them and one row per monitor, written or not. ``None`` where
+    # ``monitors.vendor`` is unset, so the key is absent.
+    monitors: dict[str, Any] | None = None
     # The free pointer to `transform compare` on a plan that rewrites a model
     # that already exists (#856). Planning scans nothing for it. Absent when the
     # plan rewrites none.
@@ -157,6 +161,8 @@ class PlanResult(Result):
             payload["pii_metadata"] = self.pii_metadata
         if self.generated_tests is not None:
             payload["generated_tests"] = self.generated_tests
+        if self.monitors is not None:
+            payload["monitors"] = self.monitors
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:

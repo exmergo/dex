@@ -249,13 +249,16 @@ def test_effective_entries_match_the_manifest_dbt_writes(tmp_path: Path):
         check=False,
     )
     assert completed.returncode == 0, completed.stdout[-2000:]
-    manifest = json.loads((tmp_path / "target" / "manifest.json").read_text())
+    manifest = json.loads(
+        (tmp_path / "target" / "manifest.json").read_text(encoding="utf-8")
+    )
     vmap = mv.version_map(_files(), ["models"])
     variants = dict(mv.entry_variants(vmap["dim_teams"].entry))
     for item in vmap["dim_teams"].versions:
         node = manifest["nodes"][f"model.p.dim_teams.v{item.v}"]
         effective = variants[item.label]
-        assert node["original_file_path"] == item.file
+        # dbt writes the platform separator; a version entry records "/".
+        assert node["original_file_path"].replace("\\", "/") == item.file
         assert str(node["latest_version"]) == vmap["dim_teams"].default
         assert list(node["columns"]) == [c["name"] for c in effective["columns"]]
         assert node["description"] == effective["description"]
