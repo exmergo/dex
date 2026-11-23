@@ -249,11 +249,12 @@ def production_enabled(
 
     Reads ``models.elementary`` ``+enabled`` (or ``enabled``) at the package's
     root, the setting the package's own models answer to and so the one its
-    tests' ``is_elementary_enabled()`` reads. Absent is dbt's default,
-    enabled. A boolean, or the text ``true``/``false``, is read as written. A
-    Jinja test of ``target.name`` (``==``, ``!=``, ``in``, ``not in`` against
-    literals, the form ``dex init`` writes) is evaluated with
-    ``prod_target``; without one it is ``unknown``. Anything else is
+    tests' ``is_elementary_enabled()`` reads, else the same key at the root of
+    ``models:``, which dbt applies to a package's models too. Absent at both is
+    dbt's default, enabled. A boolean, or the text ``true``/``false``, is read
+    as written. A Jinja test of ``target.name`` (``==``, ``!=``, ``in``,
+    ``not in`` against literals, the form ``dex init`` writes) is evaluated
+    with ``prod_target``; without one it is ``unknown``. Anything else is
     ``unknown``, never guessed.
     """
 
@@ -266,13 +267,18 @@ def production_enabled(
     if not isinstance(loaded, Mapping):
         return ENABLED, NOT_SET, None
     models = loaded.get("models")
-    package = models.get(ELEMENTARY) if isinstance(models, Mapping) else None
-    if not isinstance(package, Mapping):
+    if not isinstance(models, Mapping):
         return ENABLED, NOT_SET, None
+    package = models.get(ELEMENTARY)
     value: Any = None
-    for key in ("+enabled", "enabled"):
-        if key in package:
-            value = package[key]
+    # The package's own setting overrides one at the root of `models:`, which
+    # dbt applies to every package's models too.
+    for level in (package, models):
+        if not isinstance(level, Mapping):
+            continue
+        key = next((k for k in ("+enabled", "enabled") if k in level), None)
+        if key is not None:
+            value = level[key]
             break
     else:
         return ENABLED, NOT_SET, None

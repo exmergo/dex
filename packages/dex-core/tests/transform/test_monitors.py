@@ -137,6 +137,17 @@ def test_production_is_read_from_the_repository_with_the_prod_target(
     assert (status, reason) == expected
 
 
+def test_a_root_models_setting_reaches_the_package_unless_it_overrides_it():
+    # dbt applies a root `models: +enabled` to every package's models too.
+    root_off = "models:\n  +enabled: false\n  shop:\n    +enabled: true\n"
+    assert mon.production_enabled(root_off, "prod")[:2] == (mon.DISABLED, mon.LITERAL)
+    overridden = root_off + "  elementary:\n    +enabled: true\n"
+    assert mon.production_enabled(overridden, "prod")[:2] == (
+        mon.ENABLED,
+        mon.LITERAL,
+    )
+
+
 def test_a_setting_on_a_package_folder_does_not_decide_the_package():
     # Only the package root decides whether its models (and so its tests'
     # `is_elementary_enabled()`) run; a folder below it is not read.
@@ -691,3 +702,47 @@ def test_transform_declare_writes_the_monitors_an_earlier_declaration_owes(
     applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
     assert applied["status"] == "ok", applied["errors"]
     assert declare()["data"]["plan_id"] is None
+
+
+def test_transform_declare_says_why_an_owed_monitor_was_not_written(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir, enabled="false")
+    (dbt_project_dir / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, current_timestamp as signed_up_at\n", encoding="utf-8"
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    declared = _dex(
+        ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+        capsys,
+    )
+
+    assert declared["status"] == "ok", declared["errors"]
+    assert declared["data"]["plan_id"] is None
+    said = json.dumps(declared)
+    assert "disables the Elementary package" in said
+    assert "no monitor was written" in said

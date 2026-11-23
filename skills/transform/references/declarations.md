@@ -922,7 +922,8 @@ models:
   Otherwise every monitor is `not_rendered` with `package_not_installed`.
 - **Only where it will run.** A monitor runs where production runs, so the
   repository's `dbt_project.yml` (as the plan leaves it) is read for
-  `models: elementary: +enabled` at the package root:
+  `models: elementary: +enabled` at the package root, else `+enabled` at the
+  root of `models:`, which dbt applies to a package's models too:
 
   | `+enabled` | Production |
   |---|---|

@@ -2299,6 +2299,7 @@ def declare(
             return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
         return drafts.get(model), warnings
 
+    monitor_gate = _monitor_gate(engine, [])
     outcome = declare_mod.propose(
         view,
         selection.models,
@@ -2307,7 +2308,7 @@ def declare(
         cap=cap,
         render_tests=engine.config.declarations.render_tests,
         dialect=_dialect(engine),
-        monitors=_monitor_gate(engine, []),
+        monitors=monitor_gate,
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2330,6 +2331,12 @@ def declare(
             "nothing to propose, so no plan was stored; every selected model is "
             "listed under `skipped` with the reason"
         )
+        # A model whose only owed change is a monitor reads `complete` when the
+        # gate is closed, so the reason no monitor was written is said here
+        # (#1482); a stored plan carries it in its own warnings.
+        closed = monitor_gate.warning() if monitor_gate is not None else None
+        if closed is not None:
+            notes.append(closed)
         return DeclareResult(notes=notes, **common)
 
     payload = [
