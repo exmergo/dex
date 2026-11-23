@@ -34,7 +34,7 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -242,6 +242,69 @@ def _raw_target_key(project: Path, target: str, key: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _check_dev_drift(
+    connector: str,
+    target_config: Any,
+    profile: dict[str, str],
+    target: str,
+    env: dict | os._Environ,
+    warnings: list[str],
+) -> list[str]:
+    """Check dev namespace drift when ``<connector>.dev`` was configured (#1541)."""
+    if "dev" not in target_config.model_fields_set or not target_config.dev:
+        return []
+    fold = connector in _CASE_FOLDING
+
+    def resolve(key: str) -> str | None:
+        raw = profile.get(key)
+        if raw is None:
+            return None
+        if "{{" in str(raw):
+            resolved = _profile_scalar(raw, env)
+            if resolved is None:
+                warnings.append(
+                    f"could not resolve {PROFILES_FILE} target '{target}' "
+                    f"{key} template: {raw}; skipping dev-target drift check "
+                    "for this field"
+                )
+                return None
+            return resolved
+        return str(raw)
+
+    divergent: list[str] = []
+
+    def check_match(profile_key: str, want: str) -> None:
+        got = resolve(profile_key)
+        if got is None:
+            return
+        if (want.upper() == got.upper()) if fold else (want == got):
+            return
+        divergent.append(
+            f"  {connector}.dev: {target_config.dev}\n"
+            f"  {PROFILES_FILE} {target}.{profile_key}: {got}"
+        )
+
+    if connector == "bigquery":
+        if "." in target_config.dev:
+            proj, ds = target_config.dev.split(".", 1)
+            check_match("project", proj)
+            check_match("dataset", ds)
+        else:
+            check_match("dataset", target_config.dev)
+    elif connector in ("snowflake", "databricks"):
+        first, second = target_config.dev.split(".", 1)
+        check_match("database" if connector == "snowflake" else "catalog", first)
+        check_match("schema", second)
+    elif connector == "trino":
+        first, second = target_config.dev.split(".", 1)
+        check_match("database", first)
+        check_match("schema", second)
+    elif connector in ("postgres", "redshift", "clickhouse"):
+        check_match("schema", target_config.dev)
+
+    return divergent
+
+
 def _assert_no_drift(
     project: Path,
     target: str,
@@ -274,11 +337,24 @@ def _assert_no_drift(
     fold = config.connector in _CASE_FOLDING
     divergent = []
     warnings: list[str] = []
+    from ..config import DEV_ALIASES
+
     # Config paths resolve against the repo root (committed target); profile
     # paths resolve against the dbt project dir (dbt's cwd).
     config_base = Path(repo_root)
     profile_base = project
+    alias_fields = set(DEV_ALIASES.get(config.connector, ()))
+    has_alias = any(a in target_config.model_fields_set for a in alias_fields)
+    has_explicit_dev = "dev" in target_config.model_fields_set and not has_alias
+    if has_explicit_dev:
+        divergent.extend(
+            _check_dev_drift(
+                config.connector, target_config, profile, target, env, warnings
+            )
+        )
     for attribute, config_key, profile_key in _DRIFT_FIELDS.get(config.connector, ()):
+        if has_explicit_dev and attribute in alias_fields:
+            continue
         # An unset config field was never a claim about the dev target, so it
         # cannot have drifted away from one.
         if attribute not in target_config.model_fields_set:

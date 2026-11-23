@@ -114,6 +114,40 @@ def check_prod(
     return value
 
 
+#: Aliases kept for the dev namespace of each connector (#1541), accepted
+#: alongside the canonical ``dev`` key.
+DEV_ALIASES: dict[str, tuple[str, ...]] = {
+    "bigquery": ("dev_dataset",),
+    "snowflake": ("dev_database", "dev_schema"),
+    "databricks": ("dev_catalog", "dev_schema"),
+    "postgres": ("dev_schema",),
+    "redshift": ("dev_schema",),
+    "clickhouse": ("dev_database",),
+    "trino": ("dev_catalog", "dev_schema"),
+}
+
+
+def check_dev(connector: str, dev: str | None) -> str | None:
+    """Validate a ``<connector>.dev`` namespace string (#1541): spelled in the
+    connector's namespace vocabulary with the correct number of parts. Returns
+    the stripped value."""
+
+    if dev is None:
+        return None
+    value = dev.strip()
+    parts = value.split(".")
+    if not value or any(not part.strip() for part in parts):
+        raise ValueError(
+            f"{connector}.dev is empty or has an empty part; spell it as "
+            f"{_PROD_SPELLING[connector]}"
+        )
+    if len(parts) not in PROD_PARTS[connector]:
+        raise ValueError(
+            f"{connector}.dev is spelled as {_PROD_SPELLING[connector]}, got '{value}'"
+        )
+    return value
+
+
 def _pair(container: str | None, schema: str | None) -> str | None:
     """A two-part dev namespace, or ``None`` until both parts are set."""
 
@@ -123,6 +157,9 @@ def _pair(container: str | None, schema: str | None) -> str | None:
 class DuckDBTarget(BaseModel):
     # A local DuckDB file, or a directory of Parquet/CSV. Opened read-only.
     path: str
+    #: Where this project's models build in dev (#1541), spelled as a schema
+    #: of the file (``main``).
+    dev: str | None = None
     #: Where this project's models build in production (#1462), spelled as a schema
     #: of the file (``main``). Not a source allowlist: dex reads only its catalog
     #: metadata (names, row counts, bytes), never its rows, and never builds there.
@@ -130,8 +167,9 @@ class DuckDBTarget(BaseModel):
     prod: str | None = None
 
     @model_validator(mode="after")
-    def _check_prod(self) -> DuckDBTarget:
-        self.prod = check_prod("duckdb", self.prod, None)
+    def _check_dev_and_prod(self) -> DuckDBTarget:
+        self.dev = check_dev("duckdb", self.dev)
+        self.prod = check_prod("duckdb", self.prod, self.dev)
         return self
 
 
@@ -142,8 +180,9 @@ class BigQueryTarget(BaseModel):
     ``project`` is the billing/quota project jobs run in (also the default
     project whose datasets are explored). ``datasets`` is a source allowlist
     (entries ``dataset`` or ``project.dataset``); empty means every dataset in
-    the project. ``dev_dataset`` is where dbt dev builds write, and is refused
+    the project. ``dev`` is where dbt dev builds write (#1541), and is refused
     as a source so reads and writes can never share a dataset.
+    ``dev_dataset`` is accepted as an alias.
     ``max_full_profile_bytes`` opts large tables into block-sampled profiling
     (TABLESAMPLE) instead of a full scan; unset means profile fully, bounded
     only by the budget.
@@ -152,6 +191,9 @@ class BigQueryTarget(BaseModel):
     project: str | None = None
     location: str | None = None
     datasets: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as ``dataset``
+    #: or ``project.dataset``.
+    dev: str | None = None
     dev_dataset: str | None = None
     #: Where this project's models build in production (#1462), spelled as
     #: ``dataset`` or ``project.dataset``. Not a source allowlist: dex reads only
@@ -161,11 +203,33 @@ class BigQueryTarget(BaseModel):
     max_full_profile_bytes: int | None = None
 
     @model_validator(mode="after")
-    def _check_prod(self) -> BigQueryTarget:
-        self.prod = check_prod(
-            "bigquery", self.prod, self.dev_dataset, container=self.project
-        )
+    def _check_dev_and_prod(self) -> BigQueryTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = "dev_dataset" in self.model_fields_set
+        if dev_set and alias_set:
+            raise ValueError(
+                "bigquery.dev and bigquery.dev_dataset cannot both be set; "
+                "keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("bigquery", self.dev)
+            object.__setattr__(self, "dev_dataset", self.dev)
+        elif self.dev_dataset is not None:
+            stripped = self.dev_dataset.strip() if self.dev_dataset else None
+            object.__setattr__(self, "dev", stripped)
+        self.prod = check_prod("bigquery", self.prod, self.dev, container=self.project)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "dev_dataset" and "dev" not in self.model_fields_set:
+            object.__setattr__(
+                self, "dev", value.strip() if isinstance(value, str) else value
+            )
+        elif name == "dev":
+            object.__setattr__(
+                self, "dev_dataset", value.strip() if isinstance(value, str) else value
+            )
 
 
 class SnowflakeTarget(BaseModel):
@@ -197,6 +261,8 @@ class SnowflakeTarget(BaseModel):
     connection_name: str | None = None
     warehouse: str | None = None
     databases: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as ``DATABASE.SCHEMA``.
+    dev: str | None = None
     dev_database: str | None = None
     dev_schema: str | None = None
     #: Where this project's models build in production (#1462), spelled as
@@ -209,11 +275,44 @@ class SnowflakeTarget(BaseModel):
     suspend_after_command: bool = False
 
     @model_validator(mode="after")
-    def _check_prod(self) -> SnowflakeTarget:
-        self.prod = check_prod(
-            "snowflake", self.prod, _pair(self.dev_database, self.dev_schema)
+    def _check_dev_and_prod(self) -> SnowflakeTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = (
+            "dev_database" in self.model_fields_set
+            or "dev_schema" in self.model_fields_set
         )
+        if dev_set and alias_set:
+            raise ValueError(
+                "snowflake.dev and snowflake.dev_database/dev_schema "
+                "cannot both be set; keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("snowflake", self.dev)
+            db, schema = self.dev.split(".", 1)
+            object.__setattr__(self, "dev_database", db)
+            object.__setattr__(self, "dev_schema", schema)
+        elif self.dev_database and self.dev_schema:
+            object.__setattr__(self, "dev", f"{self.dev_database}.{self.dev_schema}")
+        self.prod = check_prod("snowflake", self.prod, self.dev)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        has_alias = (
+            "dev_database" in self.model_fields_set
+            or "dev_schema" in self.model_fields_set
+        )
+        if (
+            name in ("dev_database", "dev_schema")
+            and not ("dev" in self.model_fields_set and not has_alias)
+            and self.dev_database
+            and self.dev_schema
+        ):
+            object.__setattr__(self, "dev", f"{self.dev_database}.{self.dev_schema}")
+        elif name == "dev" and isinstance(value, str) and "." in value:
+            db, sc = value.split(".", 1)
+            object.__setattr__(self, "dev_database", db)
+            object.__setattr__(self, "dev_schema", sc)
 
 
 class DatabricksTarget(BaseModel):
@@ -229,9 +328,10 @@ class DatabricksTarget(BaseModel):
     for every billed statement: dex refuses to spend on a warehouse the config
     does not name. ``catalogs`` is a source allowlist (entries ``catalog`` or
     ``catalog.schema``); empty means every Unity Catalog catalog the principal
-    can see except ``system``. ``dev_catalog``/``dev_schema`` are where dbt dev
-    builds write; the pair is refused as a source so reads and writes never
-    share a schema. ``max_full_profile_bytes`` opts large tables into sampled
+    can see except ``system``. ``dev`` is where dbt dev builds write (#1541),
+    spelled as ``catalog.schema``; ``dev_catalog``/``dev_schema`` are accepted
+    as aliases.
+    ``max_full_profile_bytes`` opts large tables into sampled
     profiling (TABLESAMPLE) instead of a full scan; table sizes are not free on
     Databricks, so the threshold binds once a size is learned in-budget.
     ``dbu_price_usd`` is the contract-specific dollar price of one DBU; set it
@@ -243,6 +343,8 @@ class DatabricksTarget(BaseModel):
     host: str | None = None
     warehouse: str | None = None
     catalogs: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as ``catalog.schema``.
+    dev: str | None = None
     dev_catalog: str | None = None
     dev_schema: str | None = None
     #: Where this project's models build in production (#1462), spelled as
@@ -254,11 +356,44 @@ class DatabricksTarget(BaseModel):
     dbu_price_usd: float | None = None
 
     @model_validator(mode="after")
-    def _check_prod(self) -> DatabricksTarget:
-        self.prod = check_prod(
-            "databricks", self.prod, _pair(self.dev_catalog, self.dev_schema)
+    def _check_dev_and_prod(self) -> DatabricksTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = (
+            "dev_catalog" in self.model_fields_set
+            or "dev_schema" in self.model_fields_set
         )
+        if dev_set and alias_set:
+            raise ValueError(
+                "databricks.dev and databricks.dev_catalog/dev_schema "
+                "cannot both be set; keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("databricks", self.dev)
+            cat, schema = self.dev.split(".", 1)
+            object.__setattr__(self, "dev_catalog", cat)
+            object.__setattr__(self, "dev_schema", schema)
+        elif self.dev_catalog and self.dev_schema:
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+        self.prod = check_prod("databricks", self.prod, self.dev)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        has_alias = (
+            "dev_catalog" in self.model_fields_set
+            or "dev_schema" in self.model_fields_set
+        )
+        if (
+            name in ("dev_catalog", "dev_schema")
+            and not ("dev" in self.model_fields_set and not has_alias)
+            and self.dev_catalog
+            and self.dev_schema
+        ):
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+        elif name == "dev" and isinstance(value, str) and "." in value:
+            cat, sc = value.split(".", 1)
+            object.__setattr__(self, "dev_catalog", cat)
+            object.__setattr__(self, "dev_schema", sc)
 
 
 class PostgresTarget(BaseModel):
@@ -273,10 +408,11 @@ class PostgresTarget(BaseModel):
     profile. ``host``/``port``/``dbname``/``user`` are an optional committed
     non-secret target used only when no other source resolves. ``schemas`` is
     a source allowlist of schema names inside the connected database; empty
-    means every non-system schema the role can see. ``dev_schema`` is where
-    dbt dev builds write, and is refused as a source so reads and writes never
-    share a schema. ``max_full_profile_bytes`` opts large tables into sampled
-    profiling (TABLESAMPLE SYSTEM) instead of a full scan.
+    means every non-system schema the role can see. ``dev`` is where
+    dbt dev builds write (#1541), spelled as a schema; ``dev_schema`` is
+    accepted as an alias. Reads and writes never share a schema.
+    ``max_full_profile_bytes`` opts large tables into sampled profiling
+    (TABLESAMPLE SYSTEM) instead of a full scan.
     """
 
     service: str | None = None
@@ -285,6 +421,8 @@ class PostgresTarget(BaseModel):
     dbname: str | None = None
     user: str | None = None
     schemas: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as a schema.
+    dev: str | None = None
     dev_schema: str | None = None
     #: Where this project's models build in production (#1462), spelled as a schema.
     #: Not a source allowlist: dex reads only its catalog metadata (names, row
@@ -294,9 +432,32 @@ class PostgresTarget(BaseModel):
     max_full_profile_bytes: int | None = None
 
     @model_validator(mode="after")
-    def _check_prod(self) -> PostgresTarget:
-        self.prod = check_prod("postgres", self.prod, self.dev_schema)
+    def _check_dev_and_prod(self) -> PostgresTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = "dev_schema" in self.model_fields_set
+        if dev_set and alias_set:
+            raise ValueError(
+                "postgres.dev and postgres.dev_schema cannot both be set; "
+                "keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("postgres", self.dev)
+            object.__setattr__(self, "dev_schema", self.dev)
+        elif self.dev_schema is not None:
+            stripped = self.dev_schema.strip() if self.dev_schema else None
+            object.__setattr__(self, "dev", stripped)
+        self.prod = check_prod("postgres", self.prod, self.dev)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        has_alias = "dev_schema" in self.model_fields_set
+        if name == "dev_schema" and not (
+            "dev" in self.model_fields_set and not has_alias
+        ):
+            object.__setattr__(self, "dev", value)
+        elif name == "dev":
+            object.__setattr__(self, "dev_schema", value)
 
 
 class RedshiftTarget(BaseModel):
@@ -315,13 +476,14 @@ class RedshiftTarget(BaseModel):
     optional committed non-secret target for native password auth (password
     supplied by REDSHIFT_PASSWORD, never by this config). ``schemas`` is a
     source allowlist of schema names inside the connected database; empty
-    means every non-system schema the user can see. ``dev_schema`` is where
-    dbt dev builds write, and is refused as a source so reads and writes
-    never share a schema. ``rpu_price_usd`` is the region-specific dollar
-    price of one RPU-hour; set it to see dollar figures next to the RPU
-    translation (it varies by region and contract, so dex never guesses).
-    There is no sampled-profiling threshold: Redshift has no TABLESAMPLE, so
-    the budget is the only bound on profiling cost.
+    means every non-system schema the user can see. ``dev`` is where
+    dbt dev builds write (#1541), spelled as a schema; ``dev_schema`` is
+    accepted as an alias. Reads and writes never share a schema.
+    ``rpu_price_usd`` is the region-specific dollar price of one RPU-hour;
+    set it to see dollar figures next to the RPU translation (it varies by
+    region and contract, so dex never guesses). There is no
+    sampled-profiling threshold: Redshift has no TABLESAMPLE, so the budget
+    is the only bound on profiling cost.
     """
 
     workgroup: str | None = None
@@ -333,6 +495,8 @@ class RedshiftTarget(BaseModel):
     dbname: str | None = None
     user: str | None = None
     schemas: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as a schema.
+    dev: str | None = None
     dev_schema: str | None = None
     #: Where this project's models build in production (#1462), spelled as a schema.
     #: Not a source allowlist: dex reads only its catalog metadata (names, row
@@ -342,9 +506,32 @@ class RedshiftTarget(BaseModel):
     rpu_price_usd: float | None = None
 
     @model_validator(mode="after")
-    def _check_prod(self) -> RedshiftTarget:
-        self.prod = check_prod("redshift", self.prod, self.dev_schema)
+    def _check_dev_and_prod(self) -> RedshiftTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = "dev_schema" in self.model_fields_set
+        if dev_set and alias_set:
+            raise ValueError(
+                "redshift.dev and redshift.dev_schema cannot both be set; "
+                "keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("redshift", self.dev)
+            object.__setattr__(self, "dev_schema", self.dev)
+        elif self.dev_schema is not None:
+            stripped = self.dev_schema.strip() if self.dev_schema else None
+            object.__setattr__(self, "dev", stripped)
+        self.prod = check_prod("redshift", self.prod, self.dev)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        has_alias = "dev_schema" in self.model_fields_set
+        if name == "dev_schema" and not (
+            "dev" in self.model_fields_set and not has_alias
+        ):
+            object.__setattr__(self, "dev", value)
+        elif name == "dev":
+            object.__setattr__(self, "dev_schema", value)
 
 
 class ClickHouseTarget(BaseModel):
@@ -355,9 +542,9 @@ class ClickHouseTarget(BaseModel):
 
     ClickHouse namespaces are two-part, ``database.table``: there is no
     catalog level, and dbt-clickhouse's ``schema:`` *is* the ClickHouse
-    database. So ``databases`` is the source allowlist and ``dev_database``
-    is where dbt dev builds write, refused as a source so reads and writes
-    never share a database.
+    database. So ``databases`` is the source allowlist and ``dev`` is where
+    dbt dev builds write (#1541), spelled as a database; ``dev_database`` is
+    accepted as an alias. Reads and writes never share a database.
 
     ``deployment`` declares which ClickHouse this is, and is a cost decision
     rather than a connection one. Self-hosted bills no currency, so dex
@@ -379,6 +566,8 @@ class ClickHouseTarget(BaseModel):
     user: str | None = None
     secure: bool | None = None
     databases: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as a database.
+    dev: str | None = None
     dev_database: str | None = None
     #: Where this project's models build in production (#1462), spelled as a
     #: database. Not a source allowlist: dex reads only its catalog metadata (names,
@@ -412,9 +601,32 @@ class ClickHouseTarget(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_prod(self) -> ClickHouseTarget:
-        self.prod = check_prod("clickhouse", self.prod, self.dev_database)
+    def _check_dev_and_prod(self) -> ClickHouseTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = "dev_database" in self.model_fields_set
+        if dev_set and alias_set:
+            raise ValueError(
+                "clickhouse.dev and clickhouse.dev_database cannot both be set; "
+                "keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("clickhouse", self.dev)
+            object.__setattr__(self, "dev_database", self.dev)
+        elif self.dev_database is not None:
+            stripped = self.dev_database.strip() if self.dev_database else None
+            object.__setattr__(self, "dev", stripped)
+        self.prod = check_prod("clickhouse", self.prod, self.dev)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        has_alias = "dev_database" in self.model_fields_set
+        if name == "dev_database" and not (
+            "dev" in self.model_fields_set and not has_alias
+        ):
+            object.__setattr__(self, "dev", value)
+        elif name == "dev":
+            object.__setattr__(self, "dev_database", value)
 
 
 #: The host suffix every Starburst Galaxy cluster is reached under. Matched only
@@ -434,9 +646,10 @@ class TrinoTarget(BaseModel):
     postgresql), so ``catalogs`` is the source allowlist with entries
     ``catalog`` or ``catalog.schema``; empty means every catalog the identity
     can see except ``system``. dex never sets a session catalog or schema.
-    ``dev_catalog``/``dev_schema`` are where dbt dev builds write, refused as a
-    source so reads and writes never share a schema. dbt creates the schema but
-    never the catalog, so ``dev_catalog`` must already exist and be writable.
+    ``dev`` is where dbt dev builds write (#1541), spelled as ``catalog.schema``;
+    ``dev_catalog``/``dev_schema`` are accepted as aliases. Reads and writes
+    never share a schema. dbt creates the schema but never the catalog, so
+    the dev catalog must already exist and be writable.
 
     ``deployment`` declares which Trino this is, and is a cost decision rather
     than a connection one. ``self_hosted`` (Trino, Starburst Enterprise, Trino
@@ -458,6 +671,8 @@ class TrinoTarget(BaseModel):
     user: str | None = None
     http_scheme: str | None = None
     catalogs: list[str] = Field(default_factory=list)
+    #: Where this project's models build in dev (#1541), spelled as ``catalog.schema``.
+    dev: str | None = None
     dev_catalog: str | None = None
     dev_schema: str | None = None
     #: Where this project's models build in production (#1462), spelled as
@@ -501,10 +716,44 @@ class TrinoTarget(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_prod(self) -> TrinoTarget:
-        dev = _pair(self.dev_catalog, self.dev_schema)
-        self.prod = check_prod("trino", self.prod, dev)
+    def _check_dev_and_prod(self) -> TrinoTarget:
+        dev_set = "dev" in self.model_fields_set
+        alias_set = (
+            "dev_catalog" in self.model_fields_set
+            or "dev_schema" in self.model_fields_set
+        )
+        if dev_set and alias_set:
+            raise ValueError(
+                "trino.dev and trino.dev_catalog/dev_schema cannot both be set; "
+                "keep whichever you prefer and remove the other"
+            )
+        if self.dev is not None:
+            self.dev = check_dev("trino", self.dev)
+            cat, schema = self.dev.split(".", 1)
+            object.__setattr__(self, "dev_catalog", cat)
+            object.__setattr__(self, "dev_schema", schema)
+        elif self.dev_catalog and self.dev_schema:
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+        self.prod = check_prod("trino", self.prod, self.dev)
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        has_alias = (
+            "dev_catalog" in self.model_fields_set
+            or "dev_schema" in self.model_fields_set
+        )
+        if (
+            name in ("dev_catalog", "dev_schema")
+            and not ("dev" in self.model_fields_set and not has_alias)
+            and self.dev_catalog
+            and self.dev_schema
+        ):
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+        elif name == "dev" and isinstance(value, str) and "." in value:
+            cat, sc = value.split(".", 1)
+            object.__setattr__(self, "dev_catalog", cat)
+            object.__setattr__(self, "dev_schema", sc)
 
 
 class QueryLimits(BaseModel):
