@@ -6,6 +6,7 @@ these tests feed the engine one by hand and hold it to the spelling a plan uses.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -78,10 +79,7 @@ def test_a_windows_manifest_fills_the_branch_with_plan_paths():
     assert compiled_tree.macro_callers(branch, "p") == {"macros/helper.sql": ["rpt"]}
 
 
-@pytest.mark.skipif(
-    subprocess.run(["git", "--version"], capture_output=True).returncode != 0,  # noqa: S607
-    reason="git is not installed",
-)
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 def test_a_crlf_file_at_head_reads_as_the_project_reads_it(tmp_path: Path):
     def git(*args: str) -> None:
         subprocess.run(  # noqa: S603
