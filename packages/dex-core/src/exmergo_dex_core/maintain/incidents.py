@@ -558,11 +558,14 @@ def _walk(
             if not _counts_as_pass(observation, failed, counted):
                 continue
             current.streak += 1
-            if current.streak >= threshold:
+            if current.streak >= threshold and current.closed_by is None:
                 current.closed_by = observation
-                built.append(current)
-                current = None
-                seen_good = True
+        # Close after the run, so the closing run's other rows (another test
+        # carrying the claim, another source's evidence) stay on it.
+        if current is not None and current.closed_by is not None:
+            built.append(current)
+            current = None
+            seen_good = True
     if current is not None:
         built.append(current)
     return built

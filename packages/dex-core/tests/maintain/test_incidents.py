@@ -142,6 +142,47 @@ def test_every_failing_row_in_one_run_stays_on_the_incident() -> None:
         assert incident.severity == "error"
 
 
+def test_the_closing_runs_other_test_stays_on_the_incident() -> None:
+    series = [
+        _obs(1, "bad", test="test.a"),
+        _obs(2, "good", test="test.a"),
+        _obs(2, "good", test="test.b"),
+    ]
+    (incident,) = fold_incidents(series, close_after=1, now=_now(2)).incidents
+    assert incident.state == "closed"
+    assert incident.closed_by.run == "inv-2"
+    assert incident.tests == ("test.a", "test.b")
+    assert len(incident.observations) == 3
+
+
+def test_a_duplicate_pass_in_the_closing_run_stays_on_the_incident() -> None:
+    series = [_obs(1, "bad"), _obs(2, "good"), _obs(3, "good"), _obs(3, "good")]
+    (incident,) = fold_incidents(series, now=_now(3)).incidents
+    assert incident.state == "closed"
+    assert incident.closed_by.run == "inv-3"
+    assert [o.run for o in incident.observations] == [
+        "inv-1",
+        "inv-2",
+        "inv-3",
+        "inv-3",
+    ]
+
+
+def test_another_sources_pass_in_the_closing_run_is_evidence() -> None:
+    series = [
+        _obs(1, "bad", source=DBT),
+        _obs(2, "good", source=DBT),
+        _obs(2, "good", source=ELEMENTARY),
+    ]
+    (incident,) = fold_incidents(series, close_after=1, now=_now(2)).incidents
+    assert incident.state == "closed"
+    assert [(o.source, o.evidence) for o in incident.observations] == [
+        (DBT, False),
+        (DBT, False),
+        (ELEMENTARY, True),
+    ]
+
+
 def test_a_run_that_failed_is_not_also_counted_as_a_pass() -> None:
     series = [_obs(1, "bad"), _obs(2, "bad"), _obs(2, "good"), _obs(3, "good")]
     fold = fold_incidents(series, now=_now(3))
