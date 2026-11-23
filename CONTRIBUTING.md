@@ -510,7 +510,7 @@ DEX_CUBE_PG_PORT=<published port> scripts/setup_cube_dev.sh --execute --db postg
 scripts/setup_clickhouse_dev.sh          # for the ClickHouse cases
 scripts/setup_cube_dev.sh --db clickhouse
 scripts/setup_trino_dev.sh               # for the Trino cases
-cp -r scripts/cube/model /tmp/cube-trino-model
+rm -rf /tmp/cube-trino-model && cp -r scripts/cube/model /tmp/cube-trino-model
 perl -pi -e 's/sql_table: app\./sql_table: memory.app./' /tmp/cube-trino-model/cubes/*.yml
 scripts/setup_cube_dev.sh --db trino --model /tmp/cube-trino-model
 source ~/.cache/dex-dogfood/cube.env
