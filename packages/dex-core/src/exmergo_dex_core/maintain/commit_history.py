@@ -103,8 +103,10 @@ class GitHistory:
     Answers to :meth:`resolve` and :meth:`is_ancestor` are kept for the life
     of the instance, since the history they read does not change under one
     read; build a new instance to read a checkout again. The first time
-    ``git`` cannot answer at all, every later call fails the same way at once
-    rather than waiting on ``git`` again.
+    ``git`` cannot be reached at all (no repository, no ``git``, a timeout),
+    every later call, cached or not, fails the same way at once rather than
+    waiting on ``git`` again. A single command that fails is reported for that
+    call only.
 
     In a shallow clone a boundary commit has no recorded parents, so a
     negative ancestry answer, or a range that reaches the boundary, may be an
@@ -129,9 +131,12 @@ class GitHistory:
         self._failure = HistoryUnreadableError(message)
         return self._failure
 
-    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def _raise_if_failed(self) -> None:
         if self._failure is not None:
             raise self._failure
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        self._raise_if_failed()
         env = dict(os.environ)
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_OPTIONAL_LOCKS"] = "0"
@@ -178,6 +183,7 @@ class GitHistory:
 
     def resolve(self, commit: str) -> str | None:
         name = _held(commit)
+        self._raise_if_failed()
         if name in self._resolved:
             return self._resolved[name]
         self._repository()
@@ -188,12 +194,13 @@ class GitHistory:
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         older, newer = _held(ancestor), _held(descendant)
+        self._raise_if_failed()
         held = self._ancestry.get((older, newer))
         if held is None:
             self._repository()
             done = self._git("merge-base", "--is-ancestor", older, newer)
             if done.returncode not in (0, 1):
-                raise self._fail("merge-base failed")
+                raise HistoryUnreadableError("merge-base failed")
             held = self._ancestry[(older, newer)] = done.returncode == 0
         if not held and self._boundary:
             raise HistoryUnreadableError(
@@ -204,12 +211,13 @@ class GitHistory:
 
     def independent(self, commits: Sequence[str]) -> tuple[str, ...]:
         names = list(dict.fromkeys(_held(c) for c in commits))
+        self._raise_if_failed()
         if len(names) <= 1:
             return tuple(names)
         self._repository()
         done = self._git("merge-base", "--independent", *names)
         if done.returncode != 0:
-            raise self._fail("merge-base failed")
+            raise HistoryUnreadableError("merge-base failed")
         kept = set(done.stdout.split())
         return tuple(n for n in names if n in kept)
 
@@ -222,11 +230,11 @@ class GitHistory:
         spec = [head, "--not", *excluded] if excluded else [head]
         counted = self._git("rev-list", "--count", *spec)
         if counted.returncode != 0:
-            raise self._fail("rev-list failed")
+            raise HistoryUnreadableError("rev-list failed")
         try:
             count = int(counted.stdout.strip() or "0")
         except ValueError:
-            raise self._fail("rev-list failed") from None
+            raise HistoryUnreadableError("rev-list failed") from None
         if count == 0:
             return (), count
         # In a shallow clone, list the whole range: a boundary commit inside
@@ -236,7 +244,7 @@ class GitHistory:
             return (), count
         listed = self._git("rev-list", "--topo-order", *listing, *spec)
         if listed.returncode != 0:
-            raise self._fail("rev-list failed")
+            raise HistoryUnreadableError("rev-list failed")
         every = [s for s in listed.stdout.split() if _COMMIT.fullmatch(s)]
         if self._boundary.intersection(every):
             raise HistoryUnreadableError(

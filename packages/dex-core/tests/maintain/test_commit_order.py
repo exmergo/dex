@@ -587,3 +587,34 @@ def test_git_answers_are_kept_and_an_unreadable_history_fails_fast(
         with pytest.raises(HistoryUnreadableError):
             nowhere.resolve(A)
     assert len(calls) == 1
+
+
+def test_a_cached_answer_does_not_outlive_an_unreachable_git(
+    repo: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git = GitHistory(repo["root"])
+    assert git.resolve(repo["b"]) == repo["b"]
+    assert git.is_ancestor(repo["a"], repo["b"])
+
+    def unreachable(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="git", timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", unreachable)
+    with pytest.raises(HistoryUnreadableError):
+        git.between(repo["b"], [repo["a"]], 10)
+    for call in (
+        lambda: git.resolve(repo["b"]),
+        lambda: git.is_ancestor(repo["a"], repo["b"]),
+        lambda: git.independent([repo["a"]]),
+    ):
+        with pytest.raises(HistoryUnreadableError):
+            call()
+
+
+def test_one_failing_command_does_not_mark_the_history_unreadable(
+    repo: dict[str, str],
+) -> None:
+    git = GitHistory(repo["root"])
+    with pytest.raises(HistoryUnreadableError):
+        git.between("0" * 40, [], 10)  # an object the repository lacks
+    assert git.resolve(repo["b"]) == repo["b"]
