@@ -881,7 +881,7 @@ column gives neither. Dex chooses no training setting (sensitivity,
 `days_back`, seasonality stay the package's defaults). A monitor is written
 only where the package is installed (or the same plan adds it) and where the
 repository's `dbt_project.yml` enables it on the production target: its
-`models: elementary: +enabled` is read with `target.name` replaced by the
+`models: elementary: +enabled` (else a root `models: +enabled`) is read with `target.name` replaced by the
 committed `dbt_prod_target`, and a value Dex cannot evaluate, or a per-target
 test with no `dbt_prod_target`, reads `unknown`. Disabled or unknown, nothing is
 written and a warning says which. A monitor the project wrote by hand (the same
@@ -1111,7 +1111,8 @@ them.
   interval, one lifecycle rule, no value from the data), and the coverage
   timeline they are laid on (a named heartbeat, every unobserved interval and
   its reason, a subject's last verified run, and the break a diagnosis
-  bisects): `references/incidents.md`.
+  bisects, with the commits it spans read from the repository's history rather
+  than from run order): `references/incidents.md`.
 - Running the lifecycle across more than one process (a plan a second
   process can carry and check, what it depends on, what its edits contain,
   and what a build established): `references/host-integration.md`.

@@ -7,12 +7,15 @@ time a source recorded. :mod:`.incidents` folds them into incidents and
 here, so an adapter builds one set of records for both.
 
 No value crosses: each model declares ids, statuses, a severity token, times
-and a commit, and refuses any other field.
+and a commit, and refuses any other field. A commit is a hexadecimal object
+name and nothing else (:data:`COMMIT_PATTERN`): it is read from a warehouse
+row, and it reaches ``git`` when a break's commit range is read (#1467).
 """
 
 from __future__ import annotations
 
 import itertools
+import re
 import statistics
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -30,6 +33,17 @@ UNKNOWN: Literal["unknown"] = "unknown"
 #: did not run (``edr_cli_run``, or the package disabled for the run), or they
 #: ran with the test-results upload off (``disable_tests_results``).
 RunUnobserved = Literal["hooks_off", "uploads_off"]
+
+#: Where a run's commit came from (#1467): the invocation's own ``git_sha``,
+#: else the commit the orchestrator records for the run, else ``unknown``.
+CommitBasis = Literal["git_sha", "orchestrator", "unknown"]
+
+#: A commit as a source records it: an abbreviated or full hexadecimal object
+#: name (SHA-1 or SHA-256). Anything else is refused, so a commit can carry no
+#: value and can never be read by ``git`` as an option or a revision expression.
+COMMIT_PATTERN = r"^[0-9a-fA-F]{4,64}$"
+
+_COMMIT = re.compile(COMMIT_PATTERN)
 
 #: Fewest dated points a schedule is derived from (two gaps).
 MIN_SCHEDULE_POINTS = 3
@@ -99,7 +113,8 @@ class Observation(Value):
     run: str = Field(min_length=1, max_length=128)
     sequence: int
     at: datetime | None = None
-    commit: str | None = Field(default=None, max_length=64)
+    #: The commit the run's invocation records (``git_sha``), or ``None``.
+    commit: str | None = Field(default=None, pattern=COMMIT_PATTERN)
     #: In the source's own words, never mapped onto a Dex scale.
     severity: str | None = Field(default=None, pattern=SEVERITY_PATTERN)
 
@@ -108,15 +123,21 @@ class RunRef(Value):
     """One run a source holds, whether or not it observed a given subject.
 
     ``commit`` is the commit the run's invocation records (``git_sha``), or
-    ``None`` where it records none. ``unobserved`` says the run happened and
-    recorded no test outcome, and why; a run whose source recorded outcomes
-    leaves it ``None``.
+    ``None`` where it records none. ``orchestrator_commit`` is the commit the
+    orchestrator records for the same run (a dbt Cloud run's ``git_sha``, a
+    GitHub Actions run's ``head_sha``), which the adapter that matched the two
+    runs supplies; it is read only where ``commit`` is ``None``
+    (:func:`resolve_commit`). On the orchestrator heartbeat there is no
+    invocation, so the orchestrator's commit goes in ``orchestrator_commit``.
+    ``unobserved`` says the run happened and recorded no test outcome, and
+    why; a run whose source recorded outcomes leaves it ``None``.
     """
 
     run: str = Field(min_length=1, max_length=128)
     sequence: int
     at: datetime | None = None
-    commit: str | None = Field(default=None, max_length=64)
+    commit: str | None = Field(default=None, pattern=COMMIT_PATTERN)
+    orchestrator_commit: str | None = Field(default=None, pattern=COMMIT_PATTERN)
     unobserved: RunUnobserved | None = None
 
 
@@ -126,6 +147,36 @@ class ObservedPoint(Value):
     run: str
     at: datetime | None = None
     source: str
+
+
+def normalize_commit(text: object) -> str | None:
+    """A commit as a source spelled it, lowercased, or ``None`` where it is not
+    a hexadecimal object name (empty, ``NULL``, a branch name, free text).
+
+    For adapters: a row's ``git_sha`` goes through this before it reaches a
+    :class:`RunRef` or an :class:`Observation`, so a malformed one reads
+    ``unknown`` rather than refusing the whole read.
+    """
+
+    if not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    if not _COMMIT.fullmatch(candidate):
+        return None
+    return candidate.lower()
+
+
+def resolve_commit(
+    commit: str | None, orchestrator_commit: str | None = None
+) -> tuple[str, CommitBasis]:
+    """The commit of a run and where it came from: the invocation's
+    ``git_sha``, else the orchestrator's, else ``unknown`` (#1467)."""
+
+    if commit:
+        return commit, "git_sha"
+    if orchestrator_commit:
+        return orchestrator_commit, "orchestrator"
+    return UNKNOWN, "unknown"
 
 
 def utc(moment: datetime) -> datetime:

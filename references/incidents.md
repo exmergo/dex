@@ -138,7 +138,7 @@ alone starts `unknown`.
 | `severity` | the latest failure's severity, in the source's own words, never mapped onto a dex scale |
 | `opening_source` | the source whose observation opened the incident |
 | `coverage` | the opening source's timeline from the first failure to the close (or its latest run): `heartbeat`, the run series it was laid on, and `segments`, each `observed_good`, `observed_bad` or `unobserved`, an unobserved one with its `reason` and a `missed` segment with the runs the schedule expected in it |
-| `onset` | where the check broke: `after` the last observed-good run before the first failure (or `unknown`), `through` that failure, each with its `run`, `sequence`, `at` and `commit`, and the unobserved runs, missed runs and reasons between them |
+| `onset` | where the check broke: `after` the last observed-good run before the first failure (or `unknown`), `through` that failure, each with its `run`, `sequence`, `at`, `commit` and `commit_basis`, the unobserved runs, missed runs and reasons between them, and `commits`, the commit range read from the repository's history (`null` where no history was passed) |
 | `retention_bound` | per source, the oldest point it still holds, as read at call time, or `unknown` |
 | `state` | `open`, `closed` or `no_longer_observed` |
 | `closed_by` | on a closed incident, the pass that closed it |
@@ -200,11 +200,67 @@ A declared schedule has no floor.
 
 ### Order and commits
 
-Runs are ordered by invocation, never by clock. Each run carries the commit its
-invocation records (`git_sha` in Elementary's invocations table), or `unknown`
-where it records none. Elementary fills `git_sha` only from `DBT_GIT_SHA`,
-`DBT_CLOUD_GIT_SHA` or `GITHUB_SHA`, so it is `unknown` under most other
-orchestrators. Ordering by commit where the two orders disagree is a later step.
+Runs are ordered by invocation, never by clock. Each run carries its commit and
+where that commit came from, in this order:
+
+1. `git_sha`: the commit the run's invocation records (in Elementary's
+   invocations table). Elementary fills it only from `DBT_GIT_SHA`,
+   `DBT_CLOUD_GIT_SHA` or `GITHUB_SHA`, so it is empty under most other
+   orchestrators.
+2. `orchestrator`: the commit the orchestrator records for the same run, where
+   it records one. The adapter that reads the orchestrator's run history matches
+   its run to the invocation and supplies the commit. Orchestrators that record
+   one per run include dbt Cloud (each run's `git_sha`), GitHub Actions (each
+   workflow run's `head_sha`), GitLab CI (each pipeline's `sha`) and Airflow 3
+   with a Git Dag bundle (each Dag run's bundle version, the commit it ran).
+   Dagster+ exposes the commit to the run as `DAGSTER_CLOUD_GIT_SHA`, which a
+   project can pass on as `DBT_GIT_SHA`, so it reaches `git_sha` instead.
+3. `unknown`: neither records one.
+
+A commit is a hexadecimal object name and nothing else. One spelled any other
+way (a branch name, free text) is read as `unknown`, so a commit can carry no
+value from the data and is never read by `git` as an option.
+
+### The commits a break spans
+
+Runs and commits can disagree. A commit can be deployed days after it was made, a
+rollback runs an older commit after a newer one, and two branches can deploy in
+turn. A commit range read off run order alone can then name commits that never
+ran in it. So, given the repository's history, a break also carries `commits`:
+the commits read from that history, never from the runs in between. Without a
+history to read, `commits` is `null`.
+
+The range ends at the first failing run's commit. It starts at every earlier
+passing commit that is an ancestor of it, as `git bisect` would take them: the
+range is the commits the failing commit has that none of those passing commits
+has. A passing run whose commit descends from the failing one (a rollback, or a
+branch deployed in turn) bounds nothing, so it is left out rather than read as
+the start of the range, and `run_order` says `disagrees`. Deployed in the order
+A, C, B, where B introduced the failure and C fixed it, the range is A to B, and
+C is not in it; deployed in the order A, B, C it is the same range, with
+`run_order: agrees`.
+
+| `status` | What it means |
+| --- | --- |
+| `ordered` | the range is read from history: `after` (the passing commits that bound it), `commits` (newest first, at most 50) and `count` |
+| `same_commit` | the failing commit itself passed in an earlier run: no commit is in the range, so the change is not in the code |
+| `not_ordered` | the last passing run's commit and the failing one are on diverged branches (`reason: diverged`): which side changed is not known, so no range is given |
+| `unknown` | with a `reason`: `commit_unknown` or `commit_not_in_history` (with the `side`, `after` or `through`, that lacks one), `no_prior_pass`, `no_good_ancestor` (every earlier pass descends from the failure), `history_shallow` (a shallow clone cut the history the answer needs), or `history_unreadable` |
+
+Each end names its run and where its commit came from (`git_sha`,
+`orchestrator` or `unknown`), and `last_good_run` is always the last passing run
+in invocation order, whether or not it bounds the range. `unplaced_good_runs`
+counts earlier passes whose commit is unknown or not in the history: each could
+only narrow the range. A shallow clone holds only part of the history: a commit
+older than its depth reads `commit_not_in_history`, and where the clone's cut could
+hide an ancestry (a commit that is not an ancestor in the clone may be one in the
+repository) or shorten the range, it reads `history_shallow` rather than
+`not_ordered` or a short range.
+
+The history is read through `exmergo_dex_core.maintain.commit_history`:
+`GitHistory` asks `git` in a local checkout, read-only and one call at a time
+with no shell, keeping its answers for the life of the reader, and `MappedHistory` holds a commit graph in memory for a host with
+no checkout.
 
 ### A subject's history
 

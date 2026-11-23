@@ -31,6 +31,8 @@ Each incident's ``coverage`` and ``onset`` are read off its opening source's
 coverage timeline (:mod:`.timeline`, #1466), so a missed run, a run with the
 package's hooks or uploads off and a run that did not check the test each read
 unobserved, with the reason, and the onset is the break a diagnosis bisects.
+Given the repository's history (:mod:`.commit_history`), the onset also carries
+the commits it spans, read from that history rather than from run order (#1467).
 
 Three states, never two: an interval is observed good, observed bad, or
 unobserved, and nothing here reads an unobserved one as good. An incident's
@@ -56,9 +58,11 @@ from typing import Literal
 from pydantic import Field
 
 from ..errors import DexError
+from .commit_history import CommitHistory, GitHistory, MappedHistory
 from .observations import (
     SOURCE_PATTERN,
     UNKNOWN,
+    CommitBasis,
     Observation,
     ObservedPoint,
     Outcome,
@@ -72,6 +76,8 @@ from .observations import (
 from .observations import Value as _Value
 from .timeline import (
     Break,
+    CommitRange,
+    CommitRef,
     Heartbeat,
     HeartbeatBasis,
     Timeline,
@@ -273,6 +279,7 @@ def fold_incidents(
     stale_after_gaps: float = DEFAULT_STALE_AFTER_GAPS,
     stale_floor_seconds: float = DEFAULT_STALE_FLOOR_SECONDS,
     timelines: Mapping[str, Timeline] | None = None,
+    history: CommitHistory | None = None,
 ) -> IncidentFold:
     """Fold observed outcomes into incidents by the one lifecycle rule.
 
@@ -286,7 +293,9 @@ def fold_incidents(
     incident's coverage on its opening source's timeline (#1466), so a missed
     run, a run with hooks or uploads off and a run that did not check the test
     each read unobserved with their reason; a source with no timeline gets one
-    built from the runs it names, with no named heartbeat.
+    built from the runs it names, with no named heartbeat. ``history`` is the
+    repository's commit history: with it, each incident's ``onset`` carries the
+    commits it spans (#1467); without it, ``onset.commits`` is ``None``.
 
     The order of ``sources`` is the precedence between them: where two sources
     fail in the run that opens an incident, the one named first opens it. A tie
@@ -337,14 +346,16 @@ def fold_incidents(
     runs_by_source = _runs_by_source(observed, histories)
     for name, runs in runs_by_source.items():
         if name not in laid:
-            history = histories.get(name)
-            named = history is not None and bool(history.runs)
+            held_history = histories.get(name)
+            named = held_history is not None and bool(held_history.runs)
             basis: HeartbeatBasis = "source_runs" if named else "observations"
             laid[name] = build_timeline(
                 name,
                 Heartbeat(basis=basis, runs=tuple(runs)),
                 observed,
-                retention_bound=None if history is None else history.retention_bound,
+                retention_bound=(
+                    None if held_history is None else held_history.retention_bound
+                ),
             )
     schedules = {
         name: _schedule([run.at for run in runs], name, "source", allowance)
@@ -386,6 +397,7 @@ def fold_incidents(
                         current,
                         moment,
                         allowance,
+                        history,
                     ),
                 )
             )
@@ -582,6 +594,7 @@ def _incident(
     current: set[Subject] | None,
     moment: datetime,
     allowance: _Allowance,
+    history: CommitHistory | None = None,
 ) -> Incident:
     subject, signal = key
     opener = built.opening.source
@@ -613,7 +626,7 @@ def _incident(
             timeline, by_source.get(opener, []), built.opening.sequence, end_sequence
         ),
     )
-    onset = place_break(timeline, items, built.opening.sequence)
+    onset = place_break(timeline, items, built.opening.sequence, history=history)
 
     state: State = "closed" if built.closed_by is not None else "open"
     ended_reason: Literal["removed", "stale"] | None = None
@@ -721,7 +734,16 @@ def _heartbeat_runs(timeline: Timeline) -> tuple[RunRef, ...]:
             run=entry.run,
             sequence=entry.sequence,
             at=entry.at,
-            commit=None if entry.commit in (None, UNKNOWN) else entry.commit,
+            commit=(
+                entry.commit
+                if entry.commit_basis == "git_sha" and entry.commit != UNKNOWN
+                else None
+            ),
+            orchestrator_commit=(
+                entry.commit
+                if entry.commit_basis == "orchestrator" and entry.commit != UNKNOWN
+                else None
+            ),
             unobserved=_run_unobserved(entry.reason),
         )
         for entry in timeline.entries
@@ -764,13 +786,19 @@ __all__ = [
     "DEFAULT_STALE_FLOOR_SECONDS",
     "UNKNOWN",
     "Break",
+    "CommitBasis",
+    "CommitHistory",
+    "CommitRange",
+    "CommitRef",
     "Coverage",
     "CoverageSegment",
     "FoldInputCode",
     "FoldInputError",
+    "GitHistory",
     "Incident",
     "IncidentFold",
     "IncidentObservation",
+    "MappedHistory",
     "Observation",
     "ObservedPoint",
     "Outcome",
