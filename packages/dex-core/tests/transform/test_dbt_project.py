@@ -18,6 +18,7 @@ from exmergo_dex_core.dbt_project import (
     EditOp,
     content_hash,
     definitions,
+    discover_projects,
     find_project,
     jinja_calls,
     jinja_regions,
@@ -89,6 +90,126 @@ def test_find_project_missing_is_an_error(tmp_path: Path):
     empty.mkdir()
     with pytest.raises(DbtProjectError):
         find_project(empty)
+
+
+def _write_project(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "dbt_project.yml").write_text(
+        "name: dex_test\nversion: '1.0'\nprofile: dex_test\n", encoding="utf-8"
+    )
+    return path
+
+
+def test_find_project_refuses_shallow_project_over_deeper_one(tmp_path: Path):
+    # Issue #589: an example project one level down used to win silently over
+    # the real project two levels down, because discovery never looked deeper.
+    _write_project(tmp_path / "examples")
+    _write_project(tmp_path / "transform" / "dbt")
+    with pytest.raises(DbtProjectError) as excinfo:
+        find_project(tmp_path)
+    message = str(excinfo.value)
+    assert "multiple dbt projects" in message
+    assert "examples" in message
+    assert "transform/dbt" in message
+    assert "dbt_project_dir" in message
+
+
+def test_find_project_finds_only_deep_project(tmp_path: Path):
+    deep = _write_project(tmp_path / "transform" / "dbt")
+    assert find_project(tmp_path) == deep
+
+
+def test_discover_projects_skips_tooling_directories(tmp_path: Path):
+    # Directories dbt and Python tooling create hold copies of other projects
+    # (dependency packages, build output, virtual environments); they are not
+    # projects of this repository.
+    for rel in ("dbt_packages/dep", "target", ".venv/v", "node_modules/pkg"):
+        _write_project(tmp_path / rel)
+    assert discover_projects(tmp_path) == []
+    with pytest.raises(DbtProjectError, match="no dbt project found"):
+        find_project(tmp_path)
+
+
+def test_discover_projects_does_not_descend_into_a_project(tmp_path: Path):
+    # A project owns its subtree: a project nested inside another one does not
+    # make the outer one ambiguous.
+    outer = _write_project(tmp_path / "examples")
+    _write_project(tmp_path / "examples" / "nested" / "demo")
+    assert discover_projects(tmp_path) == [outer]
+    assert find_project(tmp_path) == outer
+
+
+def test_discover_projects_is_bounded_in_depth(tmp_path: Path):
+    deep = _write_project(tmp_path / "a" / "b" / "c" / "d")
+    assert discover_projects(tmp_path) == [deep]
+    # A project five levels down is past the search bound, so on its own it is
+    # not discovered at all.
+    beyond = tmp_path / "beyond"
+    _write_project(beyond / "a" / "b" / "c" / "d" / "e")
+    assert discover_projects(beyond) == []
+
+
+def test_discover_projects_finds_symlinked_project_directory(
+    tmp_path: Path, tmp_path_factory: pytest.TempPathFactory, symlinks
+):
+    # CodeRabbit on #1438: os.walk never descends into a symlinked directory,
+    # so the deeper search missed a project reached through one, where the
+    # scan before it (iterdir) found it. The linked project lives outside the
+    # searched root, so the only way it is found is through the symlink itself.
+    target = _write_project(tmp_path_factory.mktemp("linked") / "project")
+    _write_project(tmp_path / "examples")
+    (tmp_path / "production").symlink_to(target, target_is_directory=True)
+    assert discover_projects(tmp_path) == [
+        tmp_path / "examples",
+        tmp_path / "production",
+    ]
+    with pytest.raises(DbtProjectError, match="multiple dbt projects"):
+        find_project(tmp_path)
+
+
+def test_discover_projects_ignores_dangling_project_marker(tmp_path: Path, symlinks):
+    # CodeRabbit on #1438: os.walk lists a dangling dbt_project.yml symlink in
+    # filenames, so the deeper search counted its directory as a project and
+    # reported false ambiguity, where the scan before it (is_file) did not.
+    _write_project(tmp_path / "analytics")
+    broken = tmp_path / "examples"
+    broken.mkdir()
+    (broken / "dbt_project.yml").symlink_to(tmp_path / "missing.yml")
+    assert discover_projects(tmp_path) == [tmp_path / "analytics"]
+    assert find_project(tmp_path) == tmp_path / "analytics"
+
+
+def test_discover_projects_deduplicates_a_symlinked_alias(tmp_path: Path, symlinks):
+    # CodeRabbit on #1438: a symlink alias of a project (production ->
+    # transform/dbt) made the same directory two candidates, so find_project
+    # refused a layout the scan before this PR resolved to one candidate.
+    # Two paths to one directory are one project.
+    real = _write_project(tmp_path / "transform" / "dbt")
+    (tmp_path / "production").symlink_to(real, target_is_directory=True)
+    found = discover_projects(tmp_path)
+    assert len(found) == 1
+    assert found[0].resolve() == real.resolve()
+    assert find_project(tmp_path).resolve() == real.resolve()
+
+
+def test_discover_projects_reports_a_root_project_with_a_deeper_one(
+    tmp_path: Path,
+):
+    # CodeRabbit on #1438: a project at the repository root used to hide the
+    # projects below it, the same shallow-hides-deeper shape as #589 at depth
+    # zero. The root is reported together with the deeper project.
+    _write_project(tmp_path)
+    deep = _write_project(tmp_path / "transform" / "dbt")
+    assert discover_projects(tmp_path) == [tmp_path, deep]
+    with pytest.raises(DbtProjectError, match="multiple dbt projects"):
+        find_project(tmp_path)
+
+
+def test_discover_projects_returns_only_the_root_project(tmp_path: Path):
+    # A repository whose only project is at the root behaves as before.
+    root = _write_project(tmp_path)
+    assert discover_projects(tmp_path) == [root]
+    assert find_project(tmp_path) == root
 
 
 def test_resolve_target_returns_only_name_and_type(dbt_project_dir: Path):
