@@ -1652,8 +1652,15 @@ default, or a filter or operator after it is refused. A key naming a location
   in `config.meta.tags`, the model in `config.tags` (both appended to tags
   already there), and adds `disable_samples_on_pii_tags: true` under `vars:` in
   `dbt_project.yml` as a `project_yml` edit, so the project's own tests keep no
-  sample of those columns. The tag is `pii`, or the first entry of the
-  project's `pii_tags` (a block scoped to `elementary` wins over the root).
+  sample of those columns. A plan that rewrites an existing model's SQL gets
+  the tags but not the switch (`withheld`, warned): a `dbt_project.yml` edit
+  would stop that rewrite's refactor comparison and downstream impact check,
+  and `transform declare` adds it in a plan of its own (`fields.pii_tags.switch`).
+  The tag is `pii`, or the first entry of the project's `pii_tags`, both vars
+  read as the project's own tests read them: a block keyed by the root
+  project's name wins over the global one, and a block keyed `elementary` is
+  not read. A `pii_tags` written as one string is warned, since some releases
+  (0.23.0 among them) match a model's tags against its characters.
   Written models are those whose SQL the plan writes, those it declares and
   those whose YAML entry it changes; `transform declare` proposes a model whose
   only owed change is the tag (`fields.pii_tags`). A `false` under `pii`,
@@ -1666,7 +1673,8 @@ default, or a filter or operator after it is refused. A key naming a location
   own included, keeps no sample of its failing rows, and another says where the
   installed release reads less. `data.pii_tags` holds `vendor`, `tag`,
   `tag_source` (`default`, `pii_tags`), `switch` (`var`, `status`: `added`,
-  `already_on`, `set_off_by_project`, `unread`, `not_written`; `path`),
+  `already_on`, `set_off_by_project`, `unread`, `withheld`, `not_written`;
+  `path`),
   `release`, `rule` (`none` before 0.19.2, `model_tags_only` from 0.19.2 to
   0.19.4, which read no column's `config.meta.tags`, `model_and_column_tags`
   from 0.20.0, `unknown`), `sampling`, `counts` and `models[]` (`model`,

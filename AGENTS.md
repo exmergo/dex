@@ -926,8 +926,12 @@ added by the plan), each column a written model's YAML marks as PII, under any
 key a reader accepts and at any confidence, gets the tag in
 `config.meta.tags`, the model gets it in `config.tags`, and the plan adds
 `disable_samples_on_pii_tags: true` under `vars:` in `dbt_project.yml` as a
-`project_yml` edit. The tag is `pii`, or the first entry of the project's own
-`pii_tags`. A written model is one whose SQL the plan writes, one it declares,
+`project_yml` edit, except in a plan that rewrites an existing model's SQL,
+where the switch is `withheld` (a `dbt_project.yml` edit would stop that
+rewrite's comparison and impact check) and a later `transform declare` adds it.
+The tag is `pii`, or the first entry of the project's own `pii_tags`; both vars
+are read as the project's tests read them, a block keyed by the root project's
+name winning over the global one. A written model is one whose SQL the plan writes, one it declares,
 or one whose YAML entry it changes, and `transform declare` proposes a model
 whose only owed change is the tag. A `false` a person wrote under a PII flag is
 never tagged, a column whose metadata sits under a top-level `meta` is

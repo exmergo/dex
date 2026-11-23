@@ -1039,9 +1039,16 @@ their YAML entry) so the project's own tests keep no sample of personal data:
   still keeps none for a test whose query names that column or selects `*`.
 - **The switch.** The plan adds `disable_samples_on_pii_tags: true` under
   `vars:` in `dbt_project.yml`, as a `project_yml` edit. A value the project
-  sets, at the root or in a block scoped to `elementary`, is kept and warned.
+  sets is kept and warned. A plan that rewrites an existing model's SQL gets
+  the tags without the switch (`withheld`): a `dbt_project.yml` edit would stop
+  that rewrite's refactor comparison and downstream impact check. Apply it,
+  then `transform declare <model>` adds the switch in a plan of its own.
 - **The tag.** `pii`, Elementary's default, or the first entry of the
-  project's own `pii_tags`.
+  project's own `pii_tags`. Elementary reads both vars while it runs the
+  project's test, so a block keyed by the root project's name wins over the
+  global one and a block keyed `elementary` is not read. Write `pii_tags` as a
+  list: some releases, 0.23.0 among them, match a model's tags against a single
+  string's characters, and a plan warns where it is one.
 
 A warning states the trade on every plan that tags a model. The release
 matters: before 0.19.2 the package has no such rule, and 0.19.2 to 0.19.4 read
@@ -1050,7 +1057,7 @@ a model's tags but no column's `config.meta.tags`.
 | Field of `data.pii_tags` | Meaning |
 |---|---|
 | `tag`, `tag_source` | the tag written; `default` or `pii_tags` |
-| `switch` | `var`, `path`, `status` (`added`, `already_on`, `set_off_by_project`, `unread`, `not_written`) |
+| `switch` | `var`, `path`, `status` (`added`, `already_on`, `set_off_by_project`, `unread`, `withheld`, `not_written`) |
 | `release`, `rule` | the installed release and what it does with the tags: `none`, `model_tags_only`, `model_and_column_tags`, `unknown` |
 | `sampling` | the sentence the warning states |
 | `counts` | columns per status |

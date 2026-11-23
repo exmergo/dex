@@ -49,8 +49,6 @@ DEFAULT_TAG = "pii"
 SWITCH = "disable_samples_on_pii_tags"
 #: Elementary's list of the tags that mark PII.
 TAGS_VAR = "pii_tags"
-#: The package name a package-scoped ``vars:`` block is keyed by.
-PACKAGE = "elementary"
 
 #: The first release with the switch and the model tag (read from the tags).
 SWITCH_SINCE = "0.19.2"
@@ -74,11 +72,12 @@ SWITCH_ON = "already_on"
 SWITCH_OFF = "set_off_by_project"
 SWITCH_UNREAD = "unread"
 SWITCH_NOT_WRITTEN = "not_written"
+SWITCH_WITHHELD = "withheld"
 
 #: What a tagged model loses, stated by every plan that tags one.
 SAMPLING = (
     "every test on a tagged model, the project's own included, keeps no sample "
-    "of its failing rows"
+    "of its failing rows, wherever Elementary's test materialization runs it"
 )
 
 
@@ -130,7 +129,21 @@ def tag(
 
     switch = switch_status(project_yml)
     warnings: list[str] = []
-    if switch == SWITCH_ABSENT:
+    rewritten = _rewritten_models(edits, prior)
+    if switch == SWITCH_ABSENT and rewritten and not _edits_project(edits):
+        # A `dbt_project.yml` edit can change how any model compiles, so a plan
+        # carrying one gets no refactor comparison and no downstream impact on
+        # the model it rewrites. The switch waits for a plan of its own.
+        switch = SWITCH_WITHHELD
+        names = sorted(r["model"] for r in rows)
+        warnings.append(
+            f"`{SWITCH}: true` was left out of this plan, which rewrites the SQL of "
+            f"{', '.join(rewritten)}: a dbt_project.yml edit would stop the refactor "
+            "comparison and the downstream impact check from re-executing it. Apply "
+            f"this plan, then run `dex transform declare {' '.join(names)}` to add "
+            "the switch in a plan of its own; until then the tags change no sample"
+        )
+    elif switch == SWITCH_ABSENT:
         from .package_repair import RepairRefusedError, set_nested
 
         try:
@@ -159,6 +172,13 @@ def tag(
             "where it renders true"
         )
 
+    if string_tags(project_yml):
+        warnings.append(
+            f"dbt_project.yml writes `{TAGS_VAR}` as one string; write it as a list "
+            f"(`[{tag_name}]`): some Elementary releases, 0.23.0 among them, read a "
+            "single string character by character when they match a model's tags, "
+            "so the model tag does nothing there"
+        )
     rule = release_rule(gate.release)
     counts = _counts(rows)
     tagged = sorted(
@@ -203,8 +223,9 @@ def tag(
 
 def owes(content: str | None, model: str, project_yml: str | None) -> bool:
     """Whether ``model``'s entry in ``content`` has a PII-marked column (or the
-    model itself) still lacking the tag: a model ``transform declare`` should
-    propose although no measured fact is left to declare."""
+    model itself) still lacking the tag, or has one while the project does not
+    set the switch: a model ``transform declare`` should propose although no
+    measured fact is left to declare."""
 
     if not content:
         return False
@@ -215,7 +236,9 @@ def owes(content: str | None, model: str, project_yml: str | None) -> bool:
         text, row = tag_entry(content, model, tag_name)
     except (RewriteError, ValueError, yaml.YAMLError):
         return False
-    return row is not None and text != content
+    return row is not None and (
+        text != content or switch_status(project_yml) == SWITCH_ABSENT
+    )
 
 
 # --- reading the project ---------------------------------------------------------
@@ -225,21 +248,31 @@ SWITCH_ABSENT = "absent"
 
 
 def _vars(project_yml: str | None) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-    """The project's root ``vars`` and the block scoped to the package."""
+    """The project's root ``vars`` and the block scoped to the project itself.
+
+    Elementary reads the switch and ``pii_tags`` with ``var()`` while it runs a
+    test, in that test's context, and dbt merges into the global vars only the
+    block keyed by the node's own package (``VarProvider.vars_for``). The
+    project's own tests belong to the root project, so the block keyed by its
+    ``name`` wins there, and a block keyed ``elementary`` is never read.
+    """
 
     try:
         loaded = yaml.safe_load(project_yml) if project_yml else None
     except yaml.YAMLError:
         loaded = None
-    found = loaded.get("vars") if isinstance(loaded, Mapping) else None
+    if not isinstance(loaded, Mapping):
+        return {}, {}
+    found = loaded.get("vars")
     root = found if isinstance(found, Mapping) else {}
-    scoped = root.get(PACKAGE)
+    name = loaded.get("name")
+    scoped = root.get(name) if isinstance(name, str) else None
     return root, scoped if isinstance(scoped, Mapping) else {}
 
 
 def _var(project_yml: str | None, name: str) -> tuple[bool, Any]:
-    """``(set, value)`` for ``name`` as the package reads it: a block scoped to
-    the package wins over the root, as dbt resolves a package's vars."""
+    """``(set, value)`` for ``name`` as the project's own tests read it: the
+    block scoped to the root project wins over the global one."""
 
     root, scoped = _vars(project_yml)
     for level in (scoped, root):
@@ -261,6 +294,17 @@ def project_tag(project_yml: str | None) -> tuple[str, str]:
             if isinstance(first, str) and first.strip() and "{" not in first:
                 return first.strip(), TAGS_VAR
     return DEFAULT_TAG, "default"
+
+
+def string_tags(project_yml: str | None) -> bool:
+    """Whether the project writes ``pii_tags`` as one string rather than a list.
+
+    Some releases (0.23.0 among those Dex tests) read the model tag by iterating
+    ``pii_tags``, and a Jinja string iterates by character, so a model tag never
+    matches there."""
+
+    found, value = _var(project_yml, TAGS_VAR)
+    return found and isinstance(value, str)
 
 
 def switch_status(project_yml: str | None) -> str:
@@ -304,6 +348,12 @@ def _release_note(rule: str, release: str | None, tag_name: str) -> str | None:
             f"not a column's `config.meta.tags` (read from {COLUMN_META_SINCE}), so "
             "there only the model tag keeps samples out"
         )
+    if rule == RULE_UNKNOWN:
+        return (
+            "dex could not read the installed Elementary release, so whether it "
+            f"reads the '{tag_name}' tags is unchecked: releases from {SWITCH_SINCE} "
+            f"read the model tag, and from {COLUMN_META_SINCE} the column's too"
+        )
     return None
 
 
@@ -319,18 +369,52 @@ def _written_models(
     """The models whose SQL the plan writes, the models it declares, and the
     models whose YAML entry it changes."""
 
-    out = set(declared)
+    from .. import model_versions as mv
+
+    versions = mv.cached_version_map(files)
+    out = {_base(name) for name in declared}
     for edit in edits:
         if edit.op is not EditOp.UPSERT:
             continue
         if edit.kind is EditKind.MODEL_SQL and edit.path.endswith(".sql"):
-            out.add(PurePosixPath(edit.path).stem)
+            label = mv.label_for_file(edit.path, versions)
+            out.add(_base(label or PurePosixPath(edit.path).stem))
         elif edit.kind is EditKind.SCHEMA_YML:
             before = _entries(prior.get(edit.path))
             for name, entry in _entries(files.get(edit.path)).items():
                 if before.get(name) != entry:
                     out.add(name)
     return out
+
+
+def _base(model: str) -> str:
+    """A version label's model (``dim_teams.v2`` -> ``dim_teams``): every
+    version is tagged in the one YAML entry that holds them."""
+
+    from ..model_versions import split_label
+
+    return split_label(model)[0]
+
+
+def _rewritten_models(edits: list[PlanEdit], prior: Mapping[str, str]) -> list[str]:
+    """The models whose existing SQL file the plan rewrites."""
+
+    return sorted(
+        PurePosixPath(edit.path).stem
+        for edit in edits
+        if edit.kind is EditKind.MODEL_SQL
+        and edit.op is EditOp.UPSERT
+        and edit.path in prior
+    )
+
+
+def _edits_project(edits: list[PlanEdit]) -> bool:
+    """Whether the plan already edits what makes the checks treat it as global."""
+
+    return any(
+        edit.kind in (EditKind.PROJECT_YML, EditKind.PACKAGES_YML, EditKind.MACRO_SQL)
+        for edit in edits
+    )
 
 
 def _entries(content: str | None) -> dict[str, Any]:
@@ -382,7 +466,10 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 
 def _model_tags(entry: Mapping[str, Any]) -> set[str]:
     config = _mapping(entry.get("config"))
-    return _lowered(entry.get("tags")) | _lowered(config.get("tags"))
+    found = _lowered(entry.get("tags")) | _lowered(config.get("tags"))
+    for meta in (_mapping(entry.get("meta")), _mapping(config.get("meta"))):
+        found |= _lowered(meta.get("tags"))
+    return found
 
 
 def _appended(value: Any, tag_name: str) -> list[Any]:
@@ -423,6 +510,7 @@ def tag_entry(
     from . import declarations as decl
     from .rewrite import RewriteError
 
+    model = _base(model)
     entry = _entries(content).get(model)
     if entry is None:
         return content, None

@@ -190,10 +190,16 @@ def test_a_version_s_marked_column_is_tagged_on_the_version():
             ("sensitive", "pii_tags"),
         ),
         ("name: shop\nvars:\n  pii_tags: restricted\n", ("restricted", "pii_tags")),
+        # The project's own tests read the block keyed by the root project's
+        # name; a block keyed `elementary` reaches only the package's own nodes.
+        (
+            "name: shop\nvars:\n  pii_tags: [root]\n  shop:\n    pii_tags: [scoped]\n",
+            ("scoped", "pii_tags"),
+        ),
         (
             "name: shop\nvars:\n  pii_tags: [root]\n"
-            "  elementary:\n    pii_tags: [scoped]\n",
-            ("scoped", "pii_tags"),
+            "  elementary:\n    pii_tags: [package]\n",
+            ("root", "pii_tags"),
         ),
         ("name: shop\nvars:\n  pii_tags: \"{{ var('x') }}\"\n", ("pii", "default")),
         ("name: shop\nvars:\n  pii_tags: []\n", ("pii", "default")),
@@ -218,8 +224,17 @@ def test_the_tag_is_the_first_of_the_project_s_pii_tags_or_pii(project, expected
         ),
         (
             "name: shop\nvars:\n  disable_samples_on_pii_tags: true\n"
-            "  elementary:\n    disable_samples_on_pii_tags: false\n",
+            "  shop:\n    disable_samples_on_pii_tags: false\n",
             pii_tags.SWITCH_OFF,
+        ),
+        (
+            "name: shop\nvars:\n  disable_samples_on_pii_tags: true\n"
+            "  elementary:\n    disable_samples_on_pii_tags: false\n",
+            pii_tags.SWITCH_ON,
+        ),
+        (
+            "name: shop\nvars:\n  elementary:\n    disable_samples_on_pii_tags: true\n",
+            pii_tags.SWITCH_ABSENT,
         ),
         (
             'name: shop\nvars:\n  disable_samples_on_pii_tags: "{{ target.name }}"\n',
@@ -257,18 +272,21 @@ PEOPLE = "select 1 as person_id, 'x' as email, 'x' as notes, 'x' as segment\n"
 MART = "select person_id, email, notes, segment from {{ ref('stg_people') }}\n"
 
 
-def _install(project: Path, release: str = "0.26.1") -> None:
+def _install(project: Path, release: str | None = "0.26.1") -> None:
+    """The stand-in package; ``None`` installs one whose release cannot be read."""
+
     package = project / "dbt_packages" / "elementary"
     (package / "macros").mkdir(parents=True)
+    version = "" if release is None else f'version: "{release}"\n'
     (package / "dbt_project.yml").write_text(
-        f'name: elementary\nversion: "{release}"\nconfig-version: 2\n',
-        encoding="utf-8",
+        f"name: elementary\n{version}config-version: 2\n", encoding="utf-8"
     )
     (package / "macros" / "noop.sql").write_text(
         "{% macro noop() %}{% endmacro %}\n", encoding="utf-8"
     )
     (project / "packages.yml").write_text(
-        f"packages:\n  - package: elementary-data/elementary\n    version: {release}\n",
+        "packages:\n  - package: elementary-data/elementary\n"
+        f"    version: {release or '0.26.1'}\n",
         encoding="utf-8",
     )
 
@@ -525,6 +543,7 @@ def test_transform_declare_tags_a_model_whose_marks_predate_the_tag(
     assert proposal["fields"]["pii_tags"]["value"] == {
         "tag": "pii",
         "columns": ["email"],
+        "switch": True,
     }
     _apply(tmp_path, capsys)
     entry = _entry(
@@ -536,7 +555,7 @@ def test_transform_declare_tags_a_model_whose_marks_predate_the_tag(
     assert declare()["data"]["plan_id"] is None
 
 
-def test_a_plan_that_rewrites_a_marked_model_s_sql_tags_its_yaml_too(
+def test_a_sql_rewrite_tags_the_yaml_and_withholds_the_switch(
     dbt_project_dir: Path, tmp_path: Path, capsys
 ):
     _install(dbt_project_dir)
@@ -568,6 +587,84 @@ def test_a_plan_that_rewrites_a_marked_model_s_sql_tags_its_yaml_too(
         "models/staging/schema.yml",
     )
     assert model["columns"] == [{"column": "email", "status": pii_tags.ADDED}]
+    # A dbt_project.yml edit would stop the rewrite's comparison and impact
+    # check, so the switch waits for a plan of its own.
+    assert planned["data"]["pii_tags"]["switch"]["status"] == pii_tags.SWITCH_WITHHELD
+    assert "disable_samples_on_pii_tags" not in json.dumps(planned["diffs"])
+    assert any(
+        "left out of this plan" in w and "transform declare stg_people" in w
+        for w in planned["warnings"]
+    )
+
+    _apply(tmp_path, capsys)
+    declared = _dex(
+        ["--repo-root", str(tmp_path), "transform", "declare", "stg_people"], capsys
+    )
+    assert declared["status"] == "ok", declared["errors"]
+    [proposal] = declared["data"]["proposed"]
+    assert proposal["fields"]["pii_tags"]["value"]["switch"] is True
+    _apply(tmp_path, capsys)
+    project = yaml.safe_load((dbt_project_dir / "dbt_project.yml").read_text("utf-8"))
+    assert project["vars"] == {"disable_samples_on_pii_tags": True}
+
+
+def test_a_single_string_pii_tags_is_written_and_warned(
+    people: Path, tmp_path: Path, capsys
+):
+    _install(people)
+    project_yml = people / "dbt_project.yml"
+    project_yml.write_text(
+        project_yml.read_text("utf-8") + "vars:\n  pii_tags: restricted\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    planned = _plan(tmp_path, capsys)
+
+    assert planned["data"]["pii_tags"]["tag"] == "restricted"
+    assert any(
+        "as one string" in w and "[restricted]" in w for w in planned["warnings"]
+    )
+
+
+def test_an_unreadable_release_is_said_to_be_unchecked(
+    people: Path, tmp_path: Path, capsys
+):
+    _install(people, release=None)
+    _repo(tmp_path)
+
+    planned = _plan(tmp_path, capsys)
+
+    assert planned["data"]["pii_tags"]["rule"] == pii_tags.RULE_UNKNOWN
+    assert any(
+        "could not read the installed Elementary release" in w
+        for w in planned["warnings"]
+    )
+
+
+def test_a_version_label_tags_the_model_s_one_entry():
+    text = (
+        "version: 2\nmodels:\n  - name: dim_people\n    latest_version: 1\n"
+        "    versions:\n      - v: 1\n        columns:\n          - name: email\n"
+        "            config:\n              meta:\n                contains_pii: true\n"
+    )
+
+    out, row = pii_tags.tag_entry(text, "dim_people.v1", "pii")
+
+    assert row is not None and row["model_tag"] == pii_tags.ADDED
+    assert _entry(out, "dim_people")["config"]["tags"] == ["pii"]
+
+
+def test_a_model_tag_held_under_meta_counts_as_already_tagged():
+    text = SCHEMA.replace(
+        "    description: One row per person.\n",
+        "    description: One row per person.\n    config:\n      meta:\n"
+        "        tags: [pii]\n",
+    )
+
+    _, row = pii_tags.tag_entry(text, "stg_people", "pii")
+
+    assert row["model_tag"] == pii_tags.ALREADY_TAGGED
 
 
 def test_a_plan_that_writes_nothing_personal_carries_no_report(

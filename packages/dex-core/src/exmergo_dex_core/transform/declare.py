@@ -324,7 +324,14 @@ def propose(
             tagged = [
                 c for c in (tag_row or {}).get("columns", []) if c["status"] == "added"
             ]
-        if text == rendered.get(path) and not referenced:
+            switch_owed = (
+                tag_row is not None
+                and pii_tags.switch_status(rendered.get("dbt_project.yml"))
+                == pii_tags.SWITCH_ABSENT
+            )
+        else:
+            switch_owed = False
+        if text == rendered.get(path) and not referenced and not switch_owed:
             outcome.skipped.append(_why_nothing(model, entry, complete=True))
             continue
         rendered[path] = text
@@ -361,7 +368,7 @@ def propose(
                     "evidence": "declared facts; monitors.vendor",
                 },
             }
-        if tagged:
+        if tagged or switch_owed:
             # The Elementary tag each personal-data column owes, which
             # `monitors.vendor` turns on (#1487): not a measured fact either.
             fields = {
@@ -370,6 +377,7 @@ def propose(
                     "value": {
                         "tag": tag_name,
                         "columns": [c["column"] for c in tagged],
+                        "switch": switch_owed,
                     },
                     "evidence": "PII marks; monitors.vendor",
                 },
@@ -546,7 +554,7 @@ def _owes_pii_tags(model: str, files: Mapping[str, str], tag_name: str | None) -
 
     if tag_name is None:
         return False
-    path = declarations_mod.schema_path(files, model)
+    path = declarations_mod.schema_path(files, mv.split_label(model)[0])
     return path is not None and pii_tags.owes(
         files.get(path), model, files.get("dbt_project.yml")
     )
