@@ -71,10 +71,20 @@ from sqlglot import exp
 from ..adapters import get_dialect
 from ..command_args import billed_handshake
 from ..config import QueryLimits
-from ..errors import DexError
 from ..transform.elementary import release_key
 from ..values_free import require_allowed
 from .elementary_layouts import CheckedTable, adapter_catalog, check_layouts
+from .elementary_refusals import (
+    ID_TOO_LONG,
+    INVOCATION_REPEATED,
+    INVOCATION_UNREADABLE,
+    NO_INVOCATIONS,
+    READ_TOO_LARGE,
+    RELEASE_MIXED,
+    RESULT_CONFLICT,
+    STATUS_UNKNOWN,
+    ElementaryReadError,
+)
 from .incidents import SourceHistory
 from .observations import (
     SEVERITY_PATTERN,
@@ -101,14 +111,6 @@ RESULTS = "elementary_test_results"
 MAX_INVOCATIONS = 2000
 MAX_RESULT_ROWS = 100_000
 
-READ_TOO_LARGE = "elementary_read_too_large"
-NO_INVOCATIONS = "elementary_no_invocations"
-INVOCATION_UNREADABLE = "elementary_invocation_unreadable"
-INVOCATION_REPEATED = "elementary_invocation_repeated"
-RELEASE_MIXED = "elementary_rows_untested_release"
-STATUS_UNKNOWN = "elementary_status_unknown"
-RESULT_CONFLICT = "elementary_result_id_conflict"
-ID_TOO_LONG = "elementary_id_too_long"
 
 #: dbt's test statuses, as Elementary lowers them, mapped as #1468 maps dbt's.
 _OUTCOMES: Mapping[str, Outcome] = {
@@ -162,19 +164,6 @@ _RESULT_COLUMNS = (
     "status",
     "severity",
 )
-
-
-class ElementaryReadError(DexError):
-    """The reader refused what the tables hold. ``code`` says why, ``counts``
-    the rows or runs it applies to, and the message quotes no value from a row
-    but a status or version token."""
-
-    def __init__(
-        self, code: str, message: str, counts: Mapping[str, int] | None = None
-    ):
-        self.code = code
-        self.counts = dict(counts or {})
-        super().__init__(f"{message} ({code})")
 
 
 @dataclass(frozen=True)
@@ -739,6 +728,8 @@ class _Observations:
     #: a repeated id is one row, as it is everywhere else here.
     _untested: set[str] = field(default_factory=set)
     _no_id: int = 0
+    #: Every record read, by its ``id``, as it was read.
+    _records: dict[str, tuple[str | None, ...]] = field(default_factory=dict)
 
     @property
     def unattributed(self) -> int:
@@ -752,17 +743,11 @@ class _Observations:
         # Keyed by id, so a repeated row is one row here as everywhere else.
         unknown_by_id: dict[str, str] = {}
         for raw in rows:
-            row = self._row(raw, unknown_by_id)
-            if row is None:
+            if self._repeat(tuple(map(_text, raw))):
                 continue
-            held = self._seen.setdefault(row.id, row)
-            if held != row:
-                raise ElementaryReadError(
-                    RESULT_CONFLICT,
-                    f"two {RESULTS} rows share one id and differ, so neither is "
-                    "the table's own record of that result",
-                )
-            self.duplicates += held is not row
+            row = self._row(raw, unknown_by_id)
+            if row is not None:
+                self._seen[row.id] = row
         unknown: dict[str, int] = {}
         for name in unknown_by_id.values():
             unknown[name] = unknown.get(name, 0) + 1
@@ -773,6 +758,27 @@ class _Observations:
                 f"result rows with a status the reader does not map ({named})",
                 unknown,
             )
+
+    def _repeat(self, record: tuple[str | None, ...]) -> bool:
+        """Whether this record repeats an ``id`` already read, refusing one that
+        repeats it with another record. Every row with an id is checked here,
+        before any is set aside for having no test id, so a pair that differs
+        only in that is a conflict rather than one observation."""
+
+        rid = record[0]
+        if not rid:
+            return False
+        held = self._records.setdefault(rid, record)
+        if held != record:
+            raise ElementaryReadError(
+                RESULT_CONFLICT,
+                f"two {RESULTS} rows share one id and differ, so neither is "
+                "the table's own record of that result",
+            )
+        if held is record:
+            return False
+        self.duplicates += 1
+        return True
 
     def _row(self, raw: Sequence[Any], unknown: dict[str, str]) -> _Row | None:
         rid, run, test, column, kind, metric, status, severity = map(_text, raw)

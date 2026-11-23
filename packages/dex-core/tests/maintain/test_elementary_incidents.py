@@ -126,8 +126,9 @@ def _warehouse(path: Path, runs: Sequence[Run], results: Sequence[Result]) -> Pa
             "INSERT INTO main_elementary.elementary_test_results "
             "(id, invocation_id, test_unique_id, test_execution_id, column_name, "
             "test_type, test_sub_type, status, severity, detected_at, created_at, "
-            "failures, result_rows, test_results_description) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "failures, result_rows, test_results_description, test_results_query, "
+            "test_params) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 result.id,
                 result.run,
@@ -143,6 +144,8 @@ def _warehouse(path: Path, runs: Sequence[Run], results: Sequence[Result]) -> Pa
                 0 if result.status == "pass" else 1,
                 '[{"email": "a@example.com"}]',
                 "a value the test failed on",
+                "select * from orders where email = 'jane@example.com'",
+                '{"values": ["jane@example.com"]}',
             ],
         )
     con.close()
@@ -755,7 +758,8 @@ def test_a_repeated_row_is_counted_once_in_every_counter(tmp_path: Path):
         Result("r-2", "inv-1", test=""),
     ]
     read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
-    assert (read.severities_unread, read.unattributed, read.duplicate_ids) == (1, 1, 1)
+    # Each id read twice is one repeat: r-1, and r-2, which has no test id.
+    assert (read.severities_unread, read.unattributed, read.duplicate_ids) == (1, 1, 2)
 
 
 def test_the_profile_estimate_is_the_whole_ask_of_the_call_that_profiled(
@@ -946,3 +950,65 @@ def test_a_bound_that_is_not_an_int_is_refused(value):
         ReadBounds(invocations=value)
     with pytest.raises(TypeError, match="must be an int"):
         ReadBounds(result_rows=value)
+
+
+# --- after the bot review at 39743d4c ---------------------------------------------
+
+_QUOTING = ("test_results_description", "test_results_query", "test_params")
+
+
+def test_the_first_read_caches_no_value_of_a_column_that_can_quote_one(
+    tmp_path: Path,
+):
+    """Forty runs give every text column a domain small enough to cache. The
+    three that can quote a value (a result message, compiled SQL, a test's
+    arguments) get none, and nothing the reader returns carries their text."""
+
+    runs = _hourly(40)
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    read = _read(engine)
+    [dataset] = [
+        d
+        for d in engine.store.load_cache().datasets
+        if d.identifier.endswith("elementary_test_results")
+    ]
+    columns = {c.name: c for c in dataset.columns}
+    # The arm that shows a domain would be cached: a plain text column has one.
+    assert columns["status"].value_domain is not None
+    for name in _QUOTING:
+        column = columns[name]
+        assert (column.value_domain, column.min_value, column.max_value) == (
+            None,
+            None,
+            None,
+        ), name
+    assert "example.com" not in repr(read)
+    assert "failed on" not in repr(read)
+
+
+def test_the_refusal_imports_without_the_sql_extra(monkeypatch: pytest.MonkeyPatch):
+    """The package's export of the refusal reaches no module that needs
+    sqlglot, so a core-only install can catch it."""
+
+    import sys
+
+    import exmergo_dex_core
+
+    for module in (
+        "exmergo_dex_core.maintain.elementary_refusals",
+        "exmergo_dex_core.maintain.elementary_incidents",
+    ):
+        monkeypatch.delitem(sys.modules, module, raising=False)
+    monkeypatch.setitem(sys.modules, "sqlglot", None)
+    refusal = exmergo_dex_core.ElementaryReadError
+    assert refusal.__module__ == "exmergo_dex_core.maintain.elementary_refusals"
+
+
+def test_one_id_with_and_without_a_test_id_is_a_conflict(tmp_path: Path):
+    """Repeated ids are checked before a row is set aside for having no test
+    id, so the pair is a conflict and not one observation."""
+
+    runs = _hourly(1)
+    results = [Result("r-1", "inv-1"), Result("r-1", "inv-1", test="")]
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, results))
+    assert _refusal(engine).code == "elementary_result_id_conflict"
