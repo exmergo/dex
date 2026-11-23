@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from exmergo_dex_core.maintain.incidents import (
     UNKNOWN,
+    FoldInputError,
     Observation,
     ObservedPoint,
     RunRef,
@@ -23,6 +24,7 @@ from exmergo_dex_core.maintain.incidents import (
     Subject,
     fold_incidents,
 )
+from exmergo_dex_core.maintain.timeline import Heartbeat, build_timeline
 
 T0 = datetime(2026, 11, 1, 0, 0, tzinfo=UTC)
 TEST = "test.shop.not_null_orders_order_id.abc123"
@@ -112,6 +114,82 @@ def test_n_is_set_per_signal() -> None:
 def test_close_after_must_be_positive() -> None:
     with pytest.raises(ValueError, match="close_after"):
         fold_incidents([], close_after=0)
+
+
+# -- N counts runs, not rows ---------------------------------------------------
+
+
+def test_two_passing_rows_in_one_run_are_one_pass() -> None:
+    # Two tests carry one claim, or an adapter did not deduplicate: run 2
+    # holds two rows. One run of passes is not N = 2.
+    series = [_obs(1, "bad"), _obs(2, "good"), _obs(2, "good")]
+    fold = fold_incidents(series, now=_now(2))
+    assert [i.state for i in fold.incidents] == ["open"]
+    assert [o.outcome for o in fold.incidents[0].observations] == [
+        "bad",
+        "good",
+        "good",
+    ]
+
+
+def test_every_failing_row_in_one_run_stays_on_the_incident() -> None:
+    warn = _obs(1, "bad", test="t1", severity="warn")
+    error = _obs(1, "bad", test="t2", severity="error")
+    for series in ([warn, error], [error, warn]):
+        (incident,) = fold_incidents(series, now=_now(1)).incidents
+        assert incident.tests == ("t1", "t2")
+        assert len(incident.observations) == 2
+        assert incident.severity == "error"
+
+
+def test_the_closing_runs_other_test_stays_on_the_incident() -> None:
+    series = [
+        _obs(1, "bad", test="test.a"),
+        _obs(2, "good", test="test.a"),
+        _obs(2, "good", test="test.b"),
+    ]
+    (incident,) = fold_incidents(series, close_after=1, now=_now(2)).incidents
+    assert incident.state == "closed"
+    assert incident.closed_by.run == "inv-2"
+    assert incident.tests == ("test.a", "test.b")
+    assert len(incident.observations) == 3
+
+
+def test_a_duplicate_pass_in_the_closing_run_stays_on_the_incident() -> None:
+    series = [_obs(1, "bad"), _obs(2, "good"), _obs(3, "good"), _obs(3, "good")]
+    (incident,) = fold_incidents(series, now=_now(3)).incidents
+    assert incident.state == "closed"
+    assert incident.closed_by.run == "inv-3"
+    assert [o.run for o in incident.observations] == [
+        "inv-1",
+        "inv-2",
+        "inv-3",
+        "inv-3",
+    ]
+
+
+def test_another_sources_pass_in_the_closing_run_is_evidence() -> None:
+    series = [
+        _obs(1, "bad", source=DBT),
+        _obs(2, "good", source=DBT),
+        _obs(2, "good", source=ELEMENTARY),
+    ]
+    (incident,) = fold_incidents(series, close_after=1, now=_now(2)).incidents
+    assert incident.state == "closed"
+    assert [(o.source, o.evidence) for o in incident.observations] == [
+        (DBT, False),
+        (DBT, False),
+        (ELEMENTARY, True),
+    ]
+
+
+def test_a_run_that_failed_is_not_also_counted_as_a_pass() -> None:
+    series = [_obs(1, "bad"), _obs(2, "bad"), _obs(2, "good"), _obs(3, "good")]
+    fold = fold_incidents(series, now=_now(3))
+    assert [i.state for i in fold.incidents] == ["open"]
+    closing = fold_incidents([*series, _obs(4, "good")], now=_now(4))
+    assert [i.state for i in closing.incidents] == ["closed"]
+    assert closing.incidents[0].closed_by.run == "inv-4"
 
 
 # -- the check stops running ---------------------------------------------------
@@ -317,6 +395,138 @@ def test_a_failure_from_another_source_extends_and_resets_the_streak() -> None:
     fold = fold_incidents(series, now=_now(4))
     assert len(fold.incidents) == 1
     assert fold.incidents[0].state == "open"
+
+
+# -- one invocation order for every source -------------------------------------
+
+
+def _at_run(run: str, sequence: int, outcome: str, source: str) -> Observation:
+    return _obs(sequence, outcome, source=source).model_copy(update={"run": run})
+
+
+def test_one_run_numbered_twice_across_sources_is_refused() -> None:
+    # Elementary holds three invocations; the dbt adapter numbered the one it
+    # read as 1, though it is Elementary's third.
+    series = [
+        _at_run("inv-A", 1, "bad", ELEMENTARY),
+        _at_run("inv-B", 2, "good", ELEMENTARY),
+        _at_run("inv-C", 3, "good", ELEMENTARY),
+        _at_run("inv-C", 1, "bad", DBT),
+    ]
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(series, now=_now(3))
+    assert refused.value.code == "run_sequence_conflict"
+    assert refused.value.run == "inv-C"
+    assert refused.value.sequences == (3, 1)
+
+
+def test_a_run_numbered_twice_by_a_sources_runs_is_refused() -> None:
+    history = SourceHistory(name=DBT, runs=(RunRef(run="inv-2", sequence=7, at=T0),))
+    with pytest.raises(FoldInputError, match="inv-2") as refused:
+        fold_incidents(_series("bb"), sources=[history], now=_now(2))
+    assert refused.value.code == "run_sequence_conflict"
+
+
+def test_a_run_numbered_twice_by_a_timeline_is_refused() -> None:
+    timeline = build_timeline(
+        DBT,
+        Heartbeat(basis="source_runs", runs=(RunRef(run="inv-1", sequence=9),)),
+    )
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(_series("bb"), timelines={DBT: timeline}, now=_now(2))
+    assert refused.value.code == "run_sequence_conflict"
+    assert refused.value.sequences == (1, 9)
+
+
+def test_one_sequence_holding_two_runs_across_sources_is_refused() -> None:
+    # dbt numbered its one invocation 1, which is Elementary's inv-A: the
+    # fold would read dbt's pass as evidence on inv-A's run.
+    series = [
+        _at_run("inv-A", 1, "bad", ELEMENTARY),
+        _at_run("inv-B", 2, "good", ELEMENTARY),
+        _at_run("inv-D", 3, "good", ELEMENTARY),
+        _at_run("inv-C", 1, "good", DBT),
+    ]
+    ranked = [SourceHistory(name=ELEMENTARY), SourceHistory(name=DBT)]
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(series, sources=ranked, now=_now(3))
+    assert refused.value.code == "sequence_run_conflict"
+    assert refused.value.runs == ("inv-A", "inv-C")
+    assert refused.value.sequences == (1,)
+    assert refused.value.sources == (ELEMENTARY, DBT)
+
+
+def test_a_sequence_a_sources_runs_give_another_run_is_refused() -> None:
+    history = SourceHistory(name=DBT, runs=(RunRef(run="inv-X", sequence=2, at=T0),))
+    with pytest.raises(FoldInputError, match="inv-X") as refused:
+        fold_incidents(_series("bb"), sources=[history], now=_now(2))
+    assert refused.value.code == "sequence_run_conflict"
+
+
+def test_a_sequence_a_timeline_gives_another_run_is_refused() -> None:
+    timeline = build_timeline(
+        DBT,
+        Heartbeat(basis="source_runs", runs=(RunRef(run="inv-X", sequence=1),)),
+    )
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(_series("bb"), timelines={DBT: timeline}, now=_now(2))
+    assert refused.value.code == "sequence_run_conflict"
+    assert refused.value.runs == ("inv-1", "inv-X")
+
+
+def _opener_tie() -> list[Observation]:
+    # dbt read one invocation; Elementary holds that one and three more.
+    return [_obs(5, "bad", source=DBT)] + [
+        _obs(n, outcome, source=ELEMENTARY)
+        for n, outcome in [(5, "bad"), (6, "good"), (7, "good"), (8, "good")]
+    ]
+
+
+def test_a_tie_between_undeclared_sources_is_refused() -> None:
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(_opener_tie(), now=_now(8))
+    assert refused.value.code == "opener_tie_undeclared"
+    assert refused.value.sources == (DBT, ELEMENTARY)
+
+
+def test_a_tie_with_one_undeclared_source_is_refused() -> None:
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(
+            _opener_tie(), sources=[SourceHistory(name=ELEMENTARY)], now=_now(8)
+        )
+    assert refused.value.code == "opener_tie_undeclared"
+    assert refused.value.sources == (DBT, ELEMENTARY)
+
+
+def test_the_source_named_first_opens_a_tie_and_can_close_it() -> None:
+    ranked = [SourceHistory(name=ELEMENTARY), SourceHistory(name=DBT)]
+    fold = fold_incidents(_opener_tie(), sources=ranked, now=_now(8))
+    (incident,) = fold.incidents
+    assert incident.opening_source == ELEMENTARY
+    assert incident.state == "closed"
+    assert incident.closed_by.run == "inv-7"
+    assert [(o.source, o.evidence) for o in incident.observations[:2]] == [
+        (ELEMENTARY, False),
+        (DBT, False),
+    ]
+
+
+def test_a_tie_is_settled_by_the_declared_order_not_the_names() -> None:
+    ranked = [SourceHistory(name=DBT), SourceHistory(name=ELEMENTARY)]
+    fold = fold_incidents(_opener_tie(), sources=ranked, now=_now(8))
+    assert fold.incidents[0].opening_source == DBT
+    swapped = fold_incidents(_opener_tie(), sources=ranked[::-1], now=_now(8))
+    assert swapped.incidents[0].opening_source == ELEMENTARY
+
+
+def test_sources_failing_together_after_the_opener_need_no_precedence() -> None:
+    series = [
+        _obs(1, "bad", source=ELEMENTARY),
+        _obs(2, "bad", source=ELEMENTARY),
+        _obs(2, "bad", source=DBT),
+    ]
+    fold = fold_incidents(series, now=_now(2))
+    assert fold.incidents[0].opening_source == ELEMENTARY
 
 
 # -- first observed ------------------------------------------------------------
