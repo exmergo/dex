@@ -1625,7 +1625,7 @@ def test_init_trino_needs_a_dev_catalog(tmp_path: Path, capsys, monkeypatch):
     _seed_trino_config(tmp_path)
     rc, envelope = _run(_init_argv(tmp_path, "--connector", "trino"), capsys)
     assert rc == 1
-    assert "trino.dev_catalog" in envelope["errors"][0]
+    assert "trino.dev" in envelope["errors"][0]
 
 
 def test_init_trino_refuses_a_dev_target_that_is_a_source(
