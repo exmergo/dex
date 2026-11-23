@@ -142,8 +142,11 @@ _MAX_RUN_CHARS = 128
 #: and refuses rather than reading as a shorter id.
 _CELL_CHARS = _MAX_KEY_CHARS + 1
 
-#: A token a refusal may quote: a status or a package version, never free text.
-_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,31}$")
+#: What a refusal says in place of a value it will not quote. A refusal names a
+#: package version only where it reads as a release, and never names a status
+#: the reader does not map: a character pattern does not show a value is safe.
+UNREADABLE_VERSION = "an unreadable value"
+UNMAPPED_STATUS = "an unmapped status"
 _SEVERITY = re.compile(SEVERITY_PATTERN)
 _COMMIT = re.compile(r"^[0-9A-Fa-f]{7,64}$")
 
@@ -588,8 +591,10 @@ def _invocation(row: Sequence[Any]) -> _Invocation | None:
     return _Invocation(run, moment, _time(created), _commit(commit), _text(version))
 
 
-def _token(value: str | None) -> str:
-    return value if value is not None and _TOKEN.match(value) else "an unreadable value"
+def _release_label(value: str | None) -> str:
+    """The version as written where it reads as a release, else a fixed label."""
+
+    return value if release_key(value) is not None and value else UNREADABLE_VERSION
 
 
 def _identity(invocation: _Invocation) -> tuple:
@@ -630,7 +635,7 @@ def _one_release(rows: Iterable[_Invocation], release: str) -> None:
     others: dict[str, int] = {}
     for invocation in rows:
         if release_key(invocation.version) != release_key(release):
-            name = _token(invocation.version)
+            name = _release_label(invocation.version)
             others[name] = others.get(name, 0) + 1
     if others:
         named = ", ".join(
@@ -710,6 +715,21 @@ def _severity(value: str | None) -> tuple[str | None, bool]:
     return None, True
 
 
+def _too_long() -> ElementaryReadError:
+    return ElementaryReadError(
+        ID_TOO_LONG,
+        f"a {RESULTS} row carries an id, column or metric longer than "
+        f"{_MAX_KEY_CHARS} characters",
+    )
+
+
+def _check_id(rid: str | None) -> None:
+    """Refuse a present result id too long to hold, before it keys anything."""
+
+    if _long(rid):
+        raise _too_long()
+
+
 def _long(*values: str | None) -> bool:
     return any(value is not None and len(value) > _MAX_KEY_CHARS for value in values)
 
@@ -740,23 +760,29 @@ class _Observations:
         return sum(1 for row in self._seen.values() if row.severity_unread)
 
     def add(self, rows: Iterable[Sequence[Any]]) -> None:
-        # Keyed by id, so a repeated row is one row here as everywhere else.
-        unknown_by_id: dict[str, str] = {}
+        # In order: the id is held to its length before it keys anything, a
+        # repeat is dropped, and a row whose run the invocation read did not
+        # return (a run written between the two reads) is set aside before its
+        # status or attribution is read, so it never refuses the runs that were.
+        placed = {run.run for run in self.runs}
+        unmapped: set[str] = set()
         for raw in rows:
-            if self._repeat(tuple(map(_text, raw))):
+            record = tuple(map(_text, raw))
+            _check_id(record[0])
+            if self._repeat(record):
                 continue
-            row = self._row(raw, unknown_by_id)
+            if record[1] not in placed:
+                self.unplaced += 1
+                continue
+            row = self._row(record, unmapped)
             if row is not None:
                 self._seen[row.id] = row
-        unknown: dict[str, int] = {}
-        for name in unknown_by_id.values():
-            unknown[name] = unknown.get(name, 0) + 1
-        if unknown:
-            named = ", ".join(f"{n} {name}" for name, n in sorted(unknown.items()))
+        if unmapped:
+            count = len(unmapped)
             raise ElementaryReadError(
                 STATUS_UNKNOWN,
-                f"result rows with a status the reader does not map ({named})",
-                unknown,
+                f"{count} result row(s) with a status the reader does not map",
+                {UNMAPPED_STATUS: count},
             )
 
     def _repeat(self, record: tuple[str | None, ...]) -> bool:
@@ -780,24 +806,20 @@ class _Observations:
         self.duplicates += 1
         return True
 
-    def _row(self, raw: Sequence[Any], unknown: dict[str, str]) -> _Row | None:
-        rid, run, test, column, kind, metric, status, severity = map(_text, raw)
+    def _row(self, record: Sequence[str | None], unmapped: set[str]) -> _Row | None:
+        rid, run, test, column, kind, metric, status, severity = record
         if not rid:
             self._no_id += 1
             return None
         if not test:
             self._untested.add(rid)
             return None
-        if _long(rid, test, column, metric) or (run and len(run) > _MAX_RUN_CHARS):
-            raise ElementaryReadError(
-                ID_TOO_LONG,
-                f"a {RESULTS} row carries an id, column or metric longer than "
-                f"{_MAX_KEY_CHARS} characters",
-            )
+        if _long(test, column, metric):
+            raise _too_long()
         word = (status or "").strip().lower()
         outcome = _OUTCOMES.get(word)
         if outcome is None:
-            unknown[rid] = _token(word or None)
+            unmapped.add(rid)
             return None
         anomaly = (kind or "").strip().lower() == _ANOMALY
         signal = (
@@ -811,10 +833,8 @@ class _Observations:
     def observations(self) -> tuple[Observation, ...]:
         placed = {run.run: (index, run) for index, run in enumerate(self.runs, start=1)}
         kept: dict[tuple[Subject, Signal, str], _Row] = {}
+        # Every row held was placed when it was added.
         for row in sorted(self._seen.values(), key=lambda row: row.id):
-            if row.run not in placed:
-                self.unplaced += 1
-                continue
             subject = Subject.of(row.test, self.claims.get(row.test))
             key = (subject, row.signal, row.run)
             held = kept.get(key)

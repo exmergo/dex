@@ -9,6 +9,8 @@ package writes them. The tables the package itself builds are read back in
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -633,7 +635,7 @@ def test_a_status_the_reader_does_not_map_refuses(tmp_path: Path):
     refusal = _refusal(engine)
     assert (refusal.code, refusal.counts) == (
         "elementary_status_unknown",
-        {"runtime error": 1},
+        {"an unmapped status": 1},
     )
 
 
@@ -642,7 +644,7 @@ def test_an_unreadable_status_is_counted_never_quoted(tmp_path: Path):
     results = [Result("r-1", "inv-1", status="failed on 'jane@example.com'")]
     engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, results))
     refusal = _refusal(engine)
-    assert refusal.counts == {"an unreadable value": 1}
+    assert refusal.counts == {"an unmapped status": 1}
     assert "example.com" not in str(refusal)
 
 
@@ -941,7 +943,7 @@ def test_a_repeated_row_with_an_unmapped_status_is_counted_once(tmp_path: Path):
     runs = _hourly(1)
     results = [Result("r-1", "inv-1", status="runtime error")] * 2
     refusal = _refusal(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
-    assert refusal.counts == {"runtime error": 1}
+    assert refusal.counts == {"an unmapped status": 1}
 
 
 @pytest.mark.parametrize("value", [1.5, 2.0, True])
@@ -986,22 +988,41 @@ def test_the_first_read_caches_no_value_of_a_column_that_can_quote_one(
     assert "failed on" not in repr(read)
 
 
-def test_the_refusal_imports_without_the_sql_extra(monkeypatch: pytest.MonkeyPatch):
+#: Run in a fresh interpreter with sqlglot blocked before the package loads.
+_CORE_ONLY_IMPORT = (
+    "import sys\n"
+    "sys.modules['sqlglot'] = None\n"
+    "from exmergo_dex_core import ElementaryReadError\n"
+    "module = ElementaryReadError.__module__\n"
+    "assert module == 'exmergo_dex_core.maintain.elementary_refusals', module\n"
+    "assert 'exmergo_dex_core.maintain.elementary_incidents' not in sys.modules\n"
+)
+
+
+def _import_without_sqlglot() -> None:
+    subprocess.run([sys.executable, "-c", _CORE_ONLY_IMPORT], check=True)  # noqa: S603
+
+
+def _import_state() -> tuple:
+    import exmergo_dex_core.maintain as maintain
+
+    return (
+        sys.modules.get("exmergo_dex_core.maintain.elementary_refusals"),
+        getattr(maintain, "elementary_refusals", None),
+        sys.modules.get("sqlglot"),
+        reader.ElementaryReadError,
+    )
+
+
+def test_the_refusal_imports_without_the_sql_extra():
     """The package's export of the refusal reaches no module that needs
-    sqlglot, so a core-only install can catch it."""
+    sqlglot, so a core-only install can catch it. The check runs in its own
+    interpreter, so this process keeps one refusal class and its own modules."""
 
-    import sys
-
-    import exmergo_dex_core
-
-    for module in (
-        "exmergo_dex_core.maintain.elementary_refusals",
-        "exmergo_dex_core.maintain.elementary_incidents",
-    ):
-        monkeypatch.delitem(sys.modules, module, raising=False)
-    monkeypatch.setitem(sys.modules, "sqlglot", None)
-    refusal = exmergo_dex_core.ElementaryReadError
-    assert refusal.__module__ == "exmergo_dex_core.maintain.elementary_refusals"
+    before = _import_state()
+    _import_without_sqlglot()
+    after = _import_state()
+    assert all(a is b for a, b in zip(after, before, strict=True))
 
 
 def test_one_id_with_and_without_a_test_id_is_a_conflict(tmp_path: Path):
@@ -1012,3 +1033,62 @@ def test_one_id_with_and_without_a_test_id_is_a_conflict(tmp_path: Path):
     results = [Result("r-1", "inv-1"), Result("r-1", "inv-1", test="")]
     engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, results))
     assert _refusal(engine).code == "elementary_result_id_conflict"
+
+
+# --- after the bot review at 1e820935 ---------------------------------------------
+
+
+def test_an_unmapped_status_is_never_named_however_it_is_spelled(tmp_path: Path):
+    """A status shaped like a word is still text another system wrote: the
+    refusal counts it under a fixed label and quotes none of it."""
+
+    runs = _hourly(1)
+    results = [Result("r-1", "inv-1", status="jane doe")]
+    refusal = _refusal(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
+    assert refusal.counts == {reader.UNMAPPED_STATUS: 1}
+    assert "jane" not in str(refusal)
+
+
+def test_a_version_is_named_only_where_it_reads_as_a_release(tmp_path: Path):
+    runs = [
+        Run("inv-1", START, version="0.23.0"),
+        Run("inv-2", START + timedelta(hours=1), version="secret value"),
+        Run("inv-3", START + timedelta(hours=2)),
+    ]
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    refusal = _refusal(engine)
+    assert refusal.counts == {"0.23.0": 1, reader.UNREADABLE_VERSION: 1}
+    assert "secret" not in str(refusal)
+
+
+def test_rows_of_a_run_written_after_the_invocation_read_never_refuse():
+    """A run written between the two reads: its rows are set aside before
+    their status or attribution is read, whatever they hold, so the runs that
+    were read are still read."""
+
+    held = reader._Invocation("inv-1", START.replace(tzinfo=UTC), None, None, RELEASE)
+    built = reader._Observations([held], {})
+    built.add(
+        [
+            ["r-1", "inv-1", TEST, None, "dbt_test", None, "pass", None],
+            ["r-2", "inv-2", TEST, None, "dbt_test", None, "runtime error", None],
+            ["r-3", "inv-2", None, None, "dbt_test", None, "pass", None],
+            [None, "inv-2", TEST, None, "dbt_test", None, "pass", None],
+        ]
+    )
+    assert [o.run for o in built.observations()] == ["inv-1"]
+    assert (built.unplaced, built.unattributed) == (3, 0)
+
+
+def test_an_id_too_long_to_hold_refuses_on_a_row_with_no_test_id(tmp_path: Path):
+    runs = _hourly(1)
+    results = [Result("r" * 513, "inv-1", test="")]
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, results))
+    assert _refusal(engine).code == "elementary_id_too_long"
+
+
+def test_a_valid_id_with_no_test_id_is_still_unattributed(tmp_path: Path):
+    runs = _hourly(1)
+    results = [Result("r-1", "inv-1"), Result("r" * 512, "inv-1", test="")]
+    read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
+    assert (len(read.observations), read.unattributed) == (1, 1)
