@@ -33,8 +33,17 @@ upload off (``disable_dbt_invocation_autoupload``) there is none, and
 the observations name, and says which it used and why.
 
 Order is the caller's invocation ``sequence``, never a clock: sources stamp time
-with different clocks. Each run carries the commit its invocation records, or
-``unknown``. Ordering by commit is #1467.
+with different clocks. Each run carries its commit and where it came from: the
+invocation's ``git_sha``, else the commit the orchestrator records for the run,
+else ``unknown`` (#1467).
+
+Runs and commits can disagree: a rollback deploys an older commit after a newer
+one, and two branches can deploy in turn. So a break's commit range is read from
+the repository's history (:mod:`.commit_history`), never from the runs between
+its two ends: the commits the first failing run's commit has that no earlier
+passing run's commit has, as ``git bisect`` would search them. Where the last
+passing run's commit and the failing one are neither ancestor nor descendant,
+the range says so rather than guessing a direction.
 
 Pure logic: nothing here opens a connection, reads a file or runs dbt.
 """
@@ -47,8 +56,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from .commit_history import CommitHistory, HistoryKind, HistoryUnreadableError
 from .observations import (
     UNKNOWN,
+    CommitBasis,
     Observation,
     ObservedPoint,
     RunRef,
@@ -56,6 +67,7 @@ from .observations import (
     Subject,
     Value,
     median_gap,
+    resolve_commit,
     utc,
 )
 
@@ -92,6 +104,12 @@ DEFAULT_GAP_TOLERANCE = 1.5
 #: builds run by hand seconds apart is not a schedule, and an hourly job is the
 #: tightest one dbt projects commonly keep. A declared schedule has no floor.
 DEFAULT_GAP_FLOOR_SECONDS = 3600.0
+
+#: The most commits a break's range lists; ``count`` is always the full count.
+DEFAULT_COMMIT_LIMIT = 50
+
+#: The most distinct passing commits a range is bounded by, newest first.
+MAX_GOOD_COMMITS = 64
 
 
 class Heartbeat(Value):
@@ -168,8 +186,9 @@ class TimelineEntry(Value):
     run: str | None = None
     sequence: int | None = None
     at: datetime | None = None
-    #: The commit the run's invocation records, or ``unknown``.
+    #: The run's commit, or ``unknown``, and where it came from.
     commit: str | None = None
+    commit_basis: CommitBasis = "unknown"
     #: Whether the run is a heartbeat point, rather than one only an
     #: observation names.
     in_heartbeat: bool = True
@@ -233,29 +252,35 @@ def build_timeline(
     named_by_observations = heartbeat.basis == "observations"
     runs: dict[str, TimelineEntry] = {}
     for ref in heartbeat.runs:
+        commit, basis = resolve_commit(ref.commit, ref.orchestrator_commit)
         runs[ref.run] = TimelineEntry(
             kind="run",
             run=ref.run,
             sequence=ref.sequence,
             at=ref.at,
-            commit=ref.commit or UNKNOWN,
+            commit=commit,
+            commit_basis=basis,
             recorded=ref.unobserved is None,
             reason=ref.unobserved,
         )
     for observation in sorted(own, key=lambda o: (o.sequence, o.run)):
         if observation.run in runs:
             entry = runs[observation.run]
-            if entry.commit == UNKNOWN and observation.commit:
+            # An observation's commit is its invocation's ``git_sha``, which
+            # comes before the orchestrator's.
+            if entry.commit_basis != "git_sha" and observation.commit:
                 runs[observation.run] = entry.model_copy(
-                    update={"commit": observation.commit}
+                    update={"commit": observation.commit, "commit_basis": "git_sha"}
                 )
             continue
+        commit, basis = resolve_commit(observation.commit)
         runs[observation.run] = TimelineEntry(
             kind="run",
             run=observation.run,
             sequence=observation.sequence,
             at=observation.at,
-            commit=observation.commit or UNKNOWN,
+            commit=commit,
+            commit_basis=basis,
             in_heartbeat=named_by_observations,
         )
     ordered = sorted(runs.values(), key=lambda e: (e.sequence or 0, e.run or ""))
@@ -348,12 +373,77 @@ def build_timeline(
 
 class RunPoint(Value):
     """A run in the timeline: its id, place in invocation order, time and
-    commit (``unknown`` where the invocation records none)."""
+    commit (``unknown`` where nothing records one), with where the commit came
+    from."""
 
     run: str
     sequence: int
     at: datetime | None = None
     commit: str = UNKNOWN
+    commit_basis: CommitBasis = "unknown"
+
+
+#: How a break's two ends relate in the repository's history.
+CommitRangeStatus = Literal["ordered", "same_commit", "not_ordered", "unknown"]
+
+#: Why a commit range is ``unknown`` or ``not_ordered``.
+CommitRangeReason = Literal[
+    "commit_unknown",
+    "no_prior_pass",
+    "commit_not_in_history",
+    "history_unreadable",
+    "no_good_ancestor",
+    "diverged",
+]
+
+
+class CommitRef(Value):
+    """One end of a commit range: the commit, the run that deployed it, and
+    where the commit came from (``git_sha``, ``orchestrator`` or ``unknown``)."""
+
+    commit: str
+    run: str
+    sequence: int
+    basis: CommitBasis
+
+
+class CommitRange(Value):
+    """The commits a break spans, read from the repository's history.
+
+    ``through`` is the first failing run's commit. ``last_good_run`` is the
+    last passing run before it in invocation order. ``after`` holds the passing
+    commits the range is bounded by: every earlier passing run's commit that is
+    an ancestor of (or equal to) ``through``, keeping only those no other bound
+    descends from. ``commits`` are the commits ``through`` has that none of
+    ``after`` has, newest first, at most ``limit`` of them, with ``count`` the
+    full count.
+
+    ``status`` is ``ordered`` where such a bound exists; ``same_commit`` where a
+    run of the failing commit itself passed earlier, so no commit is in the
+    range and the change is not in the code; ``not_ordered`` (``diverged``)
+    where the last passing run's commit and the failing one are neither
+    ancestor nor descendant; and ``unknown`` with a ``reason`` otherwise.
+    ``side`` names which end a ``commit_unknown`` or
+    ``commit_not_in_history`` reason is about. ``run_order`` says whether the
+    last passing run is one of the bounds (``agrees``) or was left out because
+    its commit descends from the failing one (``disagrees``: a rollback, or a
+    branch deployed in turn). ``unplaced_good_runs`` counts earlier passing
+    runs whose commit is unknown or not in the history, which could only
+    narrow the range.
+    """
+
+    status: CommitRangeStatus
+    reason: CommitRangeReason | None = None
+    side: Literal["after", "through"] | None = None
+    history: HistoryKind | None = None
+    through: CommitRef
+    last_good_run: CommitRef | Literal["unknown"] = UNKNOWN
+    after: tuple[CommitRef, ...] = ()
+    run_order: Literal["agrees", "disagrees"] | None = None
+    commits: tuple[str, ...] = ()
+    count: int | None = None
+    elided: int = 0
+    unplaced_good_runs: int = 0
 
 
 class TimelineSegment(Value):
@@ -389,6 +479,9 @@ class Break(Value):
     unobserved_runs: int = 0
     missed_runs: int = 0
     reasons: tuple[UnobservedReason, ...] = ()
+    #: The commits it spans, read from history; ``None`` where the caller
+    #: passed no history to read (#1467).
+    commits: CommitRange | None = None
 
 
 class LatestPoint(Value):
@@ -471,14 +564,18 @@ def _points(timeline: Timeline, items: Iterable[Observation]) -> list[_Point]:
             continue
         on_axis.add(entry.sequence)
         held = outcomes.get(entry.sequence)
-        commit = entry.commit if entry.commit and entry.commit != UNKNOWN else None
-        if held is not None and commit is None:
-            commit = held[1].commit
+        commit: str | None = None
+        basis: CommitBasis = "unknown"
+        if entry.commit and entry.commit != UNKNOWN:
+            commit, basis = entry.commit, entry.commit_basis
+        if held is not None and held[1].commit and basis != "git_sha":
+            commit, basis = held[1].commit, "git_sha"
         point = RunPoint(
             run=entry.run,
             sequence=entry.sequence,
             at=entry.at,
             commit=commit or UNKNOWN,
+            commit_basis=basis if commit else "unknown",
         )
         if held is not None:
             state: PointState = "observed_bad" if held[0] == "bad" else "observed_good"
@@ -497,6 +594,7 @@ def _points(timeline: Timeline, items: Iterable[Observation]) -> list[_Point]:
             sequence=sequence,
             at=observation.at,
             commit=observation.commit or UNKNOWN,
+            commit_basis="git_sha" if observation.commit else "unknown",
         )
         entry = TimelineEntry(
             kind="run",
@@ -504,6 +602,7 @@ def _points(timeline: Timeline, items: Iterable[Observation]) -> list[_Point]:
             sequence=sequence,
             at=observation.at,
             commit=point.commit,
+            commit_basis=point.commit_basis,
             in_heartbeat=False,
         )
         state = "observed_bad" if outcome == "bad" else "observed_good"
@@ -635,8 +734,140 @@ def _segments(points: Iterable[_Point]) -> tuple[TimelineSegment, ...]:
     return tuple(segments)
 
 
-def _breaks(points: Iterable[_Point]) -> tuple[Break, ...]:
+def _ref(point: RunPoint) -> CommitRef:
+    return CommitRef(
+        commit=point.commit,
+        run=point.run,
+        sequence=point.sequence,
+        basis=point.commit_basis,
+    )
+
+
+def commit_range(
+    through: RunPoint,
+    last_good: RunPoint | None,
+    goods: Iterable[RunPoint],
+    history: CommitHistory,
+    *,
+    limit: int = DEFAULT_COMMIT_LIMIT,
+) -> CommitRange:
+    """The commits a break spans, read from ``history`` (#1467).
+
+    ``through`` is the first failing run, ``last_good`` the last passing run
+    before it in invocation order, and ``goods`` every passing run before it.
+    The range is bounded by every passing commit that is an ancestor of the
+    failing one, so a passing run whose commit descends from it (a rollback, a
+    branch deployed in turn) is left out rather than read as the start of the
+    range. Where the last passing commit and the failing one are neither
+    ancestor nor descendant, the range is ``not_ordered``.
+    """
+
+    head = _ref(through)
+    last = _ref(last_good) if last_good is not None else UNKNOWN
+
+    def unknown(
+        reason: CommitRangeReason,
+        side: Literal["after", "through"] | None = None,
+        unplaced: int = 0,
+    ) -> CommitRange:
+        return CommitRange(
+            status="not_ordered" if reason == "diverged" else "unknown",
+            reason=reason,
+            side=side,
+            history=history.kind,
+            through=head,
+            last_good_run=last,
+            unplaced_good_runs=unplaced,
+        )
+
+    if through.commit == UNKNOWN:
+        return unknown("commit_unknown", "through")
+    if last_good is None:
+        return unknown("no_prior_pass")
+    if last_good.commit == UNKNOWN:
+        return unknown("commit_unknown", "after")
+    try:
+        bad = history.resolve(through.commit)
+        if bad is None:
+            return unknown("commit_not_in_history", "through")
+        newest = history.resolve(last_good.commit)
+        if newest is None:
+            return unknown("commit_not_in_history", "after")
+        if (
+            newest != bad
+            and not history.is_ancestor(newest, bad)
+            and not history.is_ancestor(bad, newest)
+        ):
+            return unknown("diverged")
+
+        # Each distinct passing commit, newest run first, with its latest run.
+        by_commit: dict[str, RunPoint] = {}
+        unplaced = 0
+        ordered_goods = sorted(goods, key=lambda p: p.sequence, reverse=True)
+        for good in ordered_goods:
+            if good.sequence >= through.sequence:
+                continue
+            if good.commit == UNKNOWN:
+                unplaced += 1
+                continue
+            if len(by_commit) >= MAX_GOOD_COMMITS and good.commit not in by_commit:
+                unplaced += 1
+                continue
+            by_commit.setdefault(good.commit, good)
+        resolved: dict[str, RunPoint] = {}
+        for recorded, good in by_commit.items():
+            full = history.resolve(recorded)
+            if full is None:
+                unplaced += sum(
+                    1
+                    for g in ordered_goods
+                    if g.commit == recorded and g.sequence < through.sequence
+                )
+                continue
+            resolved.setdefault(full, good)
+        bounds = {
+            full: good
+            for full, good in resolved.items()
+            if history.is_ancestor(full, bad)
+        }
+        if not bounds:
+            return unknown("no_good_ancestor", unplaced=unplaced)
+        if bad in bounds:
+            same = bounds[bad]
+            return CommitRange(
+                status="same_commit",
+                history=history.kind,
+                through=head,
+                last_good_run=last,
+                after=(_ref(same),),
+                run_order="agrees" if newest == bad else "disagrees",
+                count=0,
+                unplaced_good_runs=unplaced,
+            )
+        kept = history.independent(list(bounds))
+        commits, count = history.between(bad, kept, limit)
+    except HistoryUnreadableError:
+        return unknown("history_unreadable")
+    after = tuple(sorted((_ref(bounds[k]) for k in kept), key=lambda r: -r.sequence))
+    return CommitRange(
+        status="ordered",
+        history=history.kind,
+        through=head,
+        last_good_run=last,
+        after=after,
+        run_order="agrees" if newest in kept else "disagrees",
+        commits=commits,
+        count=count,
+        elided=max(count - len(commits), 0),
+        unplaced_good_runs=unplaced,
+    )
+
+
+def _breaks(
+    points: Iterable[_Point], history: CommitHistory | None = None
+) -> tuple[Break, ...]:
     breaks: list[Break] = []
+    goods: list[RunPoint] = []
     last_good: RunPoint | None = None
     previous: PointState | None = None
     unobserved = missed = 0
@@ -660,10 +891,16 @@ def _breaks(points: Iterable[_Point]) -> tuple[Break, ...]:
                     unobserved_runs=unobserved,
                     missed_runs=missed,
                     reasons=tuple(sorted(reasons)),  # type: ignore[arg-type]
+                    commits=(
+                        None
+                        if history is None
+                        else commit_range(p.point, last_good, goods, history)
+                    ),
                 )
             )
         if p.state == "observed_good":
             last_good = p.point
+            goods.append(p.point)
         previous = p.state
         unobserved = missed = 0
         reasons = set()
@@ -674,6 +911,8 @@ def place_break(
     timeline: Timeline,
     observations: Iterable[Observation],
     through: int,
+    *,
+    history: CommitHistory | None = None,
 ) -> Break | None:
     """The break whose failure is the run at sequence ``through``.
 
@@ -709,12 +948,19 @@ def place_break(
         if p.reason is not None:
             reasons.add(p.reason)
     after = by_seq.get(after_seq) if after_seq is not None else None
+    commits = None
+    if history is not None:
+        good_points = [
+            by_seq[s] for s in sorted({o.sequence for o in goods}) if s in by_seq
+        ]
+        commits = commit_range(through_point, after, good_points, history)
     return Break(
         after=after if after is not None else UNKNOWN,
         through=through_point,
         unobserved_runs=unobserved,
         missed_runs=missed,
         reasons=tuple(sorted(reasons)),  # type: ignore[arg-type]
+        commits=commits,
     )
 
 
@@ -723,12 +969,15 @@ def subject_history(
     subject: Subject,
     signal: Signal,
     observations: Iterable[Observation],
+    *,
+    history: CommitHistory | None = None,
 ) -> SubjectHistory:
     """One subject and signal's history on ``timeline``.
 
     ``observations`` may come from more than one source observing the same
     invocations (the same ``sequence``): within one run a failure is read
     over a pass. A run only another source observed is added in its place.
+    With ``history``, each break carries the commits it spans (#1467).
     """
 
     items = [o for o in observations if o.subject == subject and o.signal == signal]
@@ -757,12 +1006,15 @@ def subject_history(
         last_verified=good[-1] if good and good[-1] is not None else UNKNOWN,
         last_observed=seen[-1] if seen and seen[-1] is not None else UNKNOWN,
         latest=latest,
-        breaks=_breaks(points),
+        breaks=_breaks(points, history),
     )
 
 
 def subject_histories(
-    timeline: Timeline, observations: Iterable[Observation]
+    timeline: Timeline,
+    observations: Iterable[Observation],
+    *,
+    history: CommitHistory | None = None,
 ) -> tuple[SubjectHistory, ...]:
     """Every subject and signal the observations name, on ``timeline``."""
 
@@ -774,7 +1026,9 @@ def subject_histories(
         keys,
         key=lambda k: (k[0].kind, k[0].key, k[1].column or "", k[1].metric or ""),
     )
-    return tuple(subject_history(timeline, s, g, items) for s, g in ordered)
+    return tuple(
+        subject_history(timeline, s, g, items, history=history) for s, g in ordered
+    )
 
 
 def window_segments(
@@ -808,9 +1062,15 @@ def window_segments(
 
 
 __all__ = [
+    "DEFAULT_COMMIT_LIMIT",
     "DEFAULT_GAP_FLOOR_SECONDS",
     "DEFAULT_GAP_TOLERANCE",
+    "MAX_GOOD_COMMITS",
     "Break",
+    "CommitRange",
+    "CommitRangeReason",
+    "CommitRangeStatus",
+    "CommitRef",
     "FallbackReason",
     "GapSchedule",
     "Heartbeat",
@@ -826,6 +1086,7 @@ __all__ = [
     "Upload",
     "build_timeline",
     "choose_heartbeat",
+    "commit_range",
     "place_break",
     "subject_histories",
     "subject_history",

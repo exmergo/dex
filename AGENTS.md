@@ -1111,7 +1111,8 @@ them.
   interval, one lifecycle rule, no value from the data), and the coverage
   timeline they are laid on (a named heartbeat, every unobserved interval and
   its reason, a subject's last verified run, and the break a diagnosis
-  bisects): `references/incidents.md`.
+  bisects, with the commits it spans read from the repository's history rather
+  than from run order): `references/incidents.md`.
 - Running the lifecycle across more than one process (a plan a second
   process can carry and check, what it depends on, what its edits contain,
   and what a build established): `references/host-integration.md`.
