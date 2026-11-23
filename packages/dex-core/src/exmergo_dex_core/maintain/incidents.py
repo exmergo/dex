@@ -101,18 +101,21 @@ DEFAULT_STALE_FLOOR_SECONDS = 3600.0
 CoverageSegment = TimelineSegment
 
 #: Why :func:`fold_incidents` refused its input.
-FoldInputCode = Literal["run_sequence_conflict", "opener_tie_undeclared"]
+FoldInputCode = Literal[
+    "run_sequence_conflict", "sequence_run_conflict", "opener_tie_undeclared"
+]
 
 
 class FoldInputError(DexError, ValueError):
     """Input the fold refuses rather than read in an order nobody declared.
 
-    ``run_sequence_conflict``: one run id carries two ``sequence`` values
-    across the observations, the sources' runs and the timelines, so the
-    invocation order is not one order. ``opener_tie_undeclared``: two sources
-    failed in the run that opens an incident and ``sources`` gives no
-    precedence between them. ``run`` names the run, and ``sequences`` or
-    ``sources`` what disagreed.
+    Across the observations, the sources' runs and the timelines, a run and
+    its place in invocation order must name each other one to one.
+    ``run_sequence_conflict``: one run id carries two ``sequence`` values.
+    ``sequence_run_conflict``: one ``sequence`` carries two run ids.
+    ``opener_tie_undeclared``: two sources failed in the run that opens an
+    incident and ``sources`` gives no precedence between them. ``run`` names
+    the run, and ``runs``, ``sequences`` or ``sources`` what disagreed.
     """
 
     def __init__(
@@ -121,12 +124,14 @@ class FoldInputError(DexError, ValueError):
         message: str,
         *,
         run: str,
+        runs: tuple[str, ...] = (),
         sequences: tuple[int, ...] = (),
         sources: tuple[str, ...] = (),
     ) -> None:
         super().__init__(message)
         self.code = code
         self.run = run
+        self.runs = runs
         self.sequences = sequences
         self.sources = sources
 
@@ -397,28 +402,21 @@ def _check_run_sequences(
     sources: Iterable[SourceHistory],
     timelines: Mapping[str, Timeline],
 ) -> None:
-    """Refuse a run id that carries two ``sequence`` values anywhere.
+    """Refuse a run id with two ``sequence`` values, or a sequence with two
+    run ids, anywhere.
 
     A run id names one invocation, which every source sees at one place in
-    invocation order. Two places for one run mean an adapter numbered its runs
-    on its own, and reading them as given would order the sources' outcomes
-    against each other wrongly.
+    invocation order. Two places for one run, or two runs at one place, mean
+    an adapter numbered its runs on its own, and reading them as given would
+    order the sources' outcomes against each other wrongly.
     """
 
-    seen: dict[str, tuple[int, str]] = {}
+    places: dict[str, tuple[int, str]] = {}
+    names: dict[int, tuple[str, str]] = {}
 
     def hold(run: str, sequence: int, where: str) -> None:
-        held = seen.setdefault(run, (sequence, where))
-        if held[0] != sequence:
-            raise FoldInputError(
-                "run_sequence_conflict",
-                f"run {run!r} is sequence {held[0]} in {held[1]} and "
-                f"{sequence} in {where}: one run has one place in invocation "
-                "order, so number every source's runs from the same series",
-                run=run,
-                sequences=(held[0], sequence),
-                sources=tuple(dict.fromkeys((held[1], where))),
-            )
+        _one_place(places, run, sequence, where)
+        _one_run(names, run, sequence, where)
 
     for observation in observed:
         hold(observation.run, observation.sequence, observation.source)
@@ -430,6 +428,45 @@ def _check_run_sequences(
             if entry.kind != "run" or entry.run is None or entry.sequence is None:
                 continue
             hold(entry.run, entry.sequence, name)
+
+
+def _one_place(
+    places: dict[str, tuple[int, str]], run: str, sequence: int, where: str
+) -> None:
+    """Refuse a run id seen at two sequences."""
+
+    held = places.setdefault(run, (sequence, where))
+    if held[0] == sequence:
+        return
+    raise FoldInputError(
+        "run_sequence_conflict",
+        f"run {run!r} is sequence {held[0]} in {held[1]} and "
+        f"{sequence} in {where}: one run has one place in invocation "
+        "order, so number every source's runs from the same series",
+        run=run,
+        sequences=(held[0], sequence),
+        sources=tuple(dict.fromkeys((held[1], where))),
+    )
+
+
+def _one_run(
+    names: dict[int, tuple[str, str]], run: str, sequence: int, where: str
+) -> None:
+    """Refuse a sequence seen with two run ids."""
+
+    held = names.setdefault(sequence, (run, where))
+    if held[0] == run:
+        return
+    raise FoldInputError(
+        "sequence_run_conflict",
+        f"sequence {sequence} is run {held[0]!r} in {held[1]} and {run!r} in "
+        f"{where}: one place in invocation order holds one run, so number "
+        "every source's runs from the same series",
+        run=run,
+        runs=(held[0], run),
+        sequences=(sequence,),
+        sources=tuple(dict.fromkeys((held[1], where))),
+    )
 
 
 def _order(observation: Observation) -> tuple[int, int, str, str]:

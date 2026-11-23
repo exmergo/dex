@@ -397,6 +397,42 @@ def test_a_run_numbered_twice_by_a_timeline_is_refused() -> None:
     assert refused.value.sequences == (1, 9)
 
 
+def test_one_sequence_holding_two_runs_across_sources_is_refused() -> None:
+    # dbt numbered its one invocation 1, which is Elementary's inv-A: the
+    # fold would read dbt's pass as evidence on inv-A's run.
+    series = [
+        _at_run("inv-A", 1, "bad", ELEMENTARY),
+        _at_run("inv-B", 2, "good", ELEMENTARY),
+        _at_run("inv-D", 3, "good", ELEMENTARY),
+        _at_run("inv-C", 1, "good", DBT),
+    ]
+    ranked = [SourceHistory(name=ELEMENTARY), SourceHistory(name=DBT)]
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(series, sources=ranked, now=_now(3))
+    assert refused.value.code == "sequence_run_conflict"
+    assert refused.value.runs == ("inv-A", "inv-C")
+    assert refused.value.sequences == (1,)
+    assert refused.value.sources == (ELEMENTARY, DBT)
+
+
+def test_a_sequence_a_sources_runs_give_another_run_is_refused() -> None:
+    history = SourceHistory(name=DBT, runs=(RunRef(run="inv-X", sequence=2, at=T0),))
+    with pytest.raises(FoldInputError, match="inv-X") as refused:
+        fold_incidents(_series("bb"), sources=[history], now=_now(2))
+    assert refused.value.code == "sequence_run_conflict"
+
+
+def test_a_sequence_a_timeline_gives_another_run_is_refused() -> None:
+    timeline = build_timeline(
+        DBT,
+        Heartbeat(basis="source_runs", runs=(RunRef(run="inv-X", sequence=1),)),
+    )
+    with pytest.raises(FoldInputError) as refused:
+        fold_incidents(_series("bb"), timelines={DBT: timeline}, now=_now(2))
+    assert refused.value.code == "sequence_run_conflict"
+    assert refused.value.runs == ("inv-1", "inv-X")
+
+
 def _opener_tie() -> list[Observation]:
     # dbt read one invocation; Elementary holds that one and three more.
     return [_obs(5, "bad", source=DBT)] + [

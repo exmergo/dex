@@ -71,11 +71,16 @@ incident, so its tests and its latest severity are as the sources wrote them.
 ### One invocation order for every source
 
 A run id names one invocation, so it has one place in invocation order whichever
-source holds it. `fold_incidents` refuses, with a `FoldInputError` whose `code`
-is `run_sequence_conflict`, any run id that carries two `sequence` values across
-the observations, the runs each `SourceHistory` holds and the timelines. Reading
-such input would order one source's outcomes against another's wrongly, so the
-adapters have to number every source's runs from one series.
+source holds it, and that place holds no other run. Across the observations, the
+runs each `SourceHistory` holds and the timelines, `fold_incidents` refuses with
+a `FoldInputError`:
+
+- `run_sequence_conflict`: one run id that carries two `sequence` values;
+- `sequence_run_conflict`: one `sequence` that carries two run ids, which is
+  what an adapter numbering its own runs from 1 most often produces.
+
+Reading such input would order one source's outcomes against another's wrongly,
+so the adapters have to number every source's runs from one series.
 
 ### Which source opens a tie
 
