@@ -233,8 +233,10 @@ def _history(engine: DexEngine) -> Any:
         return None
     history = GitHistory(root)
     try:
-        history.resolve("HEAD")
-    except (HistoryUnreadableError, ValueError):
+        # Reads whether the root is a repository at all; `resolve` takes only
+        # a commit's object name, never a ref such as HEAD.
+        _ = history.shallow
+    except HistoryUnreadableError:
         return None
     return history
 

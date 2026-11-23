@@ -622,3 +622,75 @@ def test_an_incident_that_closed_is_listed_undiagnosed_with_why(tmp_path: Path):
     [entry] = data["not_diagnosed"]
     assert entry["state"] == "closed"
     assert entry["reason"] == "not_open"
+
+
+# --- the history and the spend the box's planted pass found untested -------------
+
+
+def test_the_repository_s_history_reaches_the_fold_and_rules_the_project_out(
+    tmp_path: Path,
+):
+    # Every run deployed the same commit, which passed before it failed: read
+    # from the repository's history, the break spans no commit, so the project
+    # is ruled out. Without the history the range is not read at all.
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _git(root, "add", "dbt_project.yml")
+    _git(root, "commit", "-q", "-m", "project")
+    head = subprocess.run(  # noqa: S603
+        ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    con = duckdb.connect(str(warehouse))
+    con.execute("UPDATE main_elementary.dbt_invocations SET git_sha = ?", [head])
+    con.close()
+    [diagnosis] = _diagnose(root, warehouse)["diagnoses"]
+
+    assert diagnosis["range"]["commits"]["status"] == "same_commit"
+    [project] = [c for c in diagnosis["ruled_out"] if c["owner"] == "project"]
+    assert project["reason"] == "same_commit"
+    assert project["evidence"]["commit"] == head
+
+
+def test_the_command_s_spend_sums_the_incident_read_and_the_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core import command_args
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    engine = DexEngine(connector="duckdb", path=str(warehouse), repo_root=str(root))
+    opened = engine._adapter
+
+    def gated(*args, **kwargs):
+        adapter = opened(*args, **kwargs)
+        adapter.cost_gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=10_000_000.0,
+            session_ceiling=100_000_000.0,
+            session_spent=0.0,
+            confirmed=True,
+            connector="bigquery",
+            command="maintain diagnose",
+        )
+        return adapter
+
+    # Each phase settles once: the incident read first, then the checks.
+    settlements = iter(
+        [
+            {"bytes_billed": 100, "session_spent_today": 100},
+            {"bytes_billed": 40, "session_spent_today": 140},
+        ]
+    )
+    monkeypatch.setattr(engine, "_adapter", gated)
+    monkeypatch.setattr(
+        command_args, "settled_spend", lambda adapter: next(settlements)
+    )
+    data = to_envelope(engine.diagnose()).data
+
+    assert data["spend"]["bytes_billed"] == 140
+    assert data["spend"]["session_spent_today"] == 140
+    assert data["price"]["incidents"]["settled"]["bytes_billed"] == 100
+    assert data["price"]["checks"]["settled"]["bytes_billed"] == 40
