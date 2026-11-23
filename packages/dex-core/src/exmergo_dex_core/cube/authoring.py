@@ -371,11 +371,36 @@ def write_edits(
             "configured Cube model files are missing at apply time, so nothing was "
             "written: " + ", ".join(missing)
         )
-    from .loader import validate_model_contents
-
-    validated = validate_model_contents(prospective)
-    if validated.errors:
-        listed = "\n  ".join(d.render() for d in validated.errors)
+    # As at plan time, compiled-only content is refused before any other
+    # validation: the loader returns early for a Jinja template with no
+    # diagnostics, so refusals_for would pass what validate_plan rejects.
+    compiled: list[str] = []
+    for _, edit in staged:
+        found = current.get(edit.path)
+        if found is not None and (hit := _compiled_only(found)):
+            element, reason = hit
+            compiled.append(
+                f"{edit.path}: {element}: the file on disk is compiled-only "
+                f"({reason}), and dex writes plain YAML model files only, so it is "
+                "not replaced"
+            )
+        if hit := _compiled_only(edit.new_content or ""):
+            element, reason = hit
+            compiled.append(
+                f"{edit.path}: {element}: the authored content is compiled-only "
+                f"({reason}); dex authors plain YAML cubes and views that it can "
+                "validate, and never one only Cube's compiler can read"
+            )
+    if compiled:
+        raise ProjectError(
+            "compiled-only Cube content cannot be authored, so nothing was "
+            "written:\n  " + "\n  ".join(compiled)
+        )
+    # The same checks a plan is stored under, strict rules included: a plan
+    # document applied in another checkout never ran this layer's planning.
+    _validated, refusals = refusals_for(prospective, {e.path for _, e in staged})
+    if refusals:
+        listed = "\n  ".join(d.render() for d in refusals)
         raise ProjectError(
             "the Cube models this apply would leave are invalid, so nothing was "
             f"written:\n  {listed}"
@@ -401,8 +426,17 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
             handle, name = tempfile.mkstemp(
                 dir=target.parent, prefix=f".{target.name}.", suffix=".dex"
             )
+            # mkstemp creates the file owner-only; the written file keeps the
+            # target's mode, or a new file's usual mode under the umask.
+            mode = _mode_for(target)
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle, mode)
             with os.fdopen(handle, "wb") as out:
                 out.write((edit.new_content or "").encode("utf-8"))
+            if not hasattr(os, "fchmod"):
+                # os.fchmod is Unix-only, so where it is missing the mode is
+                # set on the staged path instead, before it replaces the target.
+                os.chmod(name, mode)
             temporaries.append((Path(name), target, edit))
     except OSError:
         for temporary, _, _ in temporaries:
@@ -417,6 +451,17 @@ def _write_all(staged: list[tuple[Path, PlanEdit]]) -> list[str]:
 
 
 # --- helpers -------------------------------------------------------------------
+
+
+def _mode_for(target: Path) -> int:
+    """The permission bits a write to ``target`` should leave."""
+
+    try:
+        return target.stat().st_mode & 0o777
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o666 & ~umask
 
 
 def _root(layer: CubeSemanticLayer) -> Path:
