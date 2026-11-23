@@ -27,6 +27,7 @@ import pytest
 from exmergo_dex_core import DexEngine
 from exmergo_dex_core.cache import ColumnProfile, Dataset
 from exmergo_dex_core.cli import dispatch
+from exmergo_dex_core.maintain.commit_history import git_env
 from exmergo_dex_core.maintain.results import DiagnoseResult
 from exmergo_dex_core.maintain.snapshot import Snapshot, WarehouseBaseline
 from exmergo_dex_core.results import to_envelope
@@ -57,6 +58,7 @@ def _git(root: Path, *args: str) -> None:
         ],
         check=True,
         capture_output=True,
+        env=git_env(),
     )
 
 
@@ -640,6 +642,7 @@ def test_the_repository_s_history_reaches_the_fold_and_rules_the_project_out(
         ["git", "-C", str(root), "rev-parse", "HEAD"],  # noqa: S607
         check=True,
         capture_output=True,
+        env=git_env(),
         text=True,
     ).stdout.strip()
     con = duckdb.connect(str(warehouse))
@@ -694,3 +697,22 @@ def test_the_command_s_spend_sums_the_incident_read_and_the_checks(
     assert data["spend"]["session_spent_today"] == 140
     assert data["price"]["incidents"]["settled"]["bytes_billed"] == 100
     assert data["price"]["checks"]["settled"]["bytes_billed"] == 40
+
+
+def test_a_git_dir_in_the_environment_does_not_redirect_the_series(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A process started from a git hook, or under a harness that exports
+    # GIT_DIR, still reads the repository that holds .dex, never that one.
+    runs = _runs()
+    before = runs[0].started + timedelta(minutes=30)
+    root, warehouse, _ = _project(tmp_path, duplicated=True, snapshot_before=before)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _git(decoy, "init", "-q")
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    data = _diagnose(root, warehouse)
+
+    assert data["series"]["count"] == 1
+    assert _cause(data)["finding"] == "key_lost_uniqueness"

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .commit_history import GIT_TIMEOUT_SECONDS
+from .commit_history import GIT_TIMEOUT_SECONDS, git_env
 from .diagnosis import Series, SnapshotPoint
 from .snapshot import Snapshot
 
@@ -153,9 +153,9 @@ def _measured(
 def _git(
     root: Path, timeout: float, *args: str
 ) -> subprocess.CompletedProcess[str] | None:
-    env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env["GIT_OPTIONAL_LOCKS"] = "0"
+    # The repository is the one holding `root`, never one a GIT_DIR in the
+    # environment points at (a git hook, a harness that exports it).
+    env = git_env()
     try:
         return subprocess.run(  # noqa: S603
             ["git", "-C", str(root), "-c", "core.fsmonitor=false", *args],  # noqa: S607
