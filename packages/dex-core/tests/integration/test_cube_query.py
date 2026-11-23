@@ -8,8 +8,10 @@ holds no credential for it, so every answer below was executed by dex.
 
 DuckDB runs over the fixture rows the unit tests use, written to a file this
 suite owns. Postgres runs over the ``app`` schema ``scripts/postgres_seed.sql``
-seeds, read as ``dex_ro``. Both run every query case and are held to the same
-question asked in hand-written SQL.
+seeds, read as ``dex_ro``. ClickHouse and Trino (#1410) run over the ``app``
+tables ``scripts/setup_clickhouse_dev.sh`` and ``scripts/setup_trino_dev.sh``
+seed. Each runs the query cases in ``BY_HAND`` and is held to the same question
+asked in hand-written SQL.
 
 ``--api`` (#914) asks the *executing* containers ``scripts/setup_cube_dev.sh
 --execute`` starts the same questions: Cube runs them on the same rows (DuckDB
@@ -36,7 +38,7 @@ from cube_vendor.cube_cases import MODEL, MODEL_FILES, QUERIES, VALUES, write_sh
 
 from exmergo_dex_core.cli import main
 
-from .conftest import assert_ok, integration_budget
+from .conftest import assert_ok, integration_budget, trino_client
 
 pytestmark = [pytest.mark.integration, pytest.mark.cube]
 
@@ -86,7 +88,8 @@ def _rounded(rows) -> list[tuple]:
         except (TypeError, ValueError):
             return str(value)[:19]
 
-    return sorted(tuple(one(v) for v in row) for row in rows)
+    # A NULL sorts with no other value, so order by the cells as text.
+    return sorted((tuple(one(v) for v in row) for row in rows), key=repr)
 
 
 # The question each case asks, by hand, over the same tables. `{tz}` buckets a
@@ -118,6 +121,15 @@ IDIOMS = {
     "postgres": {
         "month": "date_trunc('month', ordered_at AT TIME ZONE 'UTC')",
         "quarter": "date_trunc('quarter', ordered_at AT TIME ZONE 'UTC')",
+    },
+    "clickhouse": {
+        "month": "toStartOfMonth(toTimeZone(ordered_at, 'UTC'))",
+        "quarter": "toStartOfQuarter(toTimeZone(ordered_at, 'UTC'))",
+    },
+    # The seeded column carries no zone, and a UTC session reads it as UTC.
+    "trino": {
+        "month": "date_trunc('month', ordered_at)",
+        "quarter": "date_trunc('quarter', ordered_at)",
     },
 }
 
@@ -231,6 +243,79 @@ def test_a_live_cube_serving_an_edited_model_is_refused_as_stale(
 
     assert envelope["reason"] == "guard", envelope
     assert "orders.revenue has different SQL there" in envelope["errors"][0]
+
+
+# --- ClickHouse and Trino (#1410) --------------------------------------------------
+
+
+@pytest.mark.clickhouse
+def test_clickhouse_answers_every_case_rendered_by_a_live_cube(
+    tmp_path, capsys, ch_dsn, monkeypatch
+):
+    import clickhouse_connect
+
+    monkeypatch.setenv("CLICKHOUSE_URL", ch_dsn)
+    root = _repo(
+        tmp_path,
+        "clickhouse",
+        os.environ["DEX_TEST_CUBE_URL_CLICKHOUSE"],
+        {"clickhouse": {"databases": ["app"]}, "budget": integration_budget(None)},
+    )
+    _, asked = _run(capsys, root, *_argv("by_status"))
+    assert asked["status"] == "needs_confirmation", asked["errors"]
+
+    def by_hand(sql: str):
+        client = clickhouse_connect.get_client(dsn=ch_dsn)
+        try:
+            # Cube's ClickHouse driver and dex's adapter both run with
+            # join_use_nulls = 1, so an unmatched row is NULL, as in SQL.
+            return client.query(sql, settings={"join_use_nulls": 1}).result_rows
+        finally:
+            client.close()
+
+    _check_every_case(
+        capsys, root, "clickhouse", by_hand, ["--confirm", "--budget", "30"]
+    )
+
+
+@pytest.mark.trino
+def test_trino_answers_every_case_rendered_by_a_live_cube(
+    tmp_path, capsys, trino_url, monkeypatch
+):
+    """dex names every Trino relation with its catalog, so the model here is the
+    copy the ``cube`` job starts its Trino renderer on (``--model``): each
+    ``sql_table`` under the ``memory`` catalog. The seeded timestamps carry no
+    zone and the Trino client sends this machine's, so off UTC the buckets
+    only match the hand-written ones because dex pins the session."""
+
+    monkeypatch.setenv("TRINO_URL", trino_url)
+    root = _repo(
+        tmp_path,
+        "trino",
+        os.environ["DEX_TEST_CUBE_URL_TRINO"],
+        {"trino": {"catalogs": ["memory"]}, "budget": integration_budget(None)},
+    )
+    for name in MODEL_FILES:
+        file = root / "model" / name
+        file.write_text(
+            file.read_text().replace("sql_table: app.", "sql_table: memory.app."),
+            encoding="utf-8",
+        )
+    _, asked = _run(capsys, root, *_argv("by_status"))
+    assert asked["status"] == "needs_confirmation", asked["errors"]
+
+    def by_hand(sql: str):
+        conn = trino_client(trino_url)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SET TIME ZONE 'UTC'")
+            cursor.fetchall()
+            cursor.execute(sql.replace(" app.", " memory.app."))
+            return cursor.fetchall()
+        finally:
+            conn.close()
+
+    _check_every_case(capsys, root, "trino", by_hand, ["--confirm", "--budget", "30"])
 
 
 def test_a_live_cube_enforces_dex_scopes_and_refuses_load():

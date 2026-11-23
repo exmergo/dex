@@ -436,9 +436,10 @@ def _equality(term: exp.Expression) -> tuple[str, str] | None:
 def string_literal(value: str, connector: str) -> str:
     """``value`` as a string literal of ``connector``'s dialect.
 
-    The dialect decides the escaping: a doubled quote on Postgres and DuckDB, a
-    backslash on BigQuery, Snowflake and Redshift, which also escape the
-    backslash itself. Hand-rolled quoting would get one of them wrong.
+    The dialect decides the escaping: a doubled quote on Postgres, DuckDB and
+    Trino, a backslash on BigQuery, Snowflake and Redshift, which also escape
+    the backslash itself, as ClickHouse does beside its doubled quote.
+    Hand-rolled quoting would get one of them wrong.
     """
 
     return exp.Literal.string(value).sql(dialect=_dialect(connector))

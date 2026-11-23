@@ -355,6 +355,24 @@ def test_a_free_door_never_inherits_a_billed_cap(fake_trino_connection):
         assert query.properties == {"query_max_run_time": "60s"}
 
 
+def test_a_utc_session_is_pinned_only_when_asked(fake_trino_connection):
+    """Cube's rendered SQL reads a zone-less timestamp through the session time
+    zone, and the client sends this machine's zone, so the governed Cube path
+    asks for UTC. The caps a later statement sets leave the zone alone."""
+
+    adapter = make_adapter(fake_trino_connection)
+    adapter.run_query(
+        "SELECT COUNT(*) FROM memory.shop.customers", max_rows=10, timeout_seconds=60
+    )
+    assert "time_zone_id" not in fake_trino_connection.properties
+
+    adapter.pin_utc_session()
+    adapter.run_query(
+        "SELECT COUNT(*) FROM memory.shop.customers", max_rows=10, timeout_seconds=60
+    )
+    assert fake_trino_connection.data_queries[-1].properties["time_zone_id"] == "UTC"
+
+
 # --- estimation (free) ---------------------------------------------------------
 
 
