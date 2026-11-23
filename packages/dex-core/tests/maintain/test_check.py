@@ -129,6 +129,27 @@ def test_check_warns_when_cache_outruns_snapshot(maintain_repo):
     assert "maintain snapshot" in stale[0]
 
 
+def test_check_accepts_expected_volume_change_after_remap(maintain_repo):
+    """#985: after an expected volume change, `explore map` then
+    `maintain snapshot` re-pins the new count, so `maintain check` reports
+    no `row_count_changed` for that object. Before the fix the map reused
+    the fresh cached profile with its stale count, the snapshot pinned it,
+    and the check reported the growth again."""
+
+    maintain_repo.snapshot()
+    maintain_repo.sql(
+        "INSERT INTO orders SELECT 1000 + i, (i % 40) + 1, 9.99, 'placed', "
+        "DATE '2024-03-01' FROM range(1, 31) t(i)"
+    )
+    _rc, payload = maintain_repo.dex("explore", "map")
+    assert payload["status"] == "ok", payload
+    maintain_repo.snapshot()
+    _rc, payload = maintain_repo.dex("maintain", "check")
+    assert payload["status"] == "ok", payload
+    codes = {f["code"] for f in payload["data"]["findings"]}
+    assert "row_count_changed" not in codes
+
+
 def test_scope_narrows_every_axis_including_the_paid_ones(maintain_repo):
     """#115: an unscoped check's grain/cardinality estimate covers everything;
     a scoped one should price and report only the named object(s), across

@@ -2090,6 +2090,36 @@ def test_profile_reuses_fresh_cached_profile(
     assert refreshed["data"]["cache_hit_count"] == 0
 
 
+def test_map_refreshes_row_count_of_fresh_cached_profile(
+    airbnb_duckdb: Path, tmp_path: Path, capsys
+):
+    """#985: a fresh cached profile reused by `explore map` kept the row count
+    it was written with, so `maintain snapshot` pinned the stale count and the
+    next `maintain check` reported the expected growth as `row_count_changed`
+    again. The reuse still serves the cached columns without a re-scan, but
+    the count comes from this run's inventory."""
+
+    duckdb = pytest.importorskip("duckdb")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _map(airbnb_duckdb, repo, capsys)
+    store = FilesystemStore(repo)
+    before = _dataset(store.load_cache(), "RAW_HOSTS")
+    assert before.row_count == 3
+    stamp = before.profiled_at
+
+    conn = duckdb.connect(str(airbnb_duckdb))
+    conn.execute("INSERT INTO RAW_HOSTS VALUES (3, 'Carol'), (4, 'Dave')")
+    conn.close()
+
+    payload = _map(airbnb_duckdb, repo, capsys)
+    assert payload["status"] == "ok", payload
+    after = _dataset(store.load_cache(), "RAW_HOSTS")
+    assert after.row_count == 5
+    # Still a cache hit: the columns were reused, not re-scanned.
+    assert after.profiled_at == stamp
+
+
 def test_a_cache_written_before_the_current_schema_version_is_not_reused(
     airbnb_duckdb: Path, tmp_path: Path, capsys
 ):
