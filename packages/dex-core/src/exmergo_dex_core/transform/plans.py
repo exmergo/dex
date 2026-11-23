@@ -685,7 +685,12 @@ def plan(
     except ValueError:
         rel_project = project.as_posix()
     new_plan = TransformPlan(
-        plan_id=_plan_id(intent, pinned, edit_target=edit_target),
+        plan_id=_plan_id(
+            intent,
+            pinned,
+            project_dir=rel_project,
+            edit_target=edit_target,
+        ),
         created_at=created_at,
         intent=intent,
         project_dir=rel_project,
@@ -1425,12 +1430,21 @@ def select_columns(sql: str) -> set[str] | None:
 
 
 def _plan_id(
-    intent: str, edits: list[PlanEdit], *, edit_target: str = "project"
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    project_dir: str | Path | None = None,
+    edit_target: str = "project",
 ) -> str:
     payload: dict[str, Any] = {
         "intent": intent,
         "edits": [e.model_dump(mode="json") for e in edits],
     }
+    if project_dir is not None:
+        norm = str(project_dir).replace("\\", "/").strip()
+        if norm.startswith("./"):
+            norm = norm[2:]
+        payload["project_dir"] = norm or "."
     # Preserve every existing project plan id. The discriminator is needed only
     # for the new axis, where an identical path/content must not collide with a
     # transformation-project proposal.
