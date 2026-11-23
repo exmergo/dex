@@ -380,7 +380,9 @@ hold the longer run history.
   `dex config set` that adds it; nothing is read past the allowlist), a
   connection or catalog that could not be read (`connection_unavailable`,
   `catalog_unavailable`), a read that could not be priced (`unpriced`: it is
-  never asked for at a lower price than it would spend), or the reader's own
+  never asked for at a lower price than it would spend), a statement the
+  warehouse refused mid-read (`warehouse_refused`, its words masked, the price
+  kept), or the reader's own
   refusals. Each source answers alone, so dbt's run results are still read when
   Elementary's tables are not. A confirmation, budget or ceiling refusal is the
   command's, not a source's. An empty `incidents` list means no failure only

@@ -1192,3 +1192,44 @@ def test_a_unit_test_attached_to_a_model_is_selected_by_its_name():
 
     assert selected == {TEST, unit}
     assert unmatched == []
+
+
+def test_a_warehouse_failure_mid_read_refuses_elementary_and_still_reads_dbt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail"}, invocation="dbt-later")
+    engine = _engine(root, warehouse)
+    opened = engine._adapter
+    sent: list[str] = []
+
+    def timing_out(*args, **kwargs):
+        adapter = opened(*args, **kwargs)
+        run_query = adapter.run_query
+
+        def failing(sql, *a, **k):
+            sent.append(sql)
+            # The three counts run, then the invocation read times out.
+            if len(sent) > 3:
+                raise WarehouseQueryError("statement timed out, Value 'secret-7'")
+            return run_query(sql, *a, **k)
+
+        adapter.run_query = failing
+        return adapter
+
+    monkeypatch.setattr(engine, "_adapter", timing_out)
+    data = _data(engine.incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["reason_code"]) == (
+        "refused",
+        "warehouse_refused",
+    )
+    assert "secret-7" not in elementary["detail"]
+    assert data["sources"]["dbt_run_results"]["status"] == "read"
+    assert [i["opening_source"] for i in data["incidents"]] == ["dbt_run_results"]
+    # Priced before the failure, so the price is kept.
+    assert "read result rows" in data["price"]["per_statement"]

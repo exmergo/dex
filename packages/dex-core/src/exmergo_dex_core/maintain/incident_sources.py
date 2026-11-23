@@ -74,12 +74,13 @@ SourceStatus = Literal["read", "missing", "refused"]
 #: two uploads it needs are off), ``tables_not_declared``, ``tables_absent``
 #: (declared, not built), ``outside_allowlist`` (with the ``dex config set``
 #: that adds it), ``prerequisite`` (the ``sql`` extra is missing), a layout
-#: code (:mod:`.elementary_layouts`), a reader code (:mod:`.elementary_refusals`)
+#: code (:mod:`.elementary_layouts`), a reader code (:mod:`.elementary_refusals`),
 #: ``connection_unavailable`` and ``catalog_unavailable`` (the connection or its
 #: catalog could not be read), ``unpriced`` (part of the read could not be
-#: priced, so it was not asked for) or ``firewall_refused``. A cost refusal (a
-#: confirmation, a budget, a ceiling) is the command's and is raised, never a
-#: status. dbt's run results: ``no_project``, ``no_manifest``
+#: priced, so it was not asked for), ``warehouse_refused`` (the warehouse
+#: refused a statement of the read, its words masked) or ``firewall_refused``.
+#: A cost refusal (a confirmation, a budget, a ceiling) is the command's and is
+#: raised, never a status. dbt's run results: ``no_project``, ``no_manifest``
 #: and the adapter's own codes (:mod:`.run_results_incidents`).
 
 #: The two tables the reader reads, as the package's models name them.
@@ -584,7 +585,8 @@ def _read_elementary(
             "installed)",
             {"_warnings": warned, "release": release},
         )
-    from ..errors import DexError
+    from ..envelope import failure_text
+    from ..errors import DexError, WarehouseQueryError
     from ..guards.query_firewall import QueryRefusedError
 
     base: dict[str, Any] = {"_warnings": warned, "release": release}
@@ -636,6 +638,12 @@ def _read_elementary(
         return _Source("refused", "firewall_refused", str(exc), base)
     except _UnpricedError as exc:
         return _Source("refused", "unpriced", str(exc), base)
+    except WarehouseQueryError as exc:
+        # A server-side failure mid-read (a timeout, a refused statement) is
+        # this source's, so dbt's run results are still read and the price is
+        # kept. No cost refusal is this class. The words are masked as every
+        # folded failure is: a conversion error can quote a row's value.
+        return _Source("refused", "warehouse_refused", failure_text(exc), base)
     priced["first_read"] = read.first_read
     priced["profiled"] = list(read.profiled)
     return _Source(
