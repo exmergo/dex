@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -878,7 +878,12 @@ def _append_scaffold_gitkeep_deletes(
 
 
 def _package_models_restored(
-    root: Path, names: set[str], project_yml: str | None
+    root: Path,
+    names: set[str],
+    project_yml: str | None,
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    target: str | None = None,
 ) -> dict[str, str]:
     """The deleted names an installed package defines as a model that the
     project's ``dbt_project.yml`` after the plan leaves enabled, by package.
@@ -903,8 +908,8 @@ def _package_models_restored(
         with contextlib.suppress(OSError, UnicodeError):
             text = (root / "dbt_project.yml").read_text(encoding="utf-8")
     restored: dict[str, str] = {}
-    for model in package_models(root, names, text):
-        if model.enabled:
+    for model in package_models(root, names, text, manifest=manifest, target=target):
+        if model.enabled is True:
             restored.setdefault(model.name, model.package)
     return restored
 
@@ -992,8 +997,20 @@ def validate_deletions(view: DbtProjectView, edits: list[PlanEdit]) -> list[str]
     )
     index = ReferenceIndex(after, scan_packages=False)
 
+    manifest = view.manifest
+    if manifest is None:
+        from ..dbt_project import manifest_file
+
+        with contextlib.suppress(Exception):
+            compiled = manifest_file(view.root)
+            if compiled.is_file():
+                manifest = json.loads(compiled.read_text(encoding="utf-8"))
+
     restored = _package_models_restored(
-        root, deleted_models, surviving.get("dbt_project.yml")
+        root,
+        deleted_models,
+        surviving.get("dbt_project.yml"),
+        manifest=manifest,
     )
     # A file that goes while the post-change `versions:` keeps its name
     # referable (`dim_teams.sql` renamed to `dim_teams_v1.sql` under a

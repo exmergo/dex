@@ -1949,3 +1949,103 @@ def test_warning_when_description_with_flag_text_replaced_and_test_added(
     )
     _edits, warnings = apply_declarations(parsed, view, [])
     assert any("0.16.4" in w and "disable_test_samples" in w for w in warnings)
+
+
+def test_target_dependent_elementary_sampling_warning_without_manifest_uncertain(
+    tmp_path: Path,
+):
+    """Without a manifest, target-dependent enablement conveys uncertainty."""
+    from tests.transform.test_elementary import _write, project_yml
+
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    project_text = (
+        project_yml(flag="false")
+        + f'models:\n  elementary:\n    +enabled: "{enabled_expression("dev")}"\n'
+    )
+    _write(tmp_path, "dbt_project.yml", project_text)
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="shop",
+        profile_name="shop",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=None,
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert any(
+        (
+            "whether installed Elementary release 0.16.4 is enabled is unknown "
+            "without a matching manifest"
+        )
+        in w
+        and "whether it honours disable_test_samples is uncertain" in w
+        for w in warnings
+    )
+
+
+def test_target_dependent_elementary_sampling_warning_with_target_matched_evidence(
+    tmp_path: Path,
+):
+    """With target-matched evidence, installer expression resolves cleanly."""
+    from tests.transform.test_elementary import _write, manifest, project_yml
+
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    project_text = (
+        project_yml(flag="false")
+        + f'models:\n  elementary:\n    +enabled: "{enabled_expression("dev")}"\n'
+    )
+    _write(tmp_path, "dbt_project.yml", project_text)
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+
+    # Evidence matching dev: Elementary disabled on dev, so no warning
+    dev_m = manifest(elementary=True)
+    dev_m["metadata"]["target_name"] = "dev"
+    dev_view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="shop",
+        profile_name="shop",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=dev_m,
+    )
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, dev_warnings = apply_declarations(parsed, dev_view, [])
+    assert not any("disable_test_samples" in w for w in dev_warnings)
+
+    # Evidence matching prod: Elementary enabled on prod, so 0.16.4 warns with certainty
+    prod_m = manifest(elementary=True)
+    prod_m["metadata"]["target_name"] = "prod"
+    prod_view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="shop",
+        profile_name="shop",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=prod_m,
+    )
+    _edits, prod_warnings = apply_declarations(parsed, prod_view, [])
+    assert any(
+        "installed Elementary release 0.16.4 ignores disable_test_samples" in w
+        for w in prod_warnings
+    )

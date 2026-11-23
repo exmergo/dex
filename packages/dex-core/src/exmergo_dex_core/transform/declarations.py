@@ -525,21 +525,59 @@ def _elementary_sampling_warning(
                 if runtime.release:
                     release = runtime.release
 
-    if materialization is None:
-        if elementary.PACKAGE not in installed_packages:
-            return None
-        project = elementary._project_config(project_yml_text)
-        models_cfg = project.get("models")
-        enabled = True
-        if isinstance(models_cfg, Mapping):
-            elem_cfg = models_cfg.get(elementary.PACKAGE)
-            if isinstance(elem_cfg, Mapping):
-                val = elem_cfg.get("+enabled", elem_cfg.get("enabled", True))
-                if val is False:
-                    enabled = False
-        if not enabled:
-            return None
+    if elementary.PACKAGE not in installed_packages:
+        return None
 
+    project = elementary._project_config(project_yml_text)
+    models_cfg = project.get("models")
+    elem_enabled: bool | None = True
+    if isinstance(models_cfg, Mapping):
+        elem_cfg = models_cfg.get(elementary.PACKAGE)
+        if isinstance(elem_cfg, Mapping):
+            val = elem_cfg.get("+enabled", elem_cfg.get("enabled", True))
+            if isinstance(val, bool):
+                elem_enabled = val
+            else:
+                from .package_overrides import (
+                    is_target_dependent,
+                    resolve_target_enabled,
+                )
+
+                if is_target_dependent(val):
+                    elem_enabled = resolve_target_enabled(val, manifest=manifest)
+    if elem_enabled is False:
+        return None
+
+    if elem_enabled is None:
+        if elementary._override_flag(project):
+            return None
+        below = _is_below_0_20(release)
+        if below is True and release is not None:
+            return (
+                f"whether installed Elementary release {release} is enabled is "
+                "unknown without a matching manifest, so whether it honours "
+                "disable_test_samples is uncertain; upgrade the package to "
+                "0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            )
+        if below is None:
+            return (
+                "could not tell the installed Elementary release and whether it "
+                "is enabled is unknown without a matching manifest, so whether "
+                "it honours disable_test_samples is uncertain; upgrade the package "
+                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            )
+        if elementary.release_status(release) == "untested":
+            return (
+                f"installed Elementary release {release} is newer than the newest "
+                f"release dex was run against ({elementary.NEWEST_TESTED}), and "
+                "whether it is enabled is unknown without a matching manifest, "
+                "so whether it honours disable_test_samples is unchecked "
+                f"({elementary.RELEASE_UNTESTED}); set test_sample_row_count: 0 for "
+                "the project to keep samples off whatever it does"
+            )
+        return None
+
+    if materialization is None:
         elem_mat = f"macro.{elementary.PACKAGE}.materialization_test_default"
         synthetic_manifest = {
             "metadata": {"adapter_type": "default", "project_name": project_name},

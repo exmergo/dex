@@ -16,9 +16,10 @@ from exmergo_dex_core.transform.declarations import (
 )
 from exmergo_dex_core.transform.package_overrides import (
     documented_overrides,
+    package_enabled,
     package_models,
 )
-from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+from exmergo_dex_core.transform.plans import EditKind, EditOp, PlanEdit, PlanError
 
 DISABLED = "models:\n  tiny_pkg:\n    pkg_task:\n      +enabled: false\n"
 ENTRY = "version: 2\nmodels:\n  - name: pkg_task\n    description: From the vendor.\n"
@@ -228,3 +229,105 @@ def test_a_python_override_under_a_model_path_the_plan_adds_is_found(tmp_path):
         refuse_package_documented_entries(
             view, [project, _entry_edit("models/mine.yml")]
         )
+
+
+def test_package_enabled_target_dependent_expression_without_evidence_is_unknown():
+    """A target-dependent enablement expression without target evidence is unknown."""
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    cfg = {"tiny_pkg": {"+enabled": enabled_expression("dev")}}
+    assert package_enabled(cfg, "tiny_pkg", ["pkg_task"]) is None
+    # Literal true and false keep their existing meaning
+    assert (
+        package_enabled({"tiny_pkg": {"+enabled": True}}, "tiny_pkg", ["pkg_task"])
+        is True
+    )
+    assert (
+        package_enabled({"tiny_pkg": {"+enabled": False}}, "tiny_pkg", ["pkg_task"])
+        is False
+    )
+
+
+def test_package_enabled_installer_expression_with_target_matched_evidence():
+    """The installer's target-name expression resolves with matching target evidence."""
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    expr = enabled_expression("dev")
+    cfg = {"tiny_pkg": {"+enabled": expr}}
+
+    # Target-matched evidence for dev
+    assert package_enabled(cfg, "tiny_pkg", ["pkg_task"], target="dev") is False
+    dev_manifest = {"metadata": {"target_name": "dev"}}
+    assert (
+        package_enabled(cfg, "tiny_pkg", ["pkg_task"], manifest=dev_manifest) is False
+    )
+
+    # Target-matched evidence for prod
+    assert package_enabled(cfg, "tiny_pkg", ["pkg_task"], target="prod") is True
+    prod_manifest = {"metadata": {"target_name": "prod"}}
+    assert (
+        package_enabled(cfg, "tiny_pkg", ["pkg_task"], manifest=prod_manifest) is True
+    )
+
+    # Manifest target conflicting with requested target gives unknown
+    assert (
+        package_enabled(
+            cfg, "tiny_pkg", ["pkg_task"], manifest=dev_manifest, target="prod"
+        )
+        is None
+    )
+
+
+def test_documented_overrides_unknown_package_availability_is_not_an_override(tmp_path):
+    """Unknown package availability is not treated as a documented override."""
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    expr = enabled_expression("dev")
+    target_dep = f'models:\n  tiny_pkg:\n    +enabled: "{expr}"\n'
+    root = _project(tmp_path / "p", project_models=target_dep)
+    assert documented_overrides(root, {"pkg_task"}, _yml(root)) == {}
+    dev_manifest = {"metadata": {"target_name": "dev"}}
+    [found] = documented_overrides(
+        root, {"pkg_task"}, _yml(root), manifest=dev_manifest
+    ).values()
+    assert found.model == "pkg_task"
+
+
+def test_delete_guard_refuses_when_package_availability_is_unknown(tmp_path):
+    """Unknown availability cannot establish that a surviving reference is satisfied."""
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+    from exmergo_dex_core.transform.plans import validate_deletions
+
+    expr = enabled_expression("dev")
+    target_dep = f'models:\n  tiny_pkg:\n    +enabled: "{expr}"\n'
+    root = _project(tmp_path / "p", project_models=target_dep)
+    (root / "models" / "downstream.sql").write_text(
+        "select * from {{ ref('pkg_task') }}\n"
+    )
+
+    delete_edit = PlanEdit(
+        path="models/pkg_task.sql",
+        kind=EditKind.MODEL_SQL,
+        op=EditOp.DELETE,
+    )
+
+    # 1. Without manifest: unknown availability cannot satisfy surviving ref
+    view = load_project(root)
+    assert view.manifest is None
+    with pytest.raises(PlanError) as exc_info:
+        validate_deletions(view, [delete_edit])
+    assert "still references pkg_task" in str(exc_info.value)
+
+    # 2. With target-matched evidence for dev: model is disabled on dev, so ref dangles
+    dev_view = view.model_copy(
+        update={"manifest": {"metadata": {"target_name": "dev"}}}
+    )
+    with pytest.raises(PlanError) as exc_dev:
+        validate_deletions(dev_view, [delete_edit])
+    assert "still references pkg_task" in str(exc_dev.value)
+
+    # 3. With target-matched evidence for prod: model is enabled on prod, so satisfied
+    prod_view = view.model_copy(
+        update={"manifest": {"metadata": {"target_name": "prod"}}}
+    )
+    assert validate_deletions(prod_view, [delete_edit]) == []
