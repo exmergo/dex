@@ -291,11 +291,8 @@ class SnowflakeTarget(BaseModel):
             db, schema = self.dev.split(".", 1)
             object.__setattr__(self, "dev_database", db)
             object.__setattr__(self, "dev_schema", schema)
-        elif self.dev_database is not None or self.dev_schema is not None:
-            if self.dev_database and self.dev_schema:
-                object.__setattr__(
-                    self, "dev", f"{self.dev_database}.{self.dev_schema}"
-                )
+        elif self.dev_database and self.dev_schema:
+            object.__setattr__(self, "dev", f"{self.dev_database}.{self.dev_schema}")
         self.prod = check_prod("snowflake", self.prod, self.dev)
         return self
 
@@ -305,13 +302,13 @@ class SnowflakeTarget(BaseModel):
             "dev_database" in self.model_fields_set
             or "dev_schema" in self.model_fields_set
         )
-        if name in ("dev_database", "dev_schema") and not (
-            "dev" in self.model_fields_set and not has_alias
+        if (
+            name in ("dev_database", "dev_schema")
+            and not ("dev" in self.model_fields_set and not has_alias)
+            and self.dev_database
+            and self.dev_schema
         ):
-            if self.dev_database and self.dev_schema:
-                object.__setattr__(
-                    self, "dev", f"{self.dev_database}.{self.dev_schema}"
-                )
+            object.__setattr__(self, "dev", f"{self.dev_database}.{self.dev_schema}")
         elif name == "dev" and isinstance(value, str) and "." in value:
             db, sc = value.split(".", 1)
             object.__setattr__(self, "dev_database", db)
@@ -375,9 +372,8 @@ class DatabricksTarget(BaseModel):
             cat, schema = self.dev.split(".", 1)
             object.__setattr__(self, "dev_catalog", cat)
             object.__setattr__(self, "dev_schema", schema)
-        elif self.dev_catalog is not None or self.dev_schema is not None:
-            if self.dev_catalog and self.dev_schema:
-                object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+        elif self.dev_catalog and self.dev_schema:
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
         self.prod = check_prod("databricks", self.prod, self.dev)
         return self
 
@@ -387,11 +383,13 @@ class DatabricksTarget(BaseModel):
             "dev_catalog" in self.model_fields_set
             or "dev_schema" in self.model_fields_set
         )
-        if name in ("dev_catalog", "dev_schema") and not (
-            "dev" in self.model_fields_set and not has_alias
+        if (
+            name in ("dev_catalog", "dev_schema")
+            and not ("dev" in self.model_fields_set and not has_alias)
+            and self.dev_catalog
+            and self.dev_schema
         ):
-            if self.dev_catalog and self.dev_schema:
-                object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
         elif name == "dev" and isinstance(value, str) and "." in value:
             cat, sc = value.split(".", 1)
             object.__setattr__(self, "dev_catalog", cat)
@@ -734,9 +732,8 @@ class TrinoTarget(BaseModel):
             cat, schema = self.dev.split(".", 1)
             object.__setattr__(self, "dev_catalog", cat)
             object.__setattr__(self, "dev_schema", schema)
-        elif self.dev_catalog is not None or self.dev_schema is not None:
-            if self.dev_catalog and self.dev_schema:
-                object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+        elif self.dev_catalog and self.dev_schema:
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
         self.prod = check_prod("trino", self.prod, self.dev)
         return self
 
@@ -746,11 +743,13 @@ class TrinoTarget(BaseModel):
             "dev_catalog" in self.model_fields_set
             or "dev_schema" in self.model_fields_set
         )
-        if name in ("dev_catalog", "dev_schema") and not (
-            "dev" in self.model_fields_set and not has_alias
+        if (
+            name in ("dev_catalog", "dev_schema")
+            and not ("dev" in self.model_fields_set and not has_alias)
+            and self.dev_catalog
+            and self.dev_schema
         ):
-            if self.dev_catalog and self.dev_schema:
-                object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
+            object.__setattr__(self, "dev", f"{self.dev_catalog}.{self.dev_schema}")
         elif name == "dev" and isinstance(value, str) and "." in value:
             cat, sc = value.split(".", 1)
             object.__setattr__(self, "dev_catalog", cat)
