@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field, ValidationError, field_validator, model_validator
 
 from ..dbt_project import DbtProjectView, jinja_calls
+from ..manifest_paths import posix
 from ..references import column_parse_limit
 from ..semantic_declarations import Assumption, _Strict
 from .compiled_tree import (
@@ -595,7 +596,7 @@ def _not_compiled(
     out = []
     for label, path in sorted(disabled.items()):
         called = {
-            str((manifest_macros.get(uid) or {}).get("original_file_path") or "")
+            posix((manifest_macros.get(uid) or {}).get("original_file_path"))
             for uid in macro_closure(
                 manifest_macros, macros_of.get(label.split(".v")[0], set())
             )
@@ -910,7 +911,7 @@ def _tested_when_off(
         for test_id, node in reading:
             if test_id in seen:
                 continue
-            path = str(node.get("original_file_path") or "")
+            path = posix(node.get("original_file_path"))
             test = str(
                 (node.get("test_metadata") or {}).get("name") or node.get("name")
             )
@@ -943,7 +944,7 @@ def _tested_when_off(
             in_file = [
                 node
                 for node in compiled
-                if node.get("original_file_path") == hit.path
+                if posix(node.get("original_file_path")) == hit.path
                 and (
                     column in _argument_columns(node)
                     if hit.form == "yaml_test_column"

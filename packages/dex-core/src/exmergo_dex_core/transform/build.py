@@ -2468,8 +2468,8 @@ def _assert_compiled_functions(
 
     try:
         paths = artifact_paths(artifacts)
-        results = json.loads(paths.run_results.read_text())
-        manifest = json.loads(paths.manifest.read_text())
+        results = json.loads(paths.run_results.read_text(encoding="utf-8"))
+        manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
         selected = results["results"]
         nodes = manifest["nodes"]
         if not isinstance(selected, list) or not isinstance(nodes, dict):

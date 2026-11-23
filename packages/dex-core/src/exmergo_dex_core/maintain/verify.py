@@ -52,6 +52,7 @@ from ..envelope import failure_text
 from ..errors import WarehouseQueryError
 from ..explore.profile import NEAR_UNIQUE_RATIO
 from ..explore.relationships import entity_of, is_id_shaped
+from ..manifest_paths import posix
 from ..transform.build import shadow_parse
 from ..transform.evidence import FAILED_STATUSES, status_kind
 from ..value_mask import mask_values
@@ -754,7 +755,7 @@ def column_contract_plan(
         if isinstance(patch, str) and "://" in patch:
             pkg, path = patch.split("://", 1)
             if pkg and path and pkg != node.get("package_name"):
-                package_entries[name] = f"{install_dir.rstrip('/')}/{pkg}/{path}"
+                package_entries[name] = f"{install_dir.rstrip('/')}/{pkg}/{posix(path)}"
 
     with contextlib.suppress(Exception):
         from ..transform.package_overrides import documented_overrides

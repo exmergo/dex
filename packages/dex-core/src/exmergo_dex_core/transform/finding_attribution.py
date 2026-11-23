@@ -42,6 +42,8 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from ..manifest_paths import patch_file, posix
+
 #: The sweep history, written beside ``dex_previous_build.json``.
 HISTORY = "dex_verify_history.json"
 
@@ -377,11 +379,11 @@ def plan_reach(edits: Iterable[Any], manifest: Mapping[str, Any] | None) -> Reac
         label_of[str(unique_id)] = label
         path = node.get("original_file_path")
         if isinstance(path, str):
-            by_file.setdefault(PurePosixPath(path).as_posix(), []).append(unique_id)
+            by_file.setdefault(posix(path), []).append(unique_id)
         patch = node.get("patch_path")
         if isinstance(patch, str):
             # `p://models/schema.yml`: the package, then the file.
-            by_patch.setdefault(patch.split("://", 1)[-1], []).append(unique_id)
+            by_patch.setdefault(patch_file(patch), []).append(unique_id)
     reach.labels = set(label_of.values())
 
     roots: set[str] = set()

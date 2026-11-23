@@ -255,7 +255,11 @@ jobs:
   databricks:
     if: github.repository == 'exmergo/dex'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not the usual 15: the suite took ten minutes on 2026-11-23 and ran
+    # past fifteen later that day once the generated-test parity harness grew
+    # (temporal, freshness and continuity rows), with warehouse cold starts
+    # on top. Every statement stays capped by STATEMENT_TIMEOUT.
+    timeout-minutes: 25
     # The environment carries the Databricks variables and, via its deployment
     # branch policy (main only), refuses this job to a workflow modified on a
     # branch before the token is minted. The Databricks-side pin mirrors it:

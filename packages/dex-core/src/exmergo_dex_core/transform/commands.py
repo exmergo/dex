@@ -42,6 +42,7 @@ from ..dbt_tests import unit_test_overrides as _unit_test_overrides
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
 from ..errors import DexError, RequestError, UndeclaredPopulationChangeError
+from ..manifest_paths import posix
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
@@ -2450,7 +2451,7 @@ def _failed_package_node(
         )
     unique_id, node = failed[0]
     if node.get("package_name") == root:
-        path = node.get("original_file_path") or name
+        path = posix(node.get("original_file_path")) or name
         raise RepairRefusedError(
             f"the project owns {name} ({path}), so it is repaired with an ordinary "
             "`dex transform plan` on that file, not an override"
@@ -4879,7 +4880,7 @@ class _DownstreamTests:
         root = shadow.shadow
         try:
             for uid in closure.eligible:
-                path = (nodes.get(uid) or {}).get("original_file_path") or ""
+                path = posix((nodes.get(uid) or {}).get("original_file_path"))
                 text = (root / path).read_text(encoding="utf-8")
                 shadow.write(path, text + "\n" + mutation_mod.EPHEMERAL_HEADER + "\n")
                 originals[path] = text
@@ -8290,7 +8291,7 @@ def _incremental_replay_inputs(
             continue
         if (node.get("config") or {}).get("materialized") != "incremental":
             continue
-        path = str(node.get("original_file_path") or "")
+        path = posix(node.get("original_file_path"))
         if not path or not any(
             path == candidate or candidate.endswith("/" + path) for candidate in edited
         ):
