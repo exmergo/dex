@@ -283,3 +283,54 @@ def test_with_no_history_read_the_project_is_not_checked():
 
     assert candidate.status == "not_checked"
     assert candidate.reason == "no_commit_history"
+
+
+# --- a snapshot is placed by when its warehouse state was measured ----------------
+
+
+def test_a_snapshot_is_placed_by_its_measurement_not_its_writing():
+    # Written after the failure, measured before the last pass: it bounds the
+    # break from before, and is not the later record of the warehouse.
+    span = diag.bisect(_onset({1: "good", 2: "bad"}))
+    point = diag.SnapshotPoint(
+        commit="1" * 40,
+        created_at=_at(3),
+        measured_at=_at(0) + timedelta(minutes=30),
+    )
+    bounds = diag.bound(diag.Series("read", points=(point,)), span)
+    [window] = diag.unseen(span, bounds)
+
+    assert bounds.before == point
+    assert bounds.after is None
+    assert window.from_at == point.measured_at
+
+
+def test_a_carried_forward_warehouse_keeps_the_time_it_was_measured():
+    from exmergo_dex_core.maintain.snapshot import Snapshot
+    from exmergo_dex_core.maintain.snapshot_series import _measured
+
+    first = Snapshot(created_at=_at(1).isoformat(), warehouse_from="metadata")
+    carried = first.model_copy(update={"created_at": _at(5).isoformat()})
+    points = [
+        diag.SnapshotPoint(commit="1" * 40, created_at=_at(1)),
+        diag.SnapshotPoint(commit="2" * 40, created_at=_at(5)),
+    ]
+    placed = _measured(points, {"1" * 40: first, "2" * 40: carried})
+
+    assert [p.placed_at() for p in placed] == [_at(1), _at(1)]
+
+
+def test_a_cache_pinned_warehouse_is_placed_at_the_cache_time():
+    from exmergo_dex_core.maintain.snapshot import Snapshot
+    from exmergo_dex_core.maintain.snapshot_series import _measured
+
+    pinned = Snapshot(
+        created_at=_at(5).isoformat(),
+        warehouse_from="cache",
+        cache_updated_at=_at(2).isoformat(),
+    )
+    [placed] = _measured(
+        [diag.SnapshotPoint(commit="1" * 40, created_at=_at(5))], {"1" * 40: pinned}
+    )
+
+    assert placed.placed_at() == _at(2)

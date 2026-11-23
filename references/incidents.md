@@ -404,7 +404,10 @@ and takes each open incident to a cause, or to none.
 - **Bound.** The committed `maintain snapshot` series is the versions of
   `.dex/snapshot.json` in the repository's history. The newest snapshot captured
   at or before the last observed pass is `snapshots.before`; the oldest at or
-  after the first failure is `snapshots.after`. On a project's first day there is
+  after the first failure is `snapshots.after`. A snapshot is placed by when
+  its warehouse state was measured: `cache_updated_at` where it was pinned
+  from the exploration cache, the earlier snapshot's time where a
+  `--project-only` snapshot carried the block forward. On a project's first day there is
   no series (`series: none`), and the whole break is a window no recorded state
   of the warehouse covers (`unseen`, `no_snapshot_series`): a check then
   confirms a cause as present now, not when inside the break it entered. With a
@@ -417,7 +420,13 @@ and takes each open incident to a cause, or to none.
   `key_lost_uniqueness` against `snapshots.before` where its measurement proved
   the key unique (the volume axis's row counts ride beside it as evidence), and
   otherwise the declared-claim check, which needs no baseline: the failing
-  test's own claim held to the source (`declared_grain_not_unique`). The project
+  test's own claim held to the source (`declared_grain_not_unique`), and only
+  where one source the model reads carries the key: with several, today's data
+  cannot tell a duplicated delivery from a source at another grain
+  (`several_sources`, not checked). A source the bounding snapshot measured
+  not unique while the test passed is ruled out
+  (`not_unique_at_before_snapshot`); a relation nothing counted is
+  `not_checked` (`uncounted`), never ruled out. The project
   is ruled out where the failing commit itself passed earlier (`onset.commits`
   reads `same_commit`). Seed, package and schedule causes are listed
   `not_checked` until their checks are read.
@@ -429,7 +438,10 @@ and takes each open incident to a cause, or to none.
   `dex transform plan` step that would repair it under `next_steps`. Nothing
   here writes it.
 - **Priced.** The incident read prices its own statements first; the checks
-  are then priced together as one handshake before any probe runs.
+  are then priced together as one handshake before any probe runs, within
+  what the per-command ceiling has left after the read. Checks that do not
+  fit are offered (`scan_offered`, `price.checks.offered`), not asked for
+  again, and `data.spend` sums both phases.
 
 ## No value crosses into an incident
 

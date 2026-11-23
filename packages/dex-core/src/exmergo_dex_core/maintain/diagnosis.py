@@ -69,11 +69,24 @@ UnseenReason = Literal[
 
 
 class SnapshotPoint(Value):
-    """One committed ``maintain snapshot`` baseline: the commit that recorded it
-    and the time the baseline was captured (its ``created_at``)."""
+    """One committed ``maintain snapshot`` baseline: the commit that recorded it,
+    the time the baseline was written (its ``created_at``), and the time its
+    warehouse state was measured (``measured_at``).
+
+    The two differ where the warehouse block was carried forward (a
+    ``maintain snapshot --project-only`` writes a fresh ``created_at`` over the
+    previous measurement) or pinned from an exploration cache profiled earlier.
+    A snapshot is placed against the break by when the warehouse was measured.
+    """
 
     commit: str
     created_at: datetime
+    measured_at: datetime | None = None
+
+    def placed_at(self) -> datetime:
+        """When the warehouse state it holds was measured."""
+
+        return self.measured_at if self.measured_at is not None else self.created_at
 
 
 class DiagnosisRange(Value):
@@ -216,17 +229,17 @@ def bound(series: Series, span: DiagnosisRange) -> SnapshotBounds:
             or "no maintain snapshot baseline is committed to the repository",
             count=0,
         )
-    points = sorted(series.points, key=lambda p: (utc(p.created_at), p.commit))
+    points = sorted(series.points, key=lambda p: (utc(p.placed_at()), p.commit))
     before: SnapshotPoint | None = None
     after_at = span.after.at if span.after != UNKNOWN else None
     if after_at is not None:
         limit = utc(after_at)
-        earlier = [p for p in points if utc(p.created_at) <= limit]
+        earlier = [p for p in points if utc(p.placed_at()) <= limit]
         before = earlier[-1] if earlier else None
     later: SnapshotPoint | None = None
     if span.through.at is not None:
         limit = utc(span.through.at)
-        later = next((p for p in points if utc(p.created_at) >= limit), None)
+        later = next((p for p in points if utc(p.placed_at()) >= limit), None)
     return SnapshotBounds(series="read", count=len(points), before=before, after=later)
 
 
@@ -263,8 +276,8 @@ def unseen(span: DiagnosisRange, bounds: SnapshotBounds) -> tuple[UnseenWindow, 
         return tuple(windows)
     windows.append(
         UnseenWindow(
-            from_at=bounds.before.created_at,
-            to_at=bounds.after.created_at if bounds.after is not None else None,
+            from_at=bounds.before.placed_at(),
+            to_at=bounds.after.placed_at() if bounds.after is not None else None,
             reason="between_snapshots",
         )
     )

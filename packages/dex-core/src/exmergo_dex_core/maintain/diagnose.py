@@ -121,7 +121,11 @@ def diagnose(
     incidents = list(fold.incidents) if fold is not None else []
     open_incidents = [i for i in incidents if i.state == "open" and i.onset]
     skipped = [
-        {"subject": i.subject.key, "state": i.state}
+        {
+            "subject": i.subject.key,
+            "state": i.state,
+            "reason": "not_open" if i.state != "open" else "no_onset",
+        }
         for i in incidents
         if i not in open_incidents
     ]
@@ -136,7 +140,14 @@ def diagnose(
         ]
         if any(w.specs for w in work):
             adapter = engine._adapter(COMMAND)
-            checks_price = _confirm_all(engine, adapter, work, series_read)
+            checks_price = _confirm_all(
+                engine,
+                adapter,
+                work,
+                series_read,
+                spent_before=_billed(read.spend),
+                warnings=warnings,
+            )
         diagnoses.extend(
             diag.diagnosis(
                 subject=item.incident.subject.key,
@@ -169,10 +180,42 @@ def diagnose(
     if adapter is not None:
         command_args.stamp_spend(result, adapter)
         if checks_price is not None:
-            checks_price["settled"] = result.spend
+            checks_price["settled"] = (
+                dict(result.spend) if result.spend is not None else None
+            )
+        result.spend = _combined(read.spend, result.spend)
     else:
         result.spend = read.spend
     return result
+
+
+def _billed(spend: dict[str, Any] | None) -> float:
+    """What one phase billed, in its connector's unit (its one numeric field
+    besides the day's total)."""
+
+    if not spend:
+        return 0.0
+    for key, value in spend.items():
+        if key != "session_spent_today" and isinstance(value, int | float):
+            return float(value)
+    return 0.0
+
+
+def _combined(
+    first: dict[str, Any] | None, second: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The command's spend: both phases' billed amounts summed; the day's
+    total is the later settlement's, which already includes the first."""
+
+    if first is None or second is None:
+        return second if first is None else first
+    combined = dict(second)
+    for key, value in first.items():
+        if key == "session_spent_today" or not isinstance(value, int | float):
+            continue
+        held = combined.get(key)
+        combined[key] = (held if isinstance(held, int | float) else 0) + value
+    return combined
 
 
 # --- the inputs -------------------------------------------------------------------
@@ -349,14 +392,53 @@ class _Planned:
     before: Snapshot | None
 
 
+def _loader(status: str, reason: str, detail: str, **fields: Any) -> diag.Candidate:
+    """A loader candidate the grain axis did not answer, or answered from the
+    bounding snapshot alone."""
+
+    return diag.Candidate(
+        owner="loader",
+        kind="duplicate_load",
+        status=status,  # type: ignore[arg-type]
+        reason=reason,
+        detail=detail,
+        **fields,
+    )
+
+
+def _refuted_before(
+    before: Snapshot | None, identifier: str, columns: Sequence[str]
+) -> bool:
+    """Whether the bounding snapshot measured the tested column not unique on
+    the relation: the duplicates were there while the test still passed."""
+
+    if before is None or len(columns) != 1:
+        return False
+    for dataset in before.warehouse.datasets:
+        if dataset.identifier != identifier:
+            continue
+        for column in dataset.columns:
+            if column.name.casefold() == columns[0].casefold():
+                return column.is_unique is False
+    return False
+
+
 def _confirm_all(
     engine: DexEngine,
     adapter: Adapter,
     work: Sequence[_Work],
     series_read: SeriesRead,
+    *,
+    spent_before: float = 0.0,
+    warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     """Plan every candidate's check, price them as one handshake, run them,
-    and record each candidate's answer on its work item."""
+    and record each candidate's answer on its work item.
+
+    ``spent_before`` is what the incident read billed under the same
+    confirmation: the checks are admitted only within what the per-command
+    ceiling has left after it, and offered (``scan_offered``) otherwise.
+    """
 
     from . import drift as drift_mod
 
@@ -370,74 +452,151 @@ def _confirm_all(
             if bounds.before is not None
             else None
         )
-        carried = False
+        carriers: dict[str, list[tuple[_Spec, str, tuple[str, ...]]]] = {}
+        unlisted: list[_Spec] = []
         for spec in item.specs:
             identifier = _resolve(identifiers, spec)
             if identifier is None:
+                unlisted.append(spec)
                 continue
             _, columns = adapter.table_metadata(identifier)
             names = {c.name.casefold(): c.name for c in columns}
             if not all(c.casefold() in names for c in spec.columns):
                 continue
             spelled = tuple(names[c.casefold()] for c in spec.columns)
-            carried = True
-            planned.append(
-                (
-                    item,
-                    _plan(adapter, identifier, spelled, spec, before),
+            carriers.setdefault(spec.test, []).append((spec, identifier, spelled))
+        for test in dict.fromkeys(spec.test for spec in item.specs):
+            held = carriers.get(test, [])
+            if not held:
+                missing = [s for s in unlisted if s.test == test]
+                first = next(s for s in item.specs if s.test == test)
+                item.candidates.append(
+                    _loader(
+                        "not_checked",
+                        "source_not_listed" if missing else "columns_not_upstream",
+                        "the connection does not list "
+                        + ", ".join(sorted({f"{s.schema}.{s.name}" for s in missing}))
+                        + " (outside the source allowlist, or not built), so the "
+                        "loader's delivery was not held to the test's claim"
+                        if missing
+                        else "no source relation the tested model reads carries "
+                        "the tested columns under the same names, so the loader's "
+                        "delivery could not be held to the test's claim",
+                        columns=first.columns,
+                    )
                 )
-            )
-        if item.specs and not carried:
-            item.candidates.append(
-                diag.Candidate(
-                    owner="loader",
-                    kind="duplicate_load",
-                    columns=item.specs[0].columns,
-                    status="not_checked",
-                    reason="columns_not_upstream",
-                    detail="no source relation the tested model reads carries "
-                    "the tested columns under the same names, so the loader's "
-                    "delivery could not be held to the test's claim",
-                )
-            )
+                continue
+            for spec, identifier, spelled in held:
+                plan = _plan(adapter, identifier, spelled, spec, before)
+                if plan.measured:
+                    planned.append((item, plan))
+                elif _refuted_before(before, identifier, spelled):
+                    item.candidates.append(
+                        _loader(
+                            "ruled_out",
+                            "not_unique_at_before_snapshot",
+                            f"the snapshot that bounds the break measured "
+                            f"({', '.join(spelled)}) not unique on {identifier} "
+                            "while the test still passed, so a duplicate delivery "
+                            "since is not what broke it",
+                            relation=identifier,
+                            columns=spelled,
+                            check=GRAIN_CHECK,
+                            evidence={
+                                "measured_against": {
+                                    "snapshot_created_at": before.created_at
+                                    if before is not None
+                                    else None
+                                }
+                            },
+                        )
+                    )
+                elif len(held) > 1:
+                    # With no measured before, the claim held to today's data
+                    # cannot tell a delivery the loader duplicated from a source
+                    # at another grain the model reads beside it.
+                    item.candidates.append(
+                        _loader(
+                            "not_checked",
+                            "several_sources",
+                            f"{len(held)} sources the tested model reads carry "
+                            f"({', '.join(spelled)}), and no committed snapshot "
+                            "measured which of them held the key unique, so the "
+                            "test's claim cannot be held to any one of them",
+                            relation=identifier,
+                            columns=spelled,
+                        )
+                    )
+                else:
+                    planned.append((item, plan))
 
     estimate = 0.0
     per_table: dict[str, float] = {}
-    for _item, held in planned:
-        batched = drift_mod.batched_probes(adapter, held.plan)
-        total, per = drift_mod.grain_estimate(adapter, held.plan, batched)
+    for _item, held_plan in planned:
+        batched = drift_mod.batched_probes(adapter, held_plan.plan)
+        total, per = drift_mod.grain_estimate(adapter, held_plan.plan, batched)
         estimate += total
         for key, value in per.items():
             per_table[key] = per_table.get(key, 0.0) + value
-    if planned:
-        command_args.billed_handshake(
-            COMMAND,
-            adapter,
-            estimate,
-            per_table=per_table,
-            notes=[
-                f"{len(planned)} uniqueness check(s) of the grain axis, one per "
-                "source relation a failing uniqueness test's model reads"
-            ],
-            axes=["grain"],
-        )
+    price: dict[str, Any] = {"estimate": estimate, "per_table": per_table}
+    if not planned:
+        return price
+    gate = command_args.cost_gate(adapter)
+    left = (
+        None
+        if gate is None or gate.ceiling is None
+        else max(gate.ceiling - spent_before, 0.0)
+    )
+    if left is not None and estimate > left:
+        # One confirmation covers the whole command: what the incident read
+        # spent comes out of the same per-command ceiling, and checks that no
+        # longer fit are offered rather than asked for a second time.
+        price["offered"] = True
+        for item, held_plan in planned:
+            item.candidates.append(
+                _loader(
+                    "not_checked",
+                    "scan_offered",
+                    f"the check on {held_plan.identifier} was priced at what the "
+                    "per-command ceiling has left after the incident read, and did "
+                    "not fit; it is offered under price.checks",
+                    relation=held_plan.identifier,
+                    columns=held_plan.spec.columns,
+                    check=GRAIN_CHECK,
+                )
+            )
+        return price
+    command_args.billed_handshake(
+        COMMAND,
+        adapter,
+        estimate,
+        per_table=per_table,
+        notes=[
+            f"{len(planned)} uniqueness check(s) of the grain axis, one per "
+            "source relation a failing uniqueness test's model reads"
+        ],
+        axes=["grain"],
+    )
 
     config = engine.config
-    for item, held in planned:
-        batched = drift_mod.batched_probes(adapter, held.plan)
+    for item, held_plan in planned:
+        batched = drift_mod.batched_probes(adapter, held_plan.plan)
         probes = drift_mod.run_batched_probes(adapter, batched)
+        noted = len(held_plan.plan.notes)
         findings = drift_mod.grain_drift(
             adapter,
-            held.plan,
+            held_plan.plan,
             timeout_seconds=config.query.timeout_seconds,
             min_rows=config.maintain.grain_min_rows,
             probes=probes,
         )
-        candidate = _answer(held, findings, adapter)
+        if warnings is not None:
+            warnings.extend(held_plan.plan.notes[noted:])
+        candidate = _answer(held_plan, findings, adapter)
         item.candidates.append(candidate)
         if candidate.status == "confirmed":
-            item.next_steps.append(_repair_step(held))
-    return {"estimate": estimate, "per_table": per_table}
+            item.next_steps.append(_repair_step(held_plan))
+    return price
 
 
 def _resolve(identifiers: Mapping[str, Any], spec: _Spec) -> str | None:
@@ -492,7 +651,33 @@ def _plan(
                 for _ds, combos, _rows in plan.composite_checks
             )
         if measured:
+            # Only the tested key is scanned: the other keys the snapshot
+            # proved on the relation are not this incident's.
+            single = wanted[0] if len(columns) == 1 else None
             narrowed = plan._replace(
+                key_checks=[
+                    (ds, [k for k in keys if k.casefold() == single], rows)
+                    for ds, keys, rows in plan.key_checks
+                    if single is not None and single in {k.casefold() for k in keys}
+                ],
+                composite_checks=[
+                    (
+                        ds,
+                        [
+                            c
+                            for c in combos
+                            if sorted(k.casefold() for k in c) == sorted(wanted)
+                        ],
+                        rows,
+                    )
+                    for ds, combos, rows in plan.composite_checks
+                    if single is None
+                ],
+                widening_checks=[
+                    (ds, [c for c in combos if c[-1].casefold() == single], rows)
+                    for ds, combos, rows in plan.widening_checks or []
+                    if single is not None
+                ],
                 fanout_pairs=[],
                 declared_composite_checks=[],
                 declared_join_checks=[],
@@ -545,6 +730,17 @@ def _answer(
     )
     if hit is None:
         meta, _ = adapter.table_metadata(held.identifier)
+        if meta.row_count is None:
+            # Nothing counted the relation (a view, an external table), so the
+            # grain axis judged nothing: not checked, never read as unique.
+            return diag.Candidate(
+                **base,
+                status="not_checked",
+                reason="uncounted",
+                detail=f"nothing counted {held.identifier}'s rows, so the grain "
+                f"axis could not judge whether ({members}) is unique on it",
+                evidence={"measured_against": _against(held)},
+            )
         return diag.Candidate(
             **base,
             status="ruled_out",

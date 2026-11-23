@@ -60,7 +60,20 @@ def _git(root: Path, *args: str) -> None:
     )
 
 
-def _manifest() -> dict[str, Any]:
+def _source(name: str) -> dict[str, Any]:
+    return {
+        "unique_id": f"source.shop.raw.{name}",
+        "resource_type": "source",
+        "package_name": "shop",
+        "source_name": "raw",
+        "name": name,
+        "identifier": name,
+        "database": "dev",
+        "schema": "raw",
+    }
+
+
+def _manifest(extra_sources: Sequence[str] = ()) -> dict[str, Any]:
     nodes: dict[str, Any] = {
         MODEL: {
             "unique_id": MODEL,
@@ -70,7 +83,9 @@ def _manifest() -> dict[str, Any]:
             "database": "dev",
             "schema": "main",
             "config": {"enabled": True},
-            "depends_on": {"nodes": [SOURCE]},
+            "depends_on": {
+                "nodes": [SOURCE, *(f"source.shop.raw.{s}" for s in extra_sources)]
+            },
         },
         TEST: {
             "unique_id": TEST,
@@ -109,16 +124,8 @@ def _manifest() -> dict[str, Any]:
         "metadata": {"project_name": "shop", "adapter_type": "duckdb"},
         "nodes": nodes,
         "sources": {
-            SOURCE: {
-                "unique_id": SOURCE,
-                "resource_type": "source",
-                "package_name": "shop",
-                "source_name": "raw",
-                "name": "order_items",
-                "identifier": "order_items",
-                "database": "dev",
-                "schema": "raw",
-            }
+            SOURCE: _source("order_items"),
+            **{f"source.shop.raw.{s}": _source(s) for s in extra_sources},
         },
         "macros": {},
         "disabled": {},
@@ -149,13 +156,15 @@ def _project(
     failing: Sequence[str] = ("inv-3", "inv-4"),
     snapshot_before: datetime | None = None,
     unobserved: Sequence[str] = (),
+    extra_sources: Sequence[str] = (),
+    refuted_before: bool = False,
 ) -> tuple[Path, Path, list[Run]]:
     root = tmp_path / "project"
     root.mkdir()
     (root / "dbt_project.yml").write_text("name: shop\nversion: '1.0'\n")
     target = root / "target"
     target.mkdir()
-    (target / "manifest.json").write_text(json.dumps(_manifest()))
+    (target / "manifest.json").write_text(json.dumps(_manifest(extra_sources)))
     package = root / "dbt_packages" / "elementary"
     package.mkdir(parents=True)
     (package / "dbt_project.yml").write_text(
@@ -175,6 +184,12 @@ def _project(
     if duplicated:
         # The batch loaded twice.
         con.execute("INSERT INTO raw.order_items SELECT range, 1 FROM range(151, 201)")
+    for name in extra_sources:
+        # Another source at another grain: the key repeats by design.
+        con.execute(f"CREATE TABLE raw.{name} (order_item_id INTEGER, step INTEGER)")
+        con.execute(
+            f"INSERT INTO raw.{name} SELECT range % 200 + 1, range FROM range(0, 600)"  # noqa: S608
+        )
     con.close()
 
     if snapshot_before is not None:
@@ -188,14 +203,14 @@ def _project(
                         object_type="table",
                         row_count=200,
                         profiled_at=snapshot_before.replace(tzinfo=UTC).isoformat(),
-                        candidate_keys=[["order_item_id"]],
+                        candidate_keys=[] if refuted_before else [["order_item_id"]],
                         columns=[
                             ColumnProfile(
                                 name="order_item_id",
                                 data_type="INTEGER",
-                                distinct_count=200,
+                                distinct_count=150 if refuted_before else 200,
                                 distinct_count_exact=True,
-                                is_unique=True,
+                                is_unique=not refuted_before,
                             ),
                             ColumnProfile(name="quantity", data_type="INTEGER"),
                         ],
@@ -460,3 +475,150 @@ def test_the_checks_are_priced_as_one_handshake_before_any_probe_runs(
     assert checks == [("priced", ("maintain diagnose", ["grain"]))]
     first_probe = next(i for i, e in enumerate(events) if e[0] == "probed")
     assert events.index(checks[0]) < first_probe
+
+
+# --- the cold review's findings (#1574) -------------------------------------------
+
+
+def _loader(diagnosis: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        c
+        for part in ("causes", "ruled_out", "not_checked")
+        for c in diagnosis[part]
+        if c["owner"] == "loader"
+    ]
+
+
+def test_a_second_source_at_another_grain_is_not_confirmed_without_a_before(
+    tmp_path: Path,
+):
+    # The model reads a source whose key repeats by design beside the one the
+    # loader filled. With no measured before, today's data cannot tell them
+    # apart, so neither is named.
+    root, warehouse, _ = _project(
+        tmp_path, duplicated=False, extra_sources=("order_item_events",)
+    )
+    [diagnosis] = _diagnose(root, warehouse)["diagnoses"]
+
+    assert diagnosis["verdict"] == "no_cause"
+    reasons = {c["relation"]: c["reason"] for c in _loader(diagnosis)}
+    assert reasons == {
+        RELATION: "several_sources",
+        "dev.raw.order_item_events": "several_sources",
+    }
+
+
+def test_a_before_snapshot_that_measured_the_key_not_unique_rules_the_loader_out(
+    tmp_path: Path,
+):
+    runs = _runs()
+    before = runs[0].started + timedelta(minutes=30)
+    root, warehouse, _ = _project(
+        tmp_path, duplicated=True, snapshot_before=before, refuted_before=True
+    )
+    [diagnosis] = _diagnose(root, warehouse)["diagnoses"]
+
+    assert diagnosis["verdict"] == "no_cause"
+    [loader] = _loader(diagnosis)
+    assert loader["status"] == "ruled_out"
+    assert loader["reason"] == "not_unique_at_before_snapshot"
+
+
+def test_a_relation_nothing_counted_is_not_checked_rather_than_ruled_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A connector that keeps no row count for the relation (a BigQuery view or
+    # external table): the grain axis judges nothing, so nothing is ruled out.
+    import dataclasses
+
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    engine = DexEngine(connector="duckdb", path=str(warehouse), repo_root=str(root))
+    opened = engine._adapter
+
+    def uncounted(*args, **kwargs):
+        adapter = opened(*args, **kwargs)
+        described = adapter.table_metadata
+
+        def metadata(identifier, *more, **named):
+            meta, columns = described(identifier, *more, **named)
+            if identifier == RELATION:
+                meta = dataclasses.replace(meta, row_count=None)
+            return meta, columns
+
+        monkeypatch.setattr(adapter, "table_metadata", metadata)
+        return adapter
+
+    monkeypatch.setattr(engine, "_adapter", uncounted)
+    [diagnosis] = to_envelope(engine.diagnose()).data["diagnoses"]
+
+    [loader] = _loader(diagnosis)
+    assert loader["status"] == "not_checked"
+    assert loader["reason"] == "uncounted"
+    assert diagnosis["verdict"] == "no_cause"
+
+
+def test_a_source_the_connection_does_not_list_is_named_as_such(tmp_path: Path):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    manifest = json.loads((root / "target" / "manifest.json").read_text())
+    manifest["sources"][SOURCE]["identifier"] = "order_items_unbuilt"
+    (root / "target" / "manifest.json").write_text(json.dumps(manifest))
+    [diagnosis] = _diagnose(root, warehouse)["diagnoses"]
+
+    [loader] = _loader(diagnosis)
+    assert loader["status"] == "not_checked"
+    assert loader["reason"] == "source_not_listed"
+
+
+def test_checks_that_do_not_fit_what_the_read_left_are_offered_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.maintain import drift as drift_mod
+
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    engine = DexEngine(connector="duckdb", path=str(warehouse), repo_root=str(root))
+    opened = engine._adapter
+
+    def gated(*args, **kwargs):
+        adapter = opened(*args, **kwargs)
+        adapter.cost_gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=1_000.0,
+            session_ceiling=100_000_000.0,
+            session_spent=0.0,
+            confirmed=True,
+            connector="bigquery",
+            command="maintain diagnose",
+        )
+        return adapter
+
+    probed: list[str] = []
+    monkeypatch.setattr(engine, "_adapter", gated)
+    monkeypatch.setattr(
+        drift_mod, "grain_estimate", lambda adapter, plan, batched=None: (5_000.0, {})
+    )
+    monkeypatch.setattr(
+        drift_mod,
+        "run_batched_probes",
+        lambda adapter, batched: probed.append("probe") or {},
+    )
+    data = to_envelope(engine.diagnose()).data
+    [diagnosis] = data["diagnoses"]
+
+    assert probed == []
+    assert data["price"]["checks"]["offered"] is True
+    [loader] = _loader(diagnosis)
+    assert loader["reason"] == "scan_offered"
+    assert diagnosis["verdict"] == "no_cause"
+
+
+def test_an_incident_that_closed_is_listed_undiagnosed_with_why(tmp_path: Path):
+    # inv-2 fails and the two passes after it close the incident.
+    root, warehouse, _ = _project(tmp_path, duplicated=True, failing=("inv-2",))
+    data = _diagnose(root, warehouse)
+
+    assert data["diagnoses"] == []
+    [entry] = data["not_diagnosed"]
+    assert entry["state"] == "closed"
+    assert entry["reason"] == "not_open"

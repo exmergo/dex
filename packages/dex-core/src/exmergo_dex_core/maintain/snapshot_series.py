@@ -26,7 +26,7 @@ from .diagnosis import Series, SnapshotPoint
 from .snapshot import Snapshot
 
 #: The most committed versions one diagnosis reads, newest first.
-MAX_SNAPSHOTS = 200
+MAX_SNAPSHOTS = 50
 
 _COMMIT = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
@@ -70,7 +70,10 @@ def read_series(
                     "snapshot baseline is committed",
                 )
             )
-    listed = _git(root, timeout, "log", "--format=%H", "--", "snapshot.json")
+    # A commit that deleted the file recorded no baseline, so it is not listed.
+    listed = _git(
+        root, timeout, "log", "--format=%H", "--diff-filter=d", "--", "snapshot.json"
+    )
     if listed is None or listed.returncode != 0:
         return SeriesRead(
             Series(
@@ -105,12 +108,46 @@ def read_series(
         )
         return SeriesRead(Series("read", reason=reason), skipped=skipped)
     points.reverse()
+    points = _measured(points, snapshots)
     return SeriesRead(
         Series("read", points=tuple(points)),
         snapshots=snapshots,
         skipped=skipped,
         elided=elided,
     )
+
+
+def _measured(
+    points: list[SnapshotPoint], snapshots: dict[str, Snapshot]
+) -> list[SnapshotPoint]:
+    """Each point with the time its warehouse state was measured, oldest first.
+
+    A warehouse block identical to the previous snapshot's was carried forward
+    (``maintain snapshot --project-only``), so it keeps that snapshot's time. A
+    block pinned from the exploration cache was measured when the cache was
+    (``cache_updated_at``). Otherwise the snapshot measured it when written.
+    """
+
+    placed: list[SnapshotPoint] = []
+    previous: Snapshot | None = None
+    for point in points:
+        snapshot = snapshots[point.commit]
+        measured: datetime | None = None
+        if (
+            previous is not None
+            and placed
+            and snapshot.warehouse == previous.warehouse
+            and snapshot.cache_updated_at == previous.cache_updated_at
+        ):
+            measured = placed[-1].placed_at()
+        elif snapshot.warehouse_from == "cache" and snapshot.cache_updated_at:
+            try:
+                measured = datetime.fromisoformat(snapshot.cache_updated_at)
+            except ValueError:
+                measured = None
+        placed.append(point.model_copy(update={"measured_at": measured}))
+        previous = snapshot
+    return placed
 
 
 def _git(
