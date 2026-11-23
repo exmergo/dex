@@ -1088,3 +1088,61 @@ def test_the_plan_writes_the_filter_as_the_monitors_where_expression(
         chosen
         == ["timestamp_column: ordered_at; where_expression: status in ('placed')"] * 2
     )
+
+
+def test_transform_declare_writes_owed_monitors_with_the_declared_filter(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, current_timestamp as signed_up_at, 'paid' as plan\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "          population:\n"
+        "            rule: Customers not on the internal plan.\n"
+        "            filters:\n"
+        "              - column: plan\n"
+        "                excludes: [internal]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    proposed = _dex(
+        ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+        capsys,
+    )
+
+    assert proposed["status"] == "ok", proposed["errors"]
+    [proposal] = proposed["data"]["proposed"]
+    wheres = {
+        m["arguments"].get("where_expression")
+        for m in proposal["fields"]["monitors"]["value"]
+    }
+    assert wheres == {"(plan not in ('internal') or plan is null)"}
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "staging" / "schema.yml").read_text(
+        encoding="utf-8"
+    )
+    assert written.count("where_expression:") == 2

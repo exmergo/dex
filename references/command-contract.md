@@ -1584,7 +1584,17 @@ default, or a filter or operator after it is refused. A key naming a location
   and carrying `config.meta.dex.monitor` (`vendor`, `from`: the declaration
   field) and the `dex_monitor` tag. Several time columns give a
   `freshness_anomalies` on each and no `volume_anomalies`
-  (`ambiguous_time_column`); none gives neither (`no_time_column`). Nothing is
+  (`ambiguous_time_column`); none gives neither (`no_time_column`). A declared
+  `population.filters` is written as each monitor's `where_expression`
+  (#1483): `includes` as `<column> in (...)`, `excludes` as `(<column> not in
+  (...) or <column> is null)` (no NULL arm where the column declares
+  `null_rule: never`), joined with `and`, each part holding an `or`
+  parenthesised, since Elementary appends it to its time-bucket filter with a
+  bare `and`. Literals are escaped as `maintain verify` escapes them on the
+  connector; the column is quoted as the adapter quotes it where it must be
+  (`quote: true`, a reserved word, not a plain identifier). A filter that
+  cannot be written withholds the model's monitors (`filter_column_not_output`,
+  `filter_unwritable`), and the marker gains `filter: population.filters`. Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an
@@ -1594,7 +1604,8 @@ default, or a filter or operator after it is refused. A key naming a location
   (`package_not_installed`, `production_disabled`, `production_unknown`) and one
   warning says why. A hand-written monitor of the same test (and, for
   freshness, the same `timestamp_column`) is `hand_written` and left as
-  written; one Dex wrote that the declaration no longer gives is `stale` and
+  written, its `where_expression` included; one Dex wrote that the declaration
+  no longer gives (another time column or `where_expression`) is `stale` and
   never removed. `data.monitors` holds `vendor`, `package` (`status`,
   `release`), `production` (`status`, `reason`, `prod_target`, `expression`),
   `counts` and `monitors[]` (`model`, `test`, `column`, `arguments`, `field`,

@@ -877,7 +877,20 @@ declared with role `time` becomes the `timestamp_column` of
 model-level tests in the same YAML entry and the same plan as the declaration
 and parsed by dbt before the plan is stored. Several time columns give a
 `freshness_anomalies` on each and no `volume_anomalies` (it takes one); no time
-column gives neither. Dex chooses no training setting (sensitivity,
+column gives neither. A declared `population.filters` becomes the
+`where_expression` of each of those monitors (#1483), so they measure the rows
+the model promises: `includes` as `<column> in (...)`, `excludes` as
+`(<column> not in (...) or <column> is null)`, without the NULL arm where the
+column declares `null_rule: never`, several filters joined with `and`, each
+part holding an `or` parenthesised (Elementary appends the expression to its own
+time-bucket filter with a bare `and`). Values are literals as `maintain verify`
+writes them on the connector (text quoted and escaped, numbers and booleans as
+written), and the column is quoted as the adapter quotes it only where it must
+be (`quote: true`, a reserved word, a name that is not a plain identifier). A
+filter Dex cannot write (its column not output, or a quoting or escaping rule
+with no connector to name it) withholds the model's monitors
+(`filter_column_not_output`, `filter_unwritable`), never writes them
+unfiltered. Dex chooses no training setting (sensitivity,
 `days_back`, seasonality stay the package's defaults). A monitor is written
 only where the package is installed (or the same plan adds it) and where the
 repository's `dbt_project.yml` enables it on the production target: its
@@ -886,8 +899,9 @@ committed `dbt_prod_target`, and a value Dex cannot evaluate, or a per-target
 test with no `dbt_prod_target`, reads `unknown`. Disabled or unknown, nothing is
 written and a warning says which. A monitor the project wrote by hand (the same
 test name, and for freshness the same `timestamp_column`) is reported
-`hand_written` and never touched; one Dex wrote that the declaration no longer
-gives is reported `stale` and never removed. `data.monitors` carries the
+`hand_written` and never touched, its own `where_expression` included; one Dex
+wrote that the declaration no longer gives (another time column, or another
+`where_expression`) is reported `stale` and never removed. `data.monitors` carries the
 vendor, the `package` and `production` reading, `counts`, and one row per
 monitor (`model`, `test`, `column`, `arguments`, `field`, `status`: `added`,
 `already_listed`, `hand_written`, `stale`, or `not_rendered` with a `reason`).

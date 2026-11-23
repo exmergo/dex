@@ -336,7 +336,7 @@ def propose(
                 },
             }
         watched = [
-            {k: row[k] for k in ("test", "column", "field")}
+            {k: row[k] for k in ("test", "column", "arguments", "field")}
             for row in monitor_rows
             if row["status"] == "added"
         ]

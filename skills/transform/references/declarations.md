@@ -912,7 +912,41 @@ models:
                 monitor: {vendor: elementary, from: "columns.ordered_at.role: time"}
 ```
 
-- **Dex chooses no statistic.** Only `timestamp_column` is written.
+- **The population is the filter (#1483).** A declared `population.filters`
+  is written as the `where_expression` of every monitor the model gets, so the
+  monitors measure the rows the model promises, and a row outside them bends
+  no training history:
+
+  | Declared | `where_expression` |
+  |---|---|
+  | `includes: [placed, shipped]` | `status in ('placed', 'shipped')` (a NULL row is outside it, as it is outside the declaration) |
+  | `excludes: [cancelled]` | `(status not in ('cancelled') or status is null)`, since `not in` drops the NULL rows an `excludes` keeps |
+  | the same on a column declaring `null_rule: never` | `status not in ('cancelled')` |
+  | several filters | each as above, joined with `and` |
+  | none | no `where_expression` |
+
+  Each part holding an `or` is parenthesised: with a `timestamp_column`,
+  Elementary's table monitors read the expression as `where <timestamp> >=
+  <bucket start> and <where_expression>`, appended with no parentheses of its
+  own (`table_monitoring_query.sql`). Values are the declaration's authored
+  text, written as `maintain verify` and `dex_population_filter` compare them:
+  as text wherever any value is text, a quote doubled where a backslash is
+  ordinary (DuckDB, Postgres, Trino), written `\'` with a backslash doubled
+  where it starts an escape (BigQuery, Snowflake, Databricks, Redshift), and
+  both doubled on ClickHouse; numbers and booleans as written. The column is written as
+  declared, as dbt names it, and quoted the way the adapter quotes it
+  (backticks on BigQuery, Databricks and ClickHouse, double quotes elsewhere)
+  only where it must be: the entry marks it `quote: true`, it is a reserved
+  word, or it is not a plain identifier. A filter Dex cannot write withholds
+  every monitor of the model rather than writing it unfiltered:
+  `filter_column_not_output` (the model does not output the column) or
+  `filter_unwritable` (a value holds a Jinja delimiter dbt would render, a
+  number is not finite, or the column or a value needs a connector's rule and
+  none is configured). The monitor's marker gains `filter:
+  population.filters`, and its `data.decisions` entry names the
+  `where_expression` in `chosen`.
+- **Dex chooses no statistic.** Only `timestamp_column` and the population's
+  `where_expression` are written.
   Sensitivity, `days_back`, seasonality and every other training setting stay
   the package's defaults, unless you add them to the test yourself.
 - **Only where the package is installed.** Installed under the packages
@@ -939,11 +973,12 @@ models:
   (with or without the `elementary.` namespace) is `hand_written` and left
   exactly as written: any `volume_anomalies` on the model, since a second one
   would count its rows twice, and a `freshness_anomalies` on the same
-  `timestamp_column`. One on another column is another monitor, so Dex adds its
-  own beside it.
+  `timestamp_column`, whatever `where_expression` it carries. One on another
+  column is another monitor, so Dex adds its own beside it.
 - **A monitor is never removed.** One Dex wrote whose time column the
-  declaration no longer names is `stale` (`declaration_changed`), with a note,
-  for a reviewer to remove. Unsetting `monitors.vendor` removes nothing.
+  declaration no longer names, or whose `where_expression` the population no
+  longer gives, is `stale` (`declaration_changed`), with a note, for a
+  reviewer to remove; Dex writes the current one beside it. Unsetting `monitors.vendor` removes nothing.
 - **Monitors are not generated tests.** `declarations.render_tests` does not
   govern them, they carry no cadence tag, and `data.generated_tests` neither
   lists nor prices them. The tag `dex_monitor` lets an orchestrator select or
