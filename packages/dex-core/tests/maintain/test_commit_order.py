@@ -606,6 +606,7 @@ def test_a_cached_answer_does_not_outlive_an_unreachable_git(
         lambda: git.resolve(repo["b"]),
         lambda: git.is_ancestor(repo["a"], repo["b"]),
         lambda: git.independent([repo["a"]]),
+        lambda: git.shallow,
     ):
         with pytest.raises(HistoryUnreadableError):
             call()

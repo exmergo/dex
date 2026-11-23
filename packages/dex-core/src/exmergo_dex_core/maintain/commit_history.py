@@ -153,6 +153,7 @@ class GitHistory:
             raise self._fail(type(exc).__name__) from None
 
     def _repository(self) -> None:
+        self._raise_if_failed()
         if self._checked:
             return
         done = self._git("rev-parse", "--git-dir", "--is-shallow-repository")
