@@ -1575,6 +1575,34 @@ default, or a filter or operator after it is refused. A key naming a location
   `<connector>.prod`, its custom schema as dbt names it there, a view read as
   the tables its manifest lineage names (`through`); only catalog
   metadata is read, unasked only where reading it is free.
+- A declaration also writes an observability vendor's **monitors** where
+  `monitors.vendor` in `.dex/config.yml` names one (#1482; unset by default,
+  `elementary` the one vendor). A column declared with role `time` becomes the
+  `timestamp_column` of `elementary.volume_anomalies` and
+  `elementary.freshness_anomalies`, model-level tests in the same YAML entry
+  and plan as the declaration, each with no training setting of Dex's choosing
+  and carrying `config.meta.dex.monitor` (`vendor`, `from`: the declaration
+  field) and the `dex_monitor` tag. Several time columns give a
+  `freshness_anomalies` on each and no `volume_anomalies`
+  (`ambiguous_time_column`); none gives neither (`no_time_column`). Nothing is
+  written unless the package is installed (or the plan adds it) and the
+  repository's `dbt_project.yml` enables `models: elementary` on the production
+  target, read with `target.name` replaced by `dbt_prod_target`: a literal, an
+  absent setting (enabled) or a test of `target.name` against literals is read,
+  and anything else, or a per-target test with no `dbt_prod_target`, is
+  `unknown`. Disabled or unknown, each monitor is `not_rendered`
+  (`package_not_installed`, `production_disabled`, `production_unknown`) and one
+  warning says why. A hand-written monitor of the same test (and, for
+  freshness, the same `timestamp_column`) is `hand_written` and left as
+  written; one Dex wrote that the declaration no longer gives is `stale` and
+  never removed. `data.monitors` holds `vendor`, `package` (`status`,
+  `release`), `production` (`status`, `reason`, `prod_target`, `expression`),
+  `counts` and `monitors[]` (`model`, `test`, `column`, `arguments`, `field`,
+  `status`, `reason`), and is absent when the setting is unset. Each monitor Dex
+  wrote is a `data.decisions` entry read back from the YAML, with `monitor` and
+  `field` and no `column`, so it settles no change-scope entry. Monitors are not
+  generated tests: `declarations.render_tests` does not govern them and no
+  per-run estimate prices them.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

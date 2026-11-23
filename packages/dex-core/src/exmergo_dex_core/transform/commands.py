@@ -346,9 +346,14 @@ def plan(
 
     toggle_stated = _parse_toggle(engine, edits, toggle)
 
-    declared, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
-        engine, edits, declarations
-    )
+    (
+        declared,
+        declaration_notes,
+        drafts,
+        pii_metadata,
+        generated_tests,
+        monitors_report,
+    ) = _declare(engine, edits, declarations)
     edits = declared
 
     if not edits:
@@ -519,6 +524,7 @@ def plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    result.monitors = monitors_report
     _price_generated_tests(engine, result, edits)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
@@ -829,7 +835,14 @@ def _keep_one_entry(
 
 def _declare(
     engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
-) -> tuple[list[PlanEdit], list[str], dict[str, Any], Any, dict[str, Any] | None]:
+) -> tuple[
+    list[PlanEdit],
+    list[str],
+    dict[str, Any],
+    Any,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     """Render the payload's declarations into ``edits``, draft what the cache
     already knows about each model, and warn where intent is missing.
 
@@ -842,7 +855,9 @@ def _declare(
     or declares, its ``drafted``, ``declared`` and ``missing`` parts (see
     :mod:`.drafting`). The fifth is ``data.generated_tests`` (#1449): the
     switch's setting and each generated test the declarations give, rendered or
-    not, or ``None`` where they give none.
+    not, or ``None`` where they give none. The sixth is ``data.monitors``
+    (#1482): the vendor monitors the declarations give, or ``None`` where
+    ``monitors.vendor`` is unset or nothing was declared.
     """
 
     from ..dbt_project import load as load_project
@@ -855,12 +870,14 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}, None, None
+        return edits, [], {}, None, None, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
     generated: list[dict[str, Any]] = []
     render_tests = engine.config.declarations.render_tests
+    monitor_rows: list[dict[str, Any]] = []
+    monitor_gate = _monitor_gate(engine, edits) if parsed else None
     if parsed:
         cache = None
         if any(d.population and d.population.filters for d in parsed):
@@ -885,6 +902,8 @@ def _declare(
             render_tests=render_tests,
             generated=generated,
             dialect=_dialect(engine),
+            monitors=monitor_gate,
+            monitor_rows=monitor_rows,
         )
         warnings.extend(rendered_warnings)
         edits = _with_generated_macros(view, edits, generated)
@@ -910,6 +929,29 @@ def _declare(
         drafts,
         pii_metadata,
         _generated_report(render_tests, generated),
+        (
+            _monitors().report(monitor_gate, monitor_rows)
+            if monitor_gate is not None
+            else None
+        ),
+    )
+
+
+def _monitors() -> Any:
+    from . import monitors
+
+    return monitors
+
+
+def _monitor_gate(engine: DexEngine, edits: list[PlanEdit]) -> Any:
+    """The vendor monitors' gate (#1482) for the project as ``edits`` leave
+    it, or ``None`` where ``monitors.vendor`` is unset."""
+
+    return _monitors().gate(
+        engine.project_dir(),
+        edits,
+        engine.config.monitors.vendor,
+        engine.config.dbt_prod_target,
     )
 
 
@@ -2265,6 +2307,7 @@ def declare(
         cap=cap,
         render_tests=engine.config.declarations.render_tests,
         dialect=_dialect(engine),
+        monitors=_monitor_gate(engine, []),
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -8559,9 +8602,14 @@ def _semantic_plan(
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
     # and before the parse below, so dbt reads the layer and the models together.
-    edits, declaration_notes, drafts, pii_metadata, generated_tests = _declare(
-        engine, edits, declarations
-    )
+    (
+        edits,
+        declaration_notes,
+        drafts,
+        pii_metadata,
+        generated_tests,
+        monitors_report,
+    ) = _declare(engine, edits, declarations)
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
     # caller's call about their own YAML, not about YAML dex wrote for them.
     derived = _derive_semantic(engine, view, edits)
@@ -8626,6 +8674,7 @@ def _semantic_plan(
     result.declarations = drafts or None
     result.pii_metadata = pii_metadata
     result.generated_tests = generated_tests
+    result.monitors = monitors_report
     _price_generated_tests(engine, result, edits)
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)

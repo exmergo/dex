@@ -869,6 +869,35 @@ because the mart's SQL already enforces it; `carried` and `not_carried` account 
 every declared field, units, NULL rules and assumptions included. Every field:
 `skills/transform/references/declarations.md`.
 
+A declaration can also write an observability vendor's own monitors (#1482),
+opt-in behind `monitors.vendor` in `.dex/config.yml` (unset by default, so a
+plan writes no monitor; `elementary` is the one vendor). With it set, a column
+declared with role `time` becomes the `timestamp_column` of
+`elementary.volume_anomalies` and `elementary.freshness_anomalies`, written as
+model-level tests in the same YAML entry and the same plan as the declaration
+and parsed by dbt before the plan is stored. Several time columns give a
+`freshness_anomalies` on each and no `volume_anomalies` (it takes one); no time
+column gives neither. Dex chooses no training setting (sensitivity,
+`days_back`, seasonality stay the package's defaults). A monitor is written
+only where the package is installed (or the same plan adds it) and where the
+repository's `dbt_project.yml` enables it on the production target: its
+`models: elementary: +enabled` is read with `target.name` replaced by the
+committed `dbt_prod_target`, and a value Dex cannot evaluate, or a per-target
+test with no `dbt_prod_target`, reads `unknown`. Disabled or unknown, nothing is
+written and a warning says which. A monitor the project wrote by hand (the same
+test name, and for freshness the same `timestamp_column`) is reported
+`hand_written` and never touched; one Dex wrote that the declaration no longer
+gives is reported `stale` and never removed. `data.monitors` carries the
+vendor, the `package` and `production` reading, `counts`, and one row per
+monitor (`model`, `test`, `column`, `arguments`, `field`, `status`: `added`,
+`already_listed`, `hand_written`, `stale`, or `not_rendered` with a `reason`).
+Each monitor Dex wrote carries `config.meta.dex.monitor` (its vendor and the
+declaration field it came from) and the `dex_monitor` tag, and is a
+`data.decisions` entry read back from the YAML, naming the `monitor` and the
+`field`, with no `column`, so it settles no change to the model's rows. Monitors
+are not generated tests: `declarations.render_tests` does not govern them and
+no per-run estimate prices them.
+
 A project whose models predate declarations adopts them with `transform declare
 [<model>...]`: one capped plan proposing only the measured facts each selected
 model does not yet declare, with any intent the same `declarations` payload
