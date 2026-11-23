@@ -719,6 +719,11 @@ def preflight(
         estimate=estimate,
         ceiling=ceiling,
         estimate_quality=estimate_quality,
+        handshake=(
+            "not_applicable"
+            if paradigm is Paradigm.FREE_LOCAL
+            else ("confirmed" if confirmed else "required")
+        ),
     )
 
     if estimate is not None and ceiling is not None and estimate > ceiling:
@@ -768,23 +773,17 @@ def _cap_shortfall(remaining: int, floor: int, unit: str, reserve: float = 0.0) 
 
 
 def skipped_handshake_warning(paradigm: Paradigm, confirmed: bool) -> list[str]:
-    """The warning a command carries when the confirm handshake would have
-    fired but the paradigm cannot bill, so nothing needed confirming
-    (issue #197).
+    """The warning a command used to carry when the confirm handshake would
+    have fired but the paradigm cannot bill (issue #197).
 
-    Empty when the caller already confirmed: passing ``--confirm`` on a free
-    connector does no harm and asking why it was unnecessary would only be
-    noise, so this is reserved for the case that would otherwise have been a
-    silent, meaningless ask. Empty on a billed paradigm too, since there the
-    handshake still gates real spend and nothing was skipped.
+    Retired by issue #1520: the note said nothing went wrong and asked nothing
+    of the reader, yet sat at the top of ``warnings`` beside findings that do
+    need action, so readers learned to skip the list. The information now lives
+    as ``cost.handshake`` (``"not_applicable"`` on ``FREE_LOCAL``), and this
+    always returns empty. Kept as a function so the call sites need no change.
     """
 
-    if paradigm is not Paradigm.FREE_LOCAL or confirmed:
-        return []
-    return [
-        "no confirm handshake: this connector cannot bill, so there was "
-        "nothing to confirm and the command ran without asking"
-    ]
+    return []
 
 
 class CostGate:
@@ -925,6 +924,11 @@ class CostGate:
             ceiling=self.effective_ceiling() if ceiling is _UNSET else ceiling,
             estimate_quality=estimate_quality_of(
                 self, estimate, paradigm=self.paradigm
+            ),
+            handshake=(
+                "not_applicable"
+                if self.paradigm is Paradigm.FREE_LOCAL
+                else ("confirmed" if self.confirmed else "required")
             ),
         )
 
@@ -1389,6 +1393,10 @@ class CostGate:
             if self.paradigm is not Paradigm.FREE_LOCAL and (
                 not self.confirmed or (ceiling is not None and needed > ceiling)
             ):
+                # The phase needs a new confirmation: the cost it carries
+                # must say "required", not repeat the earlier handshake's
+                # "confirmed" (already "required" when never confirmed).
+                cost.handshake = "required"
                 raise ConfirmationRequiredError(cost)
             self._note_calibrated_admission(needed)
             self._reserve_to(needed)

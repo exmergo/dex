@@ -120,6 +120,13 @@ class Cost(BaseModel):
     cost (#1309: the Elementary package's hooks, monitoring tests and per-test
     extras, which a build priced from its compiled nodes cannot see). ``None``
     claims nothing either way, which is every command but a build.
+
+    ``handshake`` names what the confirm handshake did, so a caller does not
+    have to infer it from whether a warning appeared (#1520): ``"not_applicable"``
+    where the paradigm cannot bill (``FREE_LOCAL``), ``"confirmed"`` where the
+    caller confirmed and the handshake ran, ``"required"`` where a billed
+    paradigm still needs the confirmation (the refusal carries this cost).
+    ``None`` means no handshake state was recorded for this cost.
     """
 
     # `validate_assignment` so the derivation below also runs when a field is
@@ -134,6 +141,7 @@ class Cost(BaseModel):
     estimate_quality: EstimateQuality | None = None
     unit: str | None = None
     unpriced: list[str] | None = None
+    handshake: str | None = None
 
     @model_validator(mode="after")
     def _unit_follows_paradigm(self) -> Cost:

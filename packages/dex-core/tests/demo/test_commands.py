@@ -125,6 +125,7 @@ def test_demo_names_no_paradigm_because_it_resolved_no_connector(capsys):
         "estimate_quality": None,
         "unit": None,
         "unpriced": None,
+        "handshake": None,
     }
 
 

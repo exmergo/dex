@@ -70,13 +70,14 @@ def forbid_dbt(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(build_module, "_default_runner", exploded)
 
 
-def test_unconfirmed_build_on_free_local_runs_and_warns_instead_of_asking(
+def test_unconfirmed_build_on_free_local_runs_without_a_handshake_warning(
     dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
 ):
-    """Issue #197: a confirm handshake is emitted only where spend is possible.
+    """Issue #1520: a confirm handshake is emitted only where spend is possible.
     DuckDB is free, so an unconfirmed build runs rather than asking the caller
-    to confirm spending nothing, and the envelope says so instead of staying
-    silent about the skipped ask."""
+    to confirm spending nothing. The skipped ask no longer rides in
+    ``warnings`` (issue #197's note taught readers to skip the list); the fact
+    is recorded as ``cost.handshake: "not_applicable"`` instead."""
 
     _fake_runner_factory(monkeypatch, returncode=0)
     rc, envelope = _run(
@@ -86,7 +87,8 @@ def test_unconfirmed_build_on_free_local_runs_and_warns_instead_of_asking(
     assert envelope["status"] == "ok"
     assert envelope["cost"]["paradigm"] == "free_local"
     assert envelope["cost"]["estimate"] == 0.0
-    assert any("no confirm handshake" in w for w in envelope["warnings"])
+    assert envelope["cost"]["handshake"] == "not_applicable"
+    assert not any("no confirm handshake" in w for w in envelope["warnings"])
 
 
 def test_confirmed_build_on_free_local_carries_no_skipped_handshake_note(
