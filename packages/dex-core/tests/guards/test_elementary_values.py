@@ -376,3 +376,17 @@ def test_a_cached_profile_never_serves_a_held_value():
     # Carried into a newly built cache, as a merge does.
     rebuilt = DexCache(datasets=[Dataset.model_validate(legacy)])
     assert rebuilt.datasets[0].columns[0].min_value is None
+
+
+def test_a_profile_withholds_the_columns_that_can_quote_a_value():
+    """#1471: a result message, compiled SQL and a test's arguments are text
+    another system wrote and may quote a value, so a profile reads none."""
+
+    names = ["status", "test_results_description", "test_results_query", "test_params"]
+    held = elementary_values.withheld_columns(
+        f"{SCHEMA}.elementary_test_results", names
+    )
+    assert held == {"test_results_description", "test_results_query", "test_params"}
+    # Only on the package's own models: a project's column of the same name is
+    # the project's, judged by its flags.
+    assert elementary_values.withheld_columns("dev.main.orders", names) == set()

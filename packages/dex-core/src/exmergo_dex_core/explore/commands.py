@@ -1896,6 +1896,7 @@ def _run_statements(
     adapter: Adapter | None = None,
     handshake: Callable[..., None] | None = None,
     reads_dev_target: bool = False,
+    limits: QueryLimits | None = None,
 ) -> tuple[list[_Statement], _Batch]:
     """Drive every statement of one call through the firewall and the warehouse.
 
@@ -1913,6 +1914,11 @@ def _run_statements(
     ``auto_profile: false`` in config) restores the strict prerequisite, and on
     that path nothing here touches the connection before the firewall has spoken.
 
+    ``limits`` replaces ``query`` in config for this call's result caps, for an
+    engine reader whose bounds are its own rather than an agent's context
+    (the Elementary incident reader, #1471). The firewall, the allowlist, the
+    profile on demand, the cost handshake and the ledger are unchanged by it.
+
     Every decision, allowed or refused, lands in the query ledger, one entry per
     statement whatever the call carried.
 
@@ -1926,7 +1932,7 @@ def _run_statements(
 
     store = engine.store
     config = engine.config
-    limits = config.query
+    limits = config.query if limits is None else limits
     now = datetime.now(UTC)
     at = now.isoformat()
     cache = readable_cache(store)
