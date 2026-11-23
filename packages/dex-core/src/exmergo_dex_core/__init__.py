@@ -92,6 +92,7 @@ _EXPORTS = {
     "ExpectationError": "transform.expected_change",
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
+    "FoldInputError": "maintain.incidents",
     "IncompatibleArtifactsError": "transform.artifact_runtime",
     "InvalidConfigError": "config_document",
     "LedgerUnreadableError": "guards.cost_guard",
@@ -209,6 +210,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
     from .maintain.elementary_layouts import ElementaryLayoutError
     from .maintain.elementary_refusals import ElementaryReadError
+    from .maintain.incidents import FoldInputError
     from .maintain.snapshot import Snapshot
     from .metric_views.dependency import MetricViewDependencyError
     from .metric_views.ossie_bridge import ConversionError
@@ -306,6 +308,7 @@ __all__ = [
     "ExpectationError",
     "ExploreStore",
     "FilesystemStore",
+    "FoldInputError",
     "IncompatibleArtifactsError",
     "InvalidConfigError",
     "LedgerUnreadableError",

@@ -9,10 +9,13 @@ never open or close an incident by different rules.
 The rule, per subject and signal, with observations in invocation order:
 
 - An observed failure from any source opens an incident, or extends the open
-  one. The source whose failure opened it is the incident's opening source.
+  one. The source whose failure opened it is the incident's opening source;
+  where several fail in that run, the one named first in ``sources`` opens it.
 - ``N`` consecutive observed passes from the opening source close it (``N`` is
   set per signal, default 2), so a test that flaps stays one incident. A pass
   from any other source is attached as evidence and never counts toward ``N``.
+  Each source has one outcome per run, a failure over a pass, so ``N`` counts
+  runs rather than rows.
 - An unobserved interval (a run that did not check the test, a run with the
   package's hooks off, a skipped test) neither opens nor closes an incident,
   and does not break a run of passes either: ``N`` counts observed passes.
@@ -44,6 +47,7 @@ incident state is kept between calls.
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -51,6 +55,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from ..errors import DexError
 from .observations import (
     SOURCE_PATTERN,
     UNKNOWN,
@@ -94,6 +99,41 @@ DEFAULT_STALE_FLOOR_SECONDS = 3600.0
 
 #: Kept under its #1465 name: a coverage segment is a timeline segment.
 CoverageSegment = TimelineSegment
+
+#: Why :func:`fold_incidents` refused its input.
+FoldInputCode = Literal[
+    "run_sequence_conflict", "sequence_run_conflict", "opener_tie_undeclared"
+]
+
+
+class FoldInputError(DexError, ValueError):
+    """Input the fold refuses rather than read in an order nobody declared.
+
+    Across the observations, the sources' runs and the timelines, a run and
+    its place in invocation order must name each other one to one.
+    ``run_sequence_conflict``: one run id carries two ``sequence`` values.
+    ``sequence_run_conflict``: one ``sequence`` carries two run ids.
+    ``opener_tie_undeclared``: two sources failed in the run that opens an
+    incident and ``sources`` gives no precedence between them. ``run`` names
+    the run, and ``runs``, ``sequences`` or ``sources`` what disagreed.
+    """
+
+    def __init__(
+        self,
+        code: FoldInputCode,
+        message: str,
+        *,
+        run: str,
+        runs: tuple[str, ...] = (),
+        sequences: tuple[int, ...] = (),
+        sources: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.run = run
+        self.runs = runs
+        self.sequences = sequences
+        self.sources = sources
 
 
 class SourceHistory(_Value):
@@ -247,6 +287,11 @@ def fold_incidents(
     run, a run with hooks or uploads off and a run that did not check the test
     each read unobserved with their reason; a source with no timeline gets one
     built from the runs it names, with no named heartbeat.
+
+    The order of ``sources`` is the precedence between them: where two sources
+    fail in the run that opens an incident, the one named first opens it. A tie
+    between sources ``sources`` does not name, and a run id carrying two
+    ``sequence`` values, are refused with :class:`FoldInputError`.
     """
 
     if close_after < 1:
@@ -264,8 +309,13 @@ def fold_incidents(
     current = None if current_subjects is None else set(current_subjects)
 
     observed = list(observations)
-    histories = {history.name: history for history in sources}
+    declared = list(sources)
+    histories = {history.name: history for history in declared}
+    precedence: dict[str, int] = {}
+    for rank, declared_source in enumerate(declared):
+        precedence.setdefault(declared_source.name, rank)
     laid = dict(timelines or {})
+    _check_run_sequences(observed, declared, laid)
     for name, timeline in laid.items():
         if name != timeline.source:
             raise ValueError(
@@ -314,7 +364,7 @@ def fold_incidents(
         by_source: dict[str, list[Observation]] = {}
         for observation in sorted(items, key=_order):
             by_source.setdefault(observation.source, []).append(observation)
-        for built in _walk(sorted(items, key=_order), threshold):
+        for built in _walk(items, threshold, precedence):
             subject, signal = key
             ranked.append(
                 (
@@ -344,40 +394,175 @@ def fold_incidents(
     return IncidentFold(incidents=tuple(incidents), schedules=schedules)
 
 
-def _order(observation: Observation) -> tuple[int, int, str]:
+_OUTCOME_RANK = {"bad": 0, "good": 1, "unobserved": 2}
+
+
+def _check_run_sequences(
+    observed: Iterable[Observation],
+    sources: Iterable[SourceHistory],
+    timelines: Mapping[str, Timeline],
+) -> None:
+    """Refuse a run id with two ``sequence`` values, or a sequence with two
+    run ids, anywhere.
+
+    A run id names one invocation, which every source sees at one place in
+    invocation order. Two places for one run, or two runs at one place, mean
+    an adapter numbered its runs on its own, and reading them as given would
+    order the sources' outcomes against each other wrongly.
+    """
+
+    places: dict[str, tuple[int, str]] = {}
+    names: dict[int, tuple[str, str]] = {}
+
+    def hold(run: str, sequence: int, where: str) -> None:
+        _one_place(places, run, sequence, where)
+        _one_run(names, run, sequence, where)
+
+    for observation in observed:
+        hold(observation.run, observation.sequence, observation.source)
+    for history in sources:
+        for ref in history.runs:
+            hold(ref.run, ref.sequence, history.name)
+    for name, timeline in timelines.items():
+        for entry in timeline.entries:
+            if entry.kind != "run" or entry.run is None or entry.sequence is None:
+                continue
+            hold(entry.run, entry.sequence, name)
+
+
+def _one_place(
+    places: dict[str, tuple[int, str]], run: str, sequence: int, where: str
+) -> None:
+    """Refuse a run id seen at two sequences."""
+
+    held = places.setdefault(run, (sequence, where))
+    if held[0] == sequence:
+        return
+    raise FoldInputError(
+        "run_sequence_conflict",
+        f"run {run!r} is sequence {held[0]} in {held[1]} and "
+        f"{sequence} in {where}: one run has one place in invocation "
+        "order, so number every source's runs from the same series",
+        run=run,
+        sequences=(held[0], sequence),
+        sources=tuple(dict.fromkeys((held[1], where))),
+    )
+
+
+def _one_run(
+    names: dict[int, tuple[str, str]], run: str, sequence: int, where: str
+) -> None:
+    """Refuse a sequence seen with two run ids."""
+
+    held = names.setdefault(sequence, (run, where))
+    if held[0] == run:
+        return
+    raise FoldInputError(
+        "sequence_run_conflict",
+        f"sequence {sequence} is run {held[0]!r} in {held[1]} and {run!r} in "
+        f"{where}: one place in invocation order holds one run, so number "
+        "every source's runs from the same series",
+        run=run,
+        runs=(held[0], run),
+        sequences=(sequence,),
+        sources=tuple(dict.fromkeys((held[1], where))),
+    )
+
+
+def _order(observation: Observation) -> tuple[int, int, str, str]:
     """Invocation order; within one run a failure is read before a pass, so a
-    source that disagrees in the same run is evidence, not the opener."""
+    source that disagrees in the same run is evidence, not the opener. The
+    source and test names only keep the order stable: which source opens a tie is
+    :func:`_opener`'s, by the declared precedence."""
 
-    rank = {"bad": 0, "good": 1, "unobserved": 2}[observation.outcome]
-    return (observation.sequence, rank, observation.source)
+    rank = _OUTCOME_RANK[observation.outcome]
+    return (observation.sequence, rank, observation.source, observation.test)
 
 
-def _walk(items: list[Observation], threshold: int) -> list[_Open]:
+def _first_per_source(failures: list[Observation]) -> list[Observation]:
+    """Each source's first failure in one run: the candidates to open it."""
+
+    kept: dict[str, Observation] = {}
+    for observation in failures:
+        kept.setdefault(observation.source, observation)
+    return list(kept.values())
+
+
+def _counts_as_pass(
+    observation: Observation, failed: set[str], counted: set[str]
+) -> bool:
+    """Whether an opening-source pass adds to ``N``: once per run, and never in
+    a run the same source failed (a failure over a pass, as
+    ``timeline._merge`` merges a run). Two rows for one key in one run (two
+    tests carrying one claim, or an adapter that did not deduplicate) are
+    one observed run, so ``N`` counts runs. Every row is still recorded."""
+
+    if observation.source in failed or observation.source in counted:
+        return False
+    counted.add(observation.source)
+    return True
+
+
+def _opener(
+    candidates: list[Observation], precedence: Mapping[str, int]
+) -> Observation:
+    """The failure that opens an incident when sources fail in the same run:
+    the source declared first in ``sources``. Refused where a tied source is
+    not declared, since no order between them is given."""
+
+    if len(candidates) == 1:
+        return candidates[0]
+    names = sorted(o.source for o in candidates)
+    undeclared = [name for name in names if name not in precedence]
+    if undeclared:
+        raise FoldInputError(
+            "opener_tie_undeclared",
+            f"run {candidates[0].run!r} failed in {', '.join(names)}, and "
+            f"{', '.join(undeclared)} has no precedence: name every source "
+            "that can fail in one run in `sources`, highest precedence first",
+            run=candidates[0].run,
+            sources=tuple(names),
+        )
+    return min(candidates, key=lambda o: precedence[o.source])
+
+
+def _walk(
+    items: list[Observation], threshold: int, precedence: Mapping[str, int]
+) -> list[_Open]:
     """The incidents one subject and signal's series holds, oldest first."""
 
     built: list[_Open] = []
     current: _Open | None = None
     seen_good = False
-    for observation in items:
-        if observation.outcome == "unobserved":
-            continue
-        if observation.outcome == "bad":
+    ordered = sorted(items, key=_order)
+    for _, run in itertools.groupby(ordered, key=lambda o: o.sequence):
+        outcomes = list(run)
+        failures = [o for o in outcomes if o.outcome == "bad"]
+        failed = {o.source for o in failures}
+        counted: set[str] = set()
+        if failures:
             if current is None:
-                current = _Open(opening=observation, first_known=seen_good)
-            current.observations.append(observation)
+                opening = _opener(_first_per_source(failures), precedence)
+                current = _Open(opening=opening, first_known=seen_good)
+                failures = [opening, *(o for o in failures if o is not opening)]
+            current.observations.extend(failures)
             current.streak = 0
-            continue
-        # An observed pass.
-        if current is None:
-            seen_good = True
-            continue
-        current.observations.append(observation)
-        if observation.source != current.opening.source:
-            current.evidence.add(len(current.observations) - 1)
-            continue
-        current.streak += 1
-        if current.streak >= threshold:
-            current.closed_by = observation
+        for observation in (o for o in outcomes if o.outcome == "good"):
+            if current is None:
+                seen_good = True
+                continue
+            current.observations.append(observation)
+            if observation.source != current.opening.source:
+                current.evidence.add(len(current.observations) - 1)
+                continue
+            if not _counts_as_pass(observation, failed, counted):
+                continue
+            current.streak += 1
+            if current.streak >= threshold and current.closed_by is None:
+                current.closed_by = observation
+        # Close after the run, so the closing run's other rows (another test
+        # carrying the claim, another source's evidence) stay on it.
+        if current is not None and current.closed_by is not None:
             built.append(current)
             current = None
             seen_good = True
@@ -581,6 +766,8 @@ __all__ = [
     "Break",
     "Coverage",
     "CoverageSegment",
+    "FoldInputCode",
+    "FoldInputError",
     "Incident",
     "IncidentFold",
     "IncidentObservation",
