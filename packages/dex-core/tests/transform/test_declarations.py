@@ -2049,3 +2049,111 @@ def test_target_dependent_elementary_sampling_warning_with_target_matched_eviden
         "installed Elementary release 0.16.4 ignores disable_test_samples" in w
         for w in prod_warnings
     )
+
+
+def test_target_dependent_elementary_sampling_warning_with_root_shim(tmp_path: Path):
+    """A root materialization delegating to Elementary warns when enablement
+    is unknown.
+    """
+    from tests.transform.test_elementary import (
+        ELEMENTARY_MAT,
+        _macro,
+        _write,
+        manifest,
+        project_yml,
+    )
+
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    project_text = (
+        project_yml(flag="true")
+        + f'models:\n  elementary:\n    +enabled: "{enabled_expression("dev")}"\n'
+    )
+    _write(tmp_path, "dbt_project.yml", project_text)
+    _write(
+        tmp_path,
+        "dbt_packages/elementary/dbt_project.yml",
+        'name: elementary\nversion: "0.16.4"\n',
+    )
+    project_files = _project()
+    shim = _macro("shop", "materialization_test_default", depends=(ELEMENTARY_MAT,))
+    shim_manifest = manifest(elementary=True, extra_macros=(shim,))
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="shop",
+        profile_name="shop",
+        files={
+            path: SourceFile(path=path, content=content, sha256="x")
+            for path, content in project_files.items()
+        },
+        manifest=shim_manifest,
+    )
+
+    parsed = parse_declarations([{"model": "fct_orders", "grain": ["order_id"]}])
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert any(
+        (
+            "whether installed Elementary release 0.16.4 is enabled is unknown "
+            "without a matching manifest"
+        )
+        in w
+        for w in warnings
+    )
+
+
+def test_target_dependent_package_model_parent_check_advises_when_unresolved(
+    tmp_path: Path,
+):
+    """Target-dependent package model enablement reports advisory when manifest
+    is absent.
+    """
+    from exmergo_dex_core.transform.elementary_install import enabled_expression
+
+    project_text = (
+        "name: shop\nversion: '1.0.0'\nprofile: shop\nmodel-paths: ['models']\n"
+        f'models:\n  pkg:\n    +enabled: "{enabled_expression("dev")}"\n'
+    )
+    (tmp_path / "dbt_project.yml").write_text(project_text, encoding="utf-8")
+    pkg_dir = tmp_path / "dbt_packages" / "pkg"
+    (pkg_dir / "models").mkdir(parents=True)
+    (pkg_dir / "dbt_project.yml").write_text(
+        "name: pkg\nversion: '1.0.0'\nmodel-paths: ['models']\n", encoding="utf-8"
+    )
+    (pkg_dir / "models" / "parent_m.sql").write_text(
+        "select 1 as id, 2 as val\n", encoding="utf-8"
+    )
+
+    view = DbtProjectView(
+        root=str(tmp_path),
+        project_name="shop",
+        profile_name="shop",
+        files={
+            "dbt_project.yml": SourceFile(
+                path="dbt_project.yml", content=project_text, sha256="x"
+            ),
+            "models/child.sql": SourceFile(
+                path="models/child.sql",
+                content="select id from {{ ref('parent_m') }}\n",
+                sha256="y",
+            ),
+        },
+        manifest=None,
+    )
+
+    parsed = parse_declarations(
+        [
+            {
+                "model": "child",
+                "columns": {"id": {"references": "parent_m.id"}},
+            }
+        ]
+    )
+    _edits, warnings = apply_declarations(parsed, view, [])
+    assert any(
+        (
+            "whether 'parent_m' (model of package pkg, "
+            "`dbt_packages/pkg/models/parent_m.sql`) is enabled is unknown"
+        )
+        in w
+        for w in warnings
+    )

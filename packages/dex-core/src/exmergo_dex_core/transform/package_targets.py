@@ -92,7 +92,7 @@ class PackageTarget:
     path: str
     columns: frozenset[str] | None
     unread: str | None = None
-    enabled: bool = True
+    enabled: bool | None = True
     schema: str | None = None
 
     def described(self) -> str:
@@ -107,6 +107,7 @@ def find_package_target(
     *,
     project_yml: str | None,
     manifest: Mapping[str, Any] | None = None,
+    target: str | None = None,
 ) -> PackageTarget | None:
     """The installed package node called ``name``, or ``None``.
 
@@ -121,12 +122,14 @@ def find_package_target(
     project = Path(root)
     found: list[PackageTarget] = []
     for package, directory, _roots in _installed(project):
-        target = _in_package(project, package, directory, name, project_yml, manifest)
-        if target is not None:
-            found.append(target)
+        found_target = _in_package(
+            project, package, directory, name, project_yml, manifest, target=target
+        )
+        if found_target is not None:
+            found.append(found_target)
     if not found:
         return None
-    return next((t for t in found if t.enabled), found[0])
+    return next((t for t in found if t.enabled is not False), found[0])
 
 
 def _in_package(
@@ -136,6 +139,8 @@ def _in_package(
     name: str,
     project_yml: str | None,
     manifest: Mapping[str, Any] | None,
+    *,
+    target: str | None = None,
 ) -> PackageTarget | None:
     """The node called ``name`` in one installed package, or ``None``."""
     from ..dbt_project import DbtProjectError
@@ -174,7 +179,13 @@ def _in_package(
             Path(sql_path).parent,
         )
         folders = list(Path(sql_path).relative_to(base).parent.parts)
-        enabled = package_enabled(models_config(project_yml), package, [*folders, name])
+        enabled = package_enabled(
+            models_config(project_yml),
+            package,
+            [*folders, name],
+            manifest=manifest,
+            target=target,
+        )
         schema = (
             _manifest_schema(manifest, package, name)
             or package_custom_schema(

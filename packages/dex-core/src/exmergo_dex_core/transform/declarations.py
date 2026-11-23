@@ -548,35 +548,6 @@ def _elementary_sampling_warning(
     if elem_enabled is False:
         return None
 
-    if elem_enabled is None:
-        if elementary._override_flag(project):
-            return None
-        below = _is_below_0_20(release)
-        if below is True and release is not None:
-            return (
-                f"whether installed Elementary release {release} is enabled is "
-                "unknown without a matching manifest, so whether it honours "
-                "disable_test_samples is uncertain; upgrade the package to "
-                "0.20.0 or later, or set test_sample_row_count: 0 for the project"
-            )
-        if below is None:
-            return (
-                "could not tell the installed Elementary release and whether it "
-                "is enabled is unknown without a matching manifest, so whether "
-                "it honours disable_test_samples is uncertain; upgrade the package "
-                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
-            )
-        if elementary.release_status(release) == "untested":
-            return (
-                f"installed Elementary release {release} is newer than the newest "
-                f"release dex was run against ({elementary.NEWEST_TESTED}), and "
-                "whether it is enabled is unknown without a matching manifest, "
-                "so whether it honours disable_test_samples is unchecked "
-                f"({elementary.RELEASE_UNTESTED}); set test_sample_row_count: 0 for "
-                "the project to keep samples off whatever it does"
-            )
-        return None
-
     if materialization is None:
         elem_mat = f"macro.{elementary.PACKAGE}.materialization_test_default"
         synthetic_manifest = {
@@ -620,6 +591,33 @@ def _elementary_sampling_warning(
     # disabled, on a release Dex was not run against (#1445), so nothing says it
     # hands the tests to dbt's.
     if materialization not in ("elementary", "unknown"):
+        return None
+
+    if elem_enabled is None:
+        below = _is_below_0_20(release)
+        if below is True and release is not None:
+            return (
+                f"whether installed Elementary release {release} is enabled is "
+                "unknown without a matching manifest, so whether it honours "
+                "disable_test_samples is uncertain; upgrade the package to "
+                "0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            )
+        if below is None:
+            return (
+                "could not tell the installed Elementary release and whether it "
+                "is enabled is unknown without a matching manifest, so whether "
+                "it honours disable_test_samples is uncertain; upgrade the package "
+                "to 0.20.0 or later, or set test_sample_row_count: 0 for the project"
+            )
+        if elementary.release_status(release) == "untested":
+            return (
+                f"installed Elementary release {release} is newer than the newest "
+                f"release dex was run against ({elementary.NEWEST_TESTED}), and "
+                "whether it is enabled is unknown without a matching manifest, "
+                "so whether it honours disable_test_samples is unchecked "
+                f"({elementary.RELEASE_UNTESTED}); set test_sample_row_count: 0 for "
+                "the project to keep samples off whatever it does"
+            )
         return None
 
     below = _is_below_0_20(release)
@@ -1114,14 +1112,21 @@ def _check_reference(
         parent,
         project_yml=files.get("dbt_project.yml"),
         manifest=view.manifest,
+        target=getattr(view, "dbt_target", None),
     )
     if packaged is not None:
-        if not packaged.enabled:
+        if packaged.enabled is False:
             raise DeclarationError(
                 f"{said}, and {packaged.described()} is disabled in this project's "
                 "dbt_project.yml with no project model of that name, so dbt builds "
                 "no node called that; name the model that replaces it"
             )
+        if packaged.enabled is None:
+            return [
+                f"{said}: whether {packaged.described()} is enabled is unknown without "
+                "a matching manifest, so whether it produces '{parent_column}' was "
+                "not checked here; transform build verify reads the built relation"
+            ]
         if packaged.columns is None:
             return [
                 f"{said}: the columns of {packaged.described()} could not be read "
@@ -1753,6 +1758,7 @@ def _parent_unwritable(
             parent,
             project_yml=files.get("dbt_project.yml"),
             manifest=view.manifest,
+            target=getattr(view, "dbt_target", None),
         )
         if packaged is not None:
             return gt.PARENT_IN_PACKAGE

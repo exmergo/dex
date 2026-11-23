@@ -1055,7 +1055,11 @@ def _draft(
                 **_drafting_inputs(engine, view),
                 # Package models are enabled or disabled by the project file as
                 # the plan leaves it.
-                "packaged": _package_lookup(view, files.get("dbt_project.yml")),
+                "packaged": _package_lookup(
+                    view,
+                    files.get("dbt_project.yml"),
+                    target=engine.config.dbt_target,
+                ),
             },
             index=lambda: _post_change_index(view, edits),
             key_facts=lambda: _post_change_key_facts(view, edits),
@@ -1110,14 +1114,17 @@ def _drafting_inputs(engine: DexEngine, view: Any) -> dict[str, Any]:
         },
         "cache_note": note,
         "dev_namespace": _dev_namespace(engine),
-        "packaged": _package_lookup(view),
+        "packaged": _package_lookup(view, target=engine.config.dbt_target),
         "manifest": manifest,
         "manifest_stale": manifest_stale,
     }
 
 
 def _package_lookup(
-    view: Any, project_yml: str | None = None
+    view: Any,
+    project_yml: str | None = None,
+    *,
+    target: str | None = None,
 ) -> Callable[[str], str | None]:
     """The installed package that builds a name, for a drafted ``references``
     whose parent the project itself does not define (#1155). Read from the
@@ -1142,9 +1149,15 @@ def _package_lookup(
         """The package that builds ``name``, or ``None``; remembered per name."""
         if name not in seen:
             found = find_package_target(
-                view.root, name, project_yml=text, manifest=view.manifest
+                view.root,
+                name,
+                project_yml=text,
+                manifest=view.manifest,
+                target=target,
             )
-            targets[name] = found if found is not None and found.enabled else None
+            targets[name] = (
+                found if found is not None and found.enabled is not False else None
+            )
             seen[name] = targets[name].package if targets[name] is not None else None
         return seen[name]
 

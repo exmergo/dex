@@ -137,7 +137,7 @@ def _dbt_parent_resolvable(
         project_yml=files.get("dbt_project.yml"),
         manifest=view.manifest,
     )
-    if packaged is None or not packaged.enabled:
+    if packaged is None or packaged.enabled is False:
         return False
     if packaged.columns is None:
         return True

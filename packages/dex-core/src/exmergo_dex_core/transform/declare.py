@@ -419,10 +419,11 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
         parent,
         project_yml=files.get("dbt_project.yml"),
         manifest=getattr(view, "manifest", None),
+        target=getattr(view, "dbt_target", None),
     )
     return (
         packaged is not None
-        and packaged.enabled
+        and packaged.enabled is not False
         and (packaged.columns is None or column.lower() in packaged.columns)
     )
 
