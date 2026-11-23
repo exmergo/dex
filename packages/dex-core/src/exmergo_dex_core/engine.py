@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     )
     from .maintain.results import (
         CoverageResult,
+        DiagnoseResult,
         DriftResult,
         IncidentsResult,
         ReconcileResult,
@@ -1490,6 +1491,27 @@ class DexEngine:
         from .maintain import incident_sources
 
         return incident_sources.incidents(self, objects, invocations=invocations)
+
+    def diagnose(
+        self,
+        objects: list[str] | None = None,
+        *,
+        invocations: int | None = None,
+    ) -> DiagnoseResult:
+        """Each open incident on the selected models' tests, diagnosed (#1475).
+
+        The incidents are read as :meth:`incidents` reads them, with the
+        repository's history, and each is bisected over its onset, bounded by
+        the committed snapshot series where there is one, and answered by the
+        checks Dex already has: one confirmed cause, several, or none, with
+        what was ruled out and the window no recorded state covers. On a billed
+        connector the incident read and then the checks each raise
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before they scan.
+        """
+
+        from .maintain import diagnose
+
+        return diagnose.diagnose(self, objects, invocations=invocations)
 
     # --- transform --------------------------------------------------------
     #

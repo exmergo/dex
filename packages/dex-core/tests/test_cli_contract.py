@@ -1027,6 +1027,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
         "method": "incidents",
         "args": {"objects": "objects", "invocations": "invocations"},
     },
+    ("maintain", "diagnose"): {
+        "method": "diagnose",
+        "args": {"objects": "objects", "invocations": "invocations"},
+    },
     ("maintain", "reconcile"): {
         "method": "reconcile",
         "args": {"drift_class": "drift_class"},
