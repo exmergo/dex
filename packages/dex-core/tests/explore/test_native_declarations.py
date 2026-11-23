@@ -178,6 +178,42 @@ def test_a_contradicted_single_primary_key_keeps_the_evidence_beside_the_claim(
     )
 
 
+def test_a_contradicted_grain_that_is_also_declared_unique_carries_one_note(
+    keyed, capsys
+):
+    """One contradiction note when the column is both the declared grain and
+    the declared-unique column (#998): the persisted unique note, which is
+    the one commands reading the cache still see."""
+    dataset = _profiled(keyed, capsys, DUPLICATED)[DUPLICATED]
+
+    assert dataset["declaration"]["grain_status"] == "contradicted"
+    assert [note for note in dataset["data_quality"] if "found duplicates" in note] == [
+        "event_id is declared unique in the Ossie layer but profiling found duplicates"
+    ]
+
+
+def test_a_unique_key_that_is_not_the_grain_keeps_its_own_note(tmp_path, capsys):
+    """A unique_keys column that is not the grain keeps its own contradiction
+    note (#998)."""
+    conn = duckdb.connect(str(tmp_path / "demo.duckdb"))
+    conn.execute(
+        "CREATE TABLE mixed AS SELECT i AS a, i % 3 AS b FROM range(0, 9) t(i)"
+    )
+    conn.close()
+    root = _ossie_repo(
+        tmp_path,
+        _ossie_dataset("mixed", ["a", "b"], primary_key=["a"], unique_keys=[["b"]]),
+    )
+
+    dataset = _profiled(root, capsys, "demo.main.mixed")["demo.main.mixed"]
+
+    assert dataset["grain"] == ["a"]
+    assert dataset["declaration"]["grain_status"] == "proven"
+    assert [note for note in dataset["data_quality"] if "found duplicates" in note] == [
+        "b is declared unique in the Ossie layer but profiling found duplicates"
+    ]
+
+
 def test_a_primary_key_beats_a_measured_single_column_key(tmp_path, capsys):
     """Both arities. A composite used to yield to a proven single, and its note
     would then sit beside a declaration saying the opposite."""
