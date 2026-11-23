@@ -51,6 +51,7 @@ from typing import Any
 
 import yaml
 
+from ..errors import RequestError
 from ..semantic_declarations import Declaration, PopulationFilter, Role
 from .plans import PlanEdit
 
@@ -376,10 +377,11 @@ _SNOWFLAKE_RESERVED = frozenset(
 _JINJA = ("{{", "{%", "{#")
 
 
-class FilterUnwritableError(ValueError):
+class FilterUnwritableError(RequestError):
     """A population filter dex cannot write as a ``where_expression``.
 
     ``reason`` is the ``not_rendered`` reason every monitor of the model takes.
+    Never leaves :func:`planned`, which turns it into that reason.
     """
 
     def __init__(self, reason: str, detail: str) -> None:
