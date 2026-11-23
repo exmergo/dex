@@ -107,6 +107,33 @@ def test_inventory_rank_limit_caps_the_ranked_list(duckdb_file: Path, capsys):
     assert any("capped at 1" in n for n in payload["data"]["notes"])
 
 
+@pytest.mark.parametrize("bad_limit", ["0", "-5"])
+def test_inventory_rank_limit_below_one_is_refused(
+    duckdb_file: Path, capsys, bad_limit
+):
+    # A non-positive cap used to silently mis-cut the list (metas[:-5] drops
+    # the last 5, metas[:0] empties it) and report it as "capped at -5" (#1326).
+    rc = main(
+        [
+            "explore",
+            "inventory",
+            "--rank",
+            "--limit",
+            bad_limit,
+            "--path",
+            str(duckdb_file),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1, "exactly one envelope line"
+    payload = json.loads(out)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["reason"] == "request"
+    assert "--limit" in payload["errors"][0]
+    assert "below 1" in payload["errors"][0]
+
+
 def test_inventory_rank_all_lifts_the_cap_even_with_a_limit(duckdb_file: Path, capsys):
     # --all wins over --limit: today's full-unbounded behavior, explicitly asked
     # for, is not something a smaller --limit passed alongside it can narrow.
@@ -237,6 +264,28 @@ def test_inventory_limit_and_all_are_no_ops_without_rank(duckdb_file: Path, caps
             "--limit",
             "1",
             "--all",
+            "--path",
+            str(duckdb_file),
+        ],
+        capsys,
+    )
+    data = payload["data"]
+    assert data["object_count"] == 2
+    assert data["elided_object_count"] == 0
+
+
+@pytest.mark.parametrize("bad_limit", ["0", "-5"])
+def test_inventory_limit_below_one_is_ignored_without_rank(
+    duckdb_file: Path, capsys, bad_limit
+):
+    # --limit is a no-op without --rank, so a non-positive value must not
+    # raise there: the unranked list is returned whole, as it always was.
+    payload = _run(
+        [
+            "explore",
+            "inventory",
+            "--limit",
+            bad_limit,
             "--path",
             str(duckdb_file),
         ],
