@@ -416,11 +416,21 @@ def test_a_build_is_read(project: Path) -> None:
     assert read.run == {
         "invocation_id": INV_A,
         "generated_at": AT,
+        "invocation_started_at": None,
         "command": "build",
         "artifact": "dex",
         "cold": False,
         "logged": True,
     }
+
+
+def test_the_run_s_start_is_read_where_dbt_recorded_it(project: Path) -> None:
+    document = _document({NOT_NULL: "fail"})
+    document["metadata"]["invocation_started_at"] = "2026-11-15T10:58:00Z"
+    _write(_dex_dir(project), document)
+    read = rr.read_run_results(project, _manifest())
+    assert read.run is not None
+    assert read.run["invocation_started_at"] == "2026-11-15T10:58:00Z"
     assert [o.outcome for o in read.observations] == ["bad"]
     assert any("first_observed: unknown" in note for note in read.notes)
 

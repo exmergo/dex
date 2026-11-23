@@ -352,7 +352,9 @@ def read_elementary(
         profiled=tuple(spend.profiled),
         profile_estimate=spend.profile_estimate(),
         # A run-count window cut the table only where it filled: one holding
-        # fewer rows than `last` was read whole.
+        # fewer rows than `last` was read whole. A table of exactly `last` rows
+        # also fills it and reads as windowed, so its retention bound may be
+        # older than said: telling the two apart costs one more statement.
         windowed=plan.since is not None
         or (plan.last is not None and measured.invocations >= plan.last),
         result_rows_read=len(result_rows),

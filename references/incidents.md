@@ -367,7 +367,10 @@ hold the longer run history.
   is priced before any runs, with the profiles the firewall needs on a first
   read, as one handshake.
 - **One order.** dbt's run is placed where Elementary placed the same
-  invocation, or after the window when it ran later than all of it. A run that
+  invocation, or after the window when it started after the window's newest
+  run (dbt's `invocation_started_at` against Elementary's `run_started_at`,
+  two starts; `generated_at` is the run's end). It is then named under
+  `window.after_window`, outside the count, which never exceeds the run count. A run that
   is neither has no place in the order and is left out of the fold, with
   `folded: false`.
 - **Every source answers.** `data.sources` reports each source `read`, `missing`
@@ -375,8 +378,8 @@ hold the longer run history.
   `dex init` that offers it), a package whose uploads are off (`not_uploading`),
   a schema outside the source allowlist (`outside_allowlist`, with the
   `dex config set` that adds it; nothing is read past the allowlist), or the
-  reader's own refusals. An empty `incidents` list only means a source was read
-  and held no failure.
+  reader's own refusals. An empty `incidents` list means no failure only where a
+  source reads `read`.
 - **Read alone, dbt's run results never close an incident.** The next build
   overwrites the file, so a fixed failure drops out of it rather than reading as
   two passes.

@@ -12,10 +12,11 @@ opens an incident:
    goes through the runner ``explore query`` uses, under the firewall, the source
    allowlist, the profile on demand and the query ledger, and all five are priced
    before any runs: on a billed connector the first call answers
-   ``needs_confirmation`` and reads nothing.
+   ``needs_confirmation`` having sent no statement (it reads only the
+   catalog metadata every ``explore`` read takes first).
 2. **dbt's run results** (:mod:`.run_results_incidents`, #1468): files only, one
    invocation. Folded beside Elementary, its run takes the place Elementary gave
-   the same invocation, or the place after the window where it ran later; a run
+   the same invocation, or the place after the window where it started later; a run
    that is neither is reported and left out of the fold, since it has no place in
    the order.
 
@@ -23,8 +24,8 @@ Each source works alone and each is reported under ``sources`` as ``read``,
 ``missing`` or ``refused``, with a reason code for the last two. A schema
 outside the committed source allowlist is ``refused`` before anything opens a
 connection, with the ``dex config set`` that would add it: the allowlist is a cost
-boundary, so this command never reads past it. An empty ``incidents`` list only
-ever means a source was read and held no failure.
+boundary, so this command never reads past it. An empty ``incidents`` list
+means no failure only where a source reads ``read``.
 
 Read-only: nothing here writes to the warehouse or the project, and no incident
 state is kept between calls.
@@ -43,7 +44,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .. import command_args
 from ..values_free import require_allowed
-from .coverage_runs import current_tests
+from .coverage_runs import current_tests, parse_time
 from .incidents import SourceHistory, fold_incidents
 from .observations import Observation, Subject
 from .results import IncidentsResult
@@ -145,7 +146,7 @@ def incidents(
             steps.append(_BUILD_STEP)
         return IncidentsResult(
             sources={name: _Source("missing", code, why).report() for name in SOURCES},
-            window=_window(window_size, []),
+            window=_window(window_size, None, None),
             price=_price_report(None),
             next_steps=steps,
             warnings=[f"maintain incidents read no source: {why}"],
@@ -200,7 +201,7 @@ def incidents(
             name: schedule.model_dump(mode="json")
             for name, schedule in fold.schedules.items()
         },
-        window=_window(window_size, histories),
+        window=_window(window_size, elementary.history, dbt),
         price=_price_report(priced),
         sources={ELEMENTARY: elementary.report(), DBT_RUN_RESULTS: dbt.report()},
         scope=None
@@ -549,7 +550,7 @@ def _read_elementary(
         )
     from ..guards.query_firewall import QueryRefusedError
 
-    base = {"_warnings": warned, "release": release}
+    base: dict[str, Any] = {"_warnings": warned, "release": release}
     adapter = engine._adapter(COMMAND)
     namespace = _adapter_namespace(adapter, located)
     if namespace is None:
@@ -564,6 +565,8 @@ def _read_elementary(
     try:
         plan = reader.plan_read(engine, namespace, release, last=window_size)
         priced = _price(engine, plan)
+        # From here a refusal may follow spend, so it keeps what was priced.
+        base["_price"] = priced
         read = reader.read_elementary(engine, plan, claims=claims)
     except ElementaryLayoutError as exc:
         return _Source("refused", exc.code, str(exc), base)
@@ -684,19 +687,34 @@ def _dbt(
             steps.append(_BUILD_STEP)
         detail = found.notes[0] if found.notes else None
         return _Source(found.status, found.reason_code, detail, extra)
-    sequence = _place(found.history, elementary)
+    started = parse_time(str((found.run or {}).get("invocation_started_at") or ""))
+    sequence, placed_as = _place(found.history, started, elementary)
+    extra["placed"] = placed_as
     if sequence is None:
         extra["folded"] = False
-        extra["detail"] = (
-            "the run is not in Elementary's window and did not run after it, so "
-            "it has no place in the order and is left out of the fold"
-        )
         notes.extend(found.notes)
-        return _Source("read", extra=extra)
-    if sequence != 1:
-        found = read_run_results(
-            project_dir, manifest, claims=claims, sequence=sequence
+        return _Source(
+            "read",
+            detail=(
+                "the run is not in Elementary's window and did not start after "
+                "it, so it has no place in the order and is left out of the fold"
+            ),
+            extra=extra,
         )
+    # Re-sequenced in memory, from the one read: reading the file again could
+    # find another invocation a build wrote in between.
+    observations = tuple(
+        observation.model_copy(update={"sequence": sequence})
+        for observation in found.observations
+    )
+    history = found.history.model_copy(
+        update={
+            "runs": tuple(
+                ref.model_copy(update={"sequence": sequence})
+                for ref in found.history.runs
+            )
+        }
+    )
     counts = found.counts
     extra.update(
         folded=True,
@@ -709,57 +727,80 @@ def _dbt(
         },
     )
     notes.extend(found.notes)
-    return _Source(
-        "read",
-        extra=extra,
-        observations=found.observations,
-        history=found.history,
-    )
+    return _Source("read", extra=extra, observations=observations, history=history)
 
 
-def _place(run: SourceHistory, elementary: SourceHistory | None) -> int | None:
-    """The run's place in the one invocation order: Elementary's place for the
-    same invocation, else the place after Elementary's window where the run ran
-    later than all of it, else ``None``. Alone, it is the only run."""
+#: How dbt's run was placed in the one invocation order: ``alone`` (the only
+#: run read), ``in_window`` (Elementary recorded the same invocation),
+#: ``after_window`` (it started after Elementary's newest run) or ``unplaced``.
+Placed = Literal["alone", "in_window", "after_window", "unplaced"]
+
+
+def _place(
+    run: SourceHistory, started: datetime | None, elementary: SourceHistory | None
+) -> tuple[int | None, Placed]:
+    """The run's place in the one invocation order, and how it was found.
+
+    Elementary's place for the same invocation; else the place after
+    Elementary's window, where the run *started* after Elementary's newest run
+    started, both being starts (``run_started_at`` and dbt's
+    ``invocation_started_at``, never ``generated_at``, which is the run's end);
+    else no place. Alone, it is the only run."""
 
     [ref] = run.runs
     if elementary is None or not elementary.runs:
-        return 1
+        return 1, "alone"
     placed = {held.run: held.sequence for held in elementary.runs}
     if ref.run in placed:
-        return placed[ref.run]
+        return placed[ref.run], "in_window"
     newest = elementary.runs[-1]
-    if ref.at is not None and newest.at is not None and ref.at > newest.at:
-        return newest.sequence + 1
-    return None
+    if started is not None and newest.at is not None and started > newest.at:
+        return newest.sequence + 1, "after_window"
+    return None, "unplaced"
 
 
 # --- the envelope's own fields -------------------------------------------------
 
 
-def _window(size: int, histories: Sequence[SourceHistory]) -> dict[str, Any]:
-    """The invocations the read covered: first, last and how many."""
-
-    runs: dict[str, Any] = {}
-    for history in histories:
-        for ref in history.runs:
-            runs.setdefault(ref.run, ref)
-    ordered = sorted(runs.values(), key=lambda ref: ref.sequence)
-
-    def point(ref: Any) -> dict[str, Any] | None:
-        if ref is None:
-            return None
-        return {
-            "invocation_id": ref.run,
-            "sequence": ref.sequence,
-            "at": ref.at.isoformat() if ref.at is not None else None,
-        }
-
+def _point(ref: Any) -> dict[str, Any] | None:
+    if ref is None:
+        return None
     return {
-        "invocations": size,
-        "count": len(ordered),
-        "first": point(ordered[0] if ordered else None),
-        "last": point(ordered[-1] if ordered else None),
+        "invocation_id": ref.run,
+        "sequence": ref.sequence,
+        "at": ref.at.isoformat() if ref.at is not None else None,
+    }
+
+
+def _window(
+    size: int, elementary: SourceHistory | None, dbt: _Source | None
+) -> dict[str, Any]:
+    """The invocations the read covered: first, last and how many.
+
+    Elementary's read where it ran, which ``invocations`` bounds, so ``count``
+    never exceeds it. A dbt run placed after it is folded too and named apart
+    under ``after_window``, outside the count. With no Elementary read, the
+    window is dbt's one run and ``invocations`` is ``None``: no run count was
+    asked of anything.
+    """
+
+    history = dbt.history if dbt is not None else None
+    after: list[dict[str, Any] | None] = []
+    bound: int | None = None
+    if elementary is not None and elementary.runs:
+        runs = list(elementary.runs)
+        bound = size
+        placed = dbt.extra.get("placed") if dbt is not None else None
+        if history is not None and placed == "after_window":
+            after = [_point(ref) for ref in history.runs]
+    else:
+        runs = list(history.runs) if history is not None else []
+    return {
+        "invocations": bound,
+        "count": len(runs),
+        "first": _point(runs[0] if runs else None),
+        "last": _point(runs[-1] if runs else None),
+        "after_window": after,
     }
 
 

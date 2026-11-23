@@ -463,8 +463,8 @@ For a question about a test's run history ("since when has this test failed",
 reads Elementary's tables over the newest 20 invocations (`--invocations <n>`
 widens it) and dbt's last run results, and folds them into incidents. Read
 `data.sources` first: each source is `read`, `missing` or `refused` with a
-reason code, and an empty `incidents` list means only that a source was read and
-held no failure. Relay `first_observed: unknown` as an unknown start, never as
+reason code, and an empty `incidents` list means no failure only where a source
+reads `read`. Relay `first_observed: unknown` as an unknown start, never as
 the first run read. A source `refused` for `outside_allowlist` names the
 `dex config set` that would add the schema; that change is the person's, under
 the same rules as any config change. On a metered connector the read is priced

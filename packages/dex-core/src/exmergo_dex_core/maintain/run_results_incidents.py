@@ -159,6 +159,14 @@ def _generated_at(document: Mapping[str, Any]) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _started_at(document: Mapping[str, Any]) -> str | None:
+    metadata = document.get("metadata")
+    value = (
+        metadata.get("invocation_started_at") if isinstance(metadata, Mapping) else None
+    )
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _severities(manifest: Mapping[str, Any]) -> dict[str, str]:
     """Each test's ``config.severity`` where it is a token, by ``unique_id``."""
 
@@ -350,6 +358,9 @@ def read_run_results(
     run: dict[str, Any] = {
         "invocation_id": newest.invocation_id or None,
         "generated_at": newest.generated_at or None,
+        # When the invocation started, where dbt recorded it: another source
+        # orders runs by their start, and `generated_at` is the run's end.
+        "invocation_started_at": _started_at(newest.document),
         "command": newest.command,
         "artifact": newest.artifact,
         "cold": newest.cold,

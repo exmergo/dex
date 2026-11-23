@@ -296,7 +296,8 @@ class IncidentsResult(Result):
 
     ``sources`` names every source, ``read``, ``missing`` or ``refused`` with a
     reason code for the last two, so an empty ``incidents`` list is never read
-    as a clean history: it means a source was read and held no failure.
+    as a clean history: it means no failure only where a source reads
+    ``read``.
     ``window`` is the invocations the read covered, ``price`` what the read was
     priced at and settled at, and each incident carries its coverage and
     retention bound (#1465).

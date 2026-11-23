@@ -59,6 +59,7 @@ _DUCKDB_TYPES = {
 class Run:
     id: str
     started: datetime
+    version: str = RELEASE
 
 
 @dataclass(frozen=True)
@@ -154,12 +155,18 @@ def _run_results(
     *,
     invocation: str = "dbt-inv-1",
     at: datetime = START + timedelta(days=30),
+    started: datetime | None = None,
 ) -> None:
+    """``at`` is dbt's ``generated_at``, the run's end; ``started`` its
+    ``invocation_started_at``, a minute before by default."""
+
     target = root / "target"
+    begun = at - timedelta(minutes=1) if started is None else started
     document = {
         "metadata": {
             "invocation_id": invocation,
             "generated_at": at.strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
+            "invocation_started_at": begun.strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
         },
         "results": [
             {"unique_id": uid, "status": status, "message": "a failing value"}
@@ -200,7 +207,7 @@ def _warehouse(path: Path, runs: Sequence[Run], results: Sequence[Result]) -> Pa
                 run.started.strftime("%Y-%m-%d %H:%M:%S"),
                 run.started.strftime("%Y-%m-%d %H:%M:%S"),
                 run.started + timedelta(minutes=5),
-                RELEASE,
+                run.version,
                 "a" * 40,
             ],
         )
@@ -277,6 +284,7 @@ def test_one_failing_test_and_no_elementary_is_one_dbt_incident_of_unknown_start
     assert incident["state"] == "open"
     assert data["sources"]["dbt_run_results"]["status"] == "read"
     assert data["window"]["count"] == 1
+    assert data["window"]["invocations"] is None
     assert data["window"]["first"]["invocation_id"] == "dbt-inv-1"
 
 
@@ -536,6 +544,8 @@ def test_a_billed_connector_with_confirm_runs_the_read(
     assert data["sources"]["elementary"]["status"] == "read"
     assert len(data["incidents"]) == 1
     assert data["price"]["estimate"] is not None
+    assert data["price"]["settled"] is not None
+    assert data["price"]["settled"] == data["spend"]
     assert [e for e in engine.store._queries if e["decision"] == "allowed"]
     # The whole read once, then each of the reader's three phases through the
     # handshake it was handed, so every phase still meets the gate.
@@ -622,7 +632,9 @@ def test_a_dbt_run_elementary_also_recorded_takes_elementary_s_place(tmp_path: P
     sources = {o["source"] for o in incident["observations"]}
     assert sources == {"elementary", "dbt_run_results"}
     assert data["sources"]["dbt_run_results"]["folded"] is True
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
     assert data["window"]["count"] == 3
+    assert data["window"]["after_window"] == []
 
 
 def test_a_dbt_run_after_the_window_is_placed_after_it(tmp_path: Path):
@@ -633,12 +645,19 @@ def test_a_dbt_run_after_the_window_is_placed_after_it(tmp_path: Path):
 
     [incident] = data["incidents"]
     assert incident["opening_source"] == "dbt_run_results"
-    assert data["window"]["count"] == 4
-    assert data["window"]["last"] == {
-        "invocation_id": "dbt-later",
-        "sequence": 4,
-        "at": "2026-12-01T00:00:00+00:00",
-    }
+    assert data["sources"]["dbt_run_results"]["placed"] == "after_window"
+    # Folded after the window, and named apart: the count is Elementary's.
+    assert (data["window"]["count"], data["window"]["last"]["invocation_id"]) == (
+        3,
+        "inv-3",
+    )
+    assert data["window"]["after_window"] == [
+        {
+            "invocation_id": "dbt-later",
+            "sequence": 4,
+            "at": "2026-12-01T00:00:00+00:00",
+        }
+    ]
 
 
 def test_a_dbt_run_before_the_window_is_left_out_of_the_fold(tmp_path: Path):
@@ -649,7 +668,55 @@ def test_a_dbt_run_before_the_window_is_left_out_of_the_fold(tmp_path: Path):
 
     assert data["incidents"] == []
     assert data["sources"]["dbt_run_results"]["folded"] is False
+    assert data["sources"]["dbt_run_results"]["placed"] == "unplaced"
     assert data["window"]["count"] == 3
+
+
+def test_a_dbt_run_that_ended_after_the_window_but_started_before_it_is_unplaced(
+    tmp_path: Path,
+):
+    """dbt's ``generated_at`` is the run's end and Elementary's start is a
+    start: a run that began before the newest run and ended after it is not
+    later than it, so it gets no place after the window."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    newest = runs[-1].started
+    _run_results(
+        root,
+        {TEST: "fail"},
+        invocation="dbt-overlapping",
+        at=newest + timedelta(minutes=5),
+        started=newest - timedelta(minutes=5),
+    )
+    data = _data(_engine(root, warehouse).incidents())
+
+    assert data["incidents"] == []
+    assert data["sources"]["dbt_run_results"]["placed"] == "unplaced"
+
+
+def test_a_later_dbt_run_never_lifts_the_count_past_the_window(tmp_path: Path):
+    runs = _hourly(25)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail"}, invocation="dbt-later")
+    window = _data(_engine(root, warehouse).incidents())["window"]
+
+    assert (window["invocations"], window["count"]) == (20, 20)
+    assert [p["invocation_id"] for p in window["after_window"]] == ["dbt-later"]
+
+
+def test_a_read_refused_after_it_was_priced_keeps_its_price(tmp_path: Path):
+    runs = [*_hourly(2), Run("inv-old", START, version="0.16.4")]
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    data = _data(_engine(root, warehouse).incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["reason_code"]) == (
+        "refused",
+        "elementary_rows_untested_release",
+    )
+    assert data["price"]["estimate"] == 0.0
+    assert "read result rows" in data["price"]["per_statement"]
 
 
 # --- the selector -------------------------------------------------------------------
