@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -1252,3 +1253,252 @@ def test_the_incident_reader_reads_each_run_the_package_recorded(
         for column in ("result_rows", "test_results_description", "test_params"):
             assert column not in sql, (column, entry["decision"])
     assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- an Elementary upgrade, read by maintain check (#1447) ----------------------
+
+#: The axes ``maintain check`` sweeps on a free connector beside a dbt project.
+CHECK_AXES = ("grain", "schema", "semantic", "volume")
+
+#: What the warehouse baseline was pinned from. ``map`` is a default ``explore
+#: map``, which keeps the package's tables in the cache as inventory entries
+#: (#1311); ``map_included`` maps with ``include_elementary`` and so profiles
+#: them; ``metadata`` is a snapshot taken with no cache at all, which captures
+#: every relation's columns, the package's included. The last two are the arms
+#: that can see a column the upgrade adds to one of the package's tables.
+BASELINES = ("map", "map_included", "metadata")
+
+#: What happens between the snapshot and the check. ``upgrade`` moves the
+#: package from the oldest release DuckDB builds to the current one and changes
+#: nothing the project authored; ``upgrade_and_rename`` also renames one column
+#: of a project model, the positive control; ``rerun`` rebuilds at the same
+#: release, so drift it shares with ``upgrade`` is a run's and not the upgrade's.
+CHANGES = ("upgrade", "upgrade_and_rename", "rerun")
+
+FCT = "dev.main.fct"
+RENAMED = ("band", "size_band")
+
+#: One finding as the reading lists it: code, identifier, column.
+Seen = tuple[str, str | None, str | None]
+
+
+def _owned_by_package(finding) -> bool:
+    """A finding on a relation in the schema Elementary's models build into.
+
+    Anything else is the project's, a finding with no relation included, so a
+    package file the project view read as its own counts against the project."""
+
+    parts = (finding.identifier or "").split(".")
+    return len(parts) >= 2 and parts[-2] == ELEMENTARY_SCHEMA
+
+
+def _reading(result) -> dict[str, dict[str, list[Seen]]]:
+    """Each axis's findings, split into the project's and the package's."""
+
+    reading: dict[str, dict[str, list[Seen]]] = {}
+    for axis in CHECK_AXES:
+        sides: dict[str, list[Seen]] = {"project": [], "package": []}
+        for finding in result.by_axis[axis].findings:
+            side = "package" if _owned_by_package(finding) else "project"
+            sides[side].append((finding.code, finding.identifier, finding.column))
+        reading[axis] = {side: sorted(seen, key=str) for side, seen in sides.items()}
+    return reading
+
+
+def _move_package(project: Path, installed: Path) -> None:
+    """Install the release ``installed`` holds in place of the project's, as
+    editing the pin and running ``dbt deps`` would. No other file changes."""
+
+    for name in ("packages.yml", "package-lock.yml"):
+        shutil.copy(installed / name, project / name)
+    shutil.rmtree(project / "dbt_packages")
+    shutil.copytree(installed / "dbt_packages", project / "dbt_packages")
+
+
+def _rename_column(project: Path) -> None:
+    """Rename ``band`` on ``fct``, in its SQL and in its schema file."""
+
+    old, new = RENAMED
+    sql = project / "models" / "fct.sql"
+    text = sql.read_text("utf-8")
+    assert text.count(f"as {old}\n") == 1
+    sql.write_text(text.replace(f"as {old}\n", f"as {new}\n"), "utf-8")
+    schema = project / "models" / "schema.yml"
+    parsed = yaml.safe_load(schema.read_text("utf-8"))
+    [fct] = [m for m in parsed["models"] if m["name"] == "fct"]
+    [column] = [c for c in fct["columns"] if c["name"] == old]
+    column["name"] = new
+    schema.write_text(yaml.safe_dump(parsed, sort_keys=False), "utf-8")
+
+
+def _models_built(run_results: dict) -> None:
+    """Every model the run attempted built, the package's included."""
+
+    models = {
+        r["unique_id"]: r["status"]
+        for r in run_results["results"]
+        if r["unique_id"].startswith("model.")
+    }
+    assert any(uid.startswith("model.elementary.") for uid in models), models
+    assert {uid: s for uid, s in models.items() if s != "success"} == {}
+
+
+@dataclass
+class UpgradeRun:
+    """One arm: the snapshot it pinned and what ``maintain check`` then read."""
+
+    snapshot: dict
+    reading: dict[str, dict[str, list[Seen]]]
+
+    def pinned(self, identifier: str) -> dict | None:
+        for dataset in self.snapshot["warehouse"]["datasets"]:
+            if dataset["identifier"] == identifier:
+                return dataset
+        return None
+
+    def package_columns_pinned(self) -> bool:
+        return any(
+            dataset["columns"]
+            for dataset in self.snapshot["warehouse"]["datasets"]
+            if dataset["identifier"].split(".")[-2] == ELEMENTARY_SCHEMA
+        )
+
+
+def _upgrade_run(
+    root: Path, installs: Callable[[str], Path], baseline: str, change: str
+) -> UpgradeRun:
+    project = elementary_project(root, "a", installs(OLDEST_DUCKDB_VERSION))
+    warehouse = root / "dev.duckdb"
+    _models_built(_dbt_command(project, "build"))
+
+    with _engine(project, path=str(warehouse)) as engine:
+        if baseline == "map":
+            engine.map(full=True)
+        elif baseline == "map_included":
+            engine.map(include_elementary=True, full=True)
+            # The package's tables can crowd the project's out of the map, so
+            # the mart the control renames a column of is profiled by name.
+            engine.profile(FCT)
+        engine.snapshot()
+    snapshot = json.loads((root / ".dex" / "snapshot.json").read_text("utf-8"))
+    pinned_from = "metadata" if baseline == "metadata" else "cache"
+    assert snapshot["warehouse_from"] == pinned_from
+
+    if change in ("upgrade", "upgrade_and_rename"):
+        _move_package(project, installs(CURRENT_VERSION))
+        own = yaml.safe_load(_installed_project_file(project).read_text("utf-8"))
+        assert own["version"] == CURRENT_VERSION
+    if change == "upgrade_and_rename":
+        _rename_column(project)
+    # Elementary's `schema_changes` test fails on the renamed column, which is
+    # the package working; the models are what the check reads.
+    _models_built(_dbt_command(project, "build"))
+
+    with _engine(project, path=str(warehouse)) as engine:
+        result = engine.check()
+    assert set(result.by_axis) == set(CHECK_AXES), sorted(result.by_axis)
+    return UpgradeRun(snapshot=snapshot, reading=_reading(result))
+
+
+@pytest.fixture(scope="session")
+def upgrade_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+    elementary_installs: Callable[[str], Path],
+) -> Callable[[str, str], UpgradeRun]:
+    """``run(baseline, change)``: one arm, built once a session, since the
+    project-side and the package-side cases read the same run."""
+
+    done: dict[tuple[str, str], UpgradeRun] = {}
+
+    def run(baseline: str, change: str) -> UpgradeRun:
+        if change not in CHANGES or baseline not in BASELINES:
+            raise ValueError(f"no arm {(baseline, change)!r}")
+        if (baseline, change) not in done:
+            root = tmp_path_factory.mktemp(f"upgrade-{baseline}-{change}")
+            done[baseline, change] = _upgrade_run(
+                root, elementary_installs, baseline, change
+            )
+        return done[baseline, change]
+
+    return run
+
+
+def _nothing_on(axes: Iterable[str]) -> dict[str, list[Seen]]:
+    return {axis: [] for axis in axes}
+
+
+def _sees_the_package_s_columns(run: UpgradeRun, baseline: str) -> None:
+    """The arms built to see a leak on the warehouse side can see one."""
+
+    if baseline in ("map_included", "metadata"):
+        assert run.package_columns_pinned(), (
+            f"the {baseline} baseline pinned no column of the package's tables, "
+            "so it cannot see a column the upgrade adds to one"
+        )
+
+
+@requires_elementary
+@pytest.mark.parametrize("baseline", BASELINES)
+def test_an_elementary_upgrade_reports_no_project_drift_on_any_axis(
+    upgrade_runs: Callable[[str, str], UpgradeRun], baseline: str
+):
+    """#1447's first acceptance: the package moves from 0.23.0 to 0.26.1 with no
+    change to the project's own files, and no axis of ``maintain check``
+    reports a finding on anything the project owns."""
+
+    run = upgrade_runs(baseline, "upgrade")
+
+    _sees_the_package_s_columns(run, baseline)
+    project = {axis: sides["project"] for axis, sides in run.reading.items()}
+    assert project == _nothing_on(CHECK_AXES), run.reading
+
+
+@requires_elementary
+@pytest.mark.parametrize("baseline", BASELINES)
+def test_a_column_renamed_beside_the_upgrade_is_reported(
+    upgrade_runs: Callable[[str, str], UpgradeRun], baseline: str
+):
+    """#1447's second acceptance, the positive control: the same upgrade with
+    ``band`` renamed on ``fct``. The schema axis reports the model's file
+    changing and the column leaving and arriving on the built relation, and
+    nothing else on the project's side; the other axes report nothing there."""
+
+    run = upgrade_runs(baseline, "upgrade_and_rename")
+    old, new = RENAMED
+
+    pinned = run.pinned(FCT)
+    assert pinned is not None, f"{FCT} is not in the snapshot"
+    assert pinned["columns"], f"{FCT} was pinned with no columns"
+    assert set(run.reading["schema"]["project"]) == {
+        ("model_changed", "fct", None),
+        ("column_dropped", FCT, old),
+        ("column_added", FCT, new),
+        ("possible_rename", FCT, new),
+    }, run.reading
+    others = {
+        axis: sides["project"]
+        for axis, sides in run.reading.items()
+        if axis != "schema"
+    }
+    assert others == _nothing_on(set(CHECK_AXES) - {"schema"}), run.reading
+
+
+@requires_elementary
+@pytest.mark.parametrize("change", ["upgrade", "rerun"])
+@pytest.mark.parametrize("baseline", BASELINES)
+def test_maintain_check_reports_nothing_on_the_package_s_own_relations(
+    upgrade_runs: Callable[[str, str], UpgradeRun], baseline: str, change: str
+):
+    """#1447's third step: nothing the package owns is reported as drift beside
+    the project's. ``upgrade`` is the question the issue asks; ``rerun``, the
+    same rebuild at the same release, says which of what ``upgrade`` reports is
+    the upgrade's and which any run of the package's hooks would cause."""
+
+    run = upgrade_runs(baseline, change)
+
+    _sees_the_package_s_columns(run, baseline)
+    package = {axis: sides["package"] for axis, sides in run.reading.items()}
+    assert package == _nothing_on(CHECK_AXES), (
+        "maintain check reported drift on relations the Elementary package owns "
+        f"({baseline}, {change}): {package}"
+    )
