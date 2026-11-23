@@ -1591,15 +1591,19 @@ default, or a filter or operator after it is refused. A key naming a location
   `null_rule: never`), joined with `and`, each part holding an `or`
   parenthesised, since Elementary appends it to its time-bucket filter with a
   bare `and`. Literals are typed as declared, with no cast, text escaped as
-  the `dex_population_filter_literal` macro escapes it on the connector; the
-  column is quoted as the adapter quotes it where it must be (`quote: true`, a
-  reserved word, not a plain identifier; on Snowflake only its own reserved
-  words, and those only with `quote: true`). A filter that cannot be written
-  (its column not output, a list mixing text with numbers or booleans, a Jinja
-  delimiter, a rule with no connector) withholds the model's monitors
+  the `dex_population_filter_literal` macro escapes it on the connector, so a
+  list in another type than the column's can fail or, through an implicit
+  conversion, change which rows are counted; the column is quoted as the
+  adapter quotes it where it must be (`quote: true`, a reserved word, not a
+  plain identifier; BigQuery and Snowflake read their own reserved words, and
+  Snowflake's only with `quote: true`). A filter that cannot be written (its
+  column not output, a list mixing text with numbers or booleans, a Jinja
+  delimiter, a line break, a rule with no connector) withholds the model's monitors
   (`filter_column_not_output`, `filter_unwritable`), and the marker gains
   `filter: population.filters`. A stale monitor's row says what `changed`
-  (`timestamp_column` or `where_expression`). Nothing is
+  (`timestamp_column` or `where_expression`) and, where only the
+  `where_expression` did, the current one's `replacement` status, so the note
+  asks for removal only once the current one is listed. Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an

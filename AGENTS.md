@@ -885,14 +885,16 @@ column declares `null_rule: never`, several filters joined with `and`, each
 part holding an `or` parenthesised (Elementary appends the expression to its own
 time-bucket filter with a bare `and`). Values are literals typed as declared,
 with no cast (text quoted and escaped as the `dex_population_filter_literal`
-macro escapes it on the connector, numbers and booleans as written), so a list
-whose type differs from the column's fails in the warehouse rather than
-counting other rows. The column is quoted as the adapter quotes it only where
-it must be (`quote: true`, a reserved word, a name that is not a plain
-identifier; on Snowflake, which folds to upper case, only Snowflake's own
-reserved words, and those only with `quote: true`). A filter Dex cannot write
-(its column not output, a list mixing text with numbers or booleans, a Jinja
-delimiter, or a quoting or escaping rule with no connector to name it)
+macro escapes it on the connector, numbers and booleans as written), so declare
+the values in the column's type: a list in another type can fail in the
+warehouse or, where it converts implicitly (DuckDB, Snowflake), change which
+rows the monitor counts. The column is quoted as the adapter quotes it only
+where it must be (`quote: true`, a reserved word, a name that is not a plain
+identifier; BigQuery and Snowflake read their own reserved words, and on
+Snowflake, which folds to upper case, those only with `quote: true`). A filter
+Dex cannot write (its column not output, a list mixing text with numbers or
+booleans, a Jinja delimiter, a line break in a value, or a quoting or escaping
+rule with no connector to name it)
 withholds the model's monitors (`filter_column_not_output`,
 `filter_unwritable`), never writes them unfiltered. Dex chooses no training setting (sensitivity,
 `days_back`, seasonality stay the package's defaults). A monitor is written

@@ -374,6 +374,29 @@ _SNOWFLAKE_RESERVED = frozenset(
     """.split()  # noqa: SIM905
 )
 
+#: BigQuery's reserved keywords, as its lexical-structure reference lists
+#: them, which replace :data:`_RESERVED` there: a column spelled as one has
+#: to be backtick-quoted (``range``, ``partition``, ``interval``, ``rows``).
+#: BigQuery matches a quoted name case-insensitively, so quoting is safe.
+_BIGQUERY_RESERVED = frozenset(
+    """
+    all and any array as asc assert_rows_modified at between by case cast
+    collate contains create cross cube current default define desc distinct
+    else end enum escape except exclude exists extract false fetch following
+    for from full graph_table group grouping groups hash having if ignore in
+    inner intersect interval into is join lateral left like limit lookup merge
+    natural new no not null nulls of on or order outer over partition preceding
+    proto qualify range recursive respect right rollup rows select set some
+    struct tablesample then to treat true unbounded union unnest using when
+    where window with within
+    """.split()  # noqa: SIM905
+)
+
+_RESERVED_BY_DIALECT = {
+    "snowflake": _SNOWFLAKE_RESERVED,
+    "bigquery": _BIGQUERY_RESERVED,
+}
+
 _JINJA = ("{{", "{%", "{#")
 
 
@@ -400,7 +423,8 @@ def _identifier(column: str, dialect: str | None, *, quote: bool) -> str:
     the connector to be known. Unquoted, Snowflake folds the name to upper
     case, as it folded the column's own name when dbt created it, so on
     Snowflake only its own reserved words count, and one of those without
-    ``quote: true`` is unwritable: its case is unknowable.
+    ``quote: true`` is unwritable: its case is unknowable. BigQuery reads its
+    own reserved words too, which it matches case-insensitively quoted.
     """
 
     if any(mark in column for mark in _JINJA):
@@ -409,7 +433,7 @@ def _identifier(column: str, dialect: str | None, *, quote: bool) -> str:
             f"the filter column '{column}' holds a Jinja delimiter, which dbt "
             "would render",
         )
-    reserved = _SNOWFLAKE_RESERVED if dialect == "snowflake" else _RESERVED
+    reserved = _RESERVED_BY_DIALECT.get(dialect or "", _RESERVED)
     plain = bool(_PLAIN_IDENTIFIER.match(column))
     if not quote and plain and column.lower() not in reserved:
         return column
@@ -436,8 +460,19 @@ def _identifier(column: str, dialect: str | None, *, quote: bool) -> str:
 
 
 def _text_literal(text: str, dialect: str | None) -> str:
-    """``text`` as a single-quoted string literal on ``dialect``."""
+    """``text`` as a single-quoted string literal on ``dialect``.
 
+    A line break is refused on every connector: BigQuery's single-quoted
+    strings cannot hold one even escaped, and one written raw would also break
+    the line the YAML holds the expression on.
+    """
+
+    if "\n" in text or "\r" in text:
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            "a filter value holds a line break, which a single-quoted literal "
+            "cannot hold on every connector",
+        )
     if "'" not in text and "\\" not in text:
         return f"'{text}'"
     if dialect is None:
@@ -461,10 +496,12 @@ def _literals(values: list[Any], dialect: str | None) -> str:
     type as the declaration states it. ``maintain verify`` and the
     ``dex_population_filter`` test read the column's type at run time and
     cast it to text where they must; a ``where_expression`` is fixed text
-    written at plan time, so a list whose type differs from the column's
-    (``includes: [1, 2]`` on a text column) fails loudly in the warehouse
-    rather than counting other rows. A list mixing text with numbers or
-    booleans states no one type, so it is unwritable.
+    written at plan time, so declare the values in the column's type. A list
+    in another type (``includes: [1, 2]`` on a text column) can fail in the
+    warehouse, or, where the warehouse converts implicitly (DuckDB matches
+    ``'01'`` in a text column against ``1``), change which rows the monitor
+    counts. A list mixing text with numbers or booleans states no one type, so
+    it is unwritable.
     """
 
     import math
@@ -907,29 +944,62 @@ def decide(
             == (_timestamp_of(test) or "").lower()
             for spec in planned_specs
         )
-        rows.append(
-            {
-                "model": declaration.model,
-                "test": _test_name(test),
-                "column": _timestamp_of(test),
-                "arguments": _arguments_of(test),
-                "field": marker.get("from"),
-                "status": STALE,
-                "reason": DECLARATION_CHANGED,
-                "changed": "where_expression" if same_time else "timestamp_column",
-            }
-        )
+        stale: dict[str, Any] = {
+            "model": declaration.model,
+            "test": _test_name(test),
+            "column": _timestamp_of(test),
+            "arguments": _arguments_of(test),
+            "field": marker.get("from"),
+            "status": STALE,
+            "reason": DECLARATION_CHANGED,
+            "changed": "where_expression" if same_time else "timestamp_column",
+        }
+        if same_time:
+            # Whether the monitor the population now gives is on the model
+            # (written by this plan, already listed, or hand-written), or was
+            # held back (a closed gate): only then is the stale one redundant.
+            current = next(
+                (
+                    r
+                    for r in rows
+                    if r.get("status") != STALE
+                    and _bare(str(r["test"])).lower() == _bare(stale["test"]).lower()
+                    and (r.get("column") or "").lower()
+                    == (stale["column"] or "").lower()
+                ),
+                None,
+            )
+            stale["replacement"] = (
+                {"status": current["status"], "reason": current.get("reason")}
+                if current is not None
+                else {"status": NOT_RENDERED, "reason": None}
+            )
+        rows.append(stale)
     return to_write, rows
+
+
+#: The replacement statuses under which the current monitor is on the model.
+_REPLACED = (ADDED, ALREADY_LISTED, HAND_WRITTEN)
 
 
 def stale_note(row: Mapping[str, Any]) -> str:
     if row.get("changed") == "where_expression":
-        return (
+        replacement = row.get("replacement") or {}
+        lead = (
             f"'{row['model']}' lists {row['test']} on {row.get('column')}, written "
             "by dex with a where_expression the declared population.filters no "
-            "longer give; dex wrote the current one beside it and leaves this one "
-            "in place: remove it, since two such monitors on one model each count "
-            "its rows"
+            "longer give"
+        )
+        if replacement.get("status") in _REPLACED:
+            return (
+                f"{lead}; the current one is listed beside it and dex leaves this "
+                "one in place: remove it, since two such monitors on one model each "
+                "count its rows"
+            )
+        why = replacement.get("reason") or "it was not written"
+        return (
+            f"{lead}; dex did not write the current one ({why}), so keep this one "
+            "until it can be written, then remove it"
         )
     return (
         f"'{row['model']}' lists {row['test']} on "

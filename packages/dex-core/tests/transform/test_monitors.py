@@ -45,7 +45,14 @@ OPEN = mon.Gate(
 
 
 def _render(
-    payload: dict, *, content=None, gate=OPEN, rows=None, notes=None, outputs=None
+    payload: dict,
+    *,
+    content=None,
+    gate=OPEN,
+    rows=None,
+    notes=None,
+    outputs=None,
+    dialect=None,
 ):
     [declaration] = parse_declarations([payload])
     return render(
@@ -53,6 +60,7 @@ def _render(
         declaration,
         notes=notes,
         outputs=outputs,
+        dialect=dialect,
         monitors=gate,
         monitor_rows=rows,
     )
@@ -1181,3 +1189,145 @@ def test_transform_declare_writes_owed_monitors_with_the_declared_filter(
         encoding="utf-8"
     )
     assert written.count("where_expression:") == 2
+
+
+# --- the final pass (#1483 review) ----------------------------------------------
+
+
+CLOSED = mon.Gate(
+    vendor="elementary",
+    package=mon.INSTALLED,
+    release="0.26.1",
+    production=mon.DISABLED,
+    production_reason=mon.LITERAL,
+    prod_target="prod",
+)
+
+
+def test_a_stale_monitor_is_kept_while_its_replacement_cannot_be_written():
+    before = _render(_time("ordered_at"))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=before,
+        gate=CLOSED,
+        rows=rows,
+        notes=notes,
+    )
+
+    # Nothing new is written beside the old pair.
+    assert len(_tests(after)) == 2
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert {r["replacement"]["status"] for r in stale} == {mon.NOT_RENDERED}
+    assert {r["replacement"]["reason"] for r in stale} == {mon.PRODUCTION_DISABLED}
+    assert len(notes) == 2
+    for note in notes:
+        assert "keep this one" in note
+        assert mon.PRODUCTION_DISABLED in note
+        assert "remove it, since" not in note
+
+
+def test_a_stale_monitor_whose_replacement_is_written_asks_for_removal():
+    before = _render(_time("ordered_at"))
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=before,
+        rows=rows,
+        notes=notes,
+    )
+
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert {r["replacement"]["status"] for r in stale} == {mon.ADDED}
+    assert all("remove it, since" in n for n in notes)
+
+
+@pytest.mark.parametrize(
+    ("column", "written"),
+    [
+        ("range", "`range`"),
+        ("partition", "`partition`"),
+        ("interval", "`interval`"),
+        ("rows", "`rows`"),
+        ("status", "status"),
+    ],
+)
+def test_a_bigquery_reserved_word_is_backtick_quoted(column, written):
+    # No `quote: true`: BigQuery requires the keyword quoted.
+    assert (
+        _where(_filtered({"column": column, "includes": ["x"]}), "bigquery")
+        == f"{written} in ('x')"
+    )
+
+
+@pytest.mark.parametrize("dialect", ["bigquery", "duckdb", "snowflake", None])
+@pytest.mark.parametrize("value", ["a\nb", "a\rb"])
+def test_a_value_holding_a_line_break_is_unwritable(dialect, value):
+    with pytest.raises(mon.FilterUnwritableError) as raised:
+        _where(_filtered({"column": "status", "includes": [value]}), dialect)
+    assert raised.value.reason == mon.FILTER_UNWRITABLE
+    # A single-line value is written unchanged.
+    assert _where(_filtered({"column": "status", "includes": ["a b"]}), dialect) == (
+        "status in ('a b')"
+    )
+
+
+def test_a_non_finite_number_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": "rate", "includes": [float("inf")]}))
+
+
+def test_a_quoted_column_holding_its_quote_character_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": 'a"b', "includes": ["x"]}), "duckdb")
+
+
+def test_a_column_the_yaml_entry_marks_quote_true_is_quoted_through_decide():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: status\n"
+        "        quote: true\n"
+    )
+
+    out = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=content,
+        dialect="duckdb",
+    )
+
+    assert {a["where_expression"] for a in _arguments(out)} == {
+        "\"status\" in ('placed')"
+    }
+
+
+def test_the_plan_escapes_the_filter_for_the_configured_connector(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # A quote in a value needs the connector's escaping, so the configured
+    # dialect has to reach the monitors the plan writes.
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    declared = {
+        **DECLARED,
+        "population": {"filters": [{"column": "status", "includes": ["o'k"]}]},
+    }
+
+    planned = _plan(tmp_path, capsys, declared)
+
+    assert planned["status"] == "ok", planned["errors"]
+    rows = planned["data"]["monitors"]["monitors"]
+    assert {r["status"] for r in rows} == {mon.ADDED}
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "marts" / "fct_orders.yml").read_text(
+        encoding="utf-8"
+    )
+    wheres = {a["where_expression"] for a in _arguments(written)}
+    assert wheres == {"status in ('o''k')"}

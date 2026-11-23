@@ -937,21 +937,25 @@ models:
   as written. `maintain verify` and the `dex_population_filter` test read the
   column's type when they run and cast it to text where they must; a
   `where_expression` is text fixed at plan time, so write the values in the
-  column's type (`includes: ['1', '2']` for a text column of codes): a list in
-  another type fails in the warehouse rather than counting other rows. The
-  column is written as declared, as dbt names it, and quoted the way the
-  adapter quotes it (backticks on BigQuery, Databricks and ClickHouse, double
-  quotes elsewhere) only where it must be: the entry marks it `quote: true`,
-  it is a reserved word, or it is not a plain identifier. Snowflake folds an
-  unquoted name to upper case, so there only its own reserved words count, and
-  a column spelled as one is written only with `quote: true`, since the case it
-  was created in is unknowable. A filter Dex cannot write withholds every
-  monitor of the model rather than writing it unfiltered:
-  `filter_column_not_output` (the model does not output the column) or
-  `filter_unwritable` (a list mixes text with numbers or booleans, a value or
-  the column holds a Jinja delimiter dbt would render, a number is not finite,
-  a Snowflake reserved word lacks `quote: true`, or the column or a value
-  needs a connector's rule and none is configured). The monitor's marker gains `filter:
+  column's type (`includes: ['1', '2']` for a text column of codes). A list in
+  another type can fail in the warehouse or, where the warehouse converts
+  implicitly, change which rows the monitor counts: DuckDB matches a text
+  `'01'` against `1`. The column is written as declared, as dbt names it, and
+  quoted the way the adapter quotes it (backticks on BigQuery, Databricks and
+  ClickHouse, double quotes elsewhere) only where it must be: the entry marks
+  it `quote: true`, it is a reserved word, or it is not a plain identifier.
+  BigQuery reads its own reserved words (`range`, `partition`, `interval`,
+  `rows`, ...), from its lexical reference. Snowflake folds an unquoted name
+  to upper case, so there only its own reserved words count, and a column
+  spelled as one is written only with `quote: true`, since the case it was
+  created in is unknowable. A filter Dex cannot write withholds every monitor
+  of the model rather than writing it unfiltered: `filter_column_not_output`
+  (the model does not output the column) or `filter_unwritable` (a list mixes
+  text with numbers or booleans, a value or the column holds a Jinja
+  delimiter dbt would render, a value holds a line break, which BigQuery's
+  single-quoted strings cannot hold, a number is not finite, a Snowflake
+  reserved word lacks `quote: true`, or the column or a value needs a
+  connector's rule and none is configured). The monitor's marker gains `filter:
   population.filters`, and its `data.decisions` entry names the
   `where_expression` in `chosen`.
 - **Dex chooses no statistic.** Only `timestamp_column` and the population's
@@ -987,7 +991,9 @@ models:
 - **A monitor is never removed.** One Dex wrote whose time column the
   declaration no longer names, or whose `where_expression` the population no
   longer gives, is `stale` (`declaration_changed`), with a note, for a
-  reviewer to remove; Dex writes the current one beside it. Unsetting `monitors.vendor` removes nothing.
+  reviewer to remove; Dex writes the current one beside it. Where the current
+  one is not written (a closed gate), the note says why and asks to keep the
+  stale one until it can be. Unsetting `monitors.vendor` removes nothing.
 - **Monitors are not generated tests.** `declarations.render_tests` does not
   govern them, they carry no cadence tag, and `data.generated_tests` neither
   lists nor prices them. The tag `dex_monitor` lets an orchestrator select or
@@ -1005,7 +1011,7 @@ renders a declaration:
 | `package` | `status` (`installed`, `added_by_plan`, `not_installed`) and the installed `release` |
 | `production` | `status` (`enabled`, `disabled`, `unknown`), `reason` (see the table above), `prod_target`, and the `expression` read where it was Jinja |
 | `counts` | rows per status |
-| `monitors[]` | `model`, `test`, `column` (the timestamp column), `arguments`, `field` (the declaration field it comes from, such as `columns.ordered_at.role: time`), `status` (`added`, `already_listed`, `hand_written`, `stale`, `not_rendered`), where not written, `reason`, and on a stale row what `changed` (`timestamp_column`, or `where_expression` where only the population moved) |
+| `monitors[]` | `model`, `test`, `column` (the timestamp column), `arguments`, `field` (the declaration field it comes from, such as `columns.ordered_at.role: time`), `status` (`added`, `already_listed`, `hand_written`, `stale`, `not_rendered`), where not written, `reason`, and on a stale row what `changed` (`timestamp_column`, or `where_expression` where only the population moved, with the current monitor's `replacement` `status` and `reason`) |
 
 `transform declare` writes the monitors an earlier declaration owes: a model
 declared before `monitors.vendor` was set is proposed with a `monitors` field
