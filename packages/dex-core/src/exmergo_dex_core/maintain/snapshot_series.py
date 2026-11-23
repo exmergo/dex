@@ -37,7 +37,10 @@ class SeriesRead:
 
     series: Series
     snapshots: dict[str, Snapshot] = field(default_factory=dict)
+    #: Versions that could not be read or did not parse as a snapshot.
     skipped: int = 0
+    #: Commits that removed the file, which record no baseline.
+    removed: int = 0
     elided: int = 0
 
 
@@ -70,10 +73,11 @@ def read_series(
                     "snapshot baseline is committed",
                 )
             )
-    # A commit that deleted the file recorded no baseline, so it is not listed.
-    listed = _git(
-        root, timeout, "log", "--format=%H", "--diff-filter=d", "--", "snapshot.json"
-    )
+    # Every commit that touched the file, with no --diff-filter: a lowercase
+    # (excluding) filter drops the root commit that added it on git 2.43, the
+    # git Ubuntu 24.04 ships, so a first baseline would never be read. A commit
+    # that removed the file is listed too, and told apart below.
+    listed = _git(root, timeout, "log", "--format=%H", "--", "snapshot.json")
     if listed is None or listed.returncode != 0:
         return SeriesRead(
             Series(
@@ -87,10 +91,17 @@ def read_series(
     points: list[SnapshotPoint] = []
     snapshots: dict[str, Snapshot] = {}
     skipped = 0
+    removed = 0
     for commit in commits[:limit]:
         shown = _git(root, timeout, "show", f"{commit}:./snapshot.json")
-        if shown is None or shown.returncode != 0:
+        if shown is None:
             skipped += 1
+            continue
+        if shown.returncode != 0:
+            # The history lists the commit for touching the path, and its tree
+            # does not hold the file: the commit removed it, and recorded no
+            # baseline. Not a version that failed to parse.
+            removed += 1
             continue
         try:
             snapshot = Snapshot.model_validate_json(shown.stdout)
@@ -102,17 +113,20 @@ def read_series(
         snapshots[commit] = snapshot
     if not points:
         reason = (
-            "no maintain snapshot baseline is committed to the repository"
-            if not commits
-            else "no committed version of .dex/snapshot.json parses as a snapshot"
+            "no committed version of .dex/snapshot.json parses as a snapshot"
+            if skipped
+            else "no maintain snapshot baseline is committed to the repository"
         )
-        return SeriesRead(Series("read", reason=reason), skipped=skipped)
+        return SeriesRead(
+            Series("read", reason=reason), skipped=skipped, removed=removed
+        )
     points.reverse()
     points = _measured(points, snapshots)
     return SeriesRead(
         Series("read", points=tuple(points)),
         snapshots=snapshots,
         skipped=skipped,
+        removed=removed,
         elided=elided,
     )
 

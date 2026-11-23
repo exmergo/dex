@@ -168,6 +168,7 @@ def diagnose(
             "count": len(series_read.series.points),
             "reason": series_read.series.reason,
             "skipped": series_read.skipped,
+            "removed": series_read.removed,
         },
         sources=read.sources,
         window=read.window,

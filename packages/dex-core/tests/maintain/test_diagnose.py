@@ -716,3 +716,60 @@ def test_a_git_dir_in_the_environment_does_not_redirect_the_series(
 
     assert data["series"]["count"] == 1
     assert _cause(data)["finding"] == "key_lost_uniqueness"
+
+
+# --- the series reader on every git it meets --------------------------------------
+
+
+def _commit_snapshot(root: Path, created: datetime, message: str) -> None:
+    dex = root / ".dex"
+    dex.mkdir(exist_ok=True)
+    snap = Snapshot(created_at=created.isoformat(), connector="duckdb")
+    (dex / "snapshot.json").write_text(snap.model_dump_json(indent=2))
+    _git(root, "add", ".dex/snapshot.json")
+    _git(root, "commit", "-q", "-m", message)
+
+
+def test_a_snapshot_in_the_root_commit_is_read_and_a_removal_is_not_a_version(
+    tmp_path: Path,
+):
+    # The root commit adds the first baseline, a later commit removes the file
+    # and a third adds it again. Every version is read, the root commit's
+    # included (git 2.43 drops it under a lowercase --diff-filter), and the
+    # removal is counted apart from versions that did not parse.
+    from exmergo_dex_core.maintain.snapshot_series import read_series
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    first = datetime(2026, 11, 1, 1, tzinfo=UTC)
+    _commit_snapshot(root, first, "first baseline")
+    _git(root, "rm", "-q", ".dex/snapshot.json")
+    _git(root, "commit", "-q", "-m", "remove the baseline")
+    second = datetime(2026, 11, 1, 3, tzinfo=UTC)
+    _commit_snapshot(root, second, "second baseline")
+    (root / "unrelated.txt").write_text("x\n")
+    _git(root, "add", "unrelated.txt")
+    _git(root, "commit", "-q", "-m", "unrelated")
+
+    read = read_series(root / ".dex")
+
+    assert read.series.status == "read"
+    assert [p.created_at for p in read.series.points] == [first, second]
+    assert read.removed == 1
+    assert read.skipped == 0
+
+
+def test_a_root_commit_alone_is_a_series_of_one(tmp_path: Path):
+    from exmergo_dex_core.maintain.snapshot_series import read_series
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    only = datetime(2026, 11, 1, 1, tzinfo=UTC)
+    _commit_snapshot(root, only, "first baseline")
+
+    read = read_series(root / ".dex")
+
+    assert [p.created_at for p in read.series.points] == [only]
+    assert (read.removed, read.skipped) == (0, 0)
