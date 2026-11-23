@@ -1023,6 +1023,10 @@ _SUBCOMMAND_PARITY: dict[tuple[str, str | None], dict] = {
             "target": "target",
         },
     },
+    ("maintain", "incidents"): {
+        "method": "incidents",
+        "args": {"objects": "objects", "invocations": "invocations"},
+    },
     ("maintain", "reconcile"): {
         "method": "reconcile",
         "args": {"drift_class": "drift_class"},

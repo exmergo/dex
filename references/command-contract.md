@@ -899,6 +899,28 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      no_mutable_sql) until it changes. Dev target only; refused in
                                      values-free mode. Report only: status ok whatever the coverage.
                                      Reviewed for values-free mode without --mutate
+dex maintain incidents [<models>] [--invocations N]
+                                  -> the incidents the sources hold for the selected models' tests
+                                     (#1472), folded by the one lifecycle rule (references/
+                                     incidents.md). Sources, in precedence: Elementary's tables where
+                                     the package is installed, enabled and uploading, then dbt's
+                                     run_results.json. data.sources names each, read, missing or
+                                     refused with a reason_code, and an empty data.incidents means no
+                                     failure only where a source reads read. Elementary's read is a run
+                                     count, never a number of days: the newest N dbt_invocations rows
+                                     (20 by default, 2000 at most), through the query firewall, and
+                                     its five statements (plus a first read's profiles) are priced as
+                                     one handshake before any runs: on a billed connector the first
+                                     call is needs_confirmation having sent no statement. A schema outside
+                                     the committed source allowlist is refused before any connection
+                                     opens, naming the dex config set that adds it. data.window is the
+                                     invocations covered (first, last, count); data.price the estimate
+                                     and what it settled at; each incident carries its coverage and
+                                     retention bound. A dbt run Elementary also recorded takes its
+                                     place in the order, one started after the window follows it
+                                     (data.window.after_window, outside the count), and any
+                                     other is left out of the fold (folded: false). Read-only;
+                                     refused in values-free mode
 ```
 
 ### How authored content reaches the engine

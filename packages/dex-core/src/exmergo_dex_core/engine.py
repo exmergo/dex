@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     from .maintain.results import (
         CoverageResult,
         DriftResult,
+        IncidentsResult,
         ReconcileResult,
         SnapshotResult,
         VerifyResult,
@@ -1467,6 +1468,28 @@ class DexEngine:
         # the mode the engine is pinned to is stamped here too.
         result.result_mode = self.resolve_result_mode(None)
         return result
+
+    def incidents(
+        self,
+        objects: list[str] | None = None,
+        *,
+        invocations: int | None = None,
+    ) -> IncidentsResult:
+        """The incidents the sources hold for the selected models' tests (#1472).
+
+        Elementary's tables, read over the newest ``invocations`` runs (20 by
+        default) and priced first, and dbt's run results; ``sources`` says which
+        were read. On a billed connector an unconfirmed call raises
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before any
+        statement reads Elementary's tables. The confirmation gates those billed
+        reads only: the local manifest and run results, and the warehouse's
+        catalog metadata, are read before it is asked, and a call that reads
+        dbt's run results alone asks nothing.
+        """
+
+        from .maintain import incident_sources
+
+        return incident_sources.incidents(self, objects, invocations=invocations)
 
     # --- transform --------------------------------------------------------
     #

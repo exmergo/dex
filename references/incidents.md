@@ -351,7 +351,45 @@ severity tokens, an anomaly test's column and metric, each run's times and
 commit, and counts. It maps dbt's statuses as the run-results adapter does.
 Unlike `run_results.json`, the tables hold many invocations, so an incident read
 from them has a known start wherever an observed pass precedes its first
-failure.
+failure. `plan_read(..., last=n)` reads only the newest `n` invocation rows (by
+`created_at`, ties by id), so a window can be a run count rather than a time.
+
+### `dex maintain incidents`
+
+The command (`DexEngine.incidents`) reads both sources and folds them together,
+Elementary first: the fold's tie-break between two sources failing in the run
+that opens an incident is the order they are named in, and Elementary's tables
+hold the longer run history.
+
+- **A bounded read.** Elementary's tables are read over the newest 20
+  invocations, or `--invocations <n>` (at most 2000). A run count rather than a
+  number of days, so the price does not depend on the schedule. Every statement
+  is priced before any runs, with the profiles the firewall needs on a first
+  read, as one handshake.
+- **One order.** dbt's run is placed where Elementary placed the same
+  invocation, or after the window when it started after the window's newest
+  run (dbt's `invocation_started_at` against Elementary's `run_started_at`,
+  two starts; `generated_at` is the run's end). It is then named under
+  `window.after_window`, outside the count, which never exceeds the run count. A run that
+  is neither has no place in the order and is left out of the fold, with
+  `folded: false`.
+- **Every source answers.** `data.sources` reports each source `read`, `missing`
+  or `refused` with a reason code: no package (`not_installed`, with the
+  `dex init` that offers it), a package whose uploads are off (`not_uploading`),
+  a schema outside the source allowlist (`outside_allowlist`, with the
+  `dex config set` that adds it; nothing is read past the allowlist), a
+  connection or catalog that could not be read (`connection_unavailable`,
+  `catalog_unavailable`), a read that could not be priced (`unpriced`: it is
+  never asked for at a lower price than it would spend), a statement the
+  warehouse refused mid-read (`warehouse_refused`, its words masked, the price
+  kept), or the reader's own
+  refusals. Each source answers alone, so dbt's run results are still read when
+  Elementary's tables are not. A confirmation, budget or ceiling refusal is the
+  command's, not a source's. An empty `incidents` list means no failure only
+  where a source reads `read`.
+- **Read alone, dbt's run results never close an incident.** The next build
+  overwrites the file, so a fixed failure drops out of it rather than reading as
+  two passes.
 
 ## No value crosses into an incident
 
