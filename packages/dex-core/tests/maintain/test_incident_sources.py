@@ -1040,3 +1040,155 @@ def test_a_dataset_narrowing_on_bigquery_is_held_before_any_connection():
     assert refusal is not None
     assert refusal.reason_code == "outside_allowlist"
     assert refusal.detail is not None and "--dataset" in refusal.detail
+
+
+# --- the planted-defect pass on e8739ef0 --------------------------------------------
+
+
+def _estimated(
+    engine: DexEngine, monkeypatch: pytest.MonkeyPatch, *, confirmed: bool
+) -> None:
+    """A billed gate whose adapter prices each statement 1, 2, 3, ... in the
+    order asked, and whose profiles are priced at 7."""
+
+    from exmergo_dex_core.explore import commands as explore_commands
+
+    _billed(engine, monkeypatch, confirmed=confirmed)
+    gated = engine._adapter
+    asked = iter(range(1, 1000))
+
+    def priced(*args, **kwargs):
+        adapter = gated(*args, **kwargs)
+        adapter.query_estimate = lambda _sql: float(next(asked))
+        return adapter
+
+    monkeypatch.setattr(engine, "_adapter", priced)
+    monkeypatch.setattr(
+        explore_commands,
+        "_profile_estimate",
+        lambda _adapter, names, **_kwargs: (
+            7.0,
+            {name: 7.0 / len(names) for name in names},
+        ),
+    )
+
+
+def test_each_statement_s_estimate_and_the_profiles_reach_the_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    engine = _engine(root, warehouse)
+    _estimated(engine, monkeypatch, confirmed=False)
+
+    with pytest.raises(ConfirmationRequiredError) as asked:
+        engine.incidents()
+    data = asked.value.request.data
+    lines = data["per_table_bytes"]
+    assert [lines[label] for label in incident_sources._STATEMENT_LABELS] == [
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+    ]
+    # The five statements and the profiles the firewall needs first, together.
+    assert data["estimated_bytes"] == 1.0 + 2.0 + 3.0 + 4.0 + 5.0 + 7.0
+
+
+def test_the_price_reports_each_statement_and_the_profiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    engine = _engine(root, warehouse)
+    _estimated(engine, monkeypatch, confirmed=True)
+
+    price = _data(engine.incidents())["price"]
+    assert list(price["per_statement"].values()) == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert price["profile_estimate"] == 7.0
+    assert price["estimate"] == 22.0
+
+
+def test_only_the_declared_database_s_schema_is_read():
+    """The same schema name in two databases: the manifest's database decides."""
+
+    manifest = _manifest(elementary=True)
+    located = incident_sources._declared_namespace(manifest)
+    assert located == _Located("dev", SCHEMA)
+
+    listed = [
+        argparse.Namespace(identifier=f"other.{SCHEMA}.dbt_invocations"),
+        argparse.Namespace(identifier=f"dev.{SCHEMA}.dbt_invocations"),
+    ]
+    adapter = argparse.Namespace(list_objects=lambda: listed)
+    assert incident_sources._adapter_namespace(adapter, located) == f"dev.{SCHEMA}"
+
+
+def test_an_installed_package_the_manifest_predates_is_not_parsed(tmp_path: Path):
+    root = _project(tmp_path / "project", elementary=True)
+    (root / "target" / "manifest.json").write_text(
+        json.dumps(_manifest(elementary=False))
+    )
+    _run_results(root, {TEST: "fail"})
+    data = _data(_engine(root).incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["reason_code"]) == (
+        "missing",
+        "not_parsed",
+    )
+    assert "dex transform build --target dev" in [
+        step["command"] for step in data["next_steps"]
+    ]
+
+
+def test_uploads_nobody_can_settle_are_read_and_warned_about(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import dataclasses
+
+    from exmergo_dex_core.transform import elementary as elementary_mod
+
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    read = elementary_mod.read
+
+    def unknown(*args, **kwargs):
+        runtime = read(*args, **kwargs)
+        return dataclasses.replace(
+            runtime, uploads={**runtime.uploads, "test_results": None}
+        )
+
+    monkeypatch.setattr(elementary_mod, "read", unknown)
+    result = _engine(root, warehouse).incidents()
+
+    assert _data(result)["sources"]["elementary"]["status"] == "read"
+    assert any("test_results" in w and "is not known" in w for w in result.warnings)
+
+
+def test_dbt_s_run_results_read_alone_say_they_never_close_an_incident(
+    tmp_path: Path,
+):
+    root = _project(tmp_path / "project")
+    _run_results(root, {TEST: "fail"})
+    result = _engine(root).incidents()
+
+    assert any("never a close" in note for note in result.notes)
+
+
+def test_a_unit_test_attached_to_a_model_is_selected_by_its_name():
+    manifest = _manifest(elementary=False)
+    unit = "unit_test.shop.orders.test_orders_totals"
+    manifest["unit_tests"] = {
+        unit: {
+            "unique_id": unit,
+            "resource_type": "unit_test",
+            "depends_on": {"nodes": []},
+            "attached_node": "model.shop.orders",
+        }
+    }
+    selected, unmatched = incident_sources._selected_tests(manifest, ["orders"])
+
+    assert selected == {TEST, unit}
+    assert unmatched == []

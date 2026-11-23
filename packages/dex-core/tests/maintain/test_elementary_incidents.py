@@ -1131,3 +1131,19 @@ def test_a_run_count_past_the_table_reads_it_whole_and_says_so(tmp_path: Path):
 
     assert len(read.history.runs) == 2
     assert read.windowed is False
+
+
+def test_result_rows_with_no_invocation_are_counted_only_inside_the_run_window(
+    tmp_path: Path,
+):
+    """An orphan row older than the window's oldest run is outside the read."""
+
+    runs = _hourly(5)
+    path = _warehouse(
+        tmp_path / "dev.duckdb", runs, [*_passing(runs), Result("r-old", "inv-gone")]
+    )
+    _insert(path, [Result("r-new", "inv-gone-too")], {"inv-gone-too": runs[-1].started})
+    engine = _engine(path)
+    read = read_elementary(engine, plan_read(engine, NAMESPACE, RELEASE, last=3))
+
+    assert read.measure.results_without_invocation == 1
