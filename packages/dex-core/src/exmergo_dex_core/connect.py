@@ -762,6 +762,8 @@ def dev_target_scope(connector: str, target) -> str | None:
 
     if target is None:
         return None
+    if connector != "duckdb" and getattr(target, "dev", None):
+        return target.dev
     if connector == "bigquery":
         return target.dev_dataset or None
     if connector == "snowflake":

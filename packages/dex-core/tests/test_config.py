@@ -444,3 +444,86 @@ def test_prod_and_its_target_validate_through_config_validate(tmp_path):
     config = ConfigDocument.read(path).config()
     assert config.bigquery.prod == "analytics"
     assert config.dbt_prod_target == "prod"
+
+
+# === dev namespace (#1541) ===========================================================
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "expected"),
+    [
+        ("duckdb", {"path": "w.duckdb", "dev": "main"}, "main"),
+        ("bigquery", {"project": "p", "dev": " analytics "}, "analytics"),
+        ("snowflake", {"account": "a", "dev": "DEV.MARTS"}, "DEV.MARTS"),
+        (
+            "databricks",
+            {"host": "h", "http_path": "p", "dev": "DEV.MARTS"},
+            "DEV.MARTS",
+        ),
+        ("postgres", {"dev": "analytics"}, "analytics"),
+        ("redshift", {"dev": "analytics"}, "analytics"),
+        ("clickhouse", {"dev": "analytics"}, "analytics"),
+        ("trino", {"dev": "DEV.MARTS"}, "DEV.MARTS"),
+    ],
+)
+def test_dev_is_spelled_in_each_connectors_own_namespace(connector, target, expected):
+    from exmergo_dex_core.config import DexConfig
+
+    config = DexConfig(connector=connector, **{connector: target})
+    assert getattr(config, connector).dev == expected
+
+
+@pytest.mark.parametrize(
+    ("connector", "target", "message"),
+    [
+        ("snowflake", {"account": "a", "dev": "MARTS"}, "DATABASE.SCHEMA"),
+        ("postgres", {"dev": "db.analytics"}, "a schema"),
+        ("redshift", {"dev": "db.analytics"}, "a schema"),
+        ("clickhouse", {"dev": "db.analytics"}, "a database"),
+        (
+            "databricks",
+            {"host": "h", "http_path": "p", "dev": "CAT"},
+            "catalog.schema",
+        ),
+        ("trino", {"dev": "CAT"}, "catalog.schema"),
+        ("bigquery", {"project": "p", "dev": "a..b"}, "empty part"),
+        ("snowflake", {"account": "a", "dev": "A..B"}, "empty part"),
+    ],
+)
+def test_a_dev_no_command_could_read_is_refused(connector, target, message):
+    from exmergo_dex_core.config import DexConfig
+
+    with pytest.raises(ValueError, match=message):
+        DexConfig(connector=connector, **{connector: target})
+
+
+@pytest.mark.parametrize(
+    ("connector", "target"),
+    [
+        ("bigquery", {"project": "p", "dev": "analytics", "dev_dataset": "analytics"}),
+        ("snowflake", {"account": "a", "dev": "DB.SC", "dev_database": "DB"}),
+        (
+            "databricks",
+            {"host": "h", "http_path": "p", "dev": "CAT.SC", "dev_schema": "SC"},
+        ),
+        ("postgres", {"dev": "sc", "dev_schema": "sc"}),
+        ("redshift", {"dev": "sc", "dev_schema": "sc"}),
+        ("clickhouse", {"dev": "db", "dev_database": "db"}),
+        ("trino", {"dev": "cat.sc", "dev_catalog": "cat"}),
+    ],
+)
+def test_both_dev_and_alias_in_same_block_is_refused(connector, target):
+    from exmergo_dex_core.config import DexConfig
+
+    with pytest.raises(ValueError, match="cannot both be set"):
+        DexConfig(connector=connector, **{connector: target})
+
+
+def test_prod_equal_to_dev_is_refused_for_canonical_dev():
+    from exmergo_dex_core.config import DexConfig
+
+    with pytest.raises(ValueError, match="dev namespace"):
+        DexConfig(
+            connector="bigquery",
+            bigquery={"project": "p", "prod": "analytics", "dev": "analytics"},
+        )

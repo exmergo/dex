@@ -224,14 +224,48 @@ def _adopt(
             if existing
             else {}
         )
-        for profile_key, config_key in mapping[connector].items():
-            value = _profile_scalar(fields.get(profile_key), os.environ)
-            if value and config_key not in block:
-                if connector == "duckdb":
-                    value = os.path.relpath(
-                        (root / project_dir / value).resolve(), root
-                    )
-                block[config_key] = value
+        from .config import DEV_ALIASES
+
+        aliases = DEV_ALIASES.get(connector, ())
+        has_alias = any(a in block for a in aliases)
+        if not has_alias and "dev" not in block and connector in DEV_ALIASES:
+            # New connector block: populate canonical dev key (#1541)
+            if connector == "bigquery":
+                ds = _profile_scalar(fields.get("dataset"), os.environ)
+                proj = _profile_scalar(fields.get("project"), os.environ)
+                if proj and "project" not in block:
+                    block["project"] = proj
+                if ds:
+                    block["dev"] = ds
+            elif connector == "snowflake":
+                db = _profile_scalar(fields.get("database"), os.environ)
+                sc = _profile_scalar(fields.get("schema"), os.environ)
+                wh = _profile_scalar(fields.get("warehouse"), os.environ)
+                if wh and "warehouse" not in block:
+                    block["warehouse"] = wh
+                if db and sc:
+                    block["dev"] = f"{db}.{sc}"
+            elif connector in ("databricks", "trino"):
+                cat_key = "catalog" if connector == "databricks" else "database"
+                cat = _profile_scalar(fields.get(cat_key), os.environ)
+                sc = _profile_scalar(fields.get("schema"), os.environ)
+                if cat and sc:
+                    block["dev"] = f"{cat}.{sc}"
+            elif connector in ("postgres", "redshift", "clickhouse"):
+                sc = _profile_scalar(fields.get("schema"), os.environ)
+                if sc:
+                    block["dev"] = sc
+        else:
+            for profile_key, config_key in mapping[connector].items():
+                if "dev" in block and config_key in aliases:
+                    continue
+                value = _profile_scalar(fields.get(profile_key), os.environ)
+                if value and config_key not in block:
+                    if connector == "duckdb":
+                        value = os.path.relpath(
+                            (root / project_dir / value).resolve(), root
+                        )
+                    block[config_key] = value
         raw = config.model_dump(mode="json", exclude_unset=True, exclude_none=True)
         raw[connector] = block
         raw["connector"] = connector
@@ -915,12 +949,23 @@ def _set_destination(connector: str, block: dict, value: str) -> None:
         )
     keys = fields[connector]
     parts = value.split(".")
-    if len(keys) == 1:
-        block[keys[0]] = value
-    elif len(parts) == len(keys) and all(parts):
-        block.update(zip(keys, parts, strict=True))
+    has_alias = any(a in block for a in keys)
+    if has_alias and "dev" not in block:
+        if len(keys) == 1:
+            block[keys[0]] = value
+        elif len(parts) == len(keys) and all(parts):
+            block.update(zip(keys, parts, strict=True))
+        else:
+            raise RequestError(
+                f"--dev-destination for {connector} needs {'.'.join(keys)}"
+            )
     else:
-        raise RequestError(f"--dev-destination for {connector} needs {'.'.join(keys)}")
+        if len(keys) == 1 or (len(parts) == len(keys) and all(parts)):
+            block["dev"] = value
+        else:
+            raise RequestError(
+                f"--dev-destination for {connector} needs {'.'.join(keys)}"
+            )
 
 
 def _write(root: Path, filename: str, content: str, result: SetupResult) -> None:

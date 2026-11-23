@@ -309,13 +309,13 @@ def init_project(
 # cannot grow it (``clickhouse.deployment``, ``trino.deployment``).
 _INIT_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
     "duckdb": ("path",),
-    "bigquery": ("project", "dev_dataset", "location"),
-    "snowflake": ("dev_database", "dev_schema"),
-    "databricks": ("dev_catalog", "dev_schema"),
-    "postgres": ("dev_schema",),
-    "redshift": ("dev_schema",),
-    "clickhouse": ("dev_database",),
-    "trino": ("dev_schema",),
+    "bigquery": ("project", "dev", "location"),
+    "snowflake": ("dev",),
+    "databricks": ("dev",),
+    "postgres": ("dev",),
+    "redshift": ("dev",),
+    "clickhouse": ("dev",),
+    "trino": ("dev",),
 }
 
 
@@ -348,8 +348,20 @@ def render_init_config(
     ]
     block = getattr(config, config.connector, None)
     if block is not None:
+        from ..config import DEV_ALIASES
+
+        aliases = DEV_ALIASES.get(config.connector, ())
+        has_alias_written = any(
+            document.written(f"{config.connector}.{a}") is not ABSENT for a in aliases
+        )
         for field in _INIT_CONFIG_FIELDS[config.connector]:
-            value = getattr(block, field)
+            if field == "dev" and has_alias_written:
+                for a in aliases:
+                    alias_val = getattr(block, a, None)
+                    if alias_val is not None:
+                        amendments.append((f"{config.connector}.{a}", alias_val))
+                continue
+            value = getattr(block, field, None)
             if value is not None:
                 amendments.append((f"{config.connector}.{field}", value))
     for key, value in amendments:
@@ -452,24 +464,32 @@ def _bigquery_profile(
             ".dex/config.yml, or run `gcloud config set project <id>` (dex "
             "discovers Application Default Credentials; it never asks for keys)"
         )
-    dev_dataset = target.dev_dataset or _DEFAULT_BQ_DEV_DATASET
+    dev_val = target.dev or target.dev_dataset or _DEFAULT_BQ_DEV_DATASET
     source_datasets = {entry.split(".")[-1] for entry in target.datasets}
-    if dev_dataset in source_datasets:
+    if dev_val in source_datasets:
         raise InitError(
-            f"dev_dataset '{dev_dataset}' is also a source dataset in "
+            f"dev_dataset '{dev_val}' is also a source dataset in "
             "bigquery.datasets; dbt builds must write to a dataset dex does "
-            "not read from (set bigquery.dev_dataset to a dedicated one)"
+            "not read from (set bigquery.dev to a dedicated one)"
         )
 
     target.project = gcp_project
-    target.dev_dataset = dev_dataset
+    if (
+        "dev_dataset" in target.model_fields_set
+        and "dev" not in target.model_fields_set
+    ):
+        target.dev_dataset = dev_val
+    else:
+        target.dev = dev_val
     config.bigquery = target
 
+    dataset_name = dev_val.split(".")[-1]
+    bq_project = dev_val.split(".", 1)[0] if "." in dev_val else gcp_project
     output: dict[str, Any] = {
         "type": "bigquery",
         "method": "oauth",
-        "project": gcp_project,
-        "dataset": dev_dataset,
+        "project": bq_project,
+        "dataset": dataset_name,
         "threads": 4,
         "priority": "interactive",
     }
@@ -542,25 +562,35 @@ def _snowflake_profile(
             "(dbt builds run only on the pinned warehouse, never a "
             "connection default)"
         )
-    dev_database = target.dev_database or params.get("database")
+    if target.dev:
+        dev_database, dev_schema = target.dev.split(".", 1)
+    else:
+        dev_database = target.dev_database or params.get("database")
+        dev_schema = target.dev_schema or _DEFAULT_SF_DEV_SCHEMA
     if not dev_database:
         raise InitError(
-            "no dev database to write to: set snowflake.dev_database in "
+            "no dev database to write to: set snowflake.dev in "
             ".dex/config.yml (a scratch database the role can write; source "
             "databases stay read-only)"
         )
-    dev_schema = target.dev_schema or _DEFAULT_SF_DEV_SCHEMA
     dev_scope = f"{dev_database}.{dev_schema}".upper()
     source_scopes = {entry.upper() for entry in target.databases}
     if dev_scope in source_scopes:
         raise InitError(
             f"dev target '{dev_scope}' is also a source scope in "
             "snowflake.databases; dbt builds must write where dex does not "
-            "read (set snowflake.dev_database/dev_schema to a dedicated pair)"
+            "read (set snowflake.dev to a dedicated pair)"
         )
 
-    target.dev_database = str(dev_database)
-    target.dev_schema = dev_schema
+    has_alias = (
+        "dev_database" in target.model_fields_set
+        or "dev_schema" in target.model_fields_set
+    )
+    if has_alias and "dev" not in target.model_fields_set:
+        target.dev_database = str(dev_database)
+        target.dev_schema = dev_schema
+    else:
+        target.dev = f"{dev_database}.{dev_schema}"
     config.snowflake = target
 
     output: dict[str, Any] = {
@@ -644,25 +674,36 @@ def _databricks_profile(
             "no warehouse pinned: set databricks.warehouse in .dex/config.yml "
             "(dbt builds run only on the pinned SQL warehouse)"
         )
-    if not target.dev_catalog:
-        raise InitError(
-            "no dev catalog to write to: set databricks.dev_catalog in "
-            ".dex/config.yml (a catalog the principal can write; source "
-            "catalogs stay read-only)"
-        )
-    dev_schema = target.dev_schema or _DEFAULT_DBX_DEV_SCHEMA
-    dev_catalog = str(target.dev_catalog).lower()
+    if target.dev:
+        dev_catalog, dev_schema = target.dev.split(".", 1)
+        dev_catalog = dev_catalog.lower()
+    else:
+        if not target.dev_catalog:
+            raise InitError(
+                "no dev catalog to write to: set databricks.dev in "
+                ".dex/config.yml (a catalog the principal can write; source "
+                "catalogs stay read-only)"
+            )
+        dev_schema = target.dev_schema or _DEFAULT_DBX_DEV_SCHEMA
+        dev_catalog = str(target.dev_catalog).lower()
     dev_scope = f"{dev_catalog}.{dev_schema.lower()}"
     source_scopes = {entry.lower() for entry in target.catalogs}
     if dev_scope in source_scopes or dev_catalog in source_scopes:
         raise InitError(
             f"dev target '{dev_scope}' overlaps a source scope in "
             "databricks.catalogs; dbt builds must write where dex does not "
-            "read (set databricks.dev_catalog/dev_schema to a dedicated pair)"
+            "read (set databricks.dev to a dedicated pair)"
         )
 
-    target.dev_catalog = dev_catalog
-    target.dev_schema = dev_schema
+    has_alias = (
+        "dev_catalog" in target.model_fields_set
+        or "dev_schema" in target.model_fields_set
+    )
+    if has_alias and "dev" not in target.model_fields_set:
+        target.dev_catalog = dev_catalog
+        target.dev_schema = dev_schema
+    else:
+        target.dev = f"{dev_catalog}.{dev_schema}"
     config.databricks = target
 
     from ..adapters.databricks import warehouse_http_path
@@ -787,15 +828,18 @@ def _postgres_profile(
             "PGHOST/PGDATABASE/PGUSER), or complete the pg_service.conf entry"
         )
 
-    dev_schema = target.dev_schema or _DEFAULT_PG_DEV_SCHEMA
-    if dev_schema in set(target.schemas):
+    dev_val = target.dev or target.dev_schema or _DEFAULT_PG_DEV_SCHEMA
+    if dev_val in set(target.schemas):
         raise InitError(
-            f"dev_schema '{dev_schema}' is also a source schema in "
+            f"dev_schema '{dev_val}' is also a source schema in "
             "postgres.schemas; dbt builds must write where dex does not read "
-            "(set postgres.dev_schema to a dedicated schema)"
+            "(set postgres.dev to a dedicated schema)"
         )
 
-    target.dev_schema = dev_schema
+    if "dev_schema" in target.model_fields_set and "dev" not in target.model_fields_set:
+        target.dev_schema = dev_val
+    else:
+        target.dev = dev_val
     config.postgres = target
 
     output: dict[str, Any] = {
@@ -808,7 +852,7 @@ def _postgres_profile(
         # keeps ~/.pgpass and peer auth working when no variable is set.
         "password": "{{ env_var('PGPASSWORD', '') }}",
         "dbname": str(dbname),
-        "schema": dev_schema,
+        "schema": dev_val,
         # One thread keeps the operational database from parallel bursts; the
         # per-statement load is the guarded quantity on db-load gating.
         "threads": 1,
@@ -891,15 +935,18 @@ def _redshift_profile(
     except CredentialDiscoveryError as exc:
         raise InitError(str(exc)) from exc
 
-    dev_schema = target.dev_schema or _DEFAULT_REDSHIFT_DEV_SCHEMA
-    if dev_schema in set(target.schemas):
+    dev_val = target.dev or target.dev_schema or _DEFAULT_REDSHIFT_DEV_SCHEMA
+    if dev_val in set(target.schemas):
         raise InitError(
-            f"dev_schema '{dev_schema}' is also a source schema in "
+            f"dev_schema '{dev_val}' is also a source schema in "
             "redshift.schemas; dbt builds must write where dex does not read "
-            "(set redshift.dev_schema to a dedicated schema)"
+            "(set redshift.dev to a dedicated schema)"
         )
 
-    target.dev_schema = dev_schema
+    if "dev_schema" in target.model_fields_set and "dev" not in target.model_fields_set:
+        target.dev_schema = dev_val
+    else:
+        target.dev = dev_val
     config.redshift = target
 
     source = method.split(":", 1)[0]
@@ -971,7 +1018,7 @@ def _redshift_profile(
         )
     output.update(
         {
-            "schema": dev_schema,
+            "schema": dev_val,
             # One thread keeps the workgroup from parallel bursts; compute
             # seconds are the guarded quantity on compute-time gating.
             "threads": 1,
@@ -1148,15 +1195,21 @@ def _clickhouse_profile(
             "clickhouse.host in .dex/config.yml"
         )
 
-    dev_database = target.dev_database or DEFAULT_CH_DEV_DATABASE
-    if dev_database in set(target.databases):
+    dev_val = target.dev or target.dev_database or DEFAULT_CH_DEV_DATABASE
+    if dev_val in set(target.databases):
         raise InitError(
-            f"dev_database '{dev_database}' is also a source database in "
+            f"dev_database '{dev_val}' is also a source database in "
             "clickhouse.databases; dbt builds must write where dex does not "
-            "read (set clickhouse.dev_database to a dedicated database)"
+            "read (set clickhouse.dev to a dedicated database)"
         )
 
-    target.dev_database = dev_database
+    if (
+        "dev_database" in target.model_fields_set
+        and "dev" not in target.model_fields_set
+    ):
+        target.dev_database = dev_val
+    else:
+        target.dev = dev_val
     config.clickhouse = target
 
     output: dict[str, Any] = {
@@ -1168,7 +1221,7 @@ def _clickhouse_profile(
         # at dbt runtime (a Jinja reference, not a value).
         "password": "{{ env_var('CLICKHOUSE_PASSWORD', '') }}",
         # dbt-clickhouse's `schema` is the ClickHouse database.
-        "schema": dev_database,
+        "schema": dev_val,
         "secure": bool(fields.get("secure") or False),
         # One thread keeps a shared analytical server from parallel bursts; the
         # per-statement load is the guarded quantity on db-load gating.
@@ -1216,22 +1269,34 @@ def _trino_profile(
         params, _method, _warnings = resolve_trino_connection(target, os.environ, root)
     except CredentialDiscoveryError as exc:
         raise InitError(str(exc)) from exc
-    if not target.dev_catalog:
-        raise InitError(
-            "trino.dev_catalog is not set in .dex/config.yml: dbt builds into a "
-            "catalog it cannot create, so name a writable one (an iceberg, hive "
-            "or delta_lake catalog), e.g. `dex config set trino.dev_catalog lake`"
-        )
-    dev_schema = target.dev_schema or DEFAULT_TRINO_DEV_SCHEMA
-    dev = f"{target.dev_catalog}.{dev_schema}".lower()
+    if target.dev:
+        dev_catalog, dev_schema = target.dev.split(".", 1)
+    else:
+        if not target.dev_catalog:
+            raise InitError(
+                "trino.dev is not set in .dex/config.yml: dbt builds into a "
+                "catalog it cannot create, so name a writable one (an iceberg, hive "
+                "or delta_lake catalog), e.g. `dex config set trino.dev lake.dbt_dev`"
+            )
+        dev_catalog = target.dev_catalog
+        dev_schema = target.dev_schema or DEFAULT_TRINO_DEV_SCHEMA
+    dev = f"{dev_catalog}.{dev_schema}".lower()
     if any(dev == entry.strip().lower() for entry in target.catalogs):
         raise InitError(
             f"the dev target {dev} is also a source in trino.catalogs; dbt builds "
-            "must write where dex does not read (set trino.dev_schema to a "
+            "must write where dex does not read (set trino.dev to a "
             "dedicated schema)"
         )
 
-    target.dev_schema = dev_schema
+    has_alias = (
+        "dev_catalog" in target.model_fields_set
+        or "dev_schema" in target.model_fields_set
+    )
+    if has_alias and "dev" not in target.model_fields_set:
+        target.dev_catalog = dev_catalog
+        target.dev_schema = dev_schema
+    else:
+        target.dev = f"{dev_catalog}.{dev_schema}"
     config.trino = target
 
     output: dict[str, Any] = {"type": "trino"}
