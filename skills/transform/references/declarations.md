@@ -929,20 +929,29 @@ models:
   Elementary's table monitors read the expression as `where <timestamp> >=
   <bucket start> and <where_expression>`, appended with no parentheses of its
   own (`table_monitoring_query.sql`). Values are the declaration's authored
-  text, written as `maintain verify` and `dex_population_filter` compare them:
-  as text wherever any value is text, a quote doubled where a backslash is
-  ordinary (DuckDB, Postgres, Trino), written `\'` with a backslash doubled
-  where it starts an escape (BigQuery, Snowflake, Databricks, Redshift), and
-  both doubled on ClickHouse; numbers and booleans as written. The column is written as
-  declared, as dbt names it, and quoted the way the adapter quotes it
-  (backticks on BigQuery, Databricks and ClickHouse, double quotes elsewhere)
-  only where it must be: the entry marks it `quote: true`, it is a reserved
-  word, or it is not a plain identifier. A filter Dex cannot write withholds
-  every monitor of the model rather than writing it unfiltered:
+  text, typed as declared and never cast: text as a string literal, escaped as
+  the `dex_population_filter_literal` macro escapes it (a quote doubled where a
+  backslash is ordinary, on DuckDB, Postgres and Trino; written `\'` with a
+  backslash doubled where it starts an escape, on BigQuery, Snowflake,
+  Databricks and Redshift; both doubled on ClickHouse), numbers and booleans
+  as written. `maintain verify` and the `dex_population_filter` test read the
+  column's type when they run and cast it to text where they must; a
+  `where_expression` is text fixed at plan time, so write the values in the
+  column's type (`includes: ['1', '2']` for a text column of codes): a list in
+  another type fails in the warehouse rather than counting other rows. The
+  column is written as declared, as dbt names it, and quoted the way the
+  adapter quotes it (backticks on BigQuery, Databricks and ClickHouse, double
+  quotes elsewhere) only where it must be: the entry marks it `quote: true`,
+  it is a reserved word, or it is not a plain identifier. Snowflake folds an
+  unquoted name to upper case, so there only its own reserved words count, and
+  a column spelled as one is written only with `quote: true`, since the case it
+  was created in is unknowable. A filter Dex cannot write withholds every
+  monitor of the model rather than writing it unfiltered:
   `filter_column_not_output` (the model does not output the column) or
-  `filter_unwritable` (a value holds a Jinja delimiter dbt would render, a
-  number is not finite, or the column or a value needs a connector's rule and
-  none is configured). The monitor's marker gains `filter:
+  `filter_unwritable` (a list mixes text with numbers or booleans, a value or
+  the column holds a Jinja delimiter dbt would render, a number is not finite,
+  a Snowflake reserved word lacks `quote: true`, or the column or a value
+  needs a connector's rule and none is configured). The monitor's marker gains `filter:
   population.filters`, and its `data.decisions` entry names the
   `where_expression` in `chosen`.
 - **Dex chooses no statistic.** Only `timestamp_column` and the population's
@@ -996,7 +1005,7 @@ renders a declaration:
 | `package` | `status` (`installed`, `added_by_plan`, `not_installed`) and the installed `release` |
 | `production` | `status` (`enabled`, `disabled`, `unknown`), `reason` (see the table above), `prod_target`, and the `expression` read where it was Jinja |
 | `counts` | rows per status |
-| `monitors[]` | `model`, `test`, `column` (the timestamp column), `arguments`, `field` (the declaration field it comes from, such as `columns.ordered_at.role: time`), `status` (`added`, `already_listed`, `hand_written`, `stale`, `not_rendered`) and, where not written, `reason` |
+| `monitors[]` | `model`, `test`, `column` (the timestamp column), `arguments`, `field` (the declaration field it comes from, such as `columns.ordered_at.role: time`), `status` (`added`, `already_listed`, `hand_written`, `stale`, `not_rendered`), where not written, `reason`, and on a stale row what `changed` (`timestamp_column`, or `where_expression` where only the population moved) |
 
 `transform declare` writes the monitors an earlier declaration owes: a model
 declared before `monitors.vendor` was set is proposed with a `monitors` field

@@ -1590,11 +1590,16 @@ default, or a filter or operator after it is refused. A key naming a location
   (...) or <column> is null)` (no NULL arm where the column declares
   `null_rule: never`), joined with `and`, each part holding an `or`
   parenthesised, since Elementary appends it to its time-bucket filter with a
-  bare `and`. Literals are escaped as `maintain verify` escapes them on the
-  connector; the column is quoted as the adapter quotes it where it must be
-  (`quote: true`, a reserved word, not a plain identifier). A filter that
-  cannot be written withholds the model's monitors (`filter_column_not_output`,
-  `filter_unwritable`), and the marker gains `filter: population.filters`. Nothing is
+  bare `and`. Literals are typed as declared, with no cast, text escaped as
+  the `dex_population_filter_literal` macro escapes it on the connector; the
+  column is quoted as the adapter quotes it where it must be (`quote: true`, a
+  reserved word, not a plain identifier; on Snowflake only its own reserved
+  words, and those only with `quote: true`). A filter that cannot be written
+  (its column not output, a list mixing text with numbers or booleans, a Jinja
+  delimiter, a rule with no connector) withholds the model's monitors
+  (`filter_column_not_output`, `filter_unwritable`), and the marker gains
+  `filter: population.filters`. A stale monitor's row says what `changed`
+  (`timestamp_column` or `where_expression`). Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an

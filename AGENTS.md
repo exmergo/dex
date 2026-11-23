@@ -883,14 +883,18 @@ the model promises: `includes` as `<column> in (...)`, `excludes` as
 `(<column> not in (...) or <column> is null)`, without the NULL arm where the
 column declares `null_rule: never`, several filters joined with `and`, each
 part holding an `or` parenthesised (Elementary appends the expression to its own
-time-bucket filter with a bare `and`). Values are literals as `maintain verify`
-writes them on the connector (text quoted and escaped, numbers and booleans as
-written), and the column is quoted as the adapter quotes it only where it must
-be (`quote: true`, a reserved word, a name that is not a plain identifier). A
-filter Dex cannot write (its column not output, or a quoting or escaping rule
-with no connector to name it) withholds the model's monitors
-(`filter_column_not_output`, `filter_unwritable`), never writes them
-unfiltered. Dex chooses no training setting (sensitivity,
+time-bucket filter with a bare `and`). Values are literals typed as declared,
+with no cast (text quoted and escaped as the `dex_population_filter_literal`
+macro escapes it on the connector, numbers and booleans as written), so a list
+whose type differs from the column's fails in the warehouse rather than
+counting other rows. The column is quoted as the adapter quotes it only where
+it must be (`quote: true`, a reserved word, a name that is not a plain
+identifier; on Snowflake, which folds to upper case, only Snowflake's own
+reserved words, and those only with `quote: true`). A filter Dex cannot write
+(its column not output, a list mixing text with numbers or booleans, a Jinja
+delimiter, or a quoting or escaping rule with no connector to name it)
+withholds the model's monitors (`filter_column_not_output`,
+`filter_unwritable`), never writes them unfiltered. Dex chooses no training setting (sensitivity,
 `days_back`, seasonality stay the package's defaults). A monitor is written
 only where the package is installed (or the same plan adds it) and where the
 repository's `dbt_project.yml` enables it on the production target: its

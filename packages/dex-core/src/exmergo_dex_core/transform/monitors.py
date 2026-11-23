@@ -329,10 +329,9 @@ def production_enabled(
 _BACKTICK_DIALECTS = frozenset({"bigquery", "databricks", "spark", "clickhouse"})
 
 #: Connectors where a backslash starts an escape sequence in a string literal,
-#: so a backslash is doubled and a quote written ``\'``: the rule
-#: ``dex_population_filter_literal`` and ``maintain verify`` apply. ClickHouse
-#: doubles the backslash and the quote. Every other connector doubles the
-#: quote alone.
+#: so a backslash is doubled and a quote written ``\'``: the rule the
+#: ``dex_population_filter_literal`` macro applies. ClickHouse doubles the
+#: backslash and the quote. Every other connector doubles the quote alone.
 _BACKSLASH_DIALECTS = frozenset(
     {"bigquery", "snowflake", "databricks", "spark", "redshift"}
 )
@@ -352,6 +351,29 @@ _RESERVED = frozenset(
     union unique user using when where window with
     """.split()  # noqa: SIM905
 )
+
+#: Snowflake's own reserved words, which replace :data:`_RESERVED` there:
+#: those its reserved-keywords page reserves outright, those it bars as a
+#: column name or a column reference (``case``, ``true``, ``current_date``,
+#: ``constraint``, ...), and ``asc`` and ``desc``, which the page's prose
+#: reserves. Snowflake folds an unquoted name to upper case, so quoting a word
+#: it does not reserve (``user``, ``limit``) would name another column. A
+#: column spelled as one of these was created quoted, in a case dex cannot
+#: know, so it is written only where the entry marks it ``quote: true``.
+_SNOWFLAKE_RESERVED = frozenset(
+    """
+    all alter and any as asc between by case cast check column connect
+    constraint create current current_date current_time current_timestamp
+    current_user delete desc distinct drop else exists false following for
+    from grant group having ilike in increment insert intersect into is like
+    localtime localtimestamp minus not null of on or order qualify regexp
+    revoke rlike row rows sample select set some start table tablesample then
+    to trigger true try_cast union unique update values when whenever where
+    window with
+    """.split()  # noqa: SIM905
+)
+
+_JINJA = ("{{", "{%", "{#")
 
 
 class FilterUnwritableError(ValueError):
@@ -374,15 +396,28 @@ def _identifier(column: str, dialect: str | None, *, quote: bool) -> str:
     it is quoted the way the connector's adapter quotes it (backticks on
     BigQuery, Databricks and ClickHouse, double quotes elsewhere), which needs
     the connector to be known. Unquoted, Snowflake folds the name to upper
-    case, as it folded the column's own name when dbt created it.
+    case, as it folded the column's own name when dbt created it, so on
+    Snowflake only its own reserved words count, and one of those without
+    ``quote: true`` is unwritable: its case is unknowable.
     """
 
-    if (
-        not quote
-        and _PLAIN_IDENTIFIER.match(column)
-        and column.lower() not in _RESERVED
-    ):
+    if any(mark in column for mark in _JINJA):
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            f"the filter column '{column}' holds a Jinja delimiter, which dbt "
+            "would render",
+        )
+    reserved = _SNOWFLAKE_RESERVED if dialect == "snowflake" else _RESERVED
+    plain = bool(_PLAIN_IDENTIFIER.match(column))
+    if not quote and plain and column.lower() not in reserved:
         return column
+    if not quote and plain and dialect == "snowflake":
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            f"the filter column '{column}' is a Snowflake reserved word, so it was "
+            "created quoted, in a case dex cannot know: mark the column "
+            "`quote: true` in the model's YAML",
+        )
     if dialect is None:
         raise FilterUnwritableError(
             FILTER_UNWRITABLE,
@@ -417,32 +452,42 @@ def _text_literal(text: str, dialect: str | None) -> str:
 
 
 def _literals(values: list[Any], dialect: str | None) -> str:
-    """The values as SQL literals, comma-joined.
+    """The values as SQL literals, comma-joined, typed as declared.
 
-    Written as ``maintain verify`` and the ``dex_population_filter`` test
-    compare them: as text wherever any value is text (a boolean then written
-    ``'true'`` or ``'false'``), and otherwise as written, a number as itself
-    and a boolean as ``TRUE`` or ``FALSE``.
+    Text is a quoted string, a number itself and a boolean ``TRUE`` or
+    ``FALSE``, with no cast of the column: the literals' type is the column's
+    type as the declaration states it. ``maintain verify`` and the
+    ``dex_population_filter`` test read the column's type at run time and
+    cast it to text where they must; a ``where_expression`` is fixed text
+    written at plan time, so a list whose type differs from the column's
+    (``includes: [1, 2]`` on a text column) fails loudly in the warehouse
+    rather than counting other rows. A list mixing text with numbers or
+    booleans states no one type, so it is unwritable.
     """
 
     import math
 
-    as_text = any(isinstance(v, str) for v in values)
+    texts = [isinstance(v, str) for v in values]
+    if any(texts) and not all(texts):
+        raise FilterUnwritableError(
+            FILTER_UNWRITABLE,
+            "a filter list mixes text with numbers or booleans, so it states no "
+            "one type to compare the column with: quote every value, or none",
+        )
     out: list[str] = []
     for value in values:
         if isinstance(value, bool):
-            text = "true" if value else "false"
-            out.append(_text_literal(text, dialect) if as_text else text.upper())
+            out.append("TRUE" if value else "FALSE")
         elif isinstance(value, (int, float)):
             if isinstance(value, float) and not math.isfinite(value):
                 raise FilterUnwritableError(
                     FILTER_UNWRITABLE, f"the filter value {value} is not a SQL number"
                 )
-            out.append(_text_literal(str(value), dialect) if as_text else str(value))
+            out.append(str(value))
         else:
             out.append(_text_literal(str(value), dialect))
     joined = ", ".join(out)
-    if any(mark in joined for mark in ("{{", "{%", "{#")):
+    if any(mark in joined for mark in _JINJA):
         # dbt renders a test argument as Jinja: a value holding a Jinja
         # delimiter would run as code rather than be compared as text.
         raise FilterUnwritableError(
@@ -852,6 +897,14 @@ def decide(
         if any(matches(spec, test) for spec in planned_specs):
             continue
         marker = marker_of(test) or {}
+        # The same test on the same time column is one the population moved
+        # (#1483): only its where_expression is out of date.
+        same_time = any(
+            _bare(_test_name(spec)).lower() == _bare(_test_name(test)).lower()
+            and (_timestamp_of(spec) or "").lower()
+            == (_timestamp_of(test) or "").lower()
+            for spec in planned_specs
+        )
         rows.append(
             {
                 "model": declaration.model,
@@ -861,12 +914,21 @@ def decide(
                 "field": marker.get("from"),
                 "status": STALE,
                 "reason": DECLARATION_CHANGED,
+                "changed": "where_expression" if same_time else "timestamp_column",
             }
         )
     return to_write, rows
 
 
 def stale_note(row: Mapping[str, Any]) -> str:
+    if row.get("changed") == "where_expression":
+        return (
+            f"'{row['model']}' lists {row['test']} on {row.get('column')}, written "
+            "by dex with a where_expression the declared population.filters no "
+            "longer give; dex wrote the current one beside it and leaves this one "
+            "in place: remove it, since two such monitors on one model each count "
+            "its rows"
+        )
     return (
         f"'{row['model']}' lists {row['test']} on "
         f"{row.get('column') or 'no timestamp column'}, written by dex from "

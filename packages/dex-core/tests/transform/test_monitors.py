@@ -840,11 +840,22 @@ def test_numbers_and_booleans_are_written_as_literals():
     )
 
 
-def test_a_list_holding_text_is_written_as_text_throughout():
-    # As maintain verify and dex_population_filter compare it.
-    assert (
-        _where(_filtered({"column": "code", "includes": ["a", 7, False]}))
-        == "code in ('a', '7', 'false')"
+def test_a_list_mixing_text_with_numbers_or_booleans_is_unwritable():
+    # It states no one type for the column, and a where_expression cannot read
+    # the column's type the way maintain verify does at run time.
+    for values in (["a", 7], ["1", 2], ["a", False]):
+        with pytest.raises(mon.FilterUnwritableError) as raised:
+            _where(_filtered({"column": "code", "includes": values}))
+        assert raised.value.reason == mon.FILTER_UNWRITABLE
+
+
+def test_values_are_never_cast_to_another_type():
+    # Typed as declared: a numeric list is numbers, a text list is text.
+    assert _where(_filtered({"column": "code", "includes": ["1", "2"]})) == (
+        "code in ('1', '2')"
+    )
+    assert _where(_filtered({"column": "code", "includes": [1, 2]})) == (
+        "code in (1, 2)"
     )
 
 
@@ -859,6 +870,11 @@ def test_a_list_holding_text_is_written_as_text_throughout():
         ("order status", "databricks", "`order status`"),
         ("order status", "clickhouse", "`order status`"),
         ("order", "duckdb", '"order"'),
+        ("user", "postgres", '"user"'),
+        # Snowflake reads only its own reserved words: `user` is not one, and
+        # quoting it would name a lower-case column dbt never created.
+        ("user", "snowflake", "user"),
+        ("limit", "snowflake", "limit"),
     ],
 )
 def test_the_column_is_quoted_the_way_the_adapter_quotes_it(column, dialect, written):
@@ -893,9 +909,24 @@ def test_a_filter_that_needs_a_connector_rule_with_none_configured_is_unwritable
     )
 
 
+def test_a_snowflake_reserved_word_is_written_only_with_quote_true():
+    payload = _filtered({"column": "order", "includes": ["x"]})
+    with pytest.raises(mon.FilterUnwritableError) as raised:
+        _where(payload, "snowflake")
+    assert "quote: true" in str(raised.value)
+    assert _where(payload, "snowflake", quoted=frozenset({"order"})) == (
+        "\"order\" in ('x')"
+    )
+
+
 def test_a_value_holding_a_jinja_delimiter_is_unwritable():
     with pytest.raises(mon.FilterUnwritableError):
         _where(_filtered({"column": "status", "includes": ["{{ var('x') }}"]}))
+
+
+def test_a_column_name_holding_a_jinja_delimiter_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": "a{{b}}", "includes": ["x"]}))
 
 
 def test_no_filters_give_no_where_expression():
@@ -960,7 +991,11 @@ def test_a_monitor_written_before_the_filter_was_declared_is_stale_and_kept():
     ]
     # Never removed: the unfiltered pair is still listed beside the new one.
     assert len(_tests(after)) == 4
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert {r["changed"] for r in stale} == {"where_expression"}
+    # The note names the filter, not a time column the declaration still gives.
     assert len(notes) == 2
+    assert all("where_expression" in n and "time column" not in n for n in notes)
 
 
 def test_declaring_the_filter_again_lists_each_monitor_once():
