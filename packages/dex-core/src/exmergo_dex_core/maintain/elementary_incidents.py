@@ -189,6 +189,10 @@ class ReadBounds:
             ("invocations", self.invocations, MAX_INVOCATIONS),
             ("result_rows", self.result_rows, MAX_RESULT_ROWS),
         ):
+            # An int and nothing else: a float would reach the firewall as a
+            # fractional LIMIT, and a bool is an int to isinstance.
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an int, not {type(value).__name__}")
             if not 1 <= value <= ceiling:
                 raise ValueError(f"{name} must be between 1 and {ceiling}")
 
@@ -745,9 +749,10 @@ class _Observations:
         return sum(1 for row in self._seen.values() if row.severity_unread)
 
     def add(self, rows: Iterable[Sequence[Any]]) -> None:
-        unknown: dict[str, int] = {}
+        # Keyed by id, so a repeated row is one row here as everywhere else.
+        unknown_by_id: dict[str, str] = {}
         for raw in rows:
-            row = self._row(raw, unknown)
+            row = self._row(raw, unknown_by_id)
             if row is None:
                 continue
             held = self._seen.setdefault(row.id, row)
@@ -758,6 +763,9 @@ class _Observations:
                     "the table's own record of that result",
                 )
             self.duplicates += held is not row
+        unknown: dict[str, int] = {}
+        for name in unknown_by_id.values():
+            unknown[name] = unknown.get(name, 0) + 1
         if unknown:
             named = ", ".join(f"{n} {name}" for name, n in sorted(unknown.items()))
             raise ElementaryReadError(
@@ -766,7 +774,7 @@ class _Observations:
                 unknown,
             )
 
-    def _row(self, raw: Sequence[Any], unknown: dict[str, int]) -> _Row | None:
+    def _row(self, raw: Sequence[Any], unknown: dict[str, str]) -> _Row | None:
         rid, run, test, column, kind, metric, status, severity = map(_text, raw)
         if not rid:
             self._no_id += 1
@@ -783,8 +791,7 @@ class _Observations:
         word = (status or "").strip().lower()
         outcome = _OUTCOMES.get(word)
         if outcome is None:
-            name = _token(word or None)
-            unknown[name] = unknown.get(name, 0) + 1
+            unknown[rid] = _token(word or None)
             return None
         anomaly = (kind or "").strip().lower() == _ANOMALY
         signal = (

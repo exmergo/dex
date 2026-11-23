@@ -849,3 +849,100 @@ def test_the_window_is_a_timestamp_on_bigquery_never_a_datetime():
     for statement in (*_sql("bigquery", START).measure(),):
         assert "DATETIME" not in statement.upper()
         assert "AS TIMESTAMP)" in statement.upper()
+
+
+# --- after the final pass ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "outcome"),
+    [("pass", "error", "bad"), ("skipped", "pass", "good")],
+    ids=["error-over-pass", "pass-over-skipped"],
+)
+def test_one_run_keeps_the_worse_status_whatever_the_ids(
+    tmp_path: Path, first: str, second: str, outcome: str
+):
+    """The lower id holds the milder status, so only the ranking can pick the
+    other: an error over a pass, and a pass over a skip."""
+
+    runs = _hourly(1)
+    other = "test.shop.renamed_check.ghi789"
+    results = [
+        Result("a", "inv-1", TEST, first),
+        Result("b", "inv-1", other, second),
+    ]
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, results))
+    [only] = _read(engine, claims={TEST: "c1", other: "c1"}).observations
+    assert (only.outcome, only.test) == (outcome, other)
+
+
+@pytest.mark.parametrize("test_type", ["schema_change", "dbt_test", "anything_else"])
+def test_no_test_but_an_anomaly_test_has_a_signal(tmp_path: Path, test_type: str):
+    runs = _hourly(1)
+    results = [
+        Result(
+            "r-1",
+            "inv-1",
+            status="fail",
+            test_type=test_type,
+            column="amount",
+            metric="column_added",
+        )
+    ]
+    read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
+    [only] = read.observations
+    assert only.signal == Signal()
+
+
+def test_a_count_exactly_at_the_bound_reads(tmp_path: Path):
+    runs = _hourly(2)
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    read = _read(engine, bounds=ReadBounds(invocations=2, result_rows=2))
+    assert (len(read.history.runs), read.result_rows_read) == (2, 2)
+
+
+def test_a_run_inserted_exactly_at_since_is_read(tmp_path: Path):
+    """``since`` is inclusive: inv-1 was inserted five minutes after its start,
+    and a window from that instant holds it."""
+
+    runs = _hourly(2)
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    since = runs[0].started + timedelta(minutes=5)
+    read = _read(engine, since=since)
+    assert [ref.run for ref in read.history.runs] == ["inv-1", "inv-2"]
+
+
+def test_a_run_with_no_recorded_version_refuses(tmp_path: Path):
+    runs = [Run("inv-1", START, version=None), Run("inv-2", START + timedelta(hours=1))]
+    engine = _engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs)))
+    refusal = _refusal(engine)
+    assert (refusal.code, refusal.counts) == (
+        "elementary_rows_untested_release",
+        {"an unreadable value": 1},
+    )
+
+
+def test_a_commit_that_is_not_a_hex_sha_is_not_kept(tmp_path: Path):
+    runs = [
+        Run("inv-1", START, commit="main"),
+        Run("inv-2", START + timedelta(hours=1)),
+    ]
+    read = _read(_engine(_warehouse(tmp_path / "dev.duckdb", runs, _passing(runs))))
+    assert [ref.commit for ref in read.history.runs] == [None, "a" * 40]
+    assert read.commits_unread == 1
+    assert {o.commit for o in read.observations if o.run == "inv-1"} == {None}
+
+
+def test_a_repeated_row_with_an_unmapped_status_is_counted_once(tmp_path: Path):
+    runs = _hourly(1)
+    results = [Result("r-1", "inv-1", status="runtime error")] * 2
+    refusal = _refusal(_engine(_warehouse(tmp_path / "dev.duckdb", runs, results)))
+    assert refusal.counts == {"runtime error": 1}
+
+
+@pytest.mark.parametrize("value", [1.5, 2.0, True])
+def test_a_bound_that_is_not_an_int_is_refused(value):
+    with pytest.raises(TypeError, match="must be an int"):
+        ReadBounds(invocations=value)
+    with pytest.raises(TypeError, match="must be an int"):
+        ReadBounds(result_rows=value)
