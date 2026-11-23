@@ -1331,3 +1331,34 @@ def test_the_plan_escapes_the_filter_for_the_configured_connector(
     )
     wheres = {a["where_expression"] for a in _arguments(written)}
     assert wheres == {"status in ('o''k')"}
+
+
+def test_a_stale_monitor_is_kept_when_its_new_filter_is_unwritable():
+    # Written with filter A on ordered_at; the declaration now gives a filter
+    # dex cannot write on the same time column. The time column did not move,
+    # so the old monitor is the model's only one and must be kept.
+    before = _render(_filtered({"column": "status", "includes": ["placed"]}))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _filtered({"column": "status", "includes": ["a\nb"]}),
+        content=before,
+        rows=rows,
+        notes=notes,
+    )
+
+    # The old monitors stay as written, and nothing is added beside them.
+    assert _tests(after) == _tests(before)
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert len(stale) == 2
+    assert {r["changed"] for r in stale} == {"where_expression"}
+    assert {
+        (r["replacement"]["status"], r["replacement"]["reason"]) for r in stale
+    } == {(mon.NOT_RENDERED, mon.FILTER_UNWRITABLE)}
+    assert len(notes) == 2
+    for note in notes:
+        assert "keep this one until it can be written" in note
+        assert mon.FILTER_UNWRITABLE in note
+        assert "remove it, since" not in note
+        assert "declare the time column again" not in note

@@ -937,12 +937,15 @@ def decide(
             continue
         marker = marker_of(test) or {}
         # The same test on the same time column is one the population moved
-        # (#1483): only its where_expression is out of date.
+        # (#1483): only its where_expression is out of date. Read from every
+        # monitor the declaration gives, withheld ones included, so a filter
+        # dex cannot write still reads as the population moving, not the time
+        # column, and the note keeps the old monitor.
         same_time = any(
-            _bare(_test_name(spec)).lower() == _bare(_test_name(test)).lower()
-            and (_timestamp_of(spec) or "").lower()
-            == (_timestamp_of(test) or "").lower()
-            for spec in planned_specs
+            m.timestamp_column is not None
+            and m.test.lower() == _bare(_test_name(test)).lower()
+            and m.timestamp_column.lower() == (_timestamp_of(test) or "").lower()
+            for m in gives
         )
         stale: dict[str, Any] = {
             "model": declaration.model,
