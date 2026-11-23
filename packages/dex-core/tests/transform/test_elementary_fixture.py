@@ -1356,12 +1356,15 @@ class UpgradeRun:
                 return dataset
         return None
 
-    def package_columns_pinned(self) -> bool:
-        return any(
-            dataset["columns"]
-            for dataset in self.snapshot["warehouse"]["datasets"]
-            if dataset["identifier"].split(".")[-2] == ELEMENTARY_SCHEMA
-        )
+    def package_datasets(self) -> list[dict]:
+        """What the snapshot pinned of the package's tables."""
+
+        out = []
+        for dataset in self.snapshot["warehouse"]["datasets"]:
+            parts = dataset["identifier"].split(".")
+            if len(parts) >= 2 and parts[-2] == ELEMENTARY_SCHEMA:
+                out.append(dataset)
+        return out
 
 
 def _upgrade_run(
@@ -1408,17 +1411,25 @@ def upgrade_runs(
     """``run(baseline, change)``: one arm, built once a session, since the
     project-side and the package-side cases read the same run."""
 
-    done: dict[tuple[str, str], UpgradeRun] = {}
+    # An arm that failed is kept failed, so each case reading it fails at once
+    # rather than building it again.
+    done: dict[tuple[str, str], UpgradeRun | BaseException] = {}
 
     def run(baseline: str, change: str) -> UpgradeRun:
         if change not in CHANGES or baseline not in BASELINES:
             raise ValueError(f"no arm {(baseline, change)!r}")
         if (baseline, change) not in done:
             root = tmp_path_factory.mktemp(f"upgrade-{baseline}-{change}")
-            done[baseline, change] = _upgrade_run(
-                root, elementary_installs, baseline, change
-            )
-        return done[baseline, change]
+            try:
+                done[baseline, change] = _upgrade_run(
+                    root, elementary_installs, baseline, change
+                )
+            except (Exception, pytest.fail.Exception) as exc:
+                done[baseline, change] = exc
+        held = done[baseline, change]
+        if isinstance(held, BaseException):
+            raise held
+        return held
 
     return run
 
@@ -1428,10 +1439,13 @@ def _nothing_on(axes: Iterable[str]) -> dict[str, list[Seen]]:
 
 
 def _sees_the_package_s_columns(run: UpgradeRun, baseline: str) -> None:
-    """The arms built to see a leak on the warehouse side can see one."""
+    """Every arm pinned the package's tables, and the arms built to see a
+    column the upgrade changes pinned their columns."""
 
+    pinned = run.package_datasets()
+    assert pinned, f"the {baseline} baseline pinned none of the package's tables"
     if baseline in ("map_included", "metadata"):
-        assert run.package_columns_pinned(), (
+        assert any(dataset["columns"] for dataset in pinned), (
             f"the {baseline} baseline pinned no column of the package's tables, "
             "so it cannot see a column the upgrade adds to one"
         )
@@ -1498,7 +1512,20 @@ def test_maintain_check_reports_nothing_on_the_package_s_own_relations(
 
     _sees_the_package_s_columns(run, baseline)
     package = {axis: sides["package"] for axis, sides in run.reading.items()}
-    assert package == _nothing_on(CHECK_AXES), (
+    if package == _nothing_on(CHECK_AXES):
+        return
+    message = (
         "maintain check reported drift on relations the Elementary package owns "
         f"({baseline}, {change}): {package}"
     )
+    if change == "upgrade":
+        # Named apart: what the upgrade reports that a rebuild at the same
+        # release does not. Codes and relations only, since row counts move
+        # with every run.
+        rerun = upgrade_runs(baseline, "rerun").reading
+        only = {
+            axis: sorted(set(package[axis]) - set(rerun[axis]["package"]), key=str)
+            for axis in CHECK_AXES
+        }
+        message += f"; reported on the upgrade and not on a rerun: {only}"
+    pytest.fail(message)
