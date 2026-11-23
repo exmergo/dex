@@ -75,7 +75,11 @@ SourceStatus = Literal["read", "missing", "refused"]
 #: (declared, not built), ``outside_allowlist`` (with the ``dex config set``
 #: that adds it), ``prerequisite`` (the ``sql`` extra is missing), a layout
 #: code (:mod:`.elementary_layouts`), a reader code (:mod:`.elementary_refusals`)
-#: or ``firewall_refused``. dbt's run results: ``no_project``, ``no_manifest``
+#: ``connection_unavailable`` and ``catalog_unavailable`` (the connection or its
+#: catalog could not be read), ``unpriced`` (part of the read could not be
+#: priced, so it was not asked for) or ``firewall_refused``. A cost refusal (a
+#: confirmation, a budget, a ceiling) is the command's and is raised, never a
+#: status. dbt's run results: ``no_project``, ``no_manifest``
 #: and the adapter's own codes (:mod:`.run_results_incidents`).
 
 #: The two tables the reader reads, as the package's models name them.
@@ -152,9 +156,12 @@ def incidents(
             warnings=[f"maintain incidents read no source: {why}"],
         )
 
-    from ..transform.claims import manifest_claims
-
-    claims = manifest_claims(manifest)
+    claims, over_long = _bounded_claims(manifest)
+    if over_long:
+        warnings.append(
+            f"{over_long} test claim(s) are longer than {_MAX_KEY_CHARS} "
+            "characters, so those tests are keyed by their unique_id"
+        )
     selected, unmatched = _selected_tests(manifest, objects)
     if unmatched:
         warnings.append(
@@ -164,6 +171,7 @@ def incidents(
 
     elementary = _elementary(engine, project_dir, manifest, claims, window_size, steps)
     priced: dict[str, Any] | None = elementary.extra.pop("_price", None)
+    opened = elementary.extra.pop("_adapter", None)
     warnings.extend(elementary.extra.pop("_warnings", []))
     dbt = _dbt(project_dir, manifest, claims, elementary.history, steps, notes)
     warnings.extend(dbt.extra.pop("_warnings", []))
@@ -211,14 +219,37 @@ def incidents(
         notes=notes,
         warnings=warnings,
     )
-    # Stamped wherever a connection was opened, so a read refused after part
-    # of it ran still reports what that part billed.
-    adapter = getattr(engine, "_adapter_instance", None)
-    if adapter is not None:
-        command_args.stamp_spend(result, adapter)
+    # Stamped wherever this call acquired the adapter, so a read refused after
+    # part of it ran still reports what that part billed. Only then: an engine
+    # held across commands keeps the last one's settled gate, which a call that
+    # read files alone must not report as its own.
+    if opened is not None:
+        command_args.stamp_spend(result, opened)
         if priced is not None and result.price is not None:
             result.price["settled"] = result.spend
     return result
+
+
+#: The longest key a :class:`~.observations.Subject` holds.
+_MAX_KEY_CHARS = 512
+
+
+def _bounded_claims(manifest: Mapping[str, Any]) -> tuple[dict[str, str], int]:
+    """The manifest's claims, less those too long to key a subject, and how many
+    were dropped: both readers and the current subjects read this one map, so a
+    test is keyed alike everywhere (by its ``unique_id`` where its claim is
+    dropped, as dbt's reader already keys it)."""
+
+    from ..transform.claims import manifest_claims
+
+    kept: dict[str, str] = {}
+    dropped = 0
+    for uid, claim in manifest_claims(manifest).items():
+        if len(claim) > _MAX_KEY_CHARS:
+            dropped += 1
+        else:
+            kept[uid] = claim
+    return kept, dropped
 
 
 # --- the project ---------------------------------------------------------------
@@ -473,7 +504,12 @@ def _allowlist_refusal(
     if connector is None or connector not in _SCOPE_FIELDS:
         return None
     target = getattr(engine.config, connector, None)
-    narrowed = list(getattr(engine, "scopes", None) or [])
+    # The opener's precedence: on BigQuery `datasets` (`--dataset`) narrows
+    # ahead of `scopes` (`--scope`), as `connect.open_adapter` applies them.
+    datasets = list(getattr(engine, "datasets", None) or [])
+    flag = "--dataset" if connector == "bigquery" and datasets else "--scope"
+    narrowed = datasets if flag == "--dataset" else []
+    narrowed = narrowed or list(getattr(engine, "scopes", None) or [])
     allowlist = source_scope(connector, target, narrowed or None)
     entries = _entries(connector, located)
     if not allowlist or any(scope_within(entry, allowlist) for entry in entries):
@@ -485,7 +521,7 @@ def _allowlist_refusal(
         return _Source(
             "refused",
             "outside_allowlist",
-            f"--scope narrows this command to {', '.join(narrowed)}, which leaves "
+            f"{flag} narrows this command to {', '.join(narrowed)}, which leaves "
             f"out {located.spelled()}, the schema the Elementary package writes",
             {"namespace": located.spelled()},
         )
@@ -548,11 +584,24 @@ def _read_elementary(
             "installed)",
             {"_warnings": warned, "release": release},
         )
+    from ..errors import DexError
     from ..guards.query_firewall import QueryRefusedError
 
     base: dict[str, Any] = {"_warnings": warned, "release": release}
-    adapter = engine._adapter(COMMAND)
-    namespace = _adapter_namespace(adapter, located)
+    # One acquisition for the whole read: the engine rebuilds the cost gate on
+    # every call to `_adapter`, so acquiring again would settle the gate the
+    # whole-read reservation sits on before any statement ran on it.
+    try:
+        adapter = engine._adapter(COMMAND)
+    except DexError as exc:
+        _reraise_cost(exc)
+        return _Source("refused", "connection_unavailable", str(exc), base)
+    base["_adapter"] = adapter
+    try:
+        namespace = _adapter_namespace(adapter, located)
+    except DexError as exc:
+        _reraise_cost(exc)
+        return _Source("refused", "catalog_unavailable", str(exc), base)
     if namespace is None:
         return _Source(
             "missing",
@@ -563,20 +612,30 @@ def _read_elementary(
         )
     base["namespace"] = namespace
     try:
-        plan = reader.plan_read(engine, namespace, release, last=window_size)
-        priced = _price(engine, plan)
-        # From here a refusal may follow spend, so it keeps what was priced.
-        base["_price"] = priced
-        read = reader.read_elementary(engine, plan, claims=claims)
+        # Catalog metadata only: the layout check and the relations' spelling.
+        plan = reader.plan_read(
+            engine, namespace, release, last=window_size, adapter=adapter
+        )
     except ElementaryLayoutError as exc:
         return _Source("refused", exc.code, str(exc), base)
+    except DexError as exc:
+        _reraise_cost(exc)
+        return _Source("refused", "catalog_unavailable", str(exc), base)
+    try:
+        priced = _price(engine, adapter, plan)
+        # From here a refusal may follow spend, so it keeps what was priced.
+        base["_price"] = priced
+        read = reader.read_elementary(engine, plan, claims=claims, adapter=adapter)
     except ElementaryReadError as exc:
         # No run in the window is nothing to read rather than a refusal of what
         # was there: the package has not uploaded a run yet.
         status: SourceStatus = "missing" if exc.code == NO_INVOCATIONS else "refused"
-        return _Source(status, exc.code, str(exc), {**base, "counts": dict(exc.counts)})
+        detail = _command_advice(str(exc))
+        return _Source(status, exc.code, detail, {**base, "counts": dict(exc.counts)})
     except QueryRefusedError as exc:
         return _Source("refused", "firewall_refused", str(exc), base)
+    except _UnpricedError as exc:
+        return _Source("refused", "unpriced", str(exc), base)
     priced["first_read"] = read.first_read
     priced["profiled"] = list(read.profiled)
     return _Source(
@@ -615,31 +674,74 @@ _STATEMENT_LABELS = (
 )
 
 
-def _price(engine: DexEngine, plan: Any) -> dict[str, Any]:
+class _UnpricedError(Exception):
+    """Part of the read could not be priced, so it is not asked for at all:
+    asking at a lower price than the read spends would let a confirmation
+    authorise less than it pays for."""
+
+
+def _reraise_cost(exc: Exception) -> None:
+    """Keep the cost guard's own refusals on the command's path: a confirmation
+    ask, a budget or a ceiling is the caller's decision, never a source's
+    status."""
+
+    from ..guards.cost_guard import CostGuardError
+    from ..results import BudgetExhaustedError
+
+    if isinstance(exc, CostGuardError | BudgetExhaustedError):
+        raise exc
+
+
+#: The reader's retry advice names ``since``, which this command does not take:
+#: each such refusal is told the command's own way to read fewer runs.
+_ADVICE = {
+    "so read from after the upgrade with since": (
+        "so read fewer runs with --invocations, so the window holds only runs "
+        "written since the upgrade"
+    ),
+    "read a later window with since, nothing was read": (
+        "nothing was read; read fewer runs with --invocations"
+    ),
+}
+
+
+def _command_advice(message: str) -> str:
+    for theirs, ours in _ADVICE.items():
+        if theirs in message:
+            return message.replace(theirs, ours)
+    return message
+
+
+def _price(engine: DexEngine, adapter: Any, plan: Any) -> dict[str, Any]:
     """Price every statement the read sends, and any profile the firewall needs
-    first, as one handshake: on a billed connector an unconfirmed call raises
-    the ask here, before any statement runs."""
+    first, as one handshake on the read's one adapter: on a billed connector an
+    unconfirmed call raises the ask here, before any statement runs. A part
+    that cannot be priced raises :class:`_UnpricedError`, never a lower ask."""
 
     from ..explore.commands import _object_gap, _profile_estimate
     from ..storage import readable_cache
 
-    adapter = engine._adapter(COMMAND)
     estimate_one = getattr(adapter, "query_estimate", None)
-    per_statement = {
-        label: float(estimate_one(sql)) if estimate_one else 0.0
-        for label, sql in zip(_STATEMENT_LABELS, plan.statements(), strict=True)
-    }
     named = [f"{plan.namespace}.{table}" for table in _TABLES]
     profile_estimate = 0.0
     per_table: dict[str, float] = {}
-    to_profile: list[str] = named
-    with contextlib.suppress(Exception):
+    try:
+        per_statement = {
+            label: float(estimate_one(sql)) if estimate_one else 0.0
+            for label, sql in zip(_STATEMENT_LABELS, plan.statements(), strict=True)
+        }
         to_profile = list(
             _object_gap(adapter, readable_cache(engine.store), named).to_profile
         )
-    if to_profile:
-        with contextlib.suppress(Exception):
+        if to_profile:
             profile_estimate, per_table = _profile_estimate(adapter, to_profile)
+    except Exception as exc:
+        _reraise_cost(exc)
+        # The type alone: an estimator's message can carry a warehouse's words.
+        raise _UnpricedError(
+            f"the read could not be priced ({type(exc).__name__}), so it was not "
+            "asked for and nothing was read"
+        ) from exc
     total = profile_estimate + sum(per_statement.values())
     notes = [
         f"{len(per_statement)} statements read Elementary's tables over the newest "

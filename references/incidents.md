@@ -377,9 +377,14 @@ hold the longer run history.
   or `refused` with a reason code: no package (`not_installed`, with the
   `dex init` that offers it), a package whose uploads are off (`not_uploading`),
   a schema outside the source allowlist (`outside_allowlist`, with the
-  `dex config set` that adds it; nothing is read past the allowlist), or the
-  reader's own refusals. An empty `incidents` list means no failure only where a
-  source reads `read`.
+  `dex config set` that adds it; nothing is read past the allowlist), a
+  connection or catalog that could not be read (`connection_unavailable`,
+  `catalog_unavailable`), a read that could not be priced (`unpriced`: it is
+  never asked for at a lower price than it would spend), or the reader's own
+  refusals. Each source answers alone, so dbt's run results are still read when
+  Elementary's tables are not. A confirmation, budget or ceiling refusal is the
+  command's, not a source's. An empty `incidents` list means no failure only
+  where a source reads `read`.
 - **Read alone, dbt's run results never close an incident.** The next build
   overwrites the file, so a fixed failure drops out of it rather than reading as
   two passes.

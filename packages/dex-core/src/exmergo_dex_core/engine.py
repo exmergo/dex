@@ -1480,7 +1480,11 @@ class DexEngine:
         Elementary's tables, read over the newest ``invocations`` runs (20 by
         default) and priced first, and dbt's run results; ``sources`` says which
         were read. On a billed connector an unconfirmed call raises
-        :class:`~.guards.cost_guard.ConfirmationRequiredError` before any read.
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before any
+        statement reads Elementary's tables. The confirmation gates those billed
+        reads only: the local manifest and run results, and the warehouse's
+        catalog metadata, are read before it is asked, and a call that reads
+        dbt's run results alone asks nothing.
         """
 
         from .maintain import incident_sources

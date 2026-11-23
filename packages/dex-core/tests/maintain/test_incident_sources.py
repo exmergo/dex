@@ -846,3 +846,197 @@ def test_a_scope_that_narrows_the_schema_out_is_refused_with_no_config_change(
     assert "--scope" in elementary["detail"]
     assert "config_set" not in elementary
     assert not [s for s in data["next_steps"] if "config set" in s["command"]]
+
+
+# --- the final pass on #1572 --------------------------------------------------------
+
+
+def test_an_unavailable_connection_refuses_elementary_and_still_reads_dbt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.errors import NoConnectorSelectedError
+
+    root = _project(tmp_path / "project", elementary=True)
+    _run_results(root, {TEST: "fail"})
+    engine = _engine(root)
+
+    def unavailable(*_args, **_kwargs):
+        raise NoConnectorSelectedError("no connector is configured or inferable")
+
+    monkeypatch.setattr(engine, "_adapter", unavailable)
+    data = _data(engine.incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["reason_code"]) == (
+        "refused",
+        "connection_unavailable",
+    )
+    assert data["sources"]["dbt_run_results"]["status"] == "read"
+    assert [i["opening_source"] for i in data["incidents"]] == ["dbt_run_results"]
+
+
+def test_an_unreadable_catalog_refuses_elementary_and_still_reads_dbt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.errors import ConnectorError
+
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail"}, invocation="dbt-later")
+    engine = _engine(root, warehouse)
+    opened = engine._adapter
+
+    def no_catalog(*args, **kwargs):
+        adapter = opened(*args, **kwargs)
+
+        def refuse():
+            raise ConnectorError("the catalog could not be listed")
+
+        adapter.list_objects = refuse
+        return adapter
+
+    monkeypatch.setattr(engine, "_adapter", no_catalog)
+    data = _data(engine.incidents())
+
+    assert data["sources"]["elementary"]["reason_code"] == "catalog_unavailable"
+    assert [i["opening_source"] for i in data["incidents"]] == ["dbt_run_results"]
+
+
+def test_a_cost_refusal_at_the_connection_stays_the_command_s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.guards.cost_guard import CeilingRequiredError
+
+    root = _project(tmp_path / "project", elementary=True)
+    _run_results(root, {TEST: "fail"})
+    engine = _engine(root)
+
+    def ceiling(*_args, **_kwargs):
+        raise CeilingRequiredError("no ceiling is committed")
+
+    monkeypatch.setattr(engine, "_adapter", ceiling)
+    with pytest.raises(CeilingRequiredError):
+        engine.incidents()
+
+
+def test_every_statement_runs_on_the_gate_that_took_the_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The engine builds a new gate on every `_adapter` call, as `_billed`
+    does, so a second acquisition would leave the reservation behind."""
+
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    engine = _engine(root, warehouse)
+    _billed(engine, monkeypatch, confirmed=True)
+    gated = engine._adapter
+    acquired: list[Any] = []
+
+    def counted(*args, **kwargs):
+        adapter = gated(*args, **kwargs)
+        acquired.append(adapter.cost_gate)
+        return adapter
+
+    monkeypatch.setattr(engine, "_adapter", counted)
+    admitted_on: list[int] = []
+    admit = CostGate.preflight_command
+
+    def on(self, estimate):
+        admitted_on.append(id(self))
+        return admit(self, estimate)
+
+    monkeypatch.setattr(CostGate, "preflight_command", on)
+
+    data = _data(engine.incidents())
+    assert data["sources"]["elementary"]["status"] == "read"
+    assert len(acquired) == 1
+    # The whole-read reservation and each phase's admission, on one gate.
+    assert len(admitted_on) == 4
+    assert set(admitted_on) == {id(acquired[0])}
+
+
+def test_a_claim_too_long_to_key_a_subject_falls_back_to_the_unique_id(
+    tmp_path: Path,
+):
+    root = _project(tmp_path / "project")
+    manifest = json.loads((root / "target" / "manifest.json").read_text())
+    manifest["nodes"][TEST]["config"]["meta"] = {"dex": {"claim": "c" * 513}}
+    (root / "target" / "manifest.json").write_text(json.dumps(manifest))
+    _run_results(root, {TEST: "fail"})
+    result = _engine(root).incidents()
+
+    [incident] = _data(result)["incidents"]
+    assert incident["subject"]["key"] == TEST
+    assert any("longer than 512" in warning for warning in result.warnings)
+
+
+def test_a_read_that_cannot_be_priced_is_never_asked_at_a_lower_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.explore import commands as explore_commands
+
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail"}, invocation="dbt-later")
+    engine = _engine(root, warehouse)
+
+    def unpriceable(*_args, **_kwargs):
+        raise RuntimeError("the dry run failed")
+
+    monkeypatch.setattr(explore_commands, "_profile_estimate", unpriceable)
+    data = _data(engine.incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["reason_code"]) == ("refused", "unpriced")
+    assert "the dry run failed" not in elementary["detail"]
+    assert [e for e in engine.store._queries if e["decision"] == "allowed"] == []
+    assert data["sources"]["dbt_run_results"]["status"] == "read"
+
+
+def test_a_mixed_release_refusal_advises_invocations_not_since(tmp_path: Path):
+    runs = [*_hourly(2), Run("inv-old", START, version="0.16.4")]
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    detail = _data(_engine(root, warehouse).incidents())["sources"]["elementary"][
+        "detail"
+    ]
+
+    assert "--invocations" in detail
+    assert "since" not in detail.replace("since the upgrade", "")
+
+
+def test_a_reused_engine_reports_no_spend_for_a_read_of_files_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import shutil
+
+    runs = _hourly(2)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    engine = _engine(root, warehouse)
+    _billed(engine, monkeypatch, confirmed=True)
+    assert engine.incidents().spend is not None
+
+    # The same engine, and now a project with no Elementary: files alone.
+    shutil.rmtree(root / "dbt_packages")
+    (root / "target" / "manifest.json").write_text(
+        json.dumps(_manifest(elementary=False))
+    )
+    _run_results(root, {TEST: "fail"})
+    second = engine.incidents()
+
+    assert second.spend is None
+    assert second.price == {"estimate": None, "settled": None}
+
+
+def test_a_dataset_narrowing_on_bigquery_is_held_before_any_connection():
+    target = argparse.Namespace(datasets=["dev.analytics", "dev.main_elementary"])
+    engine = argparse.Namespace(
+        connector="bigquery",
+        datasets=["dev.analytics"],
+        scopes=None,
+        config=argparse.Namespace(connector="bigquery", bigquery=target),
+    )
+    refusal = _allowlist_refusal(engine, _Located("dev", SCHEMA), [])
+
+    assert refusal is not None
+    assert refusal.reason_code == "outside_allowlist"
+    assert refusal.detail is not None and "--dataset" in refusal.detail

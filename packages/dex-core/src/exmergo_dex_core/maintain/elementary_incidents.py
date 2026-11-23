@@ -283,6 +283,7 @@ def plan_read(
     *,
     since: datetime | None = None,
     last: int | None = None,
+    adapter: Any | None = None,
 ) -> ReadPlan:
     """Hold the two tables to ``release``'s layout and write the statements.
 
@@ -291,13 +292,16 @@ def plan_read(
     only; refuses with :class:`~.elementary_layouts.ElementaryLayoutError`.
     ``last`` reads only the newest ``last`` invocation rows (at most
     :data:`MAX_INVOCATIONS`); it and ``since`` may be given together, and each
-    narrows the other.
+    narrows the other. ``adapter`` is the caller's open adapter, so a caller
+    that prices the read keeps planning, pricing and the statements on one cost
+    gate; without it, the engine's is acquired.
     """
 
     require_allowed(engine.result_mode, COMMAND)
     if last is not None and (type(last) is not int or not 1 <= last <= MAX_INVOCATIONS):
         raise ValueError(f"last must be an int between 1 and {MAX_INVOCATIONS}")
-    adapter = engine._adapter(COMMAND)
+    if adapter is None:
+        adapter = engine._adapter(COMMAND)
     check = check_layouts(
         release, adapter_catalog(adapter, namespace), tables=(INVOCATIONS, RESULTS)
     )
@@ -323,18 +327,22 @@ def read_elementary(
     claims: Mapping[str, str] | None = None,
     bounds: ReadBounds | None = None,
     handshake: Callable[..., None] | None = None,
+    adapter: Any | None = None,
 ) -> ElementaryRead:
     """Run ``plan`` and turn what it reads into observations and a history.
 
     ``claims`` maps a test's ``unique_id`` to the claim id its
     ``config.meta.dex.claim`` carries, from the manifest. ``handshake`` stands
-    in for the billed handshake, which it must call or replace.
+    in for the billed handshake, which it must call or replace. ``adapter`` is
+    the caller's open adapter, as on :func:`plan_read`: acquiring it again would
+    settle the gate the caller reserved on and start a fresh one.
     """
 
     require_allowed(engine.result_mode, COMMAND)
     limit = bounds or ReadBounds()
     spend = _Spend(handshake)
-    adapter = engine._adapter(COMMAND)
+    if adapter is None:
+        adapter = engine._adapter(COMMAND)
     measured = _measure(engine, adapter, plan, limit, spend)
     invocation_rows = _rows(engine, adapter, plan.invocations, limit.invocations, spend)
     result_rows = _rows(engine, adapter, plan.results, limit.result_rows, spend)

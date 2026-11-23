@@ -164,7 +164,11 @@ def _started_at(document: Mapping[str, Any]) -> str | None:
     value = (
         metadata.get("invocation_started_at") if isinstance(metadata, Mapping) else None
     )
-    return value if isinstance(value, str) and value.strip() else None
+    # Echoed only where it reads as a time, as dbt types it (an optional
+    # datetime); never replaced by `generated_at`, which is the run's end.
+    if not isinstance(value, str) or parse_time(value.strip()) is None:
+        return None
+    return value.strip()
 
 
 def _severities(manifest: Mapping[str, Any]) -> dict[str, str]:

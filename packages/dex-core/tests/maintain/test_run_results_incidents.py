@@ -435,6 +435,16 @@ def test_the_run_s_start_is_read_where_dbt_recorded_it(project: Path) -> None:
     assert any("first_observed: unknown" in note for note in read.notes)
 
 
+@pytest.mark.parametrize("written", ["not a time", "2026-13-45T99:00:00Z", "  "])
+def test_a_start_that_is_not_a_time_is_not_echoed(project: Path, written: str) -> None:
+    document = _document({NOT_NULL: "fail"})
+    document["metadata"]["invocation_started_at"] = written
+    _write(_dex_dir(project), document)
+    read = rr.read_run_results(project, _manifest())
+    assert read.run is not None
+    assert read.run["invocation_started_at"] is None
+
+
 def test_an_unlogged_run_is_refused(project: Path) -> None:
     _write(project / "target", _document({NOT_NULL: "fail"}))
     _log(project, INV_B)
