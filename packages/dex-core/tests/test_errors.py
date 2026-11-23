@@ -109,6 +109,9 @@ INTERNAL_REFUSALS = {
     # Never leaves Semantic View derivation or annotation: it becomes the
     # declaration's `failed` reason, which the native route refuses with (#1292).
     "UnwritableError",
+    # Caught before a caller sees it: `maintain incidents` reports a read it
+    # could not price as the `unpriced` refusal of `sources.elementary` (#1472).
+    "_UnpricedError",
     # Connector-specific connection failures. A host catches the ConnectorError
     # family instead of importing eight names, one per warehouse it does not use.
     "BigQueryConnectionError",

@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from .. import command_args
+from ..errors import RequestError
 from ..values_free import require_allowed
 from .coverage_runs import current_tests, parse_time
 from .incidents import SourceHistory, fold_incidents
@@ -682,10 +683,11 @@ _STATEMENT_LABELS = (
 )
 
 
-class _UnpricedError(Exception):
+class _UnpricedError(RequestError):
     """Part of the read could not be priced, so it is not asked for at all:
     asking at a lower price than the read spends would let a confirmation
-    authorise less than it pays for."""
+    authorise less than it pays for. Never leaves :func:`_read_elementary`,
+    which reports it as the ``unpriced`` refusal of ``sources.elementary``."""
 
 
 def _reraise_cost(exc: Exception) -> None:
