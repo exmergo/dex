@@ -1175,6 +1175,39 @@ def test_a_claim_no_declared_fact_states_is_listed_apart() -> None:
     assert any("stale_claims" in note for note in out["notes"])
 
 
+def test_a_generated_test_with_its_claim_is_not_listed_apart() -> None:
+    # Dex renders `dex_freshness` and `dex_continuity` with a claim built from
+    # what the plan read; coverage cannot rebuild it, so it is never stale.
+    fresh = {"role": "time", "freshness": {"max_lag": "6h", "basis": "capture"}}
+    gapless = {"role": "time", "continuity": {"grain": "day"}}
+    lag = claim_id("orders", "freshness", ["loaded_at"], {"max_lag": "6h"})
+    gaps = claim_id("orders", "continuity", ["ordered_at"], {"grain": "day"})
+    manifest = _manifest(
+        [_model("orders", columns={"loaded_at": fresh, "ordered_at": gapless})],
+        [
+            _test(
+                "dex_freshness",
+                "orders",
+                "loaded_at",
+                kwargs={"max_lag_seconds": 21600},
+                claim=lag,
+            ),
+            _test(
+                "dex_continuity",
+                "orders",
+                "ordered_at",
+                kwargs={"grain": "day"},
+                claim=gaps,
+            ),
+        ],
+    )
+    out = _run(manifest)
+    assert out["stale_claims"] == []
+    assert out["summary"]["stale_claims"] == 0
+    assert _fact(out, "freshness", "loaded_at")["checked_by"] == "both"
+    assert _fact(out, "continuity", "ordered_at")["tests"] == ["dex_continuity"]
+
+
 def test_each_test_in_a_resources_tests_list_shows_its_claim() -> None:
     from exmergo_dex_core.maintain.coverage import inventory
 

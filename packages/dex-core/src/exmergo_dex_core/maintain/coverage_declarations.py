@@ -36,9 +36,11 @@ A fact a dbt model and a native layer both declare on the same relation is
 listed once per source and counted once in the summary, with what checks it
 taken from both.
 
-A test Dex rendered carries the claim id of the fact it checks (#1448), and is
-matched to that fact by the claim, whatever its kind or column; the kind and
-column below match any other test. A test whose claim names no fact the
+A test Dex rendered for a grain, a reference or a ``never`` null rule carries
+the claim id of the fact it checks (#1448), and is matched to that fact by the
+claim, whatever its kind or column; the kind and column below match any other
+test, a generated one (``dex_freshness`` and the rest) included, which is never
+listed as stale. A test whose claim names no fact the
 declaration states (a stale render, or a test of a renamed model or column,
 which keeps its claim) is listed under ``stale_claims``, and still counts where
 its kind and column match (#1498).
@@ -195,13 +197,21 @@ class _Tests:
 
     def stale(self, model: str) -> list[tuple[str, str | None, str]]:
         """(test, column, claim) of each test on ``model`` whose claim names no
-        fact its declaration states."""
+        fact its declaration states.
 
+        A generated test (``dex_freshness``, ``dex_continuity`` and the rest)
+        is never listed: its claim comes from what the plan read beside the
+        declaration (a parent's references, the model's joins, a snapshot), so
+        coverage cannot tell a current claim of one from a stale one."""
+
+        from .. import generated_tests
+
+        generated = {kind.name for kind in generated_tests.kinds()}
         known = self.claims.get(model, set())
         return [
             (name, col, claim)
             for name, col, _kwargs, _reads, claim in self.by_model.get(model, [])
-            if claim is not None and claim not in known
+            if claim is not None and claim not in known and _base(name) not in generated
         ]
 
     def on_column(self, model: str, column: str, test: str) -> bool:
