@@ -392,6 +392,7 @@ CommitRangeReason = Literal[
     "no_prior_pass",
     "commit_not_in_history",
     "history_unreadable",
+    "history_shallow",
     "no_good_ancestor",
     "diverged",
 ]
@@ -846,8 +847,10 @@ def commit_range(
             )
         kept = history.independent(list(bounds))
         commits, count = history.between(bad, kept, limit)
-    except HistoryUnreadableError:
-        return unknown("history_unreadable")
+    except HistoryUnreadableError as exc:
+        return unknown(
+            "history_shallow" if exc.code == "shallow" else "history_unreadable"
+        )
     after = tuple(sorted((_ref(bounds[k]) for k in kept), key=lambda r: -r.sequence))
     return CommitRange(
         status="ordered",

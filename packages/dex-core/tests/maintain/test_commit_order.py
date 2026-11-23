@@ -514,3 +514,76 @@ def test_git_outside_a_repository_is_unreadable(tmp_path: Path) -> None:
         git.resolve("a" * 40)
     found = _range(_series([(A, "good"), (B, "bad")], history=git))
     assert found.reason == "history_unreadable"
+
+
+def _shallow_clone(repo: dict[str, str], tmp_path: Path, depth: int) -> Path:
+    clone = tmp_path / f"shallow-{depth}"
+    subprocess.run(  # noqa: S603
+        [
+            _GIT or "git",
+            "clone",
+            "-q",
+            "--no-single-branch",
+            f"--depth={depth}",
+            f"file://{repo['root']}",
+            str(clone),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return clone
+
+
+def test_a_shallow_clone_never_reads_a_cut_ancestry_as_diverged(
+    repo: dict[str, str], tmp_path: Path
+) -> None:
+    # Depth 2 keeps C and B on main, with B's parents cut. A is still held
+    # (the `other` branch reaches it), so the full history says A..B is
+    # ordered, but the clone cannot show it.
+    git = GitHistory(_shallow_clone(repo, tmp_path, 2))
+    assert git.shallow
+    assert git.resolve(repo["a"]) == repo["a"]
+    found = _range(_series([(repo["a"], "good"), (repo["c"], "bad")], history=git))
+    assert (found.status, found.reason) == ("unknown", "history_shallow")
+    full = _range(
+        _series(
+            [(repo["a"], "good"), (repo["c"], "bad")],
+            history=GitHistory(repo["root"]),
+        )
+    )
+    assert full.status == "ordered"
+
+
+def test_a_shallow_clone_still_reads_a_range_inside_what_it_holds(
+    repo: dict[str, str], tmp_path: Path
+) -> None:
+    git = GitHistory(_shallow_clone(repo, tmp_path, 2))
+    found = _range(_series([(repo["b"], "good"), (repo["c"], "bad")], history=git))
+    assert found.status == "ordered"
+    assert found.commits == (repo["c"],)
+    assert not GitHistory(repo["root"]).shallow
+
+
+def test_git_answers_are_kept_and_an_unreadable_history_fails_fast(
+    repo: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    real = subprocess.run
+
+    def counting(argv, *args, **kwargs):
+        calls.append(tuple(argv))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", counting)
+    git = GitHistory(repo["root"])
+    for _ in range(3):
+        git.resolve(repo["b"])
+        git.is_ancestor(repo["a"], repo["b"])
+    assert len(calls) == 3  # the repository check, one resolve, one ancestry
+
+    calls.clear()
+    nowhere = GitHistory(tmp_path / "nowhere")
+    for _ in range(3):
+        with pytest.raises(HistoryUnreadableError):
+            nowhere.resolve(A)
+    assert len(calls) == 1

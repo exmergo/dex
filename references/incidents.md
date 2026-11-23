@@ -245,18 +245,21 @@ C is not in it; deployed in the order A, B, C it is the same range, with
 | `ordered` | the range is read from history: `after` (the passing commits that bound it), `commits` (newest first, at most 50) and `count` |
 | `same_commit` | the failing commit itself passed in an earlier run: no commit is in the range, so the change is not in the code |
 | `not_ordered` | the last passing run's commit and the failing one are on diverged branches (`reason: diverged`): which side changed is not known, so no range is given |
-| `unknown` | with a `reason`: `commit_unknown` or `commit_not_in_history` (with the `side`, `after` or `through`, that lacks one), `no_prior_pass`, `no_good_ancestor` (every earlier pass descends from the failure), or `history_unreadable` |
+| `unknown` | with a `reason`: `commit_unknown` or `commit_not_in_history` (with the `side`, `after` or `through`, that lacks one), `no_prior_pass`, `no_good_ancestor` (every earlier pass descends from the failure), `history_shallow` (a shallow clone cut the history the answer needs), or `history_unreadable` |
 
 Each end names its run and where its commit came from (`git_sha`,
 `orchestrator` or `unknown`), and `last_good_run` is always the last passing run
 in invocation order, whether or not it bounds the range. `unplaced_good_runs`
 counts earlier passes whose commit is unknown or not in the history: each could
-only narrow the range. A shallow clone holds only part of the history, so a
-commit older than its depth reads `commit_not_in_history`.
+only narrow the range. A shallow clone holds only part of the history: a commit
+older than its depth reads `commit_not_in_history`, and where the clone's cut could
+hide an ancestry (a commit that is not an ancestor in the clone may be one in the
+repository) or shorten the range, it reads `history_shallow` rather than
+`not_ordered` or a short range.
 
 The history is read through `exmergo_dex_core.maintain.commit_history`:
 `GitHistory` asks `git` in a local checkout, read-only and one call at a time
-with no shell, and `MappedHistory` holds a commit graph in memory for a host with
+with no shell, keeping its answers for the life of the reader, and `MappedHistory` holds a commit graph in memory for a host with
 no checkout.
 
 ### A subject's history

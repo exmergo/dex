@@ -32,6 +32,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
+from ..errors import DexError
 from .observations import COMMIT_PATTERN
 
 #: Which kind of reader answered.
@@ -43,9 +44,21 @@ _COMMIT = re.compile(COMMIT_PATTERN)
 GIT_TIMEOUT_SECONDS = 20.0
 
 
-class HistoryUnreadableError(Exception):
-    """The history could not be read at all (as opposed to a commit absent
-    from it)."""
+class HistoryUnreadableError(DexError, RuntimeError):
+    """The history could not answer, as opposed to a commit absent from it.
+
+    ``code`` is ``unreadable`` (no repository, no ``git``, a timeout) or
+    ``shallow``: a shallow clone cut the history the answer needs, so "not an
+    ancestor" or a range crossing the clone's boundary cannot be trusted.
+    :func:`~.timeline.commit_range` reads them as ``history_unreadable`` and
+    ``history_shallow``; a host calling a reader directly catches it.
+    """
+
+    def __init__(
+        self, message: str, *, code: Literal["unreadable", "shallow"] = "unreadable"
+    ) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @runtime_checkable
@@ -86,6 +99,17 @@ class GitHistory:
     Each answer is one ``git`` call with an argument list (never a shell), a
     timeout, prompts off and the file-system monitor off, so no repository
     hook or configured command runs.
+
+    Answers to :meth:`resolve` and :meth:`is_ancestor` are kept for the life
+    of the instance, since the history they read does not change under one
+    read; build a new instance to read a checkout again. The first time
+    ``git`` cannot answer at all, every later call fails the same way at once
+    rather than waiting on ``git`` again.
+
+    In a shallow clone a boundary commit has no recorded parents, so a
+    negative ancestry answer, or a range that reaches the boundary, may be an
+    artefact of the clone: both raise :class:`HistoryUnreadableError` with
+    ``code="shallow"`` rather than read as diverged history or a short range.
     """
 
     kind: HistoryKind = "git"
@@ -96,8 +120,18 @@ class GitHistory:
         self._root = Path(repo_root)
         self._timeout = timeout
         self._checked = False
+        self._boundary: frozenset[str] = frozenset()
+        self._failure: HistoryUnreadableError | None = None
+        self._resolved: dict[str, str | None] = {}
+        self._ancestry: dict[tuple[str, str], bool] = {}
+
+    def _fail(self, message: str) -> HistoryUnreadableError:
+        self._failure = HistoryUnreadableError(message)
+        return self._failure
 
     def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        if self._failure is not None:
+            raise self._failure
         env = dict(os.environ)
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_OPTIONAL_LOCKS"] = "0"
@@ -111,32 +145,62 @@ class GitHistory:
                 env=env,
             )
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            raise HistoryUnreadableError(type(exc).__name__) from None
+            raise self._fail(type(exc).__name__) from None
 
     def _repository(self) -> None:
         if self._checked:
             return
-        done = self._git("rev-parse", "--git-dir")
+        done = self._git("rev-parse", "--git-dir", "--is-shallow-repository")
         if done.returncode != 0:
-            raise HistoryUnreadableError("not a git repository")
+            raise self._fail("not a git repository")
+        if done.stdout.split()[-1:] == ["true"]:
+            self._boundary = self._shallow_boundary()
         self._checked = True
+
+    def _shallow_boundary(self) -> frozenset[str]:
+        """The commits a shallow clone cut the history at (``.git/shallow``)."""
+
+        done = self._git("rev-parse", "--path-format=absolute", "--git-path", "shallow")
+        if done.returncode != 0:
+            raise self._fail("shallow boundary unreadable")
+        try:
+            text = Path(done.stdout.strip()).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            raise self._fail("shallow boundary unreadable") from None
+        return frozenset(s.lower() for s in text.split() if _COMMIT.fullmatch(s))
+
+    @property
+    def shallow(self) -> bool:
+        """Whether the checkout is a shallow clone."""
+
+        self._repository()
+        return bool(self._boundary)
 
     def resolve(self, commit: str) -> str | None:
         name = _held(commit)
+        if name in self._resolved:
+            return self._resolved[name]
         self._repository()
         done = self._git("rev-parse", "--verify", "--quiet", f"{name}^{{commit}}")
-        if done.returncode != 0:
-            return None
-        resolved = done.stdout.strip()
-        return resolved if _COMMIT.fullmatch(resolved) else None
+        resolved = done.stdout.strip() if done.returncode == 0 else ""
+        self._resolved[name] = resolved if _COMMIT.fullmatch(resolved) else None
+        return self._resolved[name]
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
         older, newer = _held(ancestor), _held(descendant)
-        self._repository()
-        done = self._git("merge-base", "--is-ancestor", older, newer)
-        if done.returncode in (0, 1):
-            return done.returncode == 0
-        raise HistoryUnreadableError("merge-base failed")
+        held = self._ancestry.get((older, newer))
+        if held is None:
+            self._repository()
+            done = self._git("merge-base", "--is-ancestor", older, newer)
+            if done.returncode not in (0, 1):
+                raise self._fail("merge-base failed")
+            held = self._ancestry[(older, newer)] = done.returncode == 0
+        if not held and self._boundary:
+            raise HistoryUnreadableError(
+                "a shallow clone cannot show a commit is not an ancestor",
+                code="shallow",
+            )
+        return held
 
     def independent(self, commits: Sequence[str]) -> tuple[str, ...]:
         names = list(dict.fromkeys(_held(c) for c in commits))
@@ -145,7 +209,7 @@ class GitHistory:
         self._repository()
         done = self._git("merge-base", "--independent", *names)
         if done.returncode != 0:
-            raise HistoryUnreadableError("merge-base failed")
+            raise self._fail("merge-base failed")
         kept = set(done.stdout.split())
         return tuple(n for n in names if n in kept)
 
@@ -158,17 +222,27 @@ class GitHistory:
         spec = [head, "--not", *excluded] if excluded else [head]
         counted = self._git("rev-list", "--count", *spec)
         if counted.returncode != 0:
-            raise HistoryUnreadableError("rev-list failed")
+            raise self._fail("rev-list failed")
         try:
             count = int(counted.stdout.strip() or "0")
         except ValueError:
-            raise HistoryUnreadableError("rev-list failed") from None
-        if limit <= 0 or count == 0:
+            raise self._fail("rev-list failed") from None
+        if count == 0:
             return (), count
-        listed = self._git("rev-list", "--topo-order", f"--max-count={limit}", *spec)
+        # In a shallow clone, list the whole range: a boundary commit inside
+        # it means the clone cut the range short.
+        listing = [] if self._boundary else [f"--max-count={max(limit, 0)}"]
+        if limit <= 0 and not self._boundary:
+            return (), count
+        listed = self._git("rev-list", "--topo-order", *listing, *spec)
         if listed.returncode != 0:
-            raise HistoryUnreadableError("rev-list failed")
-        shas = tuple(s for s in listed.stdout.split() if _COMMIT.fullmatch(s))
+            raise self._fail("rev-list failed")
+        every = [s for s in listed.stdout.split() if _COMMIT.fullmatch(s)]
+        if self._boundary.intersection(every):
+            raise HistoryUnreadableError(
+                "the range reaches a shallow clone's boundary", code="shallow"
+            )
+        shas = tuple(every[: max(limit, 0)])
         return shas, count
 
 

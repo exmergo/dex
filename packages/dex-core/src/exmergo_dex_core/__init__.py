@@ -92,6 +92,7 @@ _EXPORTS = {
     "ExploreStore": "storage",
     "FilesystemStore": "storage",
     "FoldInputError": "maintain.incidents",
+    "HistoryUnreadableError": "maintain.commit_history",
     "IncompatibleArtifactsError": "transform.artifact_runtime",
     "InvalidConfigError": "config_document",
     "LedgerUnreadableError": "guards.cost_guard",
@@ -207,6 +208,7 @@ if TYPE_CHECKING:  # what a type checker and an IDE see; never run
     from .guards.dialect import DialectDependencyError
     from .guards.query_firewall import QueryRefusedError
     from .maintain.commands import BaselineUnreadableError, NoBaselineError
+    from .maintain.commit_history import HistoryUnreadableError
     from .maintain.elementary_layouts import ElementaryLayoutError
     from .maintain.incidents import FoldInputError
     from .maintain.snapshot import Snapshot
@@ -306,6 +308,7 @@ __all__ = [
     "ExploreStore",
     "FilesystemStore",
     "FoldInputError",
+    "HistoryUnreadableError",
     "IncompatibleArtifactsError",
     "InvalidConfigError",
     "LedgerUnreadableError",
