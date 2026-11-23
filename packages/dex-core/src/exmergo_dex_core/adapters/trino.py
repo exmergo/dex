@@ -1283,6 +1283,25 @@ class TrinoAdapter:
         rows, labels, _types = self._run_rows(sql)
         return rows, labels
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: a statement Cube renders
+        reads a timestamp with no zone through the session time zone, and the
+        Trino client sends this machine's own zone unless told otherwise, so
+        run under it the statement buckets rows differently. Only UTC, so
+        nothing caller-supplied is interpolated.
+        """
+
+        cursor = self._conn.cursor()
+        try:
+            # dex-built session statement, a constant. The client keeps the
+            # zone for every later statement on the connection.
+            cursor.execute("SET TIME ZONE 'UTC'")
+            cursor.fetchall()
+        except Exception as exc:
+            raise self._translate(exc) from exc
+
     def _run_rows(
         self,
         sql: str,

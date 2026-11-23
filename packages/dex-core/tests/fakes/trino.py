@@ -90,7 +90,9 @@ class FakeQuery:
 
     @property
     def is_session(self) -> bool:
-        return self.sql.upper().startswith(("SET SESSION", "RESET SESSION"))
+        return self.sql.upper().startswith(
+            ("SET SESSION", "RESET SESSION", "SET TIME ZONE")
+        )
 
     @property
     def is_data(self) -> bool:
@@ -146,6 +148,10 @@ class FakeTrinoCursor:
             match = re.match(r"SET SESSION (\w+) = '([^']*)'", stripped, re.IGNORECASE)
             assert match, f"unparsed session statement: {stripped}"
             conn.properties[match.group(1)] = match.group(2)
+            return self._answer([], seconds=0.0)
+        if upper == "SET TIME ZONE 'UTC'":
+            # The server answers with the `time_zone_id` property set.
+            conn.properties["time_zone_id"] = "UTC"
             return self._answer([], seconds=0.0)
         if upper.startswith("RESET SESSION"):
             conn.properties.pop(stripped.split()[-1], None)

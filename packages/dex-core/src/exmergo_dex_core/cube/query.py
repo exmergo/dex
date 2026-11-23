@@ -47,18 +47,20 @@ CUBE_CONNECTORS: dict[str, tuple[str, str]] = {
     "bigquery": ("?", "`"),
     "snowflake": ("?", '"'),
     "redshift": ("$", '"'),
+    "clickhouse": ("?", "`"),
+    "trino": ("?", '"'),
 }
 
 #: Why each connector outside :data:`CUBE_CONNECTORS` is refused, by name.
 UNSUPPORTED_CONNECTORS: dict[str, str] = {
     "databricks": "its rendered SQL has no reviewed golden yet",
-    "clickhouse": "its rendered SQL has no reviewed golden yet",
-    "trino": "its rendered SQL has no reviewed golden yet",
 }
 
 # Dialects whose string literals take a backslash escape, for the scanner that
 # finds placeholders outside quoted text.
-_BACKSLASH_ESCAPES = {"bigquery", "snowflake", "redshift"}
+_BACKSLASH_ESCAPES = {"bigquery", "snowflake", "redshift", "clickhouse"}
+# Dialects whose quoted identifiers take one too.
+_BACKSLASH_IDENTIFIERS = {"clickhouse"}
 
 
 class CubeQueryError(DexError, ValueError):
@@ -696,13 +698,14 @@ def _placeholders(sql: str, dialect: str) -> list[tuple[int, int, str]]:
 
     found: list[tuple[int, int, str]] = []
     backslash = dialect in _BACKSLASH_ESCAPES
+    identifiers = dialect in _BACKSLASH_IDENTIFIERS
     i, n = 0, len(sql)
     while i < n:
         char = sql[i]
         if char in "'\"`":
             j = i + 1
             while j < n:
-                if backslash and char == "'" and sql[j] == "\\":
+                if backslash and (char == "'" or identifiers) and sql[j] == "\\":
                     j += 2
                     continue
                 if sql[j] == char:
