@@ -7,6 +7,11 @@ of behaviour for that check, and has to be made here on purpose.
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
 from exmergo_dex_core.edits import EditOp
 from exmergo_dex_core.transform import (
     commands,
@@ -87,10 +92,12 @@ def test_each_check_reads_its_set_from_the_shared_module() -> None:
         ),
         (pii_tags.changes_global, global_edits.changes_global),
     ]
+    # ``commands`` is not in this list: it reads the comparison set inside
+    # ``_offer_refactor_comparison``, never at module level, so an attribute
+    # check says nothing about it. Its call-site case below guards it instead.
     copies = [
         module.__name__.rsplit(".", 1)[-1]
         for module in (
-            commands,
             downstream_impact,
             refactor_compare,
             prerequisites,
@@ -148,6 +155,43 @@ def test_finding_attribution_leaves_reach_unbounded_on_its_set() -> None:
         for edit in _each_kind()
         if finding_attribution.plan_reach([edit], MANIFEST).reached is None
     } == {"macro_sql", "project_yml", "packages_yml", "profiles_yml", "semantic_yml"}
+
+
+def test_the_comparison_offer_calls_a_plan_mixed_with_its_repair_on_the_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The offer's second reader of the comparison set (#1114): with an input
+    blocked, a plan that edits a kind in the set carries the repair beside the
+    rewrite. Read over every kind, at a path naming no blocked model, so only
+    the kind can make the plan mixed."""
+
+    monkeypatch.setattr(
+        commands, "_record_refactor_models", lambda engine, plan_id, per_model: None
+    )
+    monkeypatch.setattr(
+        refactor_compare, "edited_existing_models", lambda edits, project: ["summary"]
+    )
+    monkeypatch.setattr(
+        refactor_compare,
+        "_blocked_parents",
+        lambda project, model, excluded: [
+            refactor_compare.BlockedInput("users", "error")
+        ],
+    )
+
+    def mixed(edit: PlanEdit) -> bool:
+        result = SimpleNamespace(plan_id="p1", row_attribution=[], warnings=[])
+        engine = SimpleNamespace(project_dir=Path)
+        commands._offer_refactor_comparison(engine, result, [edit])
+        return result.refactor_comparison_offer.get("mixed_with_repair") == ["users"]
+
+    project = PlanEdit(path=PROJECT, kind=EditKind.PROJECT_YML, new_content="x")
+    assert mixed(project)
+    assert {edit.kind.value for edit in _each_kind() if mixed(edit)} == {
+        "macro_sql",
+        "project_yml",
+        "packages_yml",
+    }
 
 
 def test_a_changed_project_file_makes_the_plan_global() -> None:
