@@ -484,8 +484,11 @@ jobs:
     # rather than in ci.yml because installing the package needs the network,
     # and pull requests stay deterministic (#1380).
     runs-on: ubuntu-latest
-    # The file took about 15 minutes on a hosted runner (2026-11-22).
-    timeout-minutes: 30
+    # The file's 55 cases took 14:47 and 23:33 on two hosted runs on main
+    # (2026-11-23). Open pull requests add cases to it, so the limit leaves
+    # room for a slow runner: a run that hits it is cancelled, and main reads
+    # red.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: packages/dex-core
