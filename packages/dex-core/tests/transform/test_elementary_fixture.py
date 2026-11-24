@@ -525,7 +525,20 @@ def test_a_failing_test_on_a_column_dex_tags_leaves_no_sample_of_its_rows(
             before = duckdb_census(warehouse)
             run_results.unlink(missing_ok=True)
             log = dbt("test", *project_args, "--select", name, cwd=project, check=False)
-            [result] = json.loads(run_results.read_text(encoding="utf-8"))["results"]
+            results = json.loads(run_results.read_text(encoding="utf-8"))["results"]
+            # Elementary's on-run-end hooks are written beside the test, as
+            # `operation.` results: the selection itself is the one test.
+            tests = [r for r in results if r["unique_id"].startswith("test.")]
+            others = sorted(
+                r["unique_id"]
+                for r in results
+                if not r["unique_id"].startswith("test.")
+            )
+            assert [t["unique_id"].split(".")[2] for t in tests] == [name], (
+                f"--select {name} is meant to run that one test:\n{log}"
+            )
+            assert all(u.startswith("operation.") for u in others), others
+            [result] = tests
             # Only a completed failure measures sampling: an errored test keeps
             # no sample either.
             assert result["status"] == "fail" and result["failures"] >= 1, (
