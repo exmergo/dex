@@ -215,6 +215,7 @@ def read(
     warnings.extend(elementary.extra.pop("_warnings", []))
     dbt = _dbt(project_dir, manifest, claims, elementary.history, steps, notes)
     warnings.extend(dbt.extra.pop("_warnings", []))
+    held_note: str | None = dbt.extra.pop("_held_note", None)
 
     read = [source for source in (elementary, dbt) if source.history is not None]
     observations = [
@@ -236,6 +237,12 @@ def read(
         now=datetime.now(UTC),
         history=history,
     )
+    if held_note is not None and any(
+        incident.opening_source == "dbt_run_results"
+        and incident.first_observed == "unknown"
+        for incident in fold.incidents
+    ):
+        notes.append(held_note)
     if dbt.history is not None and elementary.status != "read":
         notes.append(
             "dbt's run_results.json holds one invocation, so a failure it reports "
@@ -882,11 +889,14 @@ def _dbt(
         },
     )
     if placed_as == "in_window":
-        # Elementary recorded this invocation, so the run adds no history of its
-        # own and the fold dates its failures from Elementary's runs: the file's
-        # "no known start" note does not hold here. The run itself is still
-        # named, under this source's ``run`` and ``placed``.
+        # Elementary recorded this invocation, so the run sits in Elementary's
+        # order and a failure Elementary saw pass before it is dated: the file's
+        # "no known start" note is held back here, and :func:`read` adds it again
+        # only for an incident this run opened with no known start (a test
+        # Elementary holds no result for). The run itself is still named, under
+        # this source's ``run`` and ``placed``.
         notes.extend(n for n in found.notes if n != found.unknown_start_note)
+        extra["_held_note"] = found.unknown_start_note
     else:
         notes.extend(found.notes)
     return _Source("read", extra=extra, observations=observations, history=history)

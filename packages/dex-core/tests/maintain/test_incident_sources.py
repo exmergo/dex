@@ -697,8 +697,12 @@ def test_a_dbt_run_that_ended_after_the_window_but_started_before_it_is_unplaced
 
 # --- the "no known start" note, by placement (#1592) ---------------------------------
 
-#: The words of the run-results note that every placement but ``in_window`` keeps.
-KNOWN_START = "no failure has a known start (first_observed: unknown)"
+#: The run-results note's fixed words, after the invocation it names: every
+#: placement but ``in_window`` keeps them as they are.
+KNOWN_START = (
+    "One invocation is all run_results.json holds, so no failure has a known "
+    "start (first_observed: unknown), and every interval before it is unobserved"
+)
 
 
 def _says_no_known_start(result: IncidentsResult) -> bool:
@@ -725,6 +729,49 @@ def test_a_run_elementary_recorded_drops_the_no_known_start_note(tmp_path: Path)
     # The run is still named, and the source's other notes are kept.
     assert data["sources"]["dbt_run_results"]["run"]["invocation_id"] == "inv-3"
     assert any("no dbt log was found" in note for note in result.notes)
+
+
+def test_a_run_elementary_recorded_keeps_the_note_for_a_test_elementary_never_saw(
+    tmp_path: Path,
+):
+    """Elementary recorded the invocation but holds no result for this test, so
+    the run opens the incident alone and its start is unknown for the note's own
+    reason."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {OTHER: "fail"}, invocation="inv-3", at=runs[-1].started)
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
+    [incident] = data["incidents"]
+    assert incident["subject"]["key"] == OTHER
+    assert incident["opening_source"] == "dbt_run_results"
+    assert incident["first_observed"] == "unknown"
+    assert _says_no_known_start(result)
+
+
+def test_a_run_elementary_recorded_leaves_elementary_s_unknown_start_to_it(
+    tmp_path: Path,
+):
+    """A failure in every run of Elementary's window started before it: the
+    start is unknown for Elementary's retention, not for dbt's one invocation,
+    so the run-results note stays out."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(
+        tmp_path, runs, _results(runs, failing=[run.id for run in runs])
+    )
+    _run_results(root, {TEST: "fail"}, invocation="inv-3", at=runs[-1].started)
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
+    [incident] = data["incidents"]
+    assert incident["opening_source"] == "elementary"
+    assert incident["first_observed"] == "unknown"
+    assert not _says_no_known_start(result)
 
 
 def test_a_run_read_alone_keeps_the_no_known_start_note(tmp_path: Path):
