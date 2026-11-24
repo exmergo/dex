@@ -705,8 +705,25 @@ KNOWN_START = (
 )
 
 
+#: The note an ``in_window`` run gives instead, for the incidents it opened alone.
+ONLY_DBT = (
+    "opened by dbt_run_results have no known start (first_observed: unknown): "
+    "a failure only dbt's run_results.json reports is seen in one invocation"
+)
+
+
 def _says_no_known_start(result: IncidentsResult) -> bool:
     return any(KNOWN_START in note for note in result.notes)
+
+
+def _only_dbt_note(result: IncidentsResult) -> tuple[int, str]:
+    [(at, note)] = [(i, n) for i, n in enumerate(result.notes) if ONLY_DBT in n]
+    return at, note
+
+
+def _no_log_note_at(result: IncidentsResult) -> int:
+    [at] = [i for i, n in enumerate(result.notes) if "no dbt log was found" in n]
+    return at
 
 
 def test_a_run_elementary_recorded_drops_the_no_known_start_note(tmp_path: Path):
@@ -726,6 +743,7 @@ def test_a_run_elementary_recorded_drops_the_no_known_start_note(tmp_path: Path)
     assert incident["first_observed"]["run"] == "inv-3"
     assert incident["first_observed"]["source"] == "elementary"
     assert not _says_no_known_start(result)
+    assert not any(ONLY_DBT in note for note in result.notes)
     # The run is still named, and the source's other notes are kept.
     assert data["sources"]["dbt_run_results"]["run"]["invocation_id"] == "inv-3"
     assert any("no dbt log was found" in note for note in result.notes)
@@ -749,7 +767,42 @@ def test_a_run_elementary_recorded_keeps_the_note_for_a_test_elementary_never_sa
     assert incident["subject"]["key"] == OTHER
     assert incident["opening_source"] == "dbt_run_results"
     assert incident["first_observed"] == "unknown"
-    assert _says_no_known_start(result)
+    # Scoped to the incidents the run opened alone, and where the file's own
+    # note sits in every other placement: first of the run's notes.
+    assert not _says_no_known_start(result)
+    at, note = _only_dbt_note(result)
+    assert note.startswith("1 incident(s) ")
+    assert at < _no_log_note_at(result)
+
+
+def test_a_run_elementary_recorded_scopes_the_note_beside_a_dated_incident(
+    tmp_path: Path,
+):
+    """One fold, two incidents: Elementary dates TEST, and OTHER only dbt's run
+    reports. A note saying no failure has a known start would contradict TEST's
+    ``first_observed``, so the note names the undated incident alone."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(
+        tmp_path, runs, _results(runs, failing=["inv-3"])
+    )
+    _run_results(
+        root, {TEST: "fail", OTHER: "fail"}, invocation="inv-3", at=runs[-1].started
+    )
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
+    by_key = {incident["subject"]["key"]: incident for incident in data["incidents"]}
+    assert set(by_key) == {TEST, OTHER}
+    assert by_key[TEST]["first_observed"]["run"] == "inv-3"
+    assert by_key[TEST]["first_observed"]["source"] == "elementary"
+    assert by_key[OTHER]["opening_source"] == "dbt_run_results"
+    assert by_key[OTHER]["first_observed"] == "unknown"
+    assert not _says_no_known_start(result)
+    at, note = _only_dbt_note(result)
+    assert note.startswith("1 incident(s) ")
+    assert at < _no_log_note_at(result)
 
 
 def test_a_run_elementary_recorded_leaves_elementary_s_unknown_start_to_it(
@@ -772,6 +825,7 @@ def test_a_run_elementary_recorded_leaves_elementary_s_unknown_start_to_it(
     assert incident["opening_source"] == "elementary"
     assert incident["first_observed"] == "unknown"
     assert not _says_no_known_start(result)
+    assert not any(ONLY_DBT in note for note in result.notes)
 
 
 def test_a_run_read_alone_keeps_the_no_known_start_note(tmp_path: Path):
@@ -784,6 +838,7 @@ def test_a_run_read_alone_keeps_the_no_known_start_note(tmp_path: Path):
     [incident] = data["incidents"]
     assert incident["first_observed"] == "unknown"
     assert _says_no_known_start(result)
+    assert not any(ONLY_DBT in note for note in result.notes)
 
 
 def test_a_run_after_the_window_keeps_the_no_known_start_note(tmp_path: Path):
