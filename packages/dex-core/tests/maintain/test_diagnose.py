@@ -773,3 +773,26 @@ def test_a_root_commit_alone_is_a_series_of_one(tmp_path: Path):
 
     assert [p.created_at for p in read.series.points] == [only]
     assert (read.removed, read.skipped) == (0, 0)
+
+
+def test_a_repository_with_no_commit_yet_reads_as_no_series_not_unreadable(
+    tmp_path: Path,
+):
+    # A .dex directory inside a repository nothing has been committed to: the
+    # history is readable and holds no baseline, which is not a history that
+    # could not be read.
+    from exmergo_dex_core.maintain.snapshot_series import read_series
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    dex = root / ".dex"
+    dex.mkdir()
+    snap = Snapshot(created_at=datetime(2026, 11, 1, tzinfo=UTC).isoformat())
+    (dex / "snapshot.json").write_text(snap.model_dump_json(indent=2))
+
+    read = read_series(dex)
+
+    assert read.series.status == "read"
+    assert read.series.points == ()
+    assert "no commit yet" in (read.series.reason or "")
