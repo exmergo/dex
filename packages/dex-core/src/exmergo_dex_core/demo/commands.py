@@ -361,8 +361,11 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                         "because of the batch loaded twice. Its two staging "
                         "views were not "
                         "built, so `dex maintain verify` reports them as "
-                        "no_relation until `dex transform build --target dev` "
-                        "builds them"
+                        "no_relation until a build makes them. Run `dex "
+                        "transform deps` before `dex transform build --target "
+                        "dev`: the demo's dbt_packages/elementary/ holds only "
+                        "the recorded release, which the build reads as "
+                        "installed, so it would not install the package itself"
                     ]
                     if rooted is not None
                     else []

@@ -86,8 +86,12 @@ the incident open for about three weeks after `dex demo`. The pinned digests are
 taken at a fixed generation time, so the offsets are pinned and only the dates
 move. `explore map` leaves the package's four tables out of the ranking, as it
 does for a real install. The two staging views were never built, so
-`dex maintain verify` reports them as `no_relation` until
-`dex transform build --target dev` builds them. The project's files are text, written
+`dex maintain verify` reports them as `no_relation` until a build makes them.
+Run `dex transform deps` first, then `dex transform build --target dev`. The
+order matters: `dbt_packages/elementary/` holds only the recorded
+`dbt_project.yml`, and the build installs packages only where that directory is
+missing or empty, so a build on its own would skip `dbt deps` and run dbt
+against a package with no code. The project's files are text, written
 create-only beside the warehouse, so the generator below stays the one writable
 DuckDB open; a pinned digest covers them as it covers the rows.
 

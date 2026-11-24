@@ -66,6 +66,18 @@ def _files_under(root: Path) -> list[str]:
     )
 
 
+def test_the_demo_says_to_install_the_package_before_the_build(run_from, capsys):
+    """The demo's dbt_packages/elementary/ holds only the recorded release, so
+    a build reads the package as installed and skips `dbt deps`: the note that
+    names the build names `dex transform deps` before it."""
+
+    payload = _run(run_from.argv("demo"), capsys)
+
+    [note] = [n for n in payload["data"]["notes"] if "transform build" in n]
+    assert "dex transform deps" in note
+    assert note.index("dex transform deps") < note.index("dex transform build")
+
+
 def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     payload = _run(run_from.argv("demo"), capsys)
 
