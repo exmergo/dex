@@ -695,6 +695,76 @@ def test_a_dbt_run_that_ended_after_the_window_but_started_before_it_is_unplaced
     assert data["sources"]["dbt_run_results"]["placed"] == "unplaced"
 
 
+# --- the "no known start" note, by placement (#1592) ---------------------------------
+
+#: The words of the run-results note that every placement but ``in_window`` keeps.
+KNOWN_START = "no failure has a known start (first_observed: unknown)"
+
+
+def _says_no_known_start(result: IncidentsResult) -> bool:
+    return any(KNOWN_START in note for note in result.notes)
+
+
+def test_a_run_elementary_recorded_drops_the_no_known_start_note(tmp_path: Path):
+    """Placed ``in_window``, the run is one of Elementary's: the fold dates the
+    failure from Elementary's runs, so the file's own note would contradict it."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(
+        tmp_path, runs, _results(runs, failing=["inv-3"])
+    )
+    _run_results(root, {TEST: "fail"}, invocation="inv-3", at=runs[-1].started)
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
+    [incident] = data["incidents"]
+    assert incident["first_observed"]["run"] == "inv-3"
+    assert incident["first_observed"]["source"] == "elementary"
+    assert not _says_no_known_start(result)
+    # The run is still named, and the source's other notes are kept.
+    assert data["sources"]["dbt_run_results"]["run"]["invocation_id"] == "inv-3"
+    assert any("no dbt log was found" in note for note in result.notes)
+
+
+def test_a_run_read_alone_keeps_the_no_known_start_note(tmp_path: Path):
+    root = _project(tmp_path / "project")
+    _run_results(root, {TEST: "fail"})
+    result = _engine(root).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "alone"
+    [incident] = data["incidents"]
+    assert incident["first_observed"] == "unknown"
+    assert _says_no_known_start(result)
+
+
+def test_a_run_after_the_window_keeps_the_no_known_start_note(tmp_path: Path):
+    """A failure seen only in a run newer than Elementary's window still has no
+    known start."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail"}, invocation="dbt-later")
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "after_window"
+    [incident] = data["incidents"]
+    assert incident["opening_source"] == "dbt_run_results"
+    assert _says_no_known_start(result)
+
+
+def test_an_unplaced_run_keeps_the_no_known_start_note(tmp_path: Path):
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail"}, invocation="dbt-earlier", at=START)
+    result = _engine(root, warehouse).incidents()
+
+    assert _data(result)["sources"]["dbt_run_results"]["placed"] == "unplaced"
+    assert _says_no_known_start(result)
+
+
 def test_a_later_dbt_run_never_lifts_the_count_past_the_window(tmp_path: Path):
     runs = _hourly(25)
     root, warehouse = _elementary_project(tmp_path, runs, _results(runs))

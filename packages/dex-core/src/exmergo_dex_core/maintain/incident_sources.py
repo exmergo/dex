@@ -881,7 +881,14 @@ def _dbt(
             "claims_unread": counts.claims_unread,
         },
     )
-    notes.extend(found.notes)
+    if placed_as == "in_window":
+        # Elementary recorded this invocation, so the run adds no history of its
+        # own and the fold dates its failures from Elementary's runs: the file's
+        # "no known start" note does not hold here. The run itself is still
+        # named, under this source's ``run`` and ``placed``.
+        notes.extend(n for n in found.notes if n != found.unknown_start_note)
+    else:
+        notes.extend(found.notes)
     return _Source("read", extra=extra, observations=observations, history=history)
 
 
