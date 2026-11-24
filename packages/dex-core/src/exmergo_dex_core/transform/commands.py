@@ -2394,6 +2394,7 @@ def declare(
         declarations=planned.declarations,
         semantic_proposal=planned.semantic_proposal,
         generated_tests=planned.generated_tests,
+        pii_tags=planned.pii_tags,
         notes=notes + planned.notes,
         **common,
     )

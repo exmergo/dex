@@ -92,6 +92,23 @@ def test_a_model_with_no_marked_column_is_not_tagged():
     assert (text, row) == (unmarked, None)
 
 
+@pytest.mark.parametrize("flag", ["null", "''"])
+def test_a_null_flag_is_no_answer_and_the_category_still_marks(flag: str):
+    marked = SCHEMA.replace("contains_pii: true", f"contains_pii: {flag}")
+
+    _, row = pii_tags.tag_entry(marked, "stg_people", "pii")
+
+    assert row is not None
+    assert row["columns"] == [{"column": "email", "status": pii_tags.ADDED}]
+
+
+@pytest.mark.parametrize("flag", ["false", "no", "'false'"])
+def test_every_spelling_of_a_reviewer_s_no_wins(flag: str):
+    unmarked = SCHEMA.replace("contains_pii: true", f"contains_pii: {flag}")
+
+    assert pii_tags.tag_entry(unmarked, "stg_people", "pii") == (unmarked, None)
+
+
 @pytest.mark.parametrize("key", ["pii", "is_pii", "pii_category"])
 def test_every_key_a_reader_accepts_as_a_mark_is_tagged(key: str):
     marked = SCHEMA.replace(
@@ -545,6 +562,10 @@ def test_transform_declare_tags_a_model_whose_marks_predate_the_tag(
         "columns": ["email"],
         "switch": True,
     }
+    # The plan underneath reports what it wrote, and declare passes it on.
+    report = proposed["data"]["pii_tags"]
+    assert report["switch"]["status"] == pii_tags.SWITCH_ADDED
+    assert [m["model"] for m in report["models"]] == ["stg_people"]
     _apply(tmp_path, capsys)
     entry = _entry(
         (dbt_project_dir / "models" / "staging" / "schema.yml").read_text("utf-8")
@@ -606,6 +627,46 @@ def test_a_sql_rewrite_tags_the_yaml_and_withholds_the_switch(
     _apply(tmp_path, capsys)
     project = yaml.safe_load((dbt_project_dir / "dbt_project.yml").read_text("utf-8"))
     assert project["vars"] == {"disable_samples_on_pii_tags": True}
+
+
+def test_a_sql_rewrite_resending_dbt_project_yml_unchanged_still_withholds_the_switch(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    """A payload that resends ``dbt_project.yml`` as it stands changes nothing
+    there, so merging the switch into that edit would be what made the plan
+    global; the switch is withheld as for any other rewrite."""
+
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        SCHEMA, encoding="utf-8"
+    )
+    (dbt_project_dir / "models" / "staging" / "stg_people.sql").write_text(
+        PEOPLE, encoding="utf-8"
+    )
+    _repo(tmp_path)
+    project_yml = (dbt_project_dir / "dbt_project.yml").read_text("utf-8")
+
+    planned = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                {
+                    "path": "models/staging/stg_people.sql",
+                    "kind": "model_sql",
+                    "content": PEOPLE.replace("'x' as segment", "'y' as segment"),
+                },
+                {
+                    "path": "dbt_project.yml",
+                    "kind": "project_yml",
+                    "content": project_yml,
+                },
+            ]
+        },
+    )
+
+    assert planned["data"]["pii_tags"]["switch"]["status"] == pii_tags.SWITCH_WITHHELD
+    assert "dbt_project.yml" not in planned["data"]["paths"]
 
 
 def test_a_single_string_pii_tags_is_written_and_warned(

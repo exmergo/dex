@@ -130,7 +130,7 @@ def tag(
     switch = switch_status(project_yml)
     warnings: list[str] = []
     rewritten = _rewritten_models(edits, prior)
-    if switch == SWITCH_ABSENT and rewritten and not _edits_project(edits):
+    if switch == SWITCH_ABSENT and rewritten and not _edits_project(edits, prior):
         # A `dbt_project.yml` edit can change how any model compiles, so a plan
         # carrying one gets no refactor comparison and no downstream impact on
         # the model it rewrites. The switch waits for a plan of its own.
@@ -408,13 +408,27 @@ def _rewritten_models(edits: list[PlanEdit], prior: Mapping[str, str]) -> list[s
     )
 
 
-def _edits_project(edits: list[PlanEdit]) -> bool:
-    """Whether the plan already edits what makes the checks treat it as global."""
+def _edits_project(edits: list[PlanEdit], prior: Mapping[str, str]) -> bool:
+    """Whether the plan already changes what makes the checks treat it as global.
+
+    An edit that resends such a file unchanged is no change: the plan drops it
+    before it is stored, so merging the switch into it would be what made the
+    plan global."""
+
+    def changes(edit: PlanEdit) -> bool:
+        if edit.op is EditOp.DELETE or edit.path not in prior:
+            return True
+        return _lf(edit.new_content or "") != _lf(prior[edit.path])
 
     return any(
         edit.kind in (EditKind.PROJECT_YML, EditKind.PACKAGES_YML, EditKind.MACRO_SQL)
+        and changes(edit)
         for edit in edits
     )
+
+
+def _lf(text: str) -> str:
+    return text.replace("\r\n", "\n")
 
 
 def _entries(content: str | None) -> dict[str, Any]:
@@ -488,14 +502,24 @@ def _marked(item: Any) -> bool:
     """Whether a column's YAML marks it as personal data. A ``false`` a person
     wrote under any flag wins over a ``pii_category`` left beside it: the tag
     changes what the project's tests keep, so a reviewer's no is never read as
-    a yes."""
+    a yes. A null flag is no answer and does not win."""
 
     if not isinstance(item, Mapping):
         return False
     meta = entry_meta(item)
-    if any(key in meta and not meta[key] for key in _FLAGS):
+    if any(key in meta and _said_no(meta[key]) for key in _FLAGS):
         return False
     return says_pii(meta)
+
+
+def _said_no(value: Any) -> bool:
+    """An explicit no: ``false`` (YAML's ``no`` loads as it), or that text. A
+    null or an empty value says nothing, so a ``pii_category`` beside it still
+    marks the column."""
+
+    if value is False:
+        return True
+    return isinstance(value, str) and value.strip().lower() in ("false", "no")
 
 
 def tag_entry(
