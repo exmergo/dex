@@ -10,7 +10,7 @@
 #
 # Usage:
 #   scripts/setup_cube_dev.sh [--db duckdb|postgres|bigquery|snowflake|redshift|
-#                                   clickhouse|trino]
+#                                   clickhouse|trino|databricks]
 #                             [--model DIR]
 #   scripts/setup_cube_dev.sh --execute --db duckdb|postgres|bigquery [--model DIR]
 #   scripts/setup_cube_dev.sh --down          # remove every dex-cube-* container
@@ -31,7 +31,7 @@
 # unit tests replay and the integration tests run; it is mounted read-only. One
 # container per database type, each on its own loopback port:
 #   duckdb 4000, postgres 4001, bigquery 4002, snowflake 4003, redshift 4004,
-#   clickhouse 4005, trino 4006
+#   clickhouse 4005, trino 4006, databricks 4007
 # (DEX_CUBE_PORT overrides). Cube Core outside dev mode does not reload an edited
 # model, so re-run this script after editing one: it recreates the container.
 #
@@ -46,7 +46,10 @@ set -euo pipefail
 # together, re-reading the digest with
 #   docker buildx imagetools inspect cubejs/cube:v1.8.14 --format '{{json .Manifest.Digest}}'
 DIGEST=sha256:a09be2f036993869e45767f527807246600d7c0a8639c25ffdd23e8cbbb1c7d9
-IMAGE="cubejs/cube@$DIGEST"
+# cubejs/cube:v1.8.14-jdk, the same release with a JVM, for --db databricks
+# alone: Cube's Databricks driver is JDBC and fails in the image above with
+# `Cannot find module 'java'`. Bump it with the digest above.
+JDK_DIGEST=sha256:c3f862af7ab9dad6102649854288c93a4ad89e00567ec00a5208cdbc765b243b
 # The image's own `node` user, no capabilities: Cube Core binds an unprivileged
 # port and writes nothing outside its own tmp. scripts/check_container_hardening.sh
 # refuses the container if any of these is missing.
@@ -88,7 +91,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            echo "usage: $0 [--execute] [--db duckdb|postgres|bigquery|snowflake|redshift|clickhouse|trino] [--model DIR] | --down" >&2
+            echo "usage: $0 [--execute] [--db duckdb|postgres|bigquery|snowflake|redshift|clickhouse|trino|databricks] [--model DIR] | --down" >&2
             exit 2
             ;;
     esac
@@ -97,7 +100,10 @@ done
 # The warehouse each type renders for, described by nothing that reaches one: an
 # address in TEST-NET-1 (RFC 5737), a project and an account that do not exist, a
 # DuckDB file that is not there. Cube needs these set to start a driver; it never
-# connects to plan a query.
+# connects to plan a query. Databricks is the one type whose driver has another
+# name than the type (`databricks-jdbc`); its JDBC URL names no token, and the
+# driver jar is already in the `-jdk` image, so nothing is fetched at start.
+DB_TYPE=$DB
 case "$DB" in
     duckdb) PORT_DEFAULT=4000 DB_ENV=(-e CUBEJS_DB_DUCKDB_DATABASE_PATH=/nonexistent/render-only.duckdb) ;;
     postgres) PORT_DEFAULT=4001 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_NAME=render_only -e CUBEJS_DB_USER=render_only) ;;
@@ -106,11 +112,13 @@ case "$DB" in
     redshift) PORT_DEFAULT=4004 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_NAME=render_only -e CUBEJS_DB_USER=render_only) ;;
     clickhouse) PORT_DEFAULT=4005 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_NAME=render_only -e CUBEJS_DB_USER=render_only) ;;
     trino) PORT_DEFAULT=4006 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_PRESTO_CATALOG=render_only -e CUBEJS_DB_SCHEMA=render_only -e CUBEJS_DB_USER=render_only) ;;
+    databricks) PORT_DEFAULT=4007 DIGEST=$JDK_DIGEST DB_TYPE=databricks-jdbc DB_ENV=(-e 'CUBEJS_DB_DATABRICKS_URL=jdbc:databricks://192.0.2.1:443/default;transportMode=http;ssl=1;httpPath=/render-only;AuthMech=3;UID=token' -e CUBEJS_DB_NAME=render_only) ;;
     *)
-        echo "--db must be one of duckdb, postgres, bigquery, snowflake, redshift, clickhouse, trino" >&2
+        echo "--db must be one of duckdb, postgres, bigquery, snowflake, redshift, clickhouse, trino, databricks" >&2
         exit 2
         ;;
 esac
+IMAGE="cubejs/cube@$DIGEST"
 CONTAINER="dex-cube-$DB"
 EXTRA=(-v "$CONF:/cube/conf/cube.js:ro")
 SECRET_ENV=()
@@ -211,7 +219,7 @@ docker run -d --name "$CONTAINER" \
     --env-file "$envfile" \
     -e CUBEJS_DEV_MODE=false \
     -e CUBEJS_TELEMETRY=false \
-    -e CUBEJS_DB_TYPE="$DB" \
+    -e CUBEJS_DB_TYPE="$DB_TYPE" \
     "${DB_ENV[@]+"${DB_ENV[@]}"}" \
     -v "$MODEL:/cube/conf/model:ro" \
     "${EXTRA[@]}" \
@@ -236,7 +244,7 @@ fi
     umask 077
     {
         printf 'export CUBEJS_API_SECRET="$(cat %q)"\n' "$SECRET_FILE"
-        for db in duckdb postgres bigquery snowflake redshift clickhouse trino; do
+        for db in duckdb postgres bigquery snowflake redshift clickhouse trino databricks; do
             if docker inspect "dex-cube-$db" >/dev/null 2>&1; then
                 port=$(docker port "dex-cube-$db" 4000/tcp | head -1 | sed 's/.*://')
                 upper=$(printf '%s' "$db" | tr '[:lower:]' '[:upper:]')

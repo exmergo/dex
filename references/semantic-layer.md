@@ -1418,7 +1418,7 @@ In short:
   the grain suffix (`orders.ordered_at__month`); `--where` is Cube's JSON filter.
   The token is minted from `CUBEJS_API_SECRET` (environment only); a host other
   than loopback needs `DEX_CUBE_ALLOWED_HOSTS`. DuckDB, Postgres, BigQuery,
-  Snowflake, Redshift, ClickHouse and Trino; needs `[cube]` and `[semantic-api]`. In full:
+  Snowflake, Redshift, ClickHouse, Trino and Databricks; needs `[cube]` and `[semantic-api]`. In full:
   [Querying: Cube renders, Dex executes](cube-compatibility.md#querying-cube-renders-dex-executes).
 - **`--api`: Cube executes** over `/v1/load`, on any warehouse Cube supports,
   `execution: vendor`. The PII gate still runs before anything is sent (the

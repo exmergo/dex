@@ -21,7 +21,8 @@ ceiling: Databricks kills the statement.
 Read-only is enforced in depth: the SELECT-only guard in the databricks
 dialect on every data statement through one execution door, an adapter that
 issues no mutating statements (REST metadata reads, ``SET STATEMENT_TIMEOUT``,
-``DESCRIBE DETAIL``, and guarded SELECTs only), and documented least-privilege
+``SET TIME ZONE 'UTC'``, ``DESCRIBE DETAIL``, and guarded SELECTs only), and
+documented least-privilege
 grants. Billed statements run only on the warehouse ``.dex/config.yml`` pins;
 dex never spends on a warehouse the config does not name.
 """
@@ -1446,6 +1447,18 @@ class DatabricksAdapter:
         labels = [d[0].lower() for d in cursor.description]
         return rows, labels
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: a statement Cube renders
+        truncates a timestamp, and reads the bounds of a date range, in the
+        session time zone, which is the workspace's or the warehouse's own
+        setting, so run under another zone it buckets rows differently. Only
+        UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def _billed_cursor(self, cap_seconds: float | None = None):
         """A cursor prepared for spend: warehouse pinned (strict), the SQL
         session opened lazily on first use, and the server-side statement
@@ -1470,6 +1483,9 @@ class DatabricksAdapter:
             # budget bound cannot (`statement_cap` refuses first) and the wall
             # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
+        if getattr(self, "_utc_session", False):
+            # An engine-built session statement too, a constant.
+            cursor.execute("SET TIME ZONE 'UTC'")
         return cursor
 
     def _record_elapsed(self, started: float, cursor: Any, sql: str) -> None:

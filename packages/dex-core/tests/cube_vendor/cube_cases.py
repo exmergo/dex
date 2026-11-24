@@ -28,6 +28,7 @@ CONNECTORS = (
     "redshift",
     "clickhouse",
     "trino",
+    "databricks",
 )
 
 #: ``explore semantic query`` requests, by the flags they pass.

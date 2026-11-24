@@ -339,6 +339,23 @@ def test_the_sql_session_opens_lazily_on_the_first_billed_statement(fake_databri
     assert fake_databricks.connect_count == 1
 
 
+def test_a_utc_session_is_pinned_only_when_asked(fake_databricks):
+    """Cube's rendered SQL truncates a timestamp in the session time zone, which
+    is the workspace's own setting, so the governed Cube path asks for UTC."""
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = make_adapter(fake_databricks)
+    sql = "SELECT COUNT(*) AS n FROM `shop`.`core`.`customers`"
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    pin = "SET TIME ZONE 'UTC'"
+    assert pin not in [s.sql for s in fake_databricks.connection.statements]
+
+    adapter.pin_utc_session()
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    assert [s.sql for s in fake_databricks.connection.statements][-2:] == [pin, sql]
+
+
 def test_no_pinned_warehouse_refuses_billed_work_with_the_fix(fake_databricks):
     adapter = make_adapter(fake_databricks, target=DatabricksTarget())
     with pytest.raises(DatabricksConnectionError) as exc_info:

@@ -142,7 +142,8 @@ The estimate carries its DBU translation; the handshake itself is in
   dialect through one execution door (DML, DDL, `MERGE`, `COPY INTO`,
   `OPTIMIZE`, `VACUUM`, and multi-statement forms all refuse).
 - The adapter issues no mutating calls: Unity Catalog REST reads, `SET
-  STATEMENT_TIMEOUT`, `DESCRIBE DETAIL`, and guarded SELECTs only.
+  STATEMENT_TIMEOUT`, `SET TIME ZONE 'UTC'` for a statement Cube rendered,
+  `DESCRIBE DETAIL`, and guarded SELECTs only.
 - The documented grant shape is least-privilege: `CAN USE` on the pinned
   warehouse, `USE CATALOG` + `USE SCHEMA` + `SELECT` on source catalogs, and
   write only on the dedicated dev catalog
