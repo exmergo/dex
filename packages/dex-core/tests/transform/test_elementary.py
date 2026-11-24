@@ -24,7 +24,13 @@ from exmergo_dex_core.transform.elementary import (
 )
 from exmergo_dex_core.transform.elementary import resolve as _resolve
 
-from .elementary_fixture import CURRENT_VERSION, LEGACY_VERSIONS, VERSIONS
+from .elementary_fixture import (
+    CURRENT_VERSION,
+    MATRIX,
+    POSTGRES_VERSIONS,
+    RELEASES,
+    VERSIONS,
+)
 
 ROOT = "shop"
 ELEMENTARY_MAT = "macro.elementary.materialization_test_default"
@@ -958,8 +964,8 @@ def test_a_project_without_the_package_has_no_unchecked_tests():
 
 # --- the releases Dex was run against (#1445) ------------------------------------
 
-#: Every release the Elementary fixture installs.
-FIXTURE_RELEASES = {*VERSIONS, *LEGACY_VERSIONS}
+#: Every release the Elementary fixture installs: the releases its matrix names.
+FIXTURE_RELEASES = set(RELEASES)
 
 
 def _parts(release: str) -> list[int]:
@@ -996,12 +1002,57 @@ def test_the_tested_releases_are_the_ones_the_fixture_runs():
     assert elementary.NEWEST_TESTED == CURRENT_VERSION
 
 
+def test_the_matrix_names_each_release_the_fixture_builds_once():
+    """#1446: the matrix is the fixture's release lists, slot by slot. A release
+    added to ``VERSIONS`` or ``POSTGRES_VERSIONS`` without a slot, or a slot
+    whose release neither list builds, fails here; so does a release on the
+    wrong warehouse, since DuckDB builds no release before 0.23.0."""
+
+    assert len(RELEASES) == len(set(RELEASES)), "a release fills two slots"
+    on = {
+        "DuckDB": {s.release for s in MATRIX if s.warehouse == "DuckDB"},
+        "Postgres": {s.release for s in MATRIX if s.warehouse == "Postgres"},
+    }
+    assert {s.warehouse for s in MATRIX} == set(on)
+    assert on["DuckDB"] == set(VERSIONS)
+    assert on["Postgres"] == set(POSTGRES_VERSIONS)
+    newest = max(MATRIX, key=lambda s: _parts(s.release))
+    oldest = min(MATRIX, key=lambda s: _parts(s.release))
+    assert (newest.slot, newest.release) == ("the newest release", CURRENT_VERSION)
+    assert oldest.slot == "the floor"
+
+
+def _contributing_matrix() -> list[tuple[str, str, str]]:
+    """The rows of the release-matrix table in CONTRIBUTING.md: slot, release,
+    warehouse."""
+
+    text = (Path(__file__).resolve().parents[4] / "CONTRIBUTING.md").read_text(
+        encoding="utf-8"
+    )
+    section = text.split("### The release matrix", 1)[1].split("\n#", 1)[0]
+    rows = []
+    for line in section.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or set(cells[0]) <= {"-", " "} or cells[0] == "Slot":
+            continue
+        rows.append((cells[0], cells[1].strip("`"), cells[2]))
+    return rows
+
+
+def test_the_policy_in_contributing_states_the_matrix_the_fixture_runs():
+    """The table a contributor reads is the matrix the fixture builds, row for
+    row and in order, so the policy cannot describe releases nothing runs."""
+
+    assert _contributing_matrix() == [(s.slot, s.release, s.warehouse) for s in MATRIX]
+
+
 @pytest.mark.parametrize(
     ("release", "status"),
     [
         *[(r, "supported") for r in sorted(FIXTURE_RELEASES)],
-        # Inside the range: supported, with #1381's warning below 0.20.0.
-        ("0.20.0", "supported"),
+        # Inside the range and in no slot: supported, with #1381's warning
+        # below 0.20.0.
+        ("0.21.0", "supported"),
         ("0.18.1", "supported"),
         ("v0.20.0", "supported"),
         # A patch above the newest is untested too, and so is a prerelease of it.

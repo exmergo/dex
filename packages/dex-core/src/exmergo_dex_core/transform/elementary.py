@@ -83,11 +83,18 @@ Hooks = Literal["run", "return_early", "disabled", "absent", "unknown"]
 Materialization = Literal["elementary", "dbt", "unknown"]
 
 #: Every release of the package Dex has been run against: the releases the
-#: Elementary fixture installs (``VERSIONS`` and ``LEGACY_VERSIONS`` in
+#: Elementary fixture's release matrix names (``MATRIX`` in
 #: ``tests/transform/elementary_fixture.py``, which a test holds to this set),
 #: so the two cannot drift apart. The supported range runs from the oldest of
-#: them to the newest (#1445).
-TESTED_RELEASES: tuple[str, ...] = ("0.15.2", "0.16.4", "0.23.0", "0.26.1")
+#: them to the newest (#1445); how a new release joins is the rule beside the
+#: matrix in ``CONTRIBUTING.md`` (#1446).
+TESTED_RELEASES: tuple[str, ...] = (
+    "0.15.2",
+    "0.16.4",
+    "0.20.0",
+    "0.23.0",
+    "0.26.1",
+)
 
 #: Where the installed release falls: ``supported`` inside the tested range,
 #: ``untested`` outside it (a patch above the newest included), and ``unknown``
