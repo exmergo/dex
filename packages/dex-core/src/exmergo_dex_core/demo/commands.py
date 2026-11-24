@@ -23,7 +23,7 @@ from pydantic import Field
 
 from .. import envelope as env
 from ..command_args import resolve_dex_root
-from ..config import CONFIG_FILE, DexConfig, DuckDBTarget, save_config
+from ..config import CONFIG_FILE, DexConfig, DuckDBTarget, config_yaml
 from ..diffs import file_diff
 from ..engine import DexEngine
 from ..results import Result, to_envelope
@@ -36,7 +36,12 @@ from .project import (
     refuse_target_name,
     write_project,
 )
-from .warehouse import DEMO_FILENAME, DemoPathError, generate_demo_warehouse
+from .warehouse import (
+    DEMO_FILENAME,
+    DemoPathError,
+    DemoTargetExistsError,
+    generate_demo_warehouse,
+)
 
 #: The failing test as a person reads it: its name, not its hashed id.
 _FAILING_TEST_NAME = FAILING_TEST.split(".")[2]
@@ -144,6 +149,37 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
     ]
 
 
+def _create_config(config: DexConfig, path: Path) -> str:
+    """Write the demo's config to ``path`` exclusively and return its text.
+
+    Not ``save_config``, which replaces a file already there: the demo creates
+    and never replaces, so a config that appeared since the demo looked (a
+    second ``dex demo`` in the same directory) is refused, untouched. A write
+    that fails part way removes the file it opened, so the caller's rollback
+    has nothing of this function's to find.
+    """
+
+    text = config_yaml(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # "x", and no newline argument: the same text and line endings
+        # `save_config` would write, only never over an existing file.
+        handle = path.open("x", encoding="utf-8")
+    except FileExistsError:
+        raise DemoTargetExistsError(
+            f"'{path.as_posix()}' appeared while dex demo ran, so another run "
+            "is likely writing to this directory. It was left as it is, and "
+            "nothing this run made was kept"
+        ) from None
+    try:
+        with handle:
+            handle.write(text)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return text
+
+
 def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     """Build the demo warehouse and return the one envelope the contract expects.
 
@@ -211,30 +247,36 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # config's root, so they name that root rather than the file.
     rooted: str | None = None
     if existing_root is None:
-        save_config(
-            DexConfig(
-                connector="duckdb",
-                duckdb=DuckDBTarget(path=target.name),
-                dbt_project_dir=PROJECT_DIR,
-            ),
-            root,
-        )
-        created.append(config_rel)
-        diffs.append(
-            file_diff(config_rel, None, config_path.read_text(encoding="utf-8"))
-        )
+        made_dex_dir = not config_path.parent.exists()
+        config_made = False
         project = build_project(warehouse.tables, target.name)
+        # BaseException, not Exception: an interrupt part way is cleaned up
+        # like a failure, or the next run would refuse the warehouse it left.
         try:
+            config_text = _create_config(
+                DexConfig(
+                    connector="duckdb",
+                    duckdb=DuckDBTarget(path=target.name),
+                    dbt_project_dir=PROJECT_DIR,
+                ),
+                config_path,
+            )
+            config_made = True
             written = write_project(root, project)
-        except Exception:
-            # Nothing half-made is left for a later command to read as real.
-            config_path.unlink(missing_ok=True)
-            # Only where saving the config made it: a .dex/ holding anything
-            # else (a cache) was there before and stays.
-            with contextlib.suppress(OSError):
-                config_path.parent.rmdir()
+        except BaseException:
+            # Nothing half-made is left for a later command to read as real,
+            # and nothing this run did not make is removed: a config another
+            # run wrote since the check above stays, and so does a .dex/ that
+            # was there before (a cache).
+            if config_made:
+                config_path.unlink(missing_ok=True)
+            if made_dex_dir:
+                with contextlib.suppress(OSError):
+                    config_path.parent.rmdir()
             target.unlink(missing_ok=True)
             raise
+        created.append(config_rel)
+        diffs.append(file_diff(config_rel, None, config_text))
         prefix = named.parent
         created.extend((prefix / path).as_posix() for path in written)
         diffs.extend(

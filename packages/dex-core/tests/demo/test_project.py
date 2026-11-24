@@ -218,6 +218,85 @@ def test_a_failed_project_write_leaves_nothing_behind(
     assert list(tmp_path.rglob("*")) == []
 
 
+def test_an_interrupted_project_write_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An interrupt part way through the project write is cleaned up like a
+    failure: a config and warehouse left behind would point at a project that
+    is not there, and the next run would refuse the warehouse."""
+
+    pytest.importorskip("duckdb")
+    opened: list[Path] = []
+    real_open = Path.open
+
+    def interrupted_open(self: Path, mode: str = "r", *args, **kwargs):
+        if mode == "x":
+            opened.append(self)
+            if len(opened) == 3:
+                raise KeyboardInterrupt
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", interrupted_open)
+    with pytest.raises(KeyboardInterrupt):
+        main(["--repo-root", str(tmp_path), "demo"])
+    # The third exclusive open is inside the project write: the config was
+    # created first, so the interrupt had a config and a warehouse to undo.
+    assert opened[0].name == "config.yml"
+    assert PROJECT_DIR in opened[2].as_posix()
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_a_failed_write_keeps_a_dex_directory_that_was_there_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """The rollback removes the .dex/ directory only where this run made it:
+    one that was there before, even empty, stays."""
+
+    pytest.importorskip("duckdb")
+    (tmp_path / ".dex").mkdir()
+    real_open = Path.open
+
+    def failing_open(self: Path, mode: str = "r", *args, **kwargs):
+        if mode == "x" and PROJECT_DIR in self.as_posix():
+            raise OSError("disk full")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    payload = _run(["--repo-root", str(tmp_path), "demo"], capsys)
+
+    assert payload["status"] == "error"
+    assert [p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")] == [".dex"]
+
+
+def test_a_config_that_appears_while_the_demo_runs_is_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    """Two demos in one directory can both find no config. The one that loses
+    the race refuses rather than replacing the other's config, and removes only
+    what it made itself: its warehouse goes, the other's config stays."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import commands
+
+    theirs = tmp_path / ".dex" / "config.yml"
+    theirs.parent.mkdir()
+    theirs.write_text("connector: duckdb\nduckdb:\n  path: theirs.duckdb\n")
+    before = theirs.read_bytes()
+    # The other run wrote its config after this one looked for one.
+    monkeypatch.setattr(commands, "resolve_dex_root", lambda _root: None)
+
+    payload = _run(["--repo-root", str(tmp_path), "demo"], capsys)
+
+    assert payload["status"] == "error"
+    assert payload["reason"] == "guard"
+    assert "appeared while dex demo ran" in payload["errors"][0]
+    assert theirs.read_bytes() == before
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
+        ".dex",
+        ".dex/config.yml",
+    ]
+
+
 def test_a_warehouse_named_like_the_project_directory_is_refused_first(
     tmp_path: Path, capsys
 ):
