@@ -566,7 +566,8 @@ DEX_TEST_ELEMENTARY=1 uv run pytest tests/transform/test_elementary_fixture.py
 ```
 
 Without the variable they collect as skipped with it named in the skip reason.
-They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
+They install the package at 0.26.1 and, for the mutation-run cases and the
+upgrade from one release to the other that `maintain check` reads, at 0.23.0,
 the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
 run and fails `dbt build` on DuckDB), and most installs pin 0.15 or 0.16, so
 those build on Postgres instead. DuckDB still parses 0.16.4, so the resolver's
