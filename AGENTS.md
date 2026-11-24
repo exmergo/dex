@@ -921,6 +921,31 @@ declaration field it came from) and the `dex_monitor` tag, and is a
 are not generated tests: `declarations.render_tests` does not govern them and
 no per-run estimate prices them.
 
+The same setting tags personal data for Elementary's PII sampling rule
+(#1487). With `monitors.vendor: elementary` and the package installed (or
+added by the plan), each column a written model's YAML marks as PII, under any
+key a reader accepts and at any confidence, gets the tag in
+`config.meta.tags`, the model gets it in `config.tags`, and the plan adds
+`disable_samples_on_pii_tags: true` under `vars:` in `dbt_project.yml` as a
+`project_yml` edit, except in a plan that rewrites an existing model's SQL,
+where the switch is `withheld` (a `dbt_project.yml` edit would stop that
+rewrite's comparison and impact check) and a later `transform declare` adds it.
+The tag is `pii`, or the first entry of the project's own `pii_tags`; both vars
+are read as the project's tests read them, a block keyed by the root project's
+name winning over the global one. A written model is one whose SQL the plan writes, one it declares,
+or one whose YAML entry it changes, and `transform declare` proposes a model
+whose only owed change is the tag. A `false` a person wrote under a PII flag is
+never tagged, a column whose metadata sits under a top-level `meta` is
+`not_written`, and a `disable_samples_on_pii_tags` the project sets is kept as
+written. A warning states the trade: every test on a tagged model, the
+project's own included, keeps no sample of its failing rows. `data.pii_tags`
+carries the `tag` and `tag_source`, the `switch` status, the installed
+`release` and what it does with the tags (`rule`: `none` before 0.19.2,
+`model_tags_only` from 0.19.2, which reads no column's `config.meta.tags`,
+`model_and_column_tags` from 0.20.0, or `unknown`), `counts`, and per model its
+`model_tag` and each column's status (`added`, `already_tagged`, or
+`not_written` with a `reason`).
+
 A project whose models predate declarations adopts them with `transform declare
 [<model>...]`: one capped plan proposing only the measured facts each selected
 model does not yet declare, with any intent the same `declarations` payload
