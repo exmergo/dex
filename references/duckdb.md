@@ -45,7 +45,8 @@ dex explore map     # no flags: the config demo wrote points at the file it made
 `dex demo` generates a small e-commerce warehouse locally: 7 tables and 29,512 rows
 (`customers` 1,200, `products` 300, `orders` 5,000, `order_items` 14,000,
 `web_events` 9,000, `warehouse_locations` 12, and `returns`, which an interrupted
-load left empty). No credentials, no cloud account, no network. The path is
+load left empty), and, beside the dbt project below, Elementary's 4 tables in
+`main_elementary` (30 rows). No credentials, no cloud account, no network. The path is
 positional and resolves against `--repo-root`, which defaults to the working
 directory, so `dex --repo-root R demo` writes its files into `R` and the commands
 it prints carry the same `--repo-root`. `--path` is refused there, because
@@ -83,10 +84,8 @@ observed it for three of its usual gaps, judged against the time it is called,
 so builds dated from the fixed anchor would read as long over. Weekly builds keep
 the incident open for about three weeks after `dex demo`. The pinned digests are
 taken at a fixed generation time, so the offsets are pinned and only the dates
-move. The two staging views were never built, so
-`dex maintain verify` reports them as `no_relation` until
-`dex transform build --target dev` builds them. `explore map` leaves the package's
-four tables out of the ranking, as it does for a real install. The two staging views were never built, so
+move. `explore map` leaves the package's four tables out of the ranking, as it
+does for a real install. The two staging views were never built, so
 `dex maintain verify` reports them as `no_relation` until
 `dex transform build --target dev` builds them. The project's files are text, written
 create-only beside the warehouse, so the generator below stays the one writable

@@ -82,8 +82,9 @@ the `config` group, the `explore` group, the authoring surface (`transform`,
 `semantic`), and the `maintain` group are live.
 
 ```
-dex demo [path]                   -> generate a seeded local DuckDB warehouse (7 tables,
-                                     29,512 rows) plus a .dex/config.yml beside it, so a
+dex demo [path]                   -> generate a seeded local DuckDB warehouse (the
+                                     shop's 7 tables and 29,512 rows, and Elementary's 4
+                                     holding 30) plus a .dex/config.yml beside it, so a
                                      first run needs no warehouse and no credentials,
                                      and a small dbt project under analytics/ with the
                                      seeded history of seven weekly builds (Elementary's

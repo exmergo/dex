@@ -563,8 +563,15 @@ def test_the_same_demo_with_the_failing_runs_removed_returns_no_incident(
     data = _run(_printed(demo, "maintain incidents"), capsys)["data"]
 
     assert data["incidents"] == []
-    assert data["sources"]["elementary"]["status"] == "read"
-    assert data["sources"]["dbt_run_results"]["status"] == "read"
+    elementary = data["sources"]["elementary"]
+    assert elementary["status"] == "read"
+    # The four passing builds were read; the hooks-off week has no row.
+    assert elementary["measure"]["invocations"] == 4
+    # The newest build is now the hooks-off week, which Elementary holds no
+    # row of, so dbt's run is placed after its window.
+    dbt = data["sources"]["dbt_run_results"]
+    assert dbt["status"] == "read"
+    assert dbt["placed"] == "after_window"
 
 
 def test_without_the_package_dbt_s_run_results_alone_return_it_with_no_start(

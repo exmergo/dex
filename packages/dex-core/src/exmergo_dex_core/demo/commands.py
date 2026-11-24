@@ -100,7 +100,9 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
                     "with first_observed naming the first failing build. The "
                     "week between, Elementary's hooks were off, so the coverage "
                     "timeline reads it as a missed run rather than a pass. "
-                    "dbt's run results hold the newest build too, and agree"
+                    "dbt's run results hold the newest build too; their own note "
+                    "that one build gives no known start is about that source "
+                    "alone"
                 ),
             },
             {
@@ -285,7 +287,12 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             seed=warehouse.seed,
             row_count=warehouse.row_count,
             tables=[
-                {"name": t.name, "row_count": len(t.rows), "note": t.note}
+                {
+                    "name": t.name,
+                    "schema": t.schema or "main",
+                    "row_count": len(t.rows),
+                    "note": t.note,
+                }
                 for t in warehouse.tables
             ],
             created=created,
@@ -293,9 +300,11 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             diffs=diffs,
             warnings=warnings,
             notes=[
-                "the data is generated from a pinned seed, so every run of this "
-                "command produces the same rows and the counts quoted in the docs "
-                "are the counts you have",
+                "the shop's data is generated from a pinned seed, so every run of "
+                "this command produces the same rows and the counts quoted in the "
+                "docs are the counts you have. Elementary's history beside it is "
+                "dated back from when this command ran, so only its times differ "
+                "from one run to the next",
                 "the flaws are deliberate: a broken grain, a key that mixes id "
                 "schemes, a join with no overlap, an empty table, two columns "
                 "whose declared type contradicts their content, and personal data "
