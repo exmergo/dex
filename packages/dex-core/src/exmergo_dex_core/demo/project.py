@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from collections import Counter
 from dataclasses import dataclass
@@ -46,7 +47,13 @@ from typing import Any
 
 import yaml
 
-from .warehouse import _ANCHOR, DemoTable, DemoTargetExistsError, _uuid_shaped
+from .warehouse import (
+    _ANCHOR,
+    DemoPathError,
+    DemoTable,
+    DemoTargetExistsError,
+    _uuid_shaped,
+)
 
 #: The directory the project is written into, beside the warehouse file, and
 #: the project's dbt name: the one ``dex init <name> --mode demo`` documents.
@@ -66,6 +73,9 @@ _RUN_RESULTS_SCHEMA = "https://schemas.getdbt.com/dbt/run-results/v6.json"
 #: The seeded build: the morning after the last generated date.
 BUILD_STARTED_AT = datetime.combine(_ANCHOR + timedelta(days=1), time(6, 0), tzinfo=UTC)
 _BUILD_SECONDS = 42
+#: When the project's source files read as written: the evening before the
+#: build, so the manifest is newer than every source, as after a real build.
+SOURCES_WRITTEN_AT = BUILD_STARTED_AT - timedelta(hours=12)
 BUILD_INVOCATION_ID = _uuid_shaped("dex-demo-dbt-build-1")
 
 #: The test the seeded build fails, by the id dbt gives it.
@@ -230,7 +240,7 @@ def _manifest(database: str) -> dict[str, Any]:
             "name": table,
             "resource_type": "source",
             "package_name": PROJECT_NAME,
-            "path": "models/staging/_sources.yml",
+            "path": "staging/_sources.yml",
             "original_file_path": "models/staging/_sources.yml",
             "unique_id": source_id,
             "fqn": [PROJECT_NAME, "staging", SOURCE_NAME, table],
@@ -470,6 +480,18 @@ def project_collision(root: Path) -> Path | None:
     return target if target.exists() or target.is_symlink() else None
 
 
+def refuse_target_name(target: Path) -> None:
+    """Refuse a warehouse file named like the project directory beside it,
+    before anything is written: the two would be the same path."""
+
+    if target.name == PROJECT_DIR:
+        raise DemoPathError(
+            f"'{target.as_posix()}' is where dex demo writes its dbt project "
+            f"({PROJECT_DIR}/), so it cannot also be the warehouse file. Name "
+            "the file something else, for example `dex demo shop.duckdb`"
+        )
+
+
 def refuse_collision(root: Path) -> None:
     """Refuse, before anything is written, a root that already holds the
     project directory: the demo creates and never replaces, as for the file."""
@@ -491,14 +513,26 @@ def write_project(root: Path, project: DemoProject) -> list[str]:
     refuse_collision(root)
     base = root / PROJECT_DIR
     try:
+        # Exclusive: a directory that appeared since the check is refused here,
+        # before anything is written, so the rollback below removes only ours.
+        base.mkdir()
+    except FileExistsError:
+        refuse_collision(root)
+        raise
+    try:
         for relative, text in project.files:
             path = base / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             # "x": a file that appeared since the check is refused, not replaced.
             with path.open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)
-    except Exception:
-        # The directory did not exist a moment ago, so all of it is ours.
+        # The sources were written before the build that read them, so a
+        # reader comparing their times with the manifest's does not call the
+        # seeded artifacts stale. Fixed, like every other date here.
+        written_at = SOURCES_WRITTEN_AT.timestamp()
+        for relative, _ in project.sources:
+            os.utime(base / relative, (written_at, written_at))
+    except BaseException:
         shutil.rmtree(base, ignore_errors=True)
         raise
     return [f"{PROJECT_DIR}/{relative}" for relative, _ in project.files]
@@ -517,5 +551,6 @@ __all__ = [
     "project_collision",
     "project_digest",
     "refuse_collision",
+    "refuse_target_name",
     "write_project",
 ]

@@ -38,7 +38,7 @@ from exmergo_dex_core.demo.project import (
 # an edit moves it, re-read the generated project and the incident it gives
 # (the counts below, the README's tour), then update this value.
 GOLDEN_PROJECT_DIGEST = (
-    "2892aa59313f275e29fe42ba6f4787ca9ad91bfdfb5138f432e97f69f30e5d56"
+    "9afb6c45947f4c7cc137d552835c28624db559ec0631456302fce67a83084245"
 )
 
 #: Values of order_items.order_item_id that occur more than once: the rows the
@@ -57,7 +57,10 @@ def _document(project, path: str) -> dict:
 
 @pytest.fixture
 def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Any socket a command opens fails the test: the demo promises none."""
+    """Any socket a command opens fails the test: the demo promises none.
+
+    Python's sockets only: a connection made from native code (a DuckDB
+    extension autoload, say) would pass it. The demo loads no extension."""
 
     def refuse(*_args, **_kwargs):
         raise AssertionError("the demo opened a network connection")
@@ -104,7 +107,17 @@ def test_no_project_value_depends_on_the_wall_clock():
     from exmergo_dex_core.demo import project
 
     source = Path(project.__file__).read_text(encoding="utf-8")
-    for forbidden in ("date.today", "datetime.now", "datetime.utcnow", "time.time"):
+    # A text check, so it catches the usual spellings only; the pinned digest
+    # above is what holds the output still.
+    for forbidden in (
+        "date.today",
+        "datetime.today",
+        "datetime.now",
+        "datetime.utcnow",
+        "time.time",
+        "time.monotonic",
+        "uuid.uuid",
+    ):
         assert forbidden not in source, forbidden
 
 
@@ -201,6 +214,36 @@ def test_a_failed_project_write_leaves_nothing_behind(
     assert payload["status"] == "error"
     assert len(opened) == 3
     assert list(tmp_path.rglob("*")) == []
+
+
+def test_a_warehouse_named_like_the_project_directory_is_refused_first(
+    tmp_path: Path, capsys
+):
+    """`dex demo analytics` would make the warehouse file the path the project
+    is written to; it is refused up front, naming why, and writes nothing."""
+
+    pytest.importorskip("duckdb")
+    payload = _run(["--repo-root", str(tmp_path), "demo", PROJECT_DIR], capsys)
+
+    assert payload["status"] == "error"
+    assert payload["reason"] == "request"
+    assert "cannot also be the warehouse file" in payload["errors"][0]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_sources_read_as_written_before_the_build_that_read_them(
+    tmp_path: Path,
+):
+    """A reader comparing the sources' times with the manifest's would
+    otherwise call the seeded artifacts stale on every run."""
+
+    from exmergo_dex_core.dbt_project import load, manifest_freshness
+
+    project = _project()
+    write_project(tmp_path, project)
+    freshness = manifest_freshness(load(tmp_path / PROJECT_DIR))
+    assert freshness["manifest_present"] is True
+    assert freshness["stale"] is False
 
 
 def test_write_project_refuses_a_directory_that_appeared(tmp_path: Path):

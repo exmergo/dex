@@ -60,7 +60,9 @@ In that build `unique_stg_order_items_order_item_id` failed, with 956 failures (
 `order_item_id` values the double-loaded batch below repeats, the count a real
 build of the project reports), so `dex maintain incidents` returns one open
 incident from dbt's run results and `dex maintain diagnose` names the loader's
-duplicate delivery as its cause. The project's files are text, written
+duplicate delivery as its cause. The two staging views were never built, so
+`dex maintain verify` reports them as `no_relation` until
+`dex transform build --target dev` builds them. The project's files are text, written
 create-only beside the warehouse, so the generator below stays the one writable
 DuckDB open; a pinned digest covers them as it covers the rows.
 

@@ -33,6 +33,7 @@ from .project import (
     PROJECT_DIR,
     build_project,
     refuse_collision,
+    refuse_target_name,
     write_project,
 )
 from .warehouse import DEMO_FILENAME, DemoPathError, generate_demo_warehouse
@@ -188,6 +189,7 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     # directory is refused before the warehouse is created, so a refused call
     # has written nothing at all.
     if existing_root is None and root.is_dir():
+        refuse_target_name(target)
         refuse_collision(root)
     warehouse = generate_demo_warehouse(target)
     created = [named.as_posix()]
@@ -285,7 +287,10 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                         f"{PROJECT_DIR}/target/. They are seeded, not built: the "
                         "demo runs no dbt and installs no package. In that build "
                         f"the test {_FAILING_TEST_NAME} failed, because of the "
-                        "batch loaded twice"
+                        "batch loaded twice. Its two staging views were not "
+                        "built, so `dex maintain verify` reports them as "
+                        "no_relation until `dex transform build --target dev` "
+                        "builds them"
                     ]
                     if rooted is not None
                     else []
