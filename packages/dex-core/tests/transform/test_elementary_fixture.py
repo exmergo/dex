@@ -1560,53 +1560,22 @@ PACKAGE_NULL_COLUMNS = (
     ("monitors_runs", "column_name"),
 )
 
-#: Package columns a profiled baseline pinned as unique that a second run's
-#: rows leave repeated: ``key_lost_uniqueness``, on ``map_included`` only, since
-#: only a profile pins candidate keys.
-PACKAGE_KEYS_NO_LONGER_UNIQUE = (
-    ("anomaly_threshold_sensitivity", "full_table_name"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_1_5"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_2"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_2_5"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_3"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_3_5"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_4"),
-    ("anomaly_threshold_sensitivity", "is_anomaly_4_5"),
-    ("anomaly_threshold_sensitivity", "latest_metric_value"),
-    ("anomaly_threshold_sensitivity", "metric_name"),
-    ("data_monitoring_metrics", "bucket_end"),
-    ("data_monitoring_metrics", "bucket_start"),
-    ("data_monitoring_metrics", "id"),
-    ("dbt_invocations", "command"),
-    ("dbt_invocations", "dbt_version"),
-    ("dbt_invocations", "full_refresh"),
-    ("dbt_invocations", "invocation_vars"),
-    ("dbt_invocations", "project_name"),
-    ("dbt_invocations", "selected"),
-    ("dbt_invocations", "target_adapter_specific_fields"),
-    ("dbt_invocations", "target_database"),
-    ("dbt_invocations", "target_name"),
-    ("dbt_invocations", "target_profile_name"),
-    ("dbt_invocations", "target_schema"),
-    ("dbt_invocations", "threads"),
-    ("dbt_invocations", "vars"),
-    ("dbt_run_results", "name"),
-    ("dbt_run_results", "unique_id"),
-    ("elementary_test_results", "test_alias"),
-    ("elementary_test_results", "test_name"),
-    ("elementary_test_results", "test_results_query"),
-    ("elementary_test_results", "test_short_name"),
-    ("elementary_test_results", "test_unique_id"),
-    ("metrics_anomaly_score", "bucket_end"),
-    ("metrics_anomaly_score", "bucket_start"),
-    ("metrics_anomaly_score", "id"),
-    ("metrics_anomaly_score", "training_end"),
-    ("model_run_results", "name"),
-    ("model_run_results", "unique_id"),
-    ("schema_columns_snapshot", "column_name"),
-    ("schema_columns_snapshot", "column_state_id"),
-    ("schema_columns_snapshot", "full_column_name"),
-    ("test_result_rows", "row_index"),
+#: Package tables on which a profiled baseline pinned a candidate key that a
+#: second run's rows leave repeated: ``key_lost_uniqueness``, on
+#: ``map_included`` only, since only a profile pins candidate keys. Pinned by
+#: table and not by column: which columns a profile found unique varies from
+#: run to run (box run 3 read a different set on two runs in five), while the
+#: tables are the ones the run appends to, so they lose a key on every run.
+PACKAGE_KEYS_LOST_ON = (
+    "anomaly_threshold_sensitivity",
+    "data_monitoring_metrics",
+    "dbt_invocations",
+    "dbt_run_results",
+    "elementary_test_results",
+    "metrics_anomaly_score",
+    "model_run_results",
+    "schema_columns_snapshot",
+    "test_result_rows",
 )
 
 #: Package tables whose row count moved: ``row_count_changed`` on the volume
@@ -1641,14 +1610,10 @@ PACKAGE_UPGRADE_ONLY: tuple[Seen, ...] = (
     ("column_added", f"dev.{ELEMENTARY_SCHEMA}.model_run_results", "created_at"),
 )
 
-#: What a rebuild at 0.23.0 reports that the upgrade does not: a second
-#: invocation at the same release repeats its version, and the package's
-#: ``dbt_models`` table leaves ``incremental_strategy`` mostly NULL.
-PACKAGE_RERUN_ONLY_KEY: Seen = (
-    "key_lost_uniqueness",
-    f"dev.{ELEMENTARY_SCHEMA}.dbt_invocations",
-    "elementary_version",
-)
+#: What a rebuild at 0.23.0 reports that the upgrade does not: the package's
+#: ``dbt_models`` table leaves ``incremental_strategy`` mostly NULL. (A second
+#: invocation at the same release also repeats ``elementary_version`` on
+#: ``dbt_invocations``, a table already in ``PACKAGE_KEYS_LOST_ON``.)
 PACKAGE_RERUN_ONLY_NULLS: Seen = (
     "mostly_null_column",
     f"dev.{ELEMENTARY_SCHEMA}.dbt_models",
@@ -1656,8 +1621,21 @@ PACKAGE_RERUN_ONLY_NULLS: Seen = (
 )
 
 
+#: Finding codes pinned by relation alone: the column is dropped from both
+#: sides before they are compared.
+PINNED_BY_RELATION = frozenset({"key_lost_uniqueness"})
+
+
+def _as_pinned(seen: Iterable[Seen]) -> set[Seen]:
+    return {
+        (code, identifier, None if code in PINNED_BY_RELATION else column)
+        for code, identifier, column in seen
+    }
+
+
 def _package_reading_today(baseline: str, change: str) -> dict[str, set[Seen]]:
-    """The package-side reading the box took for one arm, per axis."""
+    """The package-side reading the box took for one arm, per axis, in the
+    shape ``_as_pinned`` gives it."""
 
     def rel(table: str) -> str:
         return f"dev.{ELEMENTARY_SCHEMA}.{table}"
@@ -1665,13 +1643,9 @@ def _package_reading_today(baseline: str, change: str) -> dict[str, set[Seen]]:
     grain: set[Seen] = {("no_rows", rel(t), None) for t in PACKAGE_EMPTY_TABLES}
     grain |= {("fully_null_column", rel(t), c) for t, c in PACKAGE_NULL_COLUMNS}
     if baseline == "map_included":
-        grain |= {
-            ("key_lost_uniqueness", rel(t), c) for t, c in PACKAGE_KEYS_NO_LONGER_UNIQUE
-        }
+        grain |= {("key_lost_uniqueness", rel(t), None) for t in PACKAGE_KEYS_LOST_ON}
     if change == "rerun":
         grain.add(PACKAGE_RERUN_ONLY_NULLS)
-        if baseline == "map_included":
-            grain.add(PACKAGE_RERUN_ONLY_KEY)
     counted = (
         PACKAGE_COUNTS_MOVED_MAP if baseline == "map" else PACKAGE_COUNTS_MOVED_PROFILED
     )
@@ -1696,12 +1670,15 @@ def test_maintain_check_reports_the_package_s_own_relations_as_drift_today(
     appends to the package's run history and the null survey reads every
     pinned table; the upgrade itself adds one column on the schema axis. This
     pins that reading, so the fix, whichever shape it takes, changes it on
-    purpose."""
+    purpose. A lost key is pinned by its table, not its column (see
+    ``PACKAGE_KEYS_LOST_ON``)."""
 
     run = upgrade_runs(baseline, change)
 
     _sees_the_package_s_columns(run, baseline)
-    package = {axis: set(sides["package"]) for axis, sides in run.reading.items()}
+    package = {
+        axis: _as_pinned(sides["package"]) for axis, sides in run.reading.items()
+    }
     expected = _package_reading_today(baseline, change)
     moved = {
         axis: {
@@ -1711,6 +1688,14 @@ def test_maintain_check_reports_the_package_s_own_relations_as_drift_today(
         for axis in CHECK_AXES
         if package[axis] != expected[axis]
     }
+    # The columns behind each relation-level finding ride in the message, so a
+    # run that fails says which of them it read.
+    by_column = sorted(
+        (code, identifier, column)
+        for code, identifier, column in run.reading["grain"]["package"]
+        if code in PINNED_BY_RELATION
+    )
     assert moved == {}, (
-        f"the package-side reading moved ({baseline}, {change}): {moved}"
+        f"the package-side reading moved ({baseline}, {change}): {moved}; "
+        f"read by column: {by_column}"
     )
