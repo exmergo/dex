@@ -40,13 +40,27 @@ def test_numbered_placeholders_bind_by_number_and_may_repeat():
         ("bigquery", "'it\\'s \\\\ x'"),
         ("snowflake", "'it\\'s \\\\ x'"),
         ("redshift", "'it\\'s \\\\ x'"),
+        ("clickhouse", "'it''s \\\\ x'"),
+        ("trino", "'it''s \\ x'"),
     ],
 )
 def test_a_value_is_quoted_by_its_dialect_s_own_rules(connector, literal):
-    quote = "`" if connector == "bigquery" else '"'
+    quote = "`" if connector in {"bigquery", "clickhouse"} else '"'
     mark = "$1" if connector in {"postgres", "redshift"} else "?"
     sql = f"SELECT 1 FROM t AS {quote}t{quote} WHERE a = {mark}"  # noqa: S608
     assert bind(sql, ["it's \\ x"], connector).endswith(f"a = {literal}")
+
+
+def test_a_backslash_escaped_quote_does_not_end_a_clickhouse_literal():
+    sql = "SELECT 1 FROM t AS `t` WHERE a = 'it\\'s ?' AND b = ?"
+    assert bind(sql, ["x"], "clickhouse").endswith("a = 'it\\'s ?' AND b = 'x'")
+
+
+def test_a_backslash_escaped_quote_does_not_end_a_clickhouse_identifier():
+    sql = "SELECT 1 `a\\`?` FROM t AS `t` WHERE b = ?"
+    assert bind(sql, ["x"], "clickhouse") == (
+        "SELECT 1 `a\\`?` FROM t AS `t` WHERE b = 'x'"
+    )
 
 
 def test_a_hostile_value_stays_one_literal():

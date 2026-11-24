@@ -274,9 +274,9 @@ server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
 
 ### The order
 
-1. **Connector.** DuckDB, Postgres, BigQuery, Snowflake and Redshift, each held
-   to a golden of what Cube Core renders for it. Databricks, ClickHouse and
-   Trino are refused by name.
+1. **Connector.** DuckDB, Postgres, BigQuery, Snowflake, Redshift, ClickHouse
+   and Trino, each held to a golden of what Cube Core renders for it.
+   Databricks is refused by name.
 2. **PII gate**, before anything is sent: every grouped member, the time
    dimension a grain buckets, and every member a `--where` filter names,
    resolved to the column behind it through the static catalog and screened on
@@ -309,7 +309,9 @@ server needs none to render, which `scripts/setup_cube_dev.sh` relies on.
    connection's inventory, the cost handshake (`needs_confirmation` on a
    metered connector before any spend), Dex's connector in a UTC session (the
    setting Cube's own drivers use, so a timestamp with no zone buckets the way
-   Cube means), and the columnar cap.
+   Cube means; it matters on Trino, whose client sends the machine's own zone,
+   and on ClickHouse, where a rolling window's date series is parsed with no
+   zone), and the columnar cap.
 
 ### The CLI dialect
 
@@ -462,15 +464,18 @@ authoring and `maintain` read them, and `--local` holds the deployment to them.
 
 ### What this release does not do
 
-- `--local` on Databricks, ClickHouse and Trino: Cube supports them, and `--api`
-  answers on them, but Dex has no reviewed golden for executing Cube's SQL there.
+- `--local` on Databricks: Cube supports it, and `--api` answers on it, but Dex
+  has no reviewed golden for executing Cube's SQL there.
+- A rolling window on ClickHouse: Cube joins its date series to the measure on
+  inequalities alone, and ClickHouse 25.3 refuses a join with no equality
+  (`Cannot determine join keys`), so the query ends as a warehouse refusal.
 - One data source per query.
 - Segments, `ungrouped`, `compareDateRange` and pre-aggregations are not sent or
   not accepted.
-- Two warehouses that share a placeholder style and quoting (Postgres and
-  Redshift; DuckDB and Snowflake) cannot be told apart from a statement with no
-  parameters, so a server rendering for the wrong one of a pair is caught only
-  once the query carries a filter. Set `CUBEJS_DB_TYPE` to match.
+- Warehouses that share a placeholder style and quoting (Postgres and
+  Redshift; DuckDB, Snowflake and Trino; BigQuery and ClickHouse) cannot be
+  told apart from a statement with no parameters, so a server rendering for the
+  wrong one of a group is caught only once the query carries a filter. Set `CUBEJS_DB_TYPE` to match.
 
 ## What `maintain` makes of the layer
 

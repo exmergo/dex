@@ -183,7 +183,10 @@ class ReadPlan:
 
     ``measure`` counts what ``invocations`` and ``results`` would read, so a
     caller can price all three (#1472) before any runs. ``since`` limits the
-    read to invocations whose ``created_at`` is at or after it.
+    read to invocations whose ``created_at`` is at or after it. ``last`` limits
+    it to the ``last`` newest ``dbt_invocations`` rows by ``created_at`` (ties by
+    id), so a window is a run count rather than a time, and holds at most that
+    many invocations (#1472).
     """
 
     release: str
@@ -192,6 +195,12 @@ class ReadPlan:
     measure: tuple[str, str, str]
     invocations: str
     results: str
+    last: int | None = None
+
+    def statements(self) -> tuple[str, ...]:
+        """Every statement the read sends, in the order it sends them."""
+
+        return (*self.measure, self.invocations, self.results)
 
 
 @dataclass(frozen=True)
@@ -273,23 +282,33 @@ def plan_read(
     release: str | None,
     *,
     since: datetime | None = None,
+    last: int | None = None,
+    adapter: Any | None = None,
 ) -> ReadPlan:
     """Hold the two tables to ``release``'s layout and write the statements.
 
     ``namespace`` is the schema the package writes, qualified as the adapter
     names relations (``dev.main_elementary`` on DuckDB). Reads catalog metadata
     only; refuses with :class:`~.elementary_layouts.ElementaryLayoutError`.
+    ``last`` reads only the newest ``last`` invocation rows (at most
+    :data:`MAX_INVOCATIONS`); it and ``since`` may be given together, and each
+    narrows the other. ``adapter`` is the caller's open adapter, so a caller
+    that prices the read keeps planning, pricing and the statements on one cost
+    gate; without it, the engine's is acquired.
     """
 
     require_allowed(engine.result_mode, COMMAND)
-    adapter = engine._adapter(COMMAND)
+    if last is not None and (type(last) is not int or not 1 <= last <= MAX_INVOCATIONS):
+        raise ValueError(f"last must be an int between 1 and {MAX_INVOCATIONS}")
+    if adapter is None:
+        adapter = engine._adapter(COMMAND)
     check = check_layouts(
         release, adapter_catalog(adapter, namespace), tables=(INVOCATIONS, RESULTS)
     )
     tables = {table.table: table for table in check.tables}
     relations = _relations(adapter, namespace)
     dialect = get_dialect(engine.connector or engine.config.connector)
-    sql = _Sql(tables[INVOCATIONS], tables[RESULTS], relations, since, dialect)
+    sql = _Sql(tables[INVOCATIONS], tables[RESULTS], relations, since, dialect, last)
     return ReadPlan(
         release=check.release,
         namespace=namespace,
@@ -297,6 +316,7 @@ def plan_read(
         measure=sql.measure(),
         invocations=sql.invocations(),
         results=sql.results(),
+        last=last,
     )
 
 
@@ -307,18 +327,22 @@ def read_elementary(
     claims: Mapping[str, str] | None = None,
     bounds: ReadBounds | None = None,
     handshake: Callable[..., None] | None = None,
+    adapter: Any | None = None,
 ) -> ElementaryRead:
     """Run ``plan`` and turn what it reads into observations and a history.
 
     ``claims`` maps a test's ``unique_id`` to the claim id its
     ``config.meta.dex.claim`` carries, from the manifest. ``handshake`` stands
-    in for the billed handshake, which it must call or replace.
+    in for the billed handshake, which it must call or replace. ``adapter`` is
+    the caller's open adapter, as on :func:`plan_read`: acquiring it again would
+    settle the gate the caller reserved on and start a fresh one.
     """
 
     require_allowed(engine.result_mode, COMMAND)
     limit = bounds or ReadBounds()
     spend = _Spend(handshake)
-    adapter = engine._adapter(COMMAND)
+    if adapter is None:
+        adapter = engine._adapter(COMMAND)
     measured = _measure(engine, adapter, plan, limit, spend)
     invocation_rows = _rows(engine, adapter, plan.invocations, limit.invocations, spend)
     result_rows = _rows(engine, adapter, plan.results, limit.result_rows, spend)
@@ -335,7 +359,12 @@ def read_elementary(
         first_read=bool(spend.profiled),
         profiled=tuple(spend.profiled),
         profile_estimate=spend.profile_estimate(),
-        windowed=plan.since is not None,
+        # A run-count window cut the table only where it filled: one holding
+        # fewer rows than `last` was read whole. A table of exactly `last` rows
+        # also fills it and reads as windowed, so its retention bound may be
+        # older than said: telling the two apart costs one more statement.
+        windowed=plan.since is not None
+        or (plan.last is not None and measured.invocations >= plan.last),
         result_rows_read=len(result_rows),
         duplicate_ids=built.duplicates,
         merged_rows=built.merged,
@@ -389,6 +418,7 @@ class _Sql:
     relations: Mapping[str, str]
     since: datetime | None
     dialect: str
+    last: int | None = None
 
     def _inv(self, name: str) -> exp.Column:
         return exp.column(self.invocations_table.columns[name], table="i", quoted=True)
@@ -409,7 +439,32 @@ class _Sql:
     def _from(self, table: str, alias: str) -> exp.Select:
         return exp.select().from_(_table(self.relations[table], alias))
 
+    def _newest(self, column: str, last: int) -> exp.Select:
+        """``column`` of the newest ``last`` invocation rows in the time window:
+        by the insert's ``created_at``, ties by id, so the cut is deterministic.
+        Choosing the window by ``created_at`` is not ordering the runs by it:
+        each run read is still placed by its start (:func:`_order`)."""
+
+        select = self._from(INVOCATIONS, "i").select(self._inv(column))
+        window = self._window(self._inv("created_at"))
+        if window is not None:
+            select = select.where(window)
+        return select.order_by(
+            exp.Ordered(this=self._inv("created_at"), desc=True),
+            exp.Ordered(this=self._inv("invocation_id"), desc=True),
+        ).limit(last)
+
+    def _invocation_window(self) -> exp.Expression | None:
+        """What keeps an invocation row in the window, or ``None`` for all."""
+
+        if self.last is not None:
+            newest = self._newest("invocation_id", self.last)
+            return self._inv("invocation_id").isin(query=newest)
+        return self._window(self._inv("created_at"))
+
     def _window_ids(self) -> exp.Select:
+        if self.last is not None:
+            return self._newest("invocation_id", self.last)
         select = self._from(INVOCATIONS, "i").select(self._inv("invocation_id"))
         window = self._window(self._inv("created_at"))
         return select if window is None else select.where(window)
@@ -417,13 +472,30 @@ class _Sql:
     def _in_window(self) -> exp.Expression:
         return self._res("invocation_id").isin(query=self._window_ids())
 
+    def _results_window(self) -> exp.Expression | None:
+        """What keeps a result row with no invocation row in the counted window:
+        written at or after the window's oldest invocation row."""
+
+        if self.last is None:
+            return self._window(self._res("created_at"))
+        # The alias quoted as every other one here is: Snowflake folds `w` to
+        # `W`, and `"w"."created_at"` would then name nothing.
+        alias = exp.TableAlias(this=exp.to_identifier("w", quoted=True))
+        oldest = exp.select(
+            exp.Min(this=exp.column(self._created(), table="w", quoted=True))
+        ).from_(self._newest("created_at", self.last).subquery(alias, copy=False))
+        return self._res("created_at") >= exp.Subquery(this=oldest)
+
+    def _created(self) -> str:
+        return self.invocations_table.columns["created_at"]
+
     def _render(self, select: exp.Select) -> str:
         return select.sql(dialect=self.dialect)
 
     def measure(self) -> tuple[str, str, str]:
         count = exp.alias_(exp.Count(this=exp.Star()), "n")
         invocations = self._from(INVOCATIONS, "i").select(count)
-        window = self._window(self._inv("created_at"))
+        window = self._invocation_window()
         if window is not None:
             invocations = invocations.where(window)
         results = self._from(RESULTS, "r").select(count).where(self._in_window())
@@ -434,7 +506,7 @@ class _Sql:
             exp.not_(self._res("invocation_id").isin(query=known)),
         )
         orphans = self._from(RESULTS, "r").select(count).where(orphaned)
-        results_window = self._window(self._res("created_at"))
+        results_window = self._results_window()
         if results_window is not None:
             orphans = orphans.where(results_window)
         return (
@@ -447,7 +519,7 @@ class _Sql:
         select = self._from(INVOCATIONS, "i").select(
             *(self._inv(name) for name in _INVOCATION_COLUMNS)
         )
-        window = self._window(self._inv("created_at"))
+        window = self._invocation_window()
         return self._render(select if window is None else select.where(window))
 
     def results(self) -> str:

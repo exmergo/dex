@@ -1423,6 +1423,18 @@ class ClickHouseAdapter:
         rows, labels, _types = self._run_rows(sql)
         return rows, labels
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later billed statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: Cube names UTC wherever it
+        converts a column, but the date series of a rolling window is parsed
+        from strings with no zone, which ClickHouse reads in the session time
+        zone (the server's, unless set). Only UTC, so nothing caller-supplied
+        is interpolated.
+        """
+
+        self._utc_session = True
+
     def _run_rows(
         self,
         sql: str,
@@ -1467,6 +1479,8 @@ class ClickHouseAdapter:
 
         remaining = self.cost_gate.statement_cap(unit="database-second")
         settings: dict[str, Any] = dict(_SESSION_SETTINGS)
+        if getattr(self, "_utc_session", False):
+            settings["session_timezone"] = "UTC"
         seconds: int | None = None
         budget_bound = False
         if remaining is not None:

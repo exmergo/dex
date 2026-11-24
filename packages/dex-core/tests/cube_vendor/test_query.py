@@ -842,7 +842,8 @@ def test_a_cube_read_from_another_cube_s_table_is_refused(shop, cube, capsys):
 
 
 @pytest.mark.parametrize(
-    "connector", ["bigquery", "duckdb", "postgres", "redshift", "snowflake"]
+    "connector",
+    ["bigquery", "clickhouse", "duckdb", "postgres", "redshift", "snowflake", "trino"],
 )
 def test_each_cube_is_held_to_its_own_table_in_every_dialect(tmp_path, connector):
     from exmergo_dex_core.adapters import get_dialect
@@ -942,10 +943,10 @@ def test_a_relation_the_connection_lacks_is_refused_before_spend(
 # --- the connectors, the hosts and the token -------------------------------------
 
 
-@pytest.mark.parametrize("connector", ["databricks", "clickhouse", "trino"])
 def test_a_connector_with_no_reviewed_golden_is_refused_by_name(
-    tmp_path, capsys, monkeypatch, connector
+    tmp_path, capsys, monkeypatch
 ):
+    connector = "databricks"
     shutil.copytree(MODEL, tmp_path / "model")
     _config(tmp_path, connector=connector)
     cube = FakeCube("duckdb").install(monkeypatch)

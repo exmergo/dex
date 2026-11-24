@@ -351,7 +351,97 @@ severity tokens, an anomaly test's column and metric, each run's times and
 commit, and counts. It maps dbt's statuses as the run-results adapter does.
 Unlike `run_results.json`, the tables hold many invocations, so an incident read
 from them has a known start wherever an observed pass precedes its first
-failure.
+failure. `plan_read(..., last=n)` reads only the newest `n` invocation rows (by
+`created_at`, ties by id), so a window can be a run count rather than a time.
+
+### `dex maintain incidents`
+
+The command (`DexEngine.incidents`) reads both sources and folds them together,
+Elementary first: the fold's tie-break between two sources failing in the run
+that opens an incident is the order they are named in, and Elementary's tables
+hold the longer run history.
+
+- **A bounded read.** Elementary's tables are read over the newest 20
+  invocations, or `--invocations <n>` (at most 2000). A run count rather than a
+  number of days, so the price does not depend on the schedule. Every statement
+  is priced before any runs, with the profiles the firewall needs on a first
+  read, as one handshake.
+- **One order.** dbt's run is placed where Elementary placed the same
+  invocation, or after the window when it started after the window's newest
+  run (dbt's `invocation_started_at` against Elementary's `run_started_at`,
+  two starts; `generated_at` is the run's end). It is then named under
+  `window.after_window`, outside the count, which never exceeds the run count. A run that
+  is neither has no place in the order and is left out of the fold, with
+  `folded: false`.
+- **Every source answers.** `data.sources` reports each source `read`, `missing`
+  or `refused` with a reason code: no package (`not_installed`, with the
+  `dex init` that offers it), a package whose uploads are off (`not_uploading`),
+  a schema outside the source allowlist (`outside_allowlist`, with the
+  `dex config set` that adds it; nothing is read past the allowlist), a
+  connection or catalog that could not be read (`connection_unavailable`,
+  `catalog_unavailable`), a read that could not be priced (`unpriced`: it is
+  never asked for at a lower price than it would spend), a statement the
+  warehouse refused mid-read (`warehouse_refused`, its words masked, the price
+  kept), or the reader's own
+  refusals. Each source answers alone, so dbt's run results are still read when
+  Elementary's tables are not. A confirmation, budget or ceiling refusal is the
+  command's, not a source's. An empty `incidents` list means no failure only
+  where a source reads `read`.
+- **Read alone, dbt's run results never close an incident.** The next build
+  overwrites the file, so a fixed failure drops out of it rather than reading as
+  two passes.
+
+### `dex maintain diagnose`
+
+The command (`DexEngine.diagnose`, #1475) reads the incidents as
+`maintain incidents` does, with the repository's history handed to the fold,
+and takes each open incident to a cause, or to none.
+
+- **Bisect.** The range is the incident's onset: after the last observed-good
+  run, up to and including the first observed-bad one. A run that recorded
+  nothing between them widens the range back to the last observed pass; it never
+  splits it, so it is never read as good.
+- **Bound.** The committed `maintain snapshot` series is the versions of
+  `.dex/snapshot.json` in the repository's history. The newest snapshot captured
+  at or before the last observed pass is `snapshots.before`; the oldest at or
+  after the first failure is `snapshots.after`. A snapshot is placed by when
+  its warehouse state was measured: `cache_updated_at` where it was pinned
+  from the exploration cache, the earlier snapshot's time where a
+  `--project-only` snapshot carried the block forward. On a project's first day there is
+  no series (`series: none`), and the whole break is a window no recorded state
+  of the warehouse covers (`unseen`, `no_snapshot_series`): a check then
+  confirms a cause as present now, not when inside the break it entered. With a
+  series, the unseen window is the stretch between the bounding snapshots.
+- **Confirm with a check Dex already has.** Each candidate names the check that
+  answered it and the finding code. This release checks the cause kind
+  `dex demo` seeds: a uniqueness test failing because the loader delivered a key
+  twice. It is held, on each source relation the tested model reads that carries
+  the tested columns, by the grain axis of `maintain check`:
+  `key_lost_uniqueness` against `snapshots.before` where its measurement proved
+  the key unique (the volume axis's row counts ride beside it as evidence), and
+  otherwise the declared-claim check, which needs no baseline: the failing
+  test's own claim held to the source (`declared_grain_not_unique`), and only
+  where one source the model reads carries the key: with several, today's data
+  cannot tell a duplicated delivery from a source at another grain
+  (`several_sources`, not checked). A source the bounding snapshot measured
+  not unique while the test passed is ruled out
+  (`not_unique_at_before_snapshot`); a relation nothing counted is
+  `not_checked` (`uncounted`), never ruled out. The project
+  is ruled out where the failing commit itself passed earlier (`onset.commits`
+  reads `same_commit`). Seed, package and schedule causes are listed
+  `not_checked` until their checks are read.
+- **No cause is an answer.** `verdict` is `cause`, `several` (each named, none
+  preferred) or `no_cause`. With no confirmed candidate the answer is
+  `ruled_out` and `unseen`; the most likely candidate is never named as the
+  cause.
+- **The repair is `transform`'s.** A confirmed cause carries the
+  `dex transform plan` step that would repair it under `next_steps`. Nothing
+  here writes it.
+- **Priced.** The incident read prices its own statements first; the checks
+  are then priced together as one handshake before any probe runs, within
+  what the per-command ceiling has left after the read. Checks that do not
+  fit are offered (`scan_offered`, `price.checks.offered`), not asked for
+  again, and `data.spend` sums both phases.
 
 ## No value crosses into an incident
 

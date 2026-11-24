@@ -92,7 +92,9 @@ if TYPE_CHECKING:
     )
     from .maintain.results import (
         CoverageResult,
+        DiagnoseResult,
         DriftResult,
+        IncidentsResult,
         ReconcileResult,
         SnapshotResult,
         VerifyResult,
@@ -1467,6 +1469,49 @@ class DexEngine:
         # the mode the engine is pinned to is stamped here too.
         result.result_mode = self.resolve_result_mode(None)
         return result
+
+    def incidents(
+        self,
+        objects: list[str] | None = None,
+        *,
+        invocations: int | None = None,
+    ) -> IncidentsResult:
+        """The incidents the sources hold for the selected models' tests (#1472).
+
+        Elementary's tables, read over the newest ``invocations`` runs (20 by
+        default) and priced first, and dbt's run results; ``sources`` says which
+        were read. On a billed connector an unconfirmed call raises
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before any
+        statement reads Elementary's tables. The confirmation gates those billed
+        reads only: the local manifest and run results, and the warehouse's
+        catalog metadata, are read before it is asked, and a call that reads
+        dbt's run results alone asks nothing.
+        """
+
+        from .maintain import incident_sources
+
+        return incident_sources.incidents(self, objects, invocations=invocations)
+
+    def diagnose(
+        self,
+        objects: list[str] | None = None,
+        *,
+        invocations: int | None = None,
+    ) -> DiagnoseResult:
+        """Each open incident on the selected models' tests, diagnosed (#1475).
+
+        The incidents are read as :meth:`incidents` reads them, with the
+        repository's history, and each is bisected over its onset, bounded by
+        the committed snapshot series where there is one, and answered by the
+        checks Dex already has: one confirmed cause, several, or none, with
+        what was ruled out and the window no recorded state covers. On a billed
+        connector the incident read and then the checks each raise
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before they scan.
+        """
+
+        from .maintain import diagnose
+
+        return diagnose.diagnose(self, objects, invocations=invocations)
 
     # --- transform --------------------------------------------------------
     #

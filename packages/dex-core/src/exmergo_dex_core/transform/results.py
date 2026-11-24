@@ -102,6 +102,11 @@ class PlanResult(Result):
     # them and one row per monitor, written or not. ``None`` where
     # ``monitors.vendor`` is unset, so the key is absent.
     monitors: dict[str, Any] | None = None
+    # The Elementary PII tags the plan writes (#1487): the tag, the
+    # `disable_samples_on_pii_tags` switch, what the installed release does
+    # with them, and per model its model tag and each personal-data column's.
+    # ``None`` where ``monitors.vendor`` is unset or nothing was owed.
+    pii_tags: dict[str, Any] | None = None
     # The free pointer to `transform compare` on a plan that rewrites a model
     # that already exists (#856). Planning scans nothing for it. Absent when the
     # plan rewrites none.
@@ -163,6 +168,8 @@ class PlanResult(Result):
             payload["generated_tests"] = self.generated_tests
         if self.monitors is not None:
             payload["monitors"] = self.monitors
+        if self.pii_tags is not None:
+            payload["pii_tags"] = self.pii_tags
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:

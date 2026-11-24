@@ -363,6 +363,21 @@ def test_read_only_settings_ride_every_statement_free_or_billed(
         assert query.settings["join_use_nulls"] == 1
 
 
+def test_a_utc_session_is_pinned_only_when_asked(fake_clickhouse_connection):
+    """Cube parses a rolling window's date series from strings with no zone,
+    which ClickHouse reads in the session time zone, so the governed Cube path
+    asks for UTC."""
+
+    adapter = make_adapter(fake_clickhouse_connection)
+    sql = "SELECT count(*) FROM shop.customers"
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30.0)
+    assert "session_timezone" not in fake_clickhouse_connection.queries[-1].settings
+
+    adapter.pin_utc_session()
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30.0)
+    assert fake_clickhouse_connection.queries[-1].settings["session_timezone"] == "UTC"
+
+
 def test_a_sub_second_remainder_is_refused_rather_than_sent_as_zero(
     fake_clickhouse_connection,
 ):

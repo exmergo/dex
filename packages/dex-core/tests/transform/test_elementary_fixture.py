@@ -8,8 +8,11 @@ Elementary package from the dbt hub, so they run only with
 from __future__ import annotations
 
 import json
+import os
 import shutil
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -24,6 +27,7 @@ from .elementary_fixture import (
     LEGACY_VERSIONS,
     MATERIALIZATION_LINE,
     OLDEST_DUCKDB_VERSION,
+    ORCHESTRATOR_ENV,
     TEMP_TABLE_LINE,
     VARIANTS,
     VERSIONS,
@@ -35,7 +39,12 @@ from .elementary_fixture import (
 )
 from .elementary_fixture import elementary_installs as elementary_installs
 from .elementary_fixture import installed_elementary as installed_elementary
+from .elementary_fixture import no_orchestrator as no_orchestrator
 from .mutation_helpers import _engine
+
+#: Every case runs as if outside an orchestrator, the dbt Dex starts included,
+#: so the reading on a CI runner is the reading anywhere else (#1447).
+pytestmark = pytest.mark.usefixtures("no_orchestrator")
 
 # --- the census, offline --------------------------------------------------------
 
@@ -102,6 +111,48 @@ def test_a_relation_whose_name_holds_a_double_quote_is_still_counted(
 
     assert before[table] == 1, "the census could not count a validly named relation"
     assert footprint(before, duckdb_census(duckdb_file)) == {table: (1, 2)}
+
+
+#: What a GitHub Actions runner sets that Elementary reads into
+#: ``dbt_invocations``; with these set, #1447's pins failed on main.
+GITHUB_RUNNER_ENV = {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_RUN_ID": "45330982618",
+    "GITHUB_SHA": "0" * 40,
+    "GITHUB_REPOSITORY": "owner/repo",
+    "GITHUB_EVENT_NAME": "push",
+    "GITHUB_SERVER_URL": "https://github.com",
+    "GITHUB_HEAD_REF": "a-branch",
+}
+
+
+def test_dbt_starts_with_the_runner_s_orchestrator_variables_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from . import elementary_fixture
+
+    assert set(GITHUB_RUNNER_ENV) <= set(ORCHESTRATOR_ENV)
+    for name, value in GITHUB_RUNNER_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("DEX_KEPT", "1")
+    seen: dict[str, str] = {}
+
+    def run(argv, **kwargs):
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(elementary_fixture.shutil, "which", lambda _: "dbt")
+    monkeypatch.setattr(elementary_fixture.subprocess, "run", run)
+    dbt("--version", cwd=tmp_path)
+
+    assert seen.get("DEX_KEPT") == "1", "dbt lost the rest of the environment"
+    assert set(seen) & set(ORCHESTRATOR_ENV) == set()
+
+
+def test_each_case_runs_with_the_orchestrator_variables_cleared():
+    """The dbt Dex starts inherits this process's environment."""
+
+    assert set(os.environ) & set(ORCHESTRATOR_ENV) == set()
 
 
 # --- the fixture, against the installed package ---------------------------------
@@ -417,6 +468,166 @@ def test_a_failing_rendered_test_leaves_no_sample_of_its_rows(
     assert sampled() == 0
     _strip_sampling_switch(project)
     assert sampled() == 1
+
+
+# --- the PII tags (#1487) ------------------------------------------------------------
+
+#: A model with one personal-data column. The addresses are synthetic, built from
+#: the customer number on a reserved domain: no real person's data.
+CONTACTS_SQL = """select
+    id,
+    cid,
+    'customer' || cast(cid as varchar) || '@example.invalid' as email
+from {{ ref('stg_orders') }}
+"""
+
+#: ``email`` marked as an earlier Dex stamped it, before it wrote any tag, and
+#: three failing tests: one on the marked column (one value outside the list),
+#: one on an unmarked column of the same model (the ids ``fct`` drops), and one
+#: on a column of a model with nothing marked (the cancelled status).
+CONTACTS_YML = """version: 2
+models:
+  - name: stg_contacts
+    columns:
+      - name: id
+        data_tests:
+          - relationships:
+              name: contacts_id_in_fct
+              to: ref('fct')
+              field: id
+      - name: email
+        config:
+          meta:
+            contains_pii: true
+            pii_category: email
+        data_tests:
+          - accepted_values:
+              name: contacts_email_values
+              values: ['customer1@example.invalid', 'customer2@example.invalid',
+                       'customer3@example.invalid', 'customer4@example.invalid']
+  - name: stg_orders
+    columns:
+      - name: status
+        data_tests:
+          - accepted_values:
+              name: orders_status_values
+              values: ['placed']
+"""
+
+_PII_TESTS = ("contacts_email_values", "contacts_id_in_fct", "orders_status_values")
+
+
+def _pii_engine(tmp_path: Path, project: Path):
+    from exmergo_dex_core.config import DexConfig, MonitorsConfig
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+
+    return DexEngine(
+        connector="duckdb",
+        repo_root=str(project.parent),
+        store=FilesystemStore(project.parent),
+        config=DexConfig(
+            connector="duckdb",
+            dbt_target="dev",
+            dbt_project_dir=project.name,
+            dbt_prod_target="prod",
+            monitors=MonitorsConfig(vendor="elementary"),
+        ),
+    )
+
+
+def _strip_model_tag(project: Path) -> None:
+    """Drop the model tag the plan wrote on ``stg_contacts``, keeping the column
+    tag: what the plan would write without :func:`pii_tags._tag_model`."""
+
+    path = project / "models" / "contacts.yml"
+    schema = yaml.safe_load(path.read_text(encoding="utf-8"))
+    [entry] = [m for m in schema["models"] if m["name"] == "stg_contacts"]
+    assert entry["config"].pop("tags") == ["pii"]
+    if not entry["config"]:
+        entry.pop("config")
+    path.write_text(yaml.safe_dump(schema, sort_keys=False), encoding="utf-8")
+
+
+@requires_elementary
+@pytest.mark.parametrize("version", VERSIONS)
+def test_a_failing_test_on_a_column_dex_tags_leaves_no_sample_of_its_rows(
+    tmp_path: Path, elementary_installs: Callable[[str], Path], version: str
+):
+    """#1487, on variant a, where Elementary's materialization handles the
+    project's own tests. Before the plan each failing test copies rows into
+    ``test_result_rows``. After it, the test on the column Dex marks keeps none,
+    and the test on a model Dex marks nothing on still keeps its row. The model
+    tag also zeroes the test on the same model's unmarked column; with that tag
+    stripped by hand and the column tag kept, that test samples again."""
+
+    project = elementary_project(tmp_path, "a", elementary_installs(version))
+    (project / "models" / "stg_contacts.sql").write_text(CONTACTS_SQL, "utf-8")
+    (project / "models" / "contacts.yml").write_text(CONTACTS_YML, "utf-8")
+    warehouse = tmp_path / "dev.duckdb"
+    project_args = ("--project-dir", str(project), "--profiles-dir", str(project))
+    dbt("run", *project_args, cwd=project)
+    rows = (ELEMENTARY_SCHEMA, "test_result_rows", "BASE TABLE")
+    run_results = project / "target" / "run_results.json"
+
+    def sampled() -> dict[str, int]:
+        out: dict[str, int] = {}
+        for name in _PII_TESTS:
+            before = duckdb_census(warehouse)
+            run_results.unlink(missing_ok=True)
+            log = dbt("test", *project_args, "--select", name, cwd=project, check=False)
+            results = json.loads(run_results.read_text(encoding="utf-8"))["results"]
+            # Elementary's on-run-end hooks are written beside the test, as
+            # `operation.` results: the selection itself is the one test.
+            tests = [r for r in results if r["unique_id"].startswith("test.")]
+            others = sorted(
+                r["unique_id"]
+                for r in results
+                if not r["unique_id"].startswith("test.")
+            )
+            assert [t["unique_id"].split(".")[2] for t in tests] == [name], (
+                f"--select {name} is meant to run that one test:\n{log}"
+            )
+            assert all(u.startswith("operation.") for u in others), others
+            [result] = tests
+            # Only a completed failure measures sampling: an errored test keeps
+            # no sample either.
+            assert result["status"] == "fail" and result["failures"] >= 1, (
+                f"{name} is meant to fail:\n{log}"
+            )
+            was, now = footprint(before, duckdb_census(warehouse)).get(rows, (0, 0))
+            out[name] = now - was
+        return out
+
+    before = sampled()
+    assert before["contacts_email_values"] == 1
+    assert before["contacts_id_in_fct"] >= 1
+    assert before["orders_status_values"] == 1
+
+    engine = _pii_engine(tmp_path, project)
+    planned = engine.plan(
+        "tag the contacts model's personal data for Elementary",
+        declarations=[{"model": "stg_contacts", "description": "One row per order."}],
+        attribute_rows=False,
+    )
+    assert planned.pii_tags is not None, planned.warnings
+    assert planned.pii_tags["switch"]["status"] == "added"
+    assert planned.pii_tags["rule"] == "model_and_column_tags"
+    engine.apply(planned.plan_id)
+    project_yml = yaml.safe_load((project / "dbt_project.yml").read_text("utf-8"))
+    assert project_yml["vars"]["disable_samples_on_pii_tags"] is True
+
+    after = sampled()
+    assert after["contacts_email_values"] == 0
+    assert after["orders_status_values"] == 1
+    # The model tag's trade: the same model's unmarked column keeps no sample.
+    assert after["contacts_id_in_fct"] == 0
+
+    _strip_model_tag(project)
+    column_only = sampled()
+    assert column_only["contacts_email_values"] == 0
+    assert column_only["orders_status_values"] == 1
+    assert column_only["contacts_id_in_fct"] == before["contacts_id_in_fct"]
 
 
 # --- the resolver (#1305) ---------------------------------------------------------
@@ -1252,3 +1463,449 @@ def test_the_incident_reader_reads_each_run_the_package_recorded(
         for column in ("result_rows", "test_results_description", "test_params"):
             assert column not in sql, (column, entry["decision"])
     assert not (tmp_path / "prod.duckdb").exists()
+
+
+# --- an Elementary upgrade, read by maintain check (#1447) ----------------------
+
+#: The axes ``maintain check`` sweeps on a free connector beside a dbt project.
+CHECK_AXES = ("grain", "schema", "semantic", "volume")
+
+#: What the warehouse baseline was pinned from. ``map`` is a default ``explore
+#: map``, which keeps the package's tables in the cache as inventory entries
+#: (#1311); ``map_included`` maps with ``include_elementary`` and so profiles
+#: them; ``metadata`` is a snapshot taken with no cache at all, which captures
+#: every relation's columns, the package's included. The last two are the arms
+#: that can see a column the upgrade adds to one of the package's tables.
+BASELINES = ("map", "map_included", "metadata")
+
+#: What happens between the snapshot and the check. ``upgrade`` moves the
+#: package from the oldest release DuckDB builds to the current one and changes
+#: nothing the project authored; ``upgrade_and_rename`` also renames one column
+#: of a project model, the positive control; ``rerun`` rebuilds at the same
+#: release, so drift it shares with ``upgrade`` is a run's and not the upgrade's.
+CHANGES = ("upgrade", "upgrade_and_rename", "rerun")
+
+FCT = "dev.main.fct"
+RENAMED = ("band", "size_band")
+
+#: One finding as the reading lists it: code, identifier, column.
+Seen = tuple[str, str | None, str | None]
+
+
+def _owned_by_package(finding) -> bool:
+    """A finding on a relation in the schema Elementary's models build into.
+
+    Anything else is the project's, a finding with no relation included, so a
+    package file the project view read as its own counts against the project."""
+
+    parts = (finding.identifier or "").split(".")
+    return len(parts) >= 2 and parts[-2] == ELEMENTARY_SCHEMA
+
+
+def _reading(result) -> dict[str, dict[str, list[Seen]]]:
+    """Each axis's findings, split into the project's and the package's."""
+
+    reading: dict[str, dict[str, list[Seen]]] = {}
+    for axis in CHECK_AXES:
+        sides: dict[str, list[Seen]] = {"project": [], "package": []}
+        for finding in result.by_axis[axis].findings:
+            side = "package" if _owned_by_package(finding) else "project"
+            sides[side].append((finding.code, finding.identifier, finding.column))
+        reading[axis] = {side: sorted(seen, key=str) for side, seen in sides.items()}
+    return reading
+
+
+def _move_package(project: Path, installed: Path) -> None:
+    """Install the release ``installed`` holds in place of the project's, as
+    editing the pin and running ``dbt deps`` would. No other file changes."""
+
+    for name in ("packages.yml", "package-lock.yml"):
+        shutil.copy(installed / name, project / name)
+    shutil.rmtree(project / "dbt_packages")
+    shutil.copytree(installed / "dbt_packages", project / "dbt_packages")
+
+
+def _rename_column(project: Path) -> None:
+    """Rename ``band`` on ``fct``, in its SQL and in its schema file."""
+
+    old, new = RENAMED
+    sql = project / "models" / "fct.sql"
+    text = sql.read_text("utf-8")
+    assert text.count(f"as {old}\n") == 1
+    sql.write_text(text.replace(f"as {old}\n", f"as {new}\n"), "utf-8")
+    schema = project / "models" / "schema.yml"
+    parsed = yaml.safe_load(schema.read_text("utf-8"))
+    [fct] = [m for m in parsed["models"] if m["name"] == "fct"]
+    [column] = [c for c in fct["columns"] if c["name"] == old]
+    column["name"] = new
+    schema.write_text(yaml.safe_dump(parsed, sort_keys=False), "utf-8")
+
+
+def _models_built(run_results: dict) -> None:
+    """Every model the run attempted built, the package's included."""
+
+    models = {
+        r["unique_id"]: r["status"]
+        for r in run_results["results"]
+        if r["unique_id"].startswith("model.")
+    }
+    assert any(uid.startswith("model.elementary.") for uid in models), models
+    assert {uid: s for uid, s in models.items() if s != "success"} == {}
+
+
+@dataclass
+class UpgradeRun:
+    """One arm: the snapshot it pinned and what ``maintain check`` then read."""
+
+    snapshot: dict
+    reading: dict[str, dict[str, list[Seen]]]
+
+    def pinned(self, identifier: str) -> dict | None:
+        for dataset in self.snapshot["warehouse"]["datasets"]:
+            if dataset["identifier"] == identifier:
+                return dataset
+        return None
+
+    def package_datasets(self) -> list[dict]:
+        """What the snapshot pinned of the package's tables."""
+
+        out = []
+        for dataset in self.snapshot["warehouse"]["datasets"]:
+            parts = dataset["identifier"].split(".")
+            if len(parts) >= 2 and parts[-2] == ELEMENTARY_SCHEMA:
+                out.append(dataset)
+        return out
+
+
+def _upgrade_run(
+    root: Path, installs: Callable[[str], Path], baseline: str, change: str
+) -> UpgradeRun:
+    project = elementary_project(root, "a", installs(OLDEST_DUCKDB_VERSION))
+    warehouse = root / "dev.duckdb"
+    _models_built(_dbt_command(project, "build"))
+
+    with _engine(project, path=str(warehouse)) as engine:
+        if baseline == "map":
+            engine.map(full=True)
+        elif baseline == "map_included":
+            engine.map(include_elementary=True, full=True)
+            # The package's tables can crowd the project's out of the map, so
+            # the mart the control renames a column of is profiled by name.
+            engine.profile(FCT)
+        engine.snapshot()
+    snapshot = json.loads((root / ".dex" / "snapshot.json").read_text("utf-8"))
+    pinned_from = "metadata" if baseline == "metadata" else "cache"
+    assert snapshot["warehouse_from"] == pinned_from
+
+    if change in ("upgrade", "upgrade_and_rename"):
+        _move_package(project, installs(CURRENT_VERSION))
+        own = yaml.safe_load(_installed_project_file(project).read_text("utf-8"))
+        assert own["version"] == CURRENT_VERSION
+    if change == "upgrade_and_rename":
+        _rename_column(project)
+    # Elementary's `schema_changes` test fails on the renamed column, which is
+    # the package working; the models are what the check reads.
+    _models_built(_dbt_command(project, "build"))
+
+    with _engine(project, path=str(warehouse)) as engine:
+        result = engine.check()
+    assert set(result.by_axis) == set(CHECK_AXES), sorted(result.by_axis)
+    return UpgradeRun(snapshot=snapshot, reading=_reading(result))
+
+
+@pytest.fixture(scope="session")
+def upgrade_runs(
+    tmp_path_factory: pytest.TempPathFactory,
+    elementary_installs: Callable[[str], Path],
+) -> Callable[[str, str], UpgradeRun]:
+    """``run(baseline, change)``: one arm, built once a session, since the
+    project-side and the package-side cases read the same run."""
+
+    # An arm that failed is kept failed, so each case reading it fails at once
+    # rather than building it again.
+    done: dict[tuple[str, str], UpgradeRun | BaseException] = {}
+
+    def run(baseline: str, change: str) -> UpgradeRun:
+        if change not in CHANGES or baseline not in BASELINES:
+            raise ValueError(f"no arm {(baseline, change)!r}")
+        if (baseline, change) not in done:
+            root = tmp_path_factory.mktemp(f"upgrade-{baseline}-{change}")
+            try:
+                done[baseline, change] = _upgrade_run(
+                    root, elementary_installs, baseline, change
+                )
+            except (Exception, pytest.fail.Exception) as exc:
+                done[baseline, change] = exc
+        held = done[baseline, change]
+        if isinstance(held, BaseException):
+            raise held
+        return held
+
+    return run
+
+
+def _nothing_on(axes: Iterable[str]) -> dict[str, list[Seen]]:
+    return {axis: [] for axis in axes}
+
+
+def _sees_the_package_s_columns(run: UpgradeRun, baseline: str) -> None:
+    """Every arm pinned the package's tables, and the arms built to see a
+    column the upgrade changes pinned their columns."""
+
+    pinned = run.package_datasets()
+    assert pinned, f"the {baseline} baseline pinned none of the package's tables"
+    if baseline in ("map_included", "metadata"):
+        assert any(dataset["columns"] for dataset in pinned), (
+            f"the {baseline} baseline pinned no column of the package's tables, "
+            "so it cannot see a column the upgrade adds to one"
+        )
+
+
+@requires_elementary
+@pytest.mark.parametrize("baseline", BASELINES)
+def test_an_elementary_upgrade_reports_no_project_drift_on_any_axis(
+    upgrade_runs: Callable[[str, str], UpgradeRun], baseline: str
+):
+    """#1447's first acceptance: the package moves from 0.23.0 to 0.26.1 with no
+    change to the project's own files, and no axis of ``maintain check``
+    reports a finding on anything the project owns."""
+
+    run = upgrade_runs(baseline, "upgrade")
+
+    _sees_the_package_s_columns(run, baseline)
+    project = {axis: sides["project"] for axis, sides in run.reading.items()}
+    assert project == _nothing_on(CHECK_AXES), run.reading
+
+
+@requires_elementary
+@pytest.mark.parametrize("baseline", BASELINES)
+def test_a_column_renamed_beside_the_upgrade_is_reported(
+    upgrade_runs: Callable[[str, str], UpgradeRun], baseline: str
+):
+    """#1447's second acceptance, the positive control: the same upgrade with
+    ``band`` renamed on ``fct``. The schema axis reports the model's file
+    changing and the column leaving and arriving on the built relation, and
+    nothing else on the project's side; the other axes report nothing there."""
+
+    run = upgrade_runs(baseline, "upgrade_and_rename")
+    old, new = RENAMED
+
+    pinned = run.pinned(FCT)
+    assert pinned is not None, f"{FCT} is not in the snapshot"
+    assert pinned["columns"], f"{FCT} was pinned with no columns"
+    assert set(run.reading["schema"]["project"]) == {
+        ("model_changed", "fct", None),
+        ("column_dropped", FCT, old),
+        ("column_added", FCT, new),
+        ("possible_rename", FCT, new),
+    }, run.reading
+    others = {
+        axis: sides["project"]
+        for axis, sides in run.reading.items()
+        if axis != "schema"
+    }
+    assert others == _nothing_on(set(CHECK_AXES) - {"schema"}), run.reading
+
+
+# What ``maintain check`` reports today on the package's own relations, as the
+# fixture read it on 2026-11-24 (0.23.0 to 0.26.1, DuckDB). #1447's third step,
+# reporting the package's drift apart from the project's or leaving it out, is
+# not decided; its fix changes these and the case below with them. Every table
+# named here is in ELEMENTARY_SCHEMA.
+
+#: Package tables with no rows on the fixture: ``no_rows`` on the grain axis.
+PACKAGE_EMPTY_TABLES = (
+    "alerts_anomaly_detection",
+    "alerts_dbt_models",
+    "alerts_dbt_source_freshness",
+    "alerts_dbt_tests",
+    "alerts_schema_changes",
+    "dbt_exposures",
+    "dbt_groups",
+    "dbt_metrics",
+    "dbt_seeds",
+    "dbt_snapshots",
+    "dbt_source_freshness_results",
+    "dbt_sources",
+    "job_run_results",
+    "seed_run_results",
+    "snapshot_run_results",
+)
+
+#: Package columns NULL on every row: ``fully_null_column`` on the grain axis.
+PACKAGE_NULL_COLUMNS = (
+    ("anomaly_threshold_sensitivity", "column_name"),
+    ("data_monitoring_metrics", "column_name"),
+    ("data_monitoring_metrics", "dimension"),
+    ("data_monitoring_metrics", "dimension_value"),
+    ("data_monitoring_metrics", "source_value"),
+    ("dbt_invocations", "account_id"),
+    ("dbt_invocations", "cause"),
+    ("dbt_invocations", "cause_category"),
+    ("dbt_invocations", "dbt_user"),
+    ("dbt_invocations", "env"),
+    ("dbt_invocations", "env_id"),
+    ("dbt_invocations", "git_sha"),
+    ("dbt_invocations", "job_id"),
+    ("dbt_invocations", "job_name"),
+    ("dbt_invocations", "job_run_id"),
+    ("dbt_invocations", "job_run_url"),
+    ("dbt_invocations", "job_url"),
+    ("dbt_invocations", "orchestrator"),
+    ("dbt_invocations", "project_id"),
+    ("dbt_invocations", "pull_request_id"),
+    ("dbt_invocations", "yaml_selector"),
+    ("dbt_models", "group_name"),
+    ("dbt_run_results", "group_name"),
+    ("dbt_run_results", "query_id"),
+    ("dbt_run_results", "rows_affected"),
+    ("dbt_tests", "group_name"),
+    ("elementary_test_results", "other"),
+    ("elementary_test_results", "result_rows"),
+    ("metrics_anomaly_score", "column_name"),
+    ("metrics_anomaly_score", "dimension"),
+    ("metrics_anomaly_score", "dimension_value"),
+    ("model_run_results", "group_name"),
+    ("model_run_results", "query_id"),
+    ("monitors_runs", "column_name"),
+)
+
+#: Package tables on which a profiled baseline pinned a candidate key that a
+#: second run's rows leave repeated: ``key_lost_uniqueness``, on
+#: ``map_included`` only, since only a profile pins candidate keys. Pinned by
+#: table and not by column: which columns a profile found unique varies from
+#: run to run (box run 3 read a different set on two runs in five), while the
+#: tables are the ones the run appends to, so they lose a key on every run.
+PACKAGE_KEYS_LOST_ON = (
+    "anomaly_threshold_sensitivity",
+    "data_monitoring_metrics",
+    "dbt_invocations",
+    "dbt_run_results",
+    "elementary_test_results",
+    "metrics_anomaly_score",
+    "model_run_results",
+    "schema_columns_snapshot",
+    "test_result_rows",
+)
+
+#: Package tables whose row count moved: ``row_count_changed`` on the volume
+#: axis. The set differs with where the baseline's counts came from: the
+#: default map's inventory entries, or a profile or the snapshot's own metadata.
+PACKAGE_COUNTS_MOVED_MAP = (
+    "data_monitoring_metrics",
+    "dbt_invocations",
+    "dbt_run_results",
+    "dbt_tests",
+    "elementary_test_results",
+    "schema_columns_snapshot",
+    "test_result_rows",
+)
+
+PACKAGE_COUNTS_MOVED_PROFILED = (
+    "anomaly_threshold_sensitivity",
+    "data_monitoring_metrics",
+    "dbt_invocations",
+    "dbt_run_results",
+    "elementary_test_results",
+    "metrics_anomaly_score",
+    "model_run_results",
+    "schema_columns_snapshot",
+    "test_result_rows",
+)
+
+#: The one finding the upgrade adds that a rebuild at 0.23.0 does not: 0.26.1
+#: adds ``created_at`` to ``model_run_results``. Seen only by a baseline that
+#: pinned the package's columns.
+PACKAGE_UPGRADE_ONLY: tuple[Seen, ...] = (
+    ("column_added", f"dev.{ELEMENTARY_SCHEMA}.model_run_results", "created_at"),
+)
+
+#: What a rebuild at 0.23.0 reports that the upgrade does not: the package's
+#: ``dbt_models`` table leaves ``incremental_strategy`` mostly NULL. (A second
+#: invocation at the same release also repeats ``elementary_version`` on
+#: ``dbt_invocations``, a table already in ``PACKAGE_KEYS_LOST_ON``.)
+PACKAGE_RERUN_ONLY_NULLS: Seen = (
+    "mostly_null_column",
+    f"dev.{ELEMENTARY_SCHEMA}.dbt_models",
+    "incremental_strategy",
+)
+
+
+#: Finding codes pinned by relation alone: the column is dropped from both
+#: sides before they are compared.
+PINNED_BY_RELATION = frozenset({"key_lost_uniqueness"})
+
+
+def _as_pinned(seen: Iterable[Seen]) -> set[Seen]:
+    return {
+        (code, identifier, None if code in PINNED_BY_RELATION else column)
+        for code, identifier, column in seen
+    }
+
+
+def _package_reading_today(baseline: str, change: str) -> dict[str, set[Seen]]:
+    """The package-side reading the box took for one arm, per axis, in the
+    shape ``_as_pinned`` gives it."""
+
+    def rel(table: str) -> str:
+        return f"dev.{ELEMENTARY_SCHEMA}.{table}"
+
+    grain: set[Seen] = {("no_rows", rel(t), None) for t in PACKAGE_EMPTY_TABLES}
+    grain |= {("fully_null_column", rel(t), c) for t, c in PACKAGE_NULL_COLUMNS}
+    if baseline == "map_included":
+        grain |= {("key_lost_uniqueness", rel(t), None) for t in PACKAGE_KEYS_LOST_ON}
+    if change == "rerun":
+        grain.add(PACKAGE_RERUN_ONLY_NULLS)
+    counted = (
+        PACKAGE_COUNTS_MOVED_MAP if baseline == "map" else PACKAGE_COUNTS_MOVED_PROFILED
+    )
+    upgrade_only = change == "upgrade" and baseline != "map"
+    return {
+        "grain": grain,
+        "schema": set(PACKAGE_UPGRADE_ONLY) if upgrade_only else set(),
+        "semantic": set(),
+        "volume": {("row_count_changed", rel(t), None) for t in counted},
+    }
+
+
+@requires_elementary
+@pytest.mark.parametrize("change", ["upgrade", "rerun"])
+@pytest.mark.parametrize("baseline", BASELINES)
+def test_maintain_check_reports_the_package_s_own_relations_as_drift_today(
+    upgrade_runs: Callable[[str, str], UpgradeRun], baseline: str, change: str
+):
+    """#1447's third step, as it stands: ``maintain check`` reports the
+    package's own relations beside the project's. Volume and grain do so on a
+    rebuild at the same release as much as on the upgrade, since every run
+    appends to the package's run history and the null survey reads every
+    pinned table; the upgrade itself adds one column on the schema axis. This
+    pins that reading, so the fix, whichever shape it takes, changes it on
+    purpose. A lost key is pinned by its table, not its column (see
+    ``PACKAGE_KEYS_LOST_ON``)."""
+
+    run = upgrade_runs(baseline, change)
+
+    _sees_the_package_s_columns(run, baseline)
+    package = {
+        axis: _as_pinned(sides["package"]) for axis, sides in run.reading.items()
+    }
+    expected = _package_reading_today(baseline, change)
+    moved = {
+        axis: {
+            "not_reported": sorted(expected[axis] - package[axis], key=str),
+            "newly_reported": sorted(package[axis] - expected[axis], key=str),
+        }
+        for axis in CHECK_AXES
+        if package[axis] != expected[axis]
+    }
+    # The columns behind each relation-level finding ride in the message, so a
+    # run that fails says which of them it read.
+    by_column = sorted(
+        (code, identifier, column)
+        for code, identifier, column in run.reading["grain"]["package"]
+        if code in PINNED_BY_RELATION
+    )
+    assert moved == {}, (
+        f"the package-side reading moved ({baseline}, {change}): {moved}; "
+        f"read by column: {by_column}"
+    )

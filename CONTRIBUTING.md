@@ -495,8 +495,11 @@ warehouse type) hold no warehouse credential: Cube renders and Dex executes.
 Executing containers (`--execute`, marker `cube_execute`) run the same
 questions themselves for `--api`, over an in-memory DuckDB built from
 `scripts/cube/shop.sql` (the rows Dex's own DuckDB fixture holds) and over the
-Postgres dogfood database as `dex_ro`. No setup and no secret: the `cube` job
-runs it on every push to `main`.
+Postgres dogfood database as `dex_ro`. ClickHouse and Trino are render-only:
+Dex executes over the seeded containers of their own suites, and the Trino
+renderer serves a copy of the model with each table under the `memory`
+catalog, since Dex names every Trino relation with its catalog. No setup and
+no secret: the `cube` job runs it on every push to `main`.
 
 ```
 scripts/setup_postgres_dev.sh            # for the Postgres cases
@@ -504,8 +507,16 @@ scripts/setup_cube_dev.sh --db duckdb
 scripts/setup_cube_dev.sh --db postgres
 scripts/setup_cube_dev.sh --execute --db duckdb
 DEX_CUBE_PG_PORT=<published port> scripts/setup_cube_dev.sh --execute --db postgres
+scripts/setup_clickhouse_dev.sh          # for the ClickHouse cases
+scripts/setup_cube_dev.sh --db clickhouse
+scripts/setup_trino_dev.sh               # for the Trino cases
+rm -rf /tmp/cube-trino-model && cp -r scripts/cube/model /tmp/cube-trino-model
+perl -pi -e 's/sql_table: app\./sql_table: memory.app./' /tmp/cube-trino-model/cubes/*.yml
+scripts/setup_cube_dev.sh --db trino --model /tmp/cube-trino-model
 source ~/.cache/dex-dogfood/cube.env
 DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:<port>/dex_dogfood \
+DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+DEX_TEST_TRINO_URL=http://dex_ro@localhost:8085 \
     uv run pytest tests/integration -q -m cube
 ```
 
@@ -555,7 +566,8 @@ DEX_TEST_ELEMENTARY=1 uv run pytest tests/transform/test_elementary_fixture.py
 ```
 
 Without the variable they collect as skipped with it named in the skip reason.
-They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
+They install the package at 0.26.1 and, for the mutation-run cases and the
+upgrade from one release to the other that `maintain check` reads, at 0.23.0,
 the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
 run and fails `dbt build` on DuckDB), and most installs pin 0.15 or 0.16, so
 those build on Postgres instead. DuckDB still parses 0.16.4, so the resolver's

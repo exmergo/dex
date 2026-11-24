@@ -45,7 +45,14 @@ OPEN = mon.Gate(
 
 
 def _render(
-    payload: dict, *, content=None, gate=OPEN, rows=None, notes=None, outputs=None
+    payload: dict,
+    *,
+    content=None,
+    gate=OPEN,
+    rows=None,
+    notes=None,
+    outputs=None,
+    dialect=None,
 ):
     [declaration] = parse_declarations([payload])
     return render(
@@ -53,6 +60,7 @@ def _render(
         declaration,
         notes=notes,
         outputs=outputs,
+        dialect=dialect,
         monitors=gate,
         monitor_rows=rows,
     )
@@ -460,9 +468,9 @@ def _install(project: Path, enabled: str | None = "\"{{ target.name != 'dev' }}\
         'name: elementary\nversion: "0.26.1"\nconfig-version: 2\n', encoding="utf-8"
     )
     (package / "macros" / "tests.sql").write_text(
-        "{% test volume_anomalies(model, timestamp_column) %}"
+        "{% test volume_anomalies(model, timestamp_column, where_expression=none) %}"
         "select 1 where false{% endtest %}\n"
-        "{% test freshness_anomalies(model, timestamp_column) %}"
+        "{% test freshness_anomalies(model, timestamp_column, where_expression=none) %}"
         "select 1 where false{% endtest %}\n",
         encoding="utf-8",
     )
@@ -494,7 +502,7 @@ def _repo(
     (tmp_path / ".dex" / "config.yml").write_text(text, encoding="utf-8")
 
 
-ORDERS = "select 1 as order_id, current_timestamp as ordered_at\n"
+ORDERS = "select 1 as order_id, current_timestamp as ordered_at, 'placed' as status\n"
 DECLARED = {
     "model": "fct_orders",
     "description": "One row per order.",
@@ -746,3 +754,611 @@ def test_transform_declare_says_why_an_owed_monitor_was_not_written(
     said = json.dumps(declared)
     assert "disables the Elementary package" in said
     assert "no monitor was written" in said
+
+
+# --- the population filter as a where_expression (#1483) --------------------------
+
+
+def _filtered(*filters: dict, columns: dict | None = None) -> dict:
+    return {
+        "model": "fct_orders",
+        "population": {"filters": list(filters)},
+        "columns": {"ordered_at": {"role": "time"}, **(columns or {})},
+    }
+
+
+def _where(payload: dict, dialect: str | None = "duckdb", **kwargs) -> str | None:
+    [declaration] = parse_declarations([payload])
+    return mon.where_expression(declaration, dialect, **kwargs)
+
+
+def _arguments(content: str) -> list[dict]:
+    return [next(iter(t.values()))["arguments"] for t in _tests(content)]
+
+
+def test_includes_is_written_as_in():
+    assert (
+        _where(_filtered({"column": "status", "includes": ["placed", "shipped"]}))
+        == "status in ('placed', 'shipped')"
+    )
+
+
+def test_excludes_on_a_nullable_column_keeps_its_null_rows():
+    assert (
+        _where(_filtered({"column": "status", "excludes": ["cancelled"]}))
+        == "(status not in ('cancelled') or status is null)"
+    )
+
+
+def test_excludes_on_a_column_that_is_never_null_takes_no_null_arm():
+    assert (
+        _where(
+            _filtered(
+                {"column": "status", "excludes": ["cancelled"]},
+                columns={"status": {"null_rule": "never"}},
+            )
+        )
+        == "status not in ('cancelled')"
+    )
+
+
+def test_several_filters_join_with_and():
+    assert _where(
+        _filtered(
+            {"column": "status", "includes": ["placed"]},
+            {"column": "region", "excludes": ["test"]},
+        )
+    ) == ("status in ('placed') and (region not in ('test') or region is null)")
+
+
+@pytest.mark.parametrize(
+    ("dialect", "literal"),
+    [
+        ("duckdb", "'o''brien'"),
+        ("postgres", "'o''brien'"),
+        ("trino", "'o''brien'"),
+        ("bigquery", "'o\\'brien'"),
+        ("snowflake", "'o\\'brien'"),
+        ("databricks", "'o\\'brien'"),
+        ("redshift", "'o\\'brien'"),
+        ("clickhouse", "'o''brien'"),
+    ],
+)
+def test_an_embedded_quote_is_escaped_as_the_connector_reads_it(dialect, literal):
+    assert (
+        _where(_filtered({"column": "status", "includes": ["o'brien"]}), dialect)
+        == f"status in ({literal})"
+    )
+
+
+def test_a_backslash_is_doubled_where_it_starts_an_escape():
+    payload = _filtered({"column": "status", "includes": ["a\\b"]})
+    assert _where(payload, "duckdb") == "status in ('a\\b')"
+    assert _where(payload, "snowflake") == "status in ('a\\\\b')"
+
+
+def test_numbers_and_booleans_are_written_as_literals():
+    assert (
+        _where(_filtered({"column": "tier", "includes": [1, 2.5]}))
+        == "tier in (1, 2.5)"
+    )
+    assert (
+        _where(_filtered({"column": "is_test", "excludes": [True]}))
+        == "(is_test not in (TRUE) or is_test is null)"
+    )
+
+
+def test_a_list_mixing_text_with_numbers_or_booleans_is_unwritable():
+    # It states no one type for the column, and a where_expression cannot read
+    # the column's type the way maintain verify does at run time.
+    for values in (["a", 7], ["1", 2], ["a", False]):
+        with pytest.raises(mon.FilterUnwritableError) as raised:
+            _where(_filtered({"column": "code", "includes": values}))
+        assert raised.value.reason == mon.FILTER_UNWRITABLE
+
+
+def test_values_are_never_cast_to_another_type():
+    # Typed as declared: a numeric list is numbers, a text list is text.
+    assert _where(_filtered({"column": "code", "includes": ["1", "2"]})) == (
+        "code in ('1', '2')"
+    )
+    assert _where(_filtered({"column": "code", "includes": [1, 2]})) == (
+        "code in (1, 2)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("column", "dialect", "written"),
+    [
+        ("status", "snowflake", "status"),
+        ("Status", "bigquery", "Status"),
+        ("order status", "snowflake", '"order status"'),
+        ("order status", "postgres", '"order status"'),
+        ("order status", "bigquery", "`order status`"),
+        ("order status", "databricks", "`order status`"),
+        ("order status", "clickhouse", "`order status`"),
+        ("order", "duckdb", '"order"'),
+        ("user", "postgres", '"user"'),
+        # Snowflake reads only its own reserved words: `user` is not one, and
+        # quoting it would name a lower-case column dbt never created.
+        ("user", "snowflake", "user"),
+        ("limit", "snowflake", "limit"),
+    ],
+)
+def test_the_column_is_quoted_the_way_the_adapter_quotes_it(column, dialect, written):
+    assert (
+        _where(_filtered({"column": column, "includes": ["x"]}), dialect)
+        == f"{written} in ('x')"
+    )
+
+
+def test_a_column_the_entry_marks_quote_true_is_quoted():
+    assert (
+        _where(
+            _filtered({"column": "status", "includes": ["x"]}),
+            "snowflake",
+            quoted=frozenset({"status"}),
+        )
+        == "\"status\" in ('x')"
+    )
+
+
+def test_a_filter_that_needs_a_connector_rule_with_none_configured_is_unwritable():
+    for payload in (
+        _filtered({"column": "order status", "includes": ["x"]}),
+        _filtered({"column": "status", "includes": ["o'brien"]}),
+    ):
+        with pytest.raises(mon.FilterUnwritableError) as raised:
+            _where(payload, None)
+        assert raised.value.reason == mon.FILTER_UNWRITABLE
+    # Nothing to quote or escape: the connector decides nothing.
+    assert _where(_filtered({"column": "status", "includes": ["x"]}), None) == (
+        "status in ('x')"
+    )
+
+
+def test_a_snowflake_reserved_word_is_written_only_with_quote_true():
+    payload = _filtered({"column": "order", "includes": ["x"]})
+    with pytest.raises(mon.FilterUnwritableError) as raised:
+        _where(payload, "snowflake")
+    assert "quote: true" in str(raised.value)
+    assert _where(payload, "snowflake", quoted=frozenset({"order"})) == (
+        "\"order\" in ('x')"
+    )
+
+
+def test_a_value_holding_a_jinja_delimiter_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": "status", "includes": ["{{ var('x') }}"]}))
+
+
+def test_a_column_name_holding_a_jinja_delimiter_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": "a{{b}}", "includes": ["x"]}))
+
+
+def test_no_filters_give_no_where_expression():
+    assert _where(_time("ordered_at")) is None
+    assert _where(_filtered({"column": "status"})) is None
+
+
+def test_a_model_declaring_includes_writes_it_on_every_monitor():
+    out = _render(
+        _filtered({"column": "status", "includes": ["placed"]}), notes=[], rows=[]
+    )
+
+    assert _arguments(out) == [
+        {"timestamp_column": "ordered_at", "where_expression": "status in ('placed')"},
+        {"timestamp_column": "ordered_at", "where_expression": "status in ('placed')"},
+    ]
+    marker = next(iter(_tests(out)[0].values()))["config"]["meta"]["dex"]["monitor"]
+    assert marker["filter"] == "population.filters"
+
+
+def test_a_model_with_no_filters_writes_monitors_with_no_where_expression():
+    out = _render(_time("ordered_at"))
+
+    assert _arguments(out) == [
+        {"timestamp_column": "ordered_at"},
+        {"timestamp_column": "ordered_at"},
+    ]
+
+
+def test_a_filter_on_a_column_the_model_does_not_output_writes_no_monitor():
+    rows: list = []
+    out = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        rows=rows,
+        outputs=frozenset({"ordered_at"}),
+    )
+
+    assert "anomalies" not in out
+    assert {(r["status"], r["reason"]) for r in rows} == {
+        (mon.NOT_RENDERED, mon.FILTER_COLUMN_NOT_OUTPUT)
+    }
+
+
+def test_a_monitor_written_before_the_filter_was_declared_is_stale_and_kept():
+    before = _render(_time("ordered_at"))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=before,
+        rows=rows,
+        notes=notes,
+    )
+
+    statuses = sorted((r["test"], r["status"]) for r in rows)
+    assert statuses == [
+        (FRESHNESS, mon.ADDED),
+        (FRESHNESS, mon.STALE),
+        (VOLUME, mon.ADDED),
+        (VOLUME, mon.STALE),
+    ]
+    # Never removed: the unfiltered pair is still listed beside the new one.
+    assert len(_tests(after)) == 4
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert {r["changed"] for r in stale} == {"where_expression"}
+    # The note names the filter, not a time column the declaration still gives.
+    assert len(notes) == 2
+    assert all("where_expression" in n and "time column" not in n for n in notes)
+
+
+def test_declaring_the_filter_again_lists_each_monitor_once():
+    payload = _filtered({"column": "status", "includes": ["placed"]})
+    once = _render(payload)
+    rows: list = []
+
+    twice = _render(payload, content=once, rows=rows)
+
+    assert twice == once
+    assert {r["status"] for r in rows} == {mon.ALREADY_LISTED}
+
+
+def test_a_hand_written_monitor_keeps_its_own_where_expression():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    data_tests:\n"
+        "      - elementary.volume_anomalies:\n"
+        "          arguments:\n"
+        "            timestamp_column: ordered_at\n"
+        "            where_expression: \"region = 'emea'\"\n"
+    )
+    rows: list = []
+
+    out = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=content,
+        rows=rows,
+    )
+
+    assert out.startswith(content.split("      - elementary")[0])
+    assert "where_expression: \"region = 'emea'\"" in out
+    volume = next(r for r in rows if r["test"] == VOLUME)
+    assert volume["status"] == mon.HAND_WRITTEN
+
+
+def test_a_decision_names_the_where_expression_and_the_filter_field():
+    out = _render(_filtered({"column": "status", "includes": ["placed"]}))
+
+    [volume, _] = decisions({"models/schema.yml": out}, ["fct_orders"])
+
+    assert volume["chosen"] == (
+        "timestamp_column: ordered_at; where_expression: status in ('placed')"
+    )
+    assert "population.filters" in volume["detail"]
+    assert volume["field"] == "columns.ordered_at.role: time"
+    assert "column" not in volume
+
+
+# The two places Elementary's table monitors splice a where_expression, read in
+# macros/edr/data_monitoring/monitors_query/table_monitoring_query.sql at the
+# package's e3ab23d8: on its own, and after the time-bucket filter with a bare
+# `and`, which is what the anomaly tests run with a timestamp_column.
+_SPLICES = (
+    "select count(*) from orders where {where}",
+    "select count(*) from orders where ordered_at >= date '2024-01-01' and {where}",
+)
+
+
+def _orders():
+    duckdb = pytest.importorskip("duckdb")
+    connection = duckdb.connect()
+    connection.execute(
+        "create table orders as select * from (values"
+        " (1, 'placed', 'emea', date '2024-02-01'),"
+        " (2, 'shipped', 'emea', date '2024-02-01'),"
+        " (3, 'cancelled', 'test', date '2024-02-01'),"
+        " (4, 'placed', null, date '2024-02-01'),"
+        " (5, null, null, date '2024-02-01'),"
+        " (6, 'placed', null, date '2023-01-01')"
+        ") as t(order_id, status, region, ordered_at)"
+    )
+    return connection
+
+
+def _monitored(connection, where: str) -> list[int]:
+    counts = [connection.execute(s.format(where=where)).fetchone()[0] for s in _SPLICES]
+    return counts
+
+
+def test_the_written_includes_selects_exactly_the_declared_rows():
+    connection = _orders()
+    out = _render(_filtered({"column": "status", "includes": ["placed", "shipped"]}))
+    [where] = {a["where_expression"] for a in _arguments(out)}
+
+    # Rows 1, 2, 4 and 6 are placed or shipped; 3 is cancelled and 5 is NULL,
+    # both outside the population. Row 6 is before the time bucket.
+    assert _monitored(connection, where) == [4, 3]
+
+
+def test_the_written_excludes_keeps_null_rows_inside_the_time_bucket():
+    connection = _orders()
+    out = _render(_filtered({"column": "region", "excludes": ["test"]}))
+    [where] = {a["where_expression"] for a in _arguments(out)}
+
+    # Every row but 3 is in the population, NULL regions (4, 5, 6) included;
+    # behind the time bucket, row 6 stays out.
+    assert _monitored(connection, where) == [5, 4]
+
+
+def test_the_plan_writes_the_filter_as_the_monitors_where_expression(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    declared = {
+        **DECLARED,
+        "population": {
+            "rule": "Placed orders.",
+            "filters": [{"column": "status", "includes": ["placed"]}],
+        },
+    }
+
+    planned = _plan(tmp_path, capsys, declared)
+
+    assert planned["status"] == "ok", planned["errors"]
+    rows = planned["data"]["monitors"]["monitors"]
+    assert {r["arguments"].get("where_expression") for r in rows} == {
+        "status in ('placed')"
+    }
+    chosen = [d["chosen"] for d in planned["data"]["decisions"] if "monitor" in d]
+    assert (
+        chosen
+        == ["timestamp_column: ordered_at; where_expression: status in ('placed')"] * 2
+    )
+
+
+def test_transform_declare_writes_owed_monitors_with_the_declared_filter(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, current_timestamp as signed_up_at, 'paid' as plan\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "          population:\n"
+        "            rule: Customers not on the internal plan.\n"
+        "            filters:\n"
+        "              - column: plan\n"
+        "                excludes: [internal]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    proposed = _dex(
+        ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+        capsys,
+    )
+
+    assert proposed["status"] == "ok", proposed["errors"]
+    [proposal] = proposed["data"]["proposed"]
+    wheres = {
+        m["arguments"].get("where_expression")
+        for m in proposal["fields"]["monitors"]["value"]
+    }
+    assert wheres == {"(plan not in ('internal') or plan is null)"}
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "staging" / "schema.yml").read_text(
+        encoding="utf-8"
+    )
+    assert written.count("where_expression:") == 2
+
+
+# --- the final pass (#1483 review) ----------------------------------------------
+
+
+CLOSED = mon.Gate(
+    vendor="elementary",
+    package=mon.INSTALLED,
+    release="0.26.1",
+    production=mon.DISABLED,
+    production_reason=mon.LITERAL,
+    prod_target="prod",
+)
+
+
+def test_a_stale_monitor_is_kept_while_its_replacement_cannot_be_written():
+    before = _render(_time("ordered_at"))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=before,
+        gate=CLOSED,
+        rows=rows,
+        notes=notes,
+    )
+
+    # Nothing new is written beside the old pair.
+    assert len(_tests(after)) == 2
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert {r["replacement"]["status"] for r in stale} == {mon.NOT_RENDERED}
+    assert {r["replacement"]["reason"] for r in stale} == {mon.PRODUCTION_DISABLED}
+    assert len(notes) == 2
+    for note in notes:
+        assert "keep this one" in note
+        assert mon.PRODUCTION_DISABLED in note
+        assert "remove it, since" not in note
+
+
+def test_a_stale_monitor_whose_replacement_is_written_asks_for_removal():
+    before = _render(_time("ordered_at"))
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=before,
+        rows=rows,
+        notes=notes,
+    )
+
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert {r["replacement"]["status"] for r in stale} == {mon.ADDED}
+    assert all("remove it, since" in n for n in notes)
+
+
+@pytest.mark.parametrize(
+    ("column", "written"),
+    [
+        ("range", "`range`"),
+        ("partition", "`partition`"),
+        ("interval", "`interval`"),
+        ("rows", "`rows`"),
+        ("status", "status"),
+    ],
+)
+def test_a_bigquery_reserved_word_is_backtick_quoted(column, written):
+    # No `quote: true`: BigQuery requires the keyword quoted.
+    assert (
+        _where(_filtered({"column": column, "includes": ["x"]}), "bigquery")
+        == f"{written} in ('x')"
+    )
+
+
+@pytest.mark.parametrize("dialect", ["bigquery", "duckdb", "snowflake", None])
+@pytest.mark.parametrize("value", ["a\nb", "a\rb"])
+def test_a_value_holding_a_line_break_is_unwritable(dialect, value):
+    with pytest.raises(mon.FilterUnwritableError) as raised:
+        _where(_filtered({"column": "status", "includes": [value]}), dialect)
+    assert raised.value.reason == mon.FILTER_UNWRITABLE
+    # A single-line value is written unchanged.
+    assert _where(_filtered({"column": "status", "includes": ["a b"]}), dialect) == (
+        "status in ('a b')"
+    )
+
+
+def test_a_non_finite_number_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": "rate", "includes": [float("inf")]}))
+
+
+def test_a_quoted_column_holding_its_quote_character_is_unwritable():
+    with pytest.raises(mon.FilterUnwritableError):
+        _where(_filtered({"column": 'a"b', "includes": ["x"]}), "duckdb")
+
+
+def test_a_column_the_yaml_entry_marks_quote_true_is_quoted_through_decide():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: status\n"
+        "        quote: true\n"
+    )
+
+    out = _render(
+        _filtered({"column": "status", "includes": ["placed"]}),
+        content=content,
+        dialect="duckdb",
+    )
+
+    assert {a["where_expression"] for a in _arguments(out)} == {
+        "\"status\" in ('placed')"
+    }
+
+
+def test_the_plan_escapes_the_filter_for_the_configured_connector(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    # A quote in a value needs the connector's escaping, so the configured
+    # dialect has to reach the monitors the plan writes.
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    declared = {
+        **DECLARED,
+        "population": {"filters": [{"column": "status", "includes": ["o'k"]}]},
+    }
+
+    planned = _plan(tmp_path, capsys, declared)
+
+    assert planned["status"] == "ok", planned["errors"]
+    rows = planned["data"]["monitors"]["monitors"]
+    assert {r["status"] for r in rows} == {mon.ADDED}
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "marts" / "fct_orders.yml").read_text(
+        encoding="utf-8"
+    )
+    wheres = {a["where_expression"] for a in _arguments(written)}
+    assert wheres == {"status in ('o''k')"}
+
+
+def test_a_stale_monitor_is_kept_when_its_new_filter_is_unwritable():
+    # Written with filter A on ordered_at; the declaration now gives a filter
+    # dex cannot write on the same time column. The time column did not move,
+    # so the old monitor is the model's only one and must be kept.
+    before = _render(_filtered({"column": "status", "includes": ["placed"]}))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _filtered({"column": "status", "includes": ["a\nb"]}),
+        content=before,
+        rows=rows,
+        notes=notes,
+    )
+
+    # The old monitors stay as written, and nothing is added beside them.
+    assert _tests(after) == _tests(before)
+    stale = [r for r in rows if r["status"] == mon.STALE]
+    assert len(stale) == 2
+    assert {r["changed"] for r in stale} == {"where_expression"}
+    assert {
+        (r["replacement"]["status"], r["replacement"]["reason"]) for r in stale
+    } == {(mon.NOT_RENDERED, mon.FILTER_UNWRITABLE)}
+    assert len(notes) == 2
+    for note in notes:
+        assert "keep this one until it can be written" in note
+        assert mon.FILTER_UNWRITABLE in note
+        assert "remove it, since" not in note
+        assert "declare the time column again" not in note

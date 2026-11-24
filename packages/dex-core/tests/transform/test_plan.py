@@ -2321,3 +2321,183 @@ def test_a_sql_only_mart_edit_with_packages_missing_skips_the_derivation_parse(
     assert "transform deps" in parse["detail"]
     assert "dbt deps" not in parse["detail"]
     assert envelope["data"]["paths"] == ["models/marts/fct_orders.sql"]
+
+
+def test_plan_id_scoped_to_dbt_project(tmp_path: Path):
+    """Identical edits in two dbt projects yield different plan IDs (#1547).
+
+    Both plans remain retrievable and apply to their respective directories
+    without collision or overwriting.
+    """
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit
+
+    for name in ("analytics", "finance"):
+        proj = tmp_path / name
+        (proj / "models").mkdir(parents=True)
+        yml_text = (
+            f"name: {name}\nversion: '1.0.0'\nprofile: {name}\n"
+            "model-paths: ['models']\n"
+        )
+        (proj / "dbt_project.yml").write_text(yml_text, encoding="utf-8")
+
+    store = FilesystemStore(tmp_path)
+    edits = [
+        PlanEdit(
+            path="models/mart.sql",
+            new_content="select 1 as id\n",
+            op=EditOp.UPSERT,
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+    with DexEngine(
+        repo_root=tmp_path,
+        config=DexConfig(dbt_project_dir="analytics"),
+        store=store,
+    ) as e1:
+        p1 = e1.plan("add mart", edits=edits)
+    with DexEngine(
+        repo_root=tmp_path,
+        config=DexConfig(dbt_project_dir="finance"),
+        store=store,
+    ) as e2:
+        p2 = e2.plan("add mart", edits=edits)
+
+    assert p1.plan_id != p2.plan_id
+    assert store.load_plan(p1.plan_id).project_dir == "analytics"
+    assert store.load_plan(p2.plan_id).project_dir == "finance"
+
+    with DexEngine(
+        repo_root=tmp_path,
+        config=DexConfig(dbt_project_dir="analytics"),
+        store=store,
+    ) as e1:
+        res1 = e1.apply(p1.plan_id)
+    assert res1.written == ["models/mart.sql"]
+    assert (tmp_path / "analytics" / "models" / "mart.sql").exists()
+    assert not (tmp_path / "finance" / "models" / "mart.sql").exists()
+
+    with DexEngine(
+        repo_root=tmp_path,
+        config=DexConfig(dbt_project_dir="finance"),
+        store=store,
+    ) as e2:
+        res2 = e2.apply(p2.plan_id)
+    assert res2.written == ["models/mart.sql"]
+    assert (tmp_path / "finance" / "models" / "mart.sql").exists()
+
+
+def test_plan_id_stable_and_portable_across_separators():
+    """Project identity normalization is stable across checkouts and OS separators."""
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit, _plan_id
+
+    edits = [
+        PlanEdit(
+            path="models/mart.sql",
+            new_content="select 1 as id\n",
+            op=EditOp.UPSERT,
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+    pid1 = _plan_id("intent", edits, project_dir="sub/proj")
+    pid2 = _plan_id("intent", edits, project_dir="sub\\proj")
+    pid3 = _plan_id("intent", edits, project_dir="./sub/proj")
+    assert pid1 == pid2 == pid3
+
+    repeat = _plan_id("intent", edits, project_dir="sub/proj")
+    assert repeat == pid1
+
+
+def test_legacy_stored_plans_can_be_read_and_applied(tmp_path: Path):
+    """Existing stored plans can still be read and applied by ID (#1547)."""
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.engine import DexEngine
+    from exmergo_dex_core.storage import FilesystemStore
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit, TransformPlan
+
+    root_proj = tmp_path
+    (root_proj / "models").mkdir(parents=True)
+    (root_proj / "dbt_project.yml").write_text(
+        "name: root_shop\nversion: '1.0.0'\nprofile: root\nmodel-paths: ['models']\n",
+        encoding="utf-8",
+    )
+
+    nested_proj = tmp_path / "nested"
+    (nested_proj / "models").mkdir(parents=True)
+    nested_yml = (
+        "name: nested_shop\nversion: '1.0.0'\nprofile: nested\n"
+        "model-paths: ['models']\n"
+    )
+    (nested_proj / "dbt_project.yml").write_text(nested_yml, encoding="utf-8")
+
+    store = FilesystemStore(tmp_path)
+    legacy_root = TransformPlan(
+        plan_id="plegacyroot",
+        created_at="2026-01-01T00:00:00Z",
+        intent="legacy root",
+        project_dir=".",
+        edits=[
+            PlanEdit(
+                path="models/root_model.sql",
+                new_content="select 1 as col\n",
+                op=EditOp.UPSERT,
+                kind=EditKind.MODEL_SQL,
+            )
+        ],
+    )
+    legacy_nested = TransformPlan(
+        plan_id="plegacynest",
+        created_at="2026-01-01T00:00:00Z",
+        intent="legacy nested",
+        project_dir="nested",
+        edits=[
+            PlanEdit(
+                path="models/nested_model.sql",
+                new_content="select 2 as col\n",
+                op=EditOp.UPSERT,
+                kind=EditKind.MODEL_SQL,
+            )
+        ],
+    )
+    store.save_plan(legacy_root)
+    store.save_plan(legacy_nested)
+
+    assert store.load_plan("plegacyroot").project_dir == "."
+    assert store.load_plan("plegacynest").project_dir == "nested"
+
+    with DexEngine(repo_root=tmp_path, store=store) as engine:
+        res_root = engine.apply("plegacyroot")
+    assert res_root.written == ["models/root_model.sql"]
+    assert (tmp_path / "models" / "root_model.sql").exists()
+
+    with DexEngine(
+        repo_root=tmp_path,
+        config=DexConfig(dbt_project_dir="nested"),
+        store=store,
+    ) as engine:
+        res_nested = engine.apply("plegacynest")
+    assert res_nested.written == ["models/nested_model.sql"]
+    assert (tmp_path / "nested" / "models" / "nested_model.sql").exists()
+
+
+def test_plan_id_distinguishes_whitespace_in_project_dir():
+    """Project identity preserves directory whitespace distinctions."""
+    from exmergo_dex_core.edits import EditOp
+    from exmergo_dex_core.transform.plans import EditKind, PlanEdit, _plan_id
+
+    edits = [
+        PlanEdit(
+            path="models/mart.sql",
+            new_content="select 1 as id\n",
+            op=EditOp.UPSERT,
+            kind=EditKind.MODEL_SQL,
+        )
+    ]
+    pid1 = _plan_id("intent", edits, project_dir="analytics")
+    pid2 = _plan_id("intent", edits, project_dir=" analytics")
+    assert pid1 != pid2

@@ -9,7 +9,8 @@
 # query, and a test that passes against it proves dex never needed it to.
 #
 # Usage:
-#   scripts/setup_cube_dev.sh [--db duckdb|postgres|bigquery|snowflake|redshift]
+#   scripts/setup_cube_dev.sh [--db duckdb|postgres|bigquery|snowflake|redshift|
+#                                   clickhouse|trino]
 #                             [--model DIR]
 #   scripts/setup_cube_dev.sh --execute --db duckdb|postgres|bigquery [--model DIR]
 #   scripts/setup_cube_dev.sh --down          # remove every dex-cube-* container
@@ -29,7 +30,8 @@
 # --db defaults to postgres. --model defaults to scripts/cube/model, the model the
 # unit tests replay and the integration tests run; it is mounted read-only. One
 # container per database type, each on its own loopback port:
-#   duckdb 4000, postgres 4001, bigquery 4002, snowflake 4003, redshift 4004
+#   duckdb 4000, postgres 4001, bigquery 4002, snowflake 4003, redshift 4004,
+#   clickhouse 4005, trino 4006
 # (DEX_CUBE_PORT overrides). Cube Core outside dev mode does not reload an edited
 # model, so re-run this script after editing one: it recreates the container.
 #
@@ -86,7 +88,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            echo "usage: $0 [--execute] [--db duckdb|postgres|bigquery|snowflake|redshift] [--model DIR] | --down" >&2
+            echo "usage: $0 [--execute] [--db duckdb|postgres|bigquery|snowflake|redshift|clickhouse|trino] [--model DIR] | --down" >&2
             exit 2
             ;;
     esac
@@ -102,8 +104,10 @@ case "$DB" in
     bigquery) PORT_DEFAULT=4002 DB_ENV=(-e CUBEJS_DB_BQ_PROJECT_ID=render-only-000000) ;;
     snowflake) PORT_DEFAULT=4003 DB_ENV=(-e CUBEJS_DB_SNOWFLAKE_ACCOUNT=render-only -e CUBEJS_DB_NAME=RENDER_ONLY -e CUBEJS_DB_USER=render_only -e CUBEJS_DB_SNOWFLAKE_WAREHOUSE=RENDER_ONLY) ;;
     redshift) PORT_DEFAULT=4004 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_NAME=render_only -e CUBEJS_DB_USER=render_only) ;;
+    clickhouse) PORT_DEFAULT=4005 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_NAME=render_only -e CUBEJS_DB_USER=render_only) ;;
+    trino) PORT_DEFAULT=4006 DB_ENV=(-e CUBEJS_DB_HOST=192.0.2.1 -e CUBEJS_DB_PRESTO_CATALOG=render_only -e CUBEJS_DB_SCHEMA=render_only -e CUBEJS_DB_USER=render_only) ;;
     *)
-        echo "--db must be one of duckdb, postgres, bigquery, snowflake, redshift" >&2
+        echo "--db must be one of duckdb, postgres, bigquery, snowflake, redshift, clickhouse, trino" >&2
         exit 2
         ;;
 esac
@@ -232,7 +236,7 @@ fi
     umask 077
     {
         printf 'export CUBEJS_API_SECRET="$(cat %q)"\n' "$SECRET_FILE"
-        for db in duckdb postgres bigquery snowflake redshift; do
+        for db in duckdb postgres bigquery snowflake redshift clickhouse trino; do
             if docker inspect "dex-cube-$db" >/dev/null 2>&1; then
                 port=$(docker port "dex-cube-$db" 4000/tcp | head -1 | sed 's/.*://')
                 upper=$(printf '%s' "$db" | tr '[:lower:]' '[:upper:]')

@@ -20,8 +20,8 @@ ships only inside a Cube server, which renders a query over ``/v1/sql`` without
 executing it. ``query`` asks a Cube server for that SQL and runs it through the
 governed spine, in this order, because the safety contract is the order:
 
-1. the connector check: DuckDB, Postgres, BigQuery, Snowflake and Redshift,
-   each held to a golden of what Cube renders for it;
+1. the connector check: DuckDB, Postgres, BigQuery, Snowflake, Redshift,
+   ClickHouse and Trino, each held to a golden of what Cube renders for it;
 2. the PII request-gate on the grouped members, on the time dimension a grain
    buckets, and on every member a ``--where`` filter names, read from Cube's
    JSON filter (:mod:`...cube_dialect`) and looked up in the ``.dex/`` cache

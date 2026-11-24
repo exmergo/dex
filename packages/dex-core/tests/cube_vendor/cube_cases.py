@@ -20,7 +20,15 @@ MODEL_FILES = sorted(
 )
 
 #: The connectors Cube renders for in this release, each recorded.
-CONNECTORS = ("duckdb", "postgres", "bigquery", "snowflake", "redshift")
+CONNECTORS = (
+    "duckdb",
+    "postgres",
+    "bigquery",
+    "snowflake",
+    "redshift",
+    "clickhouse",
+    "trino",
+)
 
 #: ``explore semantic query`` requests, by the flags they pass.
 QUERIES: dict[str, dict] = {

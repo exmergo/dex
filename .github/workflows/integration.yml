@@ -56,8 +56,11 @@ name: Integration
 #   Cube: the `cube` job needs no setup: render-only Cube Core containers (dex
 #   executes, #913) and executing ones (`--api`, #914) started by
 #   scripts/setup_cube_dev.sh, over the Postgres service container and an
-#   in-memory DuckDB. A separate narrow `cube_cloud` job asks a Cube Cloud
-#   deployment serving the same model (scripts/setup_cube_cloud_ci.sh) under the
+#   in-memory DuckDB. The render-only path also runs over ClickHouse and Trino
+#   (#1410): the job starts its own keyless containers with the scripts the
+#   `clickhouse` and `trino` jobs use. A separate narrow `cube_cloud` job asks a
+#   Cube Cloud deployment serving the same model
+#   (scripts/setup_cube_cloud_ci.sh) under the
 #   protected cube-cloud-integration environment, with a one-hour token minted
 #   per run from the deployment's API secret; the deployment's warehouse is an
 #   in-memory DuckDB it builds itself, so it reaches nothing.
@@ -481,8 +484,11 @@ jobs:
     # rather than in ci.yml because installing the package needs the network,
     # and pull requests stay deterministic (#1380).
     runs-on: ubuntu-latest
-    # The file took about 15 minutes on a hosted runner (2026-11-22).
-    timeout-minutes: 30
+    # The file's 55 cases took 14:47 and 23:33 on two hosted runs on main
+    # (2026-11-23). Open pull requests add cases to it, so the limit leaves
+    # room for a slow runner: a run that hits it is cancelled, and main reads
+    # red.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: packages/dex-core
@@ -512,9 +518,12 @@ jobs:
     # answer was executed by dex. The executing containers (`--api`, #914) run
     # the same questions themselves, over the Postgres service as its read-only
     # role and an in-memory DuckDB built from scripts/cube/shop.sql. Their API
-    # secret is random per run and stays in a file.
+    # secret is random per run and stays in a file. ClickHouse and Trino (#1410)
+    # are rendered for and executed by dex only, over seeded containers this job
+    # starts with the `clickhouse` and `trino` jobs' own scripts, which is what
+    # the longer timeout is for.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/dex-core
@@ -539,6 +548,8 @@ jobs:
           --memory 1g
     env:
       DEX_TEST_PG_DSN: postgresql://dex_ro:dex_ro@localhost:5432/dex_dogfood
+      DEX_TEST_CH_DSN: clickhouse://dex_ro:dex_ro@127.0.0.1:8124/app
+      DEX_TEST_TRINO_URL: http://dex_ro@127.0.0.1:8085
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Refuse an unhardened service container
@@ -562,14 +573,27 @@ jobs:
           scripts/setup_cube_dev.sh --db postgres
           scripts/setup_cube_dev.sh --execute --db duckdb
           scripts/setup_cube_dev.sh --execute --db postgres
+      # dex names every Trino relation with its catalog, so the Trino renderer
+      # serves a copy of the model with each table under the seeded `memory`
+      # catalog; the test makes the same copy.
+      - name: Start ClickHouse and Trino, and a render-only Cube Core for each
+        working-directory: .
+        run: |
+          scripts/setup_clickhouse_dev.sh
+          scripts/setup_trino_dev.sh
+          cp -r scripts/cube/model "$RUNNER_TEMP/cube-trino-model"
+          sed -i 's/sql_table: app\./sql_table: memory.app./' \
+            "$RUNNER_TEMP"/cube-trino-model/cubes/*.yml
+          scripts/setup_cube_dev.sh --db clickhouse
+          scripts/setup_cube_dev.sh --db trino --model "$RUNNER_TEMP/cube-trino-model"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           python-version: "3.14"
-      - name: Sync (postgres + duckdb + cube + semantic-api + dev extras)
+      - name: Sync (postgres + duckdb + clickhouse + trino + cube + semantic-api + dev extras)
         run: >-
-          uv sync --extra postgres --extra duckdb --extra cube
-          --extra semantic-api --extra dev
+          uv sync --extra postgres --extra duckdb --extra clickhouse --extra trino
+          --extra cube --extra semantic-api --extra dev
       # The secret and the URLs come from the file the setup script wrote, read
       # in the one step whose tests use them.
       - name: Live Cube integration suite

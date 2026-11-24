@@ -904,6 +904,52 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      no_mutable_sql) until it changes. Dev target only; refused in
                                      values-free mode. Report only: status ok whatever the coverage.
                                      Reviewed for values-free mode without --mutate
+dex maintain incidents [<models>] [--invocations N]
+                                  -> the incidents the sources hold for the selected models' tests
+                                     (#1472), folded by the one lifecycle rule (references/
+                                     incidents.md). Sources, in precedence: Elementary's tables where
+                                     the package is installed, enabled and uploading, then dbt's
+                                     run_results.json. data.sources names each, read, missing or
+                                     refused with a reason_code, and an empty data.incidents means no
+                                     failure only where a source reads read. Elementary's read is a run
+                                     count, never a number of days: the newest N dbt_invocations rows
+                                     (20 by default, 2000 at most), through the query firewall, and
+                                     its five statements (plus a first read's profiles) are priced as
+                                     one handshake before any runs: on a billed connector the first
+                                     call is needs_confirmation having sent no statement. A schema outside
+                                     the committed source allowlist is refused before any connection
+                                     opens, naming the dex config set that adds it. data.window is the
+                                     invocations covered (first, last, count); data.price the estimate
+                                     and what it settled at; each incident carries its coverage and
+                                     retention bound. A dbt run Elementary also recorded takes its
+                                     place in the order, one started after the window follows it
+                                     (data.window.after_window, outside the count), and any
+                                     other is left out of the fold (folded: false). Read-only;
+                                     refused in values-free mode
+dex maintain diagnose [<models>] [--invocations N]
+                                  -> each open incident on the selected models' tests diagnosed to a
+                                     cause (#1475), read as maintain incidents reads them, with the
+                                     repository's history handed to the fold. data.diagnoses[] holds,
+                                     per incident: range (after the last observed-good run, through
+                                     the first observed-bad one; an unobserved run widens it, never
+                                     splits it), snapshots (the committed versions of
+                                     .dex/snapshot.json that bound it: before, at or before the last
+                                     observed pass; after, at or after the first failure; series none
+                                     on a project's first day), unseen (the windows no recorded state
+                                     covers), and every candidate with the existing check that
+                                     answered it (check, finding, evidence as counts). This release
+                                     checks a uniqueness test failing because the loader delivered a
+                                     key twice, with the grain axis on each source the tested model
+                                     reads: key_lost_uniqueness against a bounding snapshot that
+                                     proved the key unique, else the declared-claim check
+                                     (declared_grain_not_unique). The project is ruled out where the
+                                     failing commit passed earlier; seed, package and schedule are
+                                     not_checked. verdict is cause, several or no_cause; no_cause
+                                     answers with ruled_out and unseen and never names the likeliest
+                                     candidate. A confirmed cause's repair is handed to transform
+                                     under next_steps, never written. The checks are priced as one
+                                     handshake after the incident read's own. Read-only; refused in
+                                     values-free mode
 ```
 
 ### How authored content reaches the engine
@@ -1589,7 +1635,26 @@ default, or a filter or operator after it is refused. A key naming a location
   and carrying `config.meta.dex.monitor` (`vendor`, `from`: the declaration
   field) and the `dex_monitor` tag. Several time columns give a
   `freshness_anomalies` on each and no `volume_anomalies`
-  (`ambiguous_time_column`); none gives neither (`no_time_column`). Nothing is
+  (`ambiguous_time_column`); none gives neither (`no_time_column`). A declared
+  `population.filters` is written as each monitor's `where_expression`
+  (#1483): `includes` as `<column> in (...)`, `excludes` as `(<column> not in
+  (...) or <column> is null)` (no NULL arm where the column declares
+  `null_rule: never`), joined with `and`, each part holding an `or`
+  parenthesised, since Elementary appends it to its time-bucket filter with a
+  bare `and`. Literals are typed as declared, with no cast, text escaped as
+  the `dex_population_filter_literal` macro escapes it on the connector, so a
+  list in another type than the column's can fail or, through an implicit
+  conversion, change which rows are counted; the column is quoted as the
+  adapter quotes it where it must be (`quote: true`, a reserved word, not a
+  plain identifier; BigQuery and Snowflake read their own reserved words, and
+  Snowflake's only with `quote: true`). A filter that cannot be written (its
+  column not output, a list mixing text with numbers or booleans, a Jinja
+  delimiter, a line break, a rule with no connector) withholds the model's monitors
+  (`filter_column_not_output`, `filter_unwritable`), and the marker gains
+  `filter: population.filters`. A stale monitor's row says what `changed`
+  (`timestamp_column` or `where_expression`) and, where only the
+  `where_expression` did, the current one's `replacement` status, so the note
+  asks for removal only once the current one is listed. Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an
@@ -1599,7 +1664,8 @@ default, or a filter or operator after it is refused. A key naming a location
   (`package_not_installed`, `production_disabled`, `production_unknown`) and one
   warning says why. A hand-written monitor of the same test (and, for
   freshness, the same `timestamp_column`) is `hand_written` and left as
-  written; one Dex wrote that the declaration no longer gives is `stale` and
+  written, its `where_expression` included; one Dex wrote that the declaration
+  no longer gives (another time column or `where_expression`) is `stale` and
   never removed. `data.monitors` holds `vendor`, `package` (`status`,
   `release`), `production` (`status`, `reason`, `prod_target`, `expression`),
   `counts` and `monitors[]` (`model`, `test`, `column`, `arguments`, `field`,
@@ -1608,6 +1674,42 @@ default, or a filter or operator after it is refused. A key naming a location
   `field` and no `column`, so it settles no change-scope entry. Monitors are not
   generated tests: `declarations.render_tests` does not govern them and no
   per-run estimate prices them.
+- The same setting writes Elementary's **PII tag** (#1487). With
+  `monitors.vendor: elementary` and the package installed (or added by the
+  plan), every plan, with or without a declaration, tags each column a model it
+  writes marks as PII in its YAML (any key a reader accepts, at any confidence)
+  in `config.meta.tags`, the model in `config.tags` (both appended to tags
+  already there), and adds `disable_samples_on_pii_tags: true` under `vars:` in
+  `dbt_project.yml` as a `project_yml` edit, so the project's own tests keep no
+  sample of those columns. A plan that rewrites an existing model's SQL gets
+  the tags but not the switch (`withheld`, warned): a `dbt_project.yml` edit
+  would stop that rewrite's refactor comparison and downstream impact check,
+  and `transform declare` adds it in a plan of its own (`fields.pii_tags.switch`).
+  The tag is `pii`, or the first entry of the project's `pii_tags`, both vars
+  read as the project's own tests read them: a block keyed by the root
+  project's name wins over the global one, and a block keyed `elementary` is
+  not read. A `pii_tags` written as one string is warned, since some releases
+  (0.23.0 among them) match a model's tags against its characters.
+  Written models are those whose SQL the plan writes, those it declares and
+  those whose YAML entry it changes; `transform declare` proposes a model whose
+  only owed change is the tag (`fields.pii_tags`). A `false` under `pii`,
+  `contains_pii` or `is_pii` wins over a `pii_category` beside it, a tag in any
+  place the package reads (`tags`, `config.tags`, `meta.tags`,
+  `config.meta.tags`, any case) is `already_tagged`, a column with a top-level
+  `meta` and no `config.meta` is `not_written` (`top_level_meta`), and a switch
+  the project sets is kept as written (`set_off_by_project`, `unread`, each
+  warned). A warning states that every test on a tagged model, the project's
+  own included, keeps no sample of its failing rows, and another says where the
+  installed release reads less. `data.pii_tags` holds `vendor`, `tag`,
+  `tag_source` (`default`, `pii_tags`), `switch` (`var`, `status`: `added`,
+  `already_on`, `set_off_by_project`, `unread`, `withheld`, `not_written`;
+  `path`),
+  `release`, `rule` (`none` before 0.19.2, `model_tags_only` from 0.19.2 to
+  0.19.4, which read no column's `config.meta.tags`, `model_and_column_tags`
+  from 0.20.0, `unknown`), `sampling`, `counts` and `models[]` (`model`,
+  `path`, `model_tag`, `columns[]` with `column`, `version`, `status`,
+  `reason`), and is absent where the setting is unset, the package is not
+  installed, or no written model has a marked column.
 - `transform plan` reports the **row-population consequence** of an edit to a
   model that already exists, under `data.row_attribution`. Validation proves an
   edit is well formed; this is the only plan-time check that asks whether it

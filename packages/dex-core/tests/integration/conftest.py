@@ -114,6 +114,14 @@ DBX_MAX_SECONDS = float(os.environ.get("DEX_TEST_DATABRICKS_MAX_SECONDS", "60"))
 
 RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
 
+# The warehouses a live Cube test runs on beside DuckDB: the variable that
+# reaches each, and the driver it needs.
+_CUBE_WAREHOUSES = {
+    "postgres": ("DEX_TEST_PG_DSN", "psycopg"),
+    "clickhouse": ("DEX_TEST_CH_DSN", "clickhouse_connect"),
+    "trino": ("DEX_TEST_TRINO_URL", "trino"),
+}
+
 CH_MAX_SECONDS = float(os.environ.get("DEX_TEST_CH_MAX_SECONDS", "60"))
 
 TRINO_MAX_SECONDS = float(os.environ.get("DEX_TEST_TRINO_MAX_SECONDS", "60"))
@@ -209,15 +217,21 @@ def _require_cloud_env(request):
         return
     if request.node.get_closest_marker("cube"):
         # Ahead of every warehouse branch: a Cube test needs its renderer as
-        # well as its warehouse, and one without `postgres` runs on DuckDB.
-        warehouse = (
-            "postgres" if request.node.get_closest_marker("postgres") else "duckdb"
+        # well as its warehouse, and one that names none runs on DuckDB.
+        warehouse = next(
+            (
+                name
+                for name in _CUBE_WAREHOUSES
+                if request.node.get_closest_marker(name)
+            ),
+            "duckdb",
         )
+        dsn, driver = _CUBE_WAREHOUSES.get(warehouse, (None, "duckdb"))
         required = ["CUBEJS_API_SECRET", f"DEX_TEST_CUBE_URL_{warehouse.upper()}"]
         if request.node.get_closest_marker("cube_execute"):
             required.append(f"DEX_TEST_CUBE_EXEC_URL_{warehouse.upper()}")
-        if warehouse == "postgres":
-            required.append("DEX_TEST_PG_DSN")
+        if dsn:
+            required.append(dsn)
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
             execute = (
@@ -229,7 +243,7 @@ def _require_cloud_env(request):
                 "~/.cache/dex-dogfood/cube.env)"
             )
         pytest.importorskip("httpx")
-        pytest.importorskip("psycopg" if warehouse == "postgres" else "duckdb")
+        pytest.importorskip(driver)
         return
     if request.node.get_closest_marker("snowflake"):
         if not _snowflake_enabled():

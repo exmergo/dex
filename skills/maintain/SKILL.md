@@ -458,6 +458,29 @@ models at most per run, and runs again on the rest. It is priced and confirmed
 once for the whole batch on a metered connector, under the same spending rules
 as any confirmation.
 
+For a question about a test's run history ("since when has this test failed",
+"is it still failing", "did it flap"), run `maintain incidents [<model>]`. It
+reads Elementary's tables over the newest 20 invocations (`--invocations <n>`
+widens it) and dbt's last run results, and folds them into incidents. Read
+`data.sources` first: each source is `read`, `missing` or `refused` with a
+reason code, and an empty `incidents` list means no failure only where a source
+reads `read`. Relay `first_observed: unknown` as an unknown start, never as
+the first run read. A source `refused` for `outside_allowlist` names the
+`dex config set` that would add the schema; that change is the person's, under
+the same rules as any config change. On a metered connector the read is priced
+first, under the same spending rules as any confirmation.
+
+For "why is this test failing" or "what broke it", run
+`maintain diagnose [<model>]`. Each entry of `data.diagnoses` is one open
+incident. Relay its `verdict`: with `cause`, name the cause, its owner, the
+`check` and `finding` that confirmed it and its `evidence`; with `no_cause`,
+say no cause was confirmed, list `ruled_out` and the `unseen` windows, and
+never offer the likeliest candidate as the cause. A candidate `not_checked` was
+not ruled out. `snapshots.series: none` means no baseline was committed, so a
+confirmed cause is present now and when it entered the break is unseen. The
+repair in `next_steps` is a `transform` plan for the transform workflow to
+author; diagnosis writes nothing.
+
 Per-axis fields and finding codes are in
 `${CLAUDE_SKILL_DIR}/references/axes.md`. Read it when a finding's code or field
 is not described here.

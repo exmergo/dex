@@ -43,6 +43,39 @@ _COMMIT = re.compile(COMMIT_PATTERN)
 #: Seconds one ``git`` call may take before the history reads as unreadable.
 GIT_TIMEOUT_SECONDS = 20.0
 
+#: The variables that point ``git`` at a repository other than the one found
+#: from its working directory (``git rev-parse --local-env-vars``). A process
+#: started from a git hook, or under a harness that exports ``GIT_DIR``, carries
+#: them, and ``git -C <path>`` would then read that repository instead.
+REPOSITORY_ENV: tuple[str, ...] = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_INTERNAL_SUPER_PREFIX",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+)
+
+
+def git_env() -> dict[str, str]:
+    """The environment for a read-only ``git`` call that locates its
+    repository by path: prompts and optional locks off, and none of
+    :data:`REPOSITORY_ENV`, so the path alone decides which repository is
+    read."""
+
+    env = {k: v for k, v in os.environ.items() if k not in REPOSITORY_ENV}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
 
 class HistoryUnreadableError(DexError, RuntimeError):
     """The history could not answer, as opposed to a commit absent from it.
@@ -137,9 +170,7 @@ class GitHistory:
 
     def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
         self._raise_if_failed()
-        env = dict(os.environ)
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_OPTIONAL_LOCKS"] = "0"
+        env = git_env()
         try:
             return subprocess.run(  # noqa: S603
                 ["git", "-C", str(self._root), "-c", "core.fsmonitor=false", *args],  # noqa: S607

@@ -292,6 +292,78 @@ class CoverageResult(Result):
         return payload
 
 
+class IncidentsResult(Result):
+    """The incidents the sources hold for the selected tests (#1472).
+
+    ``sources`` names every source, ``read``, ``missing`` or ``refused`` with a
+    reason code for the last two, so an empty ``incidents`` list is never read
+    as a clean history: it means no failure only where a source reads
+    ``read``.
+    ``window`` is the invocations the read covered, ``price`` what the read was
+    priced at and settled at, and each incident carries its coverage and
+    retention bound (#1465).
+    """
+
+    sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    window: dict[str, Any] = Field(default_factory=dict)
+    price: dict[str, Any] | None = None
+    incidents: list[dict[str, Any]] = Field(default_factory=list)
+    schedules: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    #: The selection, where one was given: the names and how many tests they
+    #: select. ``None`` with no names, which selects every test.
+    scope: dict[str, Any] | None = None
+    next_steps: list[dict[str, str]] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "sources": self.sources,
+            "window": self.window,
+            "price": self.price,
+            "incidents": self.incidents,
+            "schedules": self.schedules,
+        }
+        if self.scope is not None:
+            payload["scope"] = self.scope
+        payload["next_steps"] = self.next_steps
+        return payload
+
+
+class DiagnoseResult(Result):
+    """Each open incident diagnosed to a cause, or to none (#1475).
+
+    ``diagnoses`` holds one :class:`~.diagnosis.Diagnosis` per open incident:
+    its range, the snapshots that bound it, the window no recorded state
+    covers, and every candidate with the check that answered it.
+    ``not_diagnosed`` names the incidents that are not open. ``series`` is the
+    committed snapshot series as read. ``sources``, ``window`` and ``scope``
+    are the incident read's, as ``maintain incidents`` reports them; ``price``
+    keeps that read's price apart from the checks'.
+    """
+
+    diagnoses: list[dict[str, Any]] = Field(default_factory=list)
+    not_diagnosed: list[dict[str, Any]] = Field(default_factory=list)
+    series: dict[str, Any] = Field(default_factory=dict)
+    sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    window: dict[str, Any] = Field(default_factory=dict)
+    price: dict[str, Any] | None = None
+    scope: dict[str, Any] | None = None
+    next_steps: list[dict[str, str]] = Field(default_factory=list)
+
+    def data(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "diagnoses": self.diagnoses,
+            "not_diagnosed": self.not_diagnosed,
+            "series": self.series,
+            "sources": self.sources,
+            "window": self.window,
+            "price": self.price,
+        }
+        if self.scope is not None:
+            payload["scope"] = self.scope
+        payload["next_steps"] = self.next_steps
+        return payload
+
+
 class ReconcileResult(Result):
     """Proposed fixes for detected drift, as a stored plan of reviewable diffs.
 
