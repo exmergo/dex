@@ -43,7 +43,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -272,6 +272,85 @@ def strip_sampling_switch(project: Path) -> None:
     path.write_text(yaml.safe_dump(schema, sort_keys=False), encoding="utf-8")
 
 
+#: Every environment variable Elementary reads into a ``dbt_invocations`` row.
+#: On a CI runner they are set (GitHub Actions sets ``GITHUB_ACTIONS``,
+#: ``GITHUB_RUN_ID``, ``GITHUB_SHA`` and the rest), so Elementary records the
+#: orchestrator, the job and the commit, and columns that are NULL on any other
+#: machine are filled: the reading the fixture pins would then depend on where
+#: it ran. Clearing them makes every run read as a run outside an orchestrator.
+#:
+#: The list is read from ``macros/edr/dbt_artifacts/upload_dbt_invocation.sql``
+#: (``upload_dbt_invocation``, ``get_orchestrator``, ``get_job_url`` and
+#: ``get_job_run_url``), which is the same file at 0.23.0 and 0.26.1; its
+#: ``get_var`` and ``get_first_env_var`` read exactly the names passed. It is a
+#: list rather than a pattern such as ``GITHUB_*`` because a pattern would miss
+#: ``AIRFLOW_HOME``, ``DBT_CLOUD_*`` and the unprefixed names, and would clear
+#: variables Elementary does not read. A release that reads another name needs
+#: it added here.
+ORCHESTRATOR_ENV = (
+    # get_orchestrator
+    "ORCHESTRATOR",
+    "DBT_ORCHESTRATOR",
+    "AIRFLOW_HOME",
+    "DBT_CLOUD_PROJECT_ID",
+    "GITHUB_ACTIONS",
+    # job_id, job_run_id, job_name
+    "JOB_ID",
+    "DBT_JOB_ID",
+    "DBT_CLOUD_JOB_ID",
+    "JOB_RUN_ID",
+    "DBT_JOB_RUN_ID",
+    "DBT_CLOUD_RUN_ID",
+    "GITHUB_RUN_ID",
+    "JOB_NAME",
+    "DBT_JOB_NAME",
+    # env, env_id, project_id
+    "DBT_ENV",
+    "DBT_ENV_ID",
+    "DBT_PROJECT_ID",
+    "GITHUB_REPOSITORY",
+    # cause_category, cause, pull_request_id, git_sha, dbt_user, account_id
+    "DBT_CAUSE_CATEGORY",
+    "DBT_CLOUD_RUN_REASON_CATEGORY",
+    "GITHUB_EVENT_NAME",
+    "DBT_CAUSE",
+    "DBT_CLOUD_RUN_REASON",
+    "DBT_PULL_REQUEST_ID",
+    "DBT_CLOUD_PR_ID",
+    "GITHUB_HEAD_REF",
+    "DBT_GIT_SHA",
+    "DBT_CLOUD_GIT_SHA",
+    "GITHUB_SHA",
+    "DBT_USER",
+    "DBT_ACCOUNT_ID",
+    # get_job_url, get_job_run_url
+    "JOB_URL",
+    "DBT_JOB_URL",
+    "JOB_RUN_URL",
+    "DBT_JOB_RUN_URL",
+    "AIRFLOW_URL",
+    "DBT_CLOUD_ACCOUNT_ID",
+    "DBT_CLOUD_DOMAIN",
+    "GITHUB_SERVER_URL",
+)
+
+
+def without_orchestrator(environ: Mapping[str, str]) -> dict[str, str]:
+    """``environ`` with every name in :data:`ORCHESTRATOR_ENV` removed."""
+
+    return {k: v for k, v in environ.items() if k not in ORCHESTRATOR_ENV}
+
+
+@pytest.fixture
+def no_orchestrator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear :data:`ORCHESTRATOR_ENV` for the test, so the dbt that Dex itself
+    starts (``engine.build``) sees no orchestrator either. :func:`dbt` clears
+    them on its own, which covers a session fixture set up before this runs."""
+
+    for name in ORCHESTRATOR_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 def dbt(*argv: str, cwd: Path, check: bool = True, stderr: bool = True) -> str:
     """Run dbt itself, outside Dex, and return what it printed.
 
@@ -280,6 +359,9 @@ def dbt(*argv: str, cwd: Path, check: bool = True, stderr: bool = True) -> str:
     ``stderr=False`` returns stdout alone, for output read line by line as data
     (``dbt ls``): an interpreter warning dbt's dependencies print on stderr,
     such as pydantic's on Python 3.14, is not a line of it.
+
+    dbt runs with :data:`ORCHESTRATOR_ENV` cleared, so what Elementary records
+    of the run is the same on a CI runner as anywhere else.
     """
 
     executable = shutil.which("dbt")
@@ -288,7 +370,12 @@ def dbt(*argv: str, cwd: Path, check: bool = True, stderr: bool = True) -> str:
             pytest.fail(f"{ENV} is set but no dbt executable is on PATH")
         pytest.skip("needs the dbt executable on PATH")
     done = subprocess.run(  # noqa: S603
-        [executable, *argv], cwd=cwd, capture_output=True, text=True, check=False
+        [executable, *argv],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=without_orchestrator(os.environ),
     )
     if check and done.returncode:
         raise RuntimeError(f"dbt {' '.join(argv)} failed:\n{done.stdout}{done.stderr}")
