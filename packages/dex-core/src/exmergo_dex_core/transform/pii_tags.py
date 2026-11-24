@@ -41,6 +41,7 @@ from typing import Any
 import yaml
 
 from ..guards.pii_meta import entry_meta, says_pii
+from .global_edits import changes_global
 from .plans import EditKind, EditOp, PlanEdit
 
 #: The tag Elementary reads when the project sets no ``pii_tags``.
@@ -130,7 +131,7 @@ def tag(
     switch = switch_status(project_yml)
     warnings: list[str] = []
     rewritten = _rewritten_models(edits, prior)
-    if switch == SWITCH_ABSENT and rewritten and not _edits_project(edits, prior):
+    if switch == SWITCH_ABSENT and rewritten and not changes_global(edits, prior):
         # A `dbt_project.yml` edit can change how any model compiles, so a plan
         # carrying one gets no refactor comparison and no downstream impact on
         # the model it rewrites. The switch waits for a plan of its own.
@@ -406,29 +407,6 @@ def _rewritten_models(edits: list[PlanEdit], prior: Mapping[str, str]) -> list[s
         and edit.op is EditOp.UPSERT
         and edit.path in prior
     )
-
-
-def _edits_project(edits: list[PlanEdit], prior: Mapping[str, str]) -> bool:
-    """Whether the plan already changes what makes the checks treat it as global.
-
-    An edit that resends such a file unchanged is no change: the plan drops it
-    before it is stored, so merging the switch into it would be what made the
-    plan global."""
-
-    def changes(edit: PlanEdit) -> bool:
-        if edit.op is EditOp.DELETE or edit.path not in prior:
-            return True
-        return _lf(edit.new_content or "") != _lf(prior[edit.path])
-
-    return any(
-        edit.kind in (EditKind.PROJECT_YML, EditKind.PACKAGES_YML, EditKind.MACRO_SQL)
-        and changes(edit)
-        for edit in edits
-    )
-
-
-def _lf(text: str) -> str:
-    return text.replace("\r\n", "\n")
 
 
 def _entries(content: str | None) -> dict[str, Any]:

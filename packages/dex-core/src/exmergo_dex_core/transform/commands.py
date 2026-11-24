@@ -1312,8 +1312,8 @@ def _offer_refactor_comparison(
     ``--for-plan`` build can report whether each rewrite was compared.
     """
 
+    from .global_edits import COMPARE_GLOBAL_KINDS
     from .refactor_compare import (
-        _GLOBAL_KINDS,
         BlockedInput,
         _blocked_key,
         _blocked_parents,
@@ -1377,7 +1377,7 @@ def _offer_refactor_comparison(
         {b.model for b in blocked_all if b.model.split(".v")[0] in touched}
         | (
             set(blocked_names)
-            if blocked_all and any(edit.kind in _GLOBAL_KINDS for edit in edits)
+            if blocked_all and any(edit.kind in COMPARE_GLOBAL_KINDS for edit in edits)
             else set()
         )
     )

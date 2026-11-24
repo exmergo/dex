@@ -34,18 +34,8 @@ import yaml
 
 from ..edits import EditOp
 from ..manifest_paths import posix
+from .global_edits import PREREQUISITE_GLOBAL_KINDS
 from .plans import EditKind, PlanEdit
-
-#: The edit kinds that can change any node's result, wherever they sit.
-_GLOBAL_KINDS = frozenset(
-    {
-        EditKind.MACRO_SQL,
-        EditKind.PROJECT_YML,
-        EditKind.PACKAGES_YML,
-        EditKind.PROFILES_YML,
-        EditKind.TEST_SQL,
-    }
-)
 
 #: Keys of a schema YAML that only describe the nodes ``required`` already names.
 #: Anything else (``sources:`` above all) can change what a model reads.
@@ -150,7 +140,7 @@ def _plan_relation(
 def _reaches_any_node(edit: PlanEdit) -> bool:
     """Whether an edit can change a node its own path or entry does not name."""
 
-    if edit.kind in _GLOBAL_KINDS or edit.op is EditOp.DELETE:
+    if edit.kind in PREREQUISITE_GLOBAL_KINDS or edit.op is EditOp.DELETE:
         return True
     if edit.kind is not EditKind.SCHEMA_YML:
         return False
