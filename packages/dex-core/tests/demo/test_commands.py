@@ -1,4 +1,4 @@
-"""`dex demo` through the CLI: one envelope, two artifacts, five refusals.
+"""`dex demo` through the CLI: one envelope, its artifacts, five refusals.
 
 Driven through `main(argv)` rather than the generator, because everything under
 test here is the command's own behavior: what it wires up, what it declines to
@@ -24,6 +24,27 @@ pytest.importorskip("duckdb")
 # A constant for the reason the shim keeps one: the SELECT is printed text the
 # envelope carries, never a statement this module builds.
 _PII_PROBE = 'dex explore query "select email from customers"'
+
+# The dbt project the demo writes beside the warehouse (#1477), listed here
+# rather than read off the generator, so a file added or lost fails here: the
+# hand-authored files, then what its seeded build left under target/.
+PROJECT_SOURCES = [
+    "analytics/dbt_project.yml",
+    "analytics/profiles.yml",
+    "analytics/models/staging/_sources.yml",
+    "analytics/models/staging/_staging.yml",
+    "analytics/models/staging/stg_orders.sql",
+    "analytics/models/staging/stg_order_items.sql",
+]
+PROJECT_FILES = [
+    *PROJECT_SOURCES,
+    "analytics/target/manifest.json",
+    "analytics/target/run_results.json",
+]
+
+
+def _under(prefix: str, paths: list[str]) -> list[str]:
+    return [f"{prefix}/{path}" if prefix else path for path in paths]
 
 
 def _run(argv: list[str], capsys) -> dict:
@@ -53,7 +74,7 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     assert data["path"] == DEMO_FILENAME
     assert data["object_count"] == 7
     assert data["row_count"] == 29512
-    assert data["created"] == [DEMO_FILENAME, ".dex/config.yml"]
+    assert data["created"] == [DEMO_FILENAME, ".dex/config.yml", *PROJECT_FILES]
     assert (run_from.root / DEMO_FILENAME).is_file()
 
     # The config is what lets every printed command run with no flags at all,
@@ -64,21 +85,29 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     assert config is not None
     assert config.connector == "duckdb"
     assert config.duckdb is not None and config.duckdb.path == DEMO_FILENAME
-    assert [d["op"] for d in payload["diffs"]] == ["create"]
-    assert [d["path"] for d in payload["diffs"]] == [".dex/config.yml"]
+    # Pinned, so a second dbt project beside it never makes discovery ambiguous.
+    assert config.dbt_project_dir == "analytics"
+    # The reviewable files are diffs; the build's artifacts are not.
+    assert {d["op"] for d in payload["diffs"]} == {"create"}
+    assert [d["path"] for d in payload["diffs"]] == [
+        ".dex/config.yml",
+        *PROJECT_SOURCES,
+    ]
 
     assert [step["command"] for step in data["next_steps"]] == [
         f"dex explore map{run_from.rerun}",
         f"dex explore profile order_items products{run_from.rerun}",
         f"dex explore relationships --verify{run_from.rerun}",
         _PII_PROBE + run_from.rerun,
+        f"dex maintain incidents{run_from.rerun}",
+        f"dex maintain diagnose{run_from.rerun}",
     ]
     assert all(step["shows"] for step in data["next_steps"])
 
 
 def test_demo_creates_nothing_but_what_it_reports(run_from, capsys):
-    """No write-ahead log left behind, no cache, no plans directory: the two
-    artifacts named in `created` are exactly the two that exist. From outside,
+    """No write-ahead log left behind, no cache, no plans directory: the
+    artifacts named in `created` are exactly the ones that exist. From outside,
     `run_from` also holds the caller's own directory to nothing at all."""
 
     payload = _run(run_from.argv("demo"), capsys)
@@ -100,14 +129,15 @@ def test_repo_root_after_the_subcommand_lands_the_same(tmp_path: Path, capsys):
         for leftover in project.rglob("*"):
             if leftover.is_file():
                 leftover.unlink()
+        for leftover in sorted(project.rglob("*"), reverse=True):
+            if leftover.is_dir():
+                leftover.rmdir()
         payload = _run(spelling, capsys)
         assert payload["status"] == "ok", spelling
-        assert _files_under(project) == [".dex/config.yml", DEMO_FILENAME]
+        expected = sorted([".dex/config.yml", DEMO_FILENAME, *PROJECT_FILES])
+        assert _files_under(project) == expected
         # The cwd is `tmp_path` itself, so this is also "nothing in the cwd".
-        assert _files_under(tmp_path) == [
-            "project/.dex/config.yml",
-            f"project/{DEMO_FILENAME}",
-        ]
+        assert _files_under(tmp_path) == _under("project", expected)
 
 
 def test_demo_names_no_paradigm_because_it_resolved_no_connector(capsys):
@@ -136,15 +166,20 @@ def test_demo_takes_a_target_path(run_from, capsys):
     assert payload["data"]["created"] == [
         "sandbox/shop.duckdb",
         "sandbox/.dex/config.yml",
+        *_under("sandbox", PROJECT_FILES),
     ]
     assert (run_from.root / "sandbox" / "shop.duckdb").is_file()
     # The config lands beside the warehouse, so the commands have to name the
     # file: a bare `explore map` run from here would not find that config. The
     # name is spelled from the caller's shell, because a live --path is.
     named = f"{run_from.rerun} --path {run_from.spell('sandbox/shop.duckdb')}"
-    assert all(
-        step["command"].endswith(named) for step in payload["data"]["next_steps"]
-    )
+    *explore, incidents, diagnose = payload["data"]["next_steps"]
+    assert all(step["command"].endswith(named) for step in explore)
+    # The incident commands find the dbt project from the config's root, so they
+    # name that root, spelled from the caller's shell, rather than the file.
+    rooted = f" --repo-root {run_from.spell('sandbox')}"
+    assert incidents["command"] == f"dex maintain incidents{rooted}"
+    assert diagnose["command"] == f"dex maintain diagnose{rooted}"
 
 
 @pytest.mark.parametrize("with_repo_root", [False, True])
@@ -167,15 +202,21 @@ def test_an_absolute_target_is_written_where_it_names(
     assert payload["data"]["created"] == [
         target.as_posix(),
         (elsewhere / ".dex" / "config.yml").as_posix(),
+        *_under(elsewhere.as_posix(), PROJECT_FILES),
     ]
-    assert _files_under(elsewhere) == [".dex/config.yml", "shop.duckdb"]
+    assert _files_under(elsewhere) == sorted(
+        [".dex/config.yml", "shop.duckdb", *PROJECT_FILES]
+    )
     assert _files_under(project) == []
     assert _files_under(caller) == []
     rerun = f" --repo-root {project.as_posix()}" if with_repo_root else ""
+    *explore, incidents, diagnose = payload["data"]["next_steps"]
     assert all(
         step["command"].endswith(f"{rerun} --path {target.as_posix()}")
-        for step in payload["data"]["next_steps"]
+        for step in explore
     )
+    for step in (incidents, diagnose):
+        assert step["command"].endswith(f" --repo-root {elsewhere.as_posix()}")
 
 
 def test_a_second_demo_refuses_rather_than_overwriting(run_from, capsys):
@@ -261,6 +302,13 @@ def test_an_existing_config_above_the_target_is_left_alone(run_from, capsys):
     assert "production.duckdb" in committed.read_text(encoding="utf-8")
     assert any("left untouched" in w for w in payload["warnings"])
     assert payload["diffs"] == []
+    # No dbt project either: under someone else's config no command finds it,
+    # so the tour stops at the warehouse and says why.
+    assert not (root / "scratch" / "analytics").exists()
+    assert any("need a directory of their own" in w for w in payload["warnings"])
+    assert not any(
+        "dex maintain" in step["command"] for step in payload["data"]["next_steps"]
+    )
     named = f"{run_from.rerun} --path {run_from.spell('scratch/shop.duckdb')}"
     assert all(
         step["command"].endswith(named) for step in payload["data"]["next_steps"]
@@ -276,7 +324,7 @@ def test_the_generated_warehouse_drives_the_whole_explore_tour(run_from, capsys)
         shlex.split(step["command"])[1:]
         for step in _run(run_from.argv("demo"), capsys)["data"]["next_steps"]
     ]
-    map_argv, profile_argv, relationships_argv, query_argv = printed
+    map_argv, profile_argv, relationships_argv, query_argv, *_incident = printed
 
     mapped = _run(map_argv, capsys)["data"]
     assert mapped["object_count"] == 7

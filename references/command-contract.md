@@ -84,9 +84,13 @@ the `config` group, the `explore` group, the authoring surface (`transform`,
 ```
 dex demo [path]                   -> generate a seeded local DuckDB warehouse (7 tables,
                                      29,512 rows) plus a .dex/config.yml beside it, so a
-                                     first run needs no warehouse and no credentials;
-                                     reports both under data.created and names what to
-                                     run next under data.next_steps. A relative path
+                                     first run needs no warehouse and no credentials,
+                                     and a small dbt project under analytics/ with the
+                                     seeded artifacts of a build in which one test
+                                     failed, so maintain incidents and maintain
+                                     diagnose have an incident to read (#1477);
+                                     reports every artifact under data.created and
+                                     names what to run next under data.next_steps. A relative path
                                      resolves against --repo-root and is reported
                                      relative to it; the next steps carry the same
                                      --repo-root so they run as printed. Create-only
