@@ -3664,7 +3664,7 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     assert payload["data"]["created"] == ["scratch/second.duckdb"]
     assert not (tmp_path / "scratch" / ".dex").exists()
     # Nor the dbt project, which no command under that config would find.
-    assert not (tmp_path / "scratch" / "analytics").exists()
+    assert not (tmp_path / "scratch" / "demo_project").exists()
     assert committed.read_text(encoding="utf-8") == before
     assert any("left untouched" in w for w in payload["warnings"])
 
@@ -3679,7 +3679,9 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     assert main(["--repo-root", str(repo), "demo"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["data"]["created"][:2] == ["dex_demo.duckdb", ".dex/config.yml"]
-    assert all(path.startswith("analytics/") for path in payload["data"]["created"][2:])
+    assert all(
+        path.startswith("demo_project/dbt/") for path in payload["data"]["created"][2:]
+    )
     written = sorted(
         p.relative_to(repo).as_posix() for p in repo.rglob("*") if p.is_file()
     )

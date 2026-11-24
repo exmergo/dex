@@ -38,7 +38,7 @@ adapter (see the next section).
 ## The demo warehouse
 
 ```bash
-dex demo            # -> ./dex_demo.duckdb, ./.dex/config.yml and ./analytics/
+dex demo            # -> ./dex_demo.duckdb, ./.dex/config.yml and ./demo_project/
 dex explore map     # no flags: the config demo wrote points at the file it made
 ```
 
@@ -52,7 +52,7 @@ directory, so `dex --repo-root R demo` writes its files into `R` and the command
 it prints carry the same `--repo-root`. `--path` is refused there, because
 everywhere else it names the warehouse dex reads.
 
-**A dbt project with an incident in it.** Beside the warehouse, `analytics/` is a
+**A dbt project with an incident in it.** Beside the warehouse, `demo_project/dbt/` is a
 dbt project over `orders` and `order_items`: a source, a staging model over each,
 and a `unique` and a `not_null` test on each key. It declares the Elementary
 package at 0.26.1 and records that release in

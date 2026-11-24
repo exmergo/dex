@@ -137,7 +137,7 @@ declares the [Elementary](https://github.com/elementary-data/elementary) package
 disabled on the dev target, so `dex transform deps` (or the first build) fetches it
 from the dbt package hub; `--no-elementary` leaves it out. Reruns preserve
 authored files. The lower-level `dex demo` command creates the warehouse and config
-with a smaller dbt project and the seeded history of its builds in Elementary's
+with a smaller dbt project under `demo_project/` and the seeded history of its builds in Elementary's
 tables, in which one test starts failing, so `dex maintain incidents` and
 `dex maintain diagnose` have an incident to read. The data comes from a pinned seed.
 

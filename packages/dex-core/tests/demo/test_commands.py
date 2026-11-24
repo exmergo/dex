@@ -29,19 +29,19 @@ _PII_PROBE = 'dex explore query "select email from customers"'
 # rather than read off the generator, so a file added or lost fails here: the
 # hand-authored files, then what its seeded build left under target/.
 PROJECT_SOURCES = [
-    "analytics/dbt_project.yml",
-    "analytics/packages.yml",
-    "analytics/profiles.yml",
-    "analytics/models/staging/_sources.yml",
-    "analytics/models/staging/_staging.yml",
-    "analytics/models/staging/stg_orders.sql",
-    "analytics/models/staging/stg_order_items.sql",
+    "demo_project/dbt/dbt_project.yml",
+    "demo_project/dbt/packages.yml",
+    "demo_project/dbt/profiles.yml",
+    "demo_project/dbt/models/staging/_sources.yml",
+    "demo_project/dbt/models/staging/_staging.yml",
+    "demo_project/dbt/models/staging/stg_orders.sql",
+    "demo_project/dbt/models/staging/stg_order_items.sql",
 ]
 PROJECT_FILES = [
     *PROJECT_SOURCES,
-    "analytics/dbt_packages/elementary/dbt_project.yml",
-    "analytics/target/manifest.json",
-    "analytics/target/run_results.json",
+    "demo_project/dbt/dbt_packages/elementary/dbt_project.yml",
+    "demo_project/dbt/target/manifest.json",
+    "demo_project/dbt/target/run_results.json",
 ]
 
 
@@ -90,7 +90,7 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     assert config.connector == "duckdb"
     assert config.duckdb is not None and config.duckdb.path == DEMO_FILENAME
     # Pinned, so a second dbt project beside it never makes discovery ambiguous.
-    assert config.dbt_project_dir == "analytics"
+    assert config.dbt_project_dir == "demo_project/dbt"
     # The reviewable files are diffs; the build's artifacts are not.
     assert {d["op"] for d in payload["diffs"]} == {"create"}
     assert [d["path"] for d in payload["diffs"]] == [
@@ -117,6 +117,31 @@ def test_demo_creates_nothing_but_what_it_reports(run_from, capsys):
     payload = _run(run_from.argv("demo"), capsys)
 
     assert _files_under(run_from.root) == sorted(payload["data"]["created"])
+
+
+def test_the_demo_leaves_the_documented_first_project_free(tmp_path: Path, capsys):
+    """The docs give the user's own project the name `analytics`
+    (`dex transform init analytics`), and init refuses wherever the root or one
+    of its children holds a dbt project. So the demo's project sits where init
+    does not look, and init after the demo creates the user's project and pins
+    it, leaving the demo's untouched."""
+
+    root = ["--repo-root", str(tmp_path)]
+    demo = _run([*root, "demo"], capsys)
+    assert demo["status"] == "ok"
+    seeded = {path: (tmp_path / path).read_bytes() for path in demo["data"]["created"]}
+
+    payload = _run([*root, "transform", "init", "analytics"], capsys)
+
+    assert payload["status"] == "ok", payload
+    assert (tmp_path / "analytics" / "dbt_project.yml").is_file()
+    from exmergo_dex_core.config import load_config
+
+    config = load_config(tmp_path)
+    assert config is not None and config.dbt_project_dir == "analytics"
+    for path, content in seeded.items():
+        if path != ".dex/config.yml":
+            assert (tmp_path / path).read_bytes() == content, path
 
 
 def test_repo_root_after_the_subcommand_lands_the_same(tmp_path: Path, capsys):
@@ -308,7 +333,7 @@ def test_an_existing_config_above_the_target_is_left_alone(run_from, capsys):
     assert payload["diffs"] == []
     # No dbt project either: under someone else's config no command finds it,
     # so the tour stops at the warehouse and says why.
-    assert not (root / "scratch" / "analytics").exists()
+    assert not (root / "scratch" / "demo_project").exists()
     assert any("need a directory of their own" in w for w in payload["warnings"])
     assert not any(
         "dex maintain" in step["command"] for step in payload["data"]["next_steps"]
