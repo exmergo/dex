@@ -8,7 +8,6 @@ group runs the same rules against a real ``git`` repository.
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -21,6 +20,7 @@ from exmergo_dex_core.maintain.commit_history import (
     GitHistory,
     HistoryUnreadableError,
     MappedHistory,
+    git_env,
 )
 from exmergo_dex_core.maintain.incidents import fold_incidents
 from exmergo_dex_core.maintain.observations import (
@@ -434,7 +434,7 @@ _GIT = shutil.which("git")
 
 def _git(root: Path, *args: str) -> str:
     env = {
-        **os.environ,
+        **git_env(),
         "GIT_AUTHOR_NAME": "dex",
         "GIT_AUTHOR_EMAIL": "dex@example.invalid",
         "GIT_COMMITTER_NAME": "dex",
@@ -530,6 +530,7 @@ def _shallow_clone(repo: dict[str, str], tmp_path: Path, depth: int) -> Path:
         ],
         check=True,
         capture_output=True,
+        env=git_env(),
     )
     return clone
 
