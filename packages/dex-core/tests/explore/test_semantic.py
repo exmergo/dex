@@ -2945,6 +2945,8 @@ def test_a_source_returning_nothing_is_refused_not_fallen_back_from(no_ambient_t
     instead of as this request's principal, which is the failure the seam exists to
     prevent, so an empty token is a refusal."""
 
+    pytest.importorskip("httpx")
+
     from exmergo_dex_core import SemanticSource
 
     engine = _engine(_hosted_config(), semantic_source=SemanticSource(token=lambda: ""))
@@ -2957,6 +2959,8 @@ def test_missing_hosted_coordinates_name_the_config_not_the_environment(
 ):
     """The fix a host has is editing the object it passed, so telling it to export
     a variable would be wrong advice."""
+
+    pytest.importorskip("httpx")
 
     from exmergo_dex_core import SemanticSource
 
