@@ -55,9 +55,20 @@ from .warehouse import (
     _uuid_shaped,
 )
 
-#: The directory the project is written into, beside the warehouse file, and
-#: the project's dbt name: the one ``dex init <name> --mode demo`` documents.
-PROJECT_DIR = "analytics"
+#: The directory the demo writes beside the warehouse file. It names itself as
+#: the demo's, so ``analytics/``, the directory the docs give the user's own
+#: project (``dex transform init analytics``), stays free.
+DEMO_DIR = "demo_project"
+#: The dbt project, one level inside it. ``transform init`` refuses wherever the
+#: root or one of its immediate children holds a dbt project
+#: (:func:`~exmergo_dex_core.dbt_project.discover_projects`), so a project
+#: directly under the root would block the user's first ``transform init``.
+#: Down here it is found through the config's ``dbt_project_dir`` pin, which
+#: ``transform init`` moves to the project it creates.
+PROJECT_DIR = f"{DEMO_DIR}/dbt"
+#: From the project directory, where dbt runs, back up to the warehouse file.
+_UP = "../" * len(PROJECT_DIR.split("/"))
+#: The project's dbt name: the one ``dex init <name> --mode demo`` documents.
 PROJECT_NAME = "analytics"
 
 #: The dbt source the staging models read, and the warehouse schema it names.
@@ -170,7 +181,7 @@ def _source_files(warehouse_name: str) -> list[tuple[str, str]]:
                     PROJECT_NAME: {
                         "target": "dev",
                         "outputs": {
-                            "dev": {"type": "duckdb", "path": f"../{warehouse_name}"}
+                            "dev": {"type": "duckdb", "path": _UP + warehouse_name}
                         },
                     }
                 }
@@ -474,17 +485,17 @@ def project_digest(project: DemoProject) -> str:
 
 
 def project_collision(root: Path) -> Path | None:
-    """The project directory under ``root`` if anything already sits there."""
+    """The demo's directory under ``root`` if anything already sits there."""
 
-    target = root / PROJECT_DIR
+    target = root / DEMO_DIR
     return target if target.exists() or target.is_symlink() else None
 
 
 def refuse_target_name(target: Path) -> None:
-    """Refuse a warehouse file named like the project directory beside it,
+    """Refuse a warehouse file named like the demo's directory beside it,
     before anything is written: the two would be the same path."""
 
-    if target.name == PROJECT_DIR:
+    if target.name == DEMO_DIR:
         raise DemoPathError(
             f"'{target.as_posix()}' is where dex demo writes its dbt project "
             f"({PROJECT_DIR}/), so it cannot also be the warehouse file. Name "
@@ -494,7 +505,7 @@ def refuse_target_name(target: Path) -> None:
 
 def refuse_collision(root: Path) -> None:
     """Refuse, before anything is written, a root that already holds the
-    project directory: the demo creates and never replaces, as for the file."""
+    demo's directory: the demo creates and never replaces, as for the file."""
 
     found = project_collision(root)
     if found is not None:
@@ -511,11 +522,12 @@ def write_project(root: Path, project: DemoProject) -> list[str]:
     removed again, so a half-written project is never left behind."""
 
     refuse_collision(root)
+    owned = root / DEMO_DIR
     base = root / PROJECT_DIR
     try:
         # Exclusive: a directory that appeared since the check is refused here,
         # before anything is written, so the rollback below removes only ours.
-        base.mkdir()
+        owned.mkdir()
     except FileExistsError:
         refuse_collision(root)
         raise
@@ -533,7 +545,7 @@ def write_project(root: Path, project: DemoProject) -> list[str]:
         for relative, _ in project.sources:
             os.utime(base / relative, (written_at, written_at))
     except BaseException:
-        shutil.rmtree(base, ignore_errors=True)
+        shutil.rmtree(owned, ignore_errors=True)
         raise
     return [f"{PROJECT_DIR}/{relative}" for relative, _ in project.files]
 
@@ -542,6 +554,7 @@ __all__ = [
     "BUILD_INVOCATION_ID",
     "BUILD_STARTED_AT",
     "DBT_VERSION",
+    "DEMO_DIR",
     "FAILING_TEST",
     "PROJECT_DIR",
     "PROJECT_NAME",

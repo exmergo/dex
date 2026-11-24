@@ -26,6 +26,7 @@ from exmergo_dex_core.cli import main
 from exmergo_dex_core.demo import DEMO_FILENAME, build_tables
 from exmergo_dex_core.demo.project import (
     BUILD_INVOCATION_ID,
+    DEMO_DIR,
     FAILING_TEST,
     PROJECT_DIR,
     build_project,
@@ -38,7 +39,7 @@ from exmergo_dex_core.demo.project import (
 # an edit moves it, re-read the generated project and the incident it gives
 # (the counts below, the README's tour), then update this value.
 GOLDEN_PROJECT_DIGEST = (
-    "9afb6c45947f4c7cc137d552835c28624db559ec0631456302fce67a83084245"
+    "60efac52619e3344a59f5efc4de03be78e31fc0753d5674b7f77e822a1788086"
 )
 
 #: Values of order_items.order_item_id that occur more than once: the rows the
@@ -100,7 +101,7 @@ def test_the_project_follows_the_warehouse_file_it_is_written_for():
     assert project_digest(project) != GOLDEN_PROJECT_DIGEST
     manifest = _document(project, "target/manifest.json")
     assert {s["database"] for s in manifest["sources"].values()} == {"shop"}
-    assert "path: ../shop.duckdb" in dict(project.files)["profiles.yml"]
+    assert "path: ../../shop.duckdb" in dict(project.files)["profiles.yml"]
 
 
 def test_no_project_value_depends_on_the_wall_clock():
@@ -180,16 +181,17 @@ def test_an_existing_project_directory_is_refused_before_anything_is_written(
         raise AssertionError("the warehouse was generated before the refusal")
 
     monkeypatch.setattr(commands, "generate_demo_warehouse", never)
-    (tmp_path / PROJECT_DIR).mkdir()
-    (tmp_path / PROJECT_DIR / "keep.txt").write_text("mine", encoding="utf-8")
+    (tmp_path / DEMO_DIR).mkdir()
+    (tmp_path / DEMO_DIR / "keep.txt").write_text("mine", encoding="utf-8")
 
     payload = _run(["--repo-root", str(tmp_path), "demo"], capsys)
 
     assert payload["status"] == "error"
     assert payload["reason"] == "guard"
     assert "never opens or replaces" in payload["errors"][0]
-    assert sorted(p.name for p in tmp_path.iterdir()) == [PROJECT_DIR]
-    assert (tmp_path / PROJECT_DIR / "keep.txt").read_text(encoding="utf-8") == "mine"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [DEMO_DIR]
+    assert sorted(p.name for p in (tmp_path / DEMO_DIR).iterdir()) == ["keep.txt"]
+    assert (tmp_path / DEMO_DIR / "keep.txt").read_text(encoding="utf-8") == "mine"
 
 
 def test_a_failed_project_write_leaves_nothing_behind(
@@ -219,11 +221,12 @@ def test_a_failed_project_write_leaves_nothing_behind(
 def test_a_warehouse_named_like_the_project_directory_is_refused_first(
     tmp_path: Path, capsys
 ):
-    """`dex demo analytics` would make the warehouse file the path the project
-    is written to; it is refused up front, naming why, and writes nothing."""
+    """`dex demo demo_project` would make the warehouse file the directory the
+    project is written into; it is refused up front, naming why, and writes
+    nothing."""
 
     pytest.importorskip("duckdb")
-    payload = _run(["--repo-root", str(tmp_path), "demo", PROJECT_DIR], capsys)
+    payload = _run(["--repo-root", str(tmp_path), "demo", DEMO_DIR], capsys)
 
     assert payload["status"] == "error"
     assert payload["reason"] == "request"
@@ -247,7 +250,7 @@ def test_the_sources_read_as_written_before_the_build_that_read_them(
 
 
 def test_write_project_refuses_a_directory_that_appeared(tmp_path: Path):
-    (tmp_path / PROJECT_DIR).mkdir()
+    (tmp_path / DEMO_DIR).mkdir()
     from exmergo_dex_core.demo import DemoTargetExistsError
 
     with pytest.raises(DemoTargetExistsError):
