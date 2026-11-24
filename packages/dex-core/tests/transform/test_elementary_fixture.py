@@ -8,7 +8,9 @@ Elementary package from the dbt hub, so they run only with
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -25,6 +27,7 @@ from .elementary_fixture import (
     LEGACY_VERSIONS,
     MATERIALIZATION_LINE,
     OLDEST_DUCKDB_VERSION,
+    ORCHESTRATOR_ENV,
     TEMP_TABLE_LINE,
     VARIANTS,
     VERSIONS,
@@ -36,7 +39,12 @@ from .elementary_fixture import (
 )
 from .elementary_fixture import elementary_installs as elementary_installs
 from .elementary_fixture import installed_elementary as installed_elementary
+from .elementary_fixture import no_orchestrator as no_orchestrator
 from .mutation_helpers import _engine
+
+#: Every case runs as if outside an orchestrator, the dbt Dex starts included,
+#: so the reading on a CI runner is the reading anywhere else (#1447).
+pytestmark = pytest.mark.usefixtures("no_orchestrator")
 
 # --- the census, offline --------------------------------------------------------
 
@@ -103,6 +111,48 @@ def test_a_relation_whose_name_holds_a_double_quote_is_still_counted(
 
     assert before[table] == 1, "the census could not count a validly named relation"
     assert footprint(before, duckdb_census(duckdb_file)) == {table: (1, 2)}
+
+
+#: What a GitHub Actions runner sets that Elementary reads into
+#: ``dbt_invocations``; with these set, #1447's pins failed on main.
+GITHUB_RUNNER_ENV = {
+    "GITHUB_ACTIONS": "true",
+    "GITHUB_RUN_ID": "45330982618",
+    "GITHUB_SHA": "0" * 40,
+    "GITHUB_REPOSITORY": "owner/repo",
+    "GITHUB_EVENT_NAME": "push",
+    "GITHUB_SERVER_URL": "https://github.com",
+    "GITHUB_HEAD_REF": "a-branch",
+}
+
+
+def test_dbt_starts_with_the_runner_s_orchestrator_variables_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from . import elementary_fixture
+
+    assert set(GITHUB_RUNNER_ENV) <= set(ORCHESTRATOR_ENV)
+    for name, value in GITHUB_RUNNER_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("DEX_KEPT", "1")
+    seen: dict[str, str] = {}
+
+    def run(argv, **kwargs):
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(elementary_fixture.shutil, "which", lambda _: "dbt")
+    monkeypatch.setattr(elementary_fixture.subprocess, "run", run)
+    dbt("--version", cwd=tmp_path)
+
+    assert seen.get("DEX_KEPT") == "1", "dbt lost the rest of the environment"
+    assert set(seen) & set(ORCHESTRATOR_ENV) == set()
+
+
+def test_each_case_runs_with_the_orchestrator_variables_cleared():
+    """The dbt Dex starts inherits this process's environment."""
+
+    assert set(os.environ) & set(ORCHESTRATOR_ENV) == set()
 
 
 # --- the fixture, against the installed package ---------------------------------
