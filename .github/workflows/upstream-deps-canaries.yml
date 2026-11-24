@@ -1,4 +1,4 @@
-name: Upstream canaries (sqlglot, DuckDB, next Python)
+name: Upstream canaries (sqlglot, DuckDB, next Python, Elementary)
 
 # A weekly run of the suite against the newest sqlglot, above the ceiling the
 # project declares. The query firewall matches sqlglot expression classes by name

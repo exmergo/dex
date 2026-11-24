@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import http.client
 import json
 import re
 import sys
@@ -113,7 +114,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             payload = fetch()
         published = hub_releases(payload)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        # A truncated read raises an HTTPException, not an OSError; it must
+        # not exit 1, which means a newer release is on the hub.
         print(f"::error::cannot compare the matrix with the hub: {exc}")
         return 2
     code, line = verdict(tested, published)

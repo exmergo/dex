@@ -640,12 +640,12 @@ Adding a new Elementary release:
    `elementary_fixture.py`, `TESTED_RELEASES` and the table above, in the same
    change, so the supported range moves with them. CI runs the fixture files
    only after a merge, so run both (above) and paste the result into the pull
-   request. The release leaving the slot stays inside the supported range but
-   leaves `TESTED_RELEASES`, unless
+   request. The release leaving the slot leaves `TESTED_RELEASES`, though it
+   stays inside the supported range. If
    `packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
-   records a layout for it: the loader refuses a layout for a release the
-   fixture does not run, so record the new release's layout in its place, or
-   keep the old release as a slot of its own.
+   records a layout for it, the loader will refuse that layout, since it reads
+   only releases the fixture runs. So either move the layout to the new
+   release in the same change, or keep the old release as a slot of its own.
 3. If the fixture fails at the new release, the pull request does not merge.
    The release stays outside the range, and Dex keeps reporting it
    `elementary_release_untested` until the failure is fixed.

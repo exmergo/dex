@@ -283,3 +283,73 @@ def test_the_watch_runs_weekly_with_no_secret_and_a_read_only_token():
     assert "secrets." not in text and "vars." not in text
     [run] = [s["run"] for s in job["steps"] if "run" in s]
     assert run == "python3 scripts/check_elementary_release.py"
+
+
+# --- the Postgres file runs every Postgres slot (#1446) ---------------------------
+
+
+#: The rendered-test case, which runs at the sample-flag boundary alone.
+RENDERED_CASE = (
+    "test_a_failing_rendered_test_keeps_no_sample_from_the_sample_flag_boundary"
+)
+
+
+def _versions_of(function) -> set[str]:
+    """The releases a test function is parametrized over, by a ``version`` arg."""
+
+    found: set[str] = set()
+    for mark in getattr(function, "pytestmark", []):
+        if mark.name != "parametrize":
+            continue
+        names, values = mark.args[0], mark.args[1]
+        names = (
+            [n.strip() for n in names.split(",")] if isinstance(names, str) else names
+        )
+        if "version" not in names:
+            continue
+        at = names.index("version")
+        for value in values:
+            found.add(value if len(names) == 1 else value[at])
+    return found
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "test_each_variant_builds_at_each_postgres_slot",
+        "test_a_mutation_run_leaves_the_dev_schemas_as_it_found_them",
+        "test_without_the_fix_a_mutation_run_leaves_rows_in_the_dev_elementary_schema",
+    ],
+)
+def test_each_release_parametrized_postgres_case_runs_every_postgres_slot(case: str):
+    """The matrix test holds MATRIX to POSTGRES_VERSIONS; this holds the Postgres
+    file to POSTGRES_VERSIONS, so a case moved back to a narrower list drops no
+    slot while CI stays green."""
+
+    import importlib
+
+    from transform.elementary_fixture import POSTGRES_VERSIONS, SAMPLE_FLAG_VERSION
+
+    module = importlib.import_module("integration.test_postgres_elementary")
+    assert _versions_of(getattr(module, case)) == set(POSTGRES_VERSIONS)
+    switch = module.test_the_per_test_sampling_switch_is_ignored_before_0_20
+    assert set(POSTGRES_VERSIONS) <= _versions_of(switch)
+    assert _versions_of(getattr(module, RENDERED_CASE)) == {SAMPLE_FLAG_VERSION}
+
+
+def test_a_truncated_hub_read_is_unreadable_not_a_new_release(monkeypatch, capsys):
+    """``http.client.IncompleteRead`` is no ``OSError``; it must exit 2, never 1,
+    which would say a newer release is on the hub."""
+
+    import http.client
+
+    spec = importlib.util.spec_from_file_location("check_elementary_release", WATCH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def truncated(*_: object) -> dict:
+        raise http.client.IncompleteRead(b"{")
+
+    monkeypatch.setattr(module, "fetch", truncated)
+    assert module.main([]) == 2
+    assert "cannot compare the matrix with the hub" in capsys.readouterr().out

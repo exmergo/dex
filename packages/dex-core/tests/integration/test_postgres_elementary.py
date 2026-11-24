@@ -120,7 +120,7 @@ def _dbt(project: Path, *argv: str, check: bool = True) -> str:
 
 @pytest.mark.parametrize("version", POSTGRES_VERSIONS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_each_variant_builds_at_the_releases_most_installs_pin(
+def test_each_variant_builds_at_each_postgres_slot(
     tmp_path: Path,
     elementary_installs: Callable[[str], Path],
     target: PostgresTarget,
