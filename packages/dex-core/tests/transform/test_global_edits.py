@@ -103,6 +103,53 @@ def test_each_check_reads_its_set_from_the_shared_module() -> None:
     assert ([local is shared for local, shared in bound], copies) == ([True] * 5, [])
 
 
+MODEL = "models/m.sql"
+#: One model whose file and YAML are both at ``MODEL``, so an edit of any kind
+#: there names a node the lineage can bound.
+MANIFEST = {
+    "nodes": {
+        "model.shop.m": {
+            "name": "m",
+            "resource_type": "model",
+            "original_file_path": MODEL,
+            "patch_path": "shop://" + MODEL,
+        }
+    }
+}
+
+
+def _each_kind() -> list[PlanEdit]:
+    return [PlanEdit(path=MODEL, kind=k, new_content="version: 2\n") for k in EditKind]
+
+
+def test_downstream_impact_calls_a_plan_global_on_the_core_alone() -> None:
+    """Read at the call site, over every kind, so a check that stops reading the
+    shared set is caught by what it does."""
+
+    assert {
+        edit.kind.value
+        for edit in _each_kind()
+        if downstream_impact.select_targets([edit], MANIFEST).reason_code
+        == "global_edit"
+    } == {"macro_sql", "project_yml", "packages_yml"}
+
+
+def test_prerequisites_reach_any_node_on_their_set() -> None:
+    assert {
+        edit.kind.value
+        for edit in _each_kind()
+        if prerequisites._reaches_any_node(edit)
+    } == {"macro_sql", "project_yml", "packages_yml", "profiles_yml", "test_sql"}
+
+
+def test_finding_attribution_leaves_reach_unbounded_on_its_set() -> None:
+    assert {
+        edit.kind.value
+        for edit in _each_kind()
+        if finding_attribution.plan_reach([edit], MANIFEST).reached is None
+    } == {"macro_sql", "project_yml", "packages_yml", "profiles_yml", "semantic_yml"}
+
+
 def test_a_changed_project_file_makes_the_plan_global() -> None:
     edit = PlanEdit(path=PROJECT, kind=EditKind.PROJECT_YML, new_content="name: x\n")
     assert global_edits.changes_global([edit], {PROJECT: BEFORE})

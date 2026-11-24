@@ -21,8 +21,9 @@ one is a change of behaviour for that check, and its pin in
 ``tests/transform/test_global_edits.py`` says so.
 
 :func:`changes_global` asks whether a plan already changes one of the core
-kinds, which is what a writer adding a ``project_yml`` edit needs to know: an
-edit added to a plan that is global already costs it no check.
+kinds, which is what a writer adding a ``project_yml`` edit needs to know: such
+a plan is global to every check already, so the added edit costs it no check.
+It asks about the core alone, not about any one check's wider set.
 """
 
 from __future__ import annotations
@@ -42,12 +43,13 @@ GLOBAL_KINDS = frozenset(
 )
 
 #: Edit kinds whose effect on a model the re-executed baseline cannot isolate.
-IMPACT_GLOBAL_KINDS = GLOBAL_KINDS
+#: A set of its own, so a check that binds the core under this name is caught.
+IMPACT_GLOBAL_KINDS = frozenset({*GLOBAL_KINDS})
 
 #: Edits that can change how an untouched parent compiles. Its dev relation keeps
 #: what it was built with, so both graphs are compiled through their ancestors and
 #: any parent that compiles differently makes the inputs unsynchronized.
-COMPARE_GLOBAL_KINDS = GLOBAL_KINDS
+COMPARE_GLOBAL_KINDS = frozenset({*GLOBAL_KINDS})
 
 #: The edit kinds that can change any node's result, wherever they sit.
 PREREQUISITE_GLOBAL_KINDS = GLOBAL_KINDS | {EditKind.PROFILES_YML, EditKind.TEST_SQL}
@@ -60,7 +62,11 @@ ATTRIBUTION_UNBOUNDED_KINDS = GLOBAL_KINDS | {
 
 
 def changes_global(edits: Iterable[PlanEdit], prior: Mapping[str, str]) -> bool:
-    """Whether the plan already changes what makes the checks treat it as global.
+    """Whether the plan already changes a kind every check treats as global.
+
+    Only the core counts (:data:`GLOBAL_KINDS`): a ``profiles_yml`` edit is
+    global to prerequisites and attribution but not to downstream impact or
+    the refactor comparison, so it does not make this true.
 
     ``prior`` maps each path the plan edits to its content before the plan. An
     edit that resends such a file unchanged is no change: the plan drops it
