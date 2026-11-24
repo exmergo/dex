@@ -2107,6 +2107,20 @@ def cmd_incidents(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     return to_envelope(result)
 
 
+def cmd_diagnose(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from . import diagnose
+
+    try:
+        result = diagnose.diagnose(
+            engine,
+            getattr(args, "objects", None),
+            invocations=getattr(args, "invocations", None),
+        )
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result)
+
+
 def semantic_drift(engine: DexEngine, objects: list[str] | None = None) -> DriftResult:
     """Definitions that no longer match: dangling references, new categoricals.
 

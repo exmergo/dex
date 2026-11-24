@@ -45,8 +45,9 @@ from typing import TYPE_CHECKING, Any, Literal
 from .. import command_args
 from ..errors import RequestError
 from ..values_free import require_allowed
+from .commit_history import CommitHistory
 from .coverage_runs import current_tests, parse_time
-from .incidents import SourceHistory, fold_incidents
+from .incidents import IncidentFold, SourceHistory, fold_incidents
 from .observations import Observation, Subject
 from .results import IncidentsResult
 
@@ -140,6 +141,36 @@ def incidents(
     """
 
     require_allowed(engine.result_mode, COMMAND)
+    return read(engine, objects, invocations=invocations).result
+
+
+@dataclass(frozen=True)
+class IncidentRead:
+    """What one read of the sources returns: the command's result, and for a
+    caller that goes on from it (``maintain diagnose``, #1475) the fold itself,
+    the manifest the tests were read from and the project it sits in."""
+
+    result: IncidentsResult
+    fold: IncidentFold | None = None
+    manifest: dict[str, Any] | None = None
+    project_dir: Path | None = None
+
+
+def read(
+    engine: DexEngine,
+    objects: list[str] | None = None,
+    *,
+    invocations: int | None = None,
+    history: CommitHistory | None = None,
+    command: str = COMMAND,
+) -> IncidentRead:
+    """The read :func:`incidents` reports, with the fold kept.
+
+    ``history`` is handed to the fold, so each incident's ``onset`` carries
+    the commits it spans (#1467). ``command`` names the caller on the cost
+    gate's ask, so a confirmation names the command that asked.
+    """
+
     window_size = check_invocations(invocations)
     warnings: list[str] = []
     notes: list[str] = []
@@ -150,12 +181,17 @@ def incidents(
         code = "no_project" if project_dir is None else "no_manifest"
         if project_dir is not None:
             steps.append(_BUILD_STEP)
-        return IncidentsResult(
-            sources={name: _Source("missing", code, why).report() for name in SOURCES},
-            window=_window(window_size, None, None),
-            price=_price_report(None),
-            next_steps=steps,
-            warnings=[f"maintain incidents read no source: {why}"],
+        return IncidentRead(
+            IncidentsResult(
+                sources={
+                    name: _Source("missing", code, why).report() for name in SOURCES
+                },
+                window=_window(window_size, None, None),
+                price=_price_report(None),
+                next_steps=steps,
+                warnings=[f"{command} read no source: {why}"],
+            ),
+            project_dir=project_dir,
         )
 
     claims, over_long = _bounded_claims(manifest)
@@ -171,7 +207,9 @@ def incidents(
             "selects no test"
         )
 
-    elementary = _elementary(engine, project_dir, manifest, claims, window_size, steps)
+    elementary = _elementary(
+        engine, project_dir, manifest, claims, window_size, steps, command
+    )
     priced: dict[str, Any] | None = elementary.extra.pop("_price", None)
     opened = elementary.extra.pop("_adapter", None)
     warnings.extend(elementary.extra.pop("_warnings", []))
@@ -196,6 +234,7 @@ def incidents(
         sources=histories,
         current_subjects=current,
         now=datetime.now(UTC),
+        history=history,
     )
     if dbt.history is not None and elementary.status != "read":
         notes.append(
@@ -229,7 +268,7 @@ def incidents(
         command_args.stamp_spend(result, opened)
         if priced is not None and result.price is not None:
             result.price["settled"] = result.spend
-    return result
+    return IncidentRead(result, fold=fold, manifest=manifest, project_dir=project_dir)
 
 
 #: The longest key a :class:`~.observations.Subject` holds.
@@ -354,6 +393,7 @@ def _elementary(
     claims: Mapping[str, str],
     window_size: int,
     steps: list[dict[str, str]],
+    command: str = COMMAND,
 ) -> _Source:
     from ..transform import elementary as elementary_mod
     from ..transform import elementary_install as install
@@ -451,7 +491,7 @@ def _elementary(
         refusal.extra["release"] = runtime.release
         return refusal
     return _read_elementary(
-        engine, located, runtime.release, claims, window_size, warned
+        engine, located, runtime.release, claims, window_size, warned, command
     )
 
 
@@ -573,6 +613,7 @@ def _read_elementary(
     claims: Mapping[str, str],
     window_size: int,
     warned: list[str],
+    command: str = COMMAND,
 ) -> _Source:
     try:
         from . import elementary_incidents as reader
@@ -595,7 +636,7 @@ def _read_elementary(
     # every call to `_adapter`, so acquiring again would settle the gate the
     # whole-read reservation sits on before any statement ran on it.
     try:
-        adapter = engine._adapter(COMMAND)
+        adapter = engine._adapter(command)
     except DexError as exc:
         _reraise_cost(exc)
         return _Source("refused", "connection_unavailable", str(exc), base)
@@ -625,7 +666,7 @@ def _read_elementary(
         _reraise_cost(exc)
         return _Source("refused", "catalog_unavailable", str(exc), base)
     try:
-        priced = _price(engine, adapter, plan)
+        priced = _price(engine, adapter, plan, command)
         # From here a refusal may follow spend, so it keeps what was priced.
         base["_price"] = priced
         read = reader.read_elementary(engine, plan, claims=claims, adapter=adapter)
@@ -722,7 +763,9 @@ def _command_advice(message: str) -> str:
     return message
 
 
-def _price(engine: DexEngine, adapter: Any, plan: Any) -> dict[str, Any]:
+def _price(
+    engine: DexEngine, adapter: Any, plan: Any, command: str = COMMAND
+) -> dict[str, Any]:
     """Price every statement the read sends, and any profile the firewall needs
     first, as one handshake on the read's one adapter: on a billed connector an
     unconfirmed call raises the ask here, before any statement runs. A part
@@ -764,7 +807,7 @@ def _price(engine: DexEngine, adapter: Any, plan: Any) -> dict[str, Any]:
             "profiling them first"
         )
     command_args.billed_handshake(
-        COMMAND,
+        command,
         adapter,
         total,
         per_table={**per_table, **per_statement},
@@ -930,6 +973,8 @@ __all__ = [
     "DEFAULT_INVOCATIONS",
     "MAX_INVOCATIONS",
     "SOURCES",
+    "IncidentRead",
     "check_invocations",
     "incidents",
+    "read",
 ]

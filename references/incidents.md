@@ -391,6 +391,58 @@ hold the longer run history.
   overwrites the file, so a fixed failure drops out of it rather than reading as
   two passes.
 
+### `dex maintain diagnose`
+
+The command (`DexEngine.diagnose`, #1475) reads the incidents as
+`maintain incidents` does, with the repository's history handed to the fold,
+and takes each open incident to a cause, or to none.
+
+- **Bisect.** The range is the incident's onset: after the last observed-good
+  run, up to and including the first observed-bad one. A run that recorded
+  nothing between them widens the range back to the last observed pass; it never
+  splits it, so it is never read as good.
+- **Bound.** The committed `maintain snapshot` series is the versions of
+  `.dex/snapshot.json` in the repository's history. The newest snapshot captured
+  at or before the last observed pass is `snapshots.before`; the oldest at or
+  after the first failure is `snapshots.after`. A snapshot is placed by when
+  its warehouse state was measured: `cache_updated_at` where it was pinned
+  from the exploration cache, the earlier snapshot's time where a
+  `--project-only` snapshot carried the block forward. On a project's first day there is
+  no series (`series: none`), and the whole break is a window no recorded state
+  of the warehouse covers (`unseen`, `no_snapshot_series`): a check then
+  confirms a cause as present now, not when inside the break it entered. With a
+  series, the unseen window is the stretch between the bounding snapshots.
+- **Confirm with a check Dex already has.** Each candidate names the check that
+  answered it and the finding code. This release checks the cause kind
+  `dex demo` seeds: a uniqueness test failing because the loader delivered a key
+  twice. It is held, on each source relation the tested model reads that carries
+  the tested columns, by the grain axis of `maintain check`:
+  `key_lost_uniqueness` against `snapshots.before` where its measurement proved
+  the key unique (the volume axis's row counts ride beside it as evidence), and
+  otherwise the declared-claim check, which needs no baseline: the failing
+  test's own claim held to the source (`declared_grain_not_unique`), and only
+  where one source the model reads carries the key: with several, today's data
+  cannot tell a duplicated delivery from a source at another grain
+  (`several_sources`, not checked). A source the bounding snapshot measured
+  not unique while the test passed is ruled out
+  (`not_unique_at_before_snapshot`); a relation nothing counted is
+  `not_checked` (`uncounted`), never ruled out. The project
+  is ruled out where the failing commit itself passed earlier (`onset.commits`
+  reads `same_commit`). Seed, package and schedule causes are listed
+  `not_checked` until their checks are read.
+- **No cause is an answer.** `verdict` is `cause`, `several` (each named, none
+  preferred) or `no_cause`. With no confirmed candidate the answer is
+  `ruled_out` and `unseen`; the most likely candidate is never named as the
+  cause.
+- **The repair is `transform`'s.** A confirmed cause carries the
+  `dex transform plan` step that would repair it under `next_steps`. Nothing
+  here writes it.
+- **Priced.** The incident read prices its own statements first; the checks
+  are then priced together as one handshake before any probe runs, within
+  what the per-command ceiling has left after the read. Checks that do not
+  fit are offered (`scan_offered`, `price.checks.offered`), not asked for
+  again, and `data.spend` sums both phases.
+
 ## No value crosses into an incident
 
 An incident, a timeline and a history carry ids, statuses, counts, times and

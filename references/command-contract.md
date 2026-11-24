@@ -921,6 +921,30 @@ dex maintain incidents [<models>] [--invocations N]
                                      (data.window.after_window, outside the count), and any
                                      other is left out of the fold (folded: false). Read-only;
                                      refused in values-free mode
+dex maintain diagnose [<models>] [--invocations N]
+                                  -> each open incident on the selected models' tests diagnosed to a
+                                     cause (#1475), read as maintain incidents reads them, with the
+                                     repository's history handed to the fold. data.diagnoses[] holds,
+                                     per incident: range (after the last observed-good run, through
+                                     the first observed-bad one; an unobserved run widens it, never
+                                     splits it), snapshots (the committed versions of
+                                     .dex/snapshot.json that bound it: before, at or before the last
+                                     observed pass; after, at or after the first failure; series none
+                                     on a project's first day), unseen (the windows no recorded state
+                                     covers), and every candidate with the existing check that
+                                     answered it (check, finding, evidence as counts). This release
+                                     checks a uniqueness test failing because the loader delivered a
+                                     key twice, with the grain axis on each source the tested model
+                                     reads: key_lost_uniqueness against a bounding snapshot that
+                                     proved the key unique, else the declared-claim check
+                                     (declared_grain_not_unique). The project is ruled out where the
+                                     failing commit passed earlier; seed, package and schedule are
+                                     not_checked. verdict is cause, several or no_cause; no_cause
+                                     answers with ruled_out and unseen and never names the likeliest
+                                     candidate. A confirmed cause's repair is handed to transform
+                                     under next_steps, never written. The checks are priced as one
+                                     handshake after the incident read's own. Read-only; refused in
+                                     values-free mode
 ```
 
 ### How authored content reaches the engine

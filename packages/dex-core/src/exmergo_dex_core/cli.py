@@ -123,6 +123,10 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # incidents: the run history of the tests, from Elementary's tables
         # and dbt's run results (#1472); a bounded read, priced first.
         "incidents",
+        # diagnose: each open incident bisected to a cause, confirmed by the
+        # checks Dex already has (#1475); the incident read, then the checks,
+        # each priced first.
+        "diagnose",
     ],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
@@ -580,6 +584,15 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "and retention bound. Reads the newest 20 invocations by default "
         "(--invocations widens it), priced first on billed connectors; never "
         "reads past the source allowlist.",
+    ),
+    ("maintain", "diagnose"): (
+        "diagnose each open test incident to a cause",
+        "Bisect each open incident over its coverage timeline, bound the break "
+        "with the committed maintain snapshot series where there is one, and "
+        "confirm each candidate cause with a check Dex already has. Answers one "
+        "cause, several, or none, with what was ruled out and the window no "
+        "recorded state covers; a confirmed cause's repair is handed to "
+        "transform, never written here.",
     ),
     ("config", "get"): (
         "show effective settings and where each came from",
@@ -1733,6 +1746,7 @@ def _build_parser() -> argparse.ArgumentParser:
                     "verify",
                     "coverage",
                     "incidents",
+                    "diagnose",
                 }:
                     sp.add_argument(
                         "objects",
@@ -1741,7 +1755,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help=(
                             "model names: repeated, comma-separated or "
                             "space-separated (default: all)"
-                            if name in {"verify", "incidents"}
+                            if name in {"verify", "incidents", "diagnose"}
                             else "model, source.table, snapshot or seed names "
                             "(default: all)"
                             if name == "coverage"
@@ -1785,7 +1799,7 @@ def _build_parser() -> argparse.ArgumentParser:
                             "prod-looking targets are refused"
                         ),
                     )
-                if group == "maintain" and name == "incidents":
+                if group == "maintain" and name in {"incidents", "diagnose"}:
                     sp.add_argument(
                         "--invocations",
                         type=int,
@@ -1955,6 +1969,7 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "verify": maintain_cmds.cmd_verify,
             "coverage": maintain_cmds.cmd_coverage,
             "incidents": maintain_cmds.cmd_incidents,
+            "diagnose": maintain_cmds.cmd_diagnose,
         }
         return handlers[args.subcommand](args, engine)
 
