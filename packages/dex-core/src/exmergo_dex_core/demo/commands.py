@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import shlex
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,15 +29,22 @@ from ..diffs import file_diff
 from ..engine import DexEngine
 from ..results import Result, to_envelope
 from ..storage import DEX_DIR
+from .elementary import seeded_runs
 from .project import (
     FAILING_TEST,
     PROJECT_DIR,
     build_project,
+    history_tables,
     refuse_collision,
     refuse_target_name,
     write_project,
 )
-from .warehouse import DEMO_FILENAME, DemoPathError, generate_demo_warehouse
+from .warehouse import (
+    DEMO_FILENAME,
+    DemoPathError,
+    build_tables,
+    generate_demo_warehouse,
+)
 
 #: The failing test as a person reads it: its name, not its hashed id.
 _FAILING_TEST_NAME = FAILING_TEST.split(".")[2]
@@ -86,11 +94,13 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
             {
                 "command": f"dex maintain incidents{rooted}",
                 "shows": (
-                    f"one open incident, read from dbt's run results: the test "
-                    f"{_FAILING_TEST_NAME} failed in the project's last build, "
-                    "because of the batch loaded twice. One build is all dbt's "
-                    "run results hold, so when the failure began is unknown "
-                    "(first_observed: unknown), and the envelope says so"
+                    f"one open incident, read from Elementary's tables: the test "
+                    f"{_FAILING_TEST_NAME} passed in four weekly builds and has "
+                    "failed in the last two, because of the batch loaded twice, "
+                    "with first_observed naming the first failing build. The "
+                    "week between, Elementary's hooks were off, so the coverage "
+                    "timeline reads it as a missed run rather than a pass. "
+                    "dbt's run results hold the newest build too, and agree"
                 ),
             },
             {
@@ -98,8 +108,10 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
                 "shows": (
                     "the cause: the loader delivered order_item_id more than "
                     "once, measured on the source stg_order_items reads, with "
-                    "what was not checked and a transform plan to hand the "
-                    "repair to. Diagnosis proposes the repair; it writes nothing"
+                    "the break from the last passing build to the first failing "
+                    "one, the window no snapshot covers, what was not checked, "
+                    "and a transform plan to hand the repair to. Diagnosis "
+                    "proposes the repair; it writes nothing"
                 ),
             },
         ]
@@ -110,8 +122,11 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
         {
             "command": f"dex explore map{flags}",
             "shows": (
-                "ranks the seven objects, profiles them, flags the personal data, "
-                "and infers the joins. Free and local: DuckDB bills nothing, so "
+                "ranks the shop's seven tables, profiles them, flags the personal "
+                "data, and infers the joins. Beside the dbt project it also names "
+                "the four tables Elementary keeps its history in, left out of the "
+                "ranking as the package's own. Free and local: DuckDB bills "
+                "nothing, so "
                 "nothing here asks you to confirm a spend. On BigQuery or "
                 "Snowflake this same command returns an estimate first and runs "
                 "only once you agree to it"
@@ -191,7 +206,12 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     if existing_root is None and root.is_dir():
         refuse_target_name(target)
         refuse_collision(root)
-    warehouse = generate_demo_warehouse(target)
+    # The one clock the demo reads (#1477): the seeded runs, and the build the
+    # project's artifacts record, are dated back from it, so the incident they
+    # hold is still open when the tour reaches it. Every other date is anchored.
+    runs = seeded_runs(datetime.now(UTC)) if existing_root is None else ()
+    extra = history_tables(build_tables(), target.name, runs) if runs else ()
+    warehouse = generate_demo_warehouse(target, extra=extra)
     created = [named.as_posix()]
     diffs: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -223,7 +243,7 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         diffs.append(
             file_diff(config_rel, None, config_path.read_text(encoding="utf-8"))
         )
-        project = build_project(warehouse.tables, target.name)
+        project = build_project(warehouse.tables, target.name, runs)
         try:
             written = write_project(root, project)
         except Exception:
@@ -284,10 +304,15 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     [
                         f"{PROJECT_DIR}/ is a dbt project over two of the tables, "
                         "with the artifacts its last dbt build left in "
-                        f"{PROJECT_DIR}/target/. They are seeded, not built: the "
-                        "demo runs no dbt and installs no package. In that build "
-                        f"the test {_FAILING_TEST_NAME} failed, because of the "
-                        "batch loaded twice. Its two staging views were not "
+                        f"{PROJECT_DIR}/target/ and the Elementary history of "
+                        "seven weekly builds in main_elementary. They are "
+                        "seeded, not built: the demo runs no dbt and installs no "
+                        "package. Those builds are dated back from the moment "
+                        "the demo ran, unlike the shop's data, so the incident "
+                        "is still open when you read it, for about three weeks. "
+                        f"In the last two the test {_FAILING_TEST_NAME} failed, "
+                        "because of the batch loaded twice. Its two staging "
+                        "views were not "
                         "built, so `dex maintain verify` reports them as "
                         "no_relation until `dex transform build --target dev` "
                         "builds them"

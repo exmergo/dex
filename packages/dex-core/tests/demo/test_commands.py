@@ -30,6 +30,7 @@ _PII_PROBE = 'dex explore query "select email from customers"'
 # hand-authored files, then what its seeded build left under target/.
 PROJECT_SOURCES = [
     "analytics/dbt_project.yml",
+    "analytics/packages.yml",
     "analytics/profiles.yml",
     "analytics/models/staging/_sources.yml",
     "analytics/models/staging/_staging.yml",
@@ -38,6 +39,7 @@ PROJECT_SOURCES = [
 ]
 PROJECT_FILES = [
     *PROJECT_SOURCES,
+    "analytics/dbt_packages/elementary/dbt_project.yml",
     "analytics/target/manifest.json",
     "analytics/target/run_results.json",
 ]
@@ -72,8 +74,10 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     # Relative to the run directory in both modes, the way every writer reports
     # the files it wrote under its root.
     assert data["path"] == DEMO_FILENAME
-    assert data["object_count"] == 7
-    assert data["row_count"] == 29512
+    # The shop's 7 tables and 29,512 rows, and Elementary's 4 tables holding
+    # 6 runs and 24 test results (#1477).
+    assert data["object_count"] == 11
+    assert data["row_count"] == 29512 + 30
     assert data["created"] == [DEMO_FILENAME, ".dex/config.yml", *PROJECT_FILES]
     assert (run_from.root / DEMO_FILENAME).is_file()
 
@@ -327,7 +331,14 @@ def test_the_generated_warehouse_drives_the_whole_explore_tour(run_from, capsys)
     map_argv, profile_argv, relationships_argv, query_argv, *_incident = printed
 
     mapped = _run(map_argv, capsys)["data"]
-    assert mapped["object_count"] == 7
+    # The shop's 7 objects, 6 PII columns and 5 joins. Elementary's 4 tables
+    # (#1477) are inventoried and left out of the ranking, as the package's own.
+    assert mapped["object_count"] == 11
+    assert len(mapped["objects"]) == 7
+    assert mapped["excluded"]["count"] == 4
+    assert mapped["excluded"]["by_namespace"] == [
+        {"namespace": "dex_demo.main_elementary", "count": 4}
+    ]
     assert mapped["pii_column_count"] == 6
     assert mapped["relationship_count"] == 5
     # The cache the tour depends on is written under the root, beside the

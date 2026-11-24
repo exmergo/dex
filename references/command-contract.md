@@ -86,9 +86,12 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (7
                                      29,512 rows) plus a .dex/config.yml beside it, so a
                                      first run needs no warehouse and no credentials,
                                      and a small dbt project under analytics/ with the
-                                     seeded artifacts of a build in which one test
-                                     failed, so maintain incidents and maintain
-                                     diagnose have an incident to read (#1477);
+                                     seeded history of seven weekly builds (Elementary's
+                                     tables in main_elementary, dated back from when
+                                     the demo ran, and the newest build's artifacts)
+                                     in which one test starts failing, so maintain
+                                     incidents and maintain diagnose have an incident
+                                     to read (#1477);
                                      reports every artifact under data.created and
                                      names what to run next under data.next_steps. A relative path
                                      resolves against --repo-root and is reported

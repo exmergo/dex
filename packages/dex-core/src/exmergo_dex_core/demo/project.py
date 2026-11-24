@@ -8,13 +8,19 @@ renders both as files, beside the warehouse :mod:`.warehouse` writes:
   the warehouse's tables, a staging model over each, and a ``unique`` and a
   ``not_null`` test on each model's key, with a dev-only ``profiles.yml`` wired
   to the demo file, as ``dex transform init`` writes one.
-- **What a build of it left behind**, seeded rather than run: ``target/manifest.json``
-  (which tests exist, what each reads) and ``target/run_results.json`` (one
-  ``dbt build`` invocation). In that build ``unique_stg_order_items_order_item_id``
-  fails, for the reason the warehouse already plants: a batch of ``order_items``
-  was loaded twice. Every other test passes. So ``dex maintain incidents`` reads
-  one open incident from dbt's run results, with no build and no warehouse
-  write first.
+- **The Elementary package, declared and recorded.** ``packages.yml`` declares
+  it at the release the reader supports, ``dbt_project.yml`` names its schema
+  and turns its row samples off, and ``dbt_packages/elementary/dbt_project.yml``
+  records that release where the resolver reads it. That file is a record, not
+  the package: the demo installs nothing (#1477).
+- **What the latest build left behind**, seeded rather than run:
+  ``target/manifest.json`` (which tests exist, what each reads, where the
+  package builds its tables) and ``target/run_results.json`` (one ``dbt build``
+  invocation, the newest of the runs :mod:`.elementary` seeds). In that build
+  ``unique_stg_order_items_order_item_id`` fails, for the reason the warehouse
+  already plants: a batch of ``order_items`` was loaded twice. Every other test
+  passes. So ``dex maintain incidents`` reads one open incident, with no build
+  and no warehouse write first.
 
 The artifacts are generated, never produced by dbt here: the demo runs no dbt,
 installs no package and touches no network. They hold the fields dex's readers
@@ -24,9 +30,11 @@ generated rows, so it agrees with what a real build of this project reports. A
 real ``dex transform build`` writes its own artifacts in Dex's artifact
 directory, and the readers take whichever is newer.
 
-**Determinism is the same contract as the warehouse's.** No wall clock: the
-build is dated from :data:`~.warehouse._ANCHOR`. The invocation id is derived,
-not drawn. :func:`project_digest` covers every file, and a test pins it.
+**Dated from generation, deterministic in every other way.** The build is the
+newest of :mod:`.elementary`'s runs, so it is dated back from the time the demo
+was generated, which the caller passes in; nothing here reads a clock. The
+invocation id is derived, not drawn. :func:`project_digest` covers every file,
+and a test pins it for a fixed generation time, so every offset is pinned.
 
 Nothing here writes a data file: :func:`build_project` is pure, and
 :func:`write_project` writes text files only, create-only, so the warehouse
@@ -41,18 +49,24 @@ import os
 import shutil
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from .elementary import (
+    RELEASE,
+    SCHEMA,
+    SeededRun,
+    SeededTest,
+    elementary_tables,
+    invocation_id,
+)
 from .warehouse import (
-    _ANCHOR,
     DemoPathError,
     DemoTable,
     DemoTargetExistsError,
-    _uuid_shaped,
 )
 
 #: The directory the project is written into, beside the warehouse file, and
@@ -70,13 +84,21 @@ DBT_VERSION = "1.12.5"
 _MANIFEST_SCHEMA = "https://schemas.getdbt.com/dbt/manifest/v12.json"
 _RUN_RESULTS_SCHEMA = "https://schemas.getdbt.com/dbt/run-results/v6.json"
 
-#: The seeded build: the morning after the last generated date.
-BUILD_STARTED_AT = datetime.combine(_ANCHOR + timedelta(days=1), time(6, 0), tzinfo=UTC)
-_BUILD_SECONDS = 42
-#: When the project's source files read as written: the evening before the
-#: build, so the manifest is newer than every source, as after a real build.
-SOURCES_WRITTEN_AT = BUILD_STARTED_AT - timedelta(hours=12)
-BUILD_INVOCATION_ID = _uuid_shaped("dex-demo-dbt-build-1")
+#: The build ``run_results.json`` holds: the newest of the seeded runs.
+BUILD_INVOCATION_ID = invocation_id(0)
+#: The project's source files read as written this long before the oldest run,
+#: so the manifest is newer than every source, as after a real build.
+_SOURCES_BEFORE = timedelta(days=1)
+
+#: The recorded release, where the resolver reads it. Not the package.
+_RECORDED_RELEASE = f"""\
+# The release of the Elementary package this project's history was recorded
+# with. dex demo writes this record and nothing else here: it installs no
+# package. `dex transform deps` installs the package itself, over this file.
+name: elementary
+version: '{RELEASE}'
+config-version: 2
+"""
 
 #: The test the seeded build fails, by the id dbt gives it.
 FAILING_TEST = "test.analytics.unique_stg_order_items_order_item_id.90e333a108"
@@ -126,6 +148,8 @@ class DemoProject:
 
     sources: tuple[tuple[str, str], ...]
     artifacts: tuple[tuple[str, str], ...]
+    #: When the sources read as written: before every seeded run.
+    sources_written_at: datetime
 
     @property
     def files(self) -> tuple[tuple[str, str], ...]:
@@ -160,6 +184,19 @@ def _source_files(warehouse_name: str) -> list[tuple[str, str]]:
                     "version": "1.0.0",
                     "profile": PROJECT_NAME,
                     "model-paths": ["models"],
+                    "models": {"elementary": {"+schema": "elementary"}},
+                    # Elementary keeps no sample of a failing test's rows.
+                    "vars": {"test_sample_row_count": 0},
+                }
+            ),
+        ),
+        (
+            "packages.yml",
+            _dump(
+                {
+                    "packages": [
+                        {"package": "elementary-data/elementary", "version": RELEASE}
+                    ]
                 }
             ),
         ),
@@ -223,7 +260,83 @@ def _test_id(test: str, model: str) -> str:
     return f"test.{PROJECT_NAME}.{test}_{model}_{key}.{_TEST_HASHES[(test, model)]}"
 
 
-def _manifest(database: str) -> dict[str, Any]:
+def seeded_tests() -> tuple[SeededTest, ...]:
+    """The project's four tests, as Elementary records them."""
+
+    return tuple(
+        SeededTest(
+            unique_id=_test_id(test, model),
+            model=model,
+            column=key,
+            short_name=test,
+        )
+        for model, _, _, key in _MODELS
+        for test in ("unique", "not_null")
+    )
+
+
+def history_tables(
+    tables: tuple[DemoTable, ...],
+    warehouse_name: str,
+    runs: tuple[SeededRun, ...],
+) -> tuple[DemoTable, ...]:
+    """Elementary's two tables for ``runs`` of this project, beside a warehouse
+    file named ``warehouse_name`` whose shop rows are ``tables``: the failing
+    test reports the same ``failures`` as in ``run_results.json``."""
+
+    return elementary_tables(
+        runs,
+        seeded_tests(),
+        failing_test=FAILING_TEST,
+        failures=duplicated_keys(tables, "order_items", "order_item_id"),
+        database=Path(warehouse_name).stem,
+        project=PROJECT_NAME,
+        dbt_version=DBT_VERSION,
+    )
+
+
+#: The package's models the demo seeds a table for: those the reader's
+#: recorded layout lists.
+_PACKAGE_TABLES = (
+    "dbt_invocations",
+    "elementary_test_results",
+    "test_result_rows",
+    "data_monitoring_metrics",
+)
+
+
+def _elementary_nodes(database: str) -> dict[str, Any]:
+    """The package's tables the demo seeds, where the project builds them,
+    and the run hooks that upload them: what a parse with the package
+    installed and enabled puts in the manifest, cut to what dex reads."""
+
+    nodes: dict[str, Any] = {}
+    for table in _PACKAGE_TABLES:
+        uid = f"model.elementary.{table}"
+        nodes[uid] = {
+            "database": database,
+            "schema": SCHEMA,
+            "name": table,
+            "resource_type": "model",
+            "package_name": "elementary",
+            "unique_id": uid,
+            "alias": table,
+            "config": {"enabled": True, "materialized": "incremental"},
+            "relation_name": f'"{database}"."{SCHEMA}"."{table}"',
+            "depends_on": {"macros": [], "nodes": []},
+        }
+    for hook in ("on-run-start", "on-run-end"):
+        uid = f"operation.elementary.elementary-{hook}-0"
+        nodes[uid] = {
+            "unique_id": uid,
+            "resource_type": "operation",
+            "package_name": "elementary",
+            "name": f"elementary-{hook}-0",
+        }
+    return nodes
+
+
+def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
     """The compiled manifest a ``dbt parse`` of the project writes, cut to what
     dex reads: the nodes, their lineage, and each test's metadata."""
 
@@ -343,13 +456,17 @@ def _manifest(database: str) -> dict[str, Any]:
         child_map[model_id] = sorted(tests)
     for source_id in sources:
         parent_map[source_id] = []
+    for uid in (package := _elementary_nodes(database)):
+        nodes[uid] = package[uid]
+        parent_map[uid] = []
+        child_map[uid] = []
     return {
         "metadata": {
             "dbt_schema_version": _MANIFEST_SCHEMA,
             "dbt_version": DBT_VERSION,
-            "generated_at": _iso(BUILD_STARTED_AT),
-            "invocation_id": BUILD_INVOCATION_ID,
-            "invocation_started_at": _iso(BUILD_STARTED_AT),
+            "generated_at": _iso(build.started_at),
+            "invocation_id": build.invocation_id,
+            "invocation_started_at": _iso(build.started_at),
             "env": {},
             "project_name": PROJECT_NAME,
             "adapter_type": "duckdb",
@@ -382,12 +499,13 @@ def duplicated_keys(tables: tuple[DemoTable, ...], table: str, column: str) -> i
     return sum(1 for n in counts.values() if n > 1)
 
 
-def _run_results(tables: tuple[DemoTable, ...]) -> dict[str, Any]:
+def _run_results(tables: tuple[DemoTable, ...], build: SeededRun) -> dict[str, Any]:
     """One ``dbt build`` of the project: both views build, and of the four
-    tests only the ``unique`` test on ``stg_order_items`` fails."""
+    tests only the ``unique`` test on ``stg_order_items`` can fail, where the
+    seeded run says it did."""
 
     results: list[dict[str, Any]] = []
-    clock = BUILD_STARTED_AT + timedelta(seconds=2)
+    clock = build.started_at + timedelta(seconds=2)
 
     def entry(uid: str, status: str, message: str, failures: int | None) -> None:
         nonlocal clock
@@ -416,7 +534,11 @@ def _run_results(tables: tuple[DemoTable, ...]) -> dict[str, Any]:
     for model, table, _, key in _MODELS:
         entry(f"model.{PROJECT_NAME}.{model}", "success", "OK", None)
         for test in ("unique", "not_null"):
-            failed = duplicated_keys(tables, table, key) if test == "unique" else 0
+            failed = (
+                duplicated_keys(tables, table, key)
+                if test == "unique" and build.outcome == "fail"
+                else 0
+            )
             if failed:
                 entry(
                     _test_id(test, model),
@@ -430,35 +552,47 @@ def _run_results(tables: tuple[DemoTable, ...]) -> dict[str, Any]:
         "metadata": {
             "dbt_schema_version": _RUN_RESULTS_SCHEMA,
             "dbt_version": DBT_VERSION,
-            "generated_at": _iso(BUILD_STARTED_AT + timedelta(seconds=_BUILD_SECONDS)),
-            "invocation_id": BUILD_INVOCATION_ID,
-            "invocation_started_at": _iso(BUILD_STARTED_AT),
+            "generated_at": _iso(build.completed_at),
+            "invocation_id": build.invocation_id,
+            "invocation_started_at": _iso(build.started_at),
             "env": {},
         },
         "results": results,
-        "elapsed_time": float(_BUILD_SECONDS),
+        "elapsed_time": (build.completed_at - build.started_at).total_seconds(),
         "args": {"which": "build", "target": "dev", "select": [], "exclude": []},
     }
 
 
-def build_project(tables: tuple[DemoTable, ...], warehouse_name: str) -> DemoProject:
+def build_project(
+    tables: tuple[DemoTable, ...],
+    warehouse_name: str,
+    runs: tuple[SeededRun, ...],
+) -> DemoProject:
     """The project for a warehouse file named ``warehouse_name``, as files.
 
     Pure: no I/O. ``tables`` are the warehouse's generated rows, which decide
-    the failing test's ``failures`` count. The database dbt names is the file's
-    stem, as dbt-duckdb names it.
+    the failing test's ``failures`` count, and ``runs`` the seeded history
+    (:func:`~.elementary.seeded_runs`), whose newest is the build the artifacts
+    record. The database dbt names is the file's stem, as dbt-duckdb names it.
     """
 
     database = Path(warehouse_name).stem
+    build = runs[-1]
     artifacts = (
-        ("target/manifest.json", json.dumps(_manifest(database), indent=2) + "\n"),
+        ("dbt_packages/elementary/dbt_project.yml", _RECORDED_RELEASE),
+        (
+            "target/manifest.json",
+            json.dumps(_manifest(database, build), indent=2) + "\n",
+        ),
         (
             "target/run_results.json",
-            json.dumps(_run_results(tables), indent=2) + "\n",
+            json.dumps(_run_results(tables, build), indent=2) + "\n",
         ),
     )
     return DemoProject(
-        sources=tuple(_source_files(warehouse_name)), artifacts=artifacts
+        sources=tuple(_source_files(warehouse_name)),
+        artifacts=artifacts,
+        sources_written_at=runs[0].started_at - _SOURCES_BEFORE,
     )
 
 
@@ -529,7 +663,7 @@ def write_project(root: Path, project: DemoProject) -> list[str]:
         # The sources were written before the build that read them, so a
         # reader comparing their times with the manifest's does not call the
         # seeded artifacts stale. Fixed, like every other date here.
-        written_at = SOURCES_WRITTEN_AT.timestamp()
+        written_at = project.sources_written_at.timestamp()
         for relative, _ in project.sources:
             os.utime(base / relative, (written_at, written_at))
     except BaseException:
@@ -540,7 +674,6 @@ def write_project(root: Path, project: DemoProject) -> list[str]:
 
 __all__ = [
     "BUILD_INVOCATION_ID",
-    "BUILD_STARTED_AT",
     "DBT_VERSION",
     "FAILING_TEST",
     "PROJECT_DIR",
@@ -548,9 +681,11 @@ __all__ = [
     "DemoProject",
     "build_project",
     "duplicated_keys",
+    "history_tables",
     "project_collision",
     "project_digest",
     "refuse_collision",
     "refuse_target_name",
+    "seeded_tests",
     "write_project",
 ]
