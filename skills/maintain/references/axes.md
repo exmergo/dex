@@ -602,7 +602,19 @@ one coverage number.
   `dex` metadata states reads `none`. A fact a dbt model and the layer both
   declare on one relation, spelled alike (a quoted part keeps its case, so
   `DB.SCHEMA.ORDERS` and `"DB"."SCHEMA"."ORDERS"` are two), is listed per source
-  with `also_declared_by` and counted once.
+  with `also_declared_by` and counted once. A generated test is credited for
+  the declared fact it checks, not only for the fact its kind names:
+  `dex_unique_combination` for a composite grain, `dex_unit_range` for a
+  fraction (never a percent), `dex_population_filter` for a filter list with
+  the declared values, `dex_parent_population` for a parent in both
+  directions with the declared parent, key and filters, and
+  `dex_join_coverage` or `dex_referenced_key` for the reference they join. A
+  test carrying the fact's current claim id matches by `claim`; one carrying
+  no claim matches by kind, column and parameters (`matched_by:
+  kind_and_column`); one carrying any other claim earns no credit, not even
+  where its kind and column match. `dex_join_coverage` is matched by its key
+  pairs and the parent it reads, never by claim, since its claim names the
+  join the model's SQL writes (#1550).
 
 ## `maintain reconcile [<class>]`
 

@@ -639,6 +639,8 @@ def _coverage_fields() -> frozenset[str]:
         "[].verify[]",
         "[].also_declared_by",
         "[].also_declared_by[]",
+        # How a fact's tests matched it (#1550): `claim` or `kind_and_column`.
+        "[].matched_by",
     )
     return _COMMON | frozenset(paths)
 

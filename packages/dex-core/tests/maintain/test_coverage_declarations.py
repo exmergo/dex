@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from exmergo_dex_core.maintain.coverage_declarations import FACT_CAP, declarations
+from exmergo_dex_core.transform.claims import claim_id
 
 PROJECT = "shop"
 
@@ -44,7 +45,11 @@ def _test(
     reads=None,
     enabled=True,
     namespace=None,
+    claim=None,
 ) -> dict:
+    config: dict[str, Any] = {"severity": "ERROR", "enabled": enabled}
+    if claim is not None:
+        config["meta"] = {"dex": {"claim": claim}}
     return {
         "resource_type": "test",
         "name": f"{test}_{on}_{column}",
@@ -56,7 +61,7 @@ def _test(
             "namespace": namespace,
             "kwargs": kwargs or {},
         },
-        "config": {"severity": "ERROR", "enabled": enabled},
+        "config": config,
         # A name, or a full unique id (a package's or a seed's), as dbt
         # resolves the test's `to` into its dependencies.
         "depends_on": {
@@ -1080,3 +1085,722 @@ def test_a_filter_entry_with_no_condition_states_no_fact() -> None:
     )
     out = _run(_manifest([model]))
     assert out["summary"]["facts"]["by_kind"]["population_filter"]["count"] == 1
+
+
+# --- Generated dbt tests credited for the declared facts they check (#1550) ---
+
+
+def _grain_claim(model: str, columns: list[str]) -> str:
+    return claim_id(model, "grain", columns, {"check": "dex_unique_combination"})
+
+
+def test_a_composite_grain_is_checked_by_its_generated_combination_test() -> None:
+    grain = ["order_id", "line_no"]
+    manifest = _manifest(
+        [
+            _model("claimed", dex={"grain": grain}),
+            _model("both", dex={"grain": grain}),
+            _model("handwritten", dex={"grain": grain}),
+            _model("mismatched", dex={"grain": grain}),
+            _model("stale", dex={"grain": grain}),
+            _model("untested", dex={"grain": grain}),
+        ],
+        [
+            _test(
+                "dex_unique_combination",
+                "claimed",
+                kwargs={"columns": ["line_no", "order_id"]},
+                claim=_grain_claim("claimed", grain),
+            ),
+            _test(
+                "dex_unique_combination",
+                "both",
+                kwargs={"columns": grain},
+                claim=_grain_claim("both", grain),
+            ),
+            _test(
+                "unique_combination_of_columns",
+                "both",
+                kwargs={"combination_of_columns": grain},
+                namespace="dbt_utils",
+            ),
+            _test(
+                "dex_unique_combination",
+                "handwritten",
+                kwargs={"columns": grain},
+            ),
+            # Another set of columns: not this grain.
+            _test(
+                "dex_unique_combination",
+                "mismatched",
+                kwargs={"columns": ["order_id", "other"]},
+            ),
+            # The columns match, but the claim names a grain this model no
+            # longer declares: a stale claim earns no credit.
+            _test(
+                "dex_unique_combination",
+                "stale",
+                kwargs={"columns": grain},
+                claim=_grain_claim("stale", ["order_id", "legacy"]),
+            ),
+        ],
+    )
+    out = _run(manifest)
+    claimed = _fact(out, "grain", model="claimed")
+    assert (claimed["checked_by"], claimed["tests"], claimed["matched_by"]) == (
+        "both",
+        ["dex_unique_combination"],
+        "claim",
+    )
+    # The claim wins over a claimless test of the same grain.
+    both = _fact(out, "grain", model="both")
+    assert (both["checked_by"], both["tests"], both["matched_by"]) == (
+        "both",
+        ["dex_unique_combination"],
+        "claim",
+    )
+    hand = _fact(out, "grain", model="handwritten")
+    assert (hand["checked_by"], hand["tests"], hand["matched_by"]) == (
+        "both",
+        ["dex_unique_combination"],
+        "kind_and_column",
+    )
+    for model in ("mismatched", "stale", "untested"):
+        fact = _fact(out, "grain", model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+        assert "matched_by" not in fact
+
+
+def _unit_claim(model: str, column: str, unit: str) -> str:
+    return claim_id(model, "unit", [column], {"check": "dex_unit_range", "unit": unit})
+
+
+def test_a_fraction_is_checked_by_its_unit_range_test_and_a_percent_is_not() -> None:
+    manifest = _manifest(
+        [
+            _model(
+                "m",
+                columns={
+                    "rate": {"unit": "fraction"},
+                    "pct": {"unit": "percent"},
+                    "claimed_rate": {"unit": "fraction"},
+                    "stale_rate": {"unit": "fraction"},
+                    "other": {"unit": "fraction"},
+                    "amount": {"unit": "currency:USD"},
+                },
+            )
+        ],
+        [
+            _test("dex_unit_range", "m", "rate"),
+            # The test checks 0 to 1; a percent is 0 to 100.
+            _test("dex_unit_range", "m", "pct"),
+            _test(
+                "dex_unit_range",
+                "m",
+                "claimed_rate",
+                claim=_unit_claim("m", "claimed_rate", "fraction"),
+            ),
+            # The claim names a percent, which this fraction column is not.
+            _test(
+                "dex_unit_range",
+                "m",
+                "stale_rate",
+                claim=_unit_claim("m", "stale_rate", "percent"),
+            ),
+            # The claim names another column.
+            _test(
+                "dex_unit_range",
+                "m",
+                "other",
+                claim=_unit_claim("m", "elsewhere", "fraction"),
+            ),
+            # A currency has no range fact at all.
+            _test("dex_unit_range", "m", "amount"),
+        ],
+    )
+    out = _run(manifest)
+    rate = _fact(out, "unit", "rate")
+    assert (rate["checked_by"], rate["tests"], rate["matched_by"]) == (
+        "both",
+        ["dex_unit_range"],
+        "kind_and_column",
+    )
+    claimed = _fact(out, "unit", "claimed_rate")
+    assert (claimed["checked_by"], claimed["matched_by"]) == ("both", "claim")
+    for column in ("pct", "stale_rate", "other"):
+        fact = _fact(out, "unit", column)
+        assert fact["checked_by"] == "dex_verify", column
+        assert fact["tests"] == []
+        assert "matched_by" not in fact
+    assert _fact(out, "unit", "amount")["checked_by"] == "none"
+
+
+def _filter_claim(model: str, column: str, mode: str, values: list) -> str:
+    return claim_id(
+        model, "population", [column], {"check": "dex_population_filter", mode: values}
+    )
+
+
+def test_a_population_filter_is_checked_only_by_a_test_with_its_values() -> None:
+    filters = [
+        {"column": "status", "excludes": ["SENTINEL_VALUE_1"]},
+        {"column": "region", "includes": ["SENTINEL_VALUE_2"]},
+    ]
+    manifest = _manifest(
+        [
+            _model("full", dex={"population": {"filters": filters}}),
+            _model("half", dex={"population": {"filters": filters}}),
+            _model(
+                "wrong_values",
+                dex={
+                    "population": {
+                        "filters": [
+                            {"column": "status", "excludes": ["SENTINEL_VALUE_1"]}
+                        ]
+                    }
+                },
+            ),
+            _model(
+                "stale",
+                dex={
+                    "population": {
+                        "filters": [
+                            {"column": "status", "excludes": ["SENTINEL_VALUE_1"]}
+                        ]
+                    }
+                },
+            ),
+            _model(
+                "mixed_mode",
+                dex={
+                    "population": {
+                        "filters": [
+                            {"column": "status", "includes": ["SENTINEL_VALUE_3"]}
+                        ]
+                    }
+                },
+            ),
+            _model(
+                "other_column",
+                dex={
+                    "population": {
+                        "filters": [
+                            {"column": "status", "excludes": ["SENTINEL_VALUE_1"]}
+                        ]
+                    }
+                },
+            ),
+        ],
+        [
+            _test(
+                "dex_population_filter",
+                "full",
+                "status",
+                kwargs={"excludes": ["SENTINEL_VALUE_1"]},
+            ),
+            _test(
+                "dex_population_filter",
+                "full",
+                "region",
+                kwargs={"includes": ["SENTINEL_VALUE_2"]},
+                claim=_filter_claim("full", "region", "includes", ["SENTINEL_VALUE_2"]),
+            ),
+            _test(
+                "dex_population_filter",
+                "half",
+                "status",
+                kwargs={"excludes": ["SENTINEL_VALUE_1"]},
+            ),
+            # A different value: a different filter.
+            _test(
+                "dex_population_filter",
+                "wrong_values",
+                "status",
+                kwargs={"excludes": ["SENTINEL_VALUE_9"]},
+            ),
+            # The values match, but the claim names another list.
+            _test(
+                "dex_population_filter",
+                "stale",
+                "status",
+                kwargs={"excludes": ["SENTINEL_VALUE_1"]},
+                claim=_filter_claim(
+                    "stale", "status", "excludes", ["SENTINEL_VALUE_9"]
+                ),
+            ),
+            # Carrying an `excludes` list, the test checks that list alone,
+            # never the `includes` list beside it.
+            _test(
+                "dex_population_filter",
+                "mixed_mode",
+                "status",
+                kwargs={
+                    "includes": ["SENTINEL_VALUE_3"],
+                    "excludes": ["SENTINEL_VALUE_1"],
+                },
+            ),
+            _test(
+                "dex_population_filter",
+                "other_column",
+                "region",
+                kwargs={"excludes": ["SENTINEL_VALUE_1"]},
+            ),
+        ],
+    )
+    out = _run(manifest)
+    status = _fact(out, "population_filter", "status", model="full")
+    assert (status["checked_by"], status["tests"], status["matched_by"]) == (
+        "both",
+        ["dex_population_filter"],
+        "kind_and_column",
+    )
+    region = _fact(out, "population_filter", "region", model="full")
+    assert (region["checked_by"], region["matched_by"]) == ("both", "claim")
+    # One list without its test leaves the other list's fact unchecked.
+    assert _fact(out, "population_filter", "status", model="half")["checked_by"] == (
+        "both"
+    )
+    assert _fact(out, "population_filter", "region", model="half")["checked_by"] == (
+        "dex_verify"
+    )
+    for model in ("wrong_values", "stale", "mixed_mode", "other_column"):
+        fact = _fact(out, "population_filter", "status", model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+        assert "matched_by" not in fact
+    for mode in (False, True):
+        dumped = json.dumps(_run(manifest, values_free=mode))
+        assert "SENTINEL_VALUE" not in dumped
+
+
+def test_a_filter_entry_with_both_lists_needs_both_of_its_tests() -> None:
+    entry = {
+        "column": "status",
+        "includes": ["SENTINEL_VALUE_3"],
+        "excludes": ["SENTINEL_VALUE_1"],
+    }
+    manifest = _manifest(
+        [
+            _model("dual", dex={"population": {"filters": [entry]}}),
+            _model("dual_half", dex={"population": {"filters": [entry]}}),
+        ],
+        [
+            _test(
+                "dex_population_filter",
+                "dual",
+                "status",
+                kwargs={"includes": ["SENTINEL_VALUE_3"]},
+                claim=_filter_claim("dual", "status", "includes", ["SENTINEL_VALUE_3"]),
+            ),
+            _test(
+                "dex_population_filter",
+                "dual",
+                "status",
+                kwargs={"excludes": ["SENTINEL_VALUE_1"]},
+            ),
+            _test(
+                "dex_population_filter",
+                "dual_half",
+                "status",
+                kwargs={"includes": ["SENTINEL_VALUE_3"]},
+            ),
+        ],
+    )
+    out = _run(manifest)
+    # One list matched by claim, the other by kind and column: the fact
+    # reads `kind_and_column`, since not every list matched by claim.
+    dual = _fact(out, "population_filter", "status", model="dual")
+    assert (dual["checked_by"], dual["tests"], dual["matched_by"]) == (
+        "both",
+        ["dex_population_filter"],
+        "kind_and_column",
+    )
+    half = _fact(out, "population_filter", "status", model="dual_half")
+    assert half["checked_by"] == "dex_verify"
+    assert half["tests"] == []
+
+
+def _parent_claim(
+    model: str, key: list[str], direction: str, parent: str, filters=None
+) -> str:
+    params: dict[str, Any] = {
+        "check": "dex_parent_population",
+        "direction": direction,
+        "parent": parent,
+        "parent_key": [column.lower() for column in key],
+    }
+    if direction == "missing" and filters:
+        params["filters"] = filters
+    return claim_id(model, "population", key, params)
+
+
+def _parent_tests(
+    on: str,
+    *,
+    parent: str = "subs",
+    key: dict | None = None,
+    filters=None,
+    claim_prefix: str | None = None,
+) -> list[dict]:
+    key = key if key is not None else {"subscription_id": "subscription_id"}
+    tests = []
+    for direction in ("missing", "unexpected"):
+        kwargs: dict[str, Any] = {
+            "parent": f"ref('{parent}')",
+            "key": dict(key),
+            "direction": direction,
+        }
+        if direction == "missing" and filters:
+            kwargs["filters"] = filters
+        claim = None
+        if claim_prefix is not None:
+            claim = _parent_claim(
+                on,
+                list(key),
+                direction,
+                parent,
+                filters if direction == "missing" else None,
+            )
+        tests.append(
+            _test(
+                "dex_parent_population",
+                on,
+                kwargs=kwargs,
+                reads=[on, parent],
+                claim=claim,
+            )
+        )
+    return tests
+
+
+def test_a_parent_population_is_checked_only_by_both_of_its_direction_tests() -> None:
+    filters = [{"column": "status", "excludes": ["SENTINEL_VALUE_1"]}]
+    population = {
+        "filters": filters,
+        "parent": {"model": "subs", "key": {"subscription_id": "subscription_id"}},
+    }
+    manifest = _manifest(
+        [
+            _model("subs"),
+            _model("other"),
+            _model("claimed", dex={"population": population}),
+            _model("full", dex={"population": population}),
+            _model("half", dex={"population": population}),
+            _model(
+                "wrong_parent",
+                dex={"population": population},
+            ),
+            _model("wrong_key", dex={"population": population}),
+            _model("wrong_filters", dex={"population": population}),
+            _model("stale", dex={"population": population}),
+        ],
+        [
+            *_parent_tests("claimed", filters=filters, claim_prefix="claimed"),
+            *_parent_tests("full", filters=filters),
+            # Only the `missing` direction: the `unexpected` half is unchecked.
+            _parent_tests("half", filters=filters)[0],
+            *_parent_tests("wrong_parent", parent="other", filters=filters),
+            *_parent_tests(
+                "wrong_key",
+                key={"subscription_id": "other_id"},
+                filters=filters,
+            ),
+            *_parent_tests(
+                "wrong_filters",
+                filters=[{"column": "status", "excludes": ["SENTINEL_VALUE_9"]}],
+            ),
+            *_parent_tests("stale", filters=filters),
+        ],
+    )
+    # The stale model's `missing` test carries a claim for another parent.
+    stale_missing = next(
+        t
+        for t in manifest["nodes"].values()
+        if isinstance(t, dict)
+        and t.get("resource_type") == "test"
+        and t.get("attached_node") == _uid("stale")
+        and (t.get("test_metadata") or {}).get("kwargs", {}).get("direction")
+        == "missing"
+    )
+    stale_missing["config"]["meta"] = {
+        "dex": {
+            "claim": _parent_claim(
+                "stale", ["subscription_id"], "missing", "other", filters
+            )
+        }
+    }
+    out = _run(manifest)
+    claimed = _fact(out, "population_parent", model="claimed")
+    assert (claimed["checked_by"], claimed["tests"], claimed["matched_by"]) == (
+        "both",
+        ["dex_parent_population"],
+        "claim",
+    )
+    full = _fact(out, "population_parent", model="full")
+    assert (full["checked_by"], full["tests"], full["matched_by"]) == (
+        "both",
+        ["dex_parent_population"],
+        "kind_and_column",
+    )
+    for model in ("half", "wrong_parent", "wrong_key", "wrong_filters", "stale"):
+        fact = _fact(out, "population_parent", model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+        assert "matched_by" not in fact
+    for mode in (False, True):
+        dumped = json.dumps(_run(manifest, values_free=mode))
+        assert "SENTINEL_VALUE" not in dumped
+
+
+def test_a_join_coverage_test_checks_only_the_reference_it_joins() -> None:
+    manifest = _manifest(
+        [
+            _model("customers"),
+            _model("vendors"),
+            _model(
+                "orders",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "wrong_parent",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "wrong_field",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "wrong_column",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "two_refs",
+                columns={
+                    "customer_id": {"references": "customers.customer_id"},
+                    "store_id": {"references": "customers.store_id"},
+                },
+                reads=["customers"],
+            ),
+        ],
+        [
+            _test(
+                "dex_join_coverage",
+                "orders",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('customers')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["orders", "customers"],
+            ),
+            _test(
+                "dex_join_coverage",
+                "wrong_parent",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('vendors')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["wrong_parent", "vendors"],
+            ),
+            _test(
+                "dex_join_coverage",
+                "wrong_field",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('customers')",
+                    "parent_columns": ["legacy_id"],
+                },
+                reads=["wrong_field", "customers"],
+            ),
+            _test(
+                "dex_join_coverage",
+                "wrong_column",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["store_id"],
+                    "parent": "ref('customers')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["wrong_column", "customers"],
+            ),
+            # One test over a two-column join checks both references it joins.
+            _test(
+                "dex_join_coverage",
+                "two_refs",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id", "store_id"],
+                    "parent": "ref('customers')",
+                    "parent_columns": ["customer_id", "store_id"],
+                },
+                reads=["two_refs", "customers"],
+            ),
+        ],
+    )
+    out = _run(manifest)
+    joined = _fact(out, "references", "customer_id", model="orders")
+    assert joined["checked_by"] == "both"
+    assert joined["tests"] == ["dex_join_coverage"]
+    for model in ("wrong_parent", "wrong_field", "wrong_column"):
+        fact = _fact(out, "references", "customer_id", model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+    for column in ("customer_id", "store_id"):
+        fact = _fact(out, "references", column, model="two_refs")
+        assert fact["tests"] == ["dex_join_coverage"], column
+
+
+def test_a_referenced_key_test_checks_the_reference_from_the_parent_side() -> None:
+    # Each child reads a parent of its own: a test on one parent says
+    # nothing about a reference to another.
+    manifest = _manifest(
+        [
+            _model("customers"),
+            _model("vendors"),
+            _model("suppliers"),
+            _model("partners"),
+            _model(
+                "orders",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "claimed",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "wrong_column",
+                columns={"vendor_id": {"references": "vendors.vendor_id"}},
+                reads=["vendors"],
+            ),
+            _model(
+                "wrong_parent",
+                columns={"supplier_id": {"references": "suppliers.supplier_id"}},
+                reads=["suppliers"],
+            ),
+            _model(
+                "stale",
+                columns={"partner_id": {"references": "partners.partner_id"}},
+                reads=["partners"],
+            ),
+        ],
+        [
+            _test("dex_referenced_key", "customers", "customer_id"),
+            _test(
+                "dex_referenced_key",
+                "customers",
+                "customer_id",
+                claim=claim_id(
+                    "customers",
+                    "referenced_key",
+                    ["customer_id"],
+                    {"check": "dex_referenced_key"},
+                ),
+            ),
+            # On the parent's other column: not the referenced field.
+            _test("dex_referenced_key", "vendors", "legacy_id"),
+            # The columns match, but the claim names another field.
+            _test(
+                "dex_referenced_key",
+                "partners",
+                "partner_id",
+                claim=claim_id(
+                    "partners",
+                    "referenced_key",
+                    ["other_id"],
+                    {"check": "dex_referenced_key"},
+                ),
+            ),
+        ],
+    )
+    out = _run(manifest)
+    # The two tests on the parent column the references name both check it:
+    # the claimless one for `orders`, the claimed one for `claimed`.
+    assert _fact(out, "references", "customer_id", model="orders")["tests"] == [
+        "dex_referenced_key"
+    ]
+    assert _fact(out, "references", "customer_id", model="claimed")["tests"] == [
+        "dex_referenced_key"
+    ]
+    for model, column in (
+        ("wrong_column", "vendor_id"),
+        ("wrong_parent", "supplier_id"),
+        ("stale", "partner_id"),
+    ):
+        fact = _fact(out, "references", column, model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+
+
+def test_a_composite_parent_key_matches_whichever_way_its_pairs_are_listed() -> None:
+    # The key's pairs are a set; the claim keeps the declaration's order.
+    population = {"parent": {"model": "subs", "key": {"a": "a_id", "b": "b_id"}}}
+    tests = [
+        _test(
+            "dex_parent_population",
+            "child",
+            kwargs={
+                "parent": "ref('subs')",
+                "key": {"b": "b_id", "a": "a_id"},
+                "direction": direction,
+            },
+            reads=["child", "subs"],
+            claim=claim_id(
+                "child",
+                "population",
+                ["a", "b"],
+                {
+                    "check": "dex_parent_population",
+                    "direction": direction,
+                    "parent": "subs",
+                    "parent_key": ["a_id", "b_id"],
+                },
+            ),
+        )
+        for direction in ("missing", "unexpected")
+    ]
+    manifest = _manifest(
+        [_model("subs"), _model("child", dex={"population": population})], tests
+    )
+    out = _run(manifest)
+    fact = _fact(out, "population_parent", model="child")
+    assert (fact["checked_by"], fact["tests"], fact["matched_by"]) == (
+        "both",
+        ["dex_parent_population"],
+        "claim",
+    )
+    assert fact["column"] == "a, b"
+
+
+def test_a_versioned_models_test_matches_by_its_bare_name_claim() -> None:
+    # A declaration on every version renders its tests under the bare name.
+    model = _model("orders", dex={"grain": ["order_id", "line_no"]})
+    model.update({"version": 2, "latest_version": 2})
+    manifest = _manifest(
+        [model],
+        [
+            _test(
+                "dex_unique_combination",
+                "orders",
+                kwargs={"columns": ["order_id", "line_no"]},
+                claim=_grain_claim("orders", ["order_id", "line_no"]),
+            ),
+        ],
+    )
+    out = _run(manifest)
+    fact = _fact(out, "grain", model="orders.v2")
+    assert (fact["checked_by"], fact["tests"], fact["matched_by"]) == (
+        "both",
+        ["dex_unique_combination"],
+        "claim",
+    )
