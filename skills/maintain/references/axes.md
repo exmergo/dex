@@ -605,8 +605,9 @@ one coverage number.
   with `also_declared_by` and counted once.
   A test Dex rendered for a grain, a reference or a `never` null rule carries
   `claim`, the id of the fact it checks, on its entry in the resource's `tests`
-  list, and is matched to that fact by the claim, whatever its kind or column.
-  A test with no claim (hand-written, or rendered before #1448) and a generated
+  list, and is matched to that fact by the claim, whatever its kind or column,
+  except that a single-column grain's `not_null` carries the grain's claim but
+  is never its check: only its `unique` is. A test with no claim (hand-written, or rendered before #1448) and a generated
   test such as `dex_freshness` are matched by kind and column, and a generated
   test is never listed as stale. A fact with tests says
   which under `matched_by`: `claim` or `kind_and_column`. A test whose claim

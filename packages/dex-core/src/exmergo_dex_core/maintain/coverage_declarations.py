@@ -943,8 +943,10 @@ def _model_facts(
         facts.append(
             _record("dbt", label, kind, column, relation, found, verify, **identity)
         )
-        if matched_by is not None:
-            facts[-1]["matched_by"] = matched_by
+        # A generated test (`dex_freshness`, `dex_continuity`) is only ever
+        # matched by kind and column, so a found test with no method says so.
+        if found:
+            facts[-1]["matched_by"] = matched_by or "kind_and_column"
 
     def prose(kind: str, column: str | None) -> None:
         facts.append(

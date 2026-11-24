@@ -1206,6 +1206,8 @@ def test_a_generated_test_with_its_claim_is_not_listed_apart() -> None:
     assert out["summary"]["stale_claims"] == 0
     assert _fact(out, "freshness", "loaded_at")["checked_by"] == "both"
     assert _fact(out, "continuity", "ordered_at")["tests"] == ["dex_continuity"]
+    assert _fact(out, "freshness", "loaded_at")["matched_by"] == "kind_and_column"
+    assert _fact(out, "continuity", "ordered_at")["matched_by"] == "kind_and_column"
 
 
 def test_each_test_in_a_resources_tests_list_shows_its_claim() -> None:
