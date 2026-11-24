@@ -412,14 +412,14 @@ def _resolves(reference: str, files: Mapping[str, str], view: Any) -> bool:
         return True
     if declarations_mod._is_seed_or_snapshot(files, view, parent):
         return True
-    from .package_targets import find_package_target
+    from .package_targets import configured_dbt_target, find_package_target
 
     packaged = find_package_target(
         view.root,
         parent,
         project_yml=files.get("dbt_project.yml"),
         manifest=getattr(view, "manifest", None),
-        target=getattr(view, "dbt_target", None),
+        target=configured_dbt_target(view.root),
     )
     return (
         packaged is not None

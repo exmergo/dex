@@ -129,13 +129,19 @@ def _dbt_parent_resolvable(
     # An installed package's model, seed or snapshot, when the project has none
     # of that name (#1155). Columns that cannot be read are accepted, as an
     # unparseable project SELECT is.
-    from .package_targets import find_package_target
+    from .package_targets import configured_dbt_target, find_package_target
 
+    target = (
+        getattr(engine.config, "dbt_target", None)
+        or configured_dbt_target(view.root)
+        or "dev"
+    )
     packaged = find_package_target(
         view.root,
         parent_model,
         project_yml=files.get("dbt_project.yml"),
         manifest=view.manifest,
+        target=target,
     )
     if packaged is None or packaged.enabled is False:
         return False

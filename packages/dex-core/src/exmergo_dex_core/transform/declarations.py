@@ -70,7 +70,7 @@ from .package_overrides import (
     documented_overrides,
     override_refusal,
 )
-from .package_targets import find_package_target
+from .package_targets import configured_dbt_target, find_package_target
 from .plans import EditKind, EditOp, PlanEdit, select_columns
 from .rewrite import (
     NO_STORED_FAILURES,
@@ -545,10 +545,10 @@ def _elementary_sampling_warning(
 
                 if is_target_dependent(val):
                     elem_enabled = resolve_target_enabled(val, manifest=manifest)
-    if elem_enabled is False:
-        return None
 
     if materialization is None:
+        if elem_enabled is False:
+            return None
         elem_mat = f"macro.{elementary.PACKAGE}.materialization_test_default"
         synthetic_manifest = {
             "metadata": {"adapter_type": "default", "project_name": project_name},
@@ -1112,7 +1112,7 @@ def _check_reference(
         parent,
         project_yml=files.get("dbt_project.yml"),
         manifest=view.manifest,
-        target=getattr(view, "dbt_target", None),
+        target=configured_dbt_target(view.root),
     )
     if packaged is not None:
         if packaged.enabled is False:
@@ -1124,7 +1124,7 @@ def _check_reference(
         if packaged.enabled is None:
             return [
                 f"{said}: whether {packaged.described()} is enabled is unknown without "
-                "a matching manifest, so whether it produces '{parent_column}' was "
+                f"a matching manifest, so whether it produces '{parent_column}' was "
                 "not checked here; transform build verify reads the built relation"
             ]
         if packaged.columns is None:
@@ -1758,7 +1758,7 @@ def _parent_unwritable(
             parent,
             project_yml=files.get("dbt_project.yml"),
             manifest=view.manifest,
-            target=getattr(view, "dbt_target", None),
+            target=configured_dbt_target(view.root),
         )
         if packaged is not None:
             return gt.PARENT_IN_PACKAGE

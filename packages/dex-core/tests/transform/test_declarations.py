@@ -2015,7 +2015,7 @@ def test_target_dependent_elementary_sampling_warning_with_target_matched_eviden
     project_files = _project()
 
     # Evidence matching dev: Elementary disabled on dev, so no warning
-    dev_m = manifest(elementary=True)
+    dev_m = manifest(elementary=True, models="disabled")
     dev_m["metadata"]["target_name"] = "dev"
     dev_view = DbtProjectView(
         root=str(tmp_path),
@@ -2155,5 +2155,6 @@ def test_target_dependent_package_model_parent_check_advises_when_unresolved(
             "`dbt_packages/pkg/models/parent_m.sql`) is enabled is unknown"
         )
         in w
+        and "whether it produces 'id' was not checked here" in w
         for w in warnings
     )

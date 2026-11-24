@@ -101,6 +101,28 @@ class PackageTarget:
         return f"'{self.name}' ({self.kind} of package {self.package}, `{self.path}`)"
 
 
+def configured_dbt_target(root: Path | str | None) -> str:
+    """The configured dbt_target from the project config, defaulting to dev."""
+    if root is None:
+        return "dev"
+    with contextlib.suppress(Exception):
+        from ..command_args import resolve_dex_root
+        from ..config import CONFIG_FILE, DEX_DIR, load_config
+
+        start = Path(root).resolve()
+        dex_root = resolve_dex_root(start)
+        if dex_root is None:
+            for directory in (start, *start.parents):
+                if (directory / DEX_DIR / CONFIG_FILE).is_file():
+                    dex_root = directory
+                    break
+        if dex_root is not None:
+            cfg = load_config(dex_root)
+            if cfg is not None and cfg.dbt_target:
+                return cfg.dbt_target
+    return "dev"
+
+
 def find_package_target(
     root: Path | str,
     name: str,

@@ -105,22 +105,18 @@ def resolve_target_enabled(
 
     Returns ``None`` when reliable target evidence is absent or unmatched.
     """
-    target_name = target
-    if target_name is None and isinstance(manifest, Mapping):
-        meta = manifest.get("metadata")
-        if isinstance(meta, Mapping):
-            t = meta.get("target_name")
-            if isinstance(t, str) and t.strip():
-                target_name = t.strip()
-    elif target is not None and isinstance(manifest, Mapping):
-        meta = manifest.get("metadata")
-        if isinstance(meta, Mapping):
-            t = meta.get("target_name")
-            if isinstance(t, str) and t.strip() and t.strip() != target:
-                return None
-
-    if target_name is None:
+    if not isinstance(manifest, Mapping):
         return None
+    meta = manifest.get("metadata")
+    if not isinstance(meta, Mapping):
+        return None
+    manifest_target = meta.get("target_name")
+    if not isinstance(manifest_target, str) or not manifest_target.strip():
+        return None
+    manifest_target = manifest_target.strip()
+    if target is not None and manifest_target != target:
+        return None
+    target_name = target if target is not None else manifest_target
 
     stripped = expr.strip()
     m_ne = re.match(
