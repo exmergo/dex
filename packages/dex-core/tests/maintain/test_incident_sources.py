@@ -709,7 +709,7 @@ KNOWN_START = (
 #: ``after_window``) gives instead, for the incidents it opened alone.
 ONLY_DBT = (
     "opened by dbt_run_results have no known start (first_observed: unknown): "
-    "a failure only dbt's run_results.json reports is seen in one invocation"
+    "no passing run is observed before their first failure"
 )
 
 
@@ -862,6 +862,32 @@ def test_a_run_elementary_recorded_dates_a_failure_it_opened_after_elementary_pa
     assert incident["first_observed"]["source"] == "dbt_run_results"
     assert not _says_no_known_start(result)
     assert not any(ONLY_DBT in note for note in result.notes)
+
+
+def test_the_scoped_note_claims_no_single_invocation(tmp_path: Path):
+    """dbt's run is an older invocation Elementary recorded (inv-2), where
+    Elementary holds no result for TEST, and Elementary sees TEST fail later
+    (inv-3). The run opens the incident with no pass before it, yet the failure
+    is seen in two invocations, so the note says no pass was observed, not that
+    one invocation is all there is."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(
+        tmp_path, runs, [Result("r-inv-3", "inv-3", status="fail")]
+    )
+    _run_results(root, {TEST: "fail"}, invocation="inv-2", at=runs[1].started)
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
+    [incident] = data["incidents"]
+    assert incident["opening_source"] == "dbt_run_results"
+    assert incident["first_observed"] == "unknown"
+    seen = {(o["source"], o["run"]) for o in incident["observations"]}
+    assert {("dbt_run_results", "inv-2"), ("elementary", "inv-3")} <= seen
+    _, note = _only_dbt_note(result)
+    assert note.startswith("1 incident(s) ")
+    assert "one invocation" not in note
 
 
 def test_a_run_after_the_window_drops_the_no_known_start_note(tmp_path: Path):

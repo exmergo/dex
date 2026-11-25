@@ -911,14 +911,15 @@ def _dbt(
 
 def _only_dbt_reports(count: int) -> str:
     """The "no known start" note for a run placed in Elementary's order. It speaks
-    of the incidents dbt's run opened alone, never of every failure, since the
-    fold can date the others from Elementary's runs."""
+    of the incidents dbt's run opened with no pass before them, never of every
+    failure, since the fold can date the others from Elementary's runs. Such an
+    incident can still carry Elementary's later failures (a run from an older
+    invocation Elementary recorded), so the note claims no single invocation."""
 
     return (
         f"{count} incident(s) opened by dbt_run_results have no known start "
-        "(first_observed: unknown): a failure only dbt's run_results.json "
-        "reports is seen in one invocation, so every interval before it is "
-        "unobserved"
+        "(first_observed: unknown): no passing run is observed before their "
+        "first failure, so every interval before it is unobserved"
     )
 
 
