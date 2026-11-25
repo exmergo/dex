@@ -856,7 +856,12 @@ def test_a_measure_reading_the_failing_column_is_named_with_its_metrics(
     assert readers["status"] == "read"
     assert readers["vendor"] == "dbt"
     assert readers["tested"] == [
-        {"test": TEST, "model": "stg_order_items", "columns": ["order_item_id"]}
+        {
+            "test": TEST,
+            "model": "stg_order_items",
+            "columns": ["order_item_id"],
+            "version": None,
+        }
     ]
     assert readers["readers"] == [
         {
@@ -910,6 +915,7 @@ def test_a_computed_expression_on_the_tested_model_is_listed_as_unresolved(
             "kind": "measure",
             "name": "order_item_count",
             "reason": "computed_expression",
+            "column": None,
             "metrics": ["items_per_unit", "order_items"],
         }
     ]
@@ -1014,3 +1020,42 @@ def test_a_test_that_is_not_a_uniqueness_test_reads_the_column_it_is_attached_to
 
     assert readers["tested"][0]["columns"] == ["order_item_id"]
     assert [r["name"] for r in readers["readers"]] == ["order_item_count"]
+
+
+def test_a_semantic_file_with_quoted_keys_that_does_not_parse_is_unreadable(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    models = root / "models"
+    models.mkdir()
+    (models / "semantic.yml").write_text(
+        "'semantic_models':\n  - name: order_items\n    model: [unclosed\n"
+    )
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "unreadable"
+    assert readers["unread_files"] == ["models/semantic.yml"]
+
+
+def test_a_test_on_a_versioned_model_lists_its_readers_as_version_unresolved(
+    tmp_path: Path,
+):
+    # The fingerprint keeps a semantic model's ref by name alone, so it cannot
+    # say whether ref('stg_order_items') resolves to the version that failed.
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root)
+    manifest = json.loads((root / "target" / "manifest.json").read_text())
+    manifest["nodes"][MODEL]["version"] = 2
+    manifest["nodes"][MODEL]["latest_version"] = 2
+    (root / "target" / "manifest.json").write_text(json.dumps(manifest))
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["tested"][0]["version"] == "2"
+    assert readers["readers"] == []
+    [item] = readers["unresolved"]
+    assert (item["name"], item["reason"], item["column"]) == (
+        "order_item_count",
+        "version_unresolved",
+        "order_item_id",
+    )
+    assert item["metrics"] == ["items_per_unit", "order_items"]
