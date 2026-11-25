@@ -1000,3 +1000,17 @@ def test_naming_the_readers_opens_no_connection(
     readers = _readers(_diagnose(root, warehouse))
 
     assert [r["name"] for r in readers["readers"]] == ["order_item_count"]
+
+
+def test_a_test_that_is_not_a_uniqueness_test_reads_the_column_it_is_attached_to(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root)
+    manifest = json.loads((root / "target" / "manifest.json").read_text())
+    manifest["nodes"][TEST]["test_metadata"] = {"name": "not_null", "kwargs": {}}
+    (root / "target" / "manifest.json").write_text(json.dumps(manifest))
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["tested"][0]["columns"] == ["order_item_id"]
+    assert [r["name"] for r in readers["readers"]] == ["order_item_count"]

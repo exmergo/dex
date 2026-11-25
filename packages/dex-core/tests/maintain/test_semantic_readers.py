@@ -144,3 +144,36 @@ def test_a_project_that_cannot_be_read_is_unreadable():
     assert got.status == "unreadable"
     assert got.reason == "project_unreadable"
     assert got.vendor == "dbt"
+
+
+def _incident(column: str | None) -> Any:
+    return SimpleNamespace(
+        tests=("test.shop.volume",), signal=SimpleNamespace(column=column)
+    )
+
+
+def _anomaly_manifest() -> dict[str, Any]:
+    return {
+        "nodes": {
+            "model.shop.stg_orders": {"resource_type": "model", "name": "stg_orders"},
+            "test.shop.volume": {
+                "resource_type": "test",
+                "test_metadata": {"name": "column_anomalies", "kwargs": {}},
+                "attached_node": "model.shop.stg_orders",
+            },
+        }
+    }
+
+
+def test_a_column_anomaly_test_reads_the_column_its_source_recorded():
+    from exmergo_dex_core.maintain.diagnose import _tested_columns
+
+    [tested] = _tested_columns(_anomaly_manifest(), _incident("id"))
+
+    assert (tested.model, tested.columns) == ("stg_orders", ("id",))
+
+
+def test_a_test_on_no_column_and_no_recorded_column_names_nothing():
+    from exmergo_dex_core.maintain.diagnose import _tested_columns
+
+    assert _tested_columns(_anomaly_manifest(), _incident(None)) == []
