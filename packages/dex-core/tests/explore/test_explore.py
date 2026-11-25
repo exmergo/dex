@@ -1288,6 +1288,92 @@ def _stub_meta(identifier: str):
     )
 
 
+def test_map_rank_cutoff_keeps_prior_joins(many_tables_duckdb: Path, tmp_path, capsys):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    argv = [
+        "explore",
+        "map",
+        "--path",
+        str(many_tables_duckdb),
+        "--repo-root",
+        str(repo),
+    ]
+    _run([*argv, "--full"], capsys)
+    store = FilesystemStore(repo)
+    prior = store.load_cache()
+    # Seed a verified join for every profiled pair so either endpoint can fall
+    # below the next map's rank cutoff, independent of the ranking order.
+    prior.relationships = [
+        _stub_relationship(left.identifier, right.identifier).model_copy(
+            update={"verified": True}
+        )
+        for left, right in zip(prior.datasets[::2], prior.datasets[1::2], strict=True)
+    ]
+    store.save_cache(prior)
+    payload = _run([*argv, "--refresh"], capsys)
+    assert payload["data"]["skipped_count"] == 35
+    current = store.load_cache()
+    old_stamps = {ds.identifier: ds.profiled_at for ds in prior.datasets}
+    examined = {
+        ds.identifier
+        for ds in current.datasets
+        if ds.profiled_at != old_stamps[ds.identifier]
+    }
+    assert len(examined) == 25
+    expected = {
+        (rel.from_dataset, rel.to_dataset)
+        for rel in prior.relationships
+        if rel.from_dataset not in examined or rel.to_dataset not in examined
+    }
+    assert expected
+    retained = {
+        (rel.from_dataset, rel.to_dataset)
+        for rel in current.relationships
+        if rel.verified
+    }
+    assert expected <= retained
+
+
+def test_compose_keeps_unobserved_inventory_and_drops_deleted_inventory():
+    from exmergo_dex_core.explore.commands import _compose_datasets
+
+    outside = Dataset(identifier="db.shop.customers", row_count=12, rank_score=0.4)
+    prior = DexCache(datasets=[outside, Dataset(identifier="db.marts.deleted")])
+    datasets, carried, out_of_scope, dropped = _compose_datasets(
+        [_stub_meta("db.marts.orders")],
+        [],
+        {},
+        prior,
+        observed_namespaces={"db.marts"},
+    )
+    assert {ds.identifier for ds in datasets} == {
+        "db.shop.customers",
+        "db.marts.orders",
+    }
+    assert next(ds for ds in datasets if ds.identifier == outside.identifier) == outside
+    assert carried == 0
+    assert out_of_scope == 1
+    assert dropped == ["db.marts.deleted"]
+
+
+def test_relationship_inventory_distinguishes_skipped_from_deleted():
+    from exmergo_dex_core.explore.commands import _carry_forward_relationships
+
+    skipped = _stub_relationship("db.marts.orders", "db.marts.skipped")
+    deleted = _stub_relationship("db.marts.orders", "db.marts.deleted")
+    prior = DexCache(relationships=[skipped, deleted])
+    rels, carried = _carry_forward_relationships(
+        prior,
+        {"db.marts.orders"},
+        [],
+        observed_namespaces={"db.marts"},
+        inventoried={"db.marts.orders", "db.marts.skipped"},
+    )
+    assert rels == [skipped]
+    assert carried == 1
+
+
 def _stub_dataset(identifier: str, *, profiled_at: str = "2026-01-01T00:00:00+00:00"):
     from exmergo_dex_core.cache import ColumnProfile
 

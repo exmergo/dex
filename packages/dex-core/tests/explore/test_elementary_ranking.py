@@ -1074,9 +1074,9 @@ def test_relationships_after_an_include_run_reads_none_of_the_cached_package_pro
 ):
     """An include run left fresh profiles of the package's tables in the cache,
     and the joins among them. A default run neither reuses the profiles as cache
-    hits nor infers from them, and leaves them in the cache as they were; the
-    joins it drops from the cache, as `map` does (an unexamined endpoint in a
-    namespace this run listed reads as gone), so none is carried forward."""
+    hits nor infers from them, and leaves them and their joins in the cache as
+    they were. Inventoried package tables are skipped, not deleted. Their
+    joins stay excluded from the reported relationships and carry count."""
 
     warehouse = _joined_warehouse(tmp_path / "warehouse.duckdb")
     repo = tmp_path / "repo"
@@ -1093,7 +1093,7 @@ def test_relationships_after_an_include_run_reads_none_of_the_cached_package_pro
     cache = json.loads((repo / ".dex" / "cache.json").read_text())
     by_id = {d["identifier"]: d for d in cache["datasets"]}
     assert all(by_id[i]["columns"] for i in _JOINED_ELEMENTARY)
-    assert _endpoints(cache["relationships"]) == _JOINED_PROJECT
+    assert _endpoints(cache["relationships"]) == _JOINED_PROJECT | _JOINED_ELEMENTARY
 
 
 def test_relationships_keeps_package_joins_carried_from_outside_its_scope_unreported(

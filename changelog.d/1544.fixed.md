@@ -1,0 +1,1 @@
+`explore map` keeps prior joins for objects still inventoried but skipped by the rank cutoff. Scoped runs also preserve inventory-only datasets in unobserved namespaces, while deleted objects and their joins are still removed.
