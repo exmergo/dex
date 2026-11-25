@@ -739,21 +739,26 @@ diagnosis answers the question a person reading a metric asks first: does this r
 that read the failing test's columns, read from dbt's semantic layer the way
 `maintain snapshot` fingerprints it, with no warehouse query.
 
-- `readers`: each entity, dimension and measure on the tested model whose
-  column is a tested one, with its `semantic_model`, `model`, `kind`, `name` and
+- `readers`: each entity, dimension and measure of a semantic model on the
+  tested model itself whose column is a tested one, with its `semantic_model`, `model`, `kind`, `name` and
   `column`. A measure carries `metrics`: every metric whose input is the
   measure, and every metric built on those.
 - `unresolved`: a member on the tested model whose expression is computed
   (`computed_expression`), and a semantic model whose `model` names nothing Dex
-  can read (`model_unresolved`). It may read the column; nothing here guesses.
-- `status`: `read` (the list stands; empty means nothing reads the column),
-  `absent` (no semantic layer), `unreadable` (a layer is there and could not
-  be read; `unread_files` names a semantic file that does not parse), or
+  can read (`model_unresolved`). Dex cannot say which column it reads, or
+  whether it reads one; nothing here guesses.
+- `status`: `read` (the list stands; empty means no semantic model on the
+  tested model reads the column), `absent` (no semantic layer), `unreadable`
+  (`unparsed_files`, each named in `unread_files`; `project_unreadable`;
+  `no_project`), or
   `not_read` with `reason` `no_tested_column` or `vendor_not_covered` (a native
   `semantic.vendor`, which this release does not match to a dbt model).
 
 Report these beside the cause: name the semantic models and metrics, and say
-which objects are unresolved rather than leaving them out.
+which objects are unresolved rather than leaving them out. A semantic model on
+a model built from the tested one (a mart over a staging model) is not
+followed, as every `read` says in its `detail`, so an empty list is not proof
+that no metric downstream reads the column.
 
 ## What each axis costs
 

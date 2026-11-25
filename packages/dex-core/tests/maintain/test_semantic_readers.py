@@ -177,3 +177,15 @@ def test_a_test_on_no_column_and_no_recorded_column_names_nothing():
     from exmergo_dex_core.maintain.diagnose import _tested_columns
 
     assert _tested_columns(_anomaly_manifest(), _incident(None)) == []
+
+
+def test_a_semantic_model_on_a_model_built_from_the_tested_one_is_not_followed():
+    # The scope every read states: a mart that selects the column from the
+    # tested staging model is not traced, and the empty list says so.
+    layer = _layer(_model("orders", "fct_orders", measures={"order_count": "id"}))
+    got = sr.readers(layer, TESTED)
+
+    assert got.status == "read"
+    assert got.readers == ()
+    assert got.detail == sr.SCOPE
+    assert "not followed" in sr.SCOPE
