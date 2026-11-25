@@ -374,7 +374,8 @@ def test_a_check_of_no_table_is_refused_rather_than_passing():
 def test_a_layout_for_a_release_the_fixture_does_not_run_is_refused_on_load():
     assert parse_layouts(_one_release("0.26.1"))
     with pytest.raises(ValueError, match="not in TESTED_RELEASES"):
-        parse_layouts(_one_release("0.20.0"))
+        # Inside the supported range, and in no slot of the fixture's matrix.
+        parse_layouts(_one_release("0.21.0"))
 
 
 def test_a_layout_that_reads_an_undeclared_column_is_refused_on_load():

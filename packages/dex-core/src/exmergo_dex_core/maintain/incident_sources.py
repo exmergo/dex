@@ -215,6 +215,7 @@ def read(
     warnings.extend(elementary.extra.pop("_warnings", []))
     dbt = _dbt(project_dir, manifest, claims, elementary.history, steps, notes)
     warnings.extend(dbt.extra.pop("_warnings", []))
+    held_at: int | None = dbt.extra.pop("_held_note_at", None)
 
     read = [source for source in (elementary, dbt) if source.history is not None]
     observations = [
@@ -236,6 +237,17 @@ def read(
         now=datetime.now(UTC),
         history=history,
     )
+    if held_at is not None:
+        undated = sum(
+            1
+            for incident in fold.incidents
+            if incident.opening_source == "dbt_run_results"
+            and incident.first_observed == "unknown"
+        )
+        if undated:
+            # Where the file's own note would have been, so the notes keep the
+            # order every other placement gives them.
+            notes.insert(held_at, _only_dbt_reports(undated))
     if dbt.history is not None and elementary.status != "read":
         notes.append(
             "dbt's run_results.json holds one invocation, so a failure it reports "
@@ -881,8 +893,34 @@ def _dbt(
             "claims_unread": counts.claims_unread,
         },
     )
-    notes.extend(found.notes)
+    if placed_as in ("in_window", "after_window"):
+        # The run has a place in Elementary's order, as one of its invocations
+        # or after its newest one, so a failure Elementary saw pass before it is
+        # dated: the file's "no known start" note is left out here. :func:`read`
+        # puts a note in its place only for the incidents this run opened with
+        # no known start (a test Elementary holds no result for), and that note
+        # names those incidents alone, since others in the same fold can be
+        # dated. The run itself is still named, under this source's ``run`` and
+        # ``placed``. Read alone, the run keeps the file's note: nothing dates it.
+        extra["_held_note_at"] = len(notes)
+        notes.extend(n for n in found.notes if n != found.unknown_start_note)
+    else:
+        notes.extend(found.notes)
     return _Source("read", extra=extra, observations=observations, history=history)
+
+
+def _only_dbt_reports(count: int) -> str:
+    """The "no known start" note for a run placed in Elementary's order. It speaks
+    of the incidents dbt's run opened with no pass before them, never of every
+    failure, since the fold can date the others from Elementary's runs. Such an
+    incident can still carry Elementary's later failures (a run from an older
+    invocation Elementary recorded), so the note claims no single invocation."""
+
+    return (
+        f"{count} incident(s) opened by dbt_run_results have no known start "
+        "(first_observed: unknown): no passing run is observed before their "
+        "first failure, so every interval before it is unobserved"
+    )
 
 
 #: How dbt's run was placed in the one invocation order: ``alone`` (the only

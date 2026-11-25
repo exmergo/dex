@@ -399,9 +399,11 @@ jobs:
     # fork could spend.
     runs-on: ubuntu-latest
     # 30, double the usual 15: the Elementary step below builds six
-    # variants at two package releases, about 9.5 minutes on a hosted runner,
-    # and the whole job took about 13 (2026-11-22), leaving room for a third
-    # release.
+    # variants at each Postgres slot of the release matrix. At two releases it
+    # took 6:25 to 9:22 on hosted runners on main (2026-11-23 and 24), and the
+    # whole job 8:47 to 12:42. The third slot, 0.20.0 (#1446), adds 11 of the
+    # step's 33 cases and one more build inside a twelfth, about 3 to 5
+    # minutes, so the job stays under 18.
     timeout-minutes: 30
     defaults:
       run:
@@ -462,9 +464,9 @@ jobs:
         run: >-
           uv run pytest tests/integration -q -m postgres
           --ignore=tests/integration/test_postgres_elementary.py
-      # The Elementary fixture at the package releases most installs pin
-      # (LEGACY_VERSIONS in tests/transform/elementary_fixture.py, which is where
-      # a release is added). Its own step, with DEX_TEST_ELEMENTARY on the step
+      # The Elementary fixture at the matrix's Postgres slots (POSTGRES_VERSIONS
+      # in tests/transform/elementary_fixture.py; how a release is added is in
+      # CONTRIBUTING.md, "The release matrix"). Its own step, with DEX_TEST_ELEMENTARY on the step
       # rather than the job, so the suite above never runs it a second time. The
       # file skips itself without the variable, and pytest counts a skip as a
       # pass, so check_no_skips.py fails the step on any skip rather than

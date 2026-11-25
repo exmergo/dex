@@ -129,6 +129,11 @@ class RunResultsRead:
     counts: RunResultsCounts = field(default_factory=RunResultsCounts)
     notes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: The note in ``notes`` saying no failure has a known start, which holds of
+    #: the file on its own. A caller that places the run in a longer history
+    #: (``maintain incidents``, where the run has a place in Elementary's
+    #: order) leaves it out there.
+    unknown_start_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -397,13 +402,14 @@ def read_run_results(
             ),
         )
 
-    notes = [
+    unknown_start = (
         f"test outcomes are read from one dbt {newest.command} invocation "
         f"({newest.invocation_id}) in {where}, generated at "
         f"{newest.generated_at or 'an unrecorded time'}. One invocation is all "
         "run_results.json holds, so no failure has a known start "
         "(first_observed: unknown), and every interval before it is unobserved"
-    ]
+    )
+    notes = [unknown_start]
     if passed_over:
         commands = sorted({later.command for later in passed_over})
         notes.append(
@@ -450,4 +456,5 @@ def read_run_results(
         run=run,
         counts=counts,
         notes=tuple(notes),
+        unknown_start_note=unknown_start,
     )

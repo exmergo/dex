@@ -572,7 +572,7 @@ the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
 run and fails `dbt build` on DuckDB), and most installs pin 0.15 or 0.16, so
 those build on Postgres instead. DuckDB still parses 0.16.4, so the resolver's
 cases install it there for `dbt parse` alone. `tests/integration/test_postgres_elementary.py`
-builds the same variants at 0.16.4 and 0.15.2 against the seeded container
+builds the same variants at 0.20.0, 0.16.4 and 0.15.2 against the seeded container
 `scripts/setup_postgres_dev.sh` starts, and needs both opt-ins:
 
 ```
@@ -605,6 +605,55 @@ step then runs `scripts/check_no_skips.py` over the JUnit report pytest wrote,
 which fails the step on any skipped case (an expected failure, `xfail`,
 included) or an empty run, so a dropped variable fails rather than reading as
 green.
+
+### The release matrix
+
+The fixture installs the package at one release per slot, and the engine's
+supported range (`TESTED_RELEASES` in
+`packages/dex-core/src/exmergo_dex_core/transform/elementary.py`, #1445) runs
+from the oldest of them to the newest. The table below is `MATRIX` in
+`tests/transform/elementary_fixture.py`: a test holds this table to it, and
+another holds `TESTED_RELEASES` to the releases it names.
+
+| Slot | Release | Warehouse | Why |
+| --- | --- | --- | --- |
+| the floor | `0.15.2` | Postgres | the oldest release Dex supports |
+| the most pinned series | `0.16.4` | Postgres | the series most public installs pin (#1312) |
+| the sample-flag boundary | `0.20.0` | Postgres | the first release the engine treats as honouring `disable_test_samples` (#1381), and the first whose run hooks return early when the package is disabled |
+| the oldest DuckDB release | `0.23.0` | DuckDB | the first with DuckDB macros |
+| the newest release | `0.26.1` | DuckDB | what a new install gets |
+
+Every slot is always in the matrix. The newest release also builds on Postgres
+in the two cases whose answer depends on the release: the per-test sampling
+switch and the sampling warning.
+
+Adding a new Elementary release:
+
+1. The weekly `elementary-release` job in
+   `.github/workflows/upstream-deps-canaries.yml` reads the package's versions
+   from the dbt package hub, the way `dbt deps` does, and fails naming the
+   release when the hub has one newer than the newest slot. Dependabot lists no
+   ecosystem for dbt packages, so this job is the watch. It needs no secret,
+   and it opens no pull request itself: one opened by the workflow's own token
+   runs no workflow, and the fixture never runs on a pull request anyway, so it
+   would carry no evidence.
+2. A pull request moves the newest slot to it: `CURRENT_VERSION` in
+   `elementary_fixture.py`, `TESTED_RELEASES` and the table above, in the same
+   change, so the supported range moves with them. CI runs the fixture files
+   only after a merge, so run both (above) and paste the result into the pull
+   request. The release leaving the slot leaves `TESTED_RELEASES`, though it
+   stays inside the supported range. If
+   `packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
+   records a layout for it, the loader will refuse that layout, since it reads
+   only releases the fixture runs. So either move the layout to the new
+   release in the same change, or keep the old release as a slot of its own.
+3. If the fixture fails at the new release, the pull request does not merge.
+   The release stays outside the range, and Dex keeps reporting it
+   `elementary_release_untested` until the failure is fixed.
+
+Apart from the newest slot moving up, a release leaves the matrix only when the
+floor moves. That changes the supported range, so its pull request carries a
+changelog fragment saying so.
 
 ## Agent evals (`evals/`)
 
