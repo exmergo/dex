@@ -610,11 +610,14 @@ one coverage number.
   directions with the declared parent, key and filters, and
   `dex_join_coverage` or `dex_referenced_key` for the reference they join. A
   test carrying the fact's current claim id matches by `claim`; one carrying
-  no claim matches by kind, column and parameters (`matched_by:
-  kind_and_column`); one carrying any other claim earns no credit, not even
-  where its kind and column match. `dex_join_coverage` is matched by its key
-  pairs and the parent it reads, never by claim, since its claim names the
-  join the model's SQL writes (#1550).
+  no claim matches by kind, column and parameters. A composite-grain, unit,
+  population-filter or parent-population fact records that as `matched_by:
+  kind_and_column`; a single-column grain checked by `unique`, and a
+  `references` fact credited by `dex_join_coverage` or `dex_referenced_key`,
+  list their tests without it. One carrying any other claim earns no credit,
+  not even where its kind and column match. `dex_join_coverage` is matched
+  by its key pairs and the parent its `parent` argument names, never by
+  claim, since its claim names the join the model's SQL writes (#1550).
 
 ## `maintain reconcile [<class>]`
 

@@ -41,13 +41,17 @@ or a parent population carries the claim id of the fact it checks (#1448),
 and is matched to that fact by the claim; a test with no claim (hand-written,
 or rendered before #1448) is matched by kind, column and parameters: the same
 columns, the same filter values, the same parent and key, both directions of
-a parent population. A fact with tests carries ``matched_by``: ``claim`` or
-``kind_and_column``. A test carrying any other claim earns no credit for the
-fact, not even where its kind and column match: a stale claim names a fact the
-declaration no longer states, a different filter or a different parent, so it
-checks something else (#1550). ``dex_join_coverage`` is the exception: its
-claim names the join the model's SQL writes, which this section cannot read,
-so it is matched by its key pairs and the parent it reads, never by claim.
+a parent population. A composite-grain, unit, population-filter or
+parent-population fact with tests carries ``matched_by``: ``claim`` or
+``kind_and_column``; other facts list their tests without it, a
+single-column grain checked by ``unique``, or a ``references`` fact credited
+by ``dex_join_coverage`` or ``dex_referenced_key``. A test carrying any
+other claim earns no credit for the fact, not even where its kind and column
+match: a stale claim names a fact the declaration no longer states, a
+different filter or a different parent, so it checks something else (#1550).
+``dex_join_coverage`` is the exception: its claim names the join the model's
+SQL writes, which this section cannot read, so it is matched by its key pairs
+and the parent its `parent` argument names, never by claim.
 
 Never a value: a population filter's ``includes``/``excludes`` and a rule's
 prose stay out of the payload in every mode, so the section is the same in
@@ -330,7 +334,14 @@ class _Tests:
             name, col, kwargs, _reads, _claim = entry
             if _base(name) != "dex_population_filter" or col != key:
                 continue
-            if kwargs.get(mode) == list(values) and not kwargs.get(other):
+            # Typed and order-insensitive, the same form the fact's
+            # identity uses, so `True` and `1` stay two predicates and a
+            # reordered list still matches. The other-list guard applies
+            # only to `includes`: a test carrying an `excludes` list checks
+            # that list alone, whatever `includes` it carries.
+            if _filter(kwargs.get(mode), None)[0] == _filter(list(values), None)[
+                0
+            ] and (mode == "excludes" or not kwargs.get(other)):
                 entries.append(entry)
         return self._match(entries, claims)
 
@@ -370,7 +381,9 @@ class _Tests:
             targets = [uid for uid in reads if uid != model]
             if wanted not in targets:
                 continue
-            if direction == "missing" and kwargs.get("filters") != filters:
+            if direction == "missing" and not _same_filters(
+                kwargs.get("filters"), filters
+            ):
                 continue
             entries.append(entry)
         return self._match(entries, claims)
@@ -381,14 +394,20 @@ class _Tests:
         """Whether a ``dex_join_coverage`` checks a declared ``references``
         (#1550): the test reads the join's two inputs, and the declared
         column and field are one of its key pairs, to the declared parent.
-        The filters the model applies before joining are the model's SQL,
-        which this section cannot read, so they are not part of the match,
-        and neither is the test's claim, which names that same join."""
+        The parent it joins to is the test's ``parent`` argument, not merely
+        one of the relations it reads: a test whose driving input is the
+        declared parent and whose parent is another model with the same key
+        name checks another join. The filters the model applies before
+        joining are the model's SQL, which this section cannot read, so they
+        are not part of the match, and neither is the test's claim, which
+        names that same join."""
 
         key = _bare(column)
         wanted_field = _bare(field) if field else None
         wanted = self._resolve(parent, near=model) if parent else None
-        for name, _col, kwargs, reads, _claim in self.by_model.get(model, []):
+        if wanted is None:
+            return False
+        for name, _col, kwargs, _reads, _claim in self.by_model.get(model, []):
             if _base(name) != "dex_join_coverage":
                 continue
             children = kwargs.get("child_columns") or []
@@ -405,10 +424,7 @@ class _Tests:
             }
             if (key, wanted_field) not in pairs:
                 continue
-            if wanted is None:
-                continue
-            targets = [uid for uid in reads if uid != model]
-            if wanted not in targets:
+            if self._resolve_test_parent(kwargs.get("parent"), near=model) != wanted:
                 continue
             return True
         return False
@@ -454,6 +470,39 @@ class _Tests:
         if len(own) == 1:
             return own[0]
         return found[0] if len(found) == 1 else None
+
+    def _resolve_test_parent(self, parent: Any, *, near: str) -> str | None:
+        """The manifest unique id a join test's ``parent`` argument names.
+
+        The argument is the ``ref()``/``source()`` call the join reads the
+        parent through, written as text, or a relation written directly. A
+        ``ref()`` names its model by its last positional argument, so
+        ``ref('pkg', 'model')`` is the model and a ``v=`` keyword never
+        changes which one (a versioned ref makes the join unreadable, so it
+        never reaches a test). A ``source()`` names no model, so it resolves
+        to nothing: the declared parent is always a model."""
+
+        if not isinstance(parent, str) or not parent.strip():
+            return None
+        value = parent.strip()
+        if value.startswith("ref(") and value.endswith(")"):
+            args = [
+                part.strip()
+                for part in value[4:-1].split(",")
+                if part.strip() and "=" not in part
+            ]
+            names = [
+                part[1:-1]
+                for part in args
+                if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'`"
+            ]
+            if not names:
+                return None
+            return self._resolve(names[-1], near=near)
+        if value.startswith("source("):
+            return None
+        # A bare name, or a relation written directly: its last part.
+        return self._resolve(value.rsplit(".", 1)[-1].strip("\"'`[]"), near=near)
 
     def relationship(
         self,
@@ -746,6 +795,38 @@ def _filter(includes: Any, excludes: Any) -> tuple:
         return tuple(sorted((type(v).__name__, repr(v)) for v in raw))
 
     return (values(includes), values(excludes))
+
+
+def _same_filters(left: Any, right: Any) -> bool:
+    """Whether two population filter rule lists state the same predicates.
+
+    Typed and order-insensitive, the same form ``_filter`` uses for a
+    fact's identity, so ``True`` and ``1`` stay two predicates and rules
+    in another order still match. A side that is not a list of rules, or
+    a rule that is not a mapping, matches nothing but an identical side.
+    """
+
+    if left is None or right is None:
+        return left is None and right is None
+    if not isinstance(left, list) or not isinstance(right, list):
+        return False
+
+    def rules(raw: list) -> list[tuple[str, tuple, tuple]] | None:
+        out: list[tuple[str, tuple, tuple]] = []
+        for rule in raw:
+            if not isinstance(rule, dict):
+                return None
+            out.append(
+                (
+                    _bare(str(rule.get("column") or "")),
+                    _filter(rule.get("includes"), rule.get("excludes"))[0],
+                    _filter(rule.get("includes"), rule.get("excludes"))[1],
+                )
+            )
+        return sorted(out, key=repr)
+
+    a, b = rules(left), rules(right)
+    return a is not None and b is not None and a == b
 
 
 def _parent_key(parent: Any) -> tuple:
@@ -1246,6 +1327,13 @@ def _model_facts(
                 hows: list[str | None] = []
                 for mode in ("includes", "excludes"):
                     values = entry.get(mode)
+                    if values is None:
+                        continue
+                    if not isinstance(values, list):
+                        # A malformed mode: no test can check it, and the
+                        # report must not raise on it (#1550).
+                        hows.append(None)
+                        continue
                     if not values:
                         continue
                     _names, mode_how = tests.population_filter(
@@ -1297,7 +1385,9 @@ def _model_facts(
                 filter_rule: dict[str, Any] = {"column": f_entry["column"]}
                 for mode in ("includes", "excludes"):
                     values = f_entry.get(mode)
-                    if values:
+                    # A malformed mode is dropped, never raised on, and a
+                    # rule left with no mode states no predicate (#1550).
+                    if isinstance(values, list) and values:
                         filter_rule[mode] = list(values)
                 if len(filter_rule) > 1:
                     filter_rules.append(filter_rule)

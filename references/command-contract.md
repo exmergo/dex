@@ -882,8 +882,12 @@ dex maintain coverage [<names>] [--full] [--mutate [--max-models N] [--target <t
                                      it checks by its claim id, or by kind, column and parameters
                                      where it carries none: a composite grain, a fraction, a
                                      population filter or a parent population (both directions),
-                                     and a join-coverage or referenced-key test for the reference
-                                     it joins (#1550). Columns a singular test
+                                     and a referenced-key test for the parent key it checks,
+                                     which verifies the referenced key without running the join.
+                                     A join-coverage test is the exception: it matches by its key
+                                     pairs and the parent its `parent` argument names even where
+                                     it carries a claim, since its claim names that same join
+                                     (#1550). Columns a singular test
                                      reads are columns.referenced_columns (roles: predicate, join,
                                      aggregation, grouping, projection; the tests that read them),
                                      counted as referenced and referenced_only and summarized as
