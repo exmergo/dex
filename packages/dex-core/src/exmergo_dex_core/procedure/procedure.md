@@ -161,7 +161,13 @@ the project edits, migrations and dev builds described below.
    re-drive the model from the child table. A change of driving relation or
    parent is `redriven` in `data.change_scope`, settled only at `request` or
    `contract` tier.
-6. **Maintain.** `dex maintain verify` checks the project as it stands;
+6. **Maintain.** When a test fails or a model is wrong, run
+   `dex maintain incidents` first, then `dex maintain diagnose` for an open
+   incident's cause and `dex maintain verify` on the models they name. Where
+   its `data.sources` reports Elementary `missing`, the run history is not
+   there to read, which is not a clean history: the step under
+   `data.next_steps` starts it (for a project without the package, the install
+   `dex init` offers). `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
 

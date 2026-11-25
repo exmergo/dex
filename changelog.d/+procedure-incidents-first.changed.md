@@ -1,0 +1,4 @@
+**The agent procedure sends an agent to `dex maintain incidents` first when a test fails or a model is wrong.**
+Step 6, **Maintain**, now opens with that routing: `dex maintain incidents` first, then `dex maintain diagnose` for an open incident's cause and `dex maintain verify` on the models they name. It also says what an empty answer means: where `data.sources` reports Elementary `missing`, the run history is not there to read, and the step under `data.next_steps` starts it (for a project without the package, the install `dex init` offers). The `maintain` skill now triggers on "when did this test start failing" and "what changed when it broke".
+
+`dex procedure` returns the new text and a new `digest`, so a copy pasted into a repository's own `CLAUDE.md` or `AGENTS.md` now reads `stale` under `dex procedure --check`, which exits as an error. Refresh it with `dex procedure --block`.
