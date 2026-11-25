@@ -356,7 +356,7 @@ class _Tests:
     ) -> tuple[list[str], str | None]:
         """Whether a ``dex_parent_population`` checks one direction of a
         declared parent population (#1550): the direction, the declared parent
-        among what the test reads, the declared key pairs, and, for
+        its ``parent`` argument names, the declared key pairs, and, for
         ``missing``, the declared filters. The ``unexpected`` direction reads
         every parent key, so a filter it carries is not read."""
 
@@ -364,7 +364,7 @@ class _Tests:
         wanted = self._resolve(parent, near=model)
         entries = []
         for entry in self.by_model.get(model, []):
-            name, _col, kwargs, reads, _claim = entry
+            name, _col, kwargs, _reads, _claim = entry
             if _base(name) != "dex_parent_population":
                 continue
             if kwargs.get("direction") != direction:
@@ -378,8 +378,10 @@ class _Tests:
                 continue
             if wanted is None:
                 continue
-            targets = [uid for uid in reads if uid != model]
-            if wanted not in targets:
+            # The parent the test's `parent` argument names, not merely
+            # one of the relations it reads: a test naming another parent
+            # while reading this one checks the other parent.
+            if self._resolve_test_parent(kwargs.get("parent"), near=model) != wanted:
                 continue
             if direction == "missing" and not _same_filters(
                 kwargs.get("filters"), filters
@@ -448,11 +450,16 @@ class _Tests:
         ]
         return self._match(entries, claims)
 
-    def _resolve(self, name: str, *, near: str) -> str | None:
+    def _resolve(
+        self, name: str, *, near: str, package: str | None = None
+    ) -> str | None:
         """The manifest unique id a declared ``references`` parent names: a
         model, seed or snapshot, of ``near``'s own package first, then the only
         one of that name anywhere; an unversioned name of a versioned model is
-        its latest version, as dbt resolves an unversioned ``ref``."""
+        its latest version, as dbt resolves an unversioned ``ref``. Where
+        ``package`` names one, only a node of that package counts: a
+        package-qualified ``ref`` names that package's model, never a
+        same-named one of the project's own package."""
 
         key = name.lower()
         found = []
@@ -464,6 +471,9 @@ class _Tests:
                 version, latest = node.get("version"), node.get("latest_version")
                 if version is None or latest is None or str(version) == str(latest):
                     found.append(uid)
+        if package is not None:
+            in_package = [uid for uid in found if self.packages.get(uid) == package]
+            return in_package[0] if len(in_package) == 1 else None
         own = [
             uid for uid in found if self.packages.get(uid) == self.packages.get(near)
         ]
@@ -476,10 +486,12 @@ class _Tests:
 
         The argument is the ``ref()``/``source()`` call the join reads the
         parent through, written as text, or a relation written directly. A
-        ``ref()`` names its model by its last positional argument, so
-        ``ref('pkg', 'model')`` is the model and a ``v=`` keyword never
-        changes which one (a versioned ref makes the join unreadable, so it
-        never reaches a test). A ``source()`` names no model, so it resolves
+        ``ref()`` names its model by its last positional argument, and where
+        it names two, the first is the package the model must live in, so
+        ``ref('pkg', 'model')`` is that package's model, never a same-named
+        one of the project's own package; a ``v=`` keyword never changes
+        which one (a versioned ref makes the join unreadable, so it never
+        reaches a test). A ``source()`` names no model, so it resolves
         to nothing: the declared parent is always a model."""
 
         if not isinstance(parent, str) or not parent.strip():
@@ -498,6 +510,8 @@ class _Tests:
             ]
             if not names:
                 return None
+            if len(names) >= 2:
+                return self._resolve(names[-1], near=near, package=names[-2])
             return self._resolve(names[-1], near=near)
         if value.startswith("source("):
             return None
@@ -789,9 +803,12 @@ def _filter(includes: Any, excludes: Any) -> tuple:
     """A population filter's values, for identity only: never output."""
 
     def values(raw: Any) -> tuple[tuple[str, str], ...]:
-        # Typed, so `true` and "True" stay two predicates.
+        # Typed, so `true` and "True" stay two predicates. A falsy scalar
+        # states no fact, like an absent mode; a truthy non-list is
+        # malformed, so it never equals an absent mode: a test carrying
+        # one must not match a declaration that states no such mode.
         if not isinstance(raw, list):
-            return ()
+            return () if not raw else (("malformed", repr(raw)),)
         return tuple(sorted((type(v).__name__, repr(v)) for v in raw))
 
     return (values(includes), values(excludes))

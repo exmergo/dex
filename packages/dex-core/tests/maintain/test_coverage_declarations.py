@@ -1590,6 +1590,71 @@ def test_a_parent_population_is_checked_only_by_both_of_its_direction_tests() ->
         assert "SENTINEL_VALUE" not in dumped
 
 
+def test_a_parent_population_test_checks_only_the_parent_it_names() -> None:
+    # A parent-population test is credited for the parent its `parent`
+    # argument names, not merely for a parent it reads: a test naming
+    # another parent while reading the declared one checks the other
+    # parent, and one naming no parent at all checks none (#1550).
+    filters = [{"column": "status", "excludes": ["SENTINEL_VALUE_1"]}]
+    population = {
+        "filters": filters,
+        "parent": {"model": "subs", "key": {"subscription_id": "subscription_id"}},
+    }
+    manifest = _manifest(
+        [
+            _model("subs"),
+            _model("other"),
+            _model("full", dex={"population": population}),
+            _model("flipped", dex={"population": population}),
+            _model("bare", dex={"population": population}),
+        ],
+        [
+            *_parent_tests("full", filters=filters),
+            # Both directions name "other" as parent, but read "subs".
+            *[
+                _test(
+                    "dex_parent_population",
+                    "flipped",
+                    kwargs={
+                        "parent": "ref('other')",
+                        "key": {"subscription_id": "subscription_id"},
+                        "direction": direction,
+                        **({"filters": filters} if direction == "missing" else {}),
+                    },
+                    reads=["flipped", "subs"],
+                )
+                for direction in ("missing", "unexpected")
+            ],
+            # Both directions name no parent at all, though they read "subs".
+            *[
+                _test(
+                    "dex_parent_population",
+                    "bare",
+                    kwargs={
+                        "key": {"subscription_id": "subscription_id"},
+                        "direction": direction,
+                        **({"filters": filters} if direction == "missing" else {}),
+                    },
+                    reads=["bare", "subs"],
+                )
+                for direction in ("missing", "unexpected")
+            ],
+        ],
+    )
+    out = _run(manifest)
+    full = _fact(out, "population_parent", model="full")
+    assert (full["checked_by"], full["tests"], full["matched_by"]) == (
+        "both",
+        ["dex_parent_population"],
+        "kind_and_column",
+    )
+    for model in ("flipped", "bare"):
+        fact = _fact(out, "population_parent", model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+        assert "matched_by" not in fact
+
+
 def test_a_join_coverage_test_checks_only_the_reference_it_joins() -> None:
     manifest = _manifest(
         [
@@ -1955,7 +2020,9 @@ def test_a_join_coverage_test_checks_the_parent_its_parent_argument_names() -> N
                 },
                 reads=["flipped", "customers", "vendors"],
             ),
-            # A two-part ref names its model by its last argument.
+            # A two-part ref names its package's model, not the project's
+            # own same-named one: the declaration names this project's
+            # `customers`, so the package's one earns no credit.
             _test(
                 "dex_join_coverage",
                 "packaged",
@@ -1969,12 +2036,127 @@ def test_a_join_coverage_test_checks_the_parent_its_parent_argument_names() -> N
             ),
         ],
     )
+    # A same-named model lives in the installed package `pkg`.
+    package_model = _model("customers")
+    package_model["package_name"] = "pkg"
+    manifest["nodes"]["model.pkg.customers"] = package_model
     out = _run(manifest)
     flipped = _fact(out, "references", "customer_id", model="flipped")
     assert flipped["checked_by"] == "dex_verify"
     assert flipped["tests"] == []
     packaged = _fact(out, "references", "customer_id", model="packaged")
-    assert packaged["tests"] == ["dex_join_coverage"]
+    assert packaged["checked_by"] == "dex_verify"
+    assert packaged["tests"] == []
+
+
+def test_a_package_qualified_parent_argument_names_its_package() -> None:
+    # A two-part ref names its package's model: where the project and an
+    # installed package both have a model of that name, `ref('pkg',
+    # 'customers')` is the package's, never the project's own (#1550).
+    manifest = _manifest(
+        [
+            _model("customers"),
+            _model(
+                "orders_pkg",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "orders_missing",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+            _model(
+                "orders_ok",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+                reads=["customers"],
+            ),
+        ],
+        [
+            # The package's model, though the test reads the project's own.
+            _test(
+                "dex_join_coverage",
+                "orders_pkg",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('pkg', 'customers')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["orders_pkg", "model.pkg.customers"],
+            ),
+            # A package with no such model: the ref names nothing.
+            _test(
+                "dex_join_coverage",
+                "orders_missing",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('nope', 'customers')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["orders_missing", "customers"],
+            ),
+            # An unqualified ref still names the project's own model.
+            _test(
+                "dex_join_coverage",
+                "orders_ok",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('customers')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["orders_ok", "customers"],
+            ),
+        ],
+    )
+    # A same-named model lives in the installed package `pkg`.
+    package_model = _model("customers")
+    package_model["package_name"] = "pkg"
+    manifest["nodes"]["model.pkg.customers"] = package_model
+    out = _run(manifest)
+    for model in ("orders_pkg", "orders_missing"):
+        fact = _fact(out, "references", "customer_id", model=model)
+        assert fact["checked_by"] == "dex_verify", model
+        assert fact["tests"] == []
+    ok = _fact(out, "references", "customer_id", model="orders_ok")
+    assert ok["tests"] == ["dex_join_coverage"]
+
+
+def test_a_two_part_ref_to_the_only_package_model_checks_it() -> None:
+    # Where the parent lives only in an installed package, a two-part ref
+    # names it: the join is credited (#1550).
+    manifest = _manifest(
+        [
+            _model(
+                "orders",
+                columns={"customer_id": {"references": "customers.customer_id"}},
+            ),
+        ],
+        [
+            _test(
+                "dex_join_coverage",
+                "orders",
+                kwargs={
+                    "child": "ref('stg_orders')",
+                    "child_columns": ["customer_id"],
+                    "parent": "ref('pkg', 'customers')",
+                    "parent_columns": ["customer_id"],
+                },
+                reads=["orders", "model.pkg.customers"],
+            ),
+        ],
+    )
+    # The parent lives only in the installed package `pkg`.
+    package_model = _model("customers")
+    package_model["package_name"] = "pkg"
+    manifest["nodes"]["model.pkg.customers"] = package_model
+    manifest["nodes"][_uid("orders")]["depends_on"]["nodes"] = ["model.pkg.customers"]
+    out = _run(manifest)
+    fact = _fact(out, "references", "customer_id", model="orders")
+    assert fact["tests"] == ["dex_join_coverage"]
+    assert fact["checked_by"] == "both"
 
 
 def test_a_malformed_population_predicate_never_crashes_the_report() -> None:
@@ -2064,3 +2246,51 @@ def test_a_malformed_population_predicate_never_crashes_the_report() -> None:
     parent = _fact(out, "population_parent", model="parent_scalar")
     assert parent["checked_by"] == "dex_verify"
     assert parent["tests"] == []
+
+
+def test_a_malformed_parent_filter_mode_never_matches() -> None:
+    # A filter mode that is not a list is malformed, never the same as the
+    # mode being absent: a test carrying one never matches a declaration
+    # that states no such mode (#1550).
+    filters = [{"column": "status", "includes": ["a"]}]
+    population = {
+        "filters": filters,
+        "parent": {"model": "subs", "key": {"subscription_id": "subscription_id"}},
+    }
+    manifest = _manifest(
+        [
+            _model("subs"),
+            _model("clean", dex={"population": population}),
+            _model("malformed", dex={"population": population}),
+        ],
+        [
+            *_parent_tests("clean", filters=filters),
+            # The `unexpected` test is clean; the `missing` test carries a
+            # malformed `excludes` beside the declared `includes`.
+            _parent_tests("malformed", filters=filters)[1],
+            _test(
+                "dex_parent_population",
+                "malformed",
+                kwargs={
+                    "parent": "ref('subs')",
+                    "key": {"subscription_id": "subscription_id"},
+                    "direction": "missing",
+                    "filters": [
+                        {"column": "status", "includes": ["a"], "excludes": "b"}
+                    ],
+                },
+                reads=["malformed", "subs"],
+            ),
+        ],
+    )
+    out = _run(manifest)
+    clean = _fact(out, "population_parent", model="clean")
+    assert (clean["checked_by"], clean["tests"], clean["matched_by"]) == (
+        "both",
+        ["dex_parent_population"],
+        "kind_and_column",
+    )
+    malformed = _fact(out, "population_parent", model="malformed")
+    assert malformed["checked_by"] == "dex_verify"
+    assert malformed["tests"] == []
+    assert "matched_by" not in malformed

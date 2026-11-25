@@ -618,6 +618,8 @@ one coverage number.
   not even where its kind and column match. `dex_join_coverage` is matched
   by its key pairs and the parent its `parent` argument names, never by
   claim, since its claim names the join the model's SQL writes (#1550).
+  `dex_parent_population` is matched the same way, by the parent its
+  `parent` argument names rather than merely a parent it reads.
 
 ## `maintain reconcile [<class>]`
 
