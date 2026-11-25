@@ -603,9 +603,9 @@ def _new_target(target: Path):
     parent = target.parent
     if not parent.is_dir():
         raise DemoPathError(
-            f"'{parent.as_posix()}' is not an existing directory; dex demo writes "
-            "one file and creates no directories. Create it first, or name a path "
-            "inside a directory that exists"
+            f"'{parent.as_posix()}' is not an existing directory; dex demo never "
+            "creates the directory its file goes in. Create it first, or name a "
+            "path inside a directory that exists"
         )
 
     try:
