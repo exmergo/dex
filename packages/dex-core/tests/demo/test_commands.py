@@ -36,12 +36,15 @@ PROJECT_SOURCES = [
     "demo_project/dbt/models/staging/_staging.yml",
     "demo_project/dbt/models/staging/stg_orders.sql",
     "demo_project/dbt/models/staging/stg_order_items.sql",
+    "demo_project/dbt/models/semantic/metricflow_time_spine.sql",
+    "demo_project/dbt/models/semantic/_semantic.yml",
 ]
 PROJECT_FILES = [
     *PROJECT_SOURCES,
     "demo_project/dbt/dbt_packages/elementary/dbt_project.yml",
     "demo_project/dbt/target/manifest.json",
     "demo_project/dbt/target/run_results.json",
+    "demo_project/dbt/target/semantic_manifest.json",
 ]
 
 

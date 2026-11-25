@@ -112,8 +112,10 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
                     "once, measured on the source stg_order_items reads, with "
                     "the break from the last passing build to the first failing "
                     "one, the window no snapshot covers, what was not checked, "
-                    "and a transform plan to hand the repair to. Diagnosis "
-                    "proposes the repair; it writes nothing"
+                    "a transform plan to hand the repair to, and the "
+                    "semantic-layer objects that read the column (the "
+                    "order_items entity order_item). Diagnosis proposes the "
+                    "repair; it writes nothing"
                 ),
             },
         ]
@@ -369,7 +371,7 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                         "is still open when you read it, for about three weeks. "
                         f"In the last two the test {_FAILING_TEST_NAME} failed, "
                         "because of the batch loaded twice. Its two staging "
-                        "views were not "
+                        "views and its semantic layer's time spine were not "
                         "built, so `dex maintain verify` reports them as "
                         "no_relation until a build makes them. Run `dex "
                         "transform deps` before `dex transform build --target "
