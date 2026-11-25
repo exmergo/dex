@@ -1246,8 +1246,8 @@ requires-dist = [
     { name = "jsonschema", marker = "extra == 'ossie'", specifier = ">=4.26" },
     { name = "metricflow", marker = "extra == 'all'", specifier = ">=0.213,<0.214" },
     { name = "metricflow", marker = "extra == 'semantic'", specifier = ">=0.213,<0.214" },
-    { name = "motley-slayer", marker = "extra == 'all'", specifier = "==1.8.4" },
-    { name = "motley-slayer", marker = "extra == 'slayer'", specifier = "==1.8.4" },
+    { name = "motley-slayer", marker = "extra == 'all'", specifier = "==1.9.1" },
+    { name = "motley-slayer", marker = "extra == 'slayer'", specifier = "==1.9.1" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'postgres'", specifier = ">=3" },
     { name = "pydantic", specifier = ">=2" },
@@ -2315,7 +2315,7 @@ wheels = [
 
 [[package]]
 name = "motley-slayer"
-version = "1.8.4"
+version = "1.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "duckdb" },
@@ -2334,9 +2334,9 @@ dependencies = [
     { name = "tantivy" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b4/83/985176c16e4cdb0986c2cbd7d40ba0b1408116a244144a0e5506966c4948/motley_slayer-1.8.4.tar.gz", hash = "sha256:44360d6f4b714cf30809badb73cc36673ccaf5a71a5d8db0304678a3daf31e6f", size = 1165973, upload-time = "2026-11-12T14:02:02.808Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f1/86/8ee7b4441f91e5c16acf3c08be2b02875eb5bb5a985157a148adc08df5ee/motley_slayer-1.9.1.tar.gz", hash = "sha256:c5a7c5b6792a223855ea603b277e8c5dba3d2be101911db648c256506476a66b", size = 1183489, upload-time = "2026-11-20T11:25:52.155Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/7f/79a5c3c1e937e7b41ea1fabf36b79a9d056e836e57a7cfba7a7033f1384b/motley_slayer-1.8.4-py3-none-any.whl", hash = "sha256:320739afee91133c4900c7b2b15316bf8522b29e860936192d3fec1ec7b8c793", size = 1309081, upload-time = "2026-11-12T14:02:00.869Z" },
+    { url = "https://files.pythonhosted.org/packages/b3/08/0e4ef2fb638c2937fc703b93165df2e183eeecac7fb199a80d710ea533e6/motley_slayer-1.9.1-py3-none-any.whl", hash = "sha256:c4a9860be2d97e453c2d003abc456ab57dff8fc63ef855e8859cb3de39e02e17", size = 1330707, upload-time = "2026-11-20T11:25:50.52Z" },
 ]
 
 [[package]]
