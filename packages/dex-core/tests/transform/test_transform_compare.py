@@ -549,6 +549,34 @@ def test_a_macro_edit_that_moves_an_untouched_parent_is_not_checked(project):
     assert "event_counts" in result.detail
 
 
+def test_a_project_edit_that_moves_an_untouched_parent_is_not_checked(project):
+    """A ``dbt_project.yml`` edit is global as a macro edit is: a var it sets
+    moves how the parent compiles, so the parent's dev relation holds the old
+    rows and the comparison has no synchronized input to read."""
+
+    (project / "models" / "event_counts.sql").write_text(
+        "select 10 as team_id, {{ var('shift', 1) }} as event_count",
+        encoding="utf-8",
+    )
+    _engine(project).build(target="dev")
+    engine = _engine(project)
+    before = (project / "dbt_project.yml").read_text("utf-8")
+    plan_id = engine.plan(
+        "project",
+        edits=[
+            PlanEdit(
+                path="dbt_project.yml",
+                new_content=before + "vars:\n  shift: 2\n",
+                kind=EditKind.PROJECT_YML,
+            )
+        ],
+    ).plan_id
+    result = engine.compare(plan_id, model="team_activity")
+    assert result.status == "not_checked"
+    assert result.reason_code == "inputs_unsynchronized"
+    assert "event_counts" in result.detail
+
+
 def test_a_macro_edit_that_moves_no_parent_is_compared(project):
     macros = project / "macros"
     macros.mkdir()

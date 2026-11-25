@@ -46,6 +46,7 @@ from .expected_change import (
     lookup_relations,
     resolve_refs,
 )
+from .global_edits import COMPARE_GLOBAL_KINDS
 from .multiset_compare import (
     ReasonCode,
     RefactorCompareResult,
@@ -65,13 +66,6 @@ COMMAND = "transform compare"
 #: Edits that change a relation both sides read, which no inlining can undo: the
 #: dev relation still holds what the last build wrote.
 _UNSYNCHRONIZING_KINDS = frozenset({EditKind.SEED_CSV, EditKind.SNAPSHOT_SQL})
-
-#: Edits that can change how an untouched parent compiles. Its dev relation keeps
-#: what it was built with, so both graphs are compiled through their ancestors and
-#: any parent that compiles differently makes the inputs unsynchronized.
-_GLOBAL_KINDS = frozenset(
-    {EditKind.MACRO_SQL, EditKind.PROJECT_YML, EditKind.PACKAGES_YML}
-)
 
 _NONDETERMINISTIC_NODES: tuple[type[exp.Expression], ...] = (
     exp.Rand,
@@ -333,7 +327,7 @@ def _compare(
             "baseline, and a repair added to this plan would leave the comparison "
             "nothing built to read.",
         )
-    through_ancestors = any(edit.kind in _GLOBAL_KINDS for edit in stored.edits)
+    through_ancestors = any(edit.kind in COMPARE_GLOBAL_KINDS for edit in stored.edits)
 
     effective = config.model_copy(update={"connector": connector})
     warnings.extend(
