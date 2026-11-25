@@ -140,6 +140,63 @@ _TEST_HASHES = {
     ("not_null", "stg_order_items"): "26a7e2bc35",
 }
 
+#: The semantic layer's file, and the time spine dbt requires beside any
+#: semantic model (#1478).
+_SEMANTIC_YML = "models/semantic/_semantic.yml"
+TIME_SPINE = "metricflow_time_spine"
+_TIME_SPINE_SQL = (
+    "select cast(range as date) as date_day\n"
+    "from range(date '2025-01-01', date '2028-01-01', interval 1 day)\n"
+)
+
+#: One semantic model per staging model: its name, the model it sits on, its
+#: description, its default time dimension, and its entities, dimensions and
+#: measures as ``(name, type, expr)`` (a time dimension adds its granularity).
+#: ``order_items`` is keyed on the column the seeded incident fails on, so
+#: ``maintain diagnose`` names it as a reader. It holds no measure: the shop's
+#: ``order_items`` has no time column, and MetricFlow gives every measure one.
+_SEMANTIC_MODELS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "orders",
+        "model": "stg_orders",
+        "description": "One row per order.",
+        "agg_time_dimension": "ordered_at",
+        "entities": (
+            ("order", "primary", "order_id"),
+            ("customer", "foreign", "customer_id"),
+        ),
+        "dimensions": (
+            ("status", "categorical", None, None),
+            ("ordered_at", "time", "cast(placed_at as timestamp)", "day"),
+        ),
+        "measures": (
+            ("order_count", "count_distinct", "order_id"),
+            ("order_revenue", "sum", "order_total"),
+        ),
+    },
+    {
+        "name": "order_items",
+        "model": "stg_order_items",
+        "description": "One row per order line item.",
+        "agg_time_dimension": None,
+        "entities": (
+            ("order_item", "primary", "order_item_id"),
+            ("order", "foreign", "order_id"),
+            ("product", "foreign", "product_id"),
+        ),
+        "dimensions": (),
+        "measures": (),
+    },
+)
+
+#: The metrics: name, label, type, and the measure (simple) or the numerator
+#: and denominator metrics (ratio) each is built on.
+_METRICS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("orders", "Orders", "simple", ("order_count",)),
+    ("revenue", "Revenue", "simple", ("order_revenue",)),
+    ("average_order_value", "Average order value", "ratio", ("revenue", "orders")),
+)
+
 #: The macros dbt records under each generic test, after the test's own.
 _TEST_MACROS = (
     "macro.dbt.get_where_subquery",
@@ -263,7 +320,77 @@ def _source_files(warehouse_name: str) -> list[tuple[str, str]]:
         ),
     ]
     files.extend((f"models/staging/{model}.sql", _sql(model)) for model, *_ in _MODELS)
+    files.append((f"models/semantic/{TIME_SPINE}.sql", _TIME_SPINE_SQL))
+    files.append((_SEMANTIC_YML, _semantic_yaml()))
     return files
+
+
+def _measure_input(metric: tuple[str, str, str, tuple[str, ...]]) -> list[str]:
+    """The measures a metric reads, through the metrics it is built on."""
+
+    _, _, kind, inputs = metric
+    if kind == "simple":
+        return list(inputs)
+    by_name = {m[0]: m for m in _METRICS}
+    return [measure for name in inputs for measure in _measure_input(by_name[name])]
+
+
+def _semantic_yaml() -> str:
+    """The semantic layer as its author writes it: the time spine's entry, the
+    semantic models and the metrics."""
+
+    def semantic_model(spec: dict[str, Any]) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "name": spec["name"],
+            "description": spec["description"],
+            "model": f"ref('{spec['model']}')",
+        }
+        if spec["agg_time_dimension"]:
+            entry["defaults"] = {"agg_time_dimension": spec["agg_time_dimension"]}
+        entry["entities"] = [
+            {"name": name, "type": kind, "expr": expr}
+            for name, kind, expr in spec["entities"]
+        ]
+        if spec["dimensions"]:
+            entry["dimensions"] = []
+            for name, kind, expr, grain in spec["dimensions"]:
+                dimension: dict[str, Any] = {"name": name, "type": kind}
+                if expr is not None:
+                    dimension["expr"] = expr
+                if grain is not None:
+                    dimension["type_params"] = {"time_granularity": grain}
+                entry["dimensions"].append(dimension)
+        if spec["measures"]:
+            entry["measures"] = [
+                {"name": name, "agg": agg, "expr": expr}
+                for name, agg, expr in spec["measures"]
+            ]
+        return entry
+
+    def metric(spec: tuple[str, str, str, tuple[str, ...]]) -> dict[str, Any]:
+        name, label, kind, inputs = spec
+        params: dict[str, Any] = (
+            {"measure": inputs[0]}
+            if kind == "simple"
+            else {"numerator": inputs[0], "denominator": inputs[1]}
+        )
+        return {"name": name, "label": label, "type": kind, "type_params": params}
+
+    return "version: 2\n\n" + _dump(
+        {
+            "models": [
+                {
+                    "name": TIME_SPINE,
+                    "description": "One row per day: the time spine MetricFlow "
+                    "joins metrics to.",
+                    "time_spine": {"standard_granularity_column": "date_day"},
+                    "columns": [{"name": "date_day", "granularity": "day"}],
+                }
+            ],
+            "semantic_models": [semantic_model(s) for s in _SEMANTIC_MODELS],
+            "metrics": [metric(m) for m in _METRICS],
+        }
+    )
 
 
 def _test_id(test: str, model: str) -> str:
@@ -345,6 +472,287 @@ def _elementary_nodes(database: str) -> dict[str, Any]:
             "name": f"elementary-{hook}-0",
         }
     return nodes
+
+
+def _time_spine_node(database: str) -> dict[str, Any]:
+    uid = f"model.{PROJECT_NAME}.{TIME_SPINE}"
+    return {
+        "database": database,
+        "schema": SOURCE_SCHEMA,
+        "name": TIME_SPINE,
+        "resource_type": "model",
+        "package_name": PROJECT_NAME,
+        "path": f"semantic/{TIME_SPINE}.sql",
+        "original_file_path": f"models/semantic/{TIME_SPINE}.sql",
+        "unique_id": uid,
+        "fqn": [PROJECT_NAME, "semantic", TIME_SPINE],
+        "alias": TIME_SPINE,
+        "checksum": {
+            "name": "sha256",
+            "checksum": hashlib.sha256(_TIME_SPINE_SQL.encode("utf-8")).hexdigest(),
+        },
+        "config": {"enabled": True, "materialized": "view", "meta": {}},
+        "tags": [],
+        "description": "One row per day: the time spine MetricFlow joins metrics to.",
+        "columns": {
+            "date_day": {
+                "name": "date_day",
+                "description": "",
+                "meta": {},
+                "tags": [],
+                "granularity": "day",
+            }
+        },
+        "meta": {},
+        "patch_path": f"{PROJECT_NAME}://{_SEMANTIC_YML}",
+        "relation_name": f'"{database}"."{SOURCE_SCHEMA}"."{TIME_SPINE}"',
+        "raw_code": _TIME_SPINE_SQL.rstrip("\n"),
+        "language": "sql",
+        "refs": [],
+        "sources": [],
+        "depends_on": {"macros": [], "nodes": []},
+        "access": "protected",
+        "version": None,
+        "latest_version": None,
+        "time_spine": {
+            "standard_granularity_column": "date_day",
+            "custom_granularities": [],
+        },
+    }
+
+
+#: The version of dbt-semantic-interfaces dbt 1.12.5 records in the semantic
+#: manifest it writes.
+_DSI_VERSION = {"major_version": "0", "minor_version": "213", "patch_version": "0"}
+
+
+def _relation(database: str, alias: str) -> dict[str, Any]:
+    return {
+        "alias": alias,
+        "schema_name": SOURCE_SCHEMA,
+        "database": database,
+        "relation_name": f'"{database}"."{SOURCE_SCHEMA}"."{alias}"',
+    }
+
+
+def _measure_ref(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "filter": None,
+        "alias": None,
+        "join_to_timespine": False,
+        "fill_nulls_with": None,
+    }
+
+
+def _metric_ref(name: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "filter": None,
+        "alias": None,
+        "offset_window": None,
+        "offset_to_grain": None,
+    }
+
+
+def _semantic_entries(
+    database: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The semantic models and metrics as dbt 1.12.5 writes them to
+    ``semantic_manifest.json``: the shape MetricFlow reads."""
+
+    return (
+        [_semantic_model_entry(database, spec) for spec in _SEMANTIC_MODELS],
+        [_metric_entry(metric) for metric in _METRICS],
+    )
+
+
+def _semantic_model_entry(database: str, spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": spec["name"],
+        "defaults": {"agg_time_dimension": spec["agg_time_dimension"]}
+        if spec["agg_time_dimension"]
+        else None,
+        "description": spec["description"],
+        "node_relation": _relation(database, spec["model"]),
+        "primary_entity": None,
+        "entities": [
+            {
+                "name": name,
+                "description": None,
+                "type": kind,
+                "role": None,
+                "expr": expr,
+                "metadata": None,
+                "label": None,
+                "config": {"meta": {}},
+            }
+            for name, kind, expr in spec["entities"]
+        ],
+        "measures": [
+            {
+                "name": name,
+                "agg": agg,
+                "description": None,
+                "create_metric": False,
+                "expr": expr,
+                "agg_params": None,
+                "metadata": None,
+                "non_additive_dimension": None,
+                "agg_time_dimension": None,
+                "label": None,
+                "config": {"meta": {}},
+            }
+            for name, agg, expr in spec["measures"]
+        ],
+        "dimensions": [
+            {
+                "name": name,
+                "description": None,
+                "type": kind,
+                "datatype": None,
+                "is_partition": False,
+                "type_params": {
+                    "time_granularity": grain,
+                    "validity_params": None,
+                }
+                if grain
+                else None,
+                "expr": expr,
+                "metadata": None,
+                "label": None,
+                "config": {"meta": {}},
+            }
+            for name, kind, expr, grain in spec["dimensions"]
+        ],
+        "label": None,
+        "metadata": None,
+        "config": {"meta": {}},
+    }
+
+
+def _metric_entry(metric: tuple[str, str, str, tuple[str, ...]]) -> dict[str, Any]:
+    name, label, kind, inputs = metric
+    return {
+        "name": name,
+        "description": "",
+        "type": kind,
+        "datatype": None,
+        "type_params": {
+            "measure": _measure_ref(inputs[0]) if kind == "simple" else None,
+            "numerator": _metric_ref(inputs[0]) if kind == "ratio" else None,
+            "denominator": _metric_ref(inputs[1]) if kind == "ratio" else None,
+            "expr": None,
+            "window": None,
+            "grain_to_date": None,
+            "metrics": [],
+            "conversion_type_params": None,
+            "cumulative_type_params": None,
+            "input_measures": [_measure_ref(m) for m in _measure_input(metric)],
+            "metric_aggregation_params": None,
+            "join_to_timespine": False,
+            "fill_nulls_with": None,
+            "is_private": None,
+        },
+        "filter": None,
+        "metadata": None,
+        "label": label,
+        "config": {"meta": {}},
+        "time_granularity": None,
+    }
+
+
+def _semantic_manifest_document(database: str) -> dict[str, Any]:
+    """``target/semantic_manifest.json``, as a ``dbt parse`` of the project
+    writes it: what ``explore semantic list --local`` reads."""
+
+    models, metrics = _semantic_entries(database)
+    return {
+        "semantic_models": models,
+        "metrics": metrics,
+        "project_configuration": {
+            "time_spine_table_configurations": [],
+            "metadata": None,
+            "dsi_package_version": _DSI_VERSION,
+            "time_spines": [
+                {
+                    "node_relation": _relation(database, TIME_SPINE),
+                    "primary_column": {"name": "date_day", "time_granularity": "day"},
+                    "custom_granularities": [],
+                }
+            ],
+        },
+        "saved_queries": [],
+    }
+
+
+def _semantic_manifest(
+    database: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[str]]]:
+    """The semantic models and metrics as ``manifest.json`` records them, and
+    each one's parents: the semantic manifest's entries, with the fields only
+    the manifest carries."""
+
+    path = _SEMANTIC_YML.removeprefix("models/")
+    entries, metric_entries = _semantic_entries(database)
+    models: dict[str, Any] = {}
+    metrics: dict[str, Any] = {}
+    parents: dict[str, list[str]] = {}
+    owner: dict[str, str] = {}
+
+    def without_metadata(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [{k: v for k, v in m.items() if k != "metadata"} for m in members]
+
+    for spec, entry in zip(_SEMANTIC_MODELS, entries, strict=True):
+        uid = f"semantic_model.{PROJECT_NAME}.{spec['name']}"
+        model_id = f"model.{PROJECT_NAME}.{spec['model']}"
+        models[uid] = {
+            **entry,
+            "resource_type": "semantic_model",
+            "package_name": PROJECT_NAME,
+            "path": path,
+            "original_file_path": _SEMANTIC_YML,
+            "unique_id": uid,
+            "fqn": [PROJECT_NAME, "semantic", spec["name"]],
+            "model": f"ref('{spec['model']}')",
+            "entities": without_metadata(entry["entities"]),
+            "measures": without_metadata(entry["measures"]),
+            "depends_on": {"macros": [], "nodes": [model_id]},
+            "refs": [{"name": spec["model"], "package": None, "version": None}],
+            "config": {"enabled": True, "group": None, "meta": {}},
+            "unrendered_config": {},
+            "group": None,
+        }
+        parents[uid] = [model_id]
+        for measure, *_ in spec["measures"]:
+            owner[measure] = uid
+    for (name, _, kind, inputs), entry in zip(_METRICS, metric_entries, strict=True):
+        uid = f"metric.{PROJECT_NAME}.{name}"
+        depends = (
+            [owner[inputs[0]]]
+            if kind == "simple"
+            else [f"metric.{PROJECT_NAME}.{i}" for i in inputs]
+        )
+        metrics[uid] = {
+            **{k: v for k, v in entry.items() if k != "datatype"},
+            "resource_type": "metric",
+            "package_name": PROJECT_NAME,
+            "path": path,
+            "original_file_path": _SEMANTIC_YML,
+            "unique_id": uid,
+            "fqn": [PROJECT_NAME, "semantic", name],
+            "config": {"enabled": True, "group": None, "meta": {}},
+            "unrendered_config": {},
+            "sources": [],
+            "depends_on": {"macros": [], "nodes": depends},
+            "refs": [],
+            "metrics": [],
+            "group": None,
+            "meta": {},
+            "tags": [],
+        }
+        parents[uid] = depends
+    return models, metrics, parents
 
 
 def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
@@ -467,6 +875,16 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
         child_map[model_id] = sorted(tests)
     for source_id in sources:
         parent_map[source_id] = []
+    spine = _time_spine_node(database)
+    nodes[spine["unique_id"]] = spine
+    parent_map[spine["unique_id"]] = []
+    child_map[spine["unique_id"]] = []
+    semantic_models, metrics, semantic_parents = _semantic_manifest(database)
+    for uid, held in semantic_parents.items():
+        parent_map[uid] = held
+        child_map.setdefault(uid, [])
+        for parent in held:
+            child_map[parent] = sorted([*child_map.get(parent, []), uid])
     for uid in (package := _elementary_nodes(database)):
         nodes[uid] = package[uid]
         parent_map[uid] = []
@@ -487,7 +905,7 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
         "macros": {},
         "docs": {},
         "exposures": {},
-        "metrics": {},
+        "metrics": metrics,
         "groups": {},
         "selectors": {},
         "disabled": {},
@@ -495,7 +913,7 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
         "child_map": child_map,
         "group_map": {},
         "saved_queries": {},
-        "semantic_models": {},
+        "semantic_models": semantic_models,
         "unit_tests": {},
     }
 
@@ -598,6 +1016,10 @@ def build_project(
         (
             "target/run_results.json",
             json.dumps(_run_results(tables, build), indent=2) + "\n",
+        ),
+        (
+            "target/semantic_manifest.json",
+            json.dumps(_semantic_manifest_document(database), indent=2) + "\n",
         ),
     )
     return DemoProject(
