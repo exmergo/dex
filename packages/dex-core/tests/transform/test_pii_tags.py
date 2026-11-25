@@ -669,6 +669,73 @@ def test_a_sql_rewrite_resending_dbt_project_yml_unchanged_still_withholds_the_s
     assert "dbt_project.yml" not in planned["data"]["paths"]
 
 
+@pytest.mark.parametrize(
+    ("path", "kind", "anchor", "added", "status"),
+    [
+        # Already global: the rewrite gets no comparison or impact check either
+        # way, so the switch joins the project edit the plan carries.
+        (
+            "dbt_project.yml",
+            "project_yml",
+            'model-paths: ["models"]\n',
+            'vars:\n  orders_since: "2026-01-01"\n',
+            pii_tags.SWITCH_ADDED,
+        ),
+        # Global to prerequisites and attribution, not to the comparison or the
+        # impact check, so the switch still waits for a plan of its own.
+        (
+            "profiles.yml",
+            "profiles_yml",
+            "      type: duckdb\n",
+            "      threads: 2\n",
+            pii_tags.SWITCH_WITHHELD,
+        ),
+    ],
+    ids=["project_yml", "profiles_yml"],
+)
+def test_a_sql_rewrite_beside_a_changed_file_adds_the_switch_only_on_the_core(
+    dbt_project_dir: Path,
+    tmp_path: Path,
+    capsys,
+    path: str,
+    kind: str,
+    anchor: str,
+    added: str,
+    status: str,
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        SCHEMA, encoding="utf-8"
+    )
+    (dbt_project_dir / "models" / "staging" / "stg_people.sql").write_text(
+        PEOPLE, encoding="utf-8"
+    )
+    _repo(tmp_path)
+    before = (dbt_project_dir / path).read_text("utf-8")
+    assert before.count(anchor) >= 1
+    changed = before.replace(anchor, anchor + added, 1)
+
+    planned = _plan(
+        tmp_path,
+        capsys,
+        {
+            "edits": [
+                {
+                    "path": "models/staging/stg_people.sql",
+                    "kind": "model_sql",
+                    "content": PEOPLE.replace("'x' as segment", "'y' as segment"),
+                },
+                {"path": path, "kind": kind, "content": changed},
+            ]
+        },
+    )
+
+    assert planned["data"]["pii_tags"]["switch"]["status"] == status
+    assert path in planned["data"]["paths"]
+    switched = "disable_samples_on_pii_tags" in json.dumps(planned["diffs"])
+    assert switched is (status == pii_tags.SWITCH_ADDED)
+
+
 def test_a_single_string_pii_tags_is_written_and_warned(
     people: Path, tmp_path: Path, capsys
 ):

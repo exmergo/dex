@@ -199,15 +199,20 @@ def test_a_changed_project_file_makes_the_plan_global() -> None:
     assert global_edits.changes_global([edit], {PROJECT: BEFORE})
 
 
-def test_a_project_file_resent_unchanged_does_not() -> None:
-    """Line endings are no change: the plan drops such an edit before storing."""
+@pytest.mark.parametrize(
+    ("prior", "resent"),
+    [
+        (BEFORE, BEFORE.replace("\n", "\r\n")),
+        (BEFORE.replace("\n", "\r\n"), BEFORE),
+    ],
+    ids=["lf_resent_as_crlf", "crlf_resent_as_lf"],
+)
+def test_a_project_file_resent_unchanged_does_not(prior: str, resent: str) -> None:
+    """Line endings are no change on either side: the plan drops such an edit
+    before storing."""
 
-    edit = PlanEdit(
-        path=PROJECT,
-        kind=EditKind.PROJECT_YML,
-        new_content=BEFORE.replace("\n", "\r\n"),
-    )
-    assert not global_edits.changes_global([edit], {PROJECT: BEFORE})
+    edit = PlanEdit(path=PROJECT, kind=EditKind.PROJECT_YML, new_content=resent)
+    assert not global_edits.changes_global([edit], {PROJECT: prior})
 
 
 def test_a_new_macro_and_a_deleted_one_are_changes() -> None:
