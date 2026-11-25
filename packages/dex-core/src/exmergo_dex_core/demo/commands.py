@@ -149,14 +149,15 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
     ]
 
 
-def _create_config(config: DexConfig, path: Path) -> str:
+def _create_config(config: DexConfig, path: Path, made: list[Path]) -> str:
     """Write the demo's config to ``path`` exclusively and return its text.
 
     Not ``save_config``, which replaces a file already there: the demo creates
     and never replaces, so a config that appeared since the demo looked (a
-    second ``dex demo`` in the same directory) is refused, untouched. A write
-    that fails part way removes the file it opened, so the caller's rollback
-    has nothing of this function's to find.
+    second ``dex demo`` in the same directory) is refused, untouched. The file
+    is recorded in ``made`` as soon as it is opened, for the caller's rollback.
+    A write that fails part way removes the file it opened and its record, so
+    the caller's rollback has nothing of this function's to find.
     """
 
     text = config_yaml(config)
@@ -171,11 +172,13 @@ def _create_config(config: DexConfig, path: Path) -> str:
             "is likely writing to this directory. It was left as it is, and "
             "nothing this run made was kept"
         ) from None
+    made.append(path)
     try:
         with handle:
             handle.write(text)
     except BaseException:
         path.unlink(missing_ok=True)
+        made.remove(path)
         raise
     return text
 
@@ -248,11 +251,18 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
     rooted: str | None = None
     if existing_root is None:
         made_dex_dir = not config_path.parent.exists()
-        config_made = False
-        project = build_project(warehouse.tables, target.name)
+        # Filled by `_create_config` the moment it opens the file, not after it
+        # returns, so an interrupt as it returns still finds the config to undo.
+        config_made: list[Path] = []
         # BaseException, not Exception: an interrupt part way is cleaned up
         # like a failure, or the next run would refuse the warehouse it left.
+        # What this leaves open: the steps between the warehouse's creation
+        # and this `try` (no I/O, only text), the one step between the config's
+        # open and its record, and `generate_demo_warehouse`'s own rollback,
+        # which predates the project and undoes an `Exception` but not an
+        # interrupt inside it.
         try:
+            project = build_project(warehouse.tables, target.name)
             config_text = _create_config(
                 DexConfig(
                     connector="duckdb",
@@ -260,8 +270,8 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                     dbt_project_dir=PROJECT_DIR,
                 ),
                 config_path,
+                config_made,
             )
-            config_made = True
             written = write_project(root, project)
         except BaseException:
             # Nothing half-made is left for a later command to read as real,

@@ -336,6 +336,177 @@ def test_write_project_refuses_a_directory_that_appeared(tmp_path: Path):
         write_project(tmp_path, _project())
 
 
+def test_a_directory_that_appears_after_the_check_is_refused_and_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`demo_project/` made by someone else between the collision check and the
+    write is refused as a guard, not as a crash, and kept whole: the demo's
+    directory is created exclusively, so the rollback never reaches one it did
+    not make."""
+
+    from exmergo_dex_core.demo import DemoTargetExistsError
+    from exmergo_dex_core.demo import project as project_module
+
+    theirs = tmp_path / DEMO_DIR
+    real = project_module.project_collision
+    calls: list[Path] = []
+
+    def appears_after_the_check(root: Path):
+        calls.append(root)
+        if len(calls) == 1:
+            # The check sees nothing; the directory lands just after it.
+            theirs.mkdir()
+            (theirs / "keep.txt").write_text("mine", encoding="utf-8")
+            return None
+        return real(root)
+
+    monkeypatch.setattr(project_module, "project_collision", appears_after_the_check)
+
+    with pytest.raises(DemoTargetExistsError, match="never opens or replaces"):
+        write_project(tmp_path, _project())
+
+    assert len(calls) == 2, "refused by the second look, after the mkdir failed"
+    assert sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")) == [
+        DEMO_DIR,
+        f"{DEMO_DIR}/keep.txt",
+    ]
+    assert (theirs / "keep.txt").read_text(encoding="utf-8") == "mine"
+
+
+def test_the_project_files_carry_no_carriage_return_on_any_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The files are written with `\\n` line endings everywhere, so the pinned
+    digest holds on Windows too. The platform default is made `\\r\\n` here,
+    as it is on Windows, so the check means the same on every platform."""
+
+    real_open = Path.open
+
+    def windows_default(self: Path, mode: str = "r", *args, **kwargs):
+        if "w" in mode or "x" in mode:
+            kwargs.setdefault("newline", "\r\n")
+        return real_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", windows_default)
+    written = write_project(tmp_path, _project())
+
+    assert written
+    for relative in written:
+        assert b"\r" not in (tmp_path / relative).read_bytes(), relative
+
+
+def test_a_dangling_link_where_the_project_goes_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, symlinks
+):
+    """A link at `demo_project` whose target is gone still names a path the
+    demo would write through, so it is a collision like a directory, refused
+    before anything is written, and left as it is."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import commands
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("the warehouse was generated before the refusal")
+
+    monkeypatch.setattr(commands, "generate_demo_warehouse", never)
+    link = tmp_path / DEMO_DIR
+    link.symlink_to(tmp_path / "gone", target_is_directory=True)
+
+    payload = _run(["--repo-root", str(tmp_path), "demo"], capsys)
+
+    assert payload["status"] == "error"
+    assert payload["reason"] == "guard"
+    assert "never opens or replaces" in payload["errors"][0]
+    assert link.is_symlink() and not link.exists()
+    assert [p.name for p in tmp_path.iterdir()] == [DEMO_DIR]
+
+
+def test_a_config_write_that_fails_part_way_removes_the_file_it_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """`_create_config` leaves no torn config, and no record of one, so the
+    caller's rollback has nothing of its to find."""
+
+    from exmergo_dex_core.config import DexConfig, DuckDBTarget
+    from exmergo_dex_core.demo.commands import _create_config
+
+    class Torn:
+        def __init__(self, handle) -> None:
+            self._handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> bool:
+            self._handle.close()
+            return False
+
+        def write(self, text: str) -> int:
+            self._handle.write(text[:8])
+            raise OSError("disk full")
+
+    real_open = Path.open
+
+    def torn_open(self: Path, mode: str = "r", *args, **kwargs):
+        handle = real_open(self, mode, *args, **kwargs)
+        return Torn(handle) if mode == "x" else handle
+
+    monkeypatch.setattr(Path, "open", torn_open)
+    path = tmp_path / ".dex" / "config.yml"
+    made: list[Path] = []
+
+    with pytest.raises(OSError, match="disk full"):
+        _create_config(
+            DexConfig(connector="duckdb", duckdb=DuckDBTarget(path="x.duckdb")),
+            path,
+            made,
+        )
+
+    assert not path.exists()
+    assert made == []
+
+
+def test_an_interrupt_as_the_config_is_written_still_removes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The config is recorded for the rollback when it is opened, not after
+    `_create_config` returns, so an interrupt landing as it returns still
+    finds it to remove, with the warehouse."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import commands
+
+    real = commands._create_config
+
+    def interrupted_on_return(*args, **kwargs):
+        real(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(commands, "_create_config", interrupted_on_return)
+    with pytest.raises(KeyboardInterrupt):
+        main(["--repo-root", str(tmp_path), "demo"])
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_an_interrupt_while_the_project_is_rendered_removes_the_warehouse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Rendering the project runs after the warehouse is generated, inside the
+    guarded block, so an interrupt there leaves no warehouse for the next run
+    to refuse."""
+
+    pytest.importorskip("duckdb")
+    from exmergo_dex_core.demo import commands
+
+    def interrupted(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(commands, "build_project", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        main(["--repo-root", str(tmp_path), "demo"])
+    assert list(tmp_path.rglob("*")) == []
+
+
 # --- acceptance: dex demo, then dex maintain incidents ----------------------------
 
 
