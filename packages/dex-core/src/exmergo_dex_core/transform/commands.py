@@ -6532,30 +6532,41 @@ def _build_project(
         logged_id = summary.pop("logged_invocation_id", None)
         # Before the shaping on both paths, so the two read the same way; here
         # there is no gate to outlive, on the billed path below there is.
-        verification = _verify_build(
-            engine,
-            checkout,
-            summary,
-            verify,
-            artifact_directory=artifacts_dir,
-            invocation_id=logged_id,
-            retirement=_plan_retirement(engine, for_plan, for_plan_document),
-            toggle=_plan_toggle(engine, for_plan, for_plan_document),
-            plan_edits=_plan_edits(engine, for_plan, for_plan_document),
-            select=select,
-            attribution=_attribution_input(
-                engine, for_plan, for_plan_document, seed_history_dir, target
-            ),
-            history=(seed_history_dir, target),
-            plan_id=for_plan,
-            impact=(
-                _impact_input(
-                    engine, for_plan, for_plan_document, repo_root, target, connector
-                )
-                if verify
-                else None
-            ),
-        )
+        try:
+            verification = _verify_build(
+                engine,
+                checkout,
+                summary,
+                verify,
+                artifact_directory=artifacts_dir,
+                invocation_id=logged_id,
+                retirement=_plan_retirement(engine, for_plan, for_plan_document),
+                toggle=_plan_toggle(engine, for_plan, for_plan_document),
+                plan_edits=_plan_edits(engine, for_plan, for_plan_document),
+                select=select,
+                attribution=_attribution_input(
+                    engine, for_plan, for_plan_document, seed_history_dir, target
+                ),
+                history=(seed_history_dir, target),
+                plan_id=for_plan,
+                impact=(
+                    _impact_input(
+                        engine,
+                        for_plan,
+                        for_plan_document,
+                        repo_root,
+                        target,
+                        connector,
+                    )
+                    if verify
+                    else None
+                ),
+            )
+        finally:
+            # DuckDB: the sweep's reader handle blocks dbt opening the file;
+            # release it, as `transform compare` does (#1378).
+            if connector == "duckdb":
+                engine.close()
         return _shape_build_result(
             summary,
             cost,
