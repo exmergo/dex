@@ -531,7 +531,9 @@ def _time_spine_node(database: str) -> dict[str, Any]:
 
 
 #: The version of dbt-semantic-interfaces dbt 1.12.5 records in the semantic
-#: manifest it writes.
+#: manifest it writes. The dbt-parse test holds the seeded file equal to a real
+#: parse, so a lock bump that moves dbt-core fails it: update this and the
+#: entries' shape to what the new release writes, then the project digest.
 _DSI_VERSION = {"major_version": "0", "minor_version": "213", "patch_version": "0"}
 
 

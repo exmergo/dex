@@ -1009,6 +1009,9 @@ def test_dbt_parses_the_project_into_the_nodes_the_seeded_manifest_names(
     assert set(parsed["sources"]) == set(seeded_manifest["sources"])
     # The semantic layer (#1478): what MetricFlow reads is the seeded file,
     # byte for byte once parsed, and the manifest's entries match dbt's own.
+    # Strict on purpose, against the dbt uv.lock pins (DBT_VERSION): a bump
+    # that changes what dbt writes fails here first. Update _DSI_VERSION and
+    # the entries in demo/project.py to the new release, then the digest.
     semantic = (base / "target" / "semantic_manifest.json").read_text("utf-8")
     assert json.loads(semantic) == _document(project, "target/semantic_manifest.json")
 
