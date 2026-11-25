@@ -178,11 +178,12 @@ the project edits, migrations and dev builds described below.
    `contract` tier.
 6. **Maintain.** When a test fails or a model is wrong, run
    `dex maintain incidents` first, then `dex maintain diagnose` for an open
-   incident's cause and `dex maintain verify` on the models they name. Where
-   its `data.sources` reports Elementary `missing`, the run history is not
-   there to read, which is not a clean history: the step under
-   `data.next_steps` starts it (for a project without the package, the install
-   `dex init` offers). `dex maintain verify` checks the project as it stands;
+   incident's cause and `dex maintain verify` on the models whose tests they
+   name. Where its `data.sources` reports Elementary `missing` or `refused`,
+   the run history was not read, which is not a clean history: the source's
+   `reason_code` says why, and for a project without the package
+   `data.next_steps` names the install `dex init` offers, which starts it.
+   `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
 
@@ -428,9 +429,10 @@ fetches the engine's dependencies from PyPI or your configured index.
 1. **Pick the entry point.** When a test fails or a model is wrong ("when did
    this test start failing", "what changed when it broke"), start at
    `maintain incidents`, then `maintain diagnose` for an open incident's cause
-   (both below); the models they name are the subjects of the checks that
-   follow. With a baseline, start at `maintain check`: it sweeps every axis and
-   ranks findings by blast radius. With no baseline, or on
+   (both below); the models whose tests they name are the subjects of the
+   checks that follow. Otherwise, and after them, with a baseline start at
+   `maintain check`: it sweeps every axis and ranks findings by blast radius.
+   With no baseline, or on
    a project whose numbers were never right, start at `maintain verify`, the one
    command here that needs no snapshot: it answers "is this right" rather than
    "what moved". A complaint about one entity or one number ("this account is
