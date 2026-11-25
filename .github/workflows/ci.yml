@@ -126,6 +126,8 @@ jobs:
         working-directory: /
         run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       # The workspace belongs to the runner's user, not the container's root, and
       # git refuses to read a repository someone else owns. hatch-vcs reads the
       # version from it during the sync.
