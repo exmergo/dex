@@ -234,7 +234,7 @@ trino = [
 # `dbt_semantic_interfaces` at all), which `transform/semantic.py` imports first.
 # `explore semantic list --local` is a pure manifest read-view and needs none of
 # this.
-semantic = ["metricflow>=0.213,<0.214", "exmergo-dex-core[sql]"]
+semantic = ["metricflow>=0.213,<0.215", "exmergo-dex-core[sql]"]
 # The hosted dbt Cloud Semantic Layer backend (`explore semantic --api`): a thin
 # GraphQL client over httpx, nothing else. No warehouse client and no dbt-core:
 # dbt Cloud owns the warehouse connection and executes server-side, so a

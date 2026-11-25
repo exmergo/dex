@@ -668,7 +668,7 @@ wheels = [
 
 [[package]]
 name = "databricks-sql-connector"
-version = "4.4.0"
+version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "lz4" },
@@ -682,9 +682,9 @@ dependencies = [
     { name = "thrift" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3e/83/b5576b2cd457d8d393aca2d22b64cbb123e0eb91a46dddc50e5ec8b5e420/databricks_sql_connector-4.4.0.tar.gz", hash = "sha256:97d20b5e12e4aa50d16fe5fea3914f19319a207f2f4912a395a08497c25cb16f", size = 225152, upload-time = "2026-07-22T10:24:50.018Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/55/0b/300b03d183c458384ef890a86347626acc8621140d760848dd915f37c950/databricks_sql_connector-4.9.0.tar.gz", hash = "sha256:e440c671a9f27a72e13d2e1ad88d0c6a25d176aa4528b1b422753b065266a81c", size = 247223, upload-time = "2026-11-04T23:32:24.719Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/88/8bd874f39f8c3f2e36f60cebdee8b016a4f227bfc59c26c171afb6fa4825/databricks_sql_connector-4.4.0-py3-none-any.whl", hash = "sha256:6d9111dce577b954fa4684e5cf81484aaa810171d852d472c3c67ec4892bbb74", size = 252850, upload-time = "2026-07-22T10:24:48.623Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/87/3df7d5b18600adfd331d308e69de8f9676039e618e2dfc8da715eaf08e24/databricks_sql_connector-4.9.0-py3-none-any.whl", hash = "sha256:3b96fe42a392150ef62e1c5b27c678a1f4c200a061f2cf7a13380b411a457425", size = 273228, upload-time = "2026-11-04T23:32:23.285Z" },
 ]
 
 [package.optional-dependencies]
@@ -710,7 +710,7 @@ wheels = [
 
 [[package]]
 name = "dbt-adapters"
-version = "1.24.5"
+version = "1.24.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "agate" },
@@ -721,14 +721,14 @@ dependencies = [
     { name = "pytz" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/d4/bea32dd730def5b875a76c05d281d397ed720b9184d936cc4cedac605948/dbt_adapters-1.24.5.tar.gz", hash = "sha256:87de096a0d5b219905f1079b002f13e3447ffb63558f4f3c5b7278670d198acb", size = 146532, upload-time = "2026-07-15T07:18:49.036Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/b3/8cabd7f09b771a37f0e26195bdc2773eceda1076c8b50458b4b76004485c/dbt_adapters-1.24.6.tar.gz", hash = "sha256:ee58547019628c97cbc0f769f38d72a6e93f3569e1170b944843cc42f9ec87eb", size = 147601, upload-time = "2026-11-17T07:57:14.305Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9c/c0/07f0e315458128c6ef246ba9698dc0f5e9333394ab8844508adac468c617/dbt_adapters-1.24.5-py3-none-any.whl", hash = "sha256:32345118b921160722a13f12c3e369b9d59a0fb8fb9b3297e29d8cd53f973411", size = 177259, upload-time = "2026-07-15T07:18:47.314Z" },
+    { url = "https://files.pythonhosted.org/packages/70/9f/c2e6869219e71d6029ba78a805d7f561b758e5a5d802cf04a34a2a9e4a85/dbt_adapters-1.24.6-py3-none-any.whl", hash = "sha256:5cee7c1020e52ea4823f40e9ec4f848f67709ec61c4b11298f4146a3173156b5", size = 177539, upload-time = "2026-11-17T07:57:12.617Z" },
 ]
 
 [[package]]
 name = "dbt-bigquery"
-version = "1.12.3"
+version = "1.12.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "dbt-adapters" },
@@ -742,9 +742,9 @@ dependencies = [
     { name = "google-cloud-storage" },
     { name = "nbformat" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/f8/6488927b99557c868417f8751acfbaeb0ff79d857073cad2e13d58bba7ff/dbt_bigquery-1.12.3.tar.gz", hash = "sha256:d71352c4a679d3952ca6a6037cb60841004fc6df9b1a1f03cfab211c215a99b8", size = 212932, upload-time = "2026-11-11T05:31:57.686Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/e9/b1923a511434b1eebc6ce81bea68479bd05388b4c1d3c5b8b8b417caaa01/dbt_bigquery-1.12.4.tar.gz", hash = "sha256:05cb22a216faa96ca05101cacbe658543e95a4e7446c7c5a1d2d7f23789b2bee", size = 213792, upload-time = "2026-11-17T12:44:51.614Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/44/610602a3e8d20f76380f8fc9968c4582ab070289bb46191b170a72b16415/dbt_bigquery-1.12.3-py3-none-any.whl", hash = "sha256:5e3aab86e765c3b6e09ea97cc3351bcd8b5805d246005b893021fc8cb9393839", size = 114607, upload-time = "2026-11-11T05:31:56.188Z" },
+    { url = "https://files.pythonhosted.org/packages/07/05/3360e22422d3a4718f414aee8d9a1167f86a866f0e7c80513eaf7a9d1829/dbt_bigquery-1.12.4-py3-none-any.whl", hash = "sha256:84751bf5e30e60a14f2824e6a32933e44839a2e1fbbe5645b8e062ae9ff895b9", size = 114955, upload-time = "2026-11-17T12:44:49.958Z" },
 ]
 
 [[package]]
@@ -830,7 +830,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/cc/5d/7b4abb8623fae9159
 
 [[package]]
 name = "dbt-databricks"
-version = "1.13.0"
+version = "1.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -844,9 +844,9 @@ dependencies = [
     { name = "packaging" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ec/4c/3e9169d416dd78c2a7918676ce7fe7448e08869e2d1b5c596b4a44436aa3/dbt_databricks-1.13.0.tar.gz", hash = "sha256:1fbd18b740fafc462cc165fb24b9f270c598b25cfeb8f7630434f76d2a00daf6", size = 142242, upload-time = "2026-10-29T12:17:43.912Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7e/5a/ed1d0677688354df10d8d3edb0c2e7438787aa8c6c0153d6509ba0277060/dbt_databricks-1.13.1.tar.gz", hash = "sha256:39936ec3326e4a0ad8fd4789be42f189c2051e11bc5be3303762391381aec7f5", size = 145556, upload-time = "2026-11-19T12:48:26.557Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/22/ac8dde6fabe2d273a1d8d42a86b73e6c2c862f85291b04e21d96388f96cc/dbt_databricks-1.13.0-py3-none-any.whl", hash = "sha256:34b96b3120426f4d6e36b3b5dfe66fe79cfef8b68f6db9621d293e6fdc02c550", size = 204247, upload-time = "2026-10-29T12:17:42.072Z" },
+    { url = "https://files.pythonhosted.org/packages/11/ec/8e97e9bc62954519aee634cd52c860737f25424cf7eabc098f4f4ab7eeb1/dbt_databricks-1.13.1-py3-none-any.whl", hash = "sha256:70630eab576771925bd95be8364f2db938392210a7db1d533bdcd41b7d837f24", size = 209146, upload-time = "2026-11-19T12:48:25.217Z" },
 ]
 
 [[package]]
@@ -1244,8 +1244,8 @@ requires-dist = [
     { name = "jsonschema", marker = "extra == 'all'", specifier = ">=4.26" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.26" },
     { name = "jsonschema", marker = "extra == 'ossie'", specifier = ">=4.26" },
-    { name = "metricflow", marker = "extra == 'all'", specifier = ">=0.213,<0.214" },
-    { name = "metricflow", marker = "extra == 'semantic'", specifier = ">=0.213,<0.214" },
+    { name = "metricflow", marker = "extra == 'all'", specifier = ">=0.213,<0.215" },
+    { name = "metricflow", marker = "extra == 'semantic'", specifier = ">=0.213,<0.215" },
     { name = "motley-slayer", marker = "extra == 'all'", specifier = "==1.8.4" },
     { name = "motley-slayer", marker = "extra == 'slayer'", specifier = "==1.8.4" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'all'", specifier = ">=3" },
@@ -2283,7 +2283,7 @@ wheels = [
 
 [[package]]
 name = "metricflow"
-version = "0.213.0"
+version = "0.214.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "importlib-metadata" },
@@ -2299,9 +2299,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a6/ae/0c75d87f004cd56f30862fa1330f6a4e36a26ea32463a6d17d5d1ab32413/metricflow-0.213.0.tar.gz", hash = "sha256:e6b5e8f05a0b9b0183430416052a61747fc89f809c39f2cdc5a3d9ba7a3f6931", size = 643641, upload-time = "2026-09-10T19:24:20.562Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a6/a2/4dcedc873f8d040db833adc2470dbe315825ed53a7d1c0f4181cf61f84ba/metricflow-0.214.0.tar.gz", hash = "sha256:4fb323a0107617f7c17d9e4888d25ebe3948cd807e72173074614a244a0bc452", size = 660974, upload-time = "2026-11-16T16:24:28.042Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/58/6c/2ec7e3c433bdab3cf15f4424769794f6d0dab9ecd3c43da00cdb85435d44/metricflow-0.213.0-py3-none-any.whl", hash = "sha256:6e1865535a200607529970f6ca1a9fcd22b7814d0b71cd654d9ee01eecf0157b", size = 999530, upload-time = "2026-09-10T19:24:17.846Z" },
+    { url = "https://files.pythonhosted.org/packages/23/65/cd4aa5d727c59609890e7548b8ac89b0cfde03228c14e7a1b42d5227c425/metricflow-0.214.0-py3-none-any.whl", hash = "sha256:d5d33ef49a0d0d7dbc8ad9529bad7105849e2579168b77d9a73e641bd7a26833", size = 1016528, upload-time = "2026-11-16T16:24:25.962Z" },
 ]
 
 [[package]]
