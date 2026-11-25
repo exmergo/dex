@@ -12,13 +12,17 @@ names the measures and metrics each metric draws from. So the answer here is a
 lookup, under three rules:
 
 - **Absent is not empty.** A project whose semantic layer declares nothing
-  reads ``absent``. ``read`` with no readers means the layer was read and
-  nothing in it reads the column.
+  reads ``absent``. ``read`` with no readers means the layer was read and no
+  semantic model on the tested model reads the column.
+- **The tested model's own semantic models.** A semantic model is matched to
+  the model the failing test is attached to, not to the models built from it:
+  one on a mart that selects the column from the tested staging model is not
+  followed, and every ``read`` says so in its ``detail`` (:data:`SCOPE`).
 - **An expression is never guessed.** A member on the tested model whose
   expression is computed is listed as ``unresolved``, with the metrics built on
-  it where it is a measure: it may read the column, and nothing here can say.
-  A semantic model whose ``model`` names no model Dex can read is listed the
-  same way.
+  it where it is a measure: nothing here can say which column it reads, or
+  whether it reads one (``count`` over ``1`` reads none). A semantic model
+  whose ``model`` names no model Dex can read is listed the same way.
 - **Metrics are reached through measures.** A metric whose input is a measure
   that reads the column reads it, and so does every metric built on that
   metric. A metric whose filter or grouping names a dimension is not traced:
@@ -42,6 +46,13 @@ if TYPE_CHECKING:
 #: and could not be read) or ``not_read`` (this release does not read it for
 #: this incident, with the reason).
 ReadStatus = Literal["read", "absent", "unreadable", "not_read"]
+
+#: What a ``read`` covers, carried as its ``detail``: an empty list is about
+#: the tested model's own semantic models, never the models built from it.
+SCOPE = (
+    "semantic models on the tested model only: a semantic model on a model "
+    "built from it (a mart that selects the column) is not followed"
+)
 
 #: The kinds of member a semantic model holds that map to a column.
 MemberKind = Literal["entity", "dimension", "measure"]
@@ -75,7 +86,8 @@ class Reader(Value):
 
 
 class Unresolved(Value):
-    """An object that may read a tested column and cannot be resolved to one.
+    """An object on the tested model whose column cannot be resolved: it may
+    read a tested column, another, or none.
 
     ``kind`` is ``semantic_model`` where the model it sits on could not be read,
     in which case ``model`` is ``None`` and nothing about its members is
@@ -266,15 +278,16 @@ def readers(
     def order(item: Reader | Unresolved) -> tuple[str, str, str]:
         return (item.semantic_model, item.kind, item.name)
 
+    detail = SCOPE
+    if unread:
+        detail += (
+            f"; {len(unread)} semantic-layer file(s) did not parse, so objects "
+            "they hold are not listed"
+        )
     return SemanticReaders(
         status="read",
         vendor=vendor,
-        detail=(
-            f"{len(unread)} semantic-layer file(s) did not parse, so objects "
-            "they hold are not listed"
-        )
-        if unread
-        else None,
+        detail=detail,
         tested=tuple(tested),
         readers=tuple(sorted(found, key=order)),
         unresolved=tuple(sorted(unresolved, key=order)),
@@ -283,6 +296,7 @@ def readers(
 
 
 __all__ = [
+    "SCOPE",
     "MemberKind",
     "ReadStatus",
     "Reader",

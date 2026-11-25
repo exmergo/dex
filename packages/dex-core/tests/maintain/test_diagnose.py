@@ -973,12 +973,12 @@ def test_a_test_on_no_column_reads_no_semantic_layer(tmp_path: Path):
     assert readers["reason"] == "no_tested_column"
 
 
-def test_naming_the_readers_opens_no_connection(
+def test_naming_the_readers_asks_the_engine_for_no_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    # Repo-only: while the semantic layer is read, nothing may open the
-    # warehouse. The incident read before it queries Elementary's tables, as
-    # it always has; the layer read adds nothing to that.
+    # Repo-only: while the semantic layer is read, the engine is asked for no
+    # adapter, the route every warehouse read here takes. The incident read
+    # before it queries Elementary's tables, as it always has.
     from exmergo_dex_core.maintain import diagnose as diagnose_mod
 
     root, warehouse, _ = _project(tmp_path, duplicated=True)
