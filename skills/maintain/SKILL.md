@@ -429,10 +429,9 @@ fetches the engine's dependencies from PyPI or your configured index.
 1. **Pick the entry point.** When a test fails or a model is wrong ("when did
    this test start failing", "what changed when it broke"), start at
    `maintain incidents`, then `maintain diagnose` for an open incident's cause
-   (both below); the models whose tests they name are the subjects of the
-   checks that follow. Otherwise, and after them, with a baseline start at
-   `maintain check`: it sweeps every axis and ranks findings by blast radius.
-   With no baseline, or on
+   (both below), then `maintain verify` on the models whose tests they name.
+   Otherwise, and after them, with a baseline start at `maintain check`: it
+   sweeps every axis and ranks findings by blast radius. With no baseline, or on
    a project whose numbers were never right, start at `maintain verify`, the one
    command here that needs no snapshot: it answers "is this right" rather than
    "what moved". A complaint about one entity or one number ("this account is
