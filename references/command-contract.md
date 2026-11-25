@@ -950,9 +950,24 @@ dex maintain diagnose [<models>] [--invocations N]
                                      not_checked. verdict is cause, several or no_cause; no_cause
                                      answers with ruled_out and unseen and never names the likeliest
                                      candidate. A confirmed cause's repair is handed to transform
-                                     under next_steps, never written. The checks are priced as one
-                                     handshake after the incident read's own. Read-only; refused in
-                                     values-free mode
+                                     under next_steps, never written. Beside the cause,
+                                     semantic_readers (#1478) names the semantic-layer objects on the
+                                     failing test's model that read its columns (a semantic model on a
+                                     model built from it is not followed), from dbt's semantic layer as
+                                     maintain snapshot fingerprints it (repo-only, free): readers
+                                     (semantic model, model, kind entity, dimension or measure, name,
+                                     column, and a measure's metrics, through every metric built on
+                                     them) and unresolved (a member on the tested model whose
+                                     expression is computed, a semantic model whose model names
+                                     nothing readable, or, on a versioned model, a member whose
+                                     version the fingerprint cannot name, version_unresolved;
+                                     never guessed). status is read (an empty readers list means no
+                                     resolved member on the tested model reads it), absent
+                                     (no semantic layer), unreadable (unparsed_files, named in
+                                     unread_files; project_unreadable; no_project) or
+                                     not_read (no_tested_column, vendor_not_covered). The checks are
+                                     priced as one handshake after the incident read's own.
+                                     Read-only; refused in values-free mode
 ```
 
 ### How authored content reaches the engine
