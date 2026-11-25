@@ -372,12 +372,12 @@ hold the longer run history.
   two starts; `generated_at` is the run's end). It is then named under
   `window.after_window`, outside the count, which never exceeds the run count. A run that
   is neither has no place in the order and is left out of the fold, with
-  `folded: false`. A run placed in Elementary's window sits in Elementary's
-  order, so the run-results note that no failure has a known start is left
-  out there. Where the run itself opened incidents with no known start (a
-  test Elementary holds no result for), a note in its place counts those
-  incidents alone, since others in the same fold can be dated. Every other
-  placement keeps the note as written.
+  `folded: false`. A run placed in Elementary's window or after it sits in
+  Elementary's order, so the run-results note that no failure has a known
+  start is left out there. Where the run itself opened incidents with no
+  known start (a test Elementary holds no result for), a note in its place
+  counts those incidents alone, since others in the same fold can be dated.
+  A run read alone, or with no place, keeps the note as written.
 - **Every source answers.** `data.sources` reports each source `read`, `missing`
   or `refused` with a reason code: no package (`not_installed`, with the
   `dex init` that offers it), a package whose uploads are off (`not_uploading`),

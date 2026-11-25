@@ -697,15 +697,16 @@ def test_a_dbt_run_that_ended_after_the_window_but_started_before_it_is_unplaced
 
 # --- the "no known start" note, by placement (#1592) ---------------------------------
 
-#: The run-results note's fixed words, after the invocation it names: every
-#: placement but ``in_window`` keeps them as they are.
+#: The run-results note's fixed words, after the invocation it names: a run
+#: read ``alone`` or ``unplaced`` keeps them as they are.
 KNOWN_START = (
     "One invocation is all run_results.json holds, so no failure has a known "
     "start (first_observed: unknown), and every interval before it is unobserved"
 )
 
 
-#: The note an ``in_window`` run gives instead, for the incidents it opened alone.
+#: The note a run placed in Elementary's order (``in_window`` or
+#: ``after_window``) gives instead, for the incidents it opened alone.
 ONLY_DBT = (
     "opened by dbt_run_results have no known start (first_observed: unknown): "
     "a failure only dbt's run_results.json reports is seen in one invocation"
@@ -841,9 +842,33 @@ def test_a_run_read_alone_keeps_the_no_known_start_note(tmp_path: Path):
     assert not any(ONLY_DBT in note for note in result.notes)
 
 
-def test_a_run_after_the_window_keeps_the_no_known_start_note(tmp_path: Path):
-    """A failure seen only in a run newer than Elementary's window still has no
-    known start."""
+def test_a_run_elementary_recorded_dates_a_failure_it_opened_after_elementary_passes(
+    tmp_path: Path,
+):
+    """Elementary saw TEST pass in inv-1 and inv-2 and holds no result for it in
+    inv-3, where dbt's run fails it: the run opens the incident, and the fold
+    dates it from Elementary's passes, so no note says its start is unknown."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs[:2]))
+    _run_results(root, {TEST: "fail"}, invocation="inv-3", at=runs[-1].started)
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "in_window"
+    [incident] = data["incidents"]
+    assert incident["opening_source"] == "dbt_run_results"
+    assert incident["first_observed"]["run"] == "inv-3"
+    assert incident["first_observed"]["source"] == "dbt_run_results"
+    assert not _says_no_known_start(result)
+    assert not any(ONLY_DBT in note for note in result.notes)
+
+
+def test_a_run_after_the_window_drops_the_no_known_start_note(tmp_path: Path):
+    """Placed ``after_window``, the run follows Elementary's newest one in the
+    same order: Elementary saw TEST pass in every run before it, so the fold
+    dates the failure from the run itself, and the file's note would contradict
+    that ``first_observed``."""
 
     runs = _hourly(3)
     root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
@@ -854,7 +879,56 @@ def test_a_run_after_the_window_keeps_the_no_known_start_note(tmp_path: Path):
     assert data["sources"]["dbt_run_results"]["placed"] == "after_window"
     [incident] = data["incidents"]
     assert incident["opening_source"] == "dbt_run_results"
-    assert _says_no_known_start(result)
+    assert incident["first_observed"]["run"] == "dbt-later"
+    assert incident["first_observed"]["source"] == "dbt_run_results"
+    assert not _says_no_known_start(result)
+    assert not any(ONLY_DBT in note for note in result.notes)
+    assert any("no dbt log was found" in note for note in result.notes)
+
+
+def test_a_run_after_the_window_scopes_the_note_beside_a_dated_incident(
+    tmp_path: Path,
+):
+    """After the window, as in it: Elementary's passes date TEST, and OTHER,
+    which Elementary holds no result for, only dbt's run reports. The note
+    names the undated incident alone, where the file's note would sit."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    _run_results(root, {TEST: "fail", OTHER: "fail"}, invocation="dbt-later")
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["dbt_run_results"]["placed"] == "after_window"
+    by_key = {incident["subject"]["key"]: incident for incident in data["incidents"]}
+    assert set(by_key) == {TEST, OTHER}
+    assert by_key[TEST]["first_observed"]["run"] == "dbt-later"
+    assert by_key[OTHER]["opening_source"] == "dbt_run_results"
+    assert by_key[OTHER]["first_observed"] == "unknown"
+    assert not _says_no_known_start(result)
+    at, note = _only_dbt_note(result)
+    assert note.startswith("1 incident(s) ")
+    assert at < _no_log_note_at(result)
+
+
+@pytest.mark.parametrize(
+    ("invocation", "placed"), [("inv-3", "in_window"), ("dbt-later", "after_window")]
+)
+def test_where_the_note_was_held_never_reaches_the_envelope(
+    tmp_path: Path, invocation: str, placed: str
+):
+    """The held note's position is the read's own bookkeeping, not a field of
+    the source."""
+
+    runs = _hourly(3)
+    root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
+    at = runs[-1].started if invocation == "inv-3" else START + timedelta(days=30)
+    _run_results(root, {OTHER: "fail"}, invocation=invocation, at=at)
+    data = _data(_engine(root, warehouse).incidents())
+
+    assert data["sources"]["dbt_run_results"]["placed"] == placed
+    for name, source in data["sources"].items():
+        assert [key for key in source if key.startswith("_")] == [], name
 
 
 def test_an_unplaced_run_keeps_the_no_known_start_note(tmp_path: Path):

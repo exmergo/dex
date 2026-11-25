@@ -893,14 +893,15 @@ def _dbt(
             "claims_unread": counts.claims_unread,
         },
     )
-    if placed_as == "in_window":
-        # Elementary recorded this invocation, so the run sits in Elementary's
-        # order and a failure Elementary saw pass before it is dated: the file's
-        # "no known start" note is left out here. :func:`read` puts a note in its
-        # place only for the incidents this run opened with no known start (a
-        # test Elementary holds no result for), and that note names those
-        # incidents alone, since others in the same fold can be dated. The run
-        # itself is still named, under this source's ``run`` and ``placed``.
+    if placed_as in ("in_window", "after_window"):
+        # The run has a place in Elementary's order, as one of its invocations
+        # or after its newest one, so a failure Elementary saw pass before it is
+        # dated: the file's "no known start" note is left out here. :func:`read`
+        # puts a note in its place only for the incidents this run opened with
+        # no known start (a test Elementary holds no result for), and that note
+        # names those incidents alone, since others in the same fold can be
+        # dated. The run itself is still named, under this source's ``run`` and
+        # ``placed``. Read alone, the run keeps the file's note: nothing dates it.
         extra["_held_note_at"] = len(notes)
         notes.extend(n for n in found.notes if n != found.unknown_start_note)
     else:
@@ -909,7 +910,7 @@ def _dbt(
 
 
 def _only_dbt_reports(count: int) -> str:
-    """The "no known start" note for a run Elementary also recorded. It speaks
+    """The "no known start" note for a run placed in Elementary's order. It speaks
     of the incidents dbt's run opened alone, never of every failure, since the
     fold can date the others from Elementary's runs."""
 

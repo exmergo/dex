@@ -131,8 +131,8 @@ class RunResultsRead:
     warnings: tuple[str, ...] = ()
     #: The note in ``notes`` saying no failure has a known start, which holds of
     #: the file on its own. A caller that places the run in a longer history
-    #: (``maintain incidents``, where Elementary recorded the same invocation)
-    #: leaves it out there.
+    #: (``maintain incidents``, where the run has a place in Elementary's
+    #: order) leaves it out there.
     unknown_start_note: str | None = None
 
 
