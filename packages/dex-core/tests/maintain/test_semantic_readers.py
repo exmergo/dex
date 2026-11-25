@@ -1,0 +1,146 @@
+"""The semantic-layer objects that read an incident's column (#1478): the pure
+lookup over ``maintain``'s own semantic-layer fingerprint."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+from exmergo_dex_core.maintain import semantic_readers as sr
+from exmergo_dex_core.maintain.diagnose import _Layer
+from exmergo_dex_core.maintain.snapshot import (
+    MetricDef,
+    SemanticLayerSnapshot,
+    SemanticModelDef,
+)
+
+TESTED = (
+    sr.TestedColumn(test="test.shop.unique_x", model="stg_orders", columns=("id",)),
+)
+
+
+def _model(name: str, model_ref: str | None, **members: Any) -> SemanticModelDef:
+    return SemanticModelDef(
+        name=name, content_sha256="0", model_ref=model_ref, **members
+    )
+
+
+def _metric(
+    name: str, measures: list[str] | None = None, metrics: list[str] | None = None
+) -> MetricDef:
+    return MetricDef(
+        name=name,
+        content_sha256="0",
+        input_measures=measures or [],
+        input_metrics=metrics or [],
+    )
+
+
+def _layer(*models: SemanticModelDef, metrics: tuple[MetricDef, ...] = ()):
+    return SemanticLayerSnapshot(
+        semantic_models=list(models), metrics=list(metrics), vendor="dbt"
+    )
+
+
+def test_metrics_are_reached_through_every_metric_built_on_the_measure():
+    layer = _layer(
+        _model("orders", "stg_orders", measures={"order_count": "id"}),
+        metrics=(
+            _metric("orders", measures=["order_count"]),
+            _metric("orders_x2", metrics=["orders"]),
+            _metric("orders_x4", metrics=["orders_x2"]),
+            _metric("unrelated", measures=["other"]),
+        ),
+    )
+    [reader] = sr.readers(layer, TESTED).readers
+
+    assert reader.metrics == ("orders", "orders_x2", "orders_x4")
+
+
+def test_a_metric_cycle_ends():
+    layer = _layer(
+        _model("orders", "stg_orders", measures={"order_count": "id"}),
+        metrics=(
+            _metric("a", measures=["order_count"], metrics=["b"]),
+            _metric("b", metrics=["a"]),
+        ),
+    )
+    [reader] = sr.readers(layer, TESTED).readers
+
+    assert reader.metrics == ("a", "b")
+
+
+def test_the_model_and_column_are_matched_without_case():
+    layer = _layer(_model("orders", "STG_Orders", measures={"order_count": "ID"}))
+    [reader] = sr.readers(layer, TESTED).readers
+
+    assert (reader.model, reader.column) == ("STG_Orders", "ID")
+
+
+def test_a_semantic_model_on_another_model_is_not_listed_even_when_computed():
+    layer = _layer(
+        _model("customers", "stg_customers", measures={"n": "id", "x": None}),
+    )
+    got = sr.readers(layer, TESTED)
+
+    assert got.status == "read"
+    assert (got.readers, got.unresolved) == ((), ())
+
+
+def test_a_semantic_model_whose_model_cannot_be_read_is_unresolved():
+    layer = _layer(_model("orders", None, measures={"order_count": "id"}))
+    [item] = sr.readers(layer, TESTED).unresolved
+
+    assert (item.kind, item.name, item.reason, item.model) == (
+        "semantic_model",
+        "orders",
+        "model_unresolved",
+        None,
+    )
+
+
+def test_metrics_alone_are_a_layer_that_was_read():
+    got = sr.readers(_layer(metrics=(_metric("m", measures=["x"]),)), TESTED)
+
+    assert got.status == "read"
+    assert got.readers == ()
+
+
+def test_unparsed_files_beside_a_read_layer_say_the_list_may_be_short():
+    layer = _layer(_model("orders", "stg_orders", measures={"order_count": "id"}))
+    got = sr.readers(layer, TESTED, unread_files=["models/b.yml", "models/a.yml"])
+
+    assert got.status == "read"
+    assert got.unread_files == ("models/a.yml", "models/b.yml")
+    assert got.detail is not None
+    assert "not listed" in got.detail
+    assert [r.name for r in got.readers] == ["order_count"]
+
+
+def test_a_native_vendor_is_not_read_and_says_why():
+    engine = SimpleNamespace(
+        config=SimpleNamespace(semantic=SimpleNamespace(vendor="ossie"))
+    )
+    got = _Layer.read(engine).readers(TESTED)  # type: ignore[arg-type]
+
+    assert got.status == "not_read"
+    assert got.reason == "vendor_not_covered"
+    assert got.vendor == "ossie"
+    assert got.tested == TESTED
+
+
+def test_a_project_that_cannot_be_read_is_unreadable():
+    from exmergo_dex_core.errors import ProjectError
+
+    def broken() -> None:
+        raise ProjectError("no dbt_project.yml")
+
+    engine = SimpleNamespace(
+        config=SimpleNamespace(semantic=SimpleNamespace(vendor=None)),
+        maintain_project=broken,
+    )
+    got = _Layer.read(engine).readers(TESTED)  # type: ignore[arg-type]
+
+    assert got.status == "unreadable"
+    assert got.reason == "project_unreadable"
+    assert got.vendor == "dbt"

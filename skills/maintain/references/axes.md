@@ -731,6 +731,30 @@ Two things look like drift and are not:
   `maintain snapshot` baselines the new format. Added and removed definitions are
   still reported.
 
+## `maintain diagnose`: who reads the broken column
+
+`maintain diagnose` takes each open incident to a cause. One field of a
+diagnosis answers the question a person reading a metric asks first: does this reach me?
+`data.diagnoses[].semantic_readers` (#1478) names the semantic-layer objects
+that read the failing test's columns, read from dbt's semantic layer the way
+`maintain snapshot` fingerprints it, with no warehouse query.
+
+- `readers`: each entity, dimension and measure on the tested model whose
+  column is a tested one, with its `semantic_model`, `model`, `kind`, `name` and
+  `column`. A measure carries `metrics`: every metric whose input is the
+  measure, and every metric built on those.
+- `unresolved`: a member on the tested model whose expression is computed
+  (`computed_expression`), and a semantic model whose `model` names nothing Dex
+  can read (`model_unresolved`). It may read the column; nothing here guesses.
+- `status`: `read` (the list stands; empty means nothing reads the column),
+  `absent` (no semantic layer), `unreadable` (a layer is there and could not
+  be read; `unread_files` names a semantic file that does not parse), or
+  `not_read` with `reason` `no_tested_column` or `vendor_not_covered` (a native
+  `semantic.vendor`, which this release does not match to a dbt model).
+
+Report these beside the cause: name the semantic models and metrics, and say
+which objects are unresolved rather than leaving them out.
+
 ## What each axis costs
 
 | Axis | Cost |

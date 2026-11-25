@@ -796,3 +796,207 @@ def test_a_repository_with_no_commit_yet_reads_as_no_series_not_unreadable(
     assert read.series.status == "read"
     assert read.series.points == ()
     assert "no commit yet" in (read.series.reason or "")
+
+
+# --- acceptance (#1478): the semantic-layer objects that read the column ----------
+
+
+def _semantic_layer(
+    root: Path,
+    *,
+    measure_expr: str = "order_item_id",
+    extra: str = "",
+) -> None:
+    """dbt semantic YAML on the tested model: one measure on ``measure_expr``,
+    a simple metric on it, and a ratio built on that metric."""
+
+    models = root / "models"
+    models.mkdir(exist_ok=True)
+    (models / "semantic.yml").write_text(
+        "semantic_models:\n"
+        "  - name: order_items\n"
+        "    model: ref('stg_order_items')\n"
+        "    measures:\n"
+        "      - name: order_item_count\n"
+        "        agg: count_distinct\n"
+        f"        expr: {measure_expr}\n"
+        "      - name: quantity_total\n"
+        "        agg: sum\n"
+        "        expr: quantity\n"
+        f"{extra}"
+        "metrics:\n"
+        "  - name: order_items\n"
+        "    type: simple\n"
+        "    type_params:\n"
+        "      measure: order_item_count\n"
+        "  - name: units\n"
+        "    type: simple\n"
+        "    type_params:\n"
+        "      measure: quantity_total\n"
+        "  - name: items_per_unit\n"
+        "    type: ratio\n"
+        "    type_params:\n"
+        "      numerator: order_items\n"
+        "      denominator: units\n"
+    )
+
+
+def _readers(data: dict[str, Any]) -> dict[str, Any]:
+    [diagnosis] = data["diagnoses"]
+    return diagnosis["semantic_readers"]
+
+
+def test_a_measure_reading_the_failing_column_is_named_with_its_metrics(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root)
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "read"
+    assert readers["vendor"] == "dbt"
+    assert readers["tested"] == [
+        {"test": TEST, "model": "stg_order_items", "columns": ["order_item_id"]}
+    ]
+    assert readers["readers"] == [
+        {
+            "semantic_model": "order_items",
+            "model": "stg_order_items",
+            "kind": "measure",
+            "name": "order_item_count",
+            "column": "order_item_id",
+            # The simple metric on the measure, and the ratio built on it.
+            "metrics": ["items_per_unit", "order_items"],
+        }
+    ]
+    assert readers["unresolved"] == []
+
+
+def test_the_same_measure_reading_another_column_names_nothing(tmp_path: Path):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root, measure_expr="quantity")
+    readers = _readers(_diagnose(root, warehouse))
+
+    # Read, and nothing in it reads the column: empty, not absent.
+    assert readers["status"] == "read"
+    assert readers["readers"] == []
+    assert readers["unresolved"] == []
+
+
+def test_a_project_with_no_semantic_layer_reads_as_absent_not_empty(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "absent"
+    assert readers["reason"] == "no_semantic_layer"
+    assert readers["readers"] == []
+
+
+def test_a_computed_expression_on_the_tested_model_is_listed_as_unresolved(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root, measure_expr="case when quantity > 0 then order_item_id end")
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "read"
+    assert readers["readers"] == []
+    assert readers["unresolved"] == [
+        {
+            "semantic_model": "order_items",
+            "model": "stg_order_items",
+            "kind": "measure",
+            "name": "order_item_count",
+            "reason": "computed_expression",
+            "metrics": ["items_per_unit", "order_items"],
+        }
+    ]
+
+
+def test_an_entity_and_a_dimension_on_the_column_are_named_without_metrics(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(
+        root,
+        measure_expr="quantity",
+        extra=(
+            "    entities:\n"
+            "      - name: order_item\n"
+            "        type: primary\n"
+            "        expr: ORDER_ITEM_ID\n"
+            "    dimensions:\n"
+            "      - name: order_item_id\n"
+            "        type: categorical\n"
+        ),
+    )
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert [(r["kind"], r["name"], r["metrics"]) for r in readers["readers"]] == [
+        ("dimension", "order_item_id", []),
+        ("entity", "order_item", []),
+    ]
+
+
+def test_a_semantic_file_that_does_not_parse_reads_as_unreadable_not_absent(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    models = root / "models"
+    models.mkdir()
+    (models / "semantic.yml").write_text(
+        "semantic_models:\n  - name: order_items\n    model: [unclosed\n"
+    )
+    engine = DexEngine(connector="duckdb", path=str(warehouse), repo_root=str(root))
+    envelope = to_envelope(engine.diagnose())
+    readers = _readers(envelope.data)
+
+    assert readers["status"] == "unreadable"
+    assert readers["reason"] == "unparsed_files"
+    assert readers["unread_files"] == ["models/semantic.yml"]
+    assert any("semantic_readers may miss" in w for w in envelope.warnings)
+
+
+def test_a_test_on_no_column_reads_no_semantic_layer(tmp_path: Path):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root)
+    manifest = json.loads((root / "target" / "manifest.json").read_text())
+    node = manifest["nodes"][TEST]
+    node["test_metadata"] = {"name": "expression_is_true", "kwargs": {}}
+    node.pop("column_name")
+    (root / "target" / "manifest.json").write_text(json.dumps(manifest))
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "not_read"
+    assert readers["reason"] == "no_tested_column"
+
+
+def test_naming_the_readers_opens_no_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Repo-only: while the semantic layer is read, nothing may open the
+    # warehouse. The incident read before it queries Elementary's tables, as
+    # it always has; the layer read adds nothing to that.
+    from exmergo_dex_core.maintain import diagnose as diagnose_mod
+
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root)
+    real = diagnose_mod._Layer.read.__func__  # type: ignore[attr-defined]
+
+    def guarded(cls: Any, engine: DexEngine) -> Any:
+        def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("the semantic-layer read opened a connection")
+
+        saved = engine._adapter
+        engine._adapter = refuse  # type: ignore[method-assign]
+        try:
+            return real(cls, engine)
+        finally:
+            engine._adapter = saved  # type: ignore[method-assign]
+
+    monkeypatch.setattr(diagnose_mod._Layer, "read", classmethod(guarded))
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert [r["name"] for r in readers["readers"]] == ["order_item_count"]

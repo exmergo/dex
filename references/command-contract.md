@@ -950,9 +950,20 @@ dex maintain diagnose [<models>] [--invocations N]
                                      not_checked. verdict is cause, several or no_cause; no_cause
                                      answers with ruled_out and unseen and never names the likeliest
                                      candidate. A confirmed cause's repair is handed to transform
-                                     under next_steps, never written. The checks are priced as one
-                                     handshake after the incident read's own. Read-only; refused in
-                                     values-free mode
+                                     under next_steps, never written. Beside the cause,
+                                     semantic_readers (#1478) names the semantic-layer objects that
+                                     read the failing test's columns, from dbt's semantic layer as
+                                     maintain snapshot fingerprints it (repo-only, free): readers
+                                     (semantic model, model, kind entity, dimension or measure, name,
+                                     column, and a measure's metrics, through every metric built on
+                                     them) and unresolved (a member on the tested model whose
+                                     expression is computed, or a semantic model whose model names
+                                     nothing readable; never guessed). status is read (an empty list
+                                     means nothing reads it), absent (no semantic layer), unreadable
+                                     (unread_files names a semantic file that does not parse) or
+                                     not_read (no_tested_column, vendor_not_covered). The checks are
+                                     priced as one handshake after the incident read's own.
+                                     Read-only; refused in values-free mode
 ```
 
 ### How authored content reaches the engine

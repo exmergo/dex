@@ -442,6 +442,25 @@ and takes each open incident to a cause, or to none.
 - **The repair is `transform`'s.** A confirmed cause carries the
   `dex transform plan` step that would repair it under `next_steps`. Nothing
   here writes it.
+- **Who reads it.** Beside the cause, `semantic_readers` (#1478) names the
+  semantic-layer objects that read the failing test's columns: the model and
+  columns come from the test's node in the manifest (a uniqueness test's
+  claim, else the column it is attached to), and the readers from dbt's
+  semantic layer as `maintain snapshot` fingerprints it, which maps each
+  entity, dimension and measure to the one column it references. Each reader
+  names its semantic model, the model it sits on, its kind and column, and for
+  a measure the metrics built on it, through every metric built on those. A
+  member on the tested model whose expression is computed, and a semantic model
+  whose `model` names nothing readable, are listed as `unresolved`, never
+  guessed. Three readings are kept apart: `read` with an empty list (the layer
+  was read and nothing reads the column), `absent` (the project declares no
+  semantic layer) and `unreadable` (a layer is there and could not be read; a
+  semantic file that does not parse is named in `unread_files`, and beside a
+  layer that was read means the list may be short). `not_read` says why the
+  layer was not looked up: `no_tested_column`, or `vendor_not_covered` where
+  `semantic.vendor` names a native layer, whose semantic models name a
+  relation rather than the dbt model a test is attached to. A metric's filter
+  or grouping on a dimension is not traced. Repo-only: no warehouse query.
 - **Priced.** The incident read prices its own statements first; the checks
   are then priced together as one handshake before any probe runs, within
   what the per-command ceiling has left after the read. Checks that do not

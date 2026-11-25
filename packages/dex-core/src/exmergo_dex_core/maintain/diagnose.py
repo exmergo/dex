@@ -31,6 +31,10 @@ spans (#1467). Each open incident is then diagnosed (:mod:`.diagnosis`):
    what was ruled out and the window that could not be seen; the most likely
    candidate is never named. A confirmed cause's repair is handed to
    ``transform`` as a step; nothing here writes it.
+5. **Who reads it.** Beside the cause, ``semantic_readers`` names the
+   semantic-layer objects that read the failing test's columns, and the metrics
+   built on them, read from dbt's semantic layer as ``maintain snapshot``
+   fingerprints it (:mod:`.semantic_readers`, #1478). Repo-only and free.
 
 Every scan goes through the grain axis's own probes and is priced first, in one
 handshake for every check this call runs, after the incident read's own.
@@ -39,6 +43,7 @@ Read-only: nothing here writes to the warehouse, the project or ``.dex/``.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +54,7 @@ from ..cache import Dataset
 from ..values_free import require_allowed
 from . import diagnosis as diag
 from . import incident_sources
+from . import semantic_readers as sr
 from .results import DiagnoseResult
 
 if TYPE_CHECKING:
@@ -56,7 +62,7 @@ if TYPE_CHECKING:
     from ..engine import DexEngine
     from .drift import GrainPlan
     from .incidents import Incident
-    from .snapshot import Snapshot
+    from .snapshot import SemanticLayerSnapshot, Snapshot
     from .snapshot_series import SeriesRead
 
 COMMAND = "maintain diagnose"
@@ -148,6 +154,13 @@ def diagnose(
                 spent_before=_billed(read.spend),
                 warnings=warnings,
             )
+        layer = _Layer.read(engine)
+        if layer.unread_files:
+            warnings.append(
+                f"{len(layer.unread_files)} semantic-layer file(s) do not parse "
+                "(" + ", ".join(layer.unread_files) + "), so semantic_readers may "
+                "miss objects they hold"
+            )
         diagnoses.extend(
             diag.diagnosis(
                 subject=item.incident.subject.key,
@@ -156,6 +169,9 @@ def diagnose(
                 series=series_read.series,
                 candidates=item.candidates,
                 next_steps=item.next_steps,
+                semantic_readers=layer.readers(
+                    _tested_columns(manifest, item.incident)
+                ),
             ).model_dump(mode="json")
             for item in work
         )
@@ -381,6 +397,157 @@ def _specs(manifest: Mapping[str, Any], incident: Incident) -> list[_Spec]:
                 )
             )
     return specs
+
+
+# --- who reads it -----------------------------------------------------------------
+
+#: A top-level key that makes a YAML file part of dbt's semantic layer.
+_SEMANTIC_KEY = re.compile(r"^(semantic_models|metrics)\s*:", re.MULTILINE)
+
+
+def _tested_columns(
+    manifest: Mapping[str, Any], incident: Incident
+) -> list[sr.TestedColumn]:
+    """The model and columns each of the incident's tests checks, from the
+    test's node in the manifest.
+
+    A uniqueness test's columns are its claim; any other test's is the column
+    it is attached to, or the column its source recorded the failure on (an
+    Elementary column anomaly test). A test on a source, or on no column,
+    names nothing a semantic model sits on.
+    """
+
+    nodes = manifest.get("nodes") or {}
+    tested: list[sr.TestedColumn] = []
+    for test in incident.tests:
+        node = nodes.get(test)
+        if not isinstance(node, Mapping):
+            continue
+        uid = _tested_model(node)
+        model = nodes.get(uid) if uid else None
+        if not isinstance(model, Mapping) or model.get("resource_type") != "model":
+            continue
+        name = str(model.get("name") or "")
+        columns = _uniqueness_columns(node)
+        if columns is None:
+            named = node.get("column_name") or incident.signal.column
+            spelled = str(named).strip().strip('"`[]') if named else ""
+            columns = (spelled,) if spelled else None
+        if not name or not columns:
+            continue
+        tested.append(sr.TestedColumn(test=test, model=name, columns=columns))
+    return tested
+
+
+@dataclass(frozen=True)
+class _Layer:
+    """The semantic layer as read once for the whole command, or why it was
+    not: every incident is looked up in the same read."""
+
+    vendor: str
+    layer: SemanticLayerSnapshot | None = None
+    status: str | None = None
+    reason: str | None = None
+    detail: str | None = None
+    unread_files: tuple[str, ...] = ()
+
+    @classmethod
+    def read(cls, engine: DexEngine) -> _Layer:
+        """dbt's semantic layer, as ``maintain snapshot`` fingerprints it.
+
+        Repo-only: the project's YAML files, never the warehouse. A native
+        layer (``semantic.vendor: ossie`` and the rest) is not read here: its
+        semantic models name a relation rather than the dbt model a test is
+        attached to. Never raises: the diagnosis stands without this field.
+        """
+
+        from pydantic import ValidationError
+
+        from ..config import SEMANTIC_SOURCE_FACTORIES
+        from ..errors import DexError
+
+        vendor = (getattr(engine.config.semantic, "vendor", None) or "dbt").lower()
+        if vendor in SEMANTIC_SOURCE_FACTORIES:
+            return cls(
+                vendor=vendor,
+                status="not_read",
+                reason="vendor_not_covered",
+                detail=f"semantic.vendor is {vendor}; this release reads dbt's "
+                "semantic layer only, so the objects that read the column are "
+                "not listed",
+            )
+        try:
+            project = engine.maintain_project()
+            if project is None:
+                return cls(
+                    vendor=vendor,
+                    status="unreadable",
+                    reason="no_project",
+                    detail=engine.project_tier_note(),
+                )
+            layer = project.semantic_layer()
+        except (DexError, ValidationError, OSError, ValueError) as exc:
+            return cls(
+                vendor=vendor,
+                status="unreadable",
+                reason="project_unreadable",
+                detail=str(exc),
+            )
+        return cls(vendor=vendor, layer=layer, unread_files=_unparsed(project))
+
+    def readers(self, tested: Sequence[sr.TestedColumn]) -> sr.SemanticReaders:
+        if not tested:
+            return sr.not_read(
+                "no_tested_column",
+                "the incident's tests name no column of a model, so no semantic "
+                "model can be matched to it",
+                vendor=self.vendor,
+            )
+        if self.layer is None:
+            build = sr.unreadable if self.status == "unreadable" else sr.not_read
+            return build(
+                self.reason or "not_read",
+                self.detail or "",
+                vendor=self.vendor,
+                tested=tested,
+            )
+        return sr.readers(self.layer, tested, unread_files=self.unread_files)
+
+
+def _unparsed(project: Any) -> tuple[str, ...]:
+    """The project's semantic-layer YAML files that do not parse.
+
+    The fingerprint skips such a file, as every reader of declared definitions
+    does, so without this a broken layer would read as an absent one.
+    """
+
+    import yaml
+    from pydantic import ValidationError
+
+    from ..dbt_project import DbtProjectView
+    from ..errors import DexError
+
+    load = getattr(project, "load", None)
+    if not callable(load):
+        return ()
+    try:
+        # Already loaded by the fingerprint, which read the same view.
+        view = load()
+    except (DexError, ValidationError, OSError, ValueError):
+        return ()
+    if not isinstance(view, DbtProjectView):
+        return ()
+    found: list[str] = []
+    for source in view.files.values():
+        if not source.path.endswith((".yml", ".yaml")):
+            continue
+        if not _SEMANTIC_KEY.search(source.content):
+            continue
+        try:
+            yaml.safe_load(source.content)
+        except yaml.YAMLError:
+            found.append(source.path)
+    return tuple(sorted(found))
 
 
 # --- the checks -------------------------------------------------------------------
