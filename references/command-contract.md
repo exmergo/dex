@@ -92,7 +92,9 @@ dex demo [path]                   -> generate a seeded local DuckDB warehouse (t
                                      the demo ran, and the newest build's artifacts)
                                      in which one test starts failing, so maintain
                                      incidents and maintain diagnose have an incident
-                                     to read (#1477);
+                                     to read (#1477), and a dbt semantic layer, one
+                                     semantic model keyed on the failing column, so
+                                     diagnose names what reads it (#1478);
                                      reports every artifact under data.created and
                                      names what to run next under data.next_steps. A relative path
                                      resolves against --repo-root and is reported

@@ -57,7 +57,7 @@ REFERENCE = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
 # project, the history and the incident they give (the counts below, the tour),
 # then update the value.
 GOLDEN_PROJECT_DIGEST = (
-    "b8d900c25d238817f456b91f67d9c979795f143be8a0c1284c5e1afdc9ad288f"
+    "218c769a51ad5d0926d7f35ffdc197def6f28ca3967c2728637223ba114f8dd7"
 )
 GOLDEN_HISTORY_DIGEST = (
     "b153c4ce178845bc4ac12cd7d61eb8daf13f85f2050fa4fdd9e2891146ae9073"
@@ -913,6 +913,57 @@ def test_diagnosis_names_the_batch_loaded_twice_as_the_cause(
     assert step["command"].startswith("dex transform plan ")
 
 
+def test_diagnosis_names_the_semantic_model_keyed_on_the_failing_column(
+    run_from, no_network, capsys
+):
+    """#1478: beside the cause, the diagnosis names who reads what broke. The
+    demo's ``order_items`` semantic model is keyed on the failing test's column,
+    so its entity is named; ``orders`` and its metrics read no column of
+    ``stg_order_items`` and are not."""
+
+    pytest.importorskip("duckdb")
+    demo = _run(run_from.argv("demo"), capsys)
+    data = _run(_printed(demo, "maintain diagnose"), capsys)["data"]
+
+    [diagnosis] = data["diagnoses"]
+    readers = diagnosis["semantic_readers"]
+    assert readers["status"] == "read"
+    assert readers["tested"] == [
+        {"test": FAILING_TEST, "model": "stg_order_items", "columns": ["order_item_id"]}
+    ]
+    assert readers["readers"] == [
+        {
+            "semantic_model": "order_items",
+            "model": "stg_order_items",
+            "kind": "entity",
+            "name": "order_item",
+            "column": "order_item_id",
+            "metrics": [],
+        }
+    ]
+    assert readers["unresolved"] == []
+    assert readers["unread_files"] == []
+
+
+def test_the_demo_s_semantic_layer_is_listed_from_its_seeded_artifacts(
+    run_from, no_network, capsys
+):
+    """``explore semantic list --local`` reads the compiled semantic manifest
+    a parse leaves in ``target/``, which the demo seeds with its build."""
+
+    _run(run_from.argv("demo"), capsys)
+    payload = _run(run_from.argv("explore", "semantic", "list", "--local"), capsys)
+
+    assert payload["status"] == "ok", payload["errors"]
+    data = payload["data"]
+    assert [m["name"] for m in data["semantic_models"]] == ["order_items", "orders"]
+    assert sorted(m["name"] for m in data["metrics"]) == [
+        "average_order_value",
+        "orders",
+        "revenue",
+    ]
+
+
 # --- the seeded manifest is the one dbt would write -------------------------------
 
 
@@ -956,6 +1007,32 @@ def test_dbt_parses_the_project_into_the_nodes_the_seeded_manifest_names(
 
     assert lineage(parsed) == lineage(seeded_manifest)
     assert set(parsed["sources"]) == set(seeded_manifest["sources"])
+    # The semantic layer (#1478): what MetricFlow reads is the seeded file,
+    # byte for byte once parsed, and the manifest's entries match dbt's own.
+    semantic = (base / "target" / "semantic_manifest.json").read_text("utf-8")
+    assert json.loads(semantic) == _document(project, "target/semantic_manifest.json")
+
+    def entries(manifest: dict, section: str) -> dict[str, dict]:
+        return {
+            uid: {
+                key: value.replace("\\", "/") if key.endswith("path") else value
+                for key, value in entry.items()
+                if key != "created_at"
+            }
+            for uid, entry in manifest[section].items()
+        }
+
+    for section in ("semantic_models", "metrics"):
+        assert entries(parsed, section) == entries(seeded_manifest, section), section
+    for map_name in ("parent_map", "child_map"):
+        for uid, held in parsed[map_name].items():
+            if uid.startswith(("semantic_model.", "metric.", "model.analytics.")):
+                assert sorted(held) == sorted(seeded_manifest[map_name][uid]), uid
+    spine = "model.analytics.metricflow_time_spine"
+    assert (
+        parsed["nodes"][spine]["time_spine"]
+        == seeded_manifest["nodes"][spine]["time_spine"]
+    )
     for uid in lineage(seeded_manifest):
         for field in ("database", "schema", "name", "test_metadata", "attached_node"):
             assert parsed["nodes"][uid].get(field) == seeded_manifest["nodes"][uid].get(

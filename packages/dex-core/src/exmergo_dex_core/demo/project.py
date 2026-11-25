@@ -13,10 +13,19 @@ renders both as files, beside the warehouse :mod:`.warehouse` writes:
   and turns its row samples off, and ``dbt_packages/elementary/dbt_project.yml``
   records that release where the resolver reads it. That file is a record, not
   the package: the demo installs nothing (#1477).
+- **A semantic layer that reads the failing column** (#1478), in
+  ``models/semantic/``: the time spine dbt requires beside any semantic model,
+  an ``orders`` semantic model with three metrics, and an ``order_items``
+  semantic model whose primary entity is ``order_item_id``. So ``dex maintain
+  diagnose`` names that entity beside the cause. ``order_items`` holds no
+  measure: the shop's ``order_items`` has no time column, and MetricFlow gives
+  every measure one.
 - **What the latest build left behind**, seeded rather than run:
   ``target/manifest.json`` (which tests exist, what each reads, where the
-  package builds its tables) and ``target/run_results.json`` (one ``dbt build``
-  invocation, the newest of the runs :mod:`.elementary` seeds). In that build
+  package builds its tables), ``target/run_results.json`` (one ``dbt build``
+  invocation, the newest of the runs :mod:`.elementary` seeds) and
+  ``target/semantic_manifest.json`` (the semantic layer as MetricFlow reads it,
+  which ``explore semantic list --local`` needs). In that build
   ``unique_stg_order_items_order_item_id`` fails, for the reason the warehouse
   already plants: a batch of ``order_items`` was loaded twice. Every other test
   passes. So ``dex maintain incidents`` reads one open incident, with no build
