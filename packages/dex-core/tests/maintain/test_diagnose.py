@@ -1037,6 +1037,38 @@ def test_a_semantic_file_with_quoted_keys_that_does_not_parse_is_unreadable(
     assert readers["unread_files"] == ["models/semantic.yml"]
 
 
+def test_a_semantic_file_with_indented_keys_that_does_not_parse_is_unreadable(
+    tmp_path: Path,
+):
+    # YAML lets a document's top-level mapping be indented, so an indented key
+    # still marks a semantic file: broken, it is unread, never no layer.
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    models = root / "models"
+    models.mkdir()
+    (models / "semantic.yml").write_text(
+        "  semantic_models:\n    - name: order_items\n      model: [unclosed\n"
+    )
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "unreadable"
+    assert readers["unread_files"] == ["models/semantic.yml"]
+
+
+def test_an_indented_broken_file_beside_a_read_layer_is_named_as_unread(
+    tmp_path: Path,
+):
+    root, warehouse, _ = _project(tmp_path, duplicated=True)
+    _semantic_layer(root)
+    (root / "models" / "more.yml").write_text(
+        "  metrics:\n    - name: broken\n      type: [unclosed\n"
+    )
+    readers = _readers(_diagnose(root, warehouse))
+
+    assert readers["status"] == "read"
+    assert readers["unread_files"] == ["models/more.yml"]
+    assert [r["name"] for r in readers["readers"]] == ["order_item_count"]
+
+
 def test_a_test_on_a_versioned_model_lists_its_readers_as_version_unresolved(
     tmp_path: Path,
 ):

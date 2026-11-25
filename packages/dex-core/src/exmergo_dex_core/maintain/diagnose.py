@@ -401,9 +401,15 @@ def _specs(manifest: Mapping[str, Any], incident: Incident) -> list[_Spec]:
 
 # --- who reads it -----------------------------------------------------------------
 
-#: A top-level key that makes a YAML file part of dbt's semantic layer, bare or
-#: quoted (``'semantic_models':``).
-_SEMANTIC_KEY = re.compile(r"""^(["']?)(semantic_models|metrics)\1\s*:""", re.MULTILINE)
+#: A key that makes a YAML file part of dbt's semantic layer, bare or quoted
+#: (``'semantic_models':``), and indented or not, since YAML lets a document's
+#: top-level mapping be indented. Only a file that fails to parse is checked,
+#: and a broken file cannot say which of its keys is top-level, so an indented
+#: key counts wherever it sits: such a file reads as an unread semantic file,
+#: never as no semantic layer.
+_SEMANTIC_KEY = re.compile(
+    r"""^[ \t]*(["']?)(semantic_models|metrics)\1\s*:""", re.MULTILINE
+)
 
 
 def _tested_columns(
