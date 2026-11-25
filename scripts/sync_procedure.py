@@ -64,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{relpath}: stale")
             failed = True
             continue
-        path.write_text(refreshed(document), encoding="utf-8")
+        # newline="\n": on Windows the default would rewrite every line as CRLF (#1599).
+        path.write_text(refreshed(document), encoding="utf-8", newline="\n")
         print(f"{relpath}: refreshed")
     return 1 if failed else 0
 
