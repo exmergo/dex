@@ -291,19 +291,20 @@ def test_a_missing_parent_directory_is_a_clean_refusal(run_from, capsys):
         f"'{run_from.spell('nope')}' is not an existing directory"
         in (payload["errors"][0])
     )
-    assert "creates no directories" in payload["errors"][0]
+    assert "never creates the directory its file goes in" in payload["errors"][0]
     assert not (run_from.root / "nope").exists()
 
 
 def test_a_repo_root_that_does_not_exist_is_a_clean_refusal(tmp_path: Path, capsys):
-    """The demo never creates directories, and the root is one."""
+    """The demo never creates the directory it writes into, and the root is
+    one."""
 
     missing = tmp_path / "missing"
     payload = _run(["--repo-root", str(missing), "demo"], capsys)
 
     assert payload["status"] == "error"
     assert payload["reason"] == "request"
-    assert "creates no directories" in payload["errors"][0]
+    assert "never creates the directory its file goes in" in payload["errors"][0]
     assert not missing.exists()
     assert _files_under(tmp_path) == []
 
