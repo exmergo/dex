@@ -30,6 +30,7 @@ _PII_PROBE = 'dex explore query "select email from customers"'
 # hand-authored files, then what its seeded build left under target/.
 PROJECT_SOURCES = [
     "demo_project/dbt/dbt_project.yml",
+    "demo_project/dbt/packages.yml",
     "demo_project/dbt/profiles.yml",
     "demo_project/dbt/models/staging/_sources.yml",
     "demo_project/dbt/models/staging/_staging.yml",
@@ -38,6 +39,7 @@ PROJECT_SOURCES = [
 ]
 PROJECT_FILES = [
     *PROJECT_SOURCES,
+    "demo_project/dbt/dbt_packages/elementary/dbt_project.yml",
     "demo_project/dbt/target/manifest.json",
     "demo_project/dbt/target/run_results.json",
 ]
@@ -64,6 +66,18 @@ def _files_under(root: Path) -> list[str]:
     )
 
 
+def test_the_demo_says_to_install_the_package_before_the_build(run_from, capsys):
+    """The demo's dbt_packages/elementary/ holds only the recorded release, so
+    a build reads the package as installed and skips `dbt deps`: the note that
+    names the build names `dex transform deps` before it."""
+
+    payload = _run(run_from.argv("demo"), capsys)
+
+    [note] = [n for n in payload["data"]["notes"] if "transform build" in n]
+    assert "dex transform deps" in note
+    assert note.index("dex transform deps") < note.index("dex transform build")
+
+
 def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     payload = _run(run_from.argv("demo"), capsys)
 
@@ -72,8 +86,15 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     # Relative to the run directory in both modes, the way every writer reports
     # the files it wrote under its root.
     assert data["path"] == DEMO_FILENAME
-    assert data["object_count"] == 7
-    assert data["row_count"] == 29512
+    # The shop's 7 tables and 29,512 rows, and Elementary's 4 tables holding
+    # 6 runs and 24 test results (#1477).
+    assert data["object_count"] == 11
+    assert data["row_count"] == 29512 + 30
+    # Each table names its schema, the shop's included: `main`, DuckDB's
+    # default, where the table itself names none.
+    assert [t["schema"] for t in data["tables"]] == ["main"] * 7 + [
+        "main_elementary"
+    ] * 4
     assert data["created"] == [DEMO_FILENAME, ".dex/config.yml", *PROJECT_FILES]
     assert (run_from.root / DEMO_FILENAME).is_file()
 
@@ -323,6 +344,11 @@ def test_an_existing_config_above_the_target_is_left_alone(run_from, capsys):
 
     assert payload["status"] == "ok"
     assert payload["data"]["created"] == ["scratch/shop.duckdb"]
+    # Nor Elementary's tables: with no project there is no history for them
+    # to hold, so the warehouse is the shop's 7 tables alone.
+    assert payload["data"]["object_count"] == 7
+    assert payload["data"]["row_count"] == 29512
+    assert {t["schema"] for t in payload["data"]["tables"]} == {"main"}
     assert (root / "scratch" / "shop.duckdb").is_file()
     assert not (root / "scratch" / ".dex").exists()
     assert "production.duckdb" in committed.read_text(encoding="utf-8")
@@ -353,7 +379,14 @@ def test_the_generated_warehouse_drives_the_whole_explore_tour(run_from, capsys)
     map_argv, profile_argv, relationships_argv, query_argv, *_incident = printed
 
     mapped = _run(map_argv, capsys)["data"]
-    assert mapped["object_count"] == 7
+    # The shop's 7 objects, 6 PII columns and 5 joins. Elementary's 4 tables
+    # (#1477) are inventoried and left out of the ranking, as the package's own.
+    assert mapped["object_count"] == 11
+    assert len(mapped["objects"]) == 7
+    assert mapped["excluded"]["count"] == 4
+    assert mapped["excluded"]["by_namespace"] == [
+        {"namespace": "dex_demo.main_elementary", "count": 4}
+    ]
     assert mapped["pii_column_count"] == 6
     assert mapped["relationship_count"] == 5
     # The cache the tour depends on is written under the root, beside the

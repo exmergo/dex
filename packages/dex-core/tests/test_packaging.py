@@ -468,25 +468,32 @@ def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Pa
 
     created, mapped = (json.loads(line) for line in done.stdout.splitlines())
     assert created["status"] == "ok"
-    # The warehouse, its config, and the small dbt project whose seeded build
-    # holds the incident (#1477), under demo_project/ so `analytics/` stays
+    # The warehouse, its config, and the small dbt project whose seeded builds
+    # hold the incident (#1477), under demo_project/ so `analytics/` stays
     # free for the user's own `dex transform init analytics`.
     assert created["data"]["created"] == [
         "dex_demo.duckdb",
         ".dex/config.yml",
         "demo_project/dbt/dbt_project.yml",
+        "demo_project/dbt/packages.yml",
         "demo_project/dbt/profiles.yml",
         "demo_project/dbt/models/staging/_sources.yml",
         "demo_project/dbt/models/staging/_staging.yml",
         "demo_project/dbt/models/staging/stg_orders.sql",
         "demo_project/dbt/models/staging/stg_order_items.sql",
+        "demo_project/dbt/dbt_packages/elementary/dbt_project.yml",
         "demo_project/dbt/target/manifest.json",
         "demo_project/dbt/target/run_results.json",
     ]
-    assert created["data"]["row_count"] == 29512
+    # The shop's 29,512 rows, and the 30 the seeded history puts in
+    # Elementary's 4 tables.
+    assert created["data"]["row_count"] == 29512 + 30
     # The second command found the config the first one wrote, with no flags.
+    # It counts Elementary's 4 tables and ranks none of them, so the shop's
+    # 7 are the tour and their personal data is all it flags.
     assert mapped["status"] == "ok"
-    assert mapped["data"]["object_count"] == 7
+    assert mapped["data"]["object_count"] == 11
+    assert mapped["data"]["excluded"]["count"] == 4
     assert mapped["data"]["pii_column_count"] == 6
 
 
