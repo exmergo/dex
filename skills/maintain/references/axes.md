@@ -746,9 +746,13 @@ that read the failing test's columns, read from dbt's semantic layer the way
 - `unresolved`: a member on the tested model whose expression is computed
   (`computed_expression`), and a semantic model whose `model` names nothing Dex
   can read (`model_unresolved`). Dex cannot say which column it reads, or
-  whether it reads one; nothing here guesses.
-- `status`: `read` (the list stands; empty means no semantic model on the
-  tested model reads the column), `absent` (no semantic layer), `unreadable`
+  whether it reads one; nothing here guesses. A test on a versioned model
+  lists the members that read its column here too (`version_unresolved`,
+  with the `column`), since the fingerprint does not record which version a
+  semantic model's `ref()` resolves to.
+- `status`: `read` (the lists stand; an empty `readers` means no resolved
+  member on the tested model reads the column, and an `unresolved` one
+  still may), `absent` (no semantic layer), `unreadable`
   (`unparsed_files`, each named in `unread_files`; `project_unreadable`;
   `no_project`), or
   `not_read` with `reason` `no_tested_column` or `vendor_not_covered` (a native

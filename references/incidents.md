@@ -456,8 +456,13 @@ and takes each open incident to a cause, or to none.
   member on the tested model whose expression is computed, and a semantic model
   whose `model` names nothing readable, are listed as `unresolved`, never
   guessed: Dex cannot say which column such a member reads, or whether it
-  reads one (`count` over `1` reads none). Three readings are kept apart: `read` with an empty list (the layer
-  was read and no semantic model on the tested model reads the column),
+  reads one (`count` over `1` reads none). A test on a versioned model lists
+  the members that read its column as `unresolved` too (`version_unresolved`,
+  with the `column`), never as readers, since the fingerprint keeps a
+  semantic model's `ref()` by name and not the version it resolves to.
+  Three readings are kept apart: `read` with an empty `readers` list (the
+  layer was read and no resolved member on the tested model reads the
+  column; an `unresolved` member still may),
   `absent` (the project declares no semantic layer) and `unreadable` (a layer
   is there and could not be read: `unparsed_files`, each named in
   `unread_files`, which beside a layer that was read means the list may be

@@ -401,8 +401,9 @@ def _specs(manifest: Mapping[str, Any], incident: Incident) -> list[_Spec]:
 
 # --- who reads it -----------------------------------------------------------------
 
-#: A top-level key that makes a YAML file part of dbt's semantic layer.
-_SEMANTIC_KEY = re.compile(r"^(semantic_models|metrics)\s*:", re.MULTILINE)
+#: A top-level key that makes a YAML file part of dbt's semantic layer, bare or
+#: quoted (``'semantic_models':``).
+_SEMANTIC_KEY = re.compile(r"""^(["']?)(semantic_models|metrics)\1\s*:""", re.MULTILINE)
 
 
 def _tested_columns(
@@ -435,7 +436,15 @@ def _tested_columns(
             columns = (spelled,) if spelled else None
         if not name or not columns:
             continue
-        tested.append(sr.TestedColumn(test=test, model=name, columns=columns))
+        version = model.get("version")
+        tested.append(
+            sr.TestedColumn(
+                test=test,
+                model=name,
+                columns=columns,
+                version=str(version) if version is not None else None,
+            )
+        )
     return tested
 
 

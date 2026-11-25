@@ -13,7 +13,8 @@ lookup, under three rules:
 
 - **Absent is not empty.** A project whose semantic layer declares nothing
   reads ``absent``. ``read`` with no readers means the layer was read and no
-  semantic model on the tested model reads the column.
+  resolved member on the tested model reads the column; an ``unresolved``
+  member still may.
 - **The tested model's own semantic models.** A semantic model is matched to
   the model the failing test is attached to, not to the models built from it:
   one on a mart that selects the column from the tested staging model is not
@@ -22,7 +23,9 @@ lookup, under three rules:
   expression is computed is listed as ``unresolved``, with the metrics built on
   it where it is a measure: nothing here can say which column it reads, or
   whether it reads one (``count`` over ``1`` reads none). A semantic model
-  whose ``model`` names no model Dex can read is listed the same way.
+  whose ``model`` names no model Dex can read is listed the same way, and so
+  is a member reading the column of a versioned model, whose version the
+  fingerprint cannot name (``version_unresolved``).
 - **Metrics are reached through measures.** A metric whose input is a measure
   that reads the column reads it, and so does every metric built on that
   metric. A metric whose filter or grouping names a dimension is not traced:
@@ -58,16 +61,26 @@ SCOPE = (
 MemberKind = Literal["entity", "dimension", "measure"]
 
 #: Why an object is listed as unresolved.
-UnresolvedReason = Literal["computed_expression", "model_unresolved"]
+UnresolvedReason = Literal[
+    "computed_expression", "model_unresolved", "version_unresolved"
+]
 
 
 class TestedColumn(Value):
     """One failing test's claim, as the diagnosis reads it: the test, the dbt
-    model it is attached to (by name), and the columns it checks."""
+    model it is attached to (by name), and the columns it checks.
+
+    ``version`` is the tested model's version where it is a versioned model.
+    The fingerprint records a semantic model's ``ref()`` by name alone, not
+    the version it resolves to, so a semantic model on a versioned model's name
+    cannot be told to read this version or another: its matching members are
+    listed as unresolved (``version_unresolved``), never as readers.
+    """
 
     test: str
     model: str
     columns: tuple[str, ...]
+    version: str | None = None
 
 
 class Reader(Value):
@@ -91,7 +104,9 @@ class Unresolved(Value):
 
     ``kind`` is ``semantic_model`` where the model it sits on could not be read,
     in which case ``model`` is ``None`` and nothing about its members is
-    claimed. ``metrics`` follows :class:`Reader`.
+    claimed. ``column`` is set for ``version_unresolved``: the tested column
+    the member reads, on a version the fingerprint cannot name. ``metrics``
+    follows :class:`Reader`.
     """
 
     semantic_model: str
@@ -99,6 +114,7 @@ class Unresolved(Value):
     kind: MemberKind | Literal["semantic_model"]
     name: str
     reason: UnresolvedReason
+    column: str | None = None
     metrics: tuple[str, ...] = ()
 
 
@@ -220,10 +236,12 @@ def readers(
         )
 
     wanted: dict[str, set[str]] = {}
+    versioned: set[str] = set()
     for item in tested:
-        wanted.setdefault(item.model.casefold(), set()).update(
-            c.casefold() for c in item.columns
-        )
+        key = item.model.casefold()
+        wanted.setdefault(key, set()).update(c.casefold() for c in item.columns)
+        if item.version is not None:
+            versioned.add(key)
     metrics = _metrics_on(layer)
 
     def metrics_of(kind: str, name: str) -> tuple[str, ...]:
@@ -260,6 +278,20 @@ def readers(
                             kind=kind,
                             name=name,
                             reason="computed_expression",
+                            metrics=metrics_of(kind, name),
+                        )
+                    )
+                elif column.casefold() in columns and (
+                    model.model_ref.casefold() in versioned
+                ):
+                    unresolved.append(
+                        Unresolved(
+                            semantic_model=model.name,
+                            model=model.model_ref,
+                            kind=kind,
+                            name=name,
+                            reason="version_unresolved",
+                            column=column,
                             metrics=metrics_of(kind, name),
                         )
                     )

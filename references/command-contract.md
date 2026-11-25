@@ -958,9 +958,11 @@ dex maintain diagnose [<models>] [--invocations N]
                                      (semantic model, model, kind entity, dimension or measure, name,
                                      column, and a measure's metrics, through every metric built on
                                      them) and unresolved (a member on the tested model whose
-                                     expression is computed, or a semantic model whose model names
-                                     nothing readable; never guessed). status is read (an empty list
-                                     means no semantic model on the tested model reads it), absent
+                                     expression is computed, a semantic model whose model names
+                                     nothing readable, or, on a versioned model, a member whose
+                                     version the fingerprint cannot name, version_unresolved;
+                                     never guessed). status is read (an empty readers list means no
+                                     resolved member on the tested model reads it), absent
                                      (no semantic layer), unreadable (unparsed_files, named in
                                      unread_files; project_unreadable; no_project) or
                                      not_read (no_tested_column, vendor_not_covered). The checks are

@@ -189,3 +189,31 @@ def test_a_semantic_model_on_a_model_built_from_the_tested_one_is_not_followed()
     assert got.readers == ()
     assert got.detail == sr.SCOPE
     assert "not followed" in sr.SCOPE
+
+
+def test_an_unversioned_tested_model_still_names_its_readers():
+    layer = _layer(_model("orders", "stg_orders", measures={"order_count": "id"}))
+    got = sr.readers(layer, TESTED)
+
+    assert [r.name for r in got.readers] == ["order_count"]
+    assert got.unresolved == ()
+
+
+def test_a_versioned_tested_model_never_names_a_reader():
+    tested = (
+        sr.TestedColumn(
+            test="test.shop.unique_x", model="stg_orders", columns=("id",), version="1"
+        ),
+    )
+    layer = _layer(
+        _model("orders", "stg_orders", measures={"order_count": "id", "n": "x"})
+    )
+    got = sr.readers(layer, tested)
+
+    assert got.readers == ()
+    [item] = got.unresolved
+    assert (item.name, item.reason, item.column) == (
+        "order_count",
+        "version_unresolved",
+        "id",
+    )
