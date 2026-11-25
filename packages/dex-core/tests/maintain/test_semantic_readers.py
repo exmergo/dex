@@ -217,3 +217,96 @@ def test_a_versioned_tested_model_never_names_a_reader():
         "version_unresolved",
         "id",
     )
+
+
+def _test_manifest(test: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "nodes": {
+            "model.shop.stg_orders": {"resource_type": "model", "name": "stg_orders"},
+            "test.shop.volume": {
+                "resource_type": "test",
+                "attached_node": "model.shop.stg_orders",
+                **test,
+            },
+        }
+    }
+
+
+def test_a_multi_column_uniqueness_test_reads_each_of_its_columns():
+    # A unique_combination_of_columns test carries no column_name: its columns
+    # are its claim, and each one is looked up.
+    from exmergo_dex_core.maintain.diagnose import _tested_columns
+
+    manifest = _test_manifest(
+        {
+            "test_metadata": {
+                "name": "unique_combination_of_columns",
+                "kwargs": {"combination_of_columns": ["order_id", "line_no"]},
+            }
+        }
+    )
+    tested = _tested_columns(manifest, _incident(None))
+    layer = _layer(
+        _model(
+            "orders",
+            "stg_orders",
+            entities={"order": "order_id"},
+            dimensions={"line": "line_no"},
+        )
+    )
+    got = sr.readers(layer, tested)
+
+    assert [t.columns for t in tested] == [("order_id", "line_no")]
+    assert [(r.kind, r.column) for r in got.readers] == [
+        ("dimension", "line_no"),
+        ("entity", "order_id"),
+    ]
+
+
+def test_the_tested_column_is_matched_without_case():
+    tested = (
+        sr.TestedColumn(test="test.shop.unique_x", model="stg_orders", columns=("ID",)),
+    )
+    layer = _layer(_model("orders", "stg_orders", measures={"order_count": "id"}))
+    [reader] = sr.readers(layer, tested).readers
+
+    assert (reader.name, reader.column) == ("order_count", "id")
+
+
+def test_a_dimension_named_like_a_measure_input_carries_no_metrics():
+    # Only a measure carries metrics, even where a dimension shares the name a
+    # metric lists among its input measures.
+    layer = _layer(
+        _model("orders", "stg_orders", dimensions={"order_count": "id"}),
+        metrics=(_metric("orders", measures=["order_count"]),),
+    )
+    [reader] = sr.readers(layer, TESTED).readers
+
+    assert (reader.kind, reader.metrics) == ("dimension", ())
+
+
+def test_a_quoted_attached_column_is_read_unquoted():
+    from exmergo_dex_core.maintain.diagnose import _tested_columns
+
+    manifest = _test_manifest(
+        {
+            "test_metadata": {"name": "not_null", "kwargs": {}},
+            "column_name": '"Order_ID"',
+        }
+    )
+    [tested] = _tested_columns(manifest, _incident(None))
+
+    assert tested.columns == ("Order_ID",)
+
+
+def test_readers_are_sorted_whatever_the_order_they_are_declared_in():
+    layer = _layer(
+        _model(
+            "orders",
+            "stg_orders",
+            measures={"z_count": "id", "a_count": "id", "m_count": "id"},
+        )
+    )
+    got = sr.readers(layer, TESTED)
+
+    assert [r.name for r in got.readers] == ["a_count", "m_count", "z_count"]
