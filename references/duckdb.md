@@ -79,7 +79,8 @@ loader's duplicate delivery as its cause, over the break from the last passing
 build to the first failing one.
 
 **The builds are dated back from when the demo ran**, unlike every other date
-here. The incident fold ends an open incident as stale once its source has not
+here but the project's source files, dated a day before the oldest build. The
+incident fold ends an open incident as stale once its source has not
 observed it for three of its usual gaps, judged against the time it is called,
 so builds dated from the fixed anchor would read as long over. Weekly builds keep
 the incident open for about three weeks after `dex demo`. The pinned digests are

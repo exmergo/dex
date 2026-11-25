@@ -672,9 +672,10 @@ def write_project(root: Path, project: DemoProject) -> list[str]:
             # "x": a file that appeared since the check is refused, not replaced.
             with path.open("x", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)
-        # The sources were written before the build that read them, so a
+        # The sources were written before the builds that read them, so a
         # reader comparing their times with the manifest's does not call the
-        # seeded artifacts stale. Fixed, like every other date here.
+        # seeded artifacts stale. Dated from the oldest seeded run, so this
+        # time moves with generation time as the runs do.
         written_at = project.sources_written_at.timestamp()
         for relative, _ in project.sources:
             os.utime(base / relative, (written_at, written_at))

@@ -592,6 +592,34 @@ def test_the_sources_read_as_written_before_the_build_that_read_them(
     assert freshness["stale"] is False
 
 
+def test_the_sources_are_dated_before_the_oldest_run(tmp_path: Path):
+    """Before every seeded build, not only the newest, so no build in the
+    history reads a source written after it ran."""
+
+    project = _project()
+    runs = _runs()
+    assert project.sources_written_at < min(run.started_at for run in runs)
+    write_project(tmp_path, project)
+    for relative, _ in project.sources:
+        mtime = (tmp_path / PROJECT_DIR / relative).stat().st_mtime
+        assert mtime == project.sources_written_at.timestamp(), relative
+        assert mtime < runs[0].started_at.timestamp(), relative
+
+
+def test_a_sub_second_generation_time_dates_the_runs_to_the_second():
+    """The runs are dated to the whole second, so a demo generated at any
+    moment within one second seeds the same history, and every time the
+    artifacts and tables print carries no fraction of the clock."""
+
+    later = REFERENCE + timedelta(microseconds=654321)
+    assert _runs(later) == _runs()
+    assert all(
+        run.started_at.microsecond == 0 and run.completed_at.microsecond == 0
+        for run in _runs(later)
+    )
+    assert project_digest(_project(later)) == GOLDEN_PROJECT_DIGEST
+
+
 def test_write_project_refuses_a_directory_that_appeared(tmp_path: Path):
     (tmp_path / DEMO_DIR).mkdir()
     from exmergo_dex_core.demo import DemoTargetExistsError

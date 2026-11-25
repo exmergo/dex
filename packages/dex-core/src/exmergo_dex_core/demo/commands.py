@@ -101,9 +101,8 @@ def _next_steps(flags: str, rooted: str | None = None) -> list[dict[str, str]]:
                     "with first_observed naming the first failing build. The "
                     "week between, Elementary's hooks were off, so the coverage "
                     "timeline reads it as a missed run rather than a pass. "
-                    "dbt's run results hold the newest build too; their own note "
-                    "that one build gives no known start is about that source "
-                    "alone"
+                    "dbt's run results hold the newest build too, the same run "
+                    "as Elementary's newest"
                 ),
             },
             {
@@ -245,7 +244,8 @@ def cmd_demo(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         refuse_collision(root)
     # The one clock the demo reads (#1477): the seeded runs, and the build the
     # project's artifacts record, are dated back from it, so the incident they
-    # hold is still open when the tour reaches it. Every other date is anchored.
+    # hold is still open when the tour reaches it, and the project's source
+    # files are dated from the oldest of them. Every other date is anchored.
     runs = seeded_runs(datetime.now(UTC)) if existing_root is None else ()
     extra = history_tables(build_tables(), target.name, runs) if runs else ()
     warehouse = generate_demo_warehouse(target, extra=extra)

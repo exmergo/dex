@@ -4,8 +4,9 @@ Everything else dex does against a warehouse is a read. This module is the singl
 exception, and it is deliberately its own path so that exception stays visible:
 it imports ``duckdb`` directly and never :mod:`..adapters.duckdb`, so the
 read-only open in the adapter has no branch that could ever be relaxed, and it
-never touches the SQL guard, because the statements here are ``CREATE TABLE`` and
-a ``COPY`` off a file this module just wrote, rather than anything an agent
+never touches the SQL guard, because the statements here are ``CREATE SCHEMA``,
+``CREATE TABLE``, a ``COPY`` off a file this module just wrote and a
+parameterised ``INSERT`` of rows it generated, rather than anything an agent
 authored. A safety-spine test asserts both of those mechanically rather than
 trusting this paragraph.
 

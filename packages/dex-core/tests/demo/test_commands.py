@@ -90,6 +90,11 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     # 6 runs and 24 test results (#1477).
     assert data["object_count"] == 11
     assert data["row_count"] == 29512 + 30
+    # Each table names its schema, the shop's included: `main`, DuckDB's
+    # default, where the table itself names none.
+    assert [t["schema"] for t in data["tables"]] == ["main"] * 7 + [
+        "main_elementary"
+    ] * 4
     assert data["created"] == [DEMO_FILENAME, ".dex/config.yml", *PROJECT_FILES]
     assert (run_from.root / DEMO_FILENAME).is_file()
 
@@ -339,6 +344,11 @@ def test_an_existing_config_above_the_target_is_left_alone(run_from, capsys):
 
     assert payload["status"] == "ok"
     assert payload["data"]["created"] == ["scratch/shop.duckdb"]
+    # Nor Elementary's tables: with no project there is no history for them
+    # to hold, so the warehouse is the shop's 7 tables alone.
+    assert payload["data"]["object_count"] == 7
+    assert payload["data"]["row_count"] == 29512
+    assert {t["schema"] for t in payload["data"]["tables"]} == {"main"}
     assert (root / "scratch" / "shop.duckdb").is_file()
     assert not (root / "scratch" / ".dex").exists()
     assert "production.duckdb" in committed.read_text(encoding="utf-8")
