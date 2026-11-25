@@ -929,7 +929,12 @@ def test_diagnosis_names_the_semantic_model_keyed_on_the_failing_column(
     readers = diagnosis["semantic_readers"]
     assert readers["status"] == "read"
     assert readers["tested"] == [
-        {"test": FAILING_TEST, "model": "stg_order_items", "columns": ["order_item_id"]}
+        {
+            "test": FAILING_TEST,
+            "model": "stg_order_items",
+            "columns": ["order_item_id"],
+            "version": None,
+        }
     ]
     assert readers["readers"] == [
         {
