@@ -36,6 +36,23 @@ A fact a dbt model and a native layer both declare on the same relation is
 listed once per source and counted once in the summary, with what checks it
 taken from both.
 
+A test Dex rendered for a composite grain, a fraction, a population filter
+or a parent population carries the claim id of the fact it checks (#1448),
+and is matched to that fact by the claim; a test with no claim (hand-written,
+or rendered before #1448) is matched by kind, column and parameters: the same
+columns, the same filter values, the same parent and key, both directions of
+a parent population. A composite-grain, unit, population-filter or
+parent-population fact with tests carries ``matched_by``: ``claim`` or
+``kind_and_column``; other facts list their tests without it, a
+single-column grain checked by ``unique``, or a ``references`` fact credited
+by ``dex_join_coverage`` or ``dex_referenced_key``. A test carrying any
+other claim earns no credit for the fact, not even where its kind and column
+match: a stale claim names a fact the declaration no longer states, a
+different filter or a different parent, so it checks something else (#1550).
+``dex_join_coverage`` is the exception: its claim names the join the model's
+SQL writes, which this section cannot read, so it is matched by its key pairs
+and the parent its `parent` argument names, never by claim.
+
 Never a value: a population filter's ``includes``/``excludes`` and a rule's
 prose stay out of the payload in every mode, so the section is the same in
 values-free mode.
@@ -43,23 +60,28 @@ values-free mode.
 How each fact kind is judged (dbt test; maintain verify codes):
 
 - grain, one column: ``unique`` on it; ``grain_broken``.
-- grain, composite: ``unique_combination_of_columns`` over the same set;
-  ``grain_broken``.
+- grain, composite: ``unique_combination_of_columns`` over the same set, or
+  ``dex_unique_combination`` over the same set; ``grain_broken``.
 - key role: ``unique`` on it; ``grain_broken`` only where it is the
   single-column grain.
 - foreign_key role with no ``references``: ``relationships`` on it; nothing
   in verify.
-- references: ``relationships`` on it to the named model; ``join_no_match``
-  and ``join_orphans`` only where the model reads the referenced model, since
-  verify judges a reference through a join its SQL writes.
+- references: ``relationships`` on it to the named model, ``dex_join_coverage``
+  over the join's key pairs, or ``dex_referenced_key`` on the named parent
+  column; ``join_no_match`` and ``join_orphans`` only where the model reads
+  the referenced model, since verify judges a reference through a join its
+  SQL writes.
 - null_rule ``never``: ``not_null`` on it; nothing in verify (dbt's test is
   the check). Any other null_rule allows NULLs and is ``prose``.
-- population.filters: no dbt test is read as one; ``population_contradicted``.
-- population.parent: none; ``parent_population_missing`` and
+- population.filters: ``dex_population_filter`` per list with the declared
+  values; ``population_contradicted``.
+- population.parent: ``dex_parent_population`` in both directions with the
+  declared parent, key and filters; ``parent_population_missing`` and
   ``parent_population_unexpected``.
 - population.rule with no filter or parent: ``prose``.
-- unit ``fraction`` or ``percent``: ``unit_out_of_range``; any other unit:
-  nothing.
+- unit ``fraction`` or ``percent``: ``unit_out_of_range``; ``dex_unit_range``
+  on it where the unit is ``fraction`` (the test checks 0 to 1; a percent is
+  0 to 100, so it never checks a percent). Any other unit: nothing.
 - additivity ``additive``: ``additivity_contradicted``; any other: nothing
   (``transform plan`` flags a SUM over a semi- or non-additive column, verify
   does not).
@@ -77,6 +99,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import dbt_tests
 from ..guards.pii_meta import entry_meta
+from ..transform.claims import claim_id, claim_in
 
 if TYPE_CHECKING:
     from ..project_definitions import ModelDeclaration
@@ -138,10 +161,10 @@ class _Tests:
     """The enabled generic tests on each model, read once."""
 
     def __init__(self, manifest: dict[str, Any], labels: dict[str, str]) -> None:
-        # (model uid) -> list of (test name, column lowered, kwargs, reads)
-        self.by_model: dict[str, list[tuple[str, str | None, dict, list[str]]]] = (
-            defaultdict(list)
-        )
+        # (model uid) -> list of (test name, column lowered, kwargs, reads, claim)
+        self.by_model: dict[
+            str, list[tuple[str, str | None, dict, list[str], str | None]]
+        ] = defaultdict(list)
         for test in (manifest.get("nodes") or {}).values():
             if not isinstance(test, dict) or test.get("resource_type") != "test":
                 continue
@@ -156,8 +179,9 @@ class _Tests:
             column = test.get("column_name") or kwargs.get("column_name")
             column_key = _bare(str(column)) if column else None
             reads = dbt_tests.test_reads(test)
+            claim = claim_in(test)
             for owner in dbt_tests.generic_test_targets(test):
-                self.by_model[owner].append((name, column_key, kwargs, reads))
+                self.by_model[owner].append((name, column_key, kwargs, reads, claim))
         self.labels = labels
         #: Each model's package, so a package-qualified `ref` resolves.
         self.parents: dict[str, dict] = {
@@ -170,11 +194,43 @@ class _Tests:
             uid: node.get("package_name") for uid, node in self.parents.items()
         }
 
+    @staticmethod
+    def _match(
+        entries: list[tuple[str, str | None, dict, list[str], str | None]],
+        claims: list[str],
+    ) -> tuple[list[str], str | None]:
+        """The tests among ``entries`` that check a fact, and how they match.
+
+        ``entries`` are the tests of one kind already matched by column and
+        parameters. A test carrying the fact's current claim checks it by
+        ``claim``; one carrying no claim checks it by ``kind_and_column``; one
+        carrying any other claim is stale and earns no credit for the fact
+        (#1550), not even where its kind and column match.
+        """
+
+        by_claim = list(
+            dict.fromkeys(
+                name
+                for name, _col, _kwargs, _reads, claim in entries
+                if claim is not None and claim in claims
+            )
+        )
+        if by_claim:
+            return by_claim, "claim"
+        by_kind = list(
+            dict.fromkeys(
+                name for name, _col, _kwargs, _reads, claim in entries if claim is None
+            )
+        )
+        if by_kind:
+            return by_kind, "kind_and_column"
+        return [], None
+
     def on_column(self, model: str, column: str, test: str) -> bool:
         key = _bare(column)
         return any(
             _base(name) == test and col == key
-            for name, col, _kwargs, _reads in self.by_model.get(model, [])
+            for name, col, _kwargs, _reads, _claim in self.by_model.get(model, [])
         )
 
     def freshness(self, model: str, column: str, declared: dict) -> bool:
@@ -189,7 +245,7 @@ class _Tests:
         except ValueError:
             return False
         key = _bare(column)
-        for name, col, kwargs, _reads in self.by_model.get(model, []):
+        for name, col, kwargs, _reads, _claim in self.by_model.get(model, []):
             if _base(name) != "dex_freshness" or col != key:
                 continue
             limit = kwargs.get("max_lag_seconds")
@@ -210,7 +266,7 @@ class _Tests:
         # The keys partition the search, so their order does not matter.
         by = sorted(_bare(str(k)) for k in (raw if isinstance(raw, list) else [raw]))
         key = _bare(column)
-        for name, col, kwargs, _reads in self.by_model.get(model, []):
+        for name, col, kwargs, _reads, _claim in self.by_model.get(model, []):
             if _base(name) != "dex_continuity" or col != key:
                 continue
             listed = kwargs.get("by") or []
@@ -222,21 +278,188 @@ class _Tests:
                 return True
         return False
 
-    def combination(self, model: str, columns: list[str]) -> str | None:
-        wanted = {_bare(c) for c in columns}
-        for name, _col, kwargs, _reads in self.by_model.get(model, []):
-            if _base(name) != "unique_combination_of_columns":
-                continue
-            combo = kwargs.get("combination_of_columns")
-            if isinstance(combo, list) and {_bare(str(c)) for c in combo} == wanted:
-                return name
-        return None
+    def unique_combination(
+        self, model: str, columns: list[str], claims: list[str]
+    ) -> tuple[list[str], str | None]:
+        """Whether a combination test checks a composite grain (#1550): dbt's
+        ``unique_combination_of_columns`` or Dex's ``dex_unique_combination``
+        over the same set of columns, by claim where it carries the grain's,
+        by kind and column where it carries none."""
 
-    def _resolve(self, name: str, *, near: str) -> str | None:
+        wanted = {_bare(c) for c in columns}
+        entries = []
+        for entry in self.by_model.get(model, []):
+            name, _col, kwargs, _reads, _claim = entry
+            if _base(name) not in {
+                "unique_combination_of_columns",
+                "dex_unique_combination",
+            }:
+                continue
+            combo = kwargs.get("combination_of_columns") or kwargs.get("columns")
+            if isinstance(combo, list) and {_bare(str(c)) for c in combo} == wanted:
+                entries.append(entry)
+        return self._match(entries, claims)
+
+    def unit_range(
+        self, model: str, column: str, claims: list[str]
+    ) -> tuple[list[str], str | None]:
+        """Whether a ``dex_unit_range`` on ``column`` checks the fact (#1550):
+        the test checks 0 to 1, so the caller only asks it of a fraction."""
+
+        key = _bare(column)
+        entries = [
+            entry
+            for entry in self.by_model.get(model, [])
+            if _base(entry[0]) == "dex_unit_range" and entry[1] == key
+        ]
+        return self._match(entries, claims)
+
+    def population_filter(
+        self,
+        model: str,
+        column: str,
+        mode: str,
+        values: list,
+        claims: list[str],
+    ) -> tuple[list[str], str | None]:
+        """Whether a ``dex_population_filter`` checks one list of a declared
+        population filter (#1550): on the filter's column, with the declared
+        values in that mode. A test carrying an ``excludes`` list checks the
+        excludes list alone, so it never checks an ``includes`` list."""
+
+        key = _bare(column)
+        other = "excludes" if mode == "includes" else "includes"
+        entries = []
+        for entry in self.by_model.get(model, []):
+            name, col, kwargs, _reads, _claim = entry
+            if _base(name) != "dex_population_filter" or col != key:
+                continue
+            # Typed and order-insensitive, the same form the fact's
+            # identity uses, so `True` and `1` stay two predicates and a
+            # reordered list still matches. The other-list guard applies
+            # only to `includes`: a test carrying an `excludes` list checks
+            # that list alone, whatever `includes` it carries.
+            if _filter(kwargs.get(mode), None)[0] == _filter(list(values), None)[
+                0
+            ] and (mode == "excludes" or not kwargs.get(other)):
+                entries.append(entry)
+        return self._match(entries, claims)
+
+    def parent_population(
+        self,
+        model: str,
+        direction: str,
+        parent: str,
+        key: list[tuple[str, str]],
+        filters: list[dict[str, Any]] | None,
+        claims: list[str],
+    ) -> tuple[list[str], str | None]:
+        """Whether a ``dex_parent_population`` checks one direction of a
+        declared parent population (#1550): the direction, the declared parent
+        its ``parent`` argument names, the declared key pairs, and, for
+        ``missing``, the declared filters. The ``unexpected`` direction reads
+        every parent key, so a filter it carries is not read."""
+
+        wanted_key = {(_bare(k), _bare(v)) for k, v in key}
+        wanted = self._resolve(parent, near=model)
+        entries = []
+        for entry in self.by_model.get(model, []):
+            name, _col, kwargs, _reads, _claim = entry
+            if _base(name) != "dex_parent_population":
+                continue
+            if kwargs.get("direction") != direction:
+                continue
+            listed = kwargs.get("key")
+            if not isinstance(listed, dict):
+                continue
+            if {
+                (_bare(str(k)), _bare(str(v))) for k, v in listed.items()
+            } != wanted_key:
+                continue
+            if wanted is None:
+                continue
+            # The parent the test's `parent` argument names, not merely
+            # one of the relations it reads: a test naming another parent
+            # while reading this one checks the other parent.
+            if self._resolve_test_parent(kwargs.get("parent"), near=model) != wanted:
+                continue
+            if direction == "missing" and not _same_filters(
+                kwargs.get("filters"), filters
+            ):
+                continue
+            entries.append(entry)
+        return self._match(entries, claims)
+
+    def join_coverage(
+        self, model: str, column: str, field: str | None, parent: str | None
+    ) -> bool:
+        """Whether a ``dex_join_coverage`` checks a declared ``references``
+        (#1550): the test reads the join's two inputs, and the declared
+        column and field are one of its key pairs, to the declared parent.
+        The parent it joins to is the test's ``parent`` argument, not merely
+        one of the relations it reads: a test whose driving input is the
+        declared parent and whose parent is another model with the same key
+        name checks another join. The filters the model applies before
+        joining are the model's SQL, which this section cannot read, so they
+        are not part of the match, and neither is the test's claim, which
+        names that same join."""
+
+        key = _bare(column)
+        wanted_field = _bare(field) if field else None
+        wanted = self._resolve(parent, near=model) if parent else None
+        if wanted is None:
+            return False
+        for name, _col, kwargs, _reads, _claim in self.by_model.get(model, []):
+            if _base(name) != "dex_join_coverage":
+                continue
+            children = kwargs.get("child_columns") or []
+            parents = kwargs.get("parent_columns") or []
+            if (
+                not isinstance(children, list)
+                or not isinstance(parents, list)
+                or len(children) != len(parents)
+            ):
+                continue
+            pairs = {
+                (_bare(str(c)), _bare(str(p)))
+                for c, p in zip(children, parents, strict=True)
+            }
+            if (key, wanted_field) not in pairs:
+                continue
+            if self._resolve_test_parent(kwargs.get("parent"), near=model) != wanted:
+                continue
+            return True
+        return False
+
+    def referenced_key(
+        self, parent_uid: str | None, field: str | None, claims: list[str]
+    ) -> tuple[list[str], str | None]:
+        """Whether a ``dex_referenced_key`` on the parent checks a declared
+        ``references`` (#1550): on the referenced field, by claim where it
+        carries the parent's, by kind and column where it carries none. The
+        test sits on the parent, the model the claim is about, not the child
+        whose declaration states the fact."""
+
+        if parent_uid is None or not field:
+            return [], None
+        key = _bare(field)
+        entries = [
+            entry
+            for entry in self.by_model.get(parent_uid, [])
+            if _base(entry[0]) == "dex_referenced_key" and entry[1] == key
+        ]
+        return self._match(entries, claims)
+
+    def _resolve(
+        self, name: str, *, near: str, package: str | None = None
+    ) -> str | None:
         """The manifest unique id a declared ``references`` parent names: a
         model, seed or snapshot, of ``near``'s own package first, then the only
         one of that name anywhere; an unversioned name of a versioned model is
-        its latest version, as dbt resolves an unversioned ``ref``."""
+        its latest version, as dbt resolves an unversioned ``ref``. Where
+        ``package`` names one, only a node of that package counts: a
+        package-qualified ``ref`` names that package's model, never a
+        same-named one of the project's own package."""
 
         key = name.lower()
         found = []
@@ -248,12 +471,52 @@ class _Tests:
                 version, latest = node.get("version"), node.get("latest_version")
                 if version is None or latest is None or str(version) == str(latest):
                     found.append(uid)
+        if package is not None:
+            in_package = [uid for uid in found if self.packages.get(uid) == package]
+            return in_package[0] if len(in_package) == 1 else None
         own = [
             uid for uid in found if self.packages.get(uid) == self.packages.get(near)
         ]
         if len(own) == 1:
             return own[0]
         return found[0] if len(found) == 1 else None
+
+    def _resolve_test_parent(self, parent: Any, *, near: str) -> str | None:
+        """The manifest unique id a join test's ``parent`` argument names.
+
+        The argument is the ``ref()``/``source()`` call the join reads the
+        parent through, written as text, or a relation written directly. A
+        ``ref()`` names its model by its last positional argument, and where
+        it names two, the first is the package the model must live in, so
+        ``ref('pkg', 'model')`` is that package's model, never a same-named
+        one of the project's own package; a ``v=`` keyword never changes
+        which one (a versioned ref makes the join unreadable, so it never
+        reaches a test). A ``source()`` names no model, so it resolves
+        to nothing: the declared parent is always a model."""
+
+        if not isinstance(parent, str) or not parent.strip():
+            return None
+        value = parent.strip()
+        if value.startswith("ref(") and value.endswith(")"):
+            args = [
+                part.strip()
+                for part in value[4:-1].split(",")
+                if part.strip() and "=" not in part
+            ]
+            names = [
+                part[1:-1]
+                for part in args
+                if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'`"
+            ]
+            if not names:
+                return None
+            if len(names) >= 2:
+                return self._resolve(names[-1], near=near, package=names[-2])
+            return self._resolve(names[-1], near=near)
+        if value.startswith("source("):
+            return None
+        # A bare name, or a relation written directly: its last part.
+        return self._resolve(value.rsplit(".", 1)[-1].strip("\"'`[]"), near=near)
 
     def relationship(
         self,
@@ -268,7 +531,7 @@ class _Tests:
         the declared ``field``."""
 
         key = _bare(column)
-        for name, col, kwargs, reads in self.by_model.get(model, []):
+        for name, col, kwargs, reads, _claim in self.by_model.get(model, []):
             if _base(name) != "relationships" or col != key:
                 continue
             tested_field = kwargs.get("field")
@@ -540,12 +803,47 @@ def _filter(includes: Any, excludes: Any) -> tuple:
     """A population filter's values, for identity only: never output."""
 
     def values(raw: Any) -> tuple[tuple[str, str], ...]:
-        # Typed, so `true` and "True" stay two predicates.
+        # Typed, so `true` and "True" stay two predicates. A falsy scalar
+        # states no fact, like an absent mode; a truthy non-list is
+        # malformed, so it never equals an absent mode: a test carrying
+        # one must not match a declaration that states no such mode.
         if not isinstance(raw, list):
-            return ()
+            return () if not raw else (("malformed", repr(raw)),)
         return tuple(sorted((type(v).__name__, repr(v)) for v in raw))
 
     return (values(includes), values(excludes))
+
+
+def _same_filters(left: Any, right: Any) -> bool:
+    """Whether two population filter rule lists state the same predicates.
+
+    Typed and order-insensitive, the same form ``_filter`` uses for a
+    fact's identity, so ``True`` and ``1`` stay two predicates and rules
+    in another order still match. A side that is not a list of rules, or
+    a rule that is not a mapping, matches nothing but an identical side.
+    """
+
+    if left is None or right is None:
+        return left is None and right is None
+    if not isinstance(left, list) or not isinstance(right, list):
+        return False
+
+    def rules(raw: list) -> list[tuple[str, tuple, tuple]] | None:
+        out: list[tuple[str, tuple, tuple]] = []
+        for rule in raw:
+            if not isinstance(rule, dict):
+                return None
+            out.append(
+                (
+                    _bare(str(rule.get("column") or "")),
+                    _filter(rule.get("includes"), rule.get("excludes"))[0],
+                    _filter(rule.get("includes"), rule.get("excludes"))[1],
+                )
+            )
+        return sorted(out, key=repr)
+
+    a, b = rules(left), rules(right)
+    return a is not None and b is not None and a == b
 
 
 def _parent_key(parent: Any) -> tuple:
@@ -842,11 +1140,18 @@ def _model_facts(
     relation = node.get("relation_name")
 
     def add(
-        kind: str, column: str | None, found: list[str], verify: list[str], **identity
+        kind: str,
+        column: str | None,
+        found: list[str],
+        verify: list[str],
+        matched_by: str | None = None,
+        **identity,
     ):
         facts.append(
             _record("dbt", label, kind, column, relation, found, verify, **identity)
         )
+        if matched_by is not None:
+            facts[-1]["matched_by"] = matched_by
 
     def prose(kind: str, column: str | None) -> None:
         facts.append(
@@ -860,18 +1165,25 @@ def _model_facts(
         else []
     )
     single_grain = _bare(grain_cols[0]) if len(grain_cols) == 1 else None
+
+    # The claim ids each rendered test of this declaration carries (#1448), by
+    # the model's label or, for a declaration on every version, its bare name.
+    names = list(dict.fromkeys([label, str(node.get("name") or label)]))
+
+    def ids(field: str, columns: list[str], params: dict[str, Any]) -> list[str]:
+        return [claim_id(name, field, columns, params) for name in names]
+
     if grain_cols:
         if len(grain_cols) == 1:
             found = ["unique"] if tests.on_column(uid, grain_cols[0], "unique") else []
             add("grain", grain_cols[0], found, ["grain_broken"])
         else:
-            combo = tests.combination(uid, grain_cols)
-            add(
-                "grain",
-                ", ".join(grain_cols),
-                [combo] if combo else [],
-                ["grain_broken"],
+            found, how = tests.unique_combination(
+                uid,
+                grain_cols,
+                ids("grain", grain_cols, {"check": "dex_unique_combination"}),
             )
+            add("grain", ", ".join(grain_cols), found, ["grain_broken"], how)
 
     # The model reads these, so a declared reference to one of them is a join
     # verify's join contract can measure.
@@ -901,8 +1213,34 @@ def _model_facts(
                 if tests.relationship(uid, name, parent, field or None)
                 else []
             )
-            joins = parent.lower() in reads or parent.split(".", 1)[0].lower() in reads
+            if tests.join_coverage(uid, name, field or None, parent):
+                found.append("dex_join_coverage")
             target_uid = tests._resolve(parent, near=uid)
+            if target_uid is not None and field:
+                # The referenced-key test sits on the parent, under the
+                # parent's claim for the field (#1457, #1550).
+                parent_node = nodes.get(target_uid) or {}
+                parent_names = list(
+                    dict.fromkeys(
+                        [
+                            _label(target_uid, parent_node),
+                            str(parent_node.get("name") or ""),
+                        ]
+                    )
+                )
+                ref_claims = [
+                    claim_id(
+                        parent_name,
+                        "referenced_key",
+                        [field],
+                        {"check": "dex_referenced_key"},
+                    )
+                    for parent_name in parent_names
+                    if parent_name
+                ]
+                ref_names, _how = tests.referenced_key(target_uid, field, ref_claims)
+                found.extend(ref_names)
+            joins = parent.lower() in reads or parent.split(".", 1)[0].lower() in reads
             target_node = nodes.get(target_uid) if target_uid else None
             add(
                 "references",
@@ -931,11 +1269,27 @@ def _model_facts(
         unit = dex.get("unit")
         if isinstance(unit, str) and unit.strip():
             checked = unit.strip().lower() in _CHECKED_UNITS
+            unit_found: list[str] = []
+            unit_how: str | None = None
+            if checked and unit.strip().lower() == "fraction":
+                # `dex_unit_range` checks 0 to 1: it checks a fraction, never
+                # a percent (0 to 100), whose check stays a question verify
+                # asks (#1455, #1550).
+                unit_found, unit_how = tests.unit_range(
+                    uid,
+                    name,
+                    ids(
+                        "unit",
+                        [name],
+                        {"check": "dex_unit_range", "unit": "fraction"},
+                    ),
+                )
             add(
                 "unit",
                 name,
-                [],
+                unit_found,
                 ["unit_out_of_range"] if checked else [],
+                unit_how,
                 what=_lower(unit),
             )
         additivity = dex.get("additivity")
@@ -985,11 +1339,51 @@ def _model_facts(
                 and entry.get("column") in filter_columns
                 and (entry.get("includes") or entry.get("excludes"))
             ):
+                # Every list the entry states needs its own test: one
+                # checking `includes` says nothing about `excludes` (#1550).
+                hows: list[str | None] = []
+                for mode in ("includes", "excludes"):
+                    values = entry.get(mode)
+                    if values is None:
+                        continue
+                    if not isinstance(values, list):
+                        # A malformed mode: no test can check it, and the
+                        # report must not raise on it (#1550).
+                        hows.append(None)
+                        continue
+                    if not values:
+                        continue
+                    _names, mode_how = tests.population_filter(
+                        uid,
+                        entry["column"],
+                        mode,
+                        list(values),
+                        ids(
+                            "population",
+                            [entry["column"]],
+                            {
+                                "check": "dex_population_filter",
+                                mode: list(values),
+                            },
+                        ),
+                    )
+                    hows.append(mode_how)
+                if hows and all(h is not None for h in hows):
+                    found = ["dex_population_filter"]
+                    how = (
+                        "claim"
+                        if all(h == "claim" for h in hows)
+                        else "kind_and_column"
+                    )
+                else:
+                    found = []
+                    how = None
                 add(
                     "population_filter",
                     entry["column"],
-                    [],
+                    found,
                     ["population_contradicted"],
+                    how,
                     what=_filter(entry.get("includes"), entry.get("excludes")),
                 )
         from ..project_definitions import read_population_parent
@@ -997,11 +1391,63 @@ def _model_facts(
         stated = read_population_parent(population.get("parent"))
         if stated is not None:
             record_column = ", ".join(stated.key)
+            # The filters the `missing` test carries, as the renderer builds
+            # them (#1454): every declared filter with a list, in order.
+            filter_rules: list[dict[str, Any]] = []
+            for f_entry in filters if isinstance(filters, list) else []:
+                if not (
+                    isinstance(f_entry, dict) and isinstance(f_entry.get("column"), str)
+                ):
+                    continue
+                filter_rule: dict[str, Any] = {"column": f_entry["column"]}
+                for mode in ("includes", "excludes"):
+                    values = f_entry.get(mode)
+                    # A malformed mode is dropped, never raised on, and a
+                    # rule left with no mode states no predicate (#1550).
+                    if isinstance(values, list) and values:
+                        filter_rule[mode] = list(values)
+                if len(filter_rule) > 1:
+                    filter_rules.append(filter_rule)
+            key_cols = list(stated.key)
+            # Both directions need their own test: one checking `missing`
+            # says nothing about `unexpected` (#1550).
+            hows = []
+            for direction in ("missing", "unexpected"):
+                params: dict[str, Any] = {
+                    "check": "dex_parent_population",
+                    "direction": direction,
+                    "parent": stated.model,
+                    # The parent columns, in key order, folded as the claim
+                    # folds a string.
+                    "parent_key": [str(v).lower() for v in stated.key.values()],
+                }
+                if direction == "missing" and filter_rules:
+                    params["filters"] = [dict(rule) for rule in filter_rules]
+                _names, dir_how = tests.parent_population(
+                    uid,
+                    direction,
+                    stated.model,
+                    list(stated.key.items()),
+                    # None where the declaration states no filter: the test
+                    # then carries no `filters` argument either.
+                    [dict(rule) for rule in filter_rules]
+                    if direction == "missing" and filter_rules
+                    else None,
+                    ids("population", key_cols, params),
+                )
+                hows.append(dir_how)
+            if all(h is not None for h in hows):
+                found = ["dex_parent_population"]
+                how = "claim" if all(h == "claim" for h in hows) else "kind_and_column"
+            else:
+                found = []
+                how = None
             add(
                 "population_parent",
                 record_column,
-                [],
+                found,
                 ["parent_population_missing", "parent_population_unexpected"],
+                how,
                 target=_target_of(
                     (nodes.get(tests._resolve(stated.model, near=uid) or "") or {}).get(
                         "relation_name"

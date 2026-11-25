@@ -639,6 +639,8 @@ def _coverage_fields() -> frozenset[str]:
         "[].verify[]",
         "[].also_declared_by",
         "[].also_declared_by[]",
+        # How a fact's tests matched it (#1550): `claim` or `kind_and_column`.
+        "[].matched_by",
     )
     return _COMMON | frozenset(paths)
 
@@ -1336,6 +1338,22 @@ class ValuesFreeContract:
                     "config": {"severity": "ERROR", "enabled": True},
                     "depends_on": {"nodes": [model]},
                 },
+                # A population-filter test on the declared filter, claimless,
+                # so the fact matches by kind and column: the envelope then
+                # carries the matched_by the allowlist names (#1550).
+                "test.shop.population_filter": {
+                    "resource_type": "test",
+                    "name": "dex_population_filter_orders_status",
+                    "package_name": "shop",
+                    "attached_node": model,
+                    "column_name": "status",
+                    "test_metadata": {
+                        "name": "dex_population_filter",
+                        "kwargs": {"includes": [value]},
+                    },
+                    "config": {"severity": "ERROR", "enabled": True},
+                    "depends_on": {"nodes": [model]},
+                },
                 "test.shop.assert_status": {
                     "resource_type": "test",
                     "name": "assert_status",
@@ -1436,6 +1454,12 @@ class ValuesFreeContract:
         envelope = to_envelope(result)
         self.assert_no_sentinel(envelope.model_dump(mode="json"))
         assert _unknown_paths("coverage", envelope.data) == []
+        # The population-filter test matches the declared filter by kind and
+        # column, so the envelope carries the matched_by the allowlist names.
+        assert any(
+            fact.get("matched_by") == "kind_and_column"
+            for fact in envelope.data["declarations"]["facts"]
+        )
 
     def test_every_field_is_known(self, engine) -> None:
         outputs = {
