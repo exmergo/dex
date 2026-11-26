@@ -1,4 +1,5 @@
-"""Vendor monitors written from a model's declaration (#1444, #1482, #1484).
+"""Vendor monitors written from a model's declaration (#1444, #1482, #1484,
+#1485, #1591).
 
 A declaration already says which column is a model's time. An observability
 vendor's monitors need the same fact, and a project that writes it twice, by
@@ -7,7 +8,7 @@ hand, in two places, lets the two drift. With ``monitors.vendor`` set in
 vendor's own tests into the same YAML entry, in the same plan and diff, parsed
 by dbt before the plan is stored.
 
-One vendor today, the Elementary dbt package, and three mapping rows:
+One vendor today, the Elementary dbt package, and four mapping rows:
 
 * a column declared with role ``time`` becomes the ``timestamp_column`` of
   ``elementary.volume_anomalies`` and ``elementary.freshness_anomalies``.
@@ -30,7 +31,21 @@ One vendor today, the Elementary dbt package, and three mapping rows:
   here: a column with no cached count is left out and named with the
   ``explore profile`` that would supply one (:class:`Domains`). A column Dex
   flags as personal data is never a dimension here, at any domain size: the
-  test groups by its values.
+  test groups by its values;
+* a column declared ``unit: fraction`` or ``unit: percent`` (#1485), and a
+  column declared ``role: measure`` with an ``additivity`` (#1591), becomes
+  the column of an ``elementary.column_anomalies`` with an explicit list of
+  monitors, on the model's time column. The unit gives ``min`` and ``max``,
+  which watch the column shift inside the hard bound ``dex_unit_range``
+  already checks on every run; the additivity gives ``sum``, ``average`` and
+  ``zero_count`` for an additive measure, ``min``, ``max`` and ``average``
+  for a semi-additive one, and ``average`` alone for a non-additive one, so
+  ``sum`` is never written where adding the column means nothing. A column
+  both rows reach gets one test whose list is the union, in the package's
+  own order (:data:`COLUMN_MONITOR_ORDER`), never two. With no list the
+  package would run its defaults, some of which mean nothing for some
+  columns, so the list is always written. A column Dex flags as personal
+  data gets none: the monitors store its values.
 
 What this module never does:
 
@@ -42,8 +57,9 @@ What this module never does:
 * choose a statistic. Sensitivity, ``days_back``, seasonality and every other
   training setting stay the package's defaults;
 * touch a monitor the project wrote by hand. A listed test of the same name
-  (and, for a freshness monitor, the same ``timestamp_column``) is reported
-  ``hand_written`` and left exactly as written;
+  (and, for a freshness monitor or a column monitor, the same
+  ``timestamp_column``) is reported ``hand_written`` and left exactly as
+  written;
 * remove a monitor. One it wrote that the declaration no longer gives is
   reported ``stale``, for a reviewer to remove.
 
@@ -64,7 +80,7 @@ from typing import Any
 import yaml
 
 from ..errors import RequestError
-from ..semantic_declarations import Declaration, PopulationFilter, Role
+from ..semantic_declarations import Additivity, Declaration, PopulationFilter, Role
 from .plans import PlanEdit
 
 #: The vendors this release writes monitors for (``monitors.vendor``).
@@ -82,6 +98,39 @@ MARKER = "monitor"
 VOLUME = "volume_anomalies"
 FRESHNESS = "freshness_anomalies"
 DIMENSION = "dimension_anomalies"
+COLUMN = "column_anomalies"
+
+#: The monitors a declared unit gives a column (#1485): its minimum and
+#: maximum, watched for a shift inside the bound ``dex_unit_range`` checks.
+UNIT_MONITORS: dict[str, tuple[str, ...]] = {
+    "fraction": ("min", "max"),
+    "percent": ("min", "max"),
+}
+
+#: The monitors a measure's declared additivity gives it (#1591). A
+#: per-bucket ``sum`` means something only where the measure adds up, so a
+#: semi-additive (a balance) or non-additive (a ratio) measure never gets one.
+ADDITIVITY_MONITORS: dict[Additivity, tuple[str, ...]] = {
+    Additivity.ADDITIVE: ("sum", "average", "zero_count"),
+    Additivity.SEMI_ADDITIVE: ("min", "max", "average"),
+    Additivity.NON_ADDITIVE: ("average",),
+}
+
+#: The package's own order of its numeric column monitors
+#: (``get_available_monitors``, ``column_numeric``, at its 0.26.1 tag): a
+#: column's list is written in it, so a union reads the same whichever row
+#: contributed first.
+COLUMN_MONITOR_ORDER = (
+    "min",
+    "max",
+    "zero_count",
+    "zero_percent",
+    "not_zero_percent",
+    "average",
+    "standard_deviation",
+    "variance",
+    "sum",
+)
 
 #: The most distinct values a dimension column may hold, by the exploration
 #: cache's count, to become a ``dimension_anomalies`` (#1484). The package
@@ -738,9 +787,18 @@ class Domains:
                 relation, [d.identifier for d in self.cache.datasets]
             )
             if len(matched) > 1:
+                # Which relation is the model's build is not settled, so a
+                # flag on any of them counts: a column monitor reads no count,
+                # only whether the column is personal data.
+                candidates = [
+                    _column(d, column)
+                    for d in self.cache.datasets
+                    if d.identifier in matched
+                ]
                 return DomainReading(
                     PROFILE_AMBIGUOUS,
-                    pii=_named_as_pii(column),
+                    pii=_named_as_pii(column)
+                    or any(c is not None and c.pii is not None for c in candidates),
                     detail=(
                         f"'{relation}' matches {len(matched)} relations in the "
                         f"cache ({', '.join(matched)}), so which one is the model's "
@@ -898,6 +956,12 @@ class Monitor:
 
     ``dimension`` is set on a ``dimension_anomalies`` (#1484): the one column
     it groups by. ``domain`` is what the cache said about that column.
+
+    ``column`` is set on a ``column_anomalies`` (#1485, #1591): the column the
+    test is listed under, which the package reads as its ``column_name``.
+    ``monitors`` is its list, in :data:`COLUMN_MONITOR_ORDER`, and ``sources``
+    each declaration field that contributed with the monitors it gave, in
+    declaration order: ``field`` is the first of them.
     """
 
     model: str
@@ -909,9 +973,14 @@ class Monitor:
     where_expression: str | None = None
     dimension: str | None = None
     domain: DomainReading | None = None
+    column: str | None = None
+    monitors: tuple[str, ...] = ()
+    sources: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def _arguments(self, with_where: bool) -> dict[str, Any]:
         out: dict[str, Any] = {}
+        if self.test == COLUMN:
+            out["column_anomalies"] = list(self.monitors)
         if self.dimension is not None:
             out["dimensions"] = [self.dimension]
         if self.timestamp_column is not None:
@@ -944,6 +1013,10 @@ class Monitor:
             marker["filter"] = FILTER_FIELD
         if self.test == DIMENSION:
             marker["max_distinct"] = DIMENSION_MAX_DISTINCT
+        if self.test == COLUMN:
+            # Which declaration field gave which monitor, so a union reads
+            # back as the rows it came from (#1485, #1591).
+            marker["sources"] = {source: list(given) for source, given in self.sources}
         meta["dex"] = {MARKER: marker}
         return {
             self.name: {
@@ -1012,6 +1085,91 @@ def _dimension_monitors(
     return out
 
 
+def column_sources(name: str, column: Any) -> list[tuple[str, tuple[str, ...]]]:
+    """The declaration fields of ``column`` (named ``name``) that give it
+    column monitors, each with the monitors it gives: ``unit: fraction`` or
+    ``unit: percent`` (#1485), and ``role: measure`` with an ``additivity``
+    (#1591). A measure with no additivity, an additivity on a column that is
+    not a measure, and any other unit give nothing: Dex does not guess."""
+
+    out: list[tuple[str, tuple[str, ...]]] = []
+    unit = column.unit.strip().lower() if isinstance(column.unit, str) else None
+    if unit in UNIT_MONITORS:
+        out.append((f"columns.{name}.unit: {unit}", UNIT_MONITORS[unit]))
+    if column.role is Role.MEASURE and column.additivity is not None:
+        additivity = Additivity(column.additivity)
+        out.append(
+            (
+                f"columns.{name}.additivity: {additivity.value}",
+                ADDITIVITY_MONITORS[additivity],
+            )
+        )
+    return out
+
+
+def union(sources: Iterable[tuple[str, tuple[str, ...]]]) -> tuple[str, ...]:
+    """Every monitor ``sources`` give, once each, in the package's order."""
+
+    given = {m for _, monitors in sources for m in monitors}
+    return tuple(m for m in COLUMN_MONITOR_ORDER if m in given)
+
+
+def _column_monitors(
+    declaration: Declaration,
+    times: list[str],
+    outputs: frozenset[str] | None,
+    domains: Domains | None,
+    where: str | None,
+    unwritable: str | None,
+    marked: frozenset[str],
+) -> list[Monitor]:
+    """One ``column_anomalies`` per column whose unit or additivity gives
+    monitors (#1485, #1591; :func:`column_sources`), each withheld where it
+    does not qualify. The checks run in this order, so the reason given is
+    the first that holds: the column is output, there is one time column and
+    the model outputs it, the column is not personal data, and the population
+    filter can be written."""
+
+    model = declaration.model
+    timestamp = times[0] if len(times) == 1 else None
+    out: list[Monitor] = []
+    for name, column in declaration.columns.items():
+        sources = column_sources(name, column)
+        if not sources:
+            continue
+        withheld: str | None = None
+        if outputs is not None and name.lower() not in outputs:
+            withheld = COLUMN_NOT_OUTPUT
+        elif not times:
+            withheld = NO_TIME_COLUMN
+        elif timestamp is None:
+            withheld = AMBIGUOUS_TIME_COLUMN
+        elif outputs is not None and timestamp.lower() not in outputs:
+            withheld = COLUMN_NOT_OUTPUT
+        elif name.lower() in marked or (
+            domains.read(model, name).pii
+            if domains is not None
+            else _named_as_pii(name)
+        ):
+            withheld = PII_FLAGGED
+        else:
+            withheld = unwritable
+        out.append(
+            Monitor(
+                model,
+                COLUMN,
+                timestamp,
+                sources[0][0],
+                withheld,
+                where_expression=where,
+                column=name,
+                monitors=union(sources),
+                sources=tuple(sources),
+            )
+        )
+    return out
+
+
 def planned(
     declaration: Declaration,
     outputs: frozenset[str] | None,
@@ -1032,6 +1190,10 @@ def planned(
     on it (#1484; :func:`_dimension_monitors`), read against ``domains``, the
     exploration cache, and ``marked``, the columns the YAML entry marks as
     personal data. Without ``domains`` no dimension monitor is planned.
+
+    Each column whose unit or additivity gives monitors gives one
+    ``column_anomalies`` on it (#1485, #1591; :func:`_column_monitors`), on the
+    same time column rule, listed under the column rather than the model.
 
     Each monitor written carries the ``where_expression`` the population
     filters give (:func:`where_expression`), on ``dialect``. Where they cannot
@@ -1057,6 +1219,8 @@ def planned(
         )
         if domains is not None
         else []
+    ) + _column_monitors(
+        declaration, times, outputs, domains, where, unwritable, marked
     )
     if not times:
         return [
@@ -1181,8 +1345,28 @@ def _dimension_set(test: Any) -> frozenset[str]:
     return frozenset(d.lower() for d in _dimensions_of(test) or [])
 
 
+def _monitors_of(test: Any) -> list[str] | None:
+    """A listed test's ``column_anomalies`` list, as written (a single string
+    reads as a one-monitor list), or ``None`` where it lists none and so runs
+    the package's defaults."""
+
+    value = _argument_raw(test, "column_anomalies")
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def _monitor_set(test: Any) -> frozenset[str]:
+    return frozenset(m.lower() for m in _monitors_of(test) or [])
+
+
 def _arguments_of(test: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    monitors = _monitors_of(test)
+    if monitors is not None:
+        out["column_anomalies"] = monitors
     dimensions = _dimensions_of(test)
     if dimensions is not None:
         out["dimensions"] = dimensions
@@ -1214,6 +1398,13 @@ def matches(spec: Any, listed: Any) -> bool:
     (its time column and filter are its author's). A hand-written one grouping
     by several columns at once is another monitor, since the package groups by
     their combination.
+
+    A ``column_anomalies`` (#1485, #1591) is compared against the tests its
+    own column lists. One Dex wrote matches only on the same monitor list,
+    compared as a set without case, as well as the same time column and
+    filter, so one written from a unit or an additivity the declaration no
+    longer states is stale. A hand-written one matches on the same
+    ``timestamp_column``: its monitor list and filter are its author's.
     """
 
     if _bare(_test_name(spec)).lower() != _bare(_test_name(listed)).lower():
@@ -1227,6 +1418,10 @@ def matches(spec: Any, listed: Any) -> bool:
         if not is_monitor(listed):
             return True
     if is_monitor(listed):
+        if _bare(_test_name(spec)).lower() == COLUMN and _monitor_set(
+            spec
+        ) != _monitor_set(listed):
+            return False
         return same and (_where_of(spec) or "") == (_where_of(listed) or "")
     if _bare(_test_name(spec)).lower() == VOLUME:
         return True
@@ -1242,6 +1437,43 @@ def entry_tests(content: str | None, model: str) -> list[Any]:
         return []
     listed = node.get("data_tests") or node.get("tests") or []
     return list(listed) if isinstance(listed, list) else []
+
+
+def column_tests(content: str | None, model: str, column: str) -> list[Any]:
+    """The tests ``content`` lists under ``column`` of ``model`` (a version
+    label reads that version as dbt builds it)."""
+
+    node = _entry(content, model)
+    columns = node.get("columns") if isinstance(node, Mapping) else None
+    entry = next(
+        (
+            c
+            for c in columns or []
+            if isinstance(c, Mapping)
+            and str(c.get("name", "")).lower() == column.lower()
+        ),
+        None,
+    )
+    if not isinstance(entry, Mapping):
+        return []
+    listed = entry.get("data_tests") or entry.get("tests") or []
+    return list(listed) if isinstance(listed, list) else []
+
+
+def _listed_column_tests(content: str | None, model: str) -> list[tuple[str, Any]]:
+    """Every test ``content`` lists under a column of ``model``, with the
+    column's name."""
+
+    node = _entry(content, model)
+    out: list[tuple[str, Any]] = []
+    columns = node.get("columns") if isinstance(node, Mapping) else None
+    for entry in columns or []:
+        if not isinstance(entry, Mapping) or entry.get("name") is None:
+            continue
+        listed = entry.get("data_tests") or entry.get("tests") or []
+        if isinstance(listed, list):
+            out.extend((str(entry["name"]), test) for test in listed)
+    return out
 
 
 def quoted_columns(content: str | None, model: str) -> frozenset[str]:
@@ -1350,20 +1582,32 @@ def decide(
     to_write: list[Monitor] = []
     rows: list[dict[str, Any]] = []
     gives = planned(declaration, outputs, dialect, quoted, domains, marked)
-    current_specs = [m.spec() for m in gives if m.withheld is None]
+    current_specs = [m.spec() for m in gives if m.withheld is None and m.test != COLUMN]
     for monitor in gives:
         row: dict[str, Any] = {
             "model": monitor.model,
             "test": monitor.name,
-            "column": monitor.dimension or monitor.timestamp_column,
+            "column": monitor.column or monitor.dimension or monitor.timestamp_column,
             "arguments": dict(monitor.arguments),
             "field": monitor.field,
         }
         if monitor.test == DIMENSION:
             row.update(_domain_fields(monitor))
+        if monitor.test == COLUMN:
+            # A column monitor is listed under its column (#1485, #1591).
+            row["sources"] = [
+                {"field": source, "monitors": list(given)}
+                for source, given in monitor.sources
+            ]
+
+        here = (
+            column_tests(content, declaration.model, monitor.column)
+            if monitor.column is not None
+            else listed
+        )
         if monitor.withheld is not None:
             found = (
-                next((t for t in listed if matches(monitor.spec(), t)), None)
+                next((t for t in here if matches(monitor.spec(), t)), None)
                 if monitor.test == DIMENSION and monitor.withheld in _DOMAIN_UNREAD
                 else None
             )
@@ -1378,9 +1622,12 @@ def decide(
                 row["status"], row["reason"] = NOT_RENDERED, monitor.withheld
             rows.append(row)
             continue
-        found = next((t for t in listed if matches(monitor.spec(), t)), None)
+        found = next((t for t in here if matches(monitor.spec(), t)), None)
         if found is not None:
             row["status"] = ALREADY_LISTED if is_monitor(found) else HAND_WRITTEN
+            if not is_monitor(found) and monitor.test == COLUMN:
+                # The author's own list stands; the row says what it holds.
+                row["arguments"] = dict(_arguments_of(found))
         elif closed is not None:
             row["status"], row["reason"] = NOT_RENDERED, closed
         else:
@@ -1394,6 +1641,10 @@ def decide(
             continue
         if _bare(_test_name(test)).lower() == DIMENSION:
             rows.append(_stale_dimension(test, declaration.model, gives, rows))
+            continue
+        if _bare(_test_name(test)).lower() == COLUMN:
+            # Listed on the model rather than a column: not one dex wrote
+            # where it writes one, so it is left to its author.
             continue
         marker = marker_of(test) or {}
         # The same test on the same time column is one the population moved
@@ -1420,6 +1671,20 @@ def decide(
         if same_time:
             stale["replacement"] = _replacement(rows, stale["test"], stale["column"])
         rows.append(stale)
+    for column, test in _listed_column_tests(content, declaration.model):
+        if not is_monitor(test) or _bare(_test_name(test)).lower() != COLUMN:
+            continue
+        given = next(
+            (
+                m
+                for m in gives
+                if m.test == COLUMN and (m.column or "").lower() == column.lower()
+            ),
+            None,
+        )
+        if given is not None and given.withheld is None and matches(given.spec(), test):
+            continue
+        rows.append(_stale_column(test, declaration.model, column, given, rows))
     return to_write, rows
 
 
@@ -1500,6 +1765,53 @@ def _stale_dimension(
     return stale
 
 
+#: Why a column no longer gives its column monitor at all, so one Dex wrote
+#: on it earlier is stale on the column itself.
+_COLUMN_GONE = (PII_FLAGGED, COLUMN_NOT_OUTPUT)
+
+
+def _stale_column(
+    test: Any,
+    model: str,
+    column: str,
+    given: Monitor | None,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The ``stale`` row for a ``column_anomalies`` Dex wrote on ``column``
+    that the declaration no longer gives (#1485, #1591). ``changed`` is
+    ``column`` where the column no longer gives one (its unit and additivity
+    give no monitor, it is now flagged as personal data, or the model no
+    longer outputs it), ``column_anomalies`` where the monitor list moved
+    (the unit or the additivity changed), ``timestamp_column`` where the
+    model's time column moved, and ``where_expression`` where only the
+    population moved."""
+
+    marker = marker_of(test) or {}
+    stale: dict[str, Any] = {
+        "model": model,
+        "test": _test_name(test),
+        "column": column,
+        "arguments": _arguments_of(test),
+        "field": marker.get("from"),
+        "status": STALE,
+        "reason": DECLARATION_CHANGED,
+    }
+    if given is None or given.withheld in _COLUMN_GONE:
+        stale["changed"] = "column"
+        stale["cause"] = "not_declared" if given is None else given.withheld
+        return stale
+    if _monitor_set(given.spec()) != _monitor_set(test):
+        stale["changed"] = "column_anomalies"
+        stale["monitors"] = list(given.monitors)
+    elif (given.timestamp_column or "").lower() != (_timestamp_of(test) or "").lower():
+        stale["changed"] = "timestamp_column"
+        return stale
+    else:
+        stale["changed"] = "where_expression"
+    stale["replacement"] = _replacement(rows, stale["test"], column)
+    return stale
+
+
 #: The replacement statuses under which the current monitor is on the model.
 _REPLACED = (ADDED, ALREADY_LISTED, HAND_WRITTEN)
 
@@ -1531,6 +1843,8 @@ def stale_note(row: Mapping[str, Any]) -> str:
             f"{lead}; dex did not write the current one ({why}), so keep this one "
             "until it can be written, then remove it"
         )
+    if _bare(str(row.get("test", ""))).lower() == COLUMN:
+        return _stale_column_note(row)
     if row.get("changed") == "dimensions":
         cause = _DIMENSION_CAUSE.get(str(row.get("cause")), "the declaration changed")
         if row.get("distinct_count") is not None:
@@ -1557,6 +1871,58 @@ def stale_note(row: Mapping[str, Any]) -> str:
         f"{row.get('column') or 'no timestamp column'}, written by dex from "
         f"{row.get('field') or 'a declaration'}, which the declaration no longer "
         "gives; dex leaves it in place: remove it, or declare the time column again"
+    )
+
+
+#: How a stale column monitor's ``cause`` reads in its note.
+_COLUMN_CAUSE = {
+    "not_declared": (
+        "neither a fraction or percent unit nor a measure's declared "
+        "additivity gives it one any more"
+    ),
+    PII_FLAGGED: "the column is now flagged as personal data",
+    COLUMN_NOT_OUTPUT: "the model no longer outputs the column",
+}
+
+
+def _stale_column_note(row: Mapping[str, Any]) -> str:
+    """The note for a stale ``column_anomalies`` (#1485, #1591)."""
+
+    lead = (
+        f"'{row['model']}' lists {row['test']} on {row.get('column')}, written by "
+        f"dex from {row.get('field') or 'a declaration'}"
+    )
+    keep = (
+        "dex leaves it in place: remove it, or keep it as your own by removing "
+        "its config.meta.dex marker"
+    )
+    changed = row.get("changed")
+    if changed == "column":
+        cause = _COLUMN_CAUSE.get(str(row.get("cause")), "the declaration changed")
+        return f"{lead}, and the column no longer gives one: {cause}; {keep}"
+    if changed == "timestamp_column":
+        return (
+            f"{lead}, with timestamp_column "
+            f"{(row.get('arguments') or {}).get('timestamp_column') or 'unset'}, which "
+            "the model's declared time column no longer gives; dex leaves it in "
+            "place: remove it, or declare the time column again"
+        )
+    what = (
+        "a monitor list the declared unit and additivity no longer give (now "
+        f"[{', '.join(row.get('monitors') or [])}])"
+        if changed == "column_anomalies"
+        else "a where_expression the declared population.filters no longer give"
+    )
+    replacement = row.get("replacement") or {}
+    if replacement.get("status") in _REPLACED:
+        return (
+            f"{lead}, with {what}; the current one is listed beside it and dex "
+            "leaves this one in place: remove it, so the column is watched once"
+        )
+    why = replacement.get("reason") or "it was not written"
+    return (
+        f"{lead}, with {what}; dex did not write the current one ({why}), so keep "
+        "this one until it can be written, then remove it"
     )
 
 
@@ -1625,9 +1991,18 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     listed = entry.get("data_tests") or entry.get("tests") or []
-    if not isinstance(listed, list):
-        return out
-    for test in listed:
+    found: list[tuple[str | None, Any]] = (
+        [(None, test) for test in listed] if isinstance(listed, list) else []
+    )
+    # A column monitor (#1485, #1591) is listed under its column.
+    columns = entry.get("columns")
+    for column in columns if isinstance(columns, list) else []:
+        if not isinstance(column, Mapping) or column.get("name") is None:
+            continue
+        under = column.get("data_tests") or column.get("tests") or []
+        if isinstance(under, list):
+            found.extend((str(column["name"]), test) for test in under)
+    for column_name, test in found:
         marker = marker_of(test)
         if marker is None:
             continue
@@ -1635,10 +2010,16 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
         timestamp = _timestamp_of(test)
         where = _where_of(test)
         dimensions = _dimensions_of(test)
+        monitors = _monitors_of(test)
         source = marker.get("from")
         chosen = [
             f"{key}: {value}"
             for key, value in (
+                ("column_name", column_name),
+                (
+                    "column_anomalies",
+                    f"[{', '.join(monitors)}]" if monitors is not None else None,
+                ),
                 (
                     "dimensions",
                     f"[{', '.join(dimensions)}]" if dimensions is not None else None,
@@ -1648,7 +2029,22 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
             )
             if value is not None
         ]
-        sources = [s for s in (source, marker.get("filter")) if isinstance(s, str)]
+        given = marker.get("sources")
+        if isinstance(given, Mapping) and given:
+            # Each field of a column monitor names the monitors it gave, so a
+            # union reads back as its rows.
+            fields: list[str] = [str(f) for f in given]
+            sources = [
+                f"{f} ({', '.join(str(m) for m in v)})"
+                if isinstance(v, list) and v
+                else f
+                for f, v in ((str(k), given[k]) for k in given)
+            ]
+        else:
+            fields = [source] if isinstance(source, str) else []
+            sources = [source] if isinstance(source, str) else []
+        if isinstance(marker.get("filter"), str):
+            sources.append(marker["filter"])
         bound = marker.get("max_distinct")
         # A dimension monitor names the bound it was written under (#1484), so
         # a reviewer sees why its column was in.
@@ -1660,7 +2056,8 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
         out.append(
             {
                 "model": label,
-                "decision": f"Monitor {name}",
+                "decision": f"Monitor {name}"
+                + (f" on {column_name}" if column_name is not None else ""),
                 "chosen": "; ".join(chosen) or "the package's defaults",
                 "evidence": "contract",
                 "detail": (
@@ -1671,6 +2068,7 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "monitor": name,
                 **({"field": source} if isinstance(source, str) else {}),
+                **({"fields": fields} if len(fields) > 1 else {}),
             }
         )
     return out

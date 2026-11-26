@@ -1547,7 +1547,8 @@ def render(
             monitor_domains,
         )
         watched = [
-            {"model": declaration.model, "column": None, "spec": m.spec()}
+            # A column monitor (#1485, #1591) renders under its column.
+            {"model": declaration.model, "column": m.column, "spec": m.spec()}
             for m in to_write
         ]
         if monitor_rows is not None:

@@ -1,4 +1,4 @@
-"""Vendor monitors written from a declaration (#1482).
+"""Vendor monitors written from a declaration (#1482, #1484, #1485, #1591).
 
 With ``monitors.vendor: elementary``, a column declared with role ``time``
 becomes the ``timestamp_column`` of ``elementary.volume_anomalies`` and
@@ -6,7 +6,8 @@ becomes the ``timestamp_column`` of ``elementary.volume_anomalies`` and
 same plan as the declaration. A monitor is written only where the package is
 installed and the repository shows it enabled on the production target; a
 hand-written monitor is never touched, and ``data.decisions`` is read back from
-the tests Dex wrote.
+the tests Dex wrote. A fraction or percent unit and a measure's additivity
+write a ``column_anomalies`` under the column, one per column.
 
 The package here is a stand-in: an ``elementary`` project under
 ``dbt_packages`` whose two test macros select nothing, so dbt parses the plan
@@ -475,7 +476,10 @@ def _install(project: Path, enabled: str | None = "\"{{ target.name != 'dev' }}\
         "{% test freshness_anomalies(model, timestamp_column, where_expression=none) %}"
         "select 1 where false{% endtest %}\n"
         "{% test dimension_anomalies(model, dimensions, timestamp_column=none,"
-        " where_expression=none) %}select 1 where false{% endtest %}\n",
+        " where_expression=none) %}select 1 where false{% endtest %}\n"
+        "{% test column_anomalies(model, column_name, column_anomalies=none,"
+        " timestamp_column=none, where_expression=none) %}"
+        "select 1 where false{% endtest %}\n",
         encoding="utf-8",
     )
     (project / "packages.yml").write_text(
@@ -2419,3 +2423,776 @@ def test_transform_declare_names_the_profile_a_skipped_model_owes_beside_a_propo
     said = json.dumps(both["data"]["notes"])
     assert "stg_customers.tier" in said
     assert "stg_accounts.tier" not in said
+
+
+# --- units and measures as column_anomalies (#1485, #1591) ---------------------
+
+COLUMN = "elementary.column_anomalies"
+
+
+def _cols(columns: dict, *, times: tuple[str, ...] = ("ordered_at",)) -> dict:
+    return {
+        "model": "fct_orders",
+        "columns": {**{t: {"role": "time"} for t in times}, **columns},
+    }
+
+
+def _column_tests(content: str, column: str, version: int | None = None) -> list:
+    [entry] = yaml.safe_load(content)["models"]
+    if version is not None:
+        entry = next(v for v in entry["versions"] if v["v"] == version)
+    found = next((c for c in entry.get("columns") or [] if c["name"] == column), None)
+    tests = (found or {}).get("data_tests") or (found or {}).get("tests") or []
+    return [
+        next(iter(t.values()))
+        for t in tests
+        if isinstance(t, dict) and next(iter(t)) == COLUMN
+    ]
+
+
+def _monitors(content: str, column: str) -> list[list[str]]:
+    return [
+        (body.get("arguments") or body).get("column_anomalies")
+        for body in _column_tests(content, column)
+    ]
+
+
+def _column_rows(rows: list) -> dict:
+    return {r["column"]: r for r in rows if r["test"] == COLUMN}
+
+
+@pytest.mark.parametrize("unit", ["fraction", "percent", " Percent "])
+def test_a_fraction_or_percent_column_is_watched_with_min_and_max(unit):
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": unit}}), rows=rows)
+
+    [body] = _column_tests(out, "share")
+    assert body["arguments"] == {
+        "column_anomalies": ["min", "max"],
+        "timestamp_column": "ordered_at",
+    }
+    assert body["config"]["tags"] == [mon.TAG]
+    # Never a model-level test: the package reads the column it sits under.
+    assert all(next(iter(t)) != COLUMN for t in _tests(out))
+    row = _column_rows(rows)["share"]
+    folded = unit.strip().lower()
+    assert row["status"] == mon.ADDED
+    assert row["field"] == f"columns.share.unit: {folded}"
+    [decision] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == COLUMN
+    ]
+    assert decision["field"] == f"columns.share.unit: {folded}"
+    assert decision["decision"] == "Monitor elementary.column_anomalies on share"
+    assert decision["chosen"] == (
+        "column_name: share; column_anomalies: [min, max]; timestamp_column: ordered_at"
+    )
+    assert "column" not in decision
+
+
+@pytest.mark.parametrize("unit", ["count", "currency:USD", "days", None])
+def test_any_other_unit_gives_no_column_monitor(unit):
+    rows: list = []
+    column = {"unit": unit} if unit is not None else {"role": "attribute"}
+
+    out = _render(_cols({"share": column}), rows=rows)
+
+    assert _column_tests(out, "share") == []
+    assert "share" not in _column_rows(rows)
+
+
+@pytest.mark.parametrize(
+    ("additivity", "expected"),
+    [
+        ("additive", ["zero_count", "average", "sum"]),
+        ("semi_additive", ["min", "max", "average"]),
+        ("non_additive", ["average"]),
+    ],
+)
+def test_a_measure_is_watched_with_the_monitors_its_additivity_gives(
+    additivity, expected
+):
+    rows: list = []
+
+    out = _render(
+        _cols({"amount": {"role": "measure", "additivity": additivity}}), rows=rows
+    )
+
+    assert _monitors(out, "amount") == [expected]
+    assert _column_rows(rows)["amount"]["field"] == (
+        f"columns.amount.additivity: {additivity}"
+    )
+    [decision] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == COLUMN
+    ]
+    assert decision["field"] == f"columns.amount.additivity: {additivity}"
+
+
+def test_one_model_with_a_measure_of_each_additivity_gets_each_its_own_list():
+    out = _render(
+        _cols(
+            {
+                "revenue": {"role": "measure", "additivity": "additive"},
+                "balance": {"role": "measure", "additivity": "semi_additive"},
+                "conversion": {"role": "measure", "additivity": "non_additive"},
+            }
+        )
+    )
+
+    assert {c: _monitors(out, c) for c in ("revenue", "balance", "conversion")} == {
+        "revenue": [["zero_count", "average", "sum"]],
+        "balance": [["min", "max", "average"]],
+        "conversion": [["average"]],
+    }
+    fields = {
+        d["chosen"].split(";")[0]: d["field"]
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == COLUMN
+    }
+    assert fields == {
+        "column_name: revenue": "columns.revenue.additivity: additive",
+        "column_name: balance": "columns.balance.additivity: semi_additive",
+        "column_name: conversion": "columns.conversion.additivity: non_additive",
+    }
+
+
+@pytest.mark.parametrize("additivity", ["semi_additive", "non_additive"])
+def test_a_measure_that_does_not_add_never_gets_sum(additivity):
+    out = _render(
+        _cols(
+            {
+                "value": {
+                    "role": "measure",
+                    "additivity": additivity,
+                    "unit": "fraction",
+                }
+            }
+        )
+    )
+
+    [monitors] = _monitors(out, "value")
+    assert "sum" not in monitors
+
+
+def test_a_measure_with_no_additivity_gets_no_column_monitor():
+    out = _render(_cols({"amount": {"role": "measure", "aggregation": "sum"}}))
+
+    assert _column_tests(out, "amount") == []
+
+
+def test_an_additivity_on_a_column_that_is_not_a_measure_gives_nothing():
+    out = _render(_cols({"amount": {"role": "attribute", "additivity": "additive"}}))
+
+    assert _column_tests(out, "amount") == []
+
+
+def test_a_fraction_that_is_also_an_additive_measure_gets_one_test_with_both_lists():
+    rows: list = []
+
+    out = _render(
+        _cols(
+            {
+                "share": {
+                    "role": "measure",
+                    "additivity": "additive",
+                    "unit": "fraction",
+                }
+            }
+        ),
+        rows=rows,
+    )
+
+    # One test, the union in the package's own order, never two.
+    assert _monitors(out, "share") == [["min", "max", "zero_count", "average", "sum"]]
+    [body] = _column_tests(out, "share")
+    assert body["config"]["meta"]["dex"]["monitor"]["sources"] == {
+        "columns.share.unit: fraction": ["min", "max"],
+        "columns.share.additivity: additive": ["sum", "average", "zero_count"],
+    }
+    row = _column_rows(rows)["share"]
+    assert [s["field"] for s in row["sources"]] == [
+        "columns.share.unit: fraction",
+        "columns.share.additivity: additive",
+    ]
+    [decision] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == COLUMN
+    ]
+    assert decision["fields"] == [
+        "columns.share.unit: fraction",
+        "columns.share.additivity: additive",
+    ]
+    assert "columns.share.unit: fraction (min, max)" in decision["detail"]
+    assert (
+        "columns.share.additivity: additive (sum, average, zero_count)"
+        in (decision["detail"])
+    )
+
+
+def test_a_semi_additive_percent_lists_min_and_max_once():
+    out = _render(
+        _cols(
+            {
+                "rate": {
+                    "role": "measure",
+                    "additivity": "semi_additive",
+                    "unit": "percent",
+                }
+            }
+        )
+    )
+
+    assert _monitors(out, "rate") == [["min", "max", "average"]]
+
+
+@pytest.mark.parametrize(
+    ("times", "reason"),
+    [
+        ((), mon.NO_TIME_COLUMN),
+        (("ordered_at", "shipped_at"), mon.AMBIGUOUS_TIME_COLUMN),
+    ],
+)
+def test_a_column_monitor_follows_the_time_column_rule(times, reason):
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": "fraction"}}, times=times), rows=rows)
+
+    assert _column_tests(out, "share") == []
+    row = _column_rows(rows)["share"]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, reason)
+
+
+@pytest.mark.parametrize(
+    "outputs",
+    [frozenset({"ordered_at"}), frozenset({"share"})],
+    ids=["column", "time_column"],
+)
+def test_a_column_monitor_reading_a_column_not_output_is_not_written(outputs):
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": "fraction"}}), rows=rows, outputs=outputs)
+
+    assert _column_tests(out, "share") == []
+    assert _column_rows(rows)["share"]["reason"] == mon.COLUMN_NOT_OUTPUT
+
+
+def test_a_column_the_yaml_marks_as_personal_data_gets_no_column_monitor():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: salary_share\n"
+        "        config:\n"
+        "          meta:\n"
+        "            contains_pii: true\n"
+    )
+    rows: list = []
+
+    out = _render(
+        _cols({"salary_share": {"unit": "fraction"}}), content=content, rows=rows
+    )
+
+    assert _column_tests(out, "salary_share") == []
+    assert _column_rows(rows)["salary_share"]["reason"] == mon.PII_FLAGGED
+
+
+def test_a_column_the_cache_flags_as_personal_data_gets_no_column_monitor():
+    from exmergo_dex_core.cache import PIICategory, PIIFlag
+
+    flag = PIIFlag(category=PIICategory("financial"), confidence=0.4)
+    rows: list = []
+
+    _render(
+        _cols({"amount": {"role": "measure", "additivity": "additive"}}),
+        rows=rows,
+        domains=_domains(_profile("amount", 900, pii=flag)),
+    )
+
+    assert _column_rows(rows)["amount"]["reason"] == mon.PII_FLAGGED
+
+
+def test_an_unprofiled_column_named_as_personal_data_gets_no_column_monitor():
+    rows: list = []
+
+    _render(_cols({"customer_email": {"unit": "fraction"}}), rows=rows)
+
+    assert _column_rows(rows)["customer_email"]["reason"] == mon.PII_FLAGGED
+
+
+def test_a_column_monitor_carries_the_population_filter():
+    payload = _cols({"share": {"unit": "fraction"}})
+    payload["columns"]["status"] = {"role": "attribute"}
+    payload["population"] = {"filters": [{"column": "status", "excludes": ["test"]}]}
+
+    out = _render(payload, dialect="duckdb")
+
+    [body] = _column_tests(out, "share")
+    assert body["arguments"]["where_expression"] == (
+        "(status not in ('test') or status is null)"
+    )
+    assert body["config"]["meta"]["dex"]["monitor"]["filter"] == "population.filters"
+
+
+def test_an_unwritable_filter_withholds_the_column_monitor_too():
+    payload = _cols({"share": {"unit": "fraction"}})
+    payload["population"] = {"filters": [{"column": "status", "includes": ["a"]}]}
+    rows: list = []
+
+    out = _render(payload, rows=rows, outputs=frozenset({"ordered_at", "share"}))
+
+    assert _column_tests(out, "share") == []
+    assert _column_rows(rows)["share"]["reason"] == mon.FILTER_COLUMN_NOT_OUTPUT
+
+
+@pytest.mark.parametrize(
+    "listed",
+    [
+        "          - elementary.column_anomalies:\n"
+        "              timestamp_column: ordered_at\n"
+        "              column_anomalies: [null_count]\n"
+        "              anomaly_sensitivity: 2\n",
+        "          - elementary.column_anomalies:\n"
+        "              arguments:\n"
+        "                timestamp_column: ORDERED_AT\n"
+        "                where_expression: \"region = 'emea'\"\n",
+    ],
+    ids=["own_list", "own_filter_and_defaults"],
+)
+def test_a_hand_written_column_monitor_on_the_column_is_kept_exactly(listed):
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: share\n"
+        "        data_tests:\n" + listed
+    )
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": "fraction"}}), content=content, rows=rows)
+
+    assert _column_tests(out, "share") == _column_tests(content, "share")
+    row = _column_rows(rows)["share"]
+    assert row["status"] == mon.HAND_WRITTEN
+    assert row["arguments"] == mon._arguments_of(
+        yaml.safe_load(listed.strip().removeprefix("- "))
+    )
+    assert [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == COLUMN
+    ] == []
+
+
+def test_a_hand_written_column_monitor_on_another_time_column_is_another_monitor():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: share\n"
+        "        data_tests:\n"
+        "          - elementary.column_anomalies:\n"
+        "              column_anomalies: [min]\n"
+    )
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": "fraction"}}), content=content, rows=rows)
+
+    assert _monitors(out, "share") == [["min"], ["min", "max"]]
+    assert _column_rows(rows)["share"]["status"] == mon.ADDED
+
+
+def test_a_column_monitor_on_another_column_does_not_count():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: other\n"
+        "        data_tests:\n"
+        "          - elementary.column_anomalies:\n"
+        "              timestamp_column: ordered_at\n"
+    )
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": "fraction"}}), content=content, rows=rows)
+
+    assert _monitors(out, "share") == [["min", "max"]]
+    assert _column_rows(rows)["share"]["status"] == mon.ADDED
+
+
+def test_declaring_again_lists_each_column_monitor_once():
+    payload = _cols(
+        {
+            "share": {"unit": "fraction"},
+            "amount": {"role": "measure", "additivity": "additive"},
+        }
+    )
+    first = _render(payload)
+    rows: list = []
+
+    again = _render(payload, content=first, rows=rows)
+
+    assert again == first
+    assert {r["column"]: r["status"] for r in rows if r["test"] == COLUMN} == {
+        "share": mon.ALREADY_LISTED,
+        "amount": mon.ALREADY_LISTED,
+    }
+
+
+def _without_unit(content: str, column: str) -> str:
+    loaded = yaml.safe_load(content)
+    [entry] = loaded["models"]
+    for item in entry["columns"]:
+        if item["name"] == column:
+            item["config"]["meta"]["dex"].pop("unit")
+    return yaml.safe_dump(loaded, sort_keys=False)
+
+
+def test_a_column_that_no_longer_gives_a_monitor_is_stale_and_kept():
+    before = _render(_cols({"share": {"unit": "fraction"}}))
+    content = _without_unit(before, "share")
+    rows: list = []
+    notes: list = []
+
+    after = _render(_cols({}), content=content, rows=rows, notes=notes)
+
+    assert _monitors(after, "share") == [["min", "max"]]
+    [stale] = [r for r in rows if r["status"] == mon.STALE]
+    assert (stale["test"], stale["column"], stale["changed"], stale["cause"]) == (
+        COLUMN,
+        "share",
+        "column",
+        "not_declared",
+    )
+    [note] = [n for n in notes if "no longer gives one" in n]
+    assert "dex leaves it in place" in note
+
+
+def test_a_column_whose_monitor_list_moved_is_stale_beside_its_replacement():
+    before = _render(_cols({"share": {"unit": "fraction"}}))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _cols({"share": {"role": "measure", "additivity": "non_additive"}}),
+        content=before,
+        rows=rows,
+        notes=notes,
+    )
+
+    assert _monitors(after, "share") == [["min", "max"], ["min", "max", "average"]]
+    [stale] = [r for r in rows if r["status"] == mon.STALE]
+    assert stale["changed"] == "column_anomalies"
+    assert stale["monitors"] == ["min", "max", "average"]
+    assert stale["replacement"]["status"] == mon.ADDED
+    [note] = [n for n in notes if "monitor list" in n]
+    assert "remove it, so the column is watched once" in note
+
+
+def test_a_column_monitor_whose_filter_moved_is_stale_with_its_replacement():
+    before = _render(_cols({"share": {"unit": "fraction"}}))
+    payload = _cols({"share": {"unit": "fraction"}})
+    payload["columns"]["status"] = {"role": "attribute"}
+    payload["population"] = {"filters": [{"column": "status", "includes": ["placed"]}]}
+    rows: list = []
+
+    _render(payload, content=before, rows=rows)
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == COLUMN]
+    assert stale["changed"] == "where_expression"
+    assert stale["replacement"]["status"] == mon.ADDED
+
+
+def test_a_column_monitor_kept_while_its_new_filter_cannot_be_written():
+    before = _render(_cols({"share": {"unit": "fraction"}}))
+    payload = _cols({"share": {"unit": "fraction"}})
+    payload["population"] = {"filters": [{"column": "status", "includes": ["a"]}]}
+    rows: list = []
+    notes: list = []
+
+    _render(
+        payload,
+        content=before,
+        rows=rows,
+        notes=notes,
+        outputs=frozenset({"ordered_at", "share"}),
+    )
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == COLUMN]
+    assert stale["changed"] == "where_expression"
+    assert stale["replacement"] == {
+        "status": mon.NOT_RENDERED,
+        "reason": mon.FILTER_COLUMN_NOT_OUTPUT,
+    }
+    assert any("keep this one until it can be written" in n for n in notes)
+
+
+def test_a_column_monitor_on_a_moved_time_column_is_stale():
+    before = _render(_cols({"share": {"unit": "fraction"}}))
+    loaded = yaml.safe_load(before)
+    [entry] = loaded["models"]
+    entry["columns"] = [c for c in entry["columns"] if c["name"] != "ordered_at"]
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _cols({"share": {"unit": "fraction"}}, times=("shipped_at",)),
+        content=yaml.safe_dump(loaded, sort_keys=False),
+        rows=rows,
+        notes=notes,
+    )
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == COLUMN]
+    assert stale["changed"] == "timestamp_column"
+    assert any("timestamp_column ordered_at" in n for n in notes)
+
+
+def test_a_versioned_model_takes_its_column_monitor_on_the_version():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    latest_version: 1\n"
+        "    versions:\n"
+        "      - v: 1\n"
+        "      - v: 2\n"
+    )
+    payload = {**_cols({"share": {"unit": "fraction"}}), "model": "fct_orders.v2"}
+    rows: list = []
+
+    out = _render(payload, content=content, rows=rows)
+
+    assert _monitors_in_version(out, 2, "share") == [["min", "max"]]
+    assert _monitors_in_version(out, 1, "share") == []
+    again: list = []
+    assert _render(payload, content=out, rows=again) == out
+    assert _column_rows(again)["share"]["status"] == mon.ALREADY_LISTED
+    [decision] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders.v2"])
+        if d["monitor"] == COLUMN
+    ]
+    assert decision["model"] == "fct_orders.v2"
+
+
+def _monitors_in_version(content: str, version: int, column: str) -> list:
+    [entry] = yaml.safe_load(content)["models"]
+    item = next(v for v in entry["versions"] if v["v"] == version)
+    found = next((c for c in item.get("columns") or [] if c["name"] == column), {})
+    return [
+        next(iter(t.values()))["arguments"]["column_anomalies"]
+        for t in found.get("data_tests") or []
+        if isinstance(t, dict) and next(iter(t)) == COLUMN
+    ]
+
+
+def test_a_closed_gate_writes_no_column_monitor():
+    gate = mon.Gate(
+        "elementary", mon.INSTALLED, "0.26.1", mon.DISABLED, mon.LITERAL, "prod"
+    )
+    rows: list = []
+
+    out = _render(_cols({"share": {"unit": "fraction"}}), gate=gate, rows=rows)
+
+    assert _column_tests(out, "share") == []
+    assert _column_rows(rows)["share"]["reason"] == mon.PRODUCTION_DISABLED
+
+
+def test_a_column_monitor_decision_settles_no_population_change():
+    out = _render(_cols({"share": {"unit": "fraction"}}))
+    [decision] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == COLUMN
+    ]
+    report = change_scope.analyze(
+        [
+            (
+                "models/marts/fct_orders.sql",
+                "select order_id, share from orders\n",
+                "select order_id, share from orders where share > 0\n",
+            )
+        ],
+        [decision],
+        "duckdb",
+    )
+
+    assert report is not None
+    [scope] = report["models"]
+    assert scope["population"] == "changed"
+    assert all(c["status"] == "undeclared" for c in scope["changes"] if "status" in c)
+
+
+MEASURED = {
+    "model": "fct_orders",
+    "description": "One row per order.",
+    "grain": ["order_id"],
+    "columns": {
+        "order_id": {"role": "key"},
+        "ordered_at": {"role": "time"},
+        "discount_share": {
+            "role": "measure",
+            "additivity": "additive",
+            "unit": "fraction",
+        },
+    },
+}
+
+MEASURED_SQL = (
+    "select 1 as order_id, current_timestamp as ordered_at, 0.25 as discount_share\n"
+)
+
+
+def test_the_plan_writes_a_column_monitor_under_its_column_and_reports_it(
+    dbt_project_dir: Path, tmp_path: Path, capsys, monkeypatch
+):
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    monkeypatch.setitem(globals(), "ORDERS", MEASURED_SQL)
+
+    planned = _plan(tmp_path, capsys, MEASURED)
+
+    assert planned["status"] == "ok", planned["errors"]
+    [row] = [r for r in planned["data"]["monitors"]["monitors"] if r["test"] == COLUMN]
+    assert (row["column"], row["status"]) == ("discount_share", mon.ADDED)
+    assert row["arguments"]["column_anomalies"] == [
+        "min",
+        "max",
+        "zero_count",
+        "average",
+        "sum",
+    ]
+    [decision] = [d for d in planned["data"]["decisions"] if d.get("monitor") == COLUMN]
+    assert decision["fields"] == [
+        "columns.discount_share.unit: fraction",
+        "columns.discount_share.additivity: additive",
+    ]
+
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "marts" / "fct_orders.yml").read_text(
+        encoding="utf-8"
+    )
+    assert _monitors(written, "discount_share") == [
+        ["min", "max", "zero_count", "average", "sum"]
+    ]
+
+
+def test_transform_declare_writes_an_owed_column_monitor(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "stg_payments.sql").write_text(
+        "select 1 as id, current_timestamp as paid_at, 0.5 as fee_share\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_payments\n"
+        "    description: One row per payment.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: paid_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n"
+        "      - name: fee_share\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              unit: fraction\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    def declare() -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", "stg_payments"],
+            capsys,
+        )
+
+    proposed = declare()
+
+    assert proposed["status"] == "ok", proposed["errors"]
+    [proposal] = proposed["data"]["proposed"]
+    assert COLUMN in [m["test"] for m in proposal["fields"]["monitors"]["value"]]
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "staging" / "schema.yml").read_text(
+        encoding="utf-8"
+    )
+    assert yaml.safe_load(written)["models"][0]["columns"][2]["data_tests"][0][COLUMN][
+        "arguments"
+    ]["column_anomalies"] == ["min", "max"]
+    assert declare()["data"]["plan_id"] is None
+
+
+def test_a_column_any_ambiguous_profile_flags_gets_no_column_monitor():
+    from exmergo_dex_core.cache import (
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+
+    flag = PIIFlag(category=PIICategory("financial"), confidence=0.4)
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="dev.main.fct_orders",
+                columns=[_profile("amount", 900)],
+            ),
+            Dataset(
+                identifier="prod.main.fct_orders",
+                columns=[_profile("amount", 900, pii=flag)],
+            ),
+        ]
+    )
+    rows: list = []
+
+    _render(
+        _cols({"amount": {"role": "measure", "additivity": "additive"}}),
+        rows=rows,
+        domains=mon.Domains(cache=cache),
+    )
+
+    assert _column_rows(rows)["amount"]["reason"] == mon.PII_FLAGGED
+
+
+def test_an_ambiguous_profile_flagging_nothing_still_writes_the_column_monitor():
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    cache = DexCache(
+        datasets=[
+            Dataset(identifier=i, columns=[_profile("amount", 900)])
+            for i in ("dev.main.fct_orders", "prod.main.fct_orders")
+        ]
+    )
+    rows: list = []
+
+    _render(
+        _cols({"amount": {"role": "measure", "additivity": "additive"}}),
+        rows=rows,
+        domains=mon.Domains(cache=cache),
+    )
+
+    assert _column_rows(rows)["amount"]["status"] == mon.ADDED

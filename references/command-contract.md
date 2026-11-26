@@ -1695,7 +1695,29 @@ default, or a filter or operator after it is refused. A key naming a location
   where the column no longer qualifies, and one whose column the cache no
   longer counts stays `already_listed`. A hand-written `dimension_anomalies`
   on the same one column is `hand_written`; one grouping by several columns
-  is another monitor. Nothing is
+  is another monitor. A column declared `unit: fraction` or `unit: percent`
+  (#1485), and a column declared role `measure` with an `additivity` (#1591),
+  becomes an `elementary.column_anomalies` listed under that column, with the
+  model's one time column as `timestamp_column` (none or several withhold it
+  as they withhold `volume_anomalies`) and an explicit `column_anomalies`
+  list: `[min, max]` from the unit; `[zero_count, average, sum]` from
+  `additive`, `[min, max, average]` from `semi_additive` and `[average]` from
+  `non_additive`, so `sum` is never written on a measure that does not add.
+  A column both rows reach gets one test whose list is the union in the
+  package's monitor order (`COLUMN_MONITOR_ORDER`). Its marker carries
+  `sources` (each declaration field with the monitors it gave), its row
+  carries the same as `sources[]` and the column as `column`, and its
+  decision names the column in `decision` and `chosen` (`column_name`,
+  `column_anomalies`), the first field as `field` and every field as
+  `fields` where there are several. A measure with no additivity, an
+  additivity on a column that is not a measure, any other unit, a column not
+  output (`column_not_output`), and a column flagged as personal data by the
+  YAML, the cached profile or an unprofiled name (`pii_flagged`) give none. A
+  hand-written `column_anomalies` under the same column with the same
+  `timestamp_column` is `hand_written`, whatever its list; a Dex-written one
+  is stale with `changed: column` and a `cause` where the column no longer
+  gives one, or `changed: column_anomalies` with the current `monitors` and a
+  `replacement` where the list moved. Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an
