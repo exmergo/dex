@@ -626,6 +626,7 @@ def apply_declarations(
     dialect: str | None = None,
     monitors: Any = None,
     monitor_rows: list[dict[str, Any]] | None = None,
+    monitor_domains: Any = None,
 ) -> tuple[list[PlanEdit], list[str]]:
     """Validate ``declarations`` and render them into the plan's edits.
 
@@ -640,6 +641,7 @@ def apply_declarations(
     whether a kind that names its dialects renders at all (#1451).
     ``monitors`` and ``monitor_rows`` are the vendor monitors' gate and rows
     (#1482; see :func:`render`); a gate that stays closed adds one warning.
+    ``monitor_domains`` reads the dimension columns' domains (#1484).
     """
 
     files = post_change_files(view, edits)
@@ -686,6 +688,7 @@ def apply_declarations(
                 history=history,
                 monitors=monitors,
                 monitor_rows=monitor_rows,
+                monitor_domains=monitor_domains,
             )
         except RewriteError as exc:
             raise DeclarationError(
@@ -1489,6 +1492,7 @@ def render(
     history: Any = None,
     monitors: Any = None,
     monitor_rows: list[dict[str, Any]] | None = None,
+    monitor_domains: Any = None,
 ) -> str:
     """``content`` with ``declaration`` spliced into its entry for the model.
 
@@ -1526,14 +1530,21 @@ def render(
     :mod:`.monitors`), or ``None`` where it is unset: the vendor's monitors the
     declaration gives render as model-level tests in the same pass as the
     generated tests, and ``monitor_rows`` collects one ``data.monitors`` row
-    per monitor, written or not.
+    per monitor, written or not. ``monitor_domains`` reads a dimension
+    column's domain from the exploration cache (#1484; :class:`.monitors.Domains`);
+    without it no ``dimension_anomalies`` is planned.
     """
 
     text = _render(content, declaration, notes, flagged_tests, [])
     watched: list[dict[str, Any]] = []
     if monitors is not None:
         to_write, rows = monitors_mod.decide(
-            content, _effective(text, declaration), monitors, outputs, dialect
+            content,
+            _effective(text, declaration),
+            monitors,
+            outputs,
+            dialect,
+            monitor_domains,
         )
         watched = [
             {"model": declaration.model, "column": None, "spec": m.spec()}
@@ -1547,6 +1558,9 @@ def render(
                 for row in rows
                 if row["status"] == monitors_mod.STALE
             )
+            unread = monitors_mod.domain_note(rows)
+            if unread is not None and unread not in notes:
+                notes.append(unread)
     if not gt.kinds():
         # No kind registered: nothing to generate, so no entry to read back.
         if watched:

@@ -206,6 +206,7 @@ def propose(
     render_tests: bool | list[str] = False,
     dialect: str | None = None,
     monitors: Any = None,
+    monitor_domains: Any = None,
 ) -> Outcome:
     """Each model's proposal, or the reason it has none, up to ``cap`` proposals.
 
@@ -214,6 +215,8 @@ def propose(
     which win field by field over anything drafted and are considered first.
     ``monitors`` is the vendor monitors' gate (#1482), or ``None``: a model
     declared before ``monitors.vendor`` was set still owes its monitors.
+    ``monitor_domains`` reads the cache's domains of its dimension columns
+    (#1484).
     """
 
     files = {path: source.content for path, source in view.files.items()}
@@ -254,7 +257,9 @@ def propose(
             not fields
             and not supplied_fields
             and not _owes_generated_tests(model, rendered, view, render_tests, dialect)
-            and not _owes_monitors(model, rendered, view, monitors, dialect)
+            and not _owes_monitors(
+                model, rendered, view, monitors, dialect, monitor_domains
+            )
             and not _owes_pii_tags(model, rendered, tag_name)
         ):
             # Whether anything would have been proposed had nothing been declared
@@ -295,6 +300,7 @@ def propose(
                 history=declarations_mod.history_reader(view, rendered),
                 monitors=monitors,
                 monitor_rows=monitor_rows,
+                monitor_domains=monitor_domains,
             )
             # The tests a references implies on its parent (#1457), which the
             # plan renders into the parent's entry: owed by this model as a
@@ -566,6 +572,7 @@ def _owes_monitors(
     view: Any,
     monitors: Any,
     dialect: str | None = None,
+    domains: Any = None,
 ) -> bool:
     """Whether the model's declaration gives a vendor monitor its YAML does not
     list yet, with the gate open (#1482): a model declared before
@@ -586,6 +593,7 @@ def _owes_monitors(
             dialect=dialect,
             monitors=monitors,
             monitor_rows=rows,
+            monitor_domains=domains,
         )
     except (RewriteError, DeclarationError):
         return False
