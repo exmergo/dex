@@ -12,6 +12,7 @@ import pytest
 
 pytest.importorskip("databricks.sql")
 
+from databricks.sql import exc as dbsql_exc
 from fakes.databricks import FakeCursor, FakeResult
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
@@ -353,7 +354,8 @@ def test_a_utc_session_is_pinned_only_when_asked(fake_databricks):
 
     adapter.pin_utc_session()
     adapter.run_query(sql, max_rows=10, timeout_seconds=30)
-    assert [s.sql for s in fake_databricks.connection.statements][-3:] == [
+    assert [s.sql for s in fake_databricks.connection.statements][-4:] == [
+        "SET STATEMENT_TIMEOUT = 30",
         pin,
         "SET STATEMENT_TIMEOUT = 30",
         sql,
@@ -392,13 +394,23 @@ def test_the_utc_pin_is_billed_and_the_cap_is_read_after_it(
         timeout_seconds=30,
     )
     assert [e["billed_seconds"] for e in entries] == pytest.approx([2.0, 1.0])
+    statements = fake_databricks.connection.statements
+    assert next(s for s in statements if "TIME ZONE" in s.sql).session_timeout == 10
     assert data_statements(fake_databricks)[-1].session_timeout == 8
 
 
 @pytest.mark.parametrize(
     ("seconds", "error", "raised"),
-    [(9.5, None, OverCeilingError), (1.0, RuntimeError("gone"), RuntimeError)],
-    ids=["spends-the-budget", "fails"],
+    [
+        (9.5, None, OverCeilingError),
+        (
+            10.0,
+            dbsql_exc.ServerOperationError("Statement has timed out after 10 seconds."),
+            OverCeilingError,
+        ),
+        (1.0, RuntimeError("gone"), RuntimeError),
+    ],
+    ids=["spends-the-budget", "times-out", "fails"],
 )
 def test_a_utc_pin_that_spends_the_budget_or_fails_is_billed_and_stops_the_query(
     fake_databricks, monkeypatch, seconds, error, raised

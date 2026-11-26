@@ -1471,16 +1471,26 @@ class DatabricksAdapter:
         if self._conn is None:
             self._conn = self._sql_connect()
         cursor = self._conn.cursor()
+        self._set_statement_timeout(cursor, remaining, cap_seconds)
         if getattr(self, "_utc_session", False):
             # An engine-built session statement, a constant. It runs on the
-            # warehouse, so its time is billed, and the cap is read again after it.
+            # warehouse under the timeout above, so its time is billed and the
+            # timeout is set again from what remains after it.
             pin = "SET TIME ZONE 'UTC'"
             started = self._clock()
             try:
                 cursor.execute(pin)
+            except Exception as exc:
+                raise self._translate(exc, cap_seconds) from exc
             finally:
                 self._record_elapsed(started, cursor, pin)
             remaining = self.cost_gate.statement_cap(unit="warehouse-second")
+            self._set_statement_timeout(cursor, remaining, cap_seconds)
+        return cursor
+
+    def _set_statement_timeout(
+        self, cursor: Any, remaining: int | None, cap_seconds: float | None
+    ) -> None:
         bounds = [b for b in (remaining, cap_seconds) if b is not None]
         # Remember which bound won so a timeout kill is reported as the wall
         # limit or the budget, whichever actually fired.
@@ -1493,7 +1503,6 @@ class DatabricksAdapter:
             # budget bound cannot (`statement_cap` refuses first) and the wall
             # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
-        return cursor
 
     def _record_elapsed(self, started: float, cursor: Any, sql: str) -> None:
         elapsed = max(self._clock() - started, 0.0)
