@@ -916,7 +916,17 @@ The domain is read, never measured: over the bound is `domain_too_large`, no
 cached count is `not_profiled` with the `explore profile` that would supply
 one, and a column flagged as personal data (by the cached profile at any
 confidence, after `pii_overrides`, or by the YAML) is `pii_flagged` at any
-domain. Dex chooses no training setting (sensitivity,
+domain. A column declared `unit: fraction` or `unit: percent` (#1485), and a
+column declared role `measure` with an `additivity` (#1591), gets an
+`elementary.column_anomalies` listed under the column, on the model's one
+time column, with an explicit monitor list: `min` and `max` for the unit,
+which watch a shift inside the bound `dex_unit_range` checks; `sum`,
+`average`, `zero_count` for an `additive` measure, `min`, `max`, `average`
+for a `semi_additive` one and `average` for a `non_additive` one, so `sum` is
+never written where adding means nothing. A column both reach gets one test
+whose list is the union, in the package's order; a measure with no
+additivity, any other unit, or a column flagged as personal data
+(`pii_flagged`) gets none. Dex chooses no training setting (sensitivity,
 `days_back`, seasonality stay the package's defaults). A monitor is written
 only where the package is installed (or the same plan adds it) and where the
 repository's `dbt_project.yml` enables it on the production target: its
