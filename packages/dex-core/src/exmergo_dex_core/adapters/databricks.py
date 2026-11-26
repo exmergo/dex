@@ -1468,24 +1468,31 @@ class DatabricksAdapter:
 
         self._warehouse()  # refuses when config pins no warehouse
         remaining = self.cost_gate.statement_cap(unit="warehouse-second")
+        if self._conn is None:
+            self._conn = self._sql_connect()
+        cursor = self._conn.cursor()
+        if getattr(self, "_utc_session", False):
+            # An engine-built session statement, a constant. It runs on the
+            # warehouse, so its time is billed, and the cap is read again after it.
+            pin = "SET TIME ZONE 'UTC'"
+            started = self._clock()
+            try:
+                cursor.execute(pin)
+            finally:
+                self._record_elapsed(started, cursor, pin)
+            remaining = self.cost_gate.statement_cap(unit="warehouse-second")
         bounds = [b for b in (remaining, cap_seconds) if b is not None]
         # Remember which bound won so a timeout kill is reported as the wall
         # limit or the budget, whichever actually fired.
         self._cap_was_wall = cap_seconds is not None and (
             remaining is None or cap_seconds < remaining
         )
-        if self._conn is None:
-            self._conn = self._sql_connect()
-        cursor = self._conn.cursor()
         if bounds:
             # An engine-built session statement, not agent SQL. STATEMENT_TIMEOUT
             # treats 0 as "no timeout", so the cap never rounds below 1: the
             # budget bound cannot (`statement_cap` refuses first) and the wall
             # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
-        if getattr(self, "_utc_session", False):
-            # An engine-built session statement too, a constant.
-            cursor.execute("SET TIME ZONE 'UTC'")
         return cursor
 
     def _record_elapsed(self, started: float, cursor: Any, sql: str) -> None:
