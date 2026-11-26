@@ -896,6 +896,9 @@ decision, not the agent's.
 | one column with role `time` | `elementary.volume_anomalies` and `elementary.freshness_anomalies`, each with that column as `timestamp_column` |
 | several columns with role `time` | `elementary.freshness_anomalies` on each; no `volume_anomalies` (`ambiguous_time_column`), since it takes one timestamp column |
 | no column with role `time` | neither (`no_time_column`): `freshness_anomalies` cannot run without one, and `volume_anomalies` without one is a different monitor (one total per run, trained only on run history) |
+| a column with role `dimension` whose cached domain is at most 20 distinct values, on a model with one `time` column | `elementary.dimension_anomalies` with `dimensions: [<column>]` and that `timestamp_column`, one test per such column |
+| a `dimension` column over 20 values, with no cached count, or flagged as personal data | no `dimension_anomalies` (`domain_too_large`, `not_profiled` or `profile_ambiguous`, `pii_flagged`) |
+| a `dimension` column on a model with no `time` column, or several | no `dimension_anomalies` (`no_time_column`, `ambiguous_time_column`), for the same reason as `volume_anomalies` |
 
 ```yaml
 models:
@@ -912,7 +915,101 @@ models:
                 monitor: {vendor: elementary, from: "columns.ordered_at.role: time"}
 ```
 
-- **Dex chooses no statistic.** Only `timestamp_column` is written.
+- **The population is the filter (#1483).** A declared `population.filters`
+  is written as the `where_expression` of every monitor the model gets, so the
+  monitors measure the rows the model promises, and a row outside them bends
+  no training history:
+
+  | Declared | `where_expression` |
+  |---|---|
+  | `includes: [placed, shipped]` | `status in ('placed', 'shipped')` (a NULL row is outside it, as it is outside the declaration) |
+  | `excludes: [cancelled]` | `(status not in ('cancelled') or status is null)`, since `not in` drops the NULL rows an `excludes` keeps |
+  | the same on a column declaring `null_rule: never` | `status not in ('cancelled')` |
+  | several filters | each as above, joined with `and` |
+  | none | no `where_expression` |
+
+  Each part holding an `or` is parenthesised: with a `timestamp_column`,
+  Elementary's table monitors read the expression as `where <timestamp> >=
+  <bucket start> and <where_expression>`, appended with no parentheses of its
+  own (`table_monitoring_query.sql`). Values are the declaration's authored
+  text, typed as declared and never cast: text as a string literal, escaped as
+  the `dex_population_filter_literal` macro escapes it (a quote doubled where a
+  backslash is ordinary, on DuckDB, Postgres and Trino; written `\'` with a
+  backslash doubled where it starts an escape, on BigQuery, Snowflake,
+  Databricks and Redshift; both doubled on ClickHouse), numbers and booleans
+  as written. `maintain verify` and the `dex_population_filter` test read the
+  column's type when they run and cast it to text where they must; a
+  `where_expression` is text fixed at plan time, so write the values in the
+  column's type (`includes: ['1', '2']` for a text column of codes). A list in
+  another type can fail in the warehouse or, where the warehouse converts
+  implicitly, change which rows the monitor counts: DuckDB matches a text
+  `'01'` against `1`. The column is written as declared, as dbt names it, and
+  quoted the way the adapter quotes it (backticks on BigQuery, Databricks and
+  ClickHouse, double quotes elsewhere) only where it must be: the entry marks
+  it `quote: true`, it is a reserved word, or it is not a plain identifier.
+  BigQuery reads its own reserved words (`range`, `partition`, `interval`,
+  `rows`, ...), from its lexical reference. Snowflake folds an unquoted name
+  to upper case, so there only its own reserved words count, and a column
+  spelled as one is written only with `quote: true`, since the case it was
+  created in is unknowable. A filter Dex cannot write withholds every monitor
+  of the model rather than writing it unfiltered: `filter_column_not_output`
+  (the model does not output the column) or `filter_unwritable` (a list mixes
+  text with numbers or booleans, a value or the column holds a Jinja
+  delimiter dbt would render, a value holds a line break, which BigQuery's
+  single-quoted strings cannot hold, a number is not finite, a Snowflake
+  reserved word lacks `quote: true`, or the column or a value needs a
+  connector's rule and none is configured). The monitor's marker gains `filter:
+  population.filters`, and its `data.decisions` entry names the
+  `where_expression` in `chosen`.
+- **A small-domain dimension is watched per value.** A column declared
+  `role: dimension` becomes the one `dimensions` entry of an
+  `elementary.dimension_anomalies`, which tracks the model's row count per
+  value of the column, where the column's domain is small: at most 20
+  distinct values by the exploration cache's `distinct_count` for the model's
+  built relation. The bound is inclusive and fixed. Each such test is
+  written with `max_distinct: 20` in its marker, and its `data.decisions`
+  entry names the bound, so a reviewer sees why the column was in. A larger
+  domain is that many series, most too thin to train, and a wider scan on
+  every run, so it is `domain_too_large`, with the count. The domain is read,
+  never measured: a column the cache holds no count for is `not_profiled`,
+  and the row and one plan warning name the `explore profile` that would
+  supply one (on a model the plan creates, `transform build --target dev`
+  first). A model name the cache holds several relations for is
+  `profile_ambiguous`. Declare again once it is profiled. A version reads
+  the relation dbt builds it as (its `alias`, else `<model>_v<N>`), and a
+  versioned model's shared entry, whose tests every version inherits, is
+  read on every version: flagged on any is flagged, unread on any is
+  unread, and the count is the largest.
+
+  ```yaml
+      - elementary.dimension_anomalies:
+          arguments:
+            dimensions: [status]
+            timestamp_column: ordered_at
+          config:
+            tags: [dex_monitor]
+            meta:
+              disable_test_samples: true
+              dex:
+                monitor:
+                  vendor: elementary
+                  from: "columns.status.role: dimension"
+                  max_distinct: 20
+  ```
+
+  One test per column, never one listing several: the package joins a
+  `dimensions` list into one combined value
+  (`dimension_monitoring_query.sql`), so `[status, channel, region]` at 20
+  values each is up to 8,000 series. A column flagged as personal data is
+  never a dimension here, at any domain size, since the test groups by its
+  values: one the cached profile flags at any confidence (a `pii_overrides`
+  entry clears that), or one the model's YAML marks (`contains_pii` or any key
+  a reader accepts). Its count is never reported. The time column follows the
+  `volume_anomalies` rule: one `time` column is the `timestamp_column`, and
+  with none or several no dimension monitor is written. The population's
+  `where_expression` is carried as on every monitor.
+- **Dex chooses no statistic.** Only `timestamp_column`, `dimensions` and the
+  population's `where_expression` are written.
   Sensitivity, `days_back`, seasonality and every other training setting stay
   the package's defaults, unless you add them to the test yourself.
 - **Only where the package is installed.** Installed under the packages
@@ -939,11 +1036,22 @@ models:
   (with or without the `elementary.` namespace) is `hand_written` and left
   exactly as written: any `volume_anomalies` on the model, since a second one
   would count its rows twice, and a `freshness_anomalies` on the same
-  `timestamp_column`. One on another column is another monitor, so Dex adds its
-  own beside it.
+  `timestamp_column`, whatever `where_expression` it carries, and a
+  `dimension_anomalies` whose `dimensions` is the same one column (compared
+  without case), whatever else it sets. One on another column, or a
+  `dimension_anomalies` grouping by several columns at once, is another
+  monitor, so Dex adds its own beside it.
 - **A monitor is never removed.** One Dex wrote whose time column the
-  declaration no longer names is `stale` (`declaration_changed`), with a note,
-  for a reviewer to remove. Unsetting `monitors.vendor` removes nothing.
+  declaration no longer names, or whose `where_expression` the population no
+  longer gives, is `stale` (`declaration_changed`), with a note, for a
+  reviewer to remove; Dex writes the current one beside it. Where the current
+  one is not written (a closed gate), the note says why and asks to keep the
+  stale one until it can be. A `dimension_anomalies` Dex wrote on a column
+  that no longer qualifies (declared another role, its cached domain now over
+  20, now flagged as personal data, or no longer output) is `stale` with
+  `changed: dimensions` and its `cause`. One whose column the cache no longer
+  counts stays `already_listed`: an empty cache is no evidence the domain
+  changed. Unsetting `monitors.vendor` removes nothing.
 - **Monitors are not generated tests.** `declarations.render_tests` does not
   govern them, they carry no cadence tag, and `data.generated_tests` neither
   lists nor prices them. The tag `dex_monitor` lets an orchestrator select or
@@ -961,11 +1069,60 @@ renders a declaration:
 | `package` | `status` (`installed`, `added_by_plan`, `not_installed`) and the installed `release` |
 | `production` | `status` (`enabled`, `disabled`, `unknown`), `reason` (see the table above), `prod_target`, and the `expression` read where it was Jinja |
 | `counts` | rows per status |
-| `monitors[]` | `model`, `test`, `column` (the timestamp column), `arguments`, `field` (the declaration field it comes from, such as `columns.ordered_at.role: time`), `status` (`added`, `already_listed`, `hand_written`, `stale`, `not_rendered`) and, where not written, `reason` |
+| `monitors[]` | `model`, `test`, `column` (the timestamp column, or on a `dimension_anomalies` the dimension column), `arguments`, `field` (the declaration field it comes from, such as `columns.ordered_at.role: time`), `status` (`added`, `already_listed`, `hand_written`, `stale`, `not_rendered`), where not written, `reason`, and on a stale row what `changed` (`timestamp_column`, `dimensions` with its `cause`, or `where_expression` where only the population moved, with the current monitor's `replacement` `status` and `reason`). A `dimension_anomalies` row also carries `bound` (20), `distinct_count` and `distinct_count_exact` where the cache counted the column (never for a column flagged as personal data), `profile` (the cached relation's `identifier` and `profiled_at`), and, where the cache could not say, the `command` that would and a `detail` |
 
 `transform declare` writes the monitors an earlier declaration owes: a model
-declared before `monitors.vendor` was set is proposed with a `monitors` field
-listing them.
+declared before `monitors.vendor` was set, or a dimension column profiled
+since it was declared, is proposed with a `monitors` field listing them.
+
+### Elementary's PII tag on personal-data columns
+
+The Elementary package keeps a sample of a failing test's rows in
+`test_result_rows`. It does not read Dex's `contains_pii` mark; it reads tags.
+With `monitors.vendor: elementary` and the package installed (or added by the
+plan), every plan tags the models it writes (their SQL, their declaration, or
+their YAML entry) so the project's own tests keep no sample of personal data:
+
+- **The column.** Each column the model's YAML marks as PII (`contains_pii`,
+  `pii`, `is_pii` or `pii_category`, at any confidence) gets the tag in
+  `config.meta.tags`, appended to any tags already there. A `false` under a
+  flag wins over a `pii_category` beside it. A tag already in `tags`,
+  `config.tags`, `meta.tags` or `config.meta.tags`, in any case, is
+  `already_tagged`. A column whose metadata sits under a top-level `meta` is
+  `not_written` (`top_level_meta`), since a `config.meta` beside it is a dbt
+  parse error.
+- **The model.** A model with such a column gets the tag in `config.tags`.
+  Elementary then keeps no sample for any test on the model, a test on one of
+  its unmarked columns included. Without the model tag, the column tag alone
+  still keeps none for a test whose query names that column or selects `*`.
+- **The switch.** The plan adds `disable_samples_on_pii_tags: true` under
+  `vars:` in `dbt_project.yml`, as a `project_yml` edit. A value the project
+  sets is kept and warned. A plan that rewrites an existing model's SQL gets
+  the tags without the switch (`withheld`): a `dbt_project.yml` edit would stop
+  that rewrite's refactor comparison and downstream impact check. Apply it,
+  then `transform declare <model>` adds the switch in a plan of its own.
+- **The tag.** `pii`, Elementary's default, or the first entry of the
+  project's own `pii_tags`. Elementary reads both vars while it runs the
+  project's test, so a block keyed by the root project's name wins over the
+  global one and a block keyed `elementary` is not read. Write `pii_tags` as a
+  list: some releases, 0.23.0 among them, match a model's tags against a single
+  string's characters, and a plan warns where it is one.
+
+A warning states the trade on every plan that tags a model. The release
+matters: before 0.19.2 the package has no such rule, and 0.19.2 to 0.19.4 read
+a model's tags but no column's `config.meta.tags`.
+
+| Field of `data.pii_tags` | Meaning |
+|---|---|
+| `tag`, `tag_source` | the tag written; `default` or `pii_tags` |
+| `switch` | `var`, `path`, `status` (`added`, `already_on`, `set_off_by_project`, `unread`, `withheld`, `not_written`) |
+| `release`, `rule` | the installed release and what it does with the tags: `none`, `model_tags_only`, `model_and_column_tags`, `unknown` |
+| `sampling` | the sentence the warning states |
+| `counts` | columns per status |
+| `models[]` | `model`, `path`, `model_tag`, and `columns[]` (`column`, `version`, `status`: `added`, `already_tagged`, `not_written`, with a `reason`) |
+
+`transform declare` proposes a model whose marks predate the tag with a
+`pii_tags` field naming the columns.
 
 ### A versioned model
 
