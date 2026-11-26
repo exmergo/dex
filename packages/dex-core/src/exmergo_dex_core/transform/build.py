@@ -63,6 +63,7 @@ from .artifact_runtime import (
     sanitize_artifact_directory,
     shared_target_dir,
 )
+from .node_record import record_node_runs
 
 # Names that mean production no matter what the config says. The build target
 # must additionally be on the allowlist (dev or the configured dbt_target); this
@@ -107,13 +108,24 @@ class DbtRunError(DexError):
     pass
 
 
-def assert_dev_target(target: str, configured: str | None = None) -> str:
+def assert_dev_target(
+    target: str, configured: str | None = None, *, prod: str | None = None
+) -> str:
     """Refuse anything that is not an explicit dev target.
 
     The denylist is checked first and wins even over the configured target, so
-    configuration alone can never route a build at production.
+    configuration alone can never route a build at production. ``prod`` is the
+    project's own production target (``dbt_prod_target``, #1462), refused by
+    name before anything else, so a production target whose name looks like
+    nothing production (``analytics``) is refused too.
     """
 
+    if prod and target.lower() == prod.lower():
+        raise ProdTargetRefusedError(
+            f"target '{target}' is the production target (dbt_prod_target in "
+            ".dex/config.yml); dex never initiates prod-target execution "
+            "(builds are dev-target only)"
+        )
     if target.lower() in _PROD_TARGET_NAMES:
         raise ProdTargetRefusedError(
             f"target '{target}' looks like production; dex never initiates "
@@ -134,6 +146,7 @@ def build(
     *,
     target: str,
     configured_target: str | None = None,
+    prod_target: str | None = None,
     select: str | None = None,
     ceiling: float | None = None,
     confirmed: bool = False,
@@ -200,7 +213,7 @@ def build(
     reason; without it the build runs as it always has.
     """
 
-    assert_dev_target(target, configured_target)
+    assert_dev_target(target, configured_target, prod=prod_target)
 
     if project_dir is None:
         raise DbtRunError("no dbt project directory resolved for the build")
@@ -367,9 +380,9 @@ def build(
         seed_argv = [_dbt_executable(), "seed", "--full-refresh", *flags]
         seed_argv += ["--select", " ".join(_exact_seed(node) for node in stale)]
         clear_run_results(artifacts)
-        seeded = _summarize(
-            project, target, run(seed_argv), artifact_directory=artifacts
-        )
+        seed_run = run(seed_argv)
+        record_node_runs(artifacts)
+        seeded = _summarize(project, target, seed_run, artifact_directory=artifacts)
         try:
             remember_seed_types(artifacts, seed_history_directory, target)
         except (OSError, ValueError) as exc:
@@ -388,6 +401,9 @@ def build(
         # results are the evidence; the refresh's are not.
         clear_run_results(artifacts)
     completed = run(argv)
+    # Before anything else reads or replaces it: the next build overwrites this
+    # run_results.json, and the record keeps what this one attempted (#1524).
+    record_node_runs(artifacts)
 
     summary = _summarize(
         project,
@@ -911,25 +927,122 @@ class ShadowRun:
             missing_ok=True
         )
 
-    def strip_run_hooks(self) -> bool:
-        """Drop ``on-run-start`` and ``on-run-end`` from the copy. True if any went.
+    def strip_run_hooks(self) -> list[str]:
+        """Drop ``on-run-start`` and ``on-run-end`` from the copy.
 
         A hook fires once per invocation, and this runs dbt once per mutant, so a
         project whose hooks grant permissions or write an audit row would do that
         N+1 times for a command the user thinks of as read-only.
+
+        dbt also runs the hooks every installed package declares in its own
+        ``dbt_project.yml`` (``task/run.py``, 1.11.11 and 1.12.5), and a
+        package such as Elementary declares them there and nowhere else, so
+        those go too (#1307). Only files inside the copy are written. Returns
+        the project names whose hooks went, the root project's first.
         """
 
-        manifest = self._require_shadow() / "dbt_project.yml"
-        if not manifest.is_file():
-            return False
-        parsed = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-        present = [key for key in ("on-run-start", "on-run-end") if key in parsed]
-        if not present:
-            return False
-        for key in present:
-            parsed.pop(key)
-        manifest.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
-        return True
+        stripped: list[str] = []
+        for path, inside in self._project_files():
+            # A file that may lie outside the copy is never written.
+            if not inside:
+                continue
+            parsed = _hooked_project(path)
+            if parsed is None:
+                continue
+            for key in _RUN_HOOK_KEYS:
+                parsed.pop(key, None)
+            path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+            stripped.append(_project_label(parsed, path))
+        return stripped
+
+    def run_hooks_outside_copy(self) -> list[str]:
+        """The installed packages whose run hooks ``strip_run_hooks`` cannot reach.
+
+        An absolute or far-climbing ``packages-install-path`` names the same
+        directory from the copy as from the project, so the packages there are
+        not copied and their ``dbt_project.yml`` is the real one, which is
+        never written. dbt still runs the hooks it declares on every
+        invocation, so a caller that runs dbt once per mutant refuses where
+        this is not empty. Read only.
+        """
+
+        return [
+            _project_label(parsed, path)
+            for path, inside in self._project_files()
+            if not inside and (parsed := _hooked_project(path)) is not None
+        ]
+
+    def _project_files(self) -> list[tuple[Path, bool]]:
+        """The copy's root ``dbt_project.yml`` and each installed package's,
+        with whether it lies inside the copy."""
+
+        shadow = self._require_shadow()
+        files = [shadow / "dbt_project.yml"]
+        packages = packages_dir(shadow)
+        if packages.is_dir():
+            files.extend(
+                directory / "dbt_project.yml"
+                for directory in sorted(packages.iterdir())
+                if directory.is_dir()
+            )
+        located: list[tuple[Path, bool]] = []
+        for path in files:
+            try:
+                inside = path.resolve().is_relative_to(shadow.resolve())
+            except (OSError, ValueError):
+                inside = False
+            located.append((path, inside))
+        return located
+
+    def disable_package_models(self, package: str) -> Callable[[], None]:
+        """Disable every model of ``package`` in the copy, and return the undo.
+
+        Written as ``models: <package>: +enabled: false`` in the copy's root
+        ``dbt_project.yml``, over whatever the project set there. dbt gives a
+        package's ``on-run-*`` operations the package's model config, so they
+        are disabled with the models (read at Elementary 0.16.4 and 0.26.1). A
+        more specific ``+enabled`` further down the package's tree still wins,
+        so a caller reads the parse afterwards rather than trusting the write.
+        """
+
+        def disable(parsed: dict[str, Any]) -> None:
+            models = parsed.get("models")
+            if not isinstance(models, dict):
+                models = parsed["models"] = {}
+            scope = models.get(package)
+            if not isinstance(scope, dict):
+                scope = models[package] = {}
+            scope.pop("enabled", None)
+            scope["+enabled"] = False
+
+        return self._edit_root_project(disable)
+
+    def set_project_flag(self, name: str, value: Any) -> Callable[[], None]:
+        """Set one of dbt's ``flags`` in the copy's root ``dbt_project.yml``, and
+        return the undo. dbt validates the whole block, so a caller reads the
+        parse afterwards rather than trusting the write."""
+
+        def flag(parsed: dict[str, Any]) -> None:
+            flags = parsed.get("flags")
+            if not isinstance(flags, dict):
+                flags = parsed["flags"] = {}
+            flags[name] = value
+
+        return self._edit_root_project(flag)
+
+    def _edit_root_project(
+        self, change: Callable[[dict[str, Any]], None]
+    ) -> Callable[[], None]:
+        path = self._require_shadow() / "dbt_project.yml"
+        original = path.read_text(encoding="utf-8")
+        parsed = yaml.safe_load(original) or {}
+        change(parsed)
+        path.write_text(yaml.safe_dump(parsed, sort_keys=False), encoding="utf-8")
+
+        def undo() -> None:
+            path.write_text(original, encoding="utf-8")
+
+        return undo
 
     def strip_semantic_models(self, model: str) -> bool:
         """Drop semantic models referencing ``model`` from the copy.
@@ -1003,6 +1116,15 @@ class ShadowRun:
         if not path.is_file():
             raise DbtRunError("dbt wrote no manifest for the copied project")
         return json.loads(path.read_text(encoding="utf-8"))
+
+    def parse(self) -> dict[str, Any]:
+        """Parse the copy and return the manifest dbt wrote. Opens no connection."""
+
+        completed = self._invoke("parse")
+        if completed.returncode != 0:
+            messages = _collect_messages(completed)
+            raise DbtRunError(messages[0] if messages else "dbt parse failed")
+        return self.manifest()
 
     def compile(
         self, select: str, *, vars_: Mapping[str, Any] | None = None
@@ -1743,6 +1865,28 @@ def packages_dir(project_dir: Path | str) -> Path:
     return project / configured
 
 
+_RUN_HOOK_KEYS = ("on-run-start", "on-run-end")
+
+
+def _hooked_project(path: Path) -> dict[str, Any] | None:
+    """A ``dbt_project.yml`` that declares a run hook, parsed, or ``None``."""
+
+    try:
+        if not path.is_file():
+            return None
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    if not isinstance(parsed, dict) or not any(k in parsed for k in _RUN_HOOK_KEYS):
+        return None
+    return parsed
+
+
+def _project_label(parsed: dict[str, Any], path: Path) -> str:
+    name = parsed.get("name")
+    return str(name) if name else path.parent.name
+
+
 def _configured_install_path(project: Path) -> Any:
     """``packages-install-path`` as written, before dbt renders it."""
 
@@ -2148,6 +2292,46 @@ def compile_estimate(
     return total, per_node, notes
 
 
+def unpriced_elementary_work(
+    project_dir: Path | str, artifact_directory: Path | str | None = None
+) -> Any:
+    """What the Elementary package runs in this build that the estimate misses.
+
+    Read from the pricing compile's own artifacts: its manifest, parsed for the
+    build's target, and its ``run_results.json``, the build's selection
+    (#1309). Returns an :class:`~.elementary.UnpricedWork`, empty where the
+    package is not installed, is disabled for the target, or the artifacts
+    cannot be read, since a reading that fails here must not cost the build
+    its estimate.
+    """
+
+    from . import elementary
+
+    project = Path(project_dir)
+    directory = (
+        Path(artifact_directory)
+        if artifact_directory is not None
+        else resolve_build_artifact_dir(project)
+    )
+    paths = artifact_paths(directory)
+    try:
+        manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+        selected = {
+            str(r["unique_id"])
+            for r in json.loads(paths.run_results.read_text(encoding="utf-8")).get(
+                "results", []
+            )
+            if r.get("unique_id")
+        }
+    except (OSError, ValueError, AttributeError):
+        return elementary.UnpricedWork()
+    runtime = elementary.read(project, manifest)
+    project_yml: str | None = None
+    with contextlib.suppress(OSError, UnicodeError):
+        project_yml = (project / "dbt_project.yml").read_text(encoding="utf-8")
+    return elementary.unpriced_work(runtime, manifest, project_yml, selected=selected)
+
+
 def _count(n: int, noun: str) -> str:
     return f"{n} {noun}{'' if n == 1 else 's'}"
 
@@ -2284,8 +2468,8 @@ def _assert_compiled_functions(
 
     try:
         paths = artifact_paths(artifacts)
-        results = json.loads(paths.run_results.read_text())
-        manifest = json.loads(paths.manifest.read_text())
+        results = json.loads(paths.run_results.read_text(encoding="utf-8"))
+        manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
         selected = results["results"]
         nodes = manifest["nodes"]
         if not isinstance(selected, list) or not isinstance(nodes, dict):
@@ -2640,9 +2824,9 @@ def _failed_node(completed: subprocess.CompletedProcess) -> tuple[str, str] | No
         found = _NODE_FAILURE.search(clean)
         if found is None:
             continue
-        rest = [
-            part.strip() for part in clean[found.end() :].splitlines() if part.strip()
-        ]
+        # Masked before the split: a value can span a line break (#1412).
+        tail = mask_values(clean[found.end() :])
+        rest = [part.strip() for part in tail.splitlines() if part.strip()]
         reason = rest[0] if rest else found.group(0)
         return found.group(1).strip(), redact(mask_values(reason))[:300]
     return None
@@ -2694,7 +2878,12 @@ def _collect_messages(
         info = event.get("info", {})
         if info.get("level") not in {"error", "warn"} or not info.get("msg"):
             continue
-        msg = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
+        # A model that fails on a cast fails in the warehouse's words, which
+        # can quote the row's value; masked whole, before the message is split
+        # into lines (a value can span one, #1412) or capped (a cut could strand
+        # a value without its closing quote, #1070).
+        raw = redact(_ANSI_ESCAPE.sub("", str(info["msg"])))
+        msg = mask_values(raw)
         msg_lines = msg.splitlines()
         # A unit test's failure opens with blank lines before its diff, so the
         # first line with something on it is the one that names the failure.
@@ -2724,14 +2913,10 @@ def _collect_messages(
                     cause = " ".join([cause, *details])
                 sep = "" if first_line.endswith(":") else ":"
                 first_line = f"{first_line}{sep} {cause}"
-        # A model that fails on a cast fails in the warehouse's words, which
-        # can quote the row's value; masked before the cap so a cut cannot
-        # strand a value without its closing quote (#1070).
-        first_line = mask_values(first_line)
         if len(first_line) > _MESSAGE_MAX_CHARS:
             first_line = first_line[:_MESSAGE_MAX_CHARS] + _MESSAGE_CUT_NOTE
             trimmed = True
-        if first_line != msg:
+        if first_line != raw:
             trimmed = True
         if first_line in seen:
             trimmed = True
@@ -2756,7 +2941,8 @@ def _collect_messages(
     messages = primary + deprecations
 
     if not messages and completed.stderr:
-        messages.append(redact(mask_values(completed.stderr.strip().splitlines()[-1])))
+        last = mask_values(completed.stderr.strip()).splitlines()[-1]
+        messages.append(redact(last))
     if len(messages) > _MESSAGE_CAP:
         messages = messages[:_MESSAGE_CAP]
         trimmed = True

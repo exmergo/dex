@@ -154,7 +154,8 @@ def test_a_skipped_node_with_no_identifiable_cause_is_still_reported(tmp_path: P
     findings, _notes = build_status_findings(tmp_path)
     assert len(findings) == 1
     assert findings[0].severity == "low"
-    assert findings[0].data == {}
+    assert "caused_by" not in findings[0].data
+    assert findings[0].data["run"]["invoked_by"] == "outside_dex"
 
 
 def test_a_successful_node_reports_nothing(tmp_path: Path):
@@ -1686,6 +1687,7 @@ def test_verify_reports_a_compile_failure_first_and_suppresses_the_rest(
         "population",
         "parent_population",
         "temporal",
+        "freshness",
     }
 
 

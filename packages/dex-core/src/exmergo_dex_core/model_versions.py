@@ -300,6 +300,33 @@ def split_label(name: str) -> tuple[str, str | None]:
     return name, None
 
 
+def ref_call(name: str) -> str:
+    """The ``ref()`` a test argument names ``name`` with: ``ref('dim_teams',
+    v=2)`` for a version label (``v='beta'`` for one that is not a number),
+    ``ref('dim_teams')`` otherwise. dbt renders a
+    generic test's arguments as Jinja, so the string resolves as a ref."""
+
+    base, version = split_label(name)
+    if version is not None:
+        # dbt takes a number or any string as a version: a number is written
+        # bare, anything else as a quoted string, which Jinja would otherwise
+        # read as a variable (`v=beta`).
+        # A leading zero (`01`) is no Jinja number either: quoted, it keeps
+        # the label as declared.
+        numeric = (
+            version.isascii()
+            and version.replace(".", "", 1).isdigit()
+            and not (len(version) > 1 and version[0] == "0" and version[1] != ".")
+        )
+        literal = (
+            version
+            if numeric
+            else "'" + version.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        )
+        return f"ref('{base}', v={literal})"
+    return f"ref('{name}')"
+
+
 def resolve(name: str, vmap: Mapping[str, VersionedModel]) -> list[str] | None:
     """The version labels ``name`` selects, or ``None`` when it names no version.
 

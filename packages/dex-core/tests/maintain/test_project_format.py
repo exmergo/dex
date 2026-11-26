@@ -22,6 +22,7 @@ import types
 from pathlib import Path
 
 import pytest
+import yaml
 
 from exmergo_dex_core.dbt_project import (
     ApplyResult,
@@ -35,6 +36,7 @@ from exmergo_dex_core.maintain.snapshot import (
     SourceTable,
     TransformLayer,
 )
+from exmergo_dex_core.transform.declarations import parse_declarations, render
 from exmergo_dex_core.transform.plans import EditKind, contained_key
 
 _NOTE = "models are assets in an orchestrated graph, so no file backs a definition"
@@ -156,6 +158,7 @@ def test_verify_runs_portable_checks_through_the_project_format(
         "population",
         "parent_population",
         "temporal",
+        "freshness",
     }
     assert all(
         "'graph' project format does not provide dbt target/ artifacts" in reason
@@ -599,6 +602,78 @@ def test_a_nullability_change_adds_and_removes_the_not_null_test(sidecar_repo):
     # The other declared test survives: only the one the drift is about moves.
     assert "-        tests: [not_null, unique]" in diff["unified"]
     assert "+        tests: [unique]" in diff["unified"]
+
+
+@pytest.mark.parametrize(
+    "listed", ["", "        tests:\n          - unique\n"], ids=["no-list", "block"]
+)
+def test_a_not_null_reconcile_adds_carries_the_unsampled_flag(sidecar_repo, listed):
+    """A test reconcile adds is one dex renders, so it keeps no failing-row sample.
+
+    Bare `- not_null` would be the one dex test Elementary still samples (#1306).
+    Both shapes: a column with no list, and a block list it extends.
+    """
+
+    sidecar = sidecar_repo.root / _SIDECAR
+    sidecar.write_text(
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+        "      - name: order_id\n" + listed + "      - name: status\n",
+        encoding="utf-8",
+    )
+    sidecar_repo.dex("explore", "map")
+    _schema_drift(sidecar_repo, "ALTER TABLE orders ALTER order_id SET NOT NULL")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    written = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
+    [order_id, _status] = written["models"][0]["columns"]
+    unsampled = {"config": {"meta": {"disable_test_samples": True}}}
+    assert order_id.get("tests", order_id.get("data_tests")) == (
+        ["unique"] if listed else []
+    ) + [{"not_null": unsampled}]
+
+
+@pytest.mark.parametrize(
+    "listed", [None, "        tests: [unique]\n"], ids=["block", "flow"]
+)
+def test_a_column_that_starts_accepting_nulls_loses_the_not_null_dex_rendered(
+    sidecar_repo, listed
+):
+    """The `not_null` a declaration rendered is a mapping, and it still moves.
+
+    A rendered test carries Elementary's unsampled flag, so it is a mapping item
+    rather than a bare name. Reconcile has to recognise that exact body as its
+    own: missing it would keep a test the source can no longer pass. Block style
+    from an entry with no list, flow style from one that already had `unique`.
+    """
+
+    [declaration] = parse_declarations(
+        [{"model": "orders", "columns": {"order_id": {"null_rule": "never"}}}]
+    )
+    sidecar = sidecar_repo.root / _SIDECAR
+    base = (
+        "version: 2\nmodels:\n  - name: orders\n    columns:\n"
+        "      - name: order_id\n" + (listed or "") + "      - name: status\n"
+    )
+    sidecar.write_text(render(base, declaration), encoding="utf-8")
+    assert "disable_test_samples" in sidecar.read_text(encoding="utf-8")
+    sidecar_repo.sql("ALTER TABLE orders ALTER order_id SET NOT NULL")
+    sidecar_repo.dex("explore", "map")
+    sidecar_repo.snapshot()
+    sidecar_repo.sql("ALTER TABLE orders ALTER order_id DROP NOT NULL")
+    sidecar_repo.dex("maintain", "schema")
+
+    rc, payload = sidecar_repo.dex("maintain", "reconcile", "schema")
+
+    assert rc == 0, payload.get("errors")
+    sidecar_repo.dex("transform", "apply", payload["data"]["plan_id"])
+    written = yaml.safe_load(sidecar.read_text(encoding="utf-8"))
+    [order_id, _status] = written["models"][0]["columns"]
+    assert order_id.get("data_tests", order_id.get("tests")) == (
+        ["unique"] if listed else None
+    )
 
 
 def test_grain_and_schema_drift_on_one_table_arrive_as_one_edit(sidecar_repo):

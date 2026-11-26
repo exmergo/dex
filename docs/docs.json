@@ -163,7 +163,8 @@
           {
             "group": "Project quality",
             "pages": [
-              "reference/evaluation"
+              "reference/evaluation",
+              "reference/incidents"
             ],
             "icon": "badge-check"
           }

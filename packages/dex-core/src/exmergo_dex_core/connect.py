@@ -762,6 +762,8 @@ def dev_target_scope(connector: str, target) -> str | None:
 
     if target is None:
         return None
+    if connector != "duckdb" and getattr(target, "dev", None):
+        return target.dev
     if connector == "bigquery":
         return target.dev_dataset or None
     if connector == "snowflake":
@@ -781,6 +783,24 @@ def dev_target_scope(connector: str, target) -> str | None:
             return f"{target.dev_catalog}.{target.dev_schema}"
         return None
     return None
+
+
+def prod_target_scope(connector: str, target) -> str | None:
+    """Where the project's models build in production (``<connector>.prod``,
+    #1462), spelled as a scope entry of ``connector``, or ``None`` when the
+    config names none.
+
+    The production counterpart of :func:`dev_target_scope`, and unlike it never
+    a source scope or a place dex writes: dex reads only the catalog metadata of
+    relations in it (names, row counts, bytes), for the plan's estimate of what
+    its generated tests cost per production run. It never narrows or widens the
+    source allowlist, and ``--scope`` neither reaches nor drops it. DuckDB's is
+    a schema of the file dex already reads.
+    """
+
+    if target is None:
+        return None
+    return getattr(target, "prod", None) or None
 
 
 def derived_dev_scopes(

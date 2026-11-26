@@ -1,4 +1,4 @@
-name: Upstream canaries (sqlglot, DuckDB, next Python)
+name: Upstream canaries (sqlglot, DuckDB, next Python, Elementary)
 
 # A weekly run of the suite against the newest sqlglot, above the ceiling the
 # project declares. The query firewall matches sqlglot expression classes by name
@@ -46,6 +46,16 @@ name: Upstream canaries (sqlglot, DuckDB, next Python)
 # (test_python_support.py lists them), and refresh the lock. Before the install it prints which resolved packages still have no
 # wheel for the version, which names the blocker whether or not a source build
 # would rescue it.
+#
+# `elementary-release` watches the dbt package hub for a release of the
+# Elementary package newer than the newest slot of the Elementary fixture's
+# release matrix (#1446; the matrix and the rule for adding a release are in
+# CONTRIBUTING.md). It reads the hub's public, keyless API, the URL `dbt deps`
+# builds, and the engine's TESTED_RELEASES, with the runner's own Python and no
+# install, so it needs no secret. Red means a new release is out and a person
+# opens the pull request the rule describes; the job opens none itself, since a
+# pull request the workflow's token opens runs no workflow and the fixture never
+# runs on a pull request.
 
 on:
   schedule:
@@ -210,3 +220,11 @@ jobs:
       - name: Suite on the next Python
         if: runner.os == 'Linux'
         run: '"$RUNNER_TEMP/next-venv/bin/python" -m pytest -q -m "not packaging"'
+
+  elementary-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The newest Elementary release on the dbt package hub is in the matrix
+        run: python3 scripts/check_elementary_release.py

@@ -23,7 +23,7 @@ import contextlib
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from . import command_args
 from . import envelope as env
@@ -120,6 +120,13 @@ COMMAND_SURFACE: dict[str, list[str]] = {
         # coverage: which resources the dbt tests reach, from the manifest
         # alone (#1280); free and connectionless, no baseline required.
         "coverage",
+        # incidents: the run history of the tests, from Elementary's tables
+        # and dbt's run results (#1472); a bounded read, priced first.
+        "incidents",
+        # diagnose: each open incident bisected to a cause, confirmed by the
+        # checks Dex already has (#1475); the incident read, then the checks,
+        # each priced first.
+        "diagnose",
     ],
     # config: read, check and change `.dex/config.yml` itself. Routed in `main`
     # before an engine is built, because every engine is built from that file
@@ -184,11 +191,13 @@ def _rewrite_unambiguous_bare_subcommand(argv: list[str]) -> list[str]:
 
 
 def _bare_subcommand_suggestion(token: str) -> str | None:
+    """The groups an ambiguous bare subcommand could mean, else None. A group
+    name is not a bare subcommand, and a name only one group defines was already
+    rewritten by `_rewrite_unambiguous_bare_subcommand`, so argparse refused it
+    for some other reason and a tip would point an agent at the wrong fix."""
     groups = _bare_subcommand_index().get(token, [])
-    if not groups:
+    if token in COMMAND_SURFACE or len(groups) < 2:
         return None
-    if len(groups) == 1:
-        return f"did you mean '{groups[0]} {token}'?"
     listed = ", ".join(f"'{g} {token}'" for g in groups)
     return f"subcommand '{token}' is ambiguous; try one of: {listed}"
 
@@ -568,6 +577,23 @@ _SUBCOMMAND_HELP: dict[tuple[str, str], tuple[str, str]] = {
         "manifest, run results and .dex/ only. --mutate refreshes stale and "
         "missing scores in one batch, behind one cost handshake.",
     ),
+    ("maintain", "incidents"): (
+        "list the test incidents the run history holds",
+        "Fold test outcomes from Elementary's tables and dbt's run results into "
+        "incidents: open, closed or no longer observed, each with its coverage "
+        "and retention bound. Reads the newest 20 invocations by default "
+        "(--invocations widens it), priced first on billed connectors; never "
+        "reads past the source allowlist.",
+    ),
+    ("maintain", "diagnose"): (
+        "diagnose each open test incident to a cause",
+        "Bisect each open incident over its coverage timeline, bound the break "
+        "with the committed maintain snapshot series where there is one, and "
+        "confirm each candidate cause with a check Dex already has. Answers one "
+        "cause, several, or none, with what was ruled out and the window no "
+        "recorded state covers; a confirmed cause's repair is handed to "
+        "transform, never written here.",
+    ),
     ("config", "get"): (
         "show effective settings and where each came from",
         "Print every setting, or those under a key, with its value and source. "
@@ -625,10 +651,25 @@ ranks what matters, profiles it, and infers how the tables join.
 """
 
 
+class _Parser(argparse.ArgumentParser):
+    """Subparsers are built with the parser's own class, so every verb uses this
+    ``error``. It still raises SystemExit(2), what argparse always raised, so a
+    caller of ``parse_args`` sees no change; the refusal text rides on the cause
+    so ``main`` can print it as an envelope (#1404). Not a class of its own: a
+    SystemExit subclass in the package would be a refusal that cannot be caught
+    as DexError."""
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        text = f"{self.prog}: error: {message}"
+        print(text, file=sys.stderr)
+        raise SystemExit(2) from argparse.ArgumentError(None, text)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """The argparse tree for every group and subcommand."""
 
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="dex",
         description=(
             "Explore an unfamiliar warehouse, transform it with reviewable\n"
@@ -710,6 +751,11 @@ def _build_parser() -> argparse.ArgumentParser:
                 "--in-place",
                 action="store_true",
                 help="scaffold dbt in the current directory",
+            )
+            gp.add_argument(
+                "--no-elementary",
+                action="store_true",
+                help="leave the Elementary package out of the project or plan",
             )
         if group == "demo":
             # Positional rather than --path: --path names the warehouse dex
@@ -1145,6 +1191,25 @@ def _build_parser() -> argparse.ArgumentParser:
                         default=argparse.SUPPRESS,
                         help="also read the configured hosted semantic layer's catalog",
                     )
+                # Ranking leaves the Elementary dbt package's own tables out by
+                # default (#1311), and so do the diagram and relationship
+                # inference (#1494); this brings them back. Spends nothing on
+                # inventory or diagram; on map and relationships it makes them
+                # worth profiling, so the usual handshake prices them like any
+                # other object.
+                include_elementary_help = {
+                    "inventory": "rank the Elementary package's own tables too",
+                    "map": "rank the Elementary package's own tables too",
+                    "relationships": "profile the Elementary package's own tables too",
+                    "diagram": "draw the Elementary package's own tables too",
+                }
+                if group == "explore" and name in include_elementary_help:
+                    sp.add_argument(
+                        "--include-elementary",
+                        action="store_true",
+                        default=argparse.SUPPRESS,
+                        help=f"{include_elementary_help[name]} (left out by default)",
+                    )
                 # transform init takes the project name; plan the intent; apply
                 # the plan id; macro the shipped-macro name (none lists them).
                 # One `argument` dest across these, so the handlers read one
@@ -1268,6 +1333,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         dest="attribute_rows",
                         action="store_false",
                         help="name row-affecting changes without measuring them",
+                    )
+                    sp.add_argument(
+                        "--no-parse",
+                        action="store_true",
+                        default=False,
+                        help="store the plan without running dbt: no parse, no compile",
                     )
                 if group == "transform" and name == "build":
                     sp.add_argument(
@@ -1502,7 +1573,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         action="append",
                         default=None,
                         metavar="COLUMN",
-                        help="baseline key column, repeatable; default: declared grain",
+                        help=(
+                            "baseline key column, repeatable or comma-separated; "
+                            "default: declared grain"
+                        ),
                     )
                     sp.add_argument(
                         "--accept-type",
@@ -1671,6 +1745,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     "semantic",
                     "verify",
                     "coverage",
+                    "incidents",
+                    "diagnose",
                 }:
                     sp.add_argument(
                         "objects",
@@ -1679,7 +1755,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help=(
                             "model names: repeated, comma-separated or "
                             "space-separated (default: all)"
-                            if name == "verify"
+                            if name in {"verify", "incidents", "diagnose"}
                             else "model, source.table, snapshot or seed names "
                             "(default: all)"
                             if name == "coverage"
@@ -1721,6 +1797,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         help=(
                             "dbt dev target --mutate runs against; "
                             "prod-looking targets are refused"
+                        ),
+                    )
+                if group == "maintain" and name in {"incidents", "diagnose"}:
+                    sp.add_argument(
+                        "--invocations",
+                        type=int,
+                        default=None,
+                        metavar="N",
+                        help=(
+                            "read the newest N invocations of Elementary's "
+                            "tables (default 20, at most 2000)"
                         ),
                     )
                 if group == "maintain" and name == "reconcile":
@@ -1859,9 +1946,14 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         # depend on the very connector it deliberately does not touch.
         # `coverage` reads a parsed manifest and nothing else (#1280).
         # `--mutate` is the one part of it that runs dbt against the warehouse.
+        # `incidents` reads dbt's run results from files, and opens a connection
+        # only for Elementary's tables, whose reader asks for the sql extra
+        # itself and reports the source refused where it is missing (#1472).
         connectionless = (
-            args.subcommand == "coverage" and not getattr(args, "mutate", False)
-        ) or (args.subcommand == "snapshot" and getattr(args, "project_only", False))
+            (args.subcommand == "coverage" and not getattr(args, "mutate", False))
+            or (args.subcommand == "snapshot" and getattr(args, "project_only", False))
+            or args.subcommand == "incidents"
+        )
         if not connectionless:
             ensure_dialect_available()
         from .maintain import commands as maintain_cmds
@@ -1876,6 +1968,8 @@ def _run(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             "reconcile": maintain_cmds.cmd_reconcile,
             "verify": maintain_cmds.cmd_verify,
             "coverage": maintain_cmds.cmd_coverage,
+            "incidents": maintain_cmds.cmd_incidents,
+            "diagnose": maintain_cmds.cmd_diagnose,
         }
         return handlers[args.subcommand](args, engine)
 
@@ -1989,6 +2083,24 @@ def _apply_authors_sql(args: argparse.Namespace, engine: Any) -> bool:
         return True
 
 
+def _asks_values_free(parser: argparse.ArgumentParser, raw: list[str]) -> bool:
+    """Whether ``raw`` turns on ``--values-free`` the way argparse reads it, an
+    unambiguous abbreviation (``--values-fr``) included, for a refusal that never
+    got parsed args to read the flag off."""
+
+    for token in raw:
+        name = token.split("=", 1)[0]
+        if name == "--values-free":
+            return True
+        if not name.startswith("--") or name in parser._option_string_actions:
+            continue
+        # argparse's own prefix match, so ambiguity and minimum length agree.
+        matches = parser._get_option_tuples(name)
+        if len(matches) == 1 and matches[0][0].dest == "values_free":
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     from .command_args import repo_root
     from .connect import paradigm_for
@@ -2032,6 +2144,25 @@ def main(argv: list[str] | None = None) -> int:
             tip = _bare_subcommand_suggestion(token) if token else None
             if tip:
                 print(f"dex: {tip}", file=sys.stderr)
+            if isinstance(exc.__cause__, argparse.ArgumentError):
+                # Every outcome prints one envelope, an argument refusal too (#1404).
+                refusal = env.error(str(exc.__cause__), reason=env.Reason.REQUEST)
+                if tip:
+                    refusal.errors.append(tip)
+                # No parsed args, so the mode and cap come from what main would
+                # have read; a malformed value leaves them unset rather than
+                # replacing the argument error that is the real refusal here.
+                result_mode: ResultMode | None = None
+                session_cap: SessionCeilingCap | None = None
+                with contextlib.suppress(Exception):
+                    result_mode = _result_mode(
+                        argparse.Namespace(values_free=_asks_values_free(parser, raw))
+                    )
+                with contextlib.suppress(Exception):
+                    session_cap = parse_session_ceiling_cap(
+                        os.environ.get(SESSION_CEILING_CAP_ENV), source="environment"
+                    )
+                return _emit(refusal, result_mode, session_cap)
         raise
     # The connector in play, for envelopes that never priced anything and so
     # never stamped a paradigm of their own. Read off the engine as soon as it
@@ -2054,11 +2185,11 @@ def main(argv: list[str] | None = None) -> int:
     internal_exception: str | None = None
     # Resolved before anything can refuse, so even a refusal states the mode. An
     # unknown DEX_RESULT_MODE is itself a refusal, rendered below like any other.
-    result_mode: ResultMode | None = None
+    result_mode = None
     # The host's cap on the daily ceiling (#787), resolved alongside the mode for
     # the same reason: a refusal should still say it, and a malformed one is
     # itself a refusal.
-    session_cap: SessionCeilingCap | None = None
+    session_cap = None
     # Building the engine is inside the handler, not before it: it reads the
     # config file and constructs the configured storage backend, and both can
     # refuse. Every agent wrapper expects exactly one envelope on stdout, so a
@@ -2244,6 +2375,16 @@ def main(argv: list[str] | None = None) -> int:
             exception=internal_exception,
             result_mode=result_mode.value if result_mode else None,
         )
+
+    return _emit(envelope, result_mode, session_cap)
+
+
+def _emit(
+    envelope: env.Envelope,
+    result_mode: ResultMode | None,
+    session_cap: SessionCeilingCap | None,
+) -> int:
+    """Stamp what every envelope carries, print it, and return the exit code."""
 
     # Every envelope a values-free process prints says so, refusals and asks
     # included, so a host can assert the mode on whatever comes back (#591).

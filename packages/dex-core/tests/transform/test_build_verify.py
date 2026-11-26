@@ -1976,6 +1976,180 @@ def test_a_build_measures_a_join_through_a_filtered_cte_over_its_filter(
     assert record["effective_input"]["to"]["filters"] == ['"is_active"']
 
 
+_GROUPED_SQL = (
+    "with orders_by_customer as (select customer_id, count(*) as order_count, "
+    'sum(amount) as total_amount from "wh"."dbt_dev"."orders" '
+    "where status = 'paid' group by customer_id) "
+    'select c.customer_id, c.name, o.order_count from "wh"."dbt_dev"."customers" c '
+    "left join orders_by_customer o on c.customer_id = o.customer_id"
+)
+
+
+def test_a_build_measures_a_join_through_a_grouped_cte_over_its_groups(
+    tmp_path: Path,
+):
+    """The grouped-key support `maintain verify` has, through the build sweep
+    (#1324): two parents have a paid group, one has none, and the record's
+    denominator is the grouped input's groups, not the child's rows."""
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.customers AS SELECT * FROM (VALUES "
+        "('c1', 'Ada'), ('c2', 'Grace'), ('c3', 'Edsger')) "
+        "t(customer_id, name)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.orders AS SELECT * FROM (VALUES "
+        "('c1', 10.0, 'paid'), ('c1', 5.0, 'paid'), ('c2', 7.0, 'cancelled'), "
+        "('c2', 3.0, 'paid')) t(customer_id, amount, status)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_customers AS " + _GROUPED_SQL.replace('"wh".', "")
+    )
+    conn.close()
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.rpt_customers": {
+                "name": "rpt_customers",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."rpt_customers"',
+                "compiled_code": _GROUPED_SQL,
+                "config": {"materialized": "table"},
+            }
+        },
+        results=[{"unique_id": "model.p.rpt_customers", "status": "success"}],
+    )
+    adapter = DuckDBAdapter(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_customers")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    assert result.findings == []
+    (record,) = result.payload()["join_coverage"]
+    assert record["status"] == "satisfied"
+    assert record["optional_unmatched"] is True
+    assert record["measured"]["rows"] == 3
+    assert record["measured"]["matched_rows"] == 2
+    assert record["measured"]["group_rows"] == 2
+    assert record["effective_input"]["to"]["grouped_by"] == ["customer_id"]
+
+
+def _grouped_build(tmp_path: Path, *, customers: str, orders: str):
+    """Build the grouped rollup against the given customers/orders rows.
+
+    Returns the warehouse path and the adapter class, so a case can run
+    ``verify_build`` itself and assert what it measured.
+    """
+
+    duckdb = pytest.importorskip("duckdb")
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+
+    path = tmp_path / "wh.duckdb"
+    conn = duckdb.connect(str(path))
+    conn.execute("CREATE SCHEMA dbt_dev")
+    conn.execute(
+        "CREATE TABLE dbt_dev.customers AS SELECT * FROM (VALUES "  # noqa: S608
+        f"{customers}) t(customer_id, name)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.orders AS SELECT * FROM (VALUES "  # noqa: S608
+        f"{orders}) t(customer_id, amount, status)"
+    )
+    conn.execute(
+        "CREATE TABLE dbt_dev.rpt_customers AS " + _GROUPED_SQL.replace('"wh".', "")
+    )
+    conn.close()
+    _artifacts(
+        tmp_path,
+        nodes={
+            "model.p.rpt_customers": {
+                "name": "rpt_customers",
+                "resource_type": "model",
+                "relation_name": '"wh"."dbt_dev"."rpt_customers"',
+                "compiled_code": _GROUPED_SQL,
+                "config": {"materialized": "table"},
+            }
+        },
+        results=[{"unique_id": "model.p.rpt_customers", "status": "success"}],
+    )
+    return path, DuckDBAdapter
+
+
+def test_a_build_marks_a_grouped_input_with_no_groups_not_applicable(
+    tmp_path: Path,
+):
+    """A zero-child fixture through the build sweep (#1324): every child row is
+    filtered out, so the grouped input has no groups. That is an undefined
+    coverage, not a zero-match join."""
+
+    path, adapter_cls = _grouped_build(
+        tmp_path,
+        customers="('c1', 'Ada'), ('c2', 'Grace')",
+        orders="('c1', 7.0, 'cancelled')",
+    )
+    adapter = adapter_cls(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_customers")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    assert result.findings == []
+    (record,) = result.payload()["join_coverage"]
+    assert record["status"] == "not_applicable"
+    assert record["reason_code"] == "empty_input"
+    assert record["measured"]["rows"] == 2
+    assert record["measured"]["group_rows"] == 0
+    assert record["measured"]["matched_rows"] == 0
+
+
+def test_a_build_reports_a_misjoined_grouped_key_as_join_no_match(
+    tmp_path: Path,
+):
+    """A dropped/misjoined-key fixture through the build sweep (#1324): the
+    grouped keys exist but no parent carries them, so the join matches
+    nothing."""
+
+    path, adapter_cls = _grouped_build(
+        tmp_path,
+        customers="('c1', 'Ada'), ('c2', 'Grace')",
+        orders="('x9', 10.0, 'paid'), ('x8', 4.0, 'paid')",
+    )
+    adapter = adapter_cls(path)
+    try:
+        result = verify_build(
+            _FactsEngine(),
+            tmp_path,
+            _summary([_node("model.p.rpt_customers")]),
+            resolve_adapter=lambda: adapter,
+        )
+    finally:
+        adapter.close()
+
+    codes = {finding.code: finding for finding in result.findings}
+    assert codes["join_no_match"].severity == "high"
+    (record,) = result.payload()["join_coverage"]
+    assert record["status"] == "contradicted"
+    assert record["measured"]["group_rows"] == 2
+    assert record["measured"]["matched_rows"] == 0
+
+
 # --- a check that fails on a value says so without the value (#1070) ----------
 
 _SENTINEL = "zq_sentinel_7"

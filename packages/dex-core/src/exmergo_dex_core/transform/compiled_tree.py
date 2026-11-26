@@ -25,6 +25,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..manifest_paths import posix
 from .plans import EditOp
 
 if TYPE_CHECKING:
@@ -185,7 +186,7 @@ def read_manifest(
         if not uid.startswith("model.") or node.get("package_name") != project:
             continue
         label = _label(node)
-        path = str(node.get("original_file_path") or "")
+        path = posix(node.get("original_file_path"))
         if path in isolated:
             branch.failed[label] = isolated[path]
             branch.failed_paths[label] = path
@@ -205,9 +206,7 @@ def read_manifest(
     for uid, entries in (manifest.get("disabled") or {}).items():
         if uid.startswith(f"model.{project}."):
             for node in entries if isinstance(entries, list) else [entries]:
-                branch.disabled[_label(node)] = str(
-                    node.get("original_file_path") or ""
-                )
+                branch.disabled[_label(node)] = posix(node.get("original_file_path"))
     branch.manifest = manifest
 
 
@@ -242,7 +241,7 @@ def macro_callers(branch: Branch, project: str) -> dict[str, list[str]]:
             for reached in macro_closure(macros, [str(uid)]):
                 if not reached.startswith(prefix):
                     continue
-                path = str((macros.get(reached) or {}).get("original_file_path") or "")
+                path = posix((macros.get(reached) or {}).get("original_file_path"))
                 if path:
                     out.setdefault(path, set()).add(label)
     return {path: sorted(labels) for path, labels in sorted(out.items())}
@@ -280,7 +279,7 @@ class Catalog:
             if node.get("relation_name") and uid.startswith("seed."):
                 self.by_relation[relation_key(node["relation_name"])] = (
                     "seed",
-                    str(node.get("original_file_path") or ""),
+                    posix(node.get("original_file_path")),
                 )
             elif (
                 node.get("relation_name")

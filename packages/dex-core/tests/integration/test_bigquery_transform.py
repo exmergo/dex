@@ -15,6 +15,7 @@ import yaml
 from .conftest import (
     MAX_BYTES,
     assert_downstream_run,
+    assert_generated_test_parity,
     assert_ok,
     assert_unpivot_build,
     downstream_probe_edits,
@@ -455,3 +456,38 @@ def test_mutation_downstream_tests_catch_what_the_models_own_miss_live(
     before = {t.table_id for t in client.list_tables(dataset)}
     assert_downstream_run(run_cli, capsys, root, 4 * MAX_BYTES)
     assert {t.table_id for t in client.list_tables(dataset)} == before
+
+
+def test_generated_tests_agree_with_maintain_verify_live(
+    tmp_path: Path, capsys, bq_project: str, bq_scratch_dataset: str
+):
+    """The generated-test parity harness (#1450, #1451) on BigQuery: each generated
+    test and `maintain verify` agree on a violating and a clean fixture."""
+    pytest.importorskip("dbt.adapters.bigquery")
+    _seed_transform_repo(tmp_path, bq_project, bq_scratch_dataset)
+    rc, envelope = run_cli(
+        ["--repo-root", str(tmp_path), "transform", "init", "analytics"], capsys
+    )
+    assert_ok(rc, envelope)
+    # One build prices every row's fixtures and tests, each statement at
+    # BigQuery's 10 MB billing minimum, so the budget grows with the rows as
+    # the per-node connectors' does: 44 statements priced 461 MB (#1457). The
+    # temporal rows (#1458) add a snapshot, five models and two tests a side,
+    # the freshness rows (#1460) six models, six tests and three probes, and
+    # the continuity rows (#1461) ten models and ten tests: the build prices
+    # 2.11 GB, just over twenty times the per-query cap, so the budget keeps
+    # four statements' worth of headroom over it.
+    report = assert_generated_test_parity(
+        run_cli, capsys, tmp_path, connector="bigquery", budget=MAX_BYTES * 24
+    )
+
+    from google.cloud import bigquery
+
+    client = bigquery.Client(project=bq_project)
+    try:
+        for name in [*report.models, *report.snapshots]:
+            client.delete_table(
+                f"{bq_project}.{bq_scratch_dataset}.{name}", not_found_ok=True
+            )
+    finally:
+        client.close()

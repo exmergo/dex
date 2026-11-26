@@ -434,6 +434,44 @@ def assert_definitions_only(
         )
 
 
+def _assert_macro_file(path: str, content: str) -> None:
+    """A macro file: macro definitions and, as dbt reads them from the macro
+    paths too, generic test definitions (``{% test %}``), the way a package
+    ships a test beside the dispatched macros that implement it. Each kind is
+    held to its own balance, and nothing loose may sit between them. A block
+    inside a Jinja comment is not a definition, so comments go first."""
+
+    content = _JINJA_COMMENT.sub("", content)
+    if not (_TEST_OPEN.search(content) or _TEST_CLOSE.search(content)):
+        assert_definitions_only(
+            path,
+            content,
+            keyword="macro",
+            open_re=_MACRO_OPEN,
+            close_re=_MACRO_CLOSE,
+            block_re=_MACRO_BLOCK,
+        )
+        return
+    assert_definitions_only(
+        path,
+        _MACRO_BLOCK.sub("", content),
+        keyword="test",
+        open_re=_TEST_OPEN,
+        close_re=_TEST_CLOSE,
+        block_re=_TEST_BLOCK,
+    )
+    rest = _TEST_BLOCK.sub("", content)
+    if _MACRO_OPEN.search(rest) or _MACRO_CLOSE.search(rest):
+        assert_definitions_only(
+            path,
+            rest,
+            keyword="macro",
+            open_re=_MACRO_OPEN,
+            close_re=_MACRO_CLOSE,
+            block_re=_MACRO_BLOCK,
+        )
+
+
 def _assert_query_only(path: str, content: str, noun: str) -> list[str]:
     """Refuse SQL that is not a single read-only SELECT, once jinja is stripped.
 
@@ -601,12 +639,27 @@ def _balanced_call(text: str, start: int) -> tuple[str | None, int]:
     return None, len(text)
 
 
+class _UnreadableCache:
+    """Stands in for an exploration cache that exists and could not be read.
+
+    It holds no flag, like an absent cache, but it is not evidence that no
+    profile flagged a column: the created-seed relaxation (#647) refuses to
+    treat a read failure as "nothing flagged this" and keeps the refusal.
+    """
+
+    datasets: tuple[()] = ()
+
+
+UNREADABLE_CACHE = _UnreadableCache()
+
+
 def validate_seed(
     path: str,
     content: str,
     *,
     cache: object | None = None,
     pii_overrides: object | None = None,
+    created: bool = False,
 ) -> list[str]:
     """Refuse a seed dbt could not load, one too large to review, or one whose
     columns look like PII. Returns warnings.
@@ -619,6 +672,11 @@ def validate_seed(
     cache, which is where a column a human reviewed and cleared has already
     stopped being flagged. A hit at or above the block threshold refuses; a
     weaker one, and the detector's own provisional generic-name match, warns.
+    ``created`` marks a seed file this plan creates rather than rewrites: its
+    columns were authored in this same plan, so a hit exactly at the threshold
+    that only the header name raised (a name-pattern guess such as ``*_note``
+    read as free text) warns and names the override instead of refusing (#647).
+    A column a profile flagged, and anything above the threshold, still refuses.
 
     **What this cannot see:** dex detects PII from names and types, never from
     values, everywhere. A seed column named ``code`` holding email addresses
@@ -685,7 +743,9 @@ def validate_seed(
                 f"names {len(header)}; every row needs one field per column"
             )
 
-    return _seed_pii_warnings(path, header, cache=cache, pii_overrides=pii_overrides)
+    return _seed_pii_warnings(
+        path, header, cache=cache, pii_overrides=pii_overrides, created=created
+    )
 
 
 def _seed_pii_warnings(
@@ -694,6 +754,7 @@ def _seed_pii_warnings(
     *,
     cache: object | None,
     pii_overrides: object | None,
+    created: bool = False,
 ) -> list[str]:
     """The two detections, unioned at the strongest confidence per column.
 
@@ -753,6 +814,20 @@ def _seed_pii_warnings(
             # It warns instead, loudly, and every non-generic pattern (email,
             # phone, national id, address) still blocks.
             warned.append((column, flag, "unrefined"))
+        elif (
+            created
+            and from_cache is None
+            and cache is not UNREADABLE_CACHE
+            and flag.confidence <= PII_BLOCK_CONFIDENCE
+        ):
+            # A seed this plan creates was authored in the same plan, and a
+            # flag no stronger than the threshold that only the header name
+            # raised is a name-pattern guess (free text at 0.5): the plan
+            # names the override rather than stopping on it (#647). A column
+            # a profile already flagged is a warehouse column being exported,
+            # which still refuses, as does a rewrite of an existing seed and
+            # any stronger flag.
+            warned.append((column, flag, "authored"))
         elif flag.confidence >= PII_BLOCK_CONFIDENCE:
             blocked.append((column, flag))
         else:
@@ -775,7 +850,18 @@ def _seed_pii_warnings(
 
     warnings: list[str] = []
     for column, flag, why in warned:
-        if why == "unrefined":
+        if why == "authored":
+            warnings.append(
+                f"{path}: '{column}' looks like {flag.category.value} "
+                f"(confidence {flag.confidence:g}, at the "
+                f"{PII_BLOCK_CONFIDENCE:g} block threshold); this plan creates "
+                "the seed, so it is not refused, but its values land in git and "
+                "stay there: have a person review them before applying. If the "
+                "column is reviewed as not personal data, record "
+                f"`- {{column: {seed}.{column}}}` under pii_overrides in "
+                ".dex/config.yml; if it is, take it out of the seed"
+            )
+        elif why == "unrefined":
             warnings.append(
                 f"{path}: '{column}' matches the generic name pattern, which "
                 "dex refines against values on a warehouse column and cannot "
@@ -842,8 +928,12 @@ def validate_edit(
     pii_overrides: object | None = None,
     compiled: CompiledModel | None = None,
     defer_compilation: bool = False,
+    created: bool = False,
 ) -> list[str]:
     """Validate one edit for its kind. Returns warnings; raises on a hard failure.
+
+    ``created`` says the edit creates its file rather than rewriting one; only
+    the seed gate reads it (see :func:`validate_seed`).
 
     ``cache`` and ``pii_overrides`` are the exploration cache and the reviewed
     columns a human has cleared, and only the seed gate reads them. They are
@@ -856,14 +946,7 @@ def validate_edit(
 
     warnings: list[str] = []
     if edit.kind is EditKind.MACRO_SQL:
-        assert_definitions_only(
-            edit.path,
-            edit.new_content,
-            keyword="macro",
-            open_re=_MACRO_OPEN,
-            close_re=_MACRO_CLOSE,
-            block_re=_MACRO_BLOCK,
-        )
+        _assert_macro_file(edit.path, edit.new_content)
     elif edit.kind is EditKind.TEST_SQL:
         # Two shapes share the test paths and only the content tells them apart.
         # A generic test is a macro under another keyword, so it gets the
@@ -912,6 +995,7 @@ def validate_edit(
                 edit.new_content,
                 cache=cache,
                 pii_overrides=pii_overrides,
+                created=created,
             )
         )
     elif edit.kind is EditKind.MODEL_SQL:

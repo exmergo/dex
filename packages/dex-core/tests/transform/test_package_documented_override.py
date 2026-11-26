@@ -276,12 +276,15 @@ def test_the_undeclared_override_plans_builds_and_keeps_the_package_entry(
     )
     assert built["status"] == "ok", built["errors"]
     manifest = json.loads(
-        (Path(built["data"]["artifact_directory"]) / "manifest.json").read_text()
+        (Path(built["data"]["artifact_directory"]) / "manifest.json").read_text(
+            encoding="utf-8"
+        )
     )
     node = manifest["nodes"]["model.proj.pkg_task"]
     # dbt gave the package's entry to the project's override.
     assert node["description"] == PACKAGE_DESCRIPTION
-    assert node["patch_path"] == "tiny_pkg://models/pkg_task.yml"
+    # dbt writes the platform separator into patch_path.
+    assert node["patch_path"].replace("\\", "/") == "tiny_pkg://models/pkg_task.yml"
 
     findings = built["data"]["verification"]["findings"]
     [gap] = [f for f in findings if f["code"] == "column_undeclared"]

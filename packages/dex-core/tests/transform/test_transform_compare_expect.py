@@ -326,3 +326,91 @@ def test_the_cli_refuses_a_malformed_expectation_before_compiling(
     envelope = json.loads(capsys.readouterr().out)
     assert envelope["status"] == "error"
     assert "not nope" in envelope["errors"][0]
+
+
+_STG_ORDERS = "select order_id, batch, amount from {{ source('raw', 'orders') }}"
+#: Keeps each order's latest batch, so a restated order is not counted twice.
+_STG_ORDERS_LATEST = """
+select order_id, batch, amount from {{ source('raw', 'orders') }}
+qualify row_number() over (partition by order_id order by batch desc) = 1
+"""
+_ORDERS = "select order_id, amount from {{ ref('stg_orders') }}"
+
+
+@pytest.fixture
+def loaded(tmp_path: Path) -> Path:
+    """A built project over a raw table that a loader keeps appending to."""
+
+    duckdb = pytest.importorskip("duckdb")
+    pytest.importorskip("dbt.adapters.duckdb")
+    with duckdb.connect(str(tmp_path / "dev.duckdb")) as con:
+        con.execute(
+            "create table main.orders_raw as select * from (values "
+            "(1, 1, 10), (2, 1, 20), (3, 1, 30)) as o(order_id, batch, amount)"
+        )
+    root = tmp_path / "analytics"
+    models = root / "models"
+    models.mkdir(parents=True)
+    (root / "dbt_project.yml").write_text(
+        'name: p\nversion: "1.0.0"\nprofile: p\nmodel-paths: ["models"]\n'
+        "models:\n  p:\n    +materialized: table\n",
+        encoding="utf-8",
+    )
+    (root / "profiles.yml").write_text(
+        "p:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n"
+        f"      path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    (models / "sources.yml").write_text(
+        "version: 2\nsources:\n  - name: raw\n    schema: main\n"
+        "    tables:\n      - name: orders\n        identifier: orders_raw\n",
+        encoding="utf-8",
+    )
+    (models / "stg_orders.sql").write_text(_STG_ORDERS, encoding="utf-8")
+    (models / "orders.sql").write_text(_ORDERS, encoding="utf-8")
+    _engine(root).build(target="dev")
+    return root
+
+
+def _load_batch(project: Path) -> None:
+    import duckdb
+
+    with duckdb.connect(str(project.parent / "dev.duckdb")) as con:
+        con.execute("insert into main.orders_raw values (2, 2, 25), (3, 2, 35)")
+
+
+def test_rows_loaded_after_the_build_mark_the_baseline_never_built(loaded):
+    engine = _engine(loaded)
+    plan_id = _plan(engine, "stg_orders", _STG_ORDERS_LATEST)
+    expect = {"changed_columns": ["amount"]}
+    before = engine.compare(
+        plan_id, model="orders", key_columns=["order_id"], expectation=expect
+    )
+    assert before.status == "as_expected", (before.detail, before.expectation)
+    assert "baseline_never_built" not in before.data()
+
+    _load_batch(loaded)
+    after = _engine(loaded).compare(
+        plan_id, model="orders", key_columns=["order_id"], expectation=expect
+    )
+    # The verdict itself is unchanged: the old SQL double-counts the new batch.
+    assert after.status == "unexpected"
+    assert after.expectation["grain"]["reason"] == "key_not_unique_on_baseline"
+    unbuilt = after.data()["baseline_never_built"]
+    assert unbuilt["row_count"] == {"last_build": 3, "baseline": 5}
+    assert "rebuilt_after" not in unbuilt
+    assert unbuilt["model_built_at"]
+    assert any("never built" in warning for warning in after.warnings)
+
+
+def test_a_parent_rebuilt_after_the_model_marks_the_baseline_never_built(loaded):
+    _load_batch(loaded)
+    _engine(loaded).build(target="dev", select="stg_orders")
+    engine = _engine(loaded)
+    plan_id = _plan(engine, "orders", _ORDERS + " where amount is not null")
+    result = engine.compare(plan_id, key_columns=["order_id"], expectation={})
+    unbuilt = result.data()["baseline_never_built"]
+    assert unbuilt["rebuilt_after"] == ["stg_orders"]
+    assert unbuilt["row_count"] == {"last_build": 3, "baseline": 5}
+    # The latest run did not build orders, so when it was built is unknown.
+    assert unbuilt["model_built_at"] is None

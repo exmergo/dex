@@ -1,0 +1,67 @@
+# The SQL a governed Metric View query renders (#1362), recorded exactly.
+#
+# Each entry is one request against the `ORDERS` view of
+# tests/metric_views_vendor/workspace_fake.py, deployed as
+# `shop.metrics.orders`, with `query.max_rows` at its default of 50. A change
+# to the rendering has to change this file in the same diff, so it is
+# reviewed, and every statement here has to parse in the pinned sqlglot's
+# Databricks dialect and regenerate unchanged.
+- name: measure_by_field
+  metrics: [orders.order_count]
+  group_by: [orders.order_status]
+  order_by: [-orders.order_count]
+  sql: >-
+    SELECT `order_status` AS `orders.order_status`, MEASURE(`order_count`) AS
+    `orders.order_count` FROM `shop`.`metrics`.`orders` GROUP BY ALL ORDER BY
+    `orders.order_count` DESC LIMIT 51
+- name: measure_alone
+  metrics: [orders.revenue]
+  sql: >-
+    SELECT MEASURE(`revenue`) AS `orders.revenue` FROM `shop`.`metrics`.`orders`
+    GROUP BY ALL LIMIT 51
+- name: ratio_and_derived
+  metrics: [orders.aov, orders.net]
+  group_by: [orders.segment]
+  sql: >-
+    SELECT `segment` AS `orders.segment`, MEASURE(`aov`) AS `orders.aov`,
+    MEASURE(`net`) AS `orders.net` FROM `shop`.`metrics`.`orders` GROUP BY ALL
+    LIMIT 51
+- name: grain_on_a_date_field
+  metrics: [orders.revenue]
+  group_by: [orders.order_date__quarter]
+  order_by: [orders.order_date__quarter]
+  sql: >-
+    SELECT DATE_TRUNC('QUARTER', `order_date`) AS `orders.order_date__quarter`,
+    MEASURE(`revenue`) AS `orders.revenue` FROM `shop`.`metrics`.`orders` GROUP
+    BY ALL ORDER BY `orders.order_date__quarter` LIMIT 51
+- name: filtered
+  metrics: [orders.order_count]
+  group_by: [orders.priority]
+  where:
+    - order_status = 'F'
+    - orders.segment IN ('BUILDING', 'MACHINERY') OR nation IS NULL
+  sql: >-
+    SELECT `priority` AS `orders.priority`, MEASURE(`order_count`) AS
+    `orders.order_count` FROM `shop`.`metrics`.`orders` WHERE (`order_status` =
+    'F') AND (`segment` IN ('BUILDING', 'MACHINERY') OR `nation` IS NULL) GROUP
+    BY ALL LIMIT 51
+- name: field_through_a_snowflake_join
+  metrics: [orders.revenue]
+  group_by: [orders.nation]
+  limit: 10
+  sql: >-
+    SELECT `nation` AS `orders.nation`, MEASURE(`revenue`) AS `orders.revenue`
+    FROM `shop`.`metrics`.`orders` GROUP BY ALL LIMIT 10
+- name: values
+  values: orders.priority
+  sql: >-
+    SELECT `priority` AS `orders.priority` FROM `shop`.`metrics`.`orders` GROUP
+    BY ALL ORDER BY `orders.priority` LIMIT 51
+- name: values_scoped_to_a_measure
+  values: orders.order_date__month
+  metrics: [orders.revenue]
+  sql: >-
+    SELECT `orders.order_date__month` FROM (SELECT DATE_TRUNC('MONTH',
+    `order_date`) AS `orders.order_date__month`, MEASURE(`revenue`) AS `__m0`
+    FROM `shop`.`metrics`.`orders` GROUP BY ALL) ORDER BY
+    `orders.order_date__month` LIMIT 51

@@ -99,6 +99,10 @@ class ColumnAggregate:
     upper_vocab_fraction: float | None = None
     person_shape_fraction: float | None = None
     avg_token_count: float | None = None
+    #: Fraction of non-null values ending in an organization suffix ("Acme Inc",
+    #: "Stability AI", "Bell Labs"), the evidence that a ``*_name`` column holds
+    #: organizations rather than people (#647).
+    org_suffix_fraction: float | None = None
     #: Declared-type-vs-content statistics, computed only for columns the
     #: engine requested via ``type_stats`` (non-PII string/integer columns).
     #: Fractions, and for epoch the min and max of the values inside the
@@ -364,10 +368,12 @@ def warehouse_refusal(
     it can rely on.
     """
 
-    first = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
-    # Masked before the cap: a cap that cut through a quoted value would leave
+    # Masked whole, before the first line is taken and before the cap: a value
+    # can span a line break (#1412), and a cap that cut through it would leave
     # it without the closing quote the mask reads its end from (#1070).
-    detail = mask_values(first) or "the server gave no message"
+    masked = mask_values(message)
+    first = next((ln.strip() for ln in masked.splitlines() if ln.strip()), "")
+    detail = first or "the server gave no message"
     if len(detail) > _SERVER_DETAIL_CAP:
         detail = detail[:_SERVER_DETAIL_CAP].rstrip() + "..."
     return WarehouseQueryError(f"{detail} [{code}]" if code else detail, stage=stage)
@@ -549,6 +555,19 @@ def affordable_combinations(
 # misread multi-word labels ("Australian Grand Prix") as person-shaped.
 UPPER_VOCAB_PATTERN = "^[A-Z]+([ -][A-Z]+)*$"
 PERSON_SHAPE_PATTERN = "^[A-Z][a-z]+ [A-Z][a-z]+$"
+# ORG_SUFFIX: a value whose last token is a legal-entity or organization suffix
+# ("Acme Inc.", "Acme, LLC", "Stability AI", "Bell Labs"), the signature of an
+# organization name rather than a person's (#647). The suffix must stand as its
+# own token (after the start, a space or a comma), so "Kain" or "Collabs" do not
+# match, and the list is case-exact, since "Ai" or "Lab" as a person's surname
+# would read as a person-shaped value first. Anchored at both ends, with `[.]`
+# rather than an escaped dot, so it reads the same under full-match engines and
+# string literals that consume backslashes.
+ORG_SUFFIX_PATTERN = (
+    "^(.*[ ,])?(Inc|INC|LLC|L[.]L[.]C|Ltd|LTD|Limited|Corp|CORP|Corporation|"
+    "GmbH|PLC|plc|LLP|AI|Lab|Labs|Group|Holdings|Technologies|Foundation|"
+    "Institute|University)[.]?$"
+)
 
 
 #: The one and zero every fraction builder averages over. A dialect that types
@@ -565,8 +584,9 @@ def shape_stat_expressions(
     *,
     fraction_literals: tuple[str, str] = DEFAULT_FRACTION_LITERALS,
 ) -> list[str]:
-    """The three value-shape aggregate expressions for one column, read back by
-    aliases ``su_{i}`` / ``sp_{i}`` / ``st_{i}``.
+    """The four value-shape aggregate expressions for one column, read back by
+    aliases ``su_{i}`` / ``sp_{i}`` / ``st_{i}`` / ``so_{i}`` (see
+    :func:`shape_aggregate_kwargs`).
 
     Results are numeric fractions and an average token count, never values. The
     CASE has no ELSE so a NULL input yields NULL, which AVG skips: nulls never
@@ -577,19 +597,38 @@ def shape_stat_expressions(
 
     one, zero = fraction_literals
 
-    def fraction(pattern: str, alias: str) -> str:
-        predicate = regexp_predicate(qcol, pattern)
+    def fraction(predicate: str, alias: str) -> str:
         return (
             f"AVG(CASE WHEN {predicate} THEN {one} "
             f"WHEN {qcol} IS NOT NULL THEN {zero} END) AS {alias}"
         )
 
+    org = regexp_predicate(qcol, ORG_SUFFIX_PATTERN)
+    # "Bell Labs" and "Globex Corp" are two capitalized words too: a value that
+    # ends in an organization suffix is not counted as person-shaped (#647).
+    person = f"({regexp_predicate(qcol, PERSON_SHAPE_PATTERN)}) AND NOT ({org})"
     token_count = f"LENGTH({qcol}) - LENGTH(REPLACE({qcol}, ' ', '')) + 1"
     return [
-        fraction(UPPER_VOCAB_PATTERN, f"su_{i}"),
-        fraction(PERSON_SHAPE_PATTERN, f"sp_{i}"),
+        fraction(regexp_predicate(qcol, UPPER_VOCAB_PATTERN), f"su_{i}"),
+        fraction(person, f"sp_{i}"),
         f"AVG({token_count}) AS st_{i}",
+        fraction(org, f"so_{i}"),
     ]
+
+
+def shape_aggregate_kwargs(
+    values: dict[str, object], i: int, wanted: bool
+) -> dict[str, float | None]:
+    """The value-shape fields of a :class:`ColumnAggregate`, read back from the
+    aliases :func:`shape_stat_expressions` wrote, so every adapter reads the same
+    statistics under the same names."""
+
+    return {
+        "upper_vocab_fraction": shape_stat_value(values, f"su_{i}", wanted),
+        "person_shape_fraction": shape_stat_value(values, f"sp_{i}", wanted),
+        "avg_token_count": shape_stat_value(values, f"st_{i}", wanted),
+        "org_suffix_fraction": shape_stat_value(values, f"so_{i}", wanted),
+    }
 
 
 def shape_stat_value(
@@ -1137,6 +1176,19 @@ class Adapter(Protocol):
       an object missing from this run's inventory was looked for and is gone
       from the warehouse (dropped), versus lived outside a narrowed ``--scope``
       or allowlist and must be carried forward untouched (#111, #149).
+    - ``size_estimate(byte_sizes)``: one statement scanning tables of these
+      byte sizes, in the paradigm's unit, with none of this command's own
+      overhead (#1462). How a plan prices a generated test per production run
+      from catalog sizes alone. Absent, the test's estimate is unknown
+      (``no_size_estimator``); DuckDB's is ``0.0``, since nothing bills.
+    - ``catalog_meta(identifier)``: one relation's :class:`ObjectMeta` from the
+      catalog, reading no row, raising ``LookupError`` where there is none.
+      Offered where ``table_metadata`` counts rows (DuckDB); absent,
+      ``table_metadata`` answers it.
+    - ``catalog_read_billed()``: ``True`` where reading a relation's catalog
+      metadata bills (Redshift Serverless wakes its workgroup, with a 60-second
+      minimum), so a plan reports a production size as unknown rather than
+      spend unasked. Absent reads as free.
     """
 
     #: Stable connector name, e.g. "duckdb", "snowflake".

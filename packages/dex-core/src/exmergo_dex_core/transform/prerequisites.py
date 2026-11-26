@@ -33,18 +33,9 @@ from typing import Any
 import yaml
 
 from ..edits import EditOp
+from ..manifest_paths import posix
+from .global_edits import PREREQUISITE_GLOBAL_KINDS
 from .plans import EditKind, PlanEdit
-
-#: The edit kinds that can change any node's result, wherever they sit.
-_GLOBAL_KINDS = frozenset(
-    {
-        EditKind.MACRO_SQL,
-        EditKind.PROJECT_YML,
-        EditKind.PACKAGES_YML,
-        EditKind.PROFILES_YML,
-        EditKind.TEST_SQL,
-    }
-)
 
 #: Keys of a schema YAML that only describe the nodes ``required`` already names.
 #: Anything else (``sources:`` above all) can change what a model reads.
@@ -108,7 +99,7 @@ def _required_names(unique_id: str, node: Any) -> set[str]:
         names.add(f"{parts[2]}_{parts[3]}".lower())
     path = node.get("original_file_path") if isinstance(node, Mapping) else None
     if path:
-        names.add(PurePosixPath(str(path)).stem.lower())
+        names.add(PurePosixPath(posix(path)).stem.lower())
     return names
 
 
@@ -149,7 +140,7 @@ def _plan_relation(
 def _reaches_any_node(edit: PlanEdit) -> bool:
     """Whether an edit can change a node its own path or entry does not name."""
 
-    if edit.kind in _GLOBAL_KINDS or edit.op is EditOp.DELETE:
+    if edit.kind in PREREQUISITE_GLOBAL_KINDS or edit.op is EditOp.DELETE:
         return True
     if edit.kind is not EditKind.SCHEMA_YML:
         return False
@@ -198,8 +189,8 @@ def _package_entry(node: Mapping[str, Any], install_dir: str | None) -> str | No
     if not package or not path:
         return None
     if install_dir:
-        return f"{install_dir.rstrip('/')}/{package}/{path}"
-    return patch
+        return f"{install_dir.rstrip('/')}/{package}/{posix(path)}"
+    return f"{package}://{posix(path)}"
 
 
 def _override_option(
@@ -428,7 +419,7 @@ def diagnose(
         if owner == "package":
             entry["package"] = package
         if node is not None and node.get("original_file_path"):
-            entry["path"] = node["original_file_path"]
+            entry["path"] = posix(node["original_file_path"])
         if message:
             entry["message"] = message[:_MESSAGE]
         if owner != "unknown":

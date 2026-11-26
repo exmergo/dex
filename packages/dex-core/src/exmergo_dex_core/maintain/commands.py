@@ -1011,11 +1011,12 @@ def verify(
     """Is the project correct right now, with no baseline required (#224).
 
     Six finding classes. Build-status gaps (#225) read the compiled manifest
-    and the last run's ``run_results.json`` (failed nodes, nodes skipped by a
-    failed parent), plus models the project declares that have no relation in
-    the warehouse. Column contract (#230) compares a built relation's actual
-    columns against what its schema.yml declares, both directions, plus a type
-    check where a type is declared. Row population (#226) reads each model's
+    and, for each node, the latest dated run that attempted it (failed nodes,
+    nodes skipped by a failed parent, each naming its run, #1524), plus
+    models the project declares that have no relation in the warehouse.
+    Column contract (#230) compares a built relation's actual columns against
+    what its schema.yml declares, both directions, plus a type check where a
+    type is declared. Row population (#226) reads each model's
     compiled SQL for the relation it is built from and compares the two row
     counts, reporting a model that lost rows with nothing in its SQL to
     account for it, or one that fanned out on a join. Grain (#229) checks that
@@ -1065,11 +1066,16 @@ def verify(
     if target is not None:
         from ..transform.build import assert_dev_target
 
-        assert_dev_target(target, engine.config.dbt_target)
+        assert_dev_target(
+            target,
+            engine.config.dbt_target,
+            prod=getattr(engine.config, "dbt_prod_target", None),
+        )
         reads_dev_target = True
 
     manifest_target: str | None = None
     judged_namespace: str | None = None
+    build_status_runs: dict | None = None
 
     project, project_reason = _read_project(engine)
     if project is None:
@@ -1158,11 +1164,19 @@ def verify(
             return result
 
         warnings.extend(compile_notes)
-        build_findings, build_notes = verify_mod.build_status_findings(project_dir)
+        node_results = verify_mod.node_results(
+            project_dir, artifact_policy=engine.config.transform.artifacts
+        )
+        if node_results.found:
+            build_status_runs = node_results.summary()
+        build_findings, build_notes = verify_mod.build_status_findings(
+            project_dir, results=node_results
+        )
         findings.extend(build_findings)
         warnings.extend(build_notes)
-        if any("no dbt run results found" in n for n in build_notes):
-            suppressed["build_status"] = build_notes[0]
+        missing = [n for n in build_notes if "no dbt run results found" in n]
+        if missing:
+            suppressed["build_status"] = missing[0]
 
     # A scope may be spelled as separate arguments, comma-separated, or as one
     # quoted argument with the names separated by spaces: `a b`, `"a b"` and
@@ -1176,6 +1190,7 @@ def verify(
     join_coverage: list[dict] | None = None
     parent_population: list[dict] | None = None
     temporal_contracts: list[dict] | None = None
+    freshness: list[dict] | None = None
     grain_coverage: list[dict] | None = None
     foreign_key_coverage: list[dict] | None = None
     fk_offer: ConfirmationRequest | None = None
@@ -1378,6 +1393,7 @@ def verify(
                     [o.identifier for o in live],
                     check_grain=True,
                     tested_grain=True,
+                    pii_overrides=pii_override_paths(engine.config.pii_overrides),
                 )
                 row_ask, join_ask, facts_ask, _fk_ask = _combined_scan_handshake(
                     adapter,
@@ -1436,6 +1452,7 @@ def verify(
                 warnings.extend(facts_plan_notes + facts.notes)
                 parent_population = facts.parent_coverage
                 temporal_contracts = facts.temporal_contracts
+                freshness = facts.freshness
                 grain_coverage.extend(facts.grain_coverage)
                 # Every grain is judged by now, so a fan-out on a model whose
                 # declared grain held is ranked as the expansion it is (#841).
@@ -1472,8 +1489,10 @@ def verify(
         join_coverage=join_coverage,
         parent_population=parent_population,
         temporal_contracts=temporal_contracts,
+        freshness=freshness,
         grain_coverage=grain_coverage,
         foreign_key_coverage=foreign_key_coverage,
+        build_status_runs=build_status_runs,
     )
     if cost is not None:
         result.cost = cost
@@ -2068,6 +2087,34 @@ def cmd_coverage(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             mutate=bool(getattr(args, "mutate", False)),
             max_models=getattr(args, "max_models", None),
             target=getattr(args, "target", None),
+        )
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result)
+
+
+def cmd_incidents(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from . import incident_sources
+
+    try:
+        result = incident_sources.incidents(
+            engine,
+            getattr(args, "objects", None),
+            invocations=getattr(args, "invocations", None),
+        )
+    except ValueError as exc:
+        return env.error_for(exc)
+    return to_envelope(result)
+
+
+def cmd_diagnose(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
+    from . import diagnose
+
+    try:
+        result = diagnose.diagnose(
+            engine,
+            getattr(args, "objects", None),
+            invocations=getattr(args, "invocations", None),
         )
     except ValueError as exc:
         return env.error_for(exc)

@@ -114,6 +114,14 @@ DBX_MAX_SECONDS = float(os.environ.get("DEX_TEST_DATABRICKS_MAX_SECONDS", "60"))
 
 RS_MAX_SECONDS = float(os.environ.get("DEX_TEST_REDSHIFT_MAX_SECONDS", "60"))
 
+# The warehouses a live Cube test runs on beside DuckDB: the variable that
+# reaches each, and the driver it needs.
+_CUBE_WAREHOUSES = {
+    "postgres": ("DEX_TEST_PG_DSN", "psycopg"),
+    "clickhouse": ("DEX_TEST_CH_DSN", "clickhouse_connect"),
+    "trino": ("DEX_TEST_TRINO_URL", "trino"),
+}
+
 CH_MAX_SECONDS = float(os.environ.get("DEX_TEST_CH_MAX_SECONDS", "60"))
 
 TRINO_MAX_SECONDS = float(os.environ.get("DEX_TEST_TRINO_MAX_SECONDS", "60"))
@@ -190,24 +198,52 @@ def _snowflake_enabled() -> bool:
 
 @pytest.fixture(autouse=True)
 def _require_cloud_env(request):
-    if request.node.get_closest_marker("cube"):
-        # Ahead of every warehouse branch: a Cube test needs its renderer as
-        # well as its warehouse, and one without `postgres` runs on DuckDB.
-        warehouse = (
-            "postgres" if request.node.get_closest_marker("postgres") else "duckdb"
-        )
-        required = ["CUBEJS_API_SECRET", f"DEX_TEST_CUBE_URL_{warehouse.upper()}"]
-        if warehouse == "postgres":
-            required.append("DEX_TEST_PG_DSN")
-        missing = [name for name in required if not os.environ.get(name)]
+    if request.node.get_closest_marker("cube_cloud"):
+        # A Cube Cloud deployment serving scripts/cube/model over the rows of
+        # scripts/cube/shop.sql (scripts/setup_cube_cloud_ci.sh), and dex's own
+        # DuckDB file for `--local`.
+        missing = [
+            name
+            for name in ("DEX_TEST_CUBE_CLOUD_URL", "CUBE_API_TOKEN")
+            if not os.environ.get(name)
+        ]
         if missing:
             pytest.skip(
+                f"Cube Cloud integration disabled: set {', '.join(missing)} (see "
+                "scripts/setup_cube_cloud_ci.sh)"
+            )
+        pytest.importorskip("httpx")
+        pytest.importorskip("duckdb")
+        return
+    if request.node.get_closest_marker("cube"):
+        # Ahead of every warehouse branch: a Cube test needs its renderer as
+        # well as its warehouse, and one that names none runs on DuckDB.
+        warehouse = next(
+            (
+                name
+                for name in _CUBE_WAREHOUSES
+                if request.node.get_closest_marker(name)
+            ),
+            "duckdb",
+        )
+        dsn, driver = _CUBE_WAREHOUSES.get(warehouse, (None, "duckdb"))
+        required = ["CUBEJS_API_SECRET", f"DEX_TEST_CUBE_URL_{warehouse.upper()}"]
+        if request.node.get_closest_marker("cube_execute"):
+            required.append(f"DEX_TEST_CUBE_EXEC_URL_{warehouse.upper()}")
+        if dsn:
+            required.append(dsn)
+        missing = [name for name in required if not os.environ.get(name)]
+        if missing:
+            execute = (
+                "--execute " if request.node.get_closest_marker("cube_execute") else ""
+            )
+            pytest.skip(
                 f"Cube integration disabled: set {', '.join(missing)} (run "
-                f"scripts/setup_cube_dev.sh --db {warehouse}, then source "
+                f"scripts/setup_cube_dev.sh {execute}--db {warehouse}, then source "
                 "~/.cache/dex-dogfood/cube.env)"
             )
         pytest.importorskip("httpx")
-        pytest.importorskip("psycopg" if warehouse == "postgres" else "duckdb")
+        pytest.importorskip(driver)
         return
     if request.node.get_closest_marker("snowflake"):
         if not _snowflake_enabled():
@@ -445,6 +481,44 @@ def assert_unpivot_build(built: dict) -> None:
     assert statuses.get("stg_entities") == "success"
     assert statuses.get("entity_relations") == "success"
     assert all(s in {"success", "pass"} for s in statuses.values()), statuses
+
+
+def assert_generated_test_parity(
+    run_cli,
+    capsys,
+    root: Path,
+    *,
+    connector: str,
+    budget: float | None,
+    null_int: str = "cast(null as integer)",
+):
+    """The parity harness (#1450, #1451) on one live warehouse: every row's
+    generated test and ``maintain verify`` agree on its violating and clean
+    fixtures, or the test declares the connector unsupported and renders
+    nothing there. ``root`` holds a ``.dex/config.yml`` and the project
+    ``transform init`` wrote; ``null_int`` is the connector's typed integer NULL.
+    ``budget`` covers one build of every row's fixture models and tests: a
+    connector priced by a per-node heuristic (Snowflake, Databricks, Redshift)
+    estimates more with every row, so a new row can need a larger one (#1454:
+    the parent rows took Snowflake's estimate past 600 seconds).
+    Returns the report, so a caller can drop the fixture models it built."""
+
+    from transform.generated_parity import ROWS, run_parity
+
+    report = run_parity(
+        lambda argv: run_cli(argv, capsys),
+        root,
+        connector=connector,
+        budget=budget,
+        null_int=null_int,
+    )
+    # What the run spent, per command, for a job log (#1451): `-s` shows it.
+    print(f"generated-test parity on {connector}: {report.spend}")
+    assert report.disagreements == [], report.disagreements
+    assert sorted(report.agreed + report.unsupported + report.withheld) == sorted(
+        r.label for r in ROWS
+    )
+    return report
 
 
 #: The downstream probe (#648): an intermediate model with one row its filter

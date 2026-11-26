@@ -464,7 +464,10 @@ def test_the_unique_test_edit_is_a_one_line_splice_not_a_reprinted_file(maintain
     maintain_repo.dex("transform", "apply", payload["data"]["plan_id"])
     written = (maintain_repo.root / "models" / "staging" / "stg_orders.yml").read_text()
     assert "# built from the orders source" in written
-    assert "tests: [not_null, unique]" in written
+    # The added `unique` carries the unsampled flag a declaration renders (#1306).
+    assert (
+        "tests: [not_null, {unique: {config: {meta: {disable_test_samples: true}}}}]"
+    ) in written
 
 
 def test_schema_and_grain_drift_produce_one_edit_for_the_shared_yaml(maintain_repo):
@@ -478,10 +481,24 @@ def test_schema_and_grain_drift_produce_one_edit_for_the_shared_yaml(maintain_re
 
     _scaffolded(maintain_repo)
     yml = maintain_repo.root / "models" / "staging" / "stg_orders.yml"
-    # A key carrying no unique test, which is what makes the grain axis propose one.
-    yml.write_text(
-        yml.read_text().replace("[unique, not_null]", "[not_null]"), encoding="utf-8"
+    import yaml
+
+    parsed_before = yaml.safe_load(yml.read_text(encoding="utf-8"))
+    order_col = next(
+        c for c in parsed_before["models"][0]["columns"] if c["name"] == "order_id"
     )
+    # A key carrying no unique test, which is what makes the grain axis propose one.
+    order_col["data_tests"] = [
+        t
+        for t in order_col.get("data_tests", [])
+        if (t if isinstance(t, str) else next(iter(t))) != "unique"
+    ]
+    yml.write_text(yaml.safe_dump(parsed_before, sort_keys=False), encoding="utf-8")
+    before_parsed = yaml.safe_load(yml.read_text(encoding="utf-8"))
+    before_tests = before_parsed["models"][0]["columns"][0]["data_tests"]
+    assert [t if isinstance(t, str) else next(iter(t)) for t in before_tests] == [
+        "not_null"
+    ]
     maintain_repo.dex("explore", "map")
     maintain_repo.snapshot()
 
@@ -501,7 +518,20 @@ def test_schema_and_grain_drift_produce_one_edit_for_the_shared_yaml(maintain_re
     assert applied["status"] == "ok", applied.get("errors")
     written = yml.read_text(encoding="utf-8")
     assert "- name: discount" in written, written
-    assert "unique" in written, written
+    after_order = next(
+        c
+        for c in yaml.safe_load(written)["models"][0]["columns"]
+        if c["name"] == "order_id"
+    )
+    assert any(
+        isinstance(t, dict)
+        and "unique" in t
+        and (
+            t["unique"].get("config", {}).get("meta", {}).get("disable_test_samples")
+            is True
+        )
+        for t in after_order["data_tests"]
+    )
 
 
 def test_grain_drift_is_advisory_with_a_visibility_test(maintain_repo):

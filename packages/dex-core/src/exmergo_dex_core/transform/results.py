@@ -86,6 +86,27 @@ class PlanResult(Result):
     # layer, offered here where it does not. Absent when no declared mart was
     # touched.
     semantic_proposal: dict[str, Any] | None = None
+    # Per model the plan writes whose outputs read a PII-flagged input (#1100):
+    # each such column's stamp status (`stamped`, `kept`, `overridden`,
+    # `disagreement`, `measured`, `redacted`, `unresolved`, `unchecked`,
+    # `not_written`), where its flag came from, and never a value. Absent when
+    # no written model reads a flagged input.
+    pii_metadata: dict[str, Any] | None = None
+    # The generated tests the plan's declarations give (#1449): what
+    # `declarations.render_tests` says, and per test its model, column, name,
+    # cadence tag and claim, and whether it rendered (`added`,
+    # `already_listed`) or not (`not_rendered` with a reason,
+    # `listed_while_off`). Absent when the declarations give none.
+    generated_tests: dict[str, Any] | None = None
+    # The vendor monitors the plan's declarations give (#1482): what gated
+    # them and one row per monitor, written or not. ``None`` where
+    # ``monitors.vendor`` is unset, so the key is absent.
+    monitors: dict[str, Any] | None = None
+    # The Elementary PII tags the plan writes (#1487): the tag, the
+    # `disable_samples_on_pii_tags` switch, what the installed release does
+    # with them, and per model its model tag and each personal-data column's.
+    # ``None`` where ``monitors.vendor`` is unset or nothing was owed.
+    pii_tags: dict[str, Any] | None = None
     # The free pointer to `transform compare` on a plan that rewrites a model
     # that already exists (#856). Planning scans nothing for it. Absent when the
     # plan rewrites none.
@@ -117,11 +138,13 @@ class PlanResult(Result):
         was produced.
         """
         payload: dict[str, Any] = {
-            "plan_id": self.plan_id,
+            # Null, not empty, when nothing was stored (a payload that changes
+            # nothing), as on `transform declare`.
+            "plan_id": self.plan_id or None,
             "intent": self.intent,
             "edit_count": len(self.paths),
             "paths": self.paths,
-            "plan_path": self.plan_path,
+            "plan_path": self.plan_path or None,
         }
         if self.toggle is not None:
             payload["toggle"] = self.toggle
@@ -139,6 +162,14 @@ class PlanResult(Result):
             payload["declarations"] = self.declarations
         if self.semantic_proposal is not None:
             payload["semantic_proposal"] = self.semantic_proposal
+        if self.pii_metadata is not None:
+            payload["pii_metadata"] = self.pii_metadata
+        if self.generated_tests is not None:
+            payload["generated_tests"] = self.generated_tests
+        if self.monitors is not None:
+            payload["monitors"] = self.monitors
+        if self.pii_tags is not None:
+            payload["pii_tags"] = self.pii_tags
         if self.defined is not None:
             payload["defined"] = self.defined
         if self.updated is not None:
@@ -627,6 +658,11 @@ class RefactorComparisonResult(Result):
     # `--cold-deps` (#1114). One run: other inputs may come from earlier builds,
     # so `cold` does not mean every input was built cold. None with no build.
     inputs_built_by: dict[str, Any] | None = None
+    # Set where an input changed after the compared model's last build (#1387):
+    # `model_built_at`, and `rebuilt_after` (upstream models a later run
+    # rebuilt) and/or `row_count` (`last_build`, `baseline`). The verdict was
+    # then computed against a baseline no build wrote. Absent otherwise.
+    baseline_never_built: dict[str, Any] | None = None
     # How the difference matches a stated expected change (#1157): the clauses,
     # the counts split into matching and unexpected, the failed clauses, and up
     # to five unexpected keys per class, firewall-cleared. Absent with no
@@ -654,6 +690,11 @@ class RefactorComparisonResult(Result):
             "target": self.target,
             "status": self.status,
             "reason_code": self.reason_code,
+            **(
+                {"baseline_never_built": self.baseline_never_built}
+                if self.baseline_never_built
+                else {}
+            ),
             "detail": self.detail,
             "compared_at": self.compared_at,
             "baseline_compiled": self.baseline_compiled,

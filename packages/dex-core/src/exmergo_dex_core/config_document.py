@@ -32,7 +32,12 @@ import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic_core import to_jsonable_python
 
-from .config import CONFIG_FILE, SEMANTIC_ENVIRONMENT, DexConfig
+from .config import (
+    CONFIG_FILE,
+    DEV_ALIASES,
+    SEMANTIC_ENVIRONMENT_BY_VENDOR,
+    DexConfig,
+)
 from .diffs import file_diff
 from .envelope import redact, secret_like
 from .errors import ConfigurationError, RequestError
@@ -64,7 +69,8 @@ class ConfigProblem:
     """One thing wrong with the file, located by setting and line.
 
     ``kind`` is ``syntax``, ``invalid``, ``unknown_key``, ``caller_only_key``,
-    ``duplicate_key``, ``secret_like_key`` or ``project_not_found``.
+    ``duplicate_key``, ``secret_like_key``, ``project_not_found`` or
+    ``unknown_test_kind``.
     ``(kind, key, message)`` identifies a problem across edits, because an edit
     shifts every line below it.
     """
@@ -407,7 +413,8 @@ class ConfigDocument:
         self._collect(
             DexConfig, config.model_dump(mode="json"), self._mapping(), "", rows
         )
-        for name, variable in SEMANTIC_ENVIRONMENT.items():
+        vendor = getattr(getattr(config, "semantic", None), "vendor", None) or "dbt"
+        for name, variable in SEMANTIC_ENVIRONMENT_BY_VENDOR.get(vendor, {}).items():
             found = environ.get(variable)
             if not found:
                 continue
@@ -427,10 +434,18 @@ class ConfigDocument:
             ]
         if target is None:
             return rows
+        target_key = target.key
+        parts = target_key.split(".")
+        if (
+            len(parts) == 2
+            and parts[0] in DEV_ALIASES
+            and parts[1] in DEV_ALIASES[parts[0]]
+        ):
+            target_key = f"{parts[0]}.dev"
         selected = [
             row
             for row in rows
-            if row.key == target.key or row.key.startswith(target.key + ".")
+            if row.key == target_key or row.key.startswith(target_key + ".")
         ]
         if selected:
             return selected
@@ -527,6 +542,10 @@ class ConfigDocument:
         edits = self._set_edits(parts, value, warnings)
         expected = copy.deepcopy(self._mapping())
         _assign(expected, parts, value)
+        if len(parts) == 2 and parts[1] == "dev" and parts[0] in DEV_ALIASES:
+            for alias in DEV_ALIASES[parts[0]]:
+                if isinstance(expected.get(parts[0]), dict):
+                    expected[parts[0]].pop(alias, None)
         return self._verified(_splice(self.text, edits), expected, key, warnings)
 
     def without(self, key: str, *, duplicate_only: bool = False) -> ConfigDocument:
@@ -560,6 +579,12 @@ class ConfigDocument:
 
         chain = self._locate(parts)
         if chain is None:
+            if len(parts) == 2 and parts[1] == "dev" and parts[0] in DEV_ALIASES:
+                aliases = DEV_ALIASES[parts[0]]
+                doc = self
+                for a in aliases:
+                    doc = doc.without(f"{parts[0]}.{a}")
+                return doc
             return self
         # Climb while the block would be left empty: removing its only key removes
         # the block. The loaded mapping is pruned by the same rule below, so the
@@ -675,11 +700,44 @@ class ConfigDocument:
         self._unknown_keys(self._mapping(), DexConfig, "", found)
         self._credential_keys(self._mapping(), "", found)
         self._project_pin(self._mapping(), found)
+        self._render_test_kinds(self._mapping(), found)
+        self._check_dev_aliases(self._mapping(), found)
         try:
             DexConfig.model_validate(self._mapping())
         except ValidationError as exc:
-            found.extend(self._invalid(error) for error in exc.errors())
+            for error in exc.errors():
+                problem = self._invalid(error)
+                if "cannot both be set" in problem.message:
+                    continue
+                if not any(
+                    p.key == problem.key and p.kind == problem.kind for p in found
+                ):
+                    found.append(problem)
         return sorted(found, key=lambda p: (p.line is None, p.line or 0, p.key, p.kind))
+
+    def _check_dev_aliases(
+        self, mapping: dict[str, Any], found: list[ConfigProblem]
+    ) -> None:
+        for connector, aliases in DEV_ALIASES.items():
+            block = mapping.get(connector)
+            if not isinstance(block, dict) or "dev" not in block:
+                continue
+            written = [a for a in aliases if a in block]
+            if not written:
+                continue
+            dev_line = self._lines.get(f"{connector}.dev")
+            alias_line = self._lines.get(f"{connector}.{written[0]}")
+            alias_names = ", ".join(f"{connector}.{a}" for a in written)
+            found.append(
+                ConfigProblem(
+                    "invalid",
+                    f"{connector}.dev",
+                    f"cannot be set when {alias_names} is also set on line "
+                    f"{alias_line}; they are two spellings of one setting, "
+                    "keep whichever you prefer and remove the other",
+                    line=dev_line,
+                )
+            )
 
     def _unknown_keys(
         self,
@@ -765,6 +823,33 @@ class ConfigDocument:
                 )
             )
 
+    def _render_test_kinds(
+        self, mapping: dict[str, Any], found: list[ConfigProblem]
+    ) -> None:
+        # Not fatal, like an unknown key: a list written for a later release,
+        # which renders a kind this one does not, still loads here and turns
+        # nothing on for that name (#1449).
+        from .generated_tests import CADENCES, SETTING, kinds, unknown_entries
+
+        section = mapping.get("declarations")
+        setting = section.get("render_tests") if isinstance(section, dict) else None
+        unknown = unknown_entries(setting)
+        if not unknown:
+            return
+        known = [kind.name for kind in kinds()]
+        names = ", ".join(known) if known else "none yet"
+        found.extend(
+            ConfigProblem(
+                "unknown_test_kind",
+                SETTING,
+                f"names '{entry}', which this release renders no generated test "
+                f"for, so it turns nothing on (generated tests: {names}; "
+                f"cadences: {', '.join(CADENCES)})",
+                line=self._line_of(SETTING),
+            )
+            for entry in unknown
+        )
+
     def _invalid(self, error: Any) -> ConfigProblem:
         key = _dotted(error["loc"])
         message = str(error["msg"]).removeprefix("Value error, ")
@@ -785,7 +870,11 @@ class ConfigDocument:
         prefix: str,
         rows: list[ConfigSetting],
     ) -> None:
+        connector_name = prefix.rstrip(".")
+        aliases = DEV_ALIASES.get(connector_name, ())
         for name, info in model.model_fields.items():
+            if name in aliases:
+                continue
             key = f"{prefix}{name}"
             value = dumped.get(name)
             in_file = isinstance(raw, dict) and name in raw
@@ -803,21 +892,42 @@ class ConfigDocument:
             if _is_free_form(info.annotation) and isinstance(value, dict) and value:
                 self._flatten(key, value, rows)
                 continue
-            if in_file:
+            if name == "dev" and connector_name in DEV_ALIASES:
+                written_aliases = [
+                    a for a in aliases if isinstance(raw, dict) and a in raw
+                ]
+                if in_file:
+                    source = "file"
+                    as_written = written if written != value else ABSENT
+                    line = self._lines.get(key)
+                elif written_aliases:
+                    source = "file"
+                    as_written = ", ".join(written_aliases)
+                    line = self._lines.get(f"{prefix}{written_aliases[0]}")
+                else:
+                    default = to_jsonable_python(
+                        info.get_default(call_default_factory=True)
+                    )
+                    source = "derived" if value != default else "default"
+                    as_written = ABSENT
+                    line = None
+            elif in_file:
                 source = "file"
                 as_written = written if written != value else ABSENT
+                line = self._lines.get(key)
             else:
                 default = to_jsonable_python(
                     info.get_default(call_default_factory=True)
                 )
                 source = "derived" if value != default else "default"
                 as_written = ABSENT
+                line = None
             rows.append(
                 ConfigSetting(
                     key=key,
                     value=value,
                     source=source,
-                    line=self._lines.get(key),
+                    line=line,
                     as_written=as_written,
                     withheld=_withheld(key, value),
                 )
@@ -979,6 +1089,35 @@ class ConfigDocument:
                     f"{CONFIG_RELPATH}; remove one by hand first"
                 )
             if not pairs:
+                if index == len(parts) - 1 and part == "dev" and len(parts) == 2:
+                    connector = parts[0]
+                    if connector in DEV_ALIASES:
+                        alias_keys = set(DEV_ALIASES[connector])
+                        alias_pairs = [
+                            (k, v)
+                            for k, v in node.value
+                            if isinstance(k, yaml.ScalarNode) and k.value in alias_keys
+                        ]
+                        if alias_pairs:
+                            first_k, first_v = alias_pairs[0]
+                            edits: list[tuple[int, int, str]] = [
+                                (
+                                    first_k.start_mark.index,
+                                    first_k.end_mark.index,
+                                    "dev",
+                                )
+                            ]
+                            edits.extend(
+                                self._replace(first_k, first_v, value, warnings)
+                            )
+                            for extra_k, _ in alias_pairs[1:]:
+                                idx = next(
+                                    i
+                                    for i, (k, _) in enumerate(node.value)
+                                    if k is extra_k
+                                )
+                                edits.extend(self._removal(node, idx))
+                            return edits
                 return self._insert(node, rest, value)
             key_node, value_node = pairs[0]
             if index == len(parts) - 1:

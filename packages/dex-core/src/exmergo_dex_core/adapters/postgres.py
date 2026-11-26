@@ -60,8 +60,8 @@ from .base import (
     key_shape_aggregate_kwargs,
     key_shape_expressions,
     name_list,
+    shape_aggregate_kwargs,
     shape_stat_expressions,
-    shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
     temporal_continuity_sql,
@@ -642,6 +642,16 @@ class PostgresAdapter:
             per_table[identifier] = batches * self._scan_seconds(meta.byte_size)
         return sum(per_table.values()), per_table
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        scan rate. What a generated test costs per production run, priced from
+        the production tables' catalog sizes; nothing this command bills (a
+        startup, wake or uptime charge) is added, since the run it prices is not
+        dex's."""
+
+        return self._scan_seconds(sum(int(b) for b in byte_sizes))
+
     def query_estimate(self, sql: str) -> float:
         """The estimate for one firewall-approved query, from the free planner
         preflight (EXPLAIN knows about indexes, so a point lookup on a huge
@@ -957,13 +967,7 @@ class PostgresAdapter:
                     max_value=(
                         json_safe(values.get(f"mx_{i}")) if wants_min_max else None
                     ),
-                    upper_vocab_fraction=shape_stat_value(
-                        values, f"su_{i}", wants_shape
-                    ),
-                    person_shape_fraction=shape_stat_value(
-                        values, f"sp_{i}", wants_shape
-                    ),
-                    avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **shape_aggregate_kwargs(values, i, wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
                     **key_shape_aggregate_kwargs(values, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),

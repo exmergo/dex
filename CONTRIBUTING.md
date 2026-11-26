@@ -118,6 +118,55 @@ uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core demo
 uv run --project ~/path/to/dex/packages/dex-core python -m exmergo_dex_core explore map
 ```
 
+## The generated-test parity harness
+
+A test Dex generates from a declaration (`dex_unique_combination`,
+`dex_population_filter`, and the kinds after it) has two implementations of one fact: its SQL macro, which runs in the
+customer's `dbt build`, and the check `maintain verify` runs. The parity harness,
+`packages/dex-core/tests/transform/generated_parity.py`, holds them to one answer.
+Each row names a generated test, the `maintain verify` finding codes it must
+agree with, and a violating and a clean fixture model. The runner declares both
+through `transform plan` with `declarations.render_tests` on, builds them with
+`transform build`, runs `maintain verify`, and fails on any disagreement,
+including a dbt failure count that differs from the count the finding states.
+
+It runs on DuckDB in the offline suite (`tests/transform/test_generated_parity.py`)
+and on every warehouse in `integration.yml` through each connector's
+`test_generated_tests_agree_with_maintain_verify_live`. A new generated test
+adds a `ParityRow` to `ROWS` (several, each with its own `name`, where one test
+has several cases to hold, as `dex_population_filter` does for `includes`,
+`excludes`, a NULL and a typed comparison); its fixtures are literal SELECTs,
+written once for every dialect, with the connector's typed integer NULL passed
+in, and a text NULL spelled `nullif('x', 'x')`, which needs no per-dialect cast. A row
+whose fixtures read another model (`dex_parent_population`'s declared parent)
+lists it under `fixtures`, built in the same selection, and a test that renders
+several instances on one model (a parent's `missing` and `unexpected`
+directions) picks its own with `arguments`. A fact that renders no test on any
+connector, only `maintain verify`'s check (`dex_unit_range`'s `percent` row,
+`heuristic_only`), sets `withheld`: the harness then checks that the plan lists
+both fixtures `not_rendered` with that reason, that no test builds, and that
+`maintain verify` alone flags the violating fixture and not the clean one
+(`dex_join_coverage`'s LEFT-join row, `covered_by_builtin`, is held the same
+way). A kind whose instances read the model's SQL (`dex_join_coverage`, which
+reads its joins) sets `GeneratedTestKind.reads_joins` and takes the joins the
+plan read beside the declaration. A kind whose test sits on another model
+than the one declaring the fact (`dex_referenced_key`, on the parent a
+`references` names) sets `GeneratedTestKind.on_parent`; its row declares the
+children with `declared_fixtures`, names the fixture `maintain verify`'s finding
+sits on with `finding_on`, and, where the finding follows from the violation but
+not the reverse (a repeated parent key fans a child out; a fan-out has other
+causes), sets `directional`, so the clean fixture need only pass the test. A
+model the build skips because a parent fixture's test failed is built again on
+its own before `maintain verify` reads it. A kind whose instances read what
+the plan read of a snapshot (`dex_temporal_contract`, from a declared
+`history`) sets `GeneratedTestKind.reads_history` and takes a
+`HistoryReading` beside the declaration; its row builds the snapshot its
+fixtures read with `snapshots`, written under `snapshots/dex_parity/`, built in
+the first pass only and reported under `ParityReport.snapshots` so a connector's
+cleanup drops them as tables. A kind that
+does not support a connector declares it (`GeneratedTestKind.dialects`), and the
+harness then checks that the plan renders nothing there.
+
 ## Live BigQuery integration tests
 
 `tests/integration/` runs the real loop against BigQuery: ADC discovery, the
@@ -437,6 +486,69 @@ DEX_TEST_TRINO_URL=http://dex_ro@127.0.0.1:8085 \
     uv run pytest tests/integration -q -m trino_iceberg
 ```
 
+## Live Cube integration tests
+
+`tests/integration/test_cube_query.py` (marker `cube`) asks real Cube Core
+containers, started by `scripts/setup_cube_dev.sh`, for every query case and
+holds each answer to hand-written SQL. Render-only containers (one per
+warehouse type) hold no warehouse credential: Cube renders and Dex executes.
+Executing containers (`--execute`, marker `cube_execute`) run the same
+questions themselves for `--api`, over an in-memory DuckDB built from
+`scripts/cube/shop.sql` (the rows Dex's own DuckDB fixture holds) and over the
+Postgres dogfood database as `dex_ro`. ClickHouse and Trino are render-only:
+Dex executes over the seeded containers of their own suites, and the Trino
+renderer serves a copy of the model with each table under the `memory`
+catalog, since Dex names every Trino relation with its catalog. No setup and
+no secret: the `cube` job runs it on every push to `main`.
+
+```
+scripts/setup_postgres_dev.sh            # for the Postgres cases
+scripts/setup_cube_dev.sh --db duckdb
+scripts/setup_cube_dev.sh --db postgres
+scripts/setup_cube_dev.sh --execute --db duckdb
+DEX_CUBE_PG_PORT=<published port> scripts/setup_cube_dev.sh --execute --db postgres
+scripts/setup_clickhouse_dev.sh          # for the ClickHouse cases
+scripts/setup_cube_dev.sh --db clickhouse
+scripts/setup_trino_dev.sh               # for the Trino cases
+rm -rf /tmp/cube-trino-model && cp -r scripts/cube/model /tmp/cube-trino-model
+perl -pi -e 's/sql_table: app\./sql_table: memory.app./' /tmp/cube-trino-model/cubes/*.yml
+scripts/setup_cube_dev.sh --db trino --model /tmp/cube-trino-model
+source ~/.cache/dex-dogfood/cube.env
+DEX_TEST_PG_DSN=postgresql://dex_ro:dex_ro@localhost:<port>/dex_dogfood \
+DEX_TEST_CH_DSN=clickhouse://dex_ro:dex_ro@localhost:8124/app \
+DEX_TEST_TRINO_URL=http://dex_ro@localhost:8085 \
+    uv run pytest tests/integration -q -m cube
+```
+
+Cube Core outside dev mode never reloads an edited model, so re-run the setup
+script after editing `scripts/cube/model`.
+
+### Narrow Cube Cloud tests
+
+`tests/integration/test_cube_cloud.py` (marker `cube_cloud`) asks a Cube Cloud
+deployment serving `scripts/cube/model` over `scripts/cube/shop.sql` both ways:
+Cube Cloud executes (`--api`, the deployment's default) and Cube Cloud renders
+for Dex to execute (`--local`) on a DuckDB file built from the same statements.
+The job runs under the protected `cube-cloud-integration` environment, which
+holds the deployment's REST API base (`DEX_TEST_CUBE_CLOUD_URL`) and its API
+secret (`CUBE_CLOUD_API_SECRET`). The job mints a one-hour token from the secret
+per run (`scripts/cube_cloud/mint_token.py`), since the tokens Cube Cloud issues
+itself last a day.
+
+`scripts/setup_cube_cloud_ci.sh --deployment <id>` deploys the fixture with the
+`cube` CLI (the deployment must be in CLI deploy mode, which
+`cube deployments update <id> --data '{"deployMode":"cli"}'` sets), rotates the deployment's
+`CUBEJS_API_SECRET`, checks a token signed with it, and writes the environment.
+`--keep-secret FILE` also keeps a 0600 copy for running the suite locally:
+
+```
+scripts/setup_cube_cloud_ci.sh --deployment <id> --keep-secret ~/.config/dex-dogfood/cube_cloud_secret
+CUBE_API_TOKEN="$(CUBE_CLOUD_API_SECRET="$(cat ~/.config/dex-dogfood/cube_cloud_secret)" \
+    python3 ../../scripts/cube_cloud/mint_token.py)" \
+    DEX_TEST_CUBE_CLOUD_URL=https://<deployment>.<region>.cubecloudapp.dev/cubejs-api \
+    uv run pytest tests/integration -q -m cube_cloud
+```
+
 ## Elementary fixture tests
 
 `tests/transform/elementary_fixture.py` builds a small dbt project with the
@@ -454,11 +566,13 @@ DEX_TEST_ELEMENTARY=1 uv run pytest tests/transform/test_elementary_fixture.py
 ```
 
 Without the variable they collect as skipped with it named in the skip reason.
-They install the package at 0.26.1 and, for the mutation-run case, at 0.23.0,
+They install the package at 0.26.1 and, for the mutation-run cases and the
+upgrade from one release to the other that `maintain check` reads, at 0.23.0,
 the first release with DuckDB macros. Earlier releases carry none (0.16.4 was
 run and fails `dbt build` on DuckDB), and most installs pin 0.15 or 0.16, so
-those run on Postgres instead. `tests/integration/test_postgres_elementary.py`
-builds the same variants at 0.16.4 and 0.15.2 against the seeded container
+those build on Postgres instead. DuckDB still parses 0.16.4, so the resolver's
+cases install it there for `dbt parse` alone. `tests/integration/test_postgres_elementary.py`
+builds the same variants at 0.20.0, 0.16.4 and 0.15.2 against the seeded container
 `scripts/setup_postgres_dev.sh` starts, and needs both opt-ins:
 
 ```
@@ -470,7 +584,76 @@ DEX_TEST_ELEMENTARY=1 \
 
 The seed gives the `dbt_dev` role a second schema, `dbt_dev_elementary`, for the
 package's models, so re-run the setup script on a container seeded before it
-existed. No CI job sets `DEX_TEST_ELEMENTARY`, so neither file runs there.
+existed.
+
+The reader of the package's tables supports fewer releases than the fixture
+runs: those with a recorded layout in
+`packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
+(0.26.1 today). Adding one means copying each table's columns from the
+package's model files at that release's tag, citing the file and lines, and
+adding a fixture case whose tables are read back to the run that wrote them.
+The loader refuses a release the fixture does not run.
+
+In CI both files run in the integration workflow
+(`.github/workflows/integration.yml`): on a push to `main` that matches the
+workflow's `paths` filter (any change under `packages/dex-core/`, for one), on the
+weekly schedule and on a manual dispatch, never on a pull request, since
+installing the package needs the network. The Postgres file runs in its own step
+of the `postgres` job and the DuckDB file in the `elementary_duckdb` job, each
+with `DEX_TEST_ELEMENTARY=1` on that step. Because a skip counts as a pass, each
+step then runs `scripts/check_no_skips.py` over the JUnit report pytest wrote,
+which fails the step on any skipped case (an expected failure, `xfail`,
+included) or an empty run, so a dropped variable fails rather than reading as
+green.
+
+### The release matrix
+
+The fixture installs the package at one release per slot, and the engine's
+supported range (`TESTED_RELEASES` in
+`packages/dex-core/src/exmergo_dex_core/transform/elementary.py`, #1445) runs
+from the oldest of them to the newest. The table below is `MATRIX` in
+`tests/transform/elementary_fixture.py`: a test holds this table to it, and
+another holds `TESTED_RELEASES` to the releases it names.
+
+| Slot | Release | Warehouse | Why |
+| --- | --- | --- | --- |
+| the floor | `0.15.2` | Postgres | the oldest release Dex supports |
+| the most pinned series | `0.16.4` | Postgres | the series most public installs pin (#1312) |
+| the sample-flag boundary | `0.20.0` | Postgres | the first release the engine treats as honouring `disable_test_samples` (#1381), and the first whose run hooks return early when the package is disabled |
+| the oldest DuckDB release | `0.23.0` | DuckDB | the first with DuckDB macros |
+| the newest release | `0.26.1` | DuckDB | what a new install gets |
+
+Every slot is always in the matrix. The newest release also builds on Postgres
+in the two cases whose answer depends on the release: the per-test sampling
+switch and the sampling warning.
+
+Adding a new Elementary release:
+
+1. The weekly `elementary-release` job in
+   `.github/workflows/upstream-deps-canaries.yml` reads the package's versions
+   from the dbt package hub, the way `dbt deps` does, and fails naming the
+   release when the hub has one newer than the newest slot. Dependabot lists no
+   ecosystem for dbt packages, so this job is the watch. It needs no secret,
+   and it opens no pull request itself: one opened by the workflow's own token
+   runs no workflow, and the fixture never runs on a pull request anyway, so it
+   would carry no evidence.
+2. A pull request moves the newest slot to it: `CURRENT_VERSION` in
+   `elementary_fixture.py`, `TESTED_RELEASES` and the table above, in the same
+   change, so the supported range moves with them. CI runs the fixture files
+   only after a merge, so run both (above) and paste the result into the pull
+   request. The release leaving the slot leaves `TESTED_RELEASES`, though it
+   stays inside the supported range. If
+   `packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
+   records a layout for it, the loader will refuse that layout, since it reads
+   only releases the fixture runs. So either move the layout to the new
+   release in the same change, or keep the old release as a slot of its own.
+3. If the fixture fails at the new release, the pull request does not merge.
+   The release stays outside the range, and Dex keeps reporting it
+   `elementary_release_untested` until the failure is fixed.
+
+Apart from the newest slot moving up, a release leaves the matrix only when the
+floor moves. That changes the supported range, so its pull request carries a
+changelog fragment saying so.
 
 ## Agent evals (`evals/`)
 
@@ -929,7 +1112,7 @@ fragment's name the way CI does:
 
 ```
 python3 scripts/uvx_locked.py towncrier build --draft --version preview
-python3 scripts/check_changelog_fragments.py
+uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py
 ```
 
 ### Writing the entry
@@ -1018,13 +1201,20 @@ commit:
    It pins the three skill wrappers to the engine version, bumps the four plugin
    manifests, writes the release's section of `CHANGELOG.md` dated today in UTC,
    and deletes the fragments it collected. It stages nothing; every change is
-   left in the working tree.
+   left in the working tree. Pass both versions bare: a leading `v` is dropped,
+   and a plugin version that is not semver is refused before anything is written.
 
 3. Review `git status` and `git diff`, and update any documentation the release
    changes: status and capability claims, install commands, version strings.
 4. Commit the changelog, the deleted fragments, the pins and the manifests
    together (`git commit -a` includes the deletions). The pull request edits
-   `CHANGELOG.md`, so it carries the `no-changelog` label.
+   `CHANGELOG.md`, so it carries the `no-changelog` label. Its **Release prep**
+   check (`.github/workflows/release-prep.yml`) holds the versions to their
+   shape with `scripts/check_release_versions.py` (bare PEP 440 engine pins, the
+   newest `CHANGELOG.md` section, bare semver manifests that agree with the
+   engine), and fails if the tree is not exactly what the script writes, such as
+   a `claude/` folder left behind by a skill edited after the script ran. Run
+   `python3 scripts/check_release_versions.py` to check before pushing.
 5. Once it is merged, tag the merged commit and push the tag. The release
    workflow refuses, before anything reaches PyPI, a tag whose wrapper pins do
    not match it or whose `CHANGELOG.md` has no section for it.
@@ -1043,7 +1233,7 @@ scripts/prepare_release.sh <engine-version> <plugin-version>
 Running the script again for a version whose section already exists leaves
 `CHANGELOG.md` and any newer fragments alone. A fragment towncrier cannot parse
 stops the script before it changes anything, and
-`python3 scripts/check_changelog_fragments.py` names the file at fault.
+`uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py` names the file at fault.
 
 ## Maintainers
 

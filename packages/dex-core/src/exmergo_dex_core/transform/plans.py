@@ -390,6 +390,9 @@ def admit_edit(
         pii_overrides=pii_overrides,
         compiled=compiled,
         defer_compilation=defer_compilation,
+        # Both the project view and the disk: a file the view skipped (an
+        # existing seed it could not decode) is not a new one (#647).
+        created=edit.path not in view.files and not resolved.exists(),
     )
 
 
@@ -524,7 +527,9 @@ def plan(
                 # An unreadable cache narrows the seed's PII gate to the header
                 # detector rather than stopping the plan. Said out loud, because
                 # a check that quietly got weaker is worse than one that failed.
-                cached.append(None)
+                from .validate import UNREADABLE_CACHE
+
+                cached.append(UNREADABLE_CACHE)
                 warnings.append(
                     f"the exploration cache could not be read ({exc}), so a "
                     "seed's columns were checked against their own names only, "
@@ -560,7 +565,19 @@ def plan(
             if edit.op is EditOp.UPSERT and edit.kind is not EditKind.SEMANTIC_DOCUMENT:
                 from .validate import validate_edit
 
-                warnings.extend(validate_edit(edit))
+                # The seed gate reads the cache and the reviewed overrides on
+                # every format, so an override clears a seed column here too.
+                warnings.extend(
+                    validate_edit(
+                        edit,
+                        cache=read_cache() if edit.kind is EditKind.SEED_CSV else None,
+                        pii_overrides=pii_overrides,
+                        # Another format's keys are not paths dex can
+                        # check on disk, so a seed absent from its view is
+                        # never assumed new: the relaxation is dbt's only.
+                        created=False,
+                    )
+                )
         current = view.files.get(edit.path)
         if edit.op is EditOp.DELETE and current is None:
             raise PlanError(
@@ -668,7 +685,12 @@ def plan(
     except ValueError:
         rel_project = project.as_posix()
     new_plan = TransformPlan(
-        plan_id=_plan_id(intent, pinned, edit_target=edit_target),
+        plan_id=_plan_id(
+            intent,
+            pinned,
+            project_dir=rel_project,
+            edit_target=edit_target,
+        ),
         created_at=created_at,
         intent=intent,
         project_dir=rel_project,
@@ -1408,12 +1430,21 @@ def select_columns(sql: str) -> set[str] | None:
 
 
 def _plan_id(
-    intent: str, edits: list[PlanEdit], *, edit_target: str = "project"
+    intent: str,
+    edits: list[PlanEdit],
+    *,
+    project_dir: str | Path | None = None,
+    edit_target: str = "project",
 ) -> str:
     payload: dict[str, Any] = {
         "intent": intent,
         "edits": [e.model_dump(mode="json") for e in edits],
     }
+    if project_dir is not None:
+        norm = str(project_dir).replace("\\", "/")
+        if norm.startswith("./"):
+            norm = norm[2:]
+        payload["project_dir"] = norm or "."
     # Preserve every existing project plan id. The discriminator is needed only
     # for the new axis, where an identical path/content must not collide with a
     # transformation-project proposal.

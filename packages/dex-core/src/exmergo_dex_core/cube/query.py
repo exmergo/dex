@@ -47,18 +47,20 @@ CUBE_CONNECTORS: dict[str, tuple[str, str]] = {
     "bigquery": ("?", "`"),
     "snowflake": ("?", '"'),
     "redshift": ("$", '"'),
+    "clickhouse": ("?", "`"),
+    "trino": ("?", '"'),
 }
 
 #: Why each connector outside :data:`CUBE_CONNECTORS` is refused, by name.
 UNSUPPORTED_CONNECTORS: dict[str, str] = {
     "databricks": "its rendered SQL has no reviewed golden yet",
-    "clickhouse": "its rendered SQL has no reviewed golden yet",
-    "trino": "its rendered SQL has no reviewed golden yet",
 }
 
 # Dialects whose string literals take a backslash escape, for the scanner that
 # finds placeholders outside quoted text.
-_BACKSLASH_ESCAPES = {"bigquery", "snowflake", "redshift"}
+_BACKSLASH_ESCAPES = {"bigquery", "snowflake", "redshift", "clickhouse"}
+# Dialects whose quoted identifiers take one too.
+_BACKSLASH_IDENTIFIERS = {"clickhouse"}
 
 
 class CubeQueryError(DexError, ValueError):
@@ -100,6 +102,16 @@ class CubeRequest:
     #: ``member`` or ``member.grain`` as Cube names a result -> the caller's token.
     names: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def buckets(self) -> list[str]:
+        """``member.grain`` for every bucketed time dimension, in query order."""
+
+        return [
+            f"{t['dimension']}.{t['granularity']}"
+            for t in self.query.get("timeDimensions", [])
+            if t.get("granularity")
+        ]
+
 
 def index(cubes: Sequence[Cube], views: Sequence[Any]) -> dict[str, Target]:
     """Every queryable token in the repository's models."""
@@ -134,6 +146,8 @@ def split_time(token: str, members: Mapping[str, Target]) -> tuple[str, str | No
     a member whose own name holds ``__`` is never cut in two.
     """
 
+    if token in members:
+        return token, None
     if "__" in token:
         head, tail = token.rsplit("__", 1)
         target = members.get(head)
@@ -217,11 +231,16 @@ def to_cube_query(
 
     # What an --order-by token may name, as written -> the member Cube orders by.
     # A bucketed time dimension is ordered by the dimension itself.
+    # Every exact grouped name first, bucketed ones included, and only then the
+    # generated aliases, so a member spelled exactly like an alias keeps its own
+    # sort key whatever order the group-by named them in.
     own = {token: token for token in (*measures, *dimensions)}
     for entry in times:
-        name = entry["dimension"]
-        own[name] = name
-        own[f"{name}__{entry['granularity']}"] = name
+        own.setdefault(entry["dimension"], entry["dimension"])
+    for entry in times:
+        own.setdefault(
+            f"{entry['dimension']}__{entry['granularity']}", entry["dimension"]
+        )
     order: list[list[str]] = []
     for raw in q.order_by:
         descending = raw.startswith("-")
@@ -560,6 +579,19 @@ def _compare(token: str, member: Member, found: Any, stale: Any) -> None:
         and _norm(entry.get("sql")) != _norm(member.sql)
     ):
         raise stale(token, "has different SQL there")
+    # Cube serves every member's SQL in `/v1/meta` (a `count` with none has
+    # none), so a member the repository defines with SQL and the server serves
+    # without any cannot be compared and is not passed as though it matched.
+    if member.sql is not None and entry.get("sql") is None:
+        raise stale(token, "has no SQL in the server's /v1/meta to compare")
+    # The other direction, for a measure: a `count` the repository defines with
+    # no SQL counts rows, and one served over a column counts that column's
+    # non-NULL values, so SQL the repository does not declare is a different
+    # measure, not an omission.
+    if kind == MEASURE and member.sql is None and entry.get("sql") is not None:
+        raise stale(
+            token, "is served with SQL the repository's member does not declare"
+        )
     if member.type == "time":
         served_grains = sorted(
             g.get("name")
@@ -666,13 +698,14 @@ def _placeholders(sql: str, dialect: str) -> list[tuple[int, int, str]]:
 
     found: list[tuple[int, int, str]] = []
     backslash = dialect in _BACKSLASH_ESCAPES
+    identifiers = dialect in _BACKSLASH_IDENTIFIERS
     i, n = 0, len(sql)
     while i < n:
         char = sql[i]
         if char in "'\"`":
             j = i + 1
             while j < n:
-                if backslash and char == "'" and sql[j] == "\\":
+                if backslash and (char == "'" or identifiers) and sql[j] == "\\":
                     j += 2
                     continue
                 if sql[j] == char:

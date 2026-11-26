@@ -27,6 +27,7 @@ from exmergo_dex_core.maintain.snapshot import (
 )
 from exmergo_dex_core.transform import declarations as d
 from exmergo_dex_core.transform import declare as declare_mod
+from exmergo_dex_core.transform.claims import claim_id
 from exmergo_dex_core.transform.drafting import read_declared
 
 YML = """\
@@ -232,7 +233,22 @@ def test_a_reference_to_a_version_writes_a_versioned_ref():
     test = (column.get("data_tests") or column["tests"])[0]
     assert test == {
         "relationships": {
-            "arguments": {"to": "ref('dim_teams', v=2)", "field": "team_id"}
+            "arguments": {"to": "ref('dim_teams', v=2)", "field": "team_id"},
+            "config": {
+                "meta": {
+                    "disable_test_samples": True,
+                    # The version label is part of the claim: v2's reference is
+                    # its own fact, not the shared entry's.
+                    "dex": {
+                        "claim": claim_id(
+                            "fct_games",
+                            "references",
+                            ["team_id"],
+                            {"references": "dim_teams.v2.team_id"},
+                        )
+                    },
+                }
+            },
         }
     }
 
@@ -299,6 +315,31 @@ def test_a_shared_grain_needs_every_version_to_produce_it():
     )
     with pytest.raises(d.DeclarationError, match="not every version produces"):
         _declare([{"model": "dim_teams", "grain": ["team_id"]}], files)
+
+
+def test_a_shared_continuity_needs_every_version_to_produce_its_keys():
+    # #1461: a continuity on the shared entry renders a test every version
+    # inherits, so a key only v1 produces would fail v2's test to compile.
+    files = _files()
+    files["models/marts/dim_teams.sql"] = (
+        "select team_id, team_label, created_at from {{ ref('stg_teams') }}\n"
+    )
+    files["models/marts/dim_teams_v2.sql"] = (
+        "select team_id, team_label as display_label, created_at\n"
+        "from {{ ref('stg_teams') }}\n"
+    )
+
+    def shared(by):
+        return [
+            {
+                "model": "dim_teams",
+                "columns": {"created_at": {"role": "time", "continuity": {"by": by}}},
+            }
+        ]
+
+    with pytest.raises(d.DeclarationError, match="not every version produces"):
+        _declare(shared(["team_label"]), files)
+    _declare(shared(["team_id"]), files)
 
 
 # --- reading it back --------------------------------------------------------------

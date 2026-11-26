@@ -252,7 +252,7 @@ semantic-api = ["httpx>=0.27"]
 ossie = ["jsonschema>=4.26"]
 # SLayer semantic models (`semantic.vendor: slayer`). Pinned to ONE exact release,
 # never a range: SLayer moves fast (eleven releases between Oct 12 and Nov 9, 2026) and
-# its stored model format is versioned (15 at 1.8.2), so a range would let the
+# its stored model format is versioned (15 at 1.8.4), so a range would let the
 # format dex reads and writes move under it on an ordinary reinstall. Moving the
 # pin is a deliberate act, and `exmergo_dex_core.slayer.dependency.SLAYER_VERSION`
 # has to move with it (a test holds the two equal).
@@ -272,7 +272,7 @@ ossie = ["jsonschema>=4.26"]
 # FastAPI, uvicorn, mcp, duckdb, jafgen and tantivy. Nothing outside
 # `exmergo_dex_core.slayer` may import `slayer`, and that module imports it only
 # behind `ensure_available`; a packaging test holds both true.
-slayer = ["motley-slayer==1.8.2", "exmergo-dex-core[sql]"]
+slayer = ["motley-slayer==1.8.4", "exmergo-dex-core[sql]"]
 # Cube YAML model files (`semantic.vendor: cube`). Read statically, validated by
 # dex's own port of Cube's model rules, so there is no Cube package to install:
 # no Node, no Cube server, no `cube_dbt`. The one thing the reader needs is the
@@ -376,7 +376,7 @@ all = [
 # runs the whole suite without also picking a connector. towncrier is the version
 # scripts/prepare_release.sh runs, so the changelog tests exercise it offline;
 # tests/test_changelog.py fails if the two pins part.
-dev = ["ruff==0.17.4", "towncrier==26.9.0", "scikit-learn>=1.4", "exmergo-dex-core[ossie,sql,storage-conformance]"]
+dev = ["ruff==0.17.5", "towncrier==26.9.0", "scikit-learn>=1.4", "exmergo-dex-core[ossie,sql,storage-conformance]"]
 
 [project.urls]
 Homepage = "https://www.exmergo.com/dex"
@@ -411,7 +411,7 @@ source = "vcs"
 [tool.hatch.version.raw-options]
 # This package lives in a subdirectory; the repository .git is two levels up.
 root = "../.."
-fallback_version = "1.18.0"
+fallback_version = "1.18.5"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -434,7 +434,9 @@ markers = [
   "clickhouse_cloud: narrow ClickHouse Cloud integration tests (protected credentials required)",
   "trino: Trino-specific integration tests (the keyless local container)",
   "trino_iceberg: narrow Trino integration tests against the Glue and S3 Iceberg catalog (protected credentials required)",
-  "cube: governed Cube queries against a live render-only Cube Core (scripts/setup_cube_dev.sh)",
+  "cube: Cube queries against a live Cube Core (scripts/setup_cube_dev.sh)",
+  "cube_execute: Cube --api queries against a live executing Cube Core (scripts/setup_cube_dev.sh --execute)",
+  "cube_cloud: narrow Cube Cloud integration tests (protected credentials required)",
   "packaging: builds a wheel and runs against it in an isolated environment; slow, needs uv",
 ]
 

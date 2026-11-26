@@ -69,6 +69,8 @@ _COLUMN_FIELDS = (
     "additivity",
     "unit",
     "references",
+    "freshness",
+    "continuity",
 )
 
 

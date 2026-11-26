@@ -75,8 +75,8 @@ from .base import (
     key_shape_aggregate_kwargs,
     key_shape_expressions,
     name_list,
+    shape_aggregate_kwargs,
     shape_stat_expressions,
-    shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
     temporal_continuity_sql,
@@ -736,6 +736,19 @@ class TrinoAdapter:
             )
         return sum(per_table.values()), per_table
 
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): their summed bytes over the
+        scan rate. What a generated test costs per production run, priced from
+        the production tables' catalog sizes; nothing this command bills (a
+        startup, wake or uptime charge) is added, since the run it prices is not
+        dex's."""
+
+        return max(
+            sum(int(b) for b in byte_sizes) / _SCAN_BYTES_PER_SECOND,
+            _MIN_STATEMENT_SECONDS,
+        )
+
     def query_estimate(self, sql: str) -> float:
         """The estimate for one firewall-approved query, from the free
         non-executing EXPLAIN (TYPE IO), which prices the statement after
@@ -1085,13 +1098,7 @@ class TrinoAdapter:
                         if wants_min_max and not sampled
                         else None
                     ),
-                    upper_vocab_fraction=shape_stat_value(
-                        values, f"su_{i}", wants_shape
-                    ),
-                    person_shape_fraction=shape_stat_value(
-                        values, f"sp_{i}", wants_shape
-                    ),
-                    avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **shape_aggregate_kwargs(values, i, wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
                     **key_shape_aggregate_kwargs(values, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),
@@ -1275,6 +1282,25 @@ class TrinoAdapter:
     def _run(self, sql: str) -> tuple[list, list[str]]:
         rows, labels, _types = self._run_rows(sql)
         return rows, labels
+
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: a statement Cube renders
+        reads a timestamp with no zone through the session time zone, and the
+        Trino client sends this machine's own zone unless told otherwise, so
+        run under it the statement buckets rows differently. Only UTC, so
+        nothing caller-supplied is interpolated.
+        """
+
+        cursor = self._conn.cursor()
+        try:
+            # dex-built session statement, a constant. The client keeps the
+            # zone for every later statement on the connection.
+            cursor.execute("SET TIME ZONE 'UTC'")
+            cursor.fetchall()
+        except Exception as exc:
+            raise self._translate(exc) from exc
 
     def _run_rows(
         self,

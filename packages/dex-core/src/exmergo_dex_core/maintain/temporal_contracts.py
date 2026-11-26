@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
+from .. import generated_tests as gt
 from ..cache import match_identifier
 from ..dbt_project import strip_relation_quoting
 from ..semantic_declarations import History
@@ -110,10 +111,9 @@ class Written:
 def snapshot_nodes(nodes: dict[str, Any], project_dir: Path) -> dict[str, SnapshotNode]:
     """Every snapshot the manifest holds, by lowered name, with its last status."""
 
-    from .verify import _run_results
+    from .verify import node_results
 
-    results = _run_results(project_dir) or []
-    status = {str(r.get("unique_id")): str(r.get("status")) for r in results}
+    status = node_results(project_dir).statuses()
     out: dict[str, SnapshotNode] = {}
     for uid, node in nodes.items():
         if (
@@ -226,9 +226,10 @@ def write_probe(
     """Write the statement that measures one contract onto ``probe``, or record
     why none could be written. Free: at most one metadata read."""
 
+    from ..explore.cumulative import _transpile_probe
     from ..guards.cost_guard import CostGuardError
     from ..guards.sql_guard import assert_select_only
-    from .declared_facts import _refusal, _transpile
+    from .declared_facts import _refusal
 
     model = probe.model.model
     rule = probe.model.history
@@ -388,7 +389,9 @@ def write_probe(
     )
     dialect = adapter.dialect
     probe.temporal = Written(
-        sql=assert_select_only(_transpile(sql, dialect), dialect=dialect),
+        # ClickHouse has no LAG: its lagInFrame needs the frame spelled out and
+        # a NULL default, as the cumulative detector writes it (#1458).
+        sql=assert_select_only(_transpile_probe(sql, dialect), dialect=dialect),
         rule=rule,
         snapshot_identifier=identifier,
     )
@@ -777,12 +780,10 @@ def _judge(
             }
         )
 
+    # The table the generated test reads too (#1458), so the measures left
+    # policy_missing here are the ones that render no dex_temporal_contract.
     policy_owed: dict[str, list[str]] = {
-        "transition_count": _owed(history, "initial_observation", "null_status"),
-        "latest_target_transition_at": _owed(
-            history, "initial_observation", "null_status", "time"
-        ),
-        "first_target_at": _owed(history, "time"),
+        name: gt.policy_owed(history, name) for name in gt.TEMPORAL_MEASURES
     }
     measure_columns = {
         "transition_count": history.measures.transition_count,
@@ -951,17 +952,6 @@ def _judge(
 
 def _value(item: Any) -> str | None:
     return item.value if item is not None else None
-
-
-def _owed(history: History, *fields: str) -> list[str]:
-    owed = []
-    for name in fields:
-        if name == "time":
-            if history.time is None or history.time.provenance is None:
-                owed.append("time.provenance")
-        elif getattr(history, name) is None:
-            owed.append(name)
-    return owed
 
 
 def _policy_text(history: History) -> str:

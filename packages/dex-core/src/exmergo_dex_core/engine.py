@@ -92,7 +92,9 @@ if TYPE_CHECKING:
     )
     from .maintain.results import (
         CoverageResult,
+        DiagnoseResult,
         DriftResult,
+        IncidentsResult,
         ReconcileResult,
         SnapshotResult,
         VerifyResult,
@@ -1086,6 +1088,7 @@ class DexEngine:
         rank: bool = False,
         limit: int | None = None,
         show_all: bool = False,
+        include_elementary: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> InventoryResult:
         from .explore import commands as explore
@@ -1098,6 +1101,7 @@ class DexEngine:
             rank=rank,
             limit=limit,
             show_all=show_all,
+            include_elementary=include_elementary,
             result_mode=mode,
         )
 
@@ -1135,6 +1139,7 @@ class DexEngine:
         refresh: bool = False,
         use_project: bool = False,
         use_hosted_semantic_layer: bool = False,
+        include_elementary: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> RelationshipsResult:
         from .explore import commands as explore
@@ -1149,6 +1154,7 @@ class DexEngine:
             refresh=refresh,
             use_project=use_project,
             use_hosted_semantic_layer=use_hosted_semantic_layer,
+            include_elementary=include_elementary,
             result_mode=mode,
         )
 
@@ -1162,6 +1168,7 @@ class DexEngine:
         refresh: bool = False,
         use_project: bool = False,
         use_hosted_semantic_layer: bool = False,
+        include_elementary: bool = False,
         result_mode: ResultMode | str | None = None,
     ) -> MapResult:
         from .explore import commands as explore
@@ -1178,6 +1185,7 @@ class DexEngine:
             refresh=refresh,
             use_project=use_project,
             use_hosted_semantic_layer=use_hosted_semantic_layer,
+            include_elementary=include_elementary,
             result_mode=mode,
         )
 
@@ -1283,21 +1291,31 @@ class DexEngine:
         )
 
     def diagram(
-        self, *, full: bool = False, result_mode: ResultMode | str | None = None
+        self,
+        *,
+        full: bool = False,
+        include_elementary: bool = False,
+        result_mode: ResultMode | str | None = None,
     ) -> DiagramResult:
         """The cached map as a Mermaid ER diagram. Reads the store, nothing else.
 
         Free on every connector and the one explore method that opens no
         connection at all, so a host holding a populated store can call it with
         no credential in play. See :mod:`~.explore.diagram` for what the
-        rendered cardinalities are and are not allowed to claim.
+        rendered cardinalities are and are not allowed to claim. The Elementary
+        package's own tables are left out unless ``include_elementary`` (#1494).
         """
 
         from .explore import commands as explore
 
         mode = self.resolve_result_mode(result_mode)
         return call_withholding(
-            mode, explore.diagram, self, full=full, result_mode=mode
+            mode,
+            explore.diagram,
+            self,
+            full=full,
+            include_elementary=include_elementary,
+            result_mode=mode,
         )
 
     # The two semantic methods import from `explore.semantic.commands`, not from
@@ -1452,6 +1470,49 @@ class DexEngine:
         result.result_mode = self.resolve_result_mode(None)
         return result
 
+    def incidents(
+        self,
+        objects: list[str] | None = None,
+        *,
+        invocations: int | None = None,
+    ) -> IncidentsResult:
+        """The incidents the sources hold for the selected models' tests (#1472).
+
+        Elementary's tables, read over the newest ``invocations`` runs (20 by
+        default) and priced first, and dbt's run results; ``sources`` says which
+        were read. On a billed connector an unconfirmed call raises
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before any
+        statement reads Elementary's tables. The confirmation gates those billed
+        reads only: the local manifest and run results, and the warehouse's
+        catalog metadata, are read before it is asked, and a call that reads
+        dbt's run results alone asks nothing.
+        """
+
+        from .maintain import incident_sources
+
+        return incident_sources.incidents(self, objects, invocations=invocations)
+
+    def diagnose(
+        self,
+        objects: list[str] | None = None,
+        *,
+        invocations: int | None = None,
+    ) -> DiagnoseResult:
+        """Each open incident on the selected models' tests, diagnosed (#1475).
+
+        The incidents are read as :meth:`incidents` reads them, with the
+        repository's history, and each is bisected over its onset, bounded by
+        the committed snapshot series where there is one, and answered by the
+        checks Dex already has: one confirmed cause, several, or none, with
+        what was ruled out and the window no recorded state covers. On a billed
+        connector the incident read and then the checks each raise
+        :class:`~.guards.cost_guard.ConfirmationRequiredError` before they scan.
+        """
+
+        from .maintain import diagnose
+
+        return diagnose.diagnose(self, objects, invocations=invocations)
+
     # --- transform --------------------------------------------------------
     #
     # Every method here needs `repo_root`: the dbt project is the source of
@@ -1470,8 +1531,12 @@ class DexEngine:
         no_agent_instructions: bool = False,
         layered_schemas: bool = False,
         in_place: bool = False,
+        elementary: bool | None = None,
     ) -> SetupResult:
-        """Set up Dex, adopt an existing project, and verify its connection."""
+        """Set up Dex, adopt an existing project, and verify its connection.
+
+        ``elementary=False`` leaves the Elementary install out (#1464).
+        """
         from .onboarding import initialize
 
         return initialize(
@@ -1485,6 +1550,7 @@ class DexEngine:
             no_agent_instructions=no_agent_instructions,
             layered_schemas=layered_schemas,
             in_place=in_place,
+            elementary=elementary,
         )
 
     def init_project(
@@ -1515,7 +1581,22 @@ class DexEngine:
         declarations: list[Any] | None = None,
         scaffold: list[str] | None = None,
         attribute_rows: bool | None = None,
+        no_parse: bool = False,
     ) -> PlanResult:
+        """Store a transform plan of reviewable diffs (see ``transform plan``).
+
+        ``no_parse`` stores the plan without starting dbt (#1517): no
+        ``dbt parse`` of the post-change project, none for a declared mart's
+        derived semantic model, and no ``dbt compile``. It is for a host that
+        must not run repository-controlled code (Jinja, macros, hooks) where it
+        authors, and parses the plan in a sandbox of its own. Unlike
+        ``semantic_plan(no_parse=True)``, which still parses a derivation it
+        adds, nothing here starts dbt. Every structural check still
+        runs: admission, placement, deletions, the PII and secret gates, hash
+        pinning and the diffs. A model with Jinja control flow cannot be checked
+        without compiling it, so it is refused rather than stored unchecked.
+        """
+
         from .transform import commands as transform
 
         return transform.plan(
@@ -1525,6 +1606,7 @@ class DexEngine:
             declarations=declarations,
             scaffold=scaffold,
             attribute_rows=attribute_rows,
+            no_parse=no_parse,
         )
 
     def compare(

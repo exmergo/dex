@@ -277,6 +277,19 @@ def test_the_slayer_extra_follows_the_configured_vendor(
             "cube",
             ["ossie", "cube", "semantic-api"],
         ),
+        # `--api` (#914): Cube executes, and the same extras carry the request.
+        (
+            ["explore", "semantic", "query", "orders.revenue", "--api"],
+            "cube",
+            ["ossie", "cube", "semantic-api"],
+        ),
+        (
+            ["explore", "semantic", "list", "--api"],
+            "cube",
+            ["ossie", "cube", "semantic-api"],
+        ),
+        (["maintain", "reconcile"], "cube", ["cube"]),
+        (["maintain", "semantic"], "cube", ["ossie", "cube"]),
         (["explore", "map", "--use-project"], "cube", ["cube"]),
         (["explore", "relationships", "--use-project"], "cube", ["cube"]),
         (["transform", "apply"], "cube", ["cube"]),
@@ -453,6 +466,52 @@ def test_the_semantic_views_vendor_and_the_connector_are_kept_apart(
         "semantic-views",
     ]
     assert wrapper._extras(["explore", "inventory"]) == ["snowflake"]
+
+
+def test_the_workspace_deployment_takes_the_metric_views_and_connector_extras(
+    wrapper, tmp_path, monkeypatch
+):
+    """`semantic.deployment: databricks_workspace` (#1364) configures no file:
+    every `explore semantic` command still takes the Metric View reader and the
+    Databricks connector, and so does `--use-hosted-semantic-layer`, which reads
+    the deployed views' joins and keys through that reader."""
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex" / "config.yml").write_text(
+        "connector: databricks\nsemantic:\n  vendor: databricks\n"
+        "  deployment: databricks_workspace\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    for mode in ("list", "values", "query"):
+        assert wrapper._extras(["explore", "semantic", mode, "orders.x"]) == [
+            "databricks",
+            "ossie",
+            "metric-views",
+            "semantic-api",
+        ], mode
+    for command in ("relationships", "map"):
+        assert wrapper._extras(["explore", command, "--use-hosted-semantic-layer"]) == [
+            "databricks",
+            "metric-views",
+        ], command
+    assert wrapper._extras(["explore", "relationships"]) == ["databricks"]
+
+
+@pytest.mark.parametrize(
+    ("vendor", "expected"),
+    [("dbt", []), ("slayer", []), ("snowflake", ["semantic-views"])],
+)
+def test_the_hosted_flag_takes_a_reader_only_where_the_warehouse_holds_the_layer(
+    wrapper, vendor, expected
+):
+    """Under dbt the flag reads dbt Cloud, which needs no reader here; SLayer's
+    extra is too heavy to take for a flag that cannot read it."""
+
+    argv = ["explore", "map", "--use-hosted-semantic-layer"]
+    assert wrapper._feature_extras(argv, vendor) == expected
 
 
 def test_a_flag_value_is_never_read_as_the_mode(wrapper):

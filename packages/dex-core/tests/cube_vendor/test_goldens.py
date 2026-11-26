@@ -67,6 +67,18 @@ GROUP BY 1, 2
 HAVING (sum("orders".total) > '1')
 ORDER BY  3  DESC
 LIMIT 10""",
+    "clickhouse": """SELECT `orders`.status `orders__status`, toDateTime64(toStartOfMonth(toTimeZone(toDateTime64(`orders`.ordered_at, 0), 'UTC'), 'UTC'), 0, 'UTC') `orders__ordered_at_month`, sum(`orders`.total) `orders__revenue`, count(`orders`.id) `orders__count` 
+FROM  app.orders  AS `orders`
+WHERE (`orders`.ordered_at >= parseDateTimeBestEffort('2026-01-01T00:00:00.000Z') AND `orders`.ordered_at <= parseDateTimeBestEffort('2026-03-31T23:59:59.999Z')) AND (`orders`.status IN ('paid', 'shipped'))
+GROUP BY 1, 2
+HAVING (sum(`orders`.total) > '1')
+ORDER BY  3  DESC
+LIMIT 10""",
+    "trino": """SELECT "orders".status "orders__status", date_trunc('month', CAST((COALESCE("orders".ordered_at, CAST(NULL AS TIMESTAMP)) AT TIME ZONE 'UTC') AS TIMESTAMP)) "orders__ordered_at_month", sum("orders".total) "orders__revenue", count("orders".id) "orders__count"  
+FROM  app.orders  AS "orders"
+WHERE ("orders".ordered_at >= from_iso8601_timestamp('2026-01-01T00:00:00.000Z') AND "orders".ordered_at <= from_iso8601_timestamp('2026-03-31T23:59:59.999Z')) AND ("orders".status IN ('paid', 'shipped')) GROUP BY 1, 2
+HAVING (sum("orders".total) > CAST('1' AS DOUBLE)) ORDER BY  3  DESC
+LIMIT 10""",
 }
 
 

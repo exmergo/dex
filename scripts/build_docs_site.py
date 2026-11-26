@@ -276,9 +276,9 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         "semantic-layers/databricks-metric-views",
         PageMeta(
             "Databricks Metric View compatibility",
-            "How dex reads and validates Databricks Metric View YAML with no "
-            "workspace connection: the ported 1.1 rules, the catalog mapping and "
-            "what it declines to claim.",
+            "How dex reads Metric View YAML from the repository or Unity Catalog "
+            "alone, queries the deployed view with MEASURE(), and what it "
+            "declines to claim.",
             "Databricks Metric Views",
         ),
     ),
@@ -409,6 +409,17 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
             "inspect dependencies and edits, apply offline, and read build "
             "evidence in a sandbox safely.",
             "Host integration",
+        ),
+    ),
+    ReferencePage(
+        "incidents.md",
+        "reference/incidents",
+        PageMeta(
+            "Test failures as incidents",
+            "How dex folds test outcomes from every source into incidents by one "
+            "rule, on a coverage timeline that never reads an unobserved interval "
+            "as good.",
+            "Incidents",
         ),
     ),
     ReferencePage(

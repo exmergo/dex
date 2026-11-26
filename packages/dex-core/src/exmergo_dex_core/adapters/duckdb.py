@@ -10,6 +10,7 @@ deterministic in CI.
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from pathlib import Path
 
 from ..envelope import Paradigm
@@ -27,8 +28,8 @@ from .base import (
     json_safe,
     key_shape_aggregate_kwargs,
     key_shape_expressions,
+    shape_aggregate_kwargs,
     shape_stat_expressions,
-    shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
     temporal_continuity_sql,
@@ -257,6 +258,21 @@ class DuckDBAdapter:
         )
         return sorted(str(name) for (name,) in rows)
 
+    def catalog_meta(self, identifier: str) -> ObjectMeta:
+        """One relation's catalog entry (#1462): DuckDB's own row estimate and
+        no byte size, reading no row, unlike :meth:`table_metadata`'s exact
+        count. ``LookupError`` where the file holds no such relation."""
+
+        meta = self._get_object(identifier)
+        if meta is None:
+            raise LookupError(identifier)
+        return meta
+
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """Nothing bills on DuckDB (#1462): every statement is free."""
+
+        return 0.0
+
     def table_metadata(self, identifier: str) -> tuple[ObjectMeta, list[ColumnMeta]]:
         """exact row count and column metadata for one object."""
         meta_found = self._get_object(identifier)
@@ -399,13 +415,7 @@ class DuckDBAdapter:
                     is_unique=is_unique,
                     min_value=values.get(f"mn_{i}") if wants_min_max else None,
                     max_value=values.get(f"mx_{i}") if wants_min_max else None,
-                    upper_vocab_fraction=shape_stat_value(
-                        values, f"su_{i}", wants_shape
-                    ),
-                    person_shape_fraction=shape_stat_value(
-                        values, f"sp_{i}", wants_shape
-                    ),
-                    avg_token_count=shape_stat_value(values, f"st_{i}", wants_shape),
+                    **shape_aggregate_kwargs(values, i, wants_shape),
                     **type_contradiction_aggregate_kwargs(values, i, wants_type),
                     **key_shape_aggregate_kwargs(values, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(values, i, wants_temporal),

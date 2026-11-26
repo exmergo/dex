@@ -17,7 +17,7 @@ def _config(semantic: dict) -> DexConfig:
 
 
 def test_the_vendor_reads_its_file_list():
-    """With `local` as its only deployment."""
+    """With `local` as its default deployment."""
     config = _config(
         {"vendor": "databricks", "databricks": {"files": ["views/orders.yaml"]}}
     )
@@ -62,8 +62,11 @@ def test_the_section_is_refused_under_another_vendor():
 
 
 def test_there_is_no_hosted_deployment():
-    """Only the files in this repository are a deployment."""
-    with pytest.raises(ValueError, match="deployment must be one of local"):
+    """The files in this repository and Unity Catalog, read by dex, are the
+    deployments; no vendor executes a Metric View query for dex."""
+    with pytest.raises(
+        ValueError, match="deployment must be one of local, databricks_workspace"
+    ):
         _config(
             {
                 "vendor": "databricks",
@@ -127,3 +130,79 @@ def test_config_get_reports_the_listing(tmp_path, capsys):
     assert envelope["status"] == "ok"
     rows = {row["key"]: row for row in envelope["data"]["settings"]}
     assert rows["semantic.databricks.files"]["value"] == ["views/orders.yaml"]
+
+
+# --- semantic.deployment: databricks_workspace (#1364) -------------------------------
+
+
+def _workspace(**semantic) -> DexConfig:
+    return DexConfig.model_validate(
+        {
+            "connector": "databricks",
+            "semantic": {
+                "vendor": "databricks",
+                "deployment": "databricks_workspace",
+                **semantic,
+            },
+        }
+    )
+
+
+def test_the_workspace_deployment_needs_no_files():
+    """The catalog is Unity Catalog's, so the listing is optional there."""
+    config = _workspace()
+
+    assert config.semantic.deployment == "databricks_workspace"
+    assert config.semantic.backend == "databricks_workspace"
+    assert config.semantic.databricks.files == []
+
+
+def test_the_workspace_deployment_keeps_configured_files():
+    """As a local dbt project sits beside dbt_cloud: maintain, transform and
+    --local keep reading them."""
+    config = _workspace(databricks={"files": ["views/orders.yaml"]})
+
+    assert config.semantic.databricks.files == ["views/orders.yaml"]
+
+
+def test_local_still_needs_its_files():
+    """Never a fallback when the listing is empty."""
+    with pytest.raises(ValueError, match=r"needs semantic\.databricks\.files"):
+        _config({"vendor": "databricks", "deployment": "local"})
+
+
+def test_the_released_backend_spelling_agrees_or_is_refused():
+    config = DexConfig.model_validate(
+        {"semantic": {"vendor": "databricks", "backend": "databricks_workspace"}}
+    )
+    assert config.semantic.deployment == "databricks_workspace"
+
+    with pytest.raises(ValueError, match="name different deployments"):
+        _workspace(backend="local", databricks={"files": ["a.yaml"]})
+
+
+@pytest.mark.parametrize(
+    "vendor", ["dbt", "snowflake", "ossie", "slayer", "cube"], ids=str
+)
+def test_the_workspace_deployment_belongs_to_databricks_only(vendor):
+    with pytest.raises(ValueError, match="deployment must be one of"):
+        DexConfig.model_validate(
+            {"semantic": {"vendor": vendor, "deployment": "databricks_workspace"}}
+        )
+
+
+def test_the_dbt_cloud_coordinates_are_still_refused():
+    with pytest.raises(ValueError, match="hosted dbt"):
+        _workspace(host="sl.cloud.getdbt.com")
+
+
+def test_config_validate_accepts_the_workspace_with_no_files(tmp_path, capsys):
+    root = _repo(
+        tmp_path,
+        "connector: databricks\nsemantic:\n  vendor: databricks\n"
+        "  deployment: databricks_workspace\n",
+    )
+
+    _, envelope = _run(capsys, root, "config", "validate")
+
+    assert envelope["status"] == "ok", envelope

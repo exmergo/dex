@@ -37,6 +37,7 @@ from ..dbt_project import (
     model_file,
 )
 from ..errors import DexError
+from ..manifest_paths import posix
 from . import window_fixture
 from .plans import EditKind, PlanEdit
 from .row_attribution import UnattributableError, naming_resolver, render_model_sql
@@ -382,7 +383,7 @@ def _manifest_model_materialization(
         name_match = node.get("name") == model_name
         if not name_match and manifest_node_label(uid, node) != model_name:
             continue
-        orig = node.get("original_file_path")
+        orig = posix(node.get("original_file_path"))
         if orig and orig != path:
             continue
         config = node.get("config")

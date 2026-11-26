@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import logging
 from collections import defaultdict, deque
 from io import StringIO
 from pathlib import Path
@@ -44,6 +45,7 @@ from .dbt_project import (
     _project_vars,
     jinja_calls,
     jinja_regions,
+    mask_yaml_comments,
     metric_inputs,
     node_files,
     node_name,
@@ -755,6 +757,8 @@ class ReferenceIndex:
                 self._scan_sql(source.content, path, node_kinds, package=package)
             elif family == "seed" and path.endswith(".csv"):
                 self._scan_seed_header(source.content, path, package=package)
+            elif path.endswith((".yml", ".yaml")):
+                self._scan_yaml_calls(source.content, path, package=package)
         # The loader reads SQL only, so a Python model's name usually comes
         # from the file on disk. `dbt.ref` and `dbt.source` in that file are
         # reads of other nodes and are indexed here. The model itself stays a
@@ -1152,17 +1156,45 @@ class ReferenceIndex:
             return
 
         blanked = blank_jinja(content)
+        # sqlglot logs a warning for each statement it falls back to parsing as
+        # a bare command (an installed package's grant or user-creation macro,
+        # say), and that warning would reach stderr once per file scanned.
+        # A statement it cannot read is already accounted for below.
+        quiet = logging.getLogger("sqlglot")
+        level = quiet.level
+        quiet.setLevel(logging.ERROR)
         try:
-            parsed = sqlglot.parse_one(blanked)
+            statements = [tree for tree in sqlglot.parse(blanked) if tree is not None]
         except Exception:
             self.limits.append(column_parse_limit(path))
             self.column_unread.append(path)
             return
-        if parsed is None:
+        finally:
+            quiet.setLevel(level)
+        if not statements:
+            return
+        if any(
+            isinstance(node, exp.Command) for tree in statements for node in tree.walk()
+        ):
+            # sqlglot read a statement it does not know as an opaque command,
+            # so the columns inside it are invisible: a limit, not an answer.
+            # Every statement is checked, since a file can hold several.
+            self.limits.append(column_parse_limit(path))
+            self.column_unread.append(path)
             return
 
-        columns = {column.name for column in parsed.find_all(exp.Column) if column.name}
-        columns |= {alias.alias for alias in parsed.find_all(exp.Alias) if alias.alias}
+        columns = {
+            column.name
+            for tree in statements
+            for column in tree.find_all(exp.Column)
+            if column.name
+        }
+        columns |= {
+            alias.alias
+            for tree in statements
+            for alias in tree.find_all(exp.Alias)
+            if alias.alias
+        }
         columns.discard(JINJA_PLACEHOLDER)
         if not columns:
             return
@@ -1747,6 +1779,31 @@ class ReferenceIndex:
                     package=package,
                 )
             )
+
+    def _scan_yaml_calls(self, content: str, path: str, *, package: str | None) -> None:
+        """Index jinja var() calls written in YAML configuration.
+
+        A static var() call in supported YAML scalar expressions is indexed with
+        its exact file and line under form "var_call"; an unreadable or dynamic
+        call is recorded as indeterminate so completeness claims stay honest.
+        YAML comments are excluded from discovery.
+        """
+
+        masked = mask_yaml_comments(content)
+        for call in jinja_calls(masked):
+            if call.callee == "var":
+                target = call.args[0] if call.args else None
+                self._record(
+                    Reference(
+                        path=path,
+                        line=call.line,
+                        form="var_call",
+                        kind="var",
+                        name=target,
+                        resolution=RESOLVED if target else INDETERMINATE,
+                        package=package,
+                    )
+                )
 
     def _scan_packages(self) -> None:
         """Index each installed package as the project it is.

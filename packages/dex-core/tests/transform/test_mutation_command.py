@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytest.importorskip("sqlglot")
 
@@ -413,6 +414,289 @@ def test_run_hooks_are_stripped_from_the_copy_and_said_so(
     result = transform_commands.test_mutations(_engine(project), "fct")
     assert any("hooks are not run" in w for w in result.warnings)
     assert "on-run-start" in manifest_path.read_text()
+
+
+def test_a_package_s_own_run_hooks_are_stripped_from_the_copy(project):
+    """dbt runs the hooks an installed package declares, and Elementary declares
+    its hooks there and nowhere else, so a root project with none to strip still
+    has hooks that fire per mutant (#1307). Only the copy is written."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    package = project / "dbt_packages" / "elementary"
+    package.mkdir(parents=True)
+    hooked = (
+        "name: elementary\nversion: '0.26.1'\nconfig-version: 2\n"
+        'on-run-start:\n  - "{{ elementary.on_run_start() }}"\n'
+        'on-run-end:\n  - "{{ elementary.on_run_end() }}"\n'
+    )
+    (package / "dbt_project.yml").write_text(hooked, encoding="utf-8")
+    quiet = project / "dbt_packages" / "dbt_utils"
+    quiet.mkdir()
+    (quiet / "dbt_project.yml").write_text("name: dbt_utils\n", encoding="utf-8")
+    root_before = (project / "dbt_project.yml").read_text(encoding="utf-8")
+
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.strip_run_hooks() == ["elementary"]
+        copied = yaml.safe_load(
+            (shadow.shadow / "dbt_packages/elementary/dbt_project.yml").read_text()
+        )
+        assert "on-run-start" not in copied and "on-run-end" not in copied
+        assert copied["name"] == "elementary"
+        assert (shadow.shadow / "dbt_project.yml").read_text() == root_before
+        assert shadow.strip_run_hooks() == [], "a second pass found hooks again"
+
+    assert (package / "dbt_project.yml").read_text(encoding="utf-8") == hooked
+
+
+def _packages_outside(project: Path, outside: Path) -> str:
+    """Install a hooked Elementary at ``outside`` and point the project there."""
+
+    package = outside / "elementary"
+    package.mkdir(parents=True)
+    hooked = (
+        "name: elementary\nversion: '0.26.1'\nconfig-version: 2\n"
+        'on-run-start:\n  - "{{ elementary.on_run_start() }}"\n'
+    )
+    (package / "dbt_project.yml").write_text(hooked, encoding="utf-8")
+    root = project / "dbt_project.yml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + f"packages-install-path: '{outside.as_posix()}'\n",
+        encoding="utf-8",
+    )
+    return hooked
+
+
+def test_a_package_installed_outside_the_copy_keeps_its_hooks_and_says_so(
+    project, tmp_path
+):
+    """An absolute packages-install-path names the same directory from the copy,
+    so the package there is the real one: never written, and named as out of
+    reach (#1307)."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    hooked = _packages_outside(project, tmp_path / "shared_packages")
+
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.strip_run_hooks() == []
+        assert shadow.run_hooks_outside_copy() == ["elementary"]
+
+    package = tmp_path / "shared_packages" / "elementary" / "dbt_project.yml"
+    assert package.read_text(encoding="utf-8") == hooked
+
+
+def test_packages_inside_the_copy_leave_no_hook_out_of_reach(project):
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    package = project / "dbt_packages" / "elementary"
+    package.mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        'name: elementary\non-run-end:\n  - "select 1"\n', encoding="utf-8"
+    )
+
+    with ShadowRun(project, target="dev") as shadow:
+        assert shadow.run_hooks_outside_copy() == []
+        assert shadow.strip_run_hooks() == ["elementary"]
+
+
+def test_a_mutation_run_refuses_hooks_it_cannot_strip(
+    project, tmp_path, recorded_dbt, monkeypatch
+):
+    """They would fire once per mutant run, so the run stops before dbt is
+    asked anything, and nothing is recorded."""
+
+    calls, plan = recorded_dbt
+    plan["manifest"] = _manifest()
+    plan["results"] = _results()
+    _packages_outside(project, tmp_path / "shared_packages")
+    _skip_dev_target_check(monkeypatch)
+
+    with pytest.raises(mutation.MutationError, match="packages-install-path"):
+        transform_commands.test_mutations(_engine(project), "fct")
+    assert calls == []
+
+
+def test_a_left_out_test_is_no_test_of_the_full_build():
+    """An incremental model whose only other test runs the branch: its
+    monitoring test runs nowhere, so no test runs the full build (#1307)."""
+
+    from exmergo_dex_core.transform.commands import _runs_full_build, _test_ids_named
+
+    node = {"unique_id": "model.p.fct", "name": "fct", "resource_type": "model"}
+    monitoring = {
+        "unique_id": "test.p.elementary_volume_anomalies_fct",
+        "name": "elementary_volume_anomalies_fct",
+        "resource_type": "test",
+        "attached_node": "model.p.fct",
+        "depends_on": {"nodes": ["model.p.fct"]},
+    }
+    manifest = {
+        "nodes": {"model.p.fct": node, monitoring["unique_id"]: monitoring},
+        "unit_tests": {},
+    }
+
+    assert _runs_full_build(manifest, node, []) is True
+    left_out = _test_ids_named(manifest, {"elementary_volume_anomalies_fct"})
+    assert left_out == {monitoring["unique_id"]}
+    assert _runs_full_build(manifest, node, [], left_out=left_out) is False
+
+
+def test_disabling_a_package_s_models_in_the_copy_overrides_the_project_and_undoes(
+    project,
+):
+    """Variant d writes its own ``+enabled`` for the package; the copy's write
+    wins over it, and the undo puts the project's text back exactly."""
+
+    from exmergo_dex_core.transform.build import ShadowRun
+
+    root = project / "dbt_project.yml"
+    root.write_text(
+        root.read_text(encoding="utf-8")
+        + "models:\n  elementary:\n    +schema: elementary\n"
+        "    +enabled: \"{{ target.name != 'dev' }}\"\n",
+        encoding="utf-8",
+    )
+    original = root.read_text(encoding="utf-8")
+
+    with ShadowRun(project, target="dev") as shadow:
+        copy = shadow.shadow / "dbt_project.yml"
+        undo = shadow.disable_package_models("elementary")
+        written = yaml.safe_load(copy.read_text(encoding="utf-8"))
+        assert written["models"]["elementary"] == {
+            "+schema": "elementary",
+            "+enabled": False,
+        }
+        undo()
+        assert copy.read_text(encoding="utf-8") == original
+        shadow.set_project_flag("require_explicit_x", True)
+        assert yaml.safe_load(copy.read_text(encoding="utf-8"))["flags"] == {
+            "require_explicit_x": True
+        }
+
+    assert root.read_text(encoding="utf-8") == original
+
+
+_LEFT_OUT = {
+    "name": "elementary_volume_anomalies_fct_ordered_at",
+    "reason_code": "elementary_disabled",
+    "reason": "checks nothing while the package is disabled",
+}
+
+
+def test_a_left_out_test_is_listed_when_the_baseline_never_runs():
+    """The budget can stop a run before its baseline, and a model whose tests
+    all run the incremental branch has no full-build baseline. A test kept out
+    of every run is still named, so the warning that points at
+    ``baseline.excluded`` is true on every path (#1307)."""
+
+    from types import SimpleNamespace
+
+    from exmergo_dex_core.envelope import Paradigm
+
+    result = transform_commands._run_mutants(
+        None,
+        "models/fct.sql",
+        SimpleNamespace(mutants=[], incremental=None),
+        model="fct",
+        paradigm=Paradigm.FREE_LOCAL,
+        connector="duckdb",
+        store=None,
+        ceiling=None,
+        estimate=None,
+        mutation_mod=mutation,
+        settle_uptime=False,
+        left_out=[_LEFT_OUT],
+    )
+
+    assert result["baseline"]["excluded"] == [{**_LEFT_OUT, "status": "not_run"}]
+
+
+def test_a_unit_test_that_overrides_vars_is_excluded_for_its_overrides(project):
+    """A mutant is compiled once with the project's own vars, so a unit test
+    whose ``overrides: vars`` a build applies fails the baseline here. It is
+    excluded naming those overrides, not as a broken test (#1396)."""
+
+    from exmergo_dex_core.dbt_tests import unit_test_overrides
+
+    class _Shadow:
+        def write(self, *args, **kwargs):
+            pass
+
+        def test(self, select, exclude=()):
+            return {
+                "nodes": [
+                    {
+                        "unique_id": "test.p.not_null.abc",
+                        "name": "not_null",
+                        "status": "pass",
+                    },
+                    {
+                        "unique_id": "unit_test.p.fct.fct_years",
+                        "name": "fct_years",
+                        "status": "fail",
+                    },
+                ]
+            }
+
+    node = {"unique_id": "model.p.fct", "name": "fct"}
+    manifest = {
+        "unit_tests": {
+            "unit_test.p.fct.fct_years": {
+                "name": "fct_years",
+                "model": "fct",
+                "depends_on": {"nodes": ["model.p.fct"]},
+                "overrides": {
+                    "vars": {"gta_v_year": 2013, "gta_6_year": 2016},
+                    "macros": {"is_incremental": False},
+                },
+            },
+            "unit_test.p.fct.plain": {
+                "name": "plain",
+                "model": "fct",
+                "depends_on": {"nodes": ["model.p.fct"]},
+                "overrides": {"macros": {"is_incremental": True}},
+            },
+        }
+    }
+    overrides = unit_test_overrides(manifest, node)
+    assert overrides == {"fct_years": "vars gta_6_year, gta_v_year"}
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1", dialect="duckdb")
+    )
+    result, _meta = _run(
+        _Shadow(), batch, project, incremental_tests=[], overrides=overrides
+    )
+
+    (entry,) = result["baseline"]["excluded"]
+    assert entry["name"] == "fct_years"
+    assert "overrides vars gta_6_year, gta_v_year" in entry["reason"]
+    assert "already failing" not in entry["reason"]
+
+
+def test_only_the_left_out_tests_the_selection_reaches_are_named():
+    """A monitoring test on a model the run does not select is not one it would
+    have run, and one the downstream routing already excludes is named there."""
+
+    def candidate(name: str, *reads: str) -> dict:
+        return {**_LEFT_OUT, "name": name, "_reads": list(reads)}
+
+    candidates = [
+        candidate("on_fct", "model.shop.fct"),
+        candidate("on_other", "model.shop.other"),
+        candidate("routed_away", "model.shop.fct", "model.shop.stale"),
+    ]
+
+    left_out, warnings = transform_commands._left_out_of(
+        candidates, {"model.shop.fct"}, skip={"routed_away"}
+    )
+
+    assert [entry["name"] for entry in left_out] == ["on_fct"]
+    assert "_reads" not in left_out[0]
+    assert warnings and "baseline.excluded" in warnings[0]
+    assert transform_commands._left_out_of(candidates, {"model.shop.none"}) == ([], [])
 
 
 def test_shadow_run_strip_semantic_models(project):
@@ -900,6 +1184,56 @@ def test_each_mutant_is_priced_as_its_own_statement():
     assert per_table[f"{dropped.id} predicate_drop"] != per_table["(baseline)"]
     assert prices[dropped.id] == per_table[f"{dropped.id} predicate_drop"]
     assert estimate == sum(per_table.values())
+
+
+@pytest.mark.parametrize("alias", ["fct_v2", "fct_final"])
+def test_a_mutant_is_spliced_into_the_cte_dbt_names_after_the_alias(alias):
+    """dbt names a model's CTE in a test after its alias: `<name>_v<N>` for a
+    version, or whatever the config sets. Looking the CTE up by the model's name
+    found nothing, so every mutant was priced at the baseline."""
+
+    from exmergo_dex_core.transform.commands import _price_mutations
+
+    class _Aliased(_PricingCopy):
+        def manifest(self):
+            manifest = super().manifest()
+            for test in manifest["nodes"].values():
+                test["compiled_code"] = test["compiled_code"].replace(
+                    "__dbt__cte__fct", f"__dbt__cte__{alias}"
+                )
+            return manifest
+
+    batch = mutation.enumerate_mutants(
+        mutation.prepare("select a from t where a > 1 and b > 2", dialect="duckdb")
+    )
+    _estimate, per_table, _prices, _notes = _price_mutations(
+        _TextPricedAdapter(),
+        _Aliased(None),
+        "models/fct.sql",
+        batch,
+        {"name": "fct", "alias": alias},
+        mutation,
+    )
+    dropped = next(m for m in batch.mutants if m.operator == "predicate_drop")
+    assert per_table[f"{dropped.id} predicate_drop"] != per_table["(baseline)"]
+
+
+def test_an_ephemeral_parent_is_matched_by_the_cte_dbt_names_after_its_alias():
+    from exmergo_dex_core.transform.commands import _parent_relations
+
+    manifest = {
+        "nodes": {
+            "model.p.stg.v2": {
+                "name": "stg",
+                "alias": "stg_v2",
+                "version": 2,
+                "config": {"materialized": "ephemeral"},
+            }
+        }
+    }
+    node = {"depends_on": {"nodes": ["model.p.stg.v2"]}}
+    [parent] = _parent_relations(manifest, node, mutation)
+    assert parent.rendered == "__dbt__cte__stg_v2"
 
 
 def test_the_comparisons_are_priced_into_the_same_batch_as_if_all_survive():

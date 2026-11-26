@@ -889,3 +889,55 @@ def test_written_tells_an_absent_key_from_one_written_as_null():
     assert document.written("cluster.sample_seed") is None
     assert document.written("budget.session_ceiling") is ABSENT
     assert document.written("query.max_rows") == 50
+
+
+# === dev namespace and aliases (#1541) ================================================
+
+
+def test_config_validate_with_dev_alias_passes():
+    doc = ConfigDocument(
+        "connector: bigquery\nbigquery:\n  project: p\n  dev_dataset: dev\n"
+    )
+    assert not doc.problems()
+
+
+def test_config_validate_refuses_both_dev_and_alias_naming_lines():
+    text = (
+        "connector: bigquery\nbigquery:\n  project: p\n  dev: dev\n  dev_dataset: dev\n"
+    )
+    doc = ConfigDocument(text)
+    problems = doc.problems()
+    assert len(problems) == 1
+    problem = problems[0]
+    assert problem.key == "bigquery.dev"
+    assert problem.line == 4
+    assert "line 5" in problem.message
+
+
+def test_settings_reports_dev_with_as_written_alias():
+    text = "connector: bigquery\nbigquery:\n  project: p\n  dev_dataset: dev\n"
+    rows = _rows(text, "bigquery.dev")
+    assert rows["bigquery.dev"]["value"] == "dev"
+    assert rows["bigquery.dev"]["as_written"] == "dev_dataset"
+
+    # Querying the alias key resolves to canonical dev.
+    alias_rows = _rows(text, "bigquery.dev_dataset")
+    assert alias_rows["bigquery.dev"]["value"] == "dev"
+
+
+def test_with_value_dev_replaces_alias_in_place():
+    doc = ConfigDocument(
+        "connector: bigquery\nbigquery:\n  project: p\n  dev_dataset: old\n"
+    )
+    updated = doc.with_value("bigquery.dev", "new_val")
+    assert "dev_dataset" not in updated.text
+    assert "dev: new_val" in updated.text
+
+
+def test_without_dev_removes_alias():
+    doc = ConfigDocument(
+        "connector: bigquery\nbigquery:\n  project: p\n  dev_dataset: old\n"
+    )
+    updated = doc.without("bigquery.dev")
+    assert "dev_dataset" not in updated.text
+    assert "dev:" not in updated.text

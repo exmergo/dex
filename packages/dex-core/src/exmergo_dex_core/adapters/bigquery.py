@@ -46,8 +46,8 @@ from .base import (
     key_shape_aggregate_kwargs,
     key_shape_expressions,
     name_list,
+    shape_aggregate_kwargs,
     shape_stat_expressions,
-    shape_stat_value,
     temporal_alignment_expressions,
     temporal_continuity_aggregate_kwargs,
     temporal_continuity_sql,
@@ -848,9 +848,7 @@ class BigQueryAdapter:
                     is_unique=is_unique,
                     min_value=row[f"mn_{i}"] if wants_min_max else None,
                     max_value=row[f"mx_{i}"] if wants_min_max else None,
-                    upper_vocab_fraction=shape_stat_value(row, f"su_{i}", wants_shape),
-                    person_shape_fraction=shape_stat_value(row, f"sp_{i}", wants_shape),
-                    avg_token_count=shape_stat_value(row, f"st_{i}", wants_shape),
+                    **shape_aggregate_kwargs(row, i, wants_shape),
                     **type_contradiction_aggregate_kwargs(row, i, wants_type),
                     **key_shape_aggregate_kwargs(row, i, wants_key_shape),
                     **temporal_continuity_aggregate_kwargs(row, i, wants_temporal),
@@ -1318,6 +1316,17 @@ class BigQueryAdapter:
         if len(countable) >= 2:
             reserved += 1  # distinct_combination_counts
         return reserved
+
+    def size_estimate(self, byte_sizes: Sequence[int]) -> float:
+        """The estimate for one statement that scans tables of these byte sizes
+        once each, in this connector's unit (#1462): the summed bytes, each
+        table raised to the 10 MB minimum BigQuery bills per table a query
+        references. An upper bound: BigQuery bills only the columns a statement
+        reads. What a generated test costs per production run, priced from the
+        production tables' catalog sizes; nothing this command bills (a startup,
+        wake or uptime charge) is added, since the run it prices is not dex's."""
+
+        return float(sum(max(int(b), _MIN_BILLED_BYTES) for b in byte_sizes))
 
     def query_estimate(self, sql: str) -> float:
         """The dry-run byte estimate for one firewall-approved query, floored to

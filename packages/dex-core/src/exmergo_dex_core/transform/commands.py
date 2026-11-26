@@ -24,7 +24,7 @@ import json
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,9 +38,11 @@ from ..dbt_tests import IncrementalUnitTest
 from ..dbt_tests import attached_tests as _attached_tests
 from ..dbt_tests import incremental_unit_tests as _incremental_unit_tests
 from ..dbt_tests import runs_full_build as _runs_full_build
+from ..dbt_tests import unit_test_overrides as _unit_test_overrides
 from ..edits import ApplyResult as PlanApplyResult
 from ..edits import EditOp, SemanticEditTarget
 from ..errors import DexError, RequestError, UndeclaredPopulationChangeError
+from ..manifest_paths import posix
 from ..results import to_envelope
 from ..storage import Store, readable_cache
 from . import plans as plans_mod
@@ -285,6 +287,7 @@ def plan(
     scaffold: list[str] | None = None,
     attribute_rows: bool | None = None,
     toggle: Any = None,
+    no_parse: bool = False,
 ) -> PlanResult:
     """Turn authored edits into a stored plan of reviewable diffs.
 
@@ -307,9 +310,21 @@ def plan(
 
     ``toggle`` is the payload's raw ``toggle`` contract (#1113): a flag that stays
     live, held on both of its values by :mod:`.toggle` once the plan is stored.
+
+    ``no_parse`` stores the plan without starting dbt (#1517): the parse gate,
+    the derivation's parse and compilation are not run, and the caller parses
+    the post-change project elsewhere. Every structural gate still runs. A
+    model with Jinja control flow is refused, since nothing but dbt's compile
+    can check it, and so is a ``toggle``, whose check compiles every model.
     """
 
     edits = list(edits or [])
+    if no_parse and toggle is not None:
+        raise ValueError(
+            "a toggle contract cannot be checked without running dbt: its check "
+            "compiles every model at both values. Plan it without --no-parse, "
+            "where dbt may run"
+        )
     if scaffold:
         from ..dbt_project import DbtProjectError
         from . import scaffold as scaffold_mod
@@ -332,7 +347,15 @@ def plan(
 
     toggle_stated = _parse_toggle(engine, edits, toggle)
 
-    declared, declaration_notes, drafts = _declare(engine, edits, declarations)
+    (
+        declared,
+        declaration_notes,
+        drafts,
+        pii_metadata,
+        generated_tests,
+        monitors_report,
+        pii_tags_report,
+    ) = _declare(engine, edits, declarations)
     edits = declared
 
     if not edits:
@@ -340,6 +363,17 @@ def plan(
             "transform plan needs content: pass --edits-file <path|-> with the "
             "authored edits or declarations, or --scaffold <table> for a staging "
             "skeleton"
+        )
+
+    edits, unchanged_notes = _skip_unchanged(engine, edits, declarations)
+    if not edits:
+        # Every edit, a rendered declaration included, is already the tree:
+        # nothing would change, so no plan is stored and `plan_id` is null, as
+        # `transform declare` answers the same no-op.
+        return PlanResult(
+            intent=intent,
+            notes=["every edit matches the tree, so no plan was stored"],
+            warnings=unchanged_notes + scaffold_notes + declaration_notes,
         )
 
     from . import model_versions as versions_mod
@@ -428,13 +462,18 @@ def plan(
         # this plan's own `packages_yml` edit declares is checked too (#1166),
         # and ahead of the derivation, whose own parse would otherwise fail on
         # it first (twice) before the gate below said so.
+        # A no-parse plan runs neither the parse nor the compile this protects,
+        # so a missing package is the parsing side's to report (as on semantic
+        # `--no-parse`, #1206).
         if (
-            has_delete or parser_owned or version_report is not None
-        ) and _unparseable_reason(view, edits) is None:
+            not no_parse
+            and (has_delete or parser_owned or version_report is not None)
+            and _unparseable_reason(view, edits) is None
+        ):
             assert_plan_packages_installed(project, edits)
         # After the guards above, because a derivation is checked by dbt's
         # parse of a copy of the project with these edits in it.
-        derived = _derive_semantic(engine, view, edits)
+        derived = _derive_semantic(engine, view, edits, parse=not no_parse)
         edits = derived.edits
         semantic_proposal = derived.proposal
         derivation_notes = derived.warnings
@@ -449,6 +488,8 @@ def plan(
             ):
                 # The derivation's own parse covered exactly these edits.
                 parse_result = derived.parse
+            elif no_parse:
+                parse_result = {"available": False, "reason": NO_PARSE_REASON}
             elif blocker := _unparseable_reason(view, edits):
                 parse_result = {"available": False, "reason": blocker}
             else:
@@ -473,7 +514,8 @@ def plan(
                     _confirm_versions(version_report, parse_result, view.project_name)
                 )
 
-    result = _make_plan(engine, intent, edits)
+    result = _make_plan(engine, intent, edits, no_parse=no_parse)
+    result.warnings.extend(unchanged_notes)
     result.warnings.extend(scaffold_notes)
     result.warnings.extend(declaration_notes)
     result.warnings.extend(parse_notes)
@@ -482,6 +524,11 @@ def plan(
     result.warnings.extend(derivation_notes)
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
+    result.pii_metadata = pii_metadata
+    result.generated_tests = generated_tests
+    result.monitors = monitors_report
+    result.pii_tags = pii_tags_report
+    _price_generated_tests(engine, result, edits)
     result.semantic_proposal = semantic_proposal
     if derived is not None:
         _store_companion(engine, intent, derived, result)
@@ -492,6 +539,87 @@ def plan(
     if toggle_stated is not None:
         _check_toggle(engine, result, toggle_stated)
     return result
+
+
+def _skip_unchanged(
+    engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
+) -> tuple[list[PlanEdit], list[str]]:
+    """Leave out the edits whose content is already the file on disk (#1415).
+
+    A payload builder that regenerates a whole feature re-sends files it did not
+    change, and each one counted as a change: an unchanged seed blocked
+    `transform compare` as unsynchronized, and an unchanged model was offered a
+    comparison the build then reported as owed. Dropped here, before any gate and
+    before the plan is stored, no diff, path, offer or check downstream sees them.
+
+    Identical means what apply already treats as a no-op: the content equals the
+    file as the project view reads it (text, universal newlines), the same test
+    `write_edits` makes before writing nothing. Only a file the view holds is
+    compared, so nothing outside the project is read. A delete is never a no-op.
+    A declaration is an edit here too, its rendered YAML, so one that changes
+    nothing is skipped like a resent file; when nothing changes at all, every
+    edit is skipped and :func:`plan` stores no plan.
+
+    A model the payload declares keeps its file even when it matches: resending
+    the SQL beside a declaration (an assumption settling an ask) is how a plan
+    says the model is in scope, and `--for-plan` verification and obligations are
+    keyed on the model files a plan carries, not on its YAML.
+    """
+
+    if not _has_dbt_project(engine):
+        return edits, []
+    from ..dbt_project import load as load_project
+    from . import declarations as declarations_mod
+
+    view = load_project(engine.project_dir())
+    files = view.files
+    # The declarations resolver over the tree as the plan leaves it, the files
+    # `apply_declarations` resolved against: a version label (`dim_teams.v2`)
+    # keeps that version's file, and a bare name the default version's after
+    # any `latest_version` or `defined_in` change this plan makes.
+    texts = declarations_mod.post_change_files(view, edits)
+    declared = {
+        path
+        for d in declarations_mod.parse_declarations(declarations)
+        if (path := declarations_mod.model_sql_path(texts, view.model_paths, d.model))
+    }
+
+    def matches(edit: PlanEdit) -> bool:
+        return (
+            edit.op is EditOp.UPSERT
+            and edit.path in files
+            and files[edit.path].content == edit.new_content
+        )
+
+    # Nothing changes the tree (a declaration whose rendered YAML is already
+    # the file, a table scaffolded again): nothing is left to plan, and the
+    # declared-model keep below has no change to carry the model in with.
+    if all(matches(edit) for edit in edits):
+        listed = ", ".join(edit.path for edit in edits)
+        one = len(edits) == 1
+        return [], [
+            f"{len(edits)} edit{'' if one else 's'} "
+            f"{'matches' if one else 'match'} the tree and "
+            f"{'was' if one else 'were'} skipped: {listed}"
+        ]
+    kept: list[PlanEdit] = []
+    skipped: list[str] = []
+    for edit in edits:
+        if matches(edit) and not (
+            edit.kind is EditKind.MODEL_SQL and edit.path in declared
+        ):
+            skipped.append(edit.path)
+        else:
+            kept.append(edit)
+    if not skipped:
+        return edits, []
+    listed = ", ".join(skipped)
+    one = len(skipped) == 1
+    return kept, [
+        f"{len(skipped)} edit{'' if one else 's'} "
+        f"{'matches' if one else 'match'} the tree and "
+        f"{'was' if one else 'were'} skipped: {listed}"
+    ]
 
 
 def _parse_toggle(
@@ -710,7 +838,15 @@ def _keep_one_entry(
 
 def _declare(
     engine: DexEngine, edits: list[PlanEdit], declarations: list[Any] | None
-) -> tuple[list[PlanEdit], list[str], dict[str, Any]]:
+) -> tuple[
+    list[PlanEdit],
+    list[str],
+    dict[str, Any],
+    Any,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     """Render the payload's declarations into ``edits``, draft what the cache
     already knows about each model, and warn where intent is missing.
 
@@ -721,7 +857,13 @@ def _declare(
 
     The third value is ``data.declarations``: per model the plan creates, edits
     or declares, its ``drafted``, ``declared`` and ``missing`` parts (see
-    :mod:`.drafting`).
+    :mod:`.drafting`). The fifth is ``data.generated_tests`` (#1449): the
+    switch's setting and each generated test the declarations give, rendered or
+    not, or ``None`` where they give none. The sixth is ``data.monitors``
+    (#1482): the vendor monitors the declarations give, or ``None`` where
+    ``monitors.vendor`` is unset or nothing was declared. The seventh is
+    ``data.pii_tags`` (#1487): the Elementary PII tags written on the models
+    the plan writes, or ``None`` where none was owed.
     """
 
     from ..dbt_project import load as load_project
@@ -734,10 +876,14 @@ def _declare(
                 "declarations are rendered into a dbt project's model YAML, and no "
                 "dbt project is the editable project here"
             )
-        return edits, [], {}
+        return edits, [], {}, None, None, None, None
     view = load_project(engine.project_dir())
 
     warnings: list[str] = []
+    generated: list[dict[str, Any]] = []
+    render_tests = engine.config.declarations.render_tests
+    monitor_rows: list[dict[str, Any]] = []
+    monitor_gate = _monitor_gate(engine, edits) if parsed else None
     if parsed:
         cache = None
         if any(d.population and d.population.filters for d in parsed):
@@ -759,8 +905,21 @@ def _declare(
             edits,
             cache=cache,
             pii_overrides=pii_override_paths(engine.config.pii_overrides),
+            render_tests=render_tests,
+            generated=generated,
+            dialect=_dialect(engine),
+            monitors=monitor_gate,
+            monitor_rows=monitor_rows,
         )
         warnings.extend(rendered_warnings)
+        edits = _with_generated_macros(view, edits, generated)
+    # A join is usually changed by editing the SQL alone (#1456): the models
+    # the payload does not declare are checked for a test left stale too.
+    stale, stale_notes = declarations_mod.stale_join_tests(
+        view, edits, (d.model for d in parsed), _dialect(engine)
+    )
+    generated.extend(stale)
+    warnings.extend(stale_notes)
     warnings.extend(
         declarations_mod.undeclared_model_warnings(
             edits, view, (d.model for d in parsed)
@@ -768,7 +927,161 @@ def _declare(
     )
     drafts, draft_warnings = _draft(engine, view, edits, [d.model for d in parsed])
     warnings.extend(draft_warnings)
-    return edits, warnings, drafts
+    edits, pii_metadata = _stamp_pii(engine, view, edits, warnings)
+    edits = declarations_mod.keep_no_failures_on_personal_columns(view, edits)
+    edits, tag_notes, pii_tags_report = _tag_pii(
+        engine, view, edits, [d.model for d in parsed]
+    )
+    warnings.extend(tag_notes)
+    return (
+        edits,
+        warnings,
+        drafts,
+        pii_metadata,
+        _generated_report(render_tests, generated),
+        (
+            _monitors().report(monitor_gate, monitor_rows)
+            if monitor_gate is not None
+            else None
+        ),
+        pii_tags_report,
+    )
+
+
+def _tag_pii(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], declared: list[str]
+) -> tuple[list[PlanEdit], list[str], dict[str, Any] | None]:
+    """Tag the personal-data columns of the models the plan writes for
+    Elementary's PII sampling rule (#1487), after the PII stamps so a mark the
+    same plan writes is tagged too. Gated as the vendor monitors are: nothing
+    where ``monitors.vendor`` is unset or the package is not installed."""
+
+    from . import pii_tags
+
+    if engine.config.monitors.vendor is None:
+        return edits, [], None
+    return pii_tags.tag(view, edits, _monitor_gate(engine, edits), declared)
+
+
+def _monitors() -> Any:
+    from . import monitors
+
+    return monitors
+
+
+def _monitor_gate(engine: DexEngine, edits: list[PlanEdit]) -> Any:
+    """The vendor monitors' gate (#1482) for the project as ``edits`` leave
+    it, or ``None`` where ``monitors.vendor`` is unset."""
+
+    return _monitors().gate(
+        engine.project_dir(),
+        edits,
+        engine.config.monitors.vendor,
+        engine.config.dbt_prod_target,
+    )
+
+
+def _dialect(engine: DexEngine) -> str | None:
+    """The connector a generated test would run on (#1451): the one this
+    command was given, else the committed one."""
+
+    return engine.connector or engine.config.connector
+
+
+def _with_generated_macros(
+    view: Any, edits: list[PlanEdit], generated: list[dict[str, Any]]
+) -> list[PlanEdit]:
+    """``edits`` plus a ``macro_sql`` edit for each shipped generic test a
+    rendered generated test needs and neither the project nor the plan defines
+    (#1452), so the plan dbt parses holds the test's definition and the diff
+    shows it. A project's own copy, however it differs, is left alone:
+    ``transform macro <name>`` reconciles it. A file already at the asset's
+    path gains only the definitions it lacks."""
+
+    from .. import generated_tests as gt
+    from . import scaffold as scaffold_mod
+
+    macros = {kind.name: kind.macro for kind in gt.kinds() if kind.macro}
+    needed = sorted(
+        {
+            macros[row["test"]]
+            for row in generated
+            if row["status"] in ("added", "already_listed") and row["test"] in macros
+        }
+    )
+    out = list(edits)
+    for name in needed:
+        if not scaffold_mod.defines_test(view, out, name):
+            out = scaffold_mod.with_shipped_test(view, out, name)
+    return out
+
+
+def _generated_report(
+    render_tests: bool | list[str], generated: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """``data.generated_tests`` (#1449): what ``declarations.render_tests``
+    says, and every generated test the plan's declarations give, each with its
+    cadence tag and claim and whether it rendered. ``None`` where they give
+    none, so a plan with nothing to say about generated tests carries no key."""
+
+    if not generated:
+        return None
+    counts: dict[str, int] = {}
+    for row in generated:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return {
+        "render_tests": render_tests,
+        "counts": counts,
+        "tests": generated,
+    }
+
+
+def _price_generated_tests(
+    engine: DexEngine, result: PlanResult, edits: list[PlanEdit]
+) -> None:
+    """What each generated test the plan leaves in the YAML costs per
+    production run (#1462), from production's catalog sizes, folded onto a
+    plan that is already stored. Total for the reason row attribution is: the
+    estimate is commentary on the plan, so a defect in it is a warning naming
+    the exception type and never a plan that fails to exist."""
+
+    from .test_cost import price
+
+    try:
+        result.warnings.extend(price(engine, result.generated_tests, edits=edits))
+    except Exception as exc:
+        result.warnings.append(
+            "could not estimate what the generated tests cost per production run "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+
+
+def _stamp_pii(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], warnings: list[str]
+) -> tuple[list[PlanEdit], dict[str, Any] | None]:
+    """Carry each flagged input's PII stamp onto the models the plan creates
+    (#1100), and report what was stamped, kept or left for a person.
+
+    Runs after the declarations render, so a stamp lands in the same YAML entry
+    a declaration wrote, and reads the cache with ``pii_overrides`` applied.
+    """
+
+    from . import pii_stamps
+
+    if not any(e.kind is EditKind.MODEL_SQL and e.op is EditOp.UPSERT for e in edits):
+        return edits, None
+    inputs = _drafting_inputs(engine, view)
+    stamped, notes, report = pii_stamps.stamp(
+        edits,
+        view,
+        cache=inputs["cache"],
+        pii_overrides=pii_override_paths(engine.config.pii_overrides),
+        dialect=inputs["dialect"],
+        vars=inputs["vars"],
+        manifest=None if inputs["manifest_stale"] else inputs["manifest"],
+    )
+    warnings.extend(notes)
+    return stamped, report
 
 
 def _draft(
@@ -999,8 +1312,8 @@ def _offer_refactor_comparison(
     ``--for-plan`` build can report whether each rewrite was compared.
     """
 
+    from .global_edits import COMPARE_GLOBAL_KINDS
     from .refactor_compare import (
-        _GLOBAL_KINDS,
         BlockedInput,
         _blocked_key,
         _blocked_parents,
@@ -1064,7 +1377,7 @@ def _offer_refactor_comparison(
         {b.model for b in blocked_all if b.model.split(".v")[0] in touched}
         | (
             set(blocked_names)
-            if blocked_all and any(edit.kind in _GLOBAL_KINDS for edit in edits)
+            if blocked_all and any(edit.kind in COMPARE_GLOBAL_KINDS for edit in edits)
             else set()
         )
     )
@@ -1087,6 +1400,8 @@ def _offer_refactor_comparison(
             + " Keep this plan unapplied until it is compared: applying it "
             "discards the baseline. " + why[0].upper() + why[1:]
         )
+    from .expected_change import ACCEPTED_SHAPE
+
     offer: dict[str, Any] = {
         "plan_id": result.plan_id,
         "recommended_before_apply": recommended,
@@ -1103,9 +1418,8 @@ def _offer_refactor_comparison(
         "intended_change": (
             "if the plan is meant to change rows, compare with --expect, stating "
             "which rows may be added and removed, which columns may change, and "
-            "that the key holds: "
-            '{"added": "none"|"any"|{"where": "<predicate>"}, "removed": ..., '
-            '"changed_columns": [...], "key": "unchanged"}'
+            '"key": "unchanged" (or "any" when the key may stop being unique): '
+            + ACCEPTED_SHAPE
         ),
     }
     if mixed:
@@ -1345,7 +1659,8 @@ def _report_change_scope(
 ) -> None:
     """Say what the plan changes about each model it rewrites beyond what an
     assumption records (#1115): which populations move and which stay, and
-    which outputs are removed, retyped, re-aggregated or re-NULLed.
+    which outputs are removed, retyped, re-aggregated or re-NULLed; and which
+    unit tests, data tests and singular tests the plan removes (#1420).
 
     Static and free: both versions are rendered and read, nothing runs. The plan
     is already stored, so a defect here is a warning and never an error.
@@ -1369,15 +1684,17 @@ def _report_change_scope(
         ]
         earlier, against, parents = _redrive_baselines(engine, view, edits, result)
         rewrites.extend(earlier)
-        if not rewrites:
-            return
-        report = change_scope.analyze(
-            rewrites,
-            result.decisions or [],
-            get_dialect(engine.connector or engine.config.connector),
-            view.vars,
-            parents=parents,
-            against=against,
+        report = (
+            change_scope.analyze(
+                rewrites,
+                result.decisions or [],
+                get_dialect(engine.connector or engine.config.connector),
+                view.vars,
+                parents=parents,
+                against=against,
+            )
+            if rewrites
+            else None
         )
     except Exception as exc:
         result.warnings.append(
@@ -1385,6 +1702,18 @@ def _report_change_scope(
             f"({type(exc).__name__}); the plan itself is unaffected"
         )
         return
+    # Tests the plan removes (#1420), whether or not it rewrites a model; a
+    # defect here drops only this list, never the models' report.
+    try:
+        removed = change_scope.removed_tests(view, edits)
+    except Exception as exc:
+        removed = []
+        result.warnings.append(
+            "could not read which tests this plan removes "
+            f"({type(exc).__name__}); the plan itself is unaffected"
+        )
+    if removed:
+        report = {**(report or {}), "removed_tests": removed}
     if report is None:
         return
     with contextlib.suppress(Exception):
@@ -1550,8 +1879,10 @@ def cmd_plan(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
             scaffold=getattr(args, "scaffold", None),
             attribute_rows=getattr(args, "attribute_rows", None),
             toggle=toggle,
+            no_parse=bool(getattr(args, "no_parse", False)),
         )
-        return to_envelope(result, hints=plan_hint(result))
+        hints = plan_hint(result) if result.plan_id else None
+        return to_envelope(result, hints=hints)
     except DbtParseError as exc:
         return env.error_for(exc, warnings=exc.warnings)
     except ValueError as exc:
@@ -1994,8 +2325,16 @@ def declare(
             return None, [f"could not draft '{model}' ({type(exc).__name__}: {exc})"]
         return drafts.get(model), warnings
 
+    monitor_gate = _monitor_gate(engine, [])
     outcome = declare_mod.propose(
-        view, selection.models, supplied, draft=draft_one, cap=cap
+        view,
+        selection.models,
+        supplied,
+        draft=draft_one,
+        cap=cap,
+        render_tests=engine.config.declarations.render_tests,
+        dialect=_dialect(engine),
+        monitors=monitor_gate,
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2018,6 +2357,12 @@ def declare(
             "nothing to propose, so no plan was stored; every selected model is "
             "listed under `skipped` with the reason"
         )
+        # A model whose only owed change is a monitor reads `complete` when the
+        # gate is closed, so the reason no monitor was written is said here
+        # (#1482); a stored plan carries it in its own warnings.
+        closed = monitor_gate.warning() if monitor_gate is not None else None
+        if closed is not None:
+            notes.append(closed)
         return DeclareResult(notes=notes, **common)
 
     payload = [
@@ -2048,6 +2393,8 @@ def declare(
         decisions=planned.decisions,
         declarations=planned.declarations,
         semantic_proposal=planned.semantic_proposal,
+        generated_tests=planned.generated_tests,
+        pii_tags=planned.pii_tags,
         notes=notes + planned.notes,
         **common,
     )
@@ -2130,7 +2477,7 @@ def _failed_package_node(
         )
     unique_id, node = failed[0]
     if node.get("package_name") == root:
-        path = node.get("original_file_path") or name
+        path = posix(node.get("original_file_path")) or name
         raise RepairRefusedError(
             f"the project owns {name} ({path}), so it is repaired with an ordinary "
             "`dex transform plan` on that file, not an override"
@@ -2606,7 +2953,9 @@ def test_mutations(
     store = engine.store
     repo_root = engine.require_repo_root("running mutation coverage")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     connector = engine.connector or config.connector
     effective = config.model_copy(update={"connector": connector})
     paradigm = paradigm_for(connector, effective)
@@ -2635,22 +2984,52 @@ def test_mutations(
             paradigm=paradigm,
             ceiling=ceiling,
         ) as shadow:
-            if shadow.strip_run_hooks():
+            stripped = shadow.strip_run_hooks()
+            if stripped:
                 warnings.append(
-                    "this project's on-run-start/on-run-end hooks are not run: "
-                    "mutation coverage invokes dbt once per mutant, and a hook "
-                    "that grants or audits would otherwise fire once per run"
+                    "on-run-start/on-run-end hooks are not run ("
+                    + ", ".join(stripped)
+                    + "): mutation coverage invokes dbt once per mutant, and a hook "
+                    "that grants, audits or uploads would otherwise fire once per run"
                 )
-            if shadow.strip_semantic_models(model):
+            unreachable = shadow.run_hooks_outside_copy()
+            if unreachable:
+                # Not recorded: it is the project's configuration that decides
+                # it, and a change there leaves no digest a record could hold.
+                raise mutation_mod.MutationError(
+                    "packages-install-path puts the installed packages outside the "
+                    "project, so dex cannot remove the on-run-start/on-run-end "
+                    "hooks of " + ", ".join(unreachable) + " from the copy it runs "
+                    "dbt in, and they would fire once per mutant run. Point "
+                    "packages-install-path inside the project, then measure"
+                )
+            from ..dbt_project import manifest_node_label
+            from ..model_versions import split_label
+
+            if shadow.strip_semantic_models(split_label(model)[0]):
                 warnings.append(
                     f"semantic models referencing '{model}' were omitted from the "
                     "shadow project: mutation coverage runs with an ephemeral mutant, "
                     "which the semantic layer cannot anchor"
                 )
+            quiet, quiet_warnings = _quiet_elementary(shadow)
+            warnings.extend(quiet_warnings)
             node, model_path = _mutable_model(engine, shadow, model, mutation_mod)
-            # Taken before anything in the copy is rewritten, from the fields a
-            # plain parse carries too, so `maintain coverage` can tell later
-            # whether this run still describes the model (#1281).
+            label = manifest_node_label(str(node.get("unique_id")), node)
+            if node.get("version") not in (None, "") and split_label(model)[1] is None:
+                warnings.append(
+                    f"'{model}' is a versioned model, so this measures {label}, "
+                    f"the version an unversioned ref('{model}') resolves to; "
+                    f"name another as {node['name']}.v<N>"
+                )
+            # The version label from here on: it is what dbt selects one
+            # version by, and what the envelope names (#1374).
+            model = label
+            # Taken before the mutants and the downstream routing rewrite the
+            # copy, from the fields a plain parse carries too, so `maintain
+            # coverage` can tell later whether this run still describes the
+            # model (#1281). Disabling Elementary's models drops none of the
+            # project's tests, since a test that reads one keeps them on (#1307).
             fingerprint = _mutation_fingerprint(shadow.manifest(), node)
             below = _DownstreamTests.prepare(
                 shadow,
@@ -2661,6 +3040,24 @@ def test_mutations(
                 connector=connector,
                 mutation_mod=mutation_mod,
             )
+            # A test kept out of every run cannot catch a mutant, so it is no
+            # test of the model here, nor one downstream (#1307).
+            left_out, left_out_warnings = _left_out_of(
+                quiet, below.selected_ids, skip=below.excluded_names
+            )
+            gone = {entry["name"] for entry in left_out}
+            had_tests = bool(below.direct or below.tests)
+            below.direct = set(below.direct) - gone
+            below.tests = [name for name in below.tests if name not in gone]
+            if had_tests and not below.direct and not below.tests:
+                raise mutation_mod.MutationError(
+                    f"every test of '{model}' is an Elementary monitoring test, "
+                    "which a mutation run keeps out because it checks nothing "
+                    "with the package disabled and writes to the dev target with "
+                    "it enabled, so there is nothing to measure. Write a test "
+                    "that reads the model's rows, then measure it"
+                )
+            warnings.extend(left_out_warnings)
             if not below.direct and not below.tests:
                 # Free, and the more useful answer than "nothing to mutate":
                 # with no test to catch anything, every mutant survives by
@@ -2723,8 +3120,15 @@ def test_mutations(
                 if branch is not None
                 else []
             )
+            # A monitoring test is attached to the model but runs nowhere, so it
+            # is no test of the full build either (#1307).
             full_tests = bool(below.tests) or _runs_full_build(
-                shadow.manifest(), node, incremental_tests
+                shadow.manifest(),
+                node,
+                incremental_tests,
+                left_out=_test_ids_named(
+                    shadow.manifest(), {entry["name"] for entry in quiet}
+                ),
             )
             if not batch.mutants:
                 equivalence = _EquivalenceCheck(
@@ -2770,7 +3174,7 @@ def test_mutations(
                     mutation_mod,
                     equivalence=equivalence,
                     reads=below.selected_ids,
-                    skip=below.excluded_names,
+                    skip=below.excluded_names | {entry["name"] for entry in left_out},
                     incremental_tests=incremental_tests,
                 )
                 warnings.extend(price_notes)
@@ -2796,7 +3200,7 @@ def test_mutations(
                     shadow,
                     model_path,
                     batch,
-                    model=node["name"],
+                    model=model,
                     paradigm=paradigm,
                     connector=connector,
                     store=store,
@@ -2816,6 +3220,8 @@ def test_mutations(
                     full_tests=full_tests,
                     settle_uptime=refresh_batch is None,
                     on_meter=meters.append,
+                    left_out=left_out,
+                    overrides=_unit_test_overrides(shadow.manifest(), node),
                 )
             except mutation_mod.MutationError as exc:
                 # A baseline that billed and then passed no test still spent:
@@ -2895,7 +3301,7 @@ def test_mutations(
 
     return MutationCoverageResult(
         record=record_at,
-        model=node["name"],
+        model=model,
         target=target,
         baseline=result["baseline"],
         mutants=result["mutants"],
@@ -3209,6 +3615,189 @@ def _mutation_cost(paradigm, estimate, ceiling, adapter):
     )
 
 
+#: Why an Elementary monitoring test is kept out of a mutation run (#1307), by
+#: the reason code the baseline's ``excluded`` carries.
+_ELEMENTARY_LEFT_OUT = {
+    "elementary_disabled": (
+        "the copy disables the Elementary package's models so that no run "
+        "writes to its schema, and this test checks nothing while the package "
+        "is disabled"
+    ),
+    "elementary_history": (
+        "this Elementary test reads the package's history or writes a table "
+        "into its schema, so each mutant's run would change what the next one "
+        "measures or leave something in the dev target; the package stays "
+        "enabled in the copy because the project refers to its models"
+    ),
+}
+
+
+def _quiet_elementary(shadow) -> tuple[list[dict[str, str]], list[str]]:
+    """Keep the Elementary package from writing to the dev target in the copy.
+
+    ``strip_run_hooks`` has already removed the package's run hooks, which do
+    the uploads. What is left is the package's models, its monitoring tests,
+    which create real tables and read history, and its ``test``
+    materialization (#1307):
+
+    1. Where nothing outside the package refers to one of its models, they are
+       disabled in the copy. dbt raises on any other node that refers to a
+       disabled model, so where one does they stay on. With them disabled, the
+       package's materialization hands every test to dbt's.
+    2. Where they stay on, the copy sets dbt's
+       ``require_explicit_package_overrides_for_builtin_materializations``, so
+       dbt picks its own ``test`` materialization over the package's. The
+       package's needs the cache its stripped ``on_run_start`` builds and fails
+       every test without it (measured on the fixture's variant e at 0.26.1),
+       so it cannot be left to run. Where a root-project materialization still
+       hands the tests to the package's, the run is refused. On a release Dex
+       was not run against (#1445) the flag is set with the models disabled
+       too, since only the tested releases show their materialization handing
+       each test to dbt's there.
+    3. Each monitoring test is kept out of every run, the baseline included:
+       with the package disabled it checks nothing, and with it enabled it
+       reads and writes the package's history. Each is returned with its
+       reason code, for the baseline's ``excluded``.
+
+    A project without the package costs nothing here: it is read from the
+    copy's installed packages before dbt is asked anything. Returns the tests
+    left out and the warnings to add.
+    """
+
+    from . import elementary as elementary_mod
+    from .build import DbtRunError
+    from .package_overrides import _installed
+
+    root = getattr(shadow, "shadow", None)
+    if root is None or not any(
+        name == elementary_mod.PACKAGE for name, _, _ in _installed(root)
+    ):
+        return [], []
+    warnings: list[str] = []
+    manifest = shadow.parse()
+    # The copy is made inert the same way on any release (#1445); a release
+    # dex was not run against is named rather than read as a known one.
+    release_warning = elementary_mod.read(root, manifest).release_warning()
+    if release_warning is not None:
+        warnings.append(release_warning)
+    dependents = elementary_mod.package_model_dependents(manifest)
+    disabled = False
+    if dependents:
+        warnings.append(
+            "the Elementary package's models stay enabled in the copy, because "
+            f"{dependents[0]} refers to one and dbt would refuse the parse without "
+            "them; the tests run under dbt's own test materialization and its "
+            "monitoring tests are left out instead"
+        )
+    else:
+        undo = shadow.disable_package_models(elementary_mod.PACKAGE)
+        try:
+            manifest = shadow.parse()
+            disabled = not elementary_mod.read(root, manifest).enabled
+        except DbtRunError:
+            pass
+        if not disabled:
+            undo()
+            manifest = shadow.parse()
+            warnings.append(
+                "dex could not disable the Elementary package's models in the "
+                "copy, so they stay enabled; the tests run under dbt's own test "
+                "materialization and its monitoring tests are left out instead"
+            )
+    # With the package disabled, its materialization hands each test to dbt's
+    # on every release dex read; on another (#1445) nothing says it does, so
+    # dbt's own is pinned as it is where the package stays enabled.
+    if not disabled or elementary_mod.read(root, manifest).materialization == "unknown":
+        why = (
+            "the Elementary package stays enabled in this project's copy"
+            if not disabled
+            else "the installed Elementary release is not one dex was run against"
+        )
+        manifest = _pin_dbt_test_materialization(shadow, root, why)
+    code = "elementary_disabled" if disabled else "elementary_history"
+    left_out = [
+        {
+            "name": name,
+            "reason_code": code,
+            "reason": _ELEMENTARY_LEFT_OUT[code],
+            "_reads": reads,
+        }
+        for name, reads in elementary_mod.monitoring_tests(manifest).items()
+    ]
+    return left_out, warnings
+
+
+def _pin_dbt_test_materialization(shadow, root: Path, why: str) -> dict:
+    """Set dbt's override flag in the copy so its own ``test`` materialization
+    runs, and return the manifest; refuse where dbt will not parse the copy
+    with it, or where the project still hands the tests to Elementary's."""
+
+    from . import elementary as elementary_mod
+    from .build import DbtRunError
+    from .mutation import MutationError
+
+    undo = shadow.set_project_flag(elementary_mod.OVERRIDE_FLAG, True)
+    try:
+        manifest = shadow.parse()
+    except DbtRunError as exc:
+        # dbt 1.12.5 refuses `flags:` in dbt_project.yml beside a legacy
+        # `config:` block in profiles.yml, among others.
+        undo()
+        raise MutationError(
+            f"{why}, so dex sets dbt's require_explicit_package_overrides_for_"
+            "builtin_materializations there to run the tests under dbt's own test "
+            f"materialization, and dbt would not parse the copy with it: {exc}"
+        ) from exc
+    if elementary_mod.read(root, manifest).materialization != "dbt":
+        raise MutationError(
+            f"{why}, and a test materialization in the project still hands "
+            "every test to Elementary's, which needs the run hooks a mutation "
+            "run cannot fire. Measuring would write to the dev target or fail "
+            "every test, so dex does not run it"
+        )
+    return manifest
+
+
+def _left_out_of(
+    candidates: list[dict], selected: set[str], *, skip: set[str] = frozenset()
+) -> tuple[list[dict[str, str]], list[str]]:
+    """The candidates a run over ``selected`` would reach, and the warning.
+
+    ``ShadowRun`` pins ``--indirect-selection eager``, which runs a test that
+    reads any selected node, so a test is kept where one of the nodes it reads
+    is selected. ``skip`` names tests the run already excludes for another
+    reason (the downstream routing's), which are reported there instead.
+    """
+
+    left_out = [
+        {key: value for key, value in entry.items() if key != "_reads"}
+        for entry in candidates
+        if set(entry["_reads"]) & selected and entry["name"] not in skip
+    ]
+    if not left_out:
+        return [], []
+    return left_out, [
+        f"{len(left_out)} Elementary monitoring test(s) are not run against the "
+        "baseline or any mutant; each is in data.baseline.excluded with its "
+        "reason_code"
+    ]
+
+
+def _test_ids_named(manifest: dict, names: set[str]) -> set[str]:
+    """The unique ids of the data tests named in ``names``.
+
+    The left-out tests are keyed by name, the way a run's exclusions are, while
+    ``runs_full_build`` compares unique ids."""
+
+    if not names:
+        return set()
+    return {
+        uid
+        for uid, other in (manifest.get("nodes") or {}).items()
+        if other.get("resource_type") == "test" and other.get("name") in names
+    }
+
+
 def _mutable_model(engine, shadow, model: str, mutation_mod):
     """The node to mutate, or the free refusal saying why this model is not one.
 
@@ -3218,13 +3807,15 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
     """
 
     from ..dbt_project import load as load_project
-    from ..dbt_project import model_file
+    from ..model_versions import version_text
 
     view = load_project(shadow.project)
-    path = model_file(view, model)
+    name, version, path = _version_to_mutate(view, model, mutation_mod)
+    if version is not None:
+        model = f"{name}.v{version}"
     content = view.files[path].content
     if hasattr(shadow, "strip_semantic_models"):
-        shadow.strip_semantic_models(model)
+        shadow.strip_semantic_models(name)
     # The header is appended rather than prepended: dbt gives a scalar config key
     # to the last `config()` call in a file, so a model declaring its own
     # `materialized` would otherwise win and the mutant would build a relation.
@@ -3234,7 +3825,9 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
     matches = [
         node
         for uid, node in manifest.get("nodes", {}).items()
-        if uid.startswith("model.") and node.get("name") == model
+        if uid.startswith("model.")
+        and node.get("name") == name
+        and (version is None or version_text(node.get("version")) == version)
     ]
     if not matches:
         raise mutation_mod.MutationError(f"dbt compiled no model named '{model}'")
@@ -3263,6 +3856,54 @@ def _mutable_model(engine, shadow, model: str, mutation_mod):
             "run mutants that would materialize into your dev target"
         )
     return node, path
+
+
+def _version_to_mutate(view, model: str, mutation_mod) -> tuple[str, str | None, str]:
+    """The model name, version and file ``--mutate <model>`` names (#1374).
+
+    ``orders.v2`` names one version of a versioned model, the label
+    ``transform declare`` takes. A bare ``orders`` names the version an
+    unversioned ``ref('orders')`` resolves to (its ``latest_version``), which
+    is the version a reader of the model gets. A version's file stem
+    (``orders_v2``) is refused with its label, as ``transform declare`` refuses
+    it. The version is ``None`` for a model with no versions.
+    """
+
+    from .. import model_versions as mv
+    from ..dbt_project import model_file
+
+    files = {path: source.content for path, source in view.files.items()}
+    vmap = mv.cached_version_map(files, view.model_paths)
+    base, version = mv.split_label(model)
+    versioned = mv.lookup(vmap, base)
+    if versioned is None:
+        if version is not None:
+            raise mutation_mod.MutationError(
+                f"'{model}' names a version, and the project declares no "
+                f"versioned model '{base}'"
+            )
+        label = mv.label_for_stem(model, vmap)
+        if label is not None:
+            raise mutation_mod.MutationError(
+                f"'{model}' is the file that builds '{label}', a version of a "
+                f"versioned model; name it as '{label}'"
+            )
+        return model, None, model_file(view, model)
+    item = versioned.version(version if version is not None else versioned.default)
+    if item is None:
+        raise mutation_mod.MutationError(
+            f"'{model}' names version {version} of '{versioned.base}', which "
+            f"lists versions {', '.join(v.v for v in versioned.versions)}"
+        )
+    if item.file is None:
+        raise mutation_mod.MutationError(
+            f"no file builds '{item.label}', so dbt compiles no such version"
+        )
+    if not item.file.endswith(".sql"):
+        raise mutation_mod.MutationError(
+            f"'{item.label}' is a Python model; mutation coverage plants defects in SQL"
+        )
+    return versioned.base, item.v, item.file
 
 
 def _plan_mutants(
@@ -3374,7 +4015,7 @@ def _parent_relations(manifest: dict, node: dict, mutation_mod) -> list:
             continue
         ephemeral = (parent.get("config") or {}).get("materialized") == "ephemeral"
         rendered = (
-            f"{mutation_mod.DBT_CTE_PREFIX}{parent['name']}"
+            f"{mutation_mod.DBT_CTE_PREFIX}{parent.get('alias') or parent['name']}"
             if ephemeral
             else parent.get("relation_name")
         )
@@ -3490,7 +4131,10 @@ def _price_mutations(
     def spliced(statement: str, body: str) -> str:
         return (
             mutation_mod.inline_into_test(
-                statement, model_name=node["name"], body=body, dialect=adapter.dialect
+                statement,
+                model_name=node.get("alias") or node["name"],
+                body=body,
+                dialect=adapter.dialect,
             )
             or statement
         )
@@ -3581,8 +4225,18 @@ def _run_mutants(
     full_tests: bool = True,
     settle_uptime: bool = True,
     on_meter=None,
+    left_out: Sequence[dict[str, str]] = (),
+    overrides: Mapping[str, str] | None = None,
 ):
     """The baseline, then one run per mutant, stopping if the budget runs out.
+
+    ``left_out`` names tests kept out of every run, the baseline included, each
+    with its ``reason_code`` and ``reason``; they are reported in the
+    baseline's ``excluded`` beside the tests that did not pass there (#1307).
+
+    ``overrides`` maps a unit test to what it overrides. A mutant is compiled
+    with the project's own vars and macros, so one of those that fails the
+    baseline is excluded for its overrides, not as a broken test (#1396).
 
     A survivor is compared with the model on the dev data straight after its
     own run, while its body is still the model file, so the comparison costs
@@ -3607,6 +4261,7 @@ def _run_mutants(
     exclude = [
         *(downstream.exclude if downstream is not None else []),
         *sorted({f"unit_test:{test.select}" for test in incremental_tests}),
+        *(entry["name"] for entry in left_out),
     ]
     below = set(downstream.tests) if downstream is not None else set()
     warnings: list[str] = []
@@ -3634,7 +4289,9 @@ def _run_mutants(
         "not_run": 0,
     }
     baseline: dict[str, str] = {}
-    excluded: list[dict[str, str]] = []
+    # Listed whether or not the baseline runs: these are out of every run.
+    left_out_entries = [{**entry, "status": "not_run"} for entry in left_out]
+    excluded: list[dict[str, str]] = list(left_out_entries)
     tested = 0
     exhausted = False
 
@@ -3661,17 +4318,30 @@ def _run_mutants(
         baseline_summary = shadow.test(select, exclude=exclude)
         meter.settle(baseline_summary, "(baseline)")
         baseline = _test_statuses(baseline_summary)
+        overrides = overrides or {}
         excluded = [
-            {"name": name, "status": status, "reason": _exclusion_reason(status)}
+            {
+                "name": name,
+                "status": status,
+                "reason": _exclusion_reason(status, overrides.get(name)),
+            }
             for name, status in sorted(baseline.items())
             if status != "pass"
-        ]
+        ] + left_out_entries
         if not any(status == "pass" for status in baseline.values()):
+            overridden = sorted(set(baseline) & set(overrides))
             raise mutation_mod.MutationError(
                 f"no test of '{model}' passes against the unmutated model, so there "
                 "is nothing that could catch a defect. Build its parents first "
                 f"(`transform build --select +{model}`) and fix the failing tests, "
                 "then measure them"
+                + (
+                    ". " + ", ".join(overridden) + " set overrides, which a "
+                    "mutant cannot honour: it is compiled once with the project's "
+                    "own vars and macros"
+                    if overridden
+                    else ""
+                )
             )
 
         if equivalence is not None:
@@ -3747,6 +4417,7 @@ def _run_mutants(
             mutation_mod=mutation_mod,
             exhausted=exhausted,
             warnings=warnings,
+            overrides=overrides,
         )
 
     mutants.sort(key=lambda m: (_survivor_rank(m), m["id"]))
@@ -3790,6 +4461,7 @@ def _run_incremental(
     mutation_mod,
     exhausted: bool,
     warnings: list[str],
+    overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """The incremental branch's mutants, against the tests that run the branch.
 
@@ -3912,7 +4584,11 @@ def _run_incremental(
                 for name, status in sorted(baseline.items())
             ],
             "excluded": [
-                {"name": name, "status": status, "reason": _exclusion_reason(status)}
+                {
+                    "name": name,
+                    "status": status,
+                    "reason": _exclusion_reason(status, (overrides or {}).get(name)),
+                }
                 for name, status in sorted(baseline.items())
                 if status != "pass"
             ],
@@ -4230,7 +4906,7 @@ class _DownstreamTests:
         root = shadow.shadow
         try:
             for uid in closure.eligible:
-                path = (nodes.get(uid) or {}).get("original_file_path") or ""
+                path = posix((nodes.get(uid) or {}).get("original_file_path"))
                 text = (root / path).read_text(encoding="utf-8")
                 shadow.write(path, text + "\n" + mutation_mod.EPHEMERAL_HEADER + "\n")
                 originals[path] = text
@@ -4584,7 +5260,14 @@ def _test_statuses(summary: dict | None) -> dict[str, str]:
     }
 
 
-def _exclusion_reason(status: str) -> str:
+def _exclusion_reason(status: str, overrides: str | None = None) -> str:
+    if overrides:
+        return (
+            f"this test overrides {overrides}, and a mutant is compiled once with "
+            "the project's own values, so the override cannot reach it; the test "
+            "can fail here and still pass in a build, so it is left out for its "
+            "overrides, not as a broken test"
+        )
     if status == "error":
         return (
             "this test could not run against the unmutated model, so it cannot "
@@ -4659,7 +5342,7 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
                 getattr(args, "plan_id", None),
                 model=getattr(args, "model", None),
                 column_mapping=_column_map(getattr(args, "map", None)),
-                key_columns=getattr(args, "key", None),
+                key_columns=_key_columns_arg(getattr(args, "key", None)),
                 target=getattr(args, "target", None),
                 accepted_type_changes=getattr(args, "accept_type", None),
                 expectation=_expectation_arg(args),
@@ -4667,6 +5350,15 @@ def cmd_compare(args: argparse.Namespace, engine: DexEngine) -> env.Envelope:
         )
     except ValueError as exc:
         return env.error_for(exc, **_resolution_error(exc))
+
+
+def _key_columns_arg(values: Sequence[str] | None) -> list[str] | None:
+    """Expand comma-separated ``--key`` values while preserving repeats."""
+
+    if values is None:
+        return None
+
+    return [column.strip() for value in values for column in value.split(",")]
 
 
 def _expectation_arg(args: argparse.Namespace) -> str | None:
@@ -5597,7 +6289,9 @@ def build(
         )
     # Ahead of the install: a prod target must not get as far as a reinstall.
     assert_dev_target(
-        target or engine.config.dbt_target or "dev", engine.config.dbt_target
+        target or engine.config.dbt_target or "dev",
+        engine.config.dbt_target,
+        prod=getattr(engine.config, "dbt_prod_target", None),
     )
     project = engine.project_dir()
     if not has_package_spec(project):
@@ -5762,7 +6456,9 @@ def _build_project(
     config = engine.config
     repo_root = engine.require_repo_root("building the dbt project")
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     ceiling = engine.budget if engine.budget is not None else config.budget.ceiling
     connector = engine.connector or config.connector
 
@@ -5816,6 +6512,7 @@ def _build_project(
             checkout,
             target=target,
             configured_target=config.dbt_target,
+            prod_target=getattr(config, "dbt_prod_target", None),
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -5927,7 +6624,15 @@ def _build_project(
         ),
         impact=impact,
     )
+    unpriced = None
     if estimate is not None:
+        # The estimate prices compiled nodes, and the Elementary package runs
+        # work no node shows (#1309); read off the pricing compile's artifacts,
+        # so it answers for the build's own target and selection.
+        from .build import unpriced_elementary_work
+
+        unpriced = unpriced_elementary_work(checkout, artifacts_dir)
+        price_notes = [*price_notes, *unpriced.warnings()]
         command_args.billed_handshake(
             "transform build",
             adapter,
@@ -5935,12 +6640,14 @@ def _build_project(
             per_table=per_node or None,
             notes=price_notes or None,
             upper_bounds=upper_bounds or None,
+            unpriced=unpriced.as_dict() if unpriced.codes else None,
         )
     try:
         summary, cost = run_build(
             checkout,
             target=target,
             configured_target=config.dbt_target,
+            prod_target=getattr(config, "dbt_prod_target", None),
             select=select,
             ceiling=ceiling,
             confirmed=engine.confirmed,
@@ -5959,6 +6666,9 @@ def _build_project(
             full_refresh=full_refresh,
         )
         logged_id = summary.pop("logged_invocation_id", None)
+        if unpriced is not None and unpriced.codes:
+            cost.unpriced = unpriced.codes
+            summary["unpriced"] = unpriced.as_dict()
     except ConfirmationRequiredError as exc:
         # Reached only when pricing degraded to no estimate; the note explains
         # why the confirm ask carries no number. `billed_handshake` never ran on
@@ -7474,6 +8184,9 @@ def _attach_completion(
     try:
         states = inputs.get("comparisons")
         diagnosed = _attach_prerequisites(result, inputs)
+        release_warning = _elementary_release_warning(inputs)
+        if release_warning is not None:
+            result.warnings.append(release_warning)
         result.completion = summarize_completion(
             result.evidence,
             result.verification,
@@ -7502,12 +8215,72 @@ def _attach_completion(
             incremental_replay=_incremental_replay_inputs(result, inputs),
             repair=inputs.get("repair"),
             population_accepted=inputs.get("population_accepted"),
+            unchecked_tests=_unchecked_tests(inputs),
         )
+        # The list may be capped, or cut whole by the budget: the count is
+        # what was listed plus what the cut took.
+        unchecked = len(
+            result.completion.assurance.unchecked_tests or []
+        ) + result.completion.elided.get("assurance.unchecked_tests", 0)
+        if unchecked:
+            # A pointer line, like verification's, so a caller reading the
+            # warnings alone learns that a passing test vouched for nothing.
+            result.warnings.append(
+                f"{unchecked} passing Elementary test(s) are not counted toward "
+                "any model's assurance (compiled to the package's no-results "
+                "query, judged against history dex did not measure, or run by an "
+                "Elementary release dex was not run against); they are "
+                "under data.completion.assurance.unchecked_tests with a "
+                "reason_code, any past the list's cap counted in "
+                "data.completion.elided"
+            )
     except Exception as exc:
         result.notes.append(
             f"could not summarize this build's completion ({type(exc).__name__}); "
             "the full evidence is under data.evidence and data.verification"
         )
+
+
+def _unchecked_tests(inputs: dict[str, Any]) -> dict[str, str] | None:
+    """The tests whose pass checked nothing in this build, with why (#1308).
+
+    Read from the build's own manifest, which holds each test's compiled SQL,
+    and from what the installed Elementary package does for the target that
+    manifest was parsed for. A project without the package has none. Best
+    effort: an unreadable manifest leaves every test counted as it was.
+    """
+
+    runtime = _elementary_runtime(inputs)
+    if runtime is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        return dict(elementary_mod.unchecked_tests(inputs["manifest"], runtime)) or None
+    return None
+
+
+def _elementary_release_warning(inputs: dict[str, Any]) -> str | None:
+    """The warning for an Elementary release dex was not run against (#1445),
+    ``None`` where the release is supported or the package is not installed."""
+
+    runtime = _elementary_runtime(inputs)
+    return runtime.release_warning() if runtime is not None else None
+
+
+def _elementary_runtime(inputs: dict[str, Any]) -> Any:
+    """What the installed Elementary package does for the build's target, read
+    from the build's own manifest; ``None`` where it cannot be read."""
+
+    manifest = inputs.get("manifest")
+    project = inputs.get("project")
+    if not isinstance(manifest, dict) or project is None:
+        return None
+    from . import elementary as elementary_mod
+
+    with contextlib.suppress(Exception):
+        return elementary_mod.read(project, manifest)
+    return None
 
 
 def _incremental_replay_inputs(
@@ -7544,7 +8317,7 @@ def _incremental_replay_inputs(
             continue
         if (node.get("config") or {}).get("materialized") != "incremental":
             continue
-        path = str(node.get("original_file_path") or "")
+        path = posix(node.get("original_file_path"))
         if not path or not any(
             path == candidate or candidate.endswith("/" + path) for candidate in edited
         ):
@@ -7621,7 +8394,9 @@ def _failure_message(prefix: str, messages: list[str]) -> str:
     return f"{prefix}: {messages[0]}" if messages else prefix
 
 
-def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanResult:
+def _make_plan(
+    engine: DexEngine, intent: str, edits: list[PlanEdit], *, no_parse: bool = False
+) -> PlanResult:
     from ..adapters import get_dialect
     from ..adapters.project import PlacingProject, placement_gap
 
@@ -7648,7 +8423,10 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
     compiled_models = {}
     compilation = None
     compile_required = False
-    if _has_dbt_project(engine):
+    uncompiled_notes: list[str] = []
+    if _has_dbt_project(engine) and no_parse:
+        uncompiled_notes = _refuse_uncompiled(edits)
+    elif _has_dbt_project(engine):
         from .validate import needs_compilation
 
         compile_required = any(
@@ -7731,10 +8509,47 @@ def _make_plan(engine: DexEngine, intent: str, edits: list[PlanEdit]) -> PlanRes
         diffs=diffs,
         warnings=[*warnings, gap] if gap else warnings,
     )
+    result.warnings.extend(uncompiled_notes)
     if compilation is not None:
         result.warnings.extend(compilation.warnings)
         compilation.settle(result)
     return result
+
+
+NO_PARSE_REASON = (
+    "dbt parse not run: the plan was stored with no_parse, so the post-change "
+    "project is the caller's to parse"
+)
+
+
+def _refuse_uncompiled(edits: list[PlanEdit]) -> list[str]:
+    """What a no-parse plan cannot check without compiling (#1517).
+
+    Control flow cannot be reduced to SQL by deleting its delimiters, so a model
+    carrying it is refused with the error a missing compile always raises. A
+    model that only lists columns through a macro reduces to SQL as it does
+    where dbt is absent: it is checked statically and named in a warning,
+    since its column list was never expanded.
+    """
+
+    from .validate import EditValidationError, has_control_flow, lists_columns
+
+    models = [
+        e for e in edits if e.kind is EditKind.MODEL_SQL and e.new_content is not None
+    ]
+    blocked = [e.path for e in models if has_control_flow(e.new_content or "")]
+    if blocked:
+        raise EditValidationError(
+            f"{', '.join(blocked)}: Jinja control flow requires dbt compilation, "
+            "which a no_parse plan does not run; plan this model where dbt may "
+            "run (without --no-parse)"
+        )
+    return [
+        f"{e.path}: its column-listing macro was not expanded, since a no_parse "
+        "plan does not compile, so its columns were checked from the SQL alone"
+        for e in models
+        if lists_columns(e.new_content or "")
+    ]
 
 
 def _semantic_plan(
@@ -7821,7 +8636,15 @@ def _semantic_plan(
     # Declarations render after the semantic-only checks above, because what they
     # produce is a model's properties (`schema_yml`), not a semantic definition,
     # and before the parse below, so dbt reads the layer and the models together.
-    edits, declaration_notes, drafts = _declare(engine, edits, declarations)
+    (
+        edits,
+        declaration_notes,
+        drafts,
+        pii_metadata,
+        generated_tests,
+        monitors_report,
+        pii_tags_report,
+    ) = _declare(engine, edits, declarations)
     # A derivation is parsed by dbt whatever `--no-parse` says: the flag is the
     # caller's call about their own YAML, not about YAML dex wrote for them.
     derived = _derive_semantic(engine, view, edits)
@@ -7884,13 +8707,20 @@ def _semantic_plan(
     result.warnings.extend(derived.warnings)
     result.decisions = _plan_decisions(engine, edits, declarations)
     result.declarations = drafts or None
+    result.pii_metadata = pii_metadata
+    result.generated_tests = generated_tests
+    result.monitors = monitors_report
+    result.pii_tags = pii_tags_report
+    _price_generated_tests(engine, result, edits)
     result.semantic_proposal = derived.proposal
     _store_companion(engine, intent, derived, result)
     _contradiction_warnings(result)
     return result
 
 
-def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any:
+def _derive_semantic(
+    engine: DexEngine, view: Any, edits: list[PlanEdit], *, parse: bool = True
+) -> Any:
     """The semantic definition each declared mart in ``edits`` implies (#499, #927).
 
     Free on every connector: it reads the post-change project and the stored
@@ -7920,6 +8750,7 @@ def _derive_semantic(engine: DexEngine, view: Any, edits: list[PlanEdit]) -> Any
             models,
             cache=cache,
             dialect=get_dialect(engine.connector or engine.config.connector),
+            parse=parse,
         )
         outcome.warnings.extend(
             semantic_hook.versioned_marts(

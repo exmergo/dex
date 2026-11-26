@@ -634,7 +634,7 @@ def test_init_postgres_bootstraps_a_project(tmp_path: Path, capsys, monkeypatch)
     config = yaml.safe_load(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
-    assert config["postgres"]["dev_schema"] == "dbt_dev"
+    assert config["postgres"]["dev"] == "dbt_dev"
 
 
 def test_init_postgres_renders_the_committed_build_identity(
@@ -730,7 +730,7 @@ def test_init_redshift_bootstraps_a_password_profile(
     config = yaml.safe_load(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
-    assert config["redshift"]["dev_schema"] == "dbt_dev"
+    assert config["redshift"]["dev"] == "dbt_dev"
 
 
 def test_init_redshift_renders_the_committed_build_identity(
@@ -809,7 +809,7 @@ def test_init_bigquery_bootstraps_a_project(tmp_path: Path, capsys):
     )
     assert config["connector"] == "bigquery"
     assert config["bigquery"]["project"] == "test-proj"
-    assert config["bigquery"]["dev_dataset"] == "dbt_dev"
+    assert config["bigquery"]["dev"] == "dbt_dev"
 
 
 def _no_ambient_bigquery(monkeypatch) -> None:
@@ -866,7 +866,7 @@ def test_init_bigquery_honors_an_explicit_project_on_a_fresh_root(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
     assert config["bigquery"]["project"] == "example-project"
-    assert config["bigquery"]["dev_dataset"] == "dbt_dev"
+    assert config["bigquery"]["dev"] == "dbt_dev"
 
 
 def test_init_bigquery_explicit_project_beats_the_configured_one(
@@ -1448,7 +1448,7 @@ def test_init_clickhouse_bootstraps_a_two_part_namespace_profile(
     config = yaml.safe_load(
         (tmp_path / ".dex" / "config.yml").read_text(encoding="utf-8")
     )
-    assert config["clickhouse"]["dev_database"] == "dbt_dev"
+    assert config["clickhouse"]["dev"] == "dbt_dev"
 
 
 def test_init_clickhouse_renders_a_cap_the_build_can_tighten(
@@ -1625,7 +1625,7 @@ def test_init_trino_needs_a_dev_catalog(tmp_path: Path, capsys, monkeypatch):
     _seed_trino_config(tmp_path)
     rc, envelope = _run(_init_argv(tmp_path, "--connector", "trino"), capsys)
     assert rc == 1
-    assert "trino.dev_catalog" in envelope["errors"][0]
+    assert "trino.dev" in envelope["errors"][0]
 
 
 def test_init_trino_refuses_a_dev_target_that_is_a_source(

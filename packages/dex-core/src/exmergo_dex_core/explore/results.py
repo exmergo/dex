@@ -25,6 +25,7 @@ from ..values_free import COLUMN_VALUE_FIELDS
 from .semantic import SemanticCatalog
 from .summary import (
     MAX_DECLARED_COLUMNS,
+    ExcludedObjects,
     MapObject,
     SkippedObjects,
     capped_declaration,
@@ -65,14 +66,21 @@ class InventoryResult(Result):
     objects: list[InventoryEntry] = Field(default_factory=list)
     ranked: bool = False
     elided_object_count: int = 0
+    # What a ranked call left out by default (#1311). Reported on a ranked call
+    # only, where `count: 0` says nothing was left out; an unranked call leaves
+    # nothing out and carries no such block.
+    excluded: ExcludedObjects | None = None
 
     def data(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "object_count": len(self.objects),
             "objects": [o.model_dump(mode="json") for o in self.objects],
             "ranked": self.ranked,
             "elided_object_count": self.elided_object_count,
         }
+        if self.excluded is not None:
+            payload["excluded"] = self.excluded.model_dump(mode="json")
+        return payload
 
 
 def _profile_dataset_payload(
@@ -256,6 +264,10 @@ class RelationshipsResult(Result):
     with different columns; see :class:`DeclaredRelationshipConflict`. Empty is
     the positive statement that every declaration touching the same two
     datasets agreed.
+
+    ``excluded`` names the Elementary package's own tables inference left out,
+    neither profiled nor joined (#1494), in the shape ``map`` reports them;
+    always present, so ``count: 0`` says nothing was left out.
     """
 
     relationships: list[Relationship] = Field(default_factory=list)
@@ -265,6 +277,7 @@ class RelationshipsResult(Result):
     cache_hit_count: int = 0
     carried_relationship_count: int = 0
     conflicts: list[DeclaredRelationshipConflict] = Field(default_factory=list)
+    excluded: ExcludedObjects = Field(default_factory=ExcludedObjects)
     cache_path: str = ""
     updated_at: str = ""
 
@@ -278,6 +291,7 @@ class RelationshipsResult(Result):
             "cache_hit_count": self.cache_hit_count,
             "carried_relationship_count": self.carried_relationship_count,
             "conflicts": [c.model_dump(mode="json") for c in self.conflicts],
+            "excluded": self.excluded.model_dump(mode="json"),
             "cache_path": self.cache_path,
             "updated_at": self.updated_at,
         }
@@ -319,6 +333,9 @@ class MapResult(Result):
     # Always reported: `count: 0` is the positive statement that nothing was
     # skipped, the same way an empty `notes` is.
     skipped: SkippedObjects = Field(default_factory=SkippedObjects)
+    # What ranking left out by default (#1311): Elementary's own tables. Always
+    # reported, `count: 0` when nothing was left out.
+    excluded: ExcludedObjects = Field(default_factory=ExcludedObjects)
     carried_forward_count: int = 0
     out_of_scope_carried_count: int = 0
     dropped_count: int = 0
@@ -349,6 +366,7 @@ class MapResult(Result):
             "cache_hit_count": self.cache_hit_count,
             "skipped_count": self.skipped_count,
             "skipped": self.skipped.model_dump(mode="json"),
+            "excluded": self.excluded.model_dump(mode="json"),
             "carried_forward_count": self.carried_forward_count,
             "out_of_scope_carried_count": self.out_of_scope_carried_count,
             "dropped_count": self.dropped_count,
@@ -398,6 +416,10 @@ class DiagramResult(Result):
     elided_entity_count: int = 0
     elided_column_count: int = 0
     elided_edge_count: int = 0
+    #: The Elementary package's tables the diagram left out (#1494), in the
+    #: shape ``map`` reports them; always present, so ``count: 0`` is the
+    #: positive statement that nothing was left out.
+    excluded: ExcludedObjects = Field(default_factory=ExcludedObjects)
     full: bool = False
     updated_at: str = ""
 
@@ -420,6 +442,7 @@ class DiagramResult(Result):
             "elided_entity_count": self.elided_entity_count,
             "elided_column_count": self.elided_column_count,
             "elided_edge_count": self.elided_edge_count,
+            "excluded": self.excluded.model_dump(mode="json"),
             "full": self.full,
             "updated_at": self.updated_at,
         }

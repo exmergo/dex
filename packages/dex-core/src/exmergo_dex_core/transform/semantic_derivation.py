@@ -29,7 +29,7 @@ cannot parse breaks every dbt command in the project.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any
@@ -78,6 +78,24 @@ WINDOW_CHOICE = "max"
 #: Granularities a ``date_trunc`` can name that MetricFlow accepts as a time
 #: dimension's ``time_granularity``.
 _GRANULARITIES = ("day", "week", "month", "quarter", "year")
+
+#: MetricFlow's time granularities (``TimeGranularity``), which no entity,
+#: dimension or measure may be named, in any case.
+_RESERVED_NAMES = frozenset(
+    {
+        "nanosecond",
+        "microsecond",
+        "millisecond",
+        "second",
+        "minute",
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year",
+    }
+)
 
 #: Layer prefixes stripped from a model name when it names an entity.
 _LAYER_PREFIX = re.compile(r"^(fct|fact|dim|mart|marts)_", re.IGNORECASE)
@@ -193,6 +211,9 @@ def derive(
     *,
     column_types: Mapping[str, tuple[str | None, str | None]],
     on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
+    reserved: Mapping[str, set[str]] | None = None,
+    primary_name: str | None = None,
+    drafted: Collection[str] = (),
 ) -> Derivation:
     """The semantic model ``declared`` states, with every gap named.
 
@@ -201,6 +222,12 @@ def derive(
     where the SQL truncates the column to one. ``on_ref`` is
     :func:`semantic_models_by_ref` over the project as it will read, which is how
     a foreign key finds the entity name the model it references already uses.
+    ``reserved`` is :func:`_planned_names` over the plan's declarations, the names
+    the marts derived alongside this one will give each element type.
+    ``primary_name`` is the primary entity name the plan already settled for this
+    mart, used as given so the foreign keys of other marts that join it match.
+    ``drafted`` names the marts ``on_ref`` holds as plan drafts: a reference to
+    one of their columns that carries no entity has nothing to join, ever.
     """
 
     derivation = Derivation(model=model)
@@ -241,18 +268,101 @@ def derive(
             "Declare the grain and plan again"
         )
 
+    # MetricFlow wants one element type per name, here and across the semantic
+    # layer (#1416). A grain column that is also a dimension (a time column grain)
+    # names its primary entity after the model, settled before the foreign keys so
+    # their duplicate check reads the final name; a dimension of a foreign entity's
+    # name moves aside further down. A replacement name stays clear of this model's
+    # elements, of the entities its foreign keys join by, of every entity name the
+    # layer or the plan already uses (so it joins nothing by accident), and of any
+    # name they give another element type.
+    stem = _LAYER_PREFIX.sub("", model).lower()
+    layer = _layer_names(on_ref, reserved)
+    measure_names = {n for n, f in columns.items() if f.get("role") == "measure"}
+    dimension_columns = {
+        n
+        for n, f in columns.items()
+        if f.get("role") == "dimension"
+        or (f.get("role") == "time" and column_types.get(n, (None, None))[0] != "other")
+    }
+    if primary is not None and primary in dimension_columns:
+        if primary_name is None:
+            joins_by = {
+                _foreign_entity(n, f.get("references"), on_ref)[0]
+                for n, f in columns.items()
+                if f.get("role") == "foreign_key" and n not in grain
+            }
+            primary_name = _free_name(
+                f"{stem}_{grain[0]}",
+                dimension_columns
+                | measure_names
+                | joins_by
+                | layer["entity"]
+                | layer["dimension"]
+                | layer["measure"],
+            )
+        primary = primary_name
+        entities[0]["name"] = primary
+        notes.append(
+            f"{grain[0]}: the primary entity is named '{primary}' because the "
+            "column is also a dimension, and MetricFlow does not allow one name "
+            "for both"
+        )
+
+    # A name this model gives no join to (a fallback, or a reference nothing
+    # declares yet) is numbered off any dimension or measure name here, in the
+    # layer or in the plan; a joined name stays the parent's. A number, or a
+    # fallback that by definition joins nothing, also keeps clear of every entity
+    # name the layer and the plan use, so it never takes another mart's join name.
+    incompatible = (
+        dimension_columns | measure_names | layer["dimension"] | layer["measure"]
+    )
     used_names = {e["name"] for e in entities}
     for name, fields in columns.items():
         if fields.get("role") != "foreign_key" or name in grain:
             continue
-        entity, joined = _foreign_entity(name, fields.get("references"), on_ref)
+        references = fields.get("references")
+        entity, joined = _foreign_entity(name, references, on_ref)
+        if (
+            joined is None
+            and isinstance(references, str)
+            and references.rsplit(".", 1)[0] in drafted
+        ):
+            reason = (
+                f"references {references}, a column the plan derives with no "
+                "entity, so no name can join it"
+            )
+            limitations.append(f"{name}: {reason}; the foreign key is not derived")
+            reasons[f"columns.{name}"] = reason
+            continue
+        if entity in used_names and joined is not None:
+            # the referenced column's entity is one this model already names, so
+            # no other name could join it: leave it out rather than offer one
+            reason = (
+                f"references {references}, whose entity '{entity}' this semantic "
+                "model already uses, so it cannot join it"
+            )
+            limitations.append(f"{name}: {reason}; the foreign key is not derived")
+            reasons[f"columns.{name}"] = reason
+            continue
         if entity in used_names:
             fallback = _entity_name(name, model)
+            if fallback in incompatible | layer["entity"]:
+                fallback = _free_name(
+                    fallback, incompatible | layer["entity"] | used_names
+                )
             notes.append(
                 f"{name}: entity '{entity}' is already used in this semantic model, "
                 f"so it is named '{fallback}' instead and does not join on '{entity}'"
             )
             entity, joined = fallback, None
+        elif joined is None and entity in incompatible:
+            renamed = _free_name(entity, incompatible | layer["entity"] | used_names)
+            notes.append(
+                f"{name}: entity '{renamed}' instead of '{entity}', which names a "
+                "dimension or measure, and MetricFlow does not allow one name for both"
+            )
+            entity = renamed
         if entity in used_names:
             notes.append(f"{name}: no entity name free for it, so it is not derived")
             continue
@@ -318,7 +428,30 @@ def derive(
             carried.extend(_carried_column(name, fields, described=True))
             time_columns.append(name)
 
-    agg_time = time_columns[0] if time_columns else None
+    foreign_names = {e["name"] for e in entities if e["type"] == "foreign"}
+    dimension_name = {d["name"]: d["name"] for d in dimensions}
+    for dimension in dimensions:
+        column = dimension["name"]
+        if column not in foreign_names:
+            continue
+        taken = (
+            {d["name"] for d in dimensions}
+            | {e["name"] for e in entities}
+            | measure_names
+            | layer["entity"]
+            | layer["dimension"]
+            | layer["measure"]
+        )
+        renamed = _free_name(f"{stem}_{column}", taken)
+        dimension["name"], dimension["expr"] = renamed, column
+        dimension_name[column] = renamed
+        notes.append(
+            f"{column}: the dimension is named '{renamed}' because the foreign "
+            "entity of the same name joins by it, and MetricFlow does not allow "
+            "one name for both"
+        )
+
+    agg_time = dimension_name[time_columns[0]] if time_columns else None
     if len(time_columns) > 1:
         notes.append(
             f"default time dimension is {agg_time}, the first time column declared; "
@@ -413,9 +546,39 @@ def derive(
     if meta:
         body["config"] = {"meta": {DEX_META_KEY: meta}}
     derivation.body = body
+    reserved = [
+        f"{element.get('expr', element['name'])}: the {kind} would be named "
+        f"'{element['name']}', a time granularity MetricFlow reserves, so dbt cannot "
+        "parse it. Rename the output column, or name the "
+        f"{kind} '{semantic_model_name}_{element['name']}' with "
+        f"`expr: {element.get('expr', element['name'])}`"
+        + (
+            ", point `defaults.agg_time_dimension`"
+            + (
+                " and each semi_additive measure's `non_additive_dimension.name`"
+                if any("non_additive_dimension" in m for m in measures)
+                else ""
+            )
+            + " at it,"
+            if kind == "dimension" and element["name"] == agg_time
+            else ""
+        )
+        + " and pass the definition to `semantic plan --definitions-file`"
+        for kind, elements in (
+            ("entity", entities),
+            ("dimension", dimensions),
+            ("measure", measures),
+        )
+        for element in elements
+        if element["name"].lower() in _RESERVED_NAMES
+    ]
+    limitations.extend(reserved)
     if primary is None:
         derivation.status = "failed"
         derivation.blocked = limitations[0]
+    elif reserved:
+        derivation.status = "failed"
+        derivation.blocked = "; ".join(reserved)
     notes.append(
         "metrics are not derived: a measure is what a column holds, a metric is a "
         "business definition, and that stays the author's"
@@ -526,6 +689,64 @@ def _described(
     if isinstance(description, str) and description.strip():
         element["description"] = description
     return element
+
+
+def _free_name(base: str, taken: set[str]) -> str:
+    """``base`` with underscores collapsed, numbered until it is not in ``taken``."""
+
+    base = re.sub(r"_+", "_", base)
+    name, suffix = base, 1
+    while name in taken:
+        suffix += 1
+        name = f"{base}_{suffix}"
+    return name
+
+
+def _layer_names(
+    on_ref: Mapping[str, list[tuple[str, dict[str, Any]]]],
+    reserved: Mapping[str, set[str]] | None = None,
+) -> dict[str, set[str]]:
+    """The entity, dimension and measure names the semantic layer already declares,
+    with the ones ``reserved`` holds for the rest of the plan."""
+
+    names: dict[str, set[str]] = {"entity": set(), "dimension": set(), "measure": set()}
+    for found in on_ref.values():
+        for _path, entry in found:
+            for kind, key in (
+                ("entity", "entities"),
+                ("dimension", "dimensions"),
+                ("measure", "measures"),
+            ):
+                for element in entry.get(key) or []:
+                    if isinstance(element, dict) and isinstance(
+                        element.get("name"), str
+                    ):
+                        names[kind].add(element["name"])
+    for kind, held in (reserved or {}).items():
+        names[kind] |= held
+    return names
+
+
+def _planned_names(declarations: Iterable[Any]) -> dict[str, set[str]]:
+    """The element names the plan's declarations ask for before any rename, so a
+    replacement chosen for one mart stays clear of them whichever mart derives
+    first."""
+
+    names: dict[str, set[str]] = {"entity": set(), "dimension": set(), "measure": set()}
+    for declaration in declarations:
+        declared = declaration.declared
+        grain = [g for g in declared.get("grain") or [] if isinstance(g, str)]
+        if len(grain) == 1:
+            names["entity"].add(_entity_name(grain[0], declaration.model))
+        for name, fields in (declared.get("columns") or {}).items():
+            role = fields.get("role") if isinstance(fields, dict) else None
+            if role in ("dimension", "time"):
+                names["dimension"].add(name)
+            elif role == "measure":
+                names["measure"].add(name)
+            elif role == "foreign_key":
+                names["entity"].add(_entity_name(name, name))
+    return names
 
 
 def _entity_name(column: str, model: str) -> str:
@@ -791,8 +1012,12 @@ def validate_parse(
     project: Any,
     target: str | None,
     spine: list[PlanEdit],
+    parse: bool = True,
 ) -> dict[str, Any] | None:
     """dbt's parse of a copy of the project with the derivations in it.
+
+    ``parse`` False records the parse as ``not_run`` and starts nothing: a
+    no-parse plan (#1517) leaves the post-change project to its caller.
 
     Returns the parse result when it covered exactly ``base_edits`` plus the
     derivations and no throwaway spine, so the caller can stand it in for its
@@ -819,6 +1044,13 @@ def validate_parse(
                 )
             derivation.validation["parse"] = entry
 
+    if not parse:
+        record(
+            "not_run",
+            "the plan was stored with no_parse, so dbt did not parse the "
+            "derivation; author it with `semantic plan` once the project parses",
+        )
+        return None
     # dbt parses nothing whose declared packages are not installed, so a parse
     # here could only fail, twice, in dbt's `Run "dbt deps"` words. Say why in
     # Dex's, read against the post-edit tree (#1166). The plan's own gate
@@ -892,12 +1124,16 @@ class MetricFlowDerivation:
         *,
         project: Any,
         target: str | None,
+        parse: bool = True,
     ) -> None:
         self.view = view
         self.edits = edits
         self.files = files
         self.project = project
         self.target = target
+        # False on a no-parse plan (#1517): no dbt is started, so each
+        # derivation is left unvalidated and out of the plan.
+        self.parse = parse
 
     def derive_semantic(self, request: Any) -> Any:
         from ..semantic_source import DerivedDefinition, SemanticDerivationResult
@@ -953,13 +1189,116 @@ class MetricFlowDerivation:
 
         derivations: list[Derivation] = []
         claimed: dict[str, str] = {}
-        for declaration in request.declarations:
+        # on_ref plus the plan's marts, for foreign keys alone: the collision
+        # check keeps reading on_ref, the project as it stands. A first pass
+        # settles each mart's primary entity name; further passes, with those
+        # names fixed, add every foreign entity that joins a known entity (the
+        # layer's or another draft's) until the drafts stop changing, so a child
+        # can join a parent column that is itself a foreign key. Every foreign key
+        # in the plan resolves against those drafts and nothing derived later, so
+        # it joins the same name whatever order the plan derives in, cycles
+        # included. What an accepted body adds is reserved for the marts after it.
+        authored = _layer_names(on_ref)["entity"]
+        # names settled or accepted so far, held for every mart after
+        held: dict[str, set[str]] = {
+            "entity": set(),
+            "dimension": set(),
+            "measure": set(),
+        }
+
+        def reserved_for(model: str) -> dict[str, set[str]]:
+            names = _planned_names(d for d in request.declarations if d.model != model)
+            for kind, more in held.items():
+                names[kind] |= more
+            return names
+
+        planned_marts = [d for d in request.declarations if d.model not in on_ref]
+        settled: dict[str, str] = {}
+        drafts: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+        for declaration in planned_marts:
+            body = derive(
+                declaration.model,
+                declaration.declared,
+                column_types=declaration.column_types,
+                on_ref=on_ref,
+                reserved=reserved_for(declaration.model),
+            ).body
+            primary = [
+                e for e in (body or {}).get("entities", []) if e["type"] == "primary"
+            ]
+            if primary:
+                drafts[declaration.model] = [
+                    ("", {"name": body["name"], "entities": primary})
+                ]
+                settled[declaration.model] = primary[0]["name"]
+                # a later draft keeps clear of it, so two settled names never meet
+                held["entity"].add(primary[0]["name"])
+        # Only names anchored in an entity that exists either way, the layer's or
+        # a settled primary, enter a draft, and a foreign key with `references`
+        # only when that reference resolves to the anchor (a fallback that merely
+        # shares its name never propagates): a pair of foreign keys that reference
+        # each other with no such anchor never enters, so the drafts only gain
+        # entities and settle. If they still have not settled by the pass limit,
+        # the plan joins primary entities alone rather than a half-settled state.
+        anchored = authored | set(settled.values())
+        every_planned = {d.model for d in planned_marts}
+
+        def anchors(entity: dict[str, Any], columns: Any, lookup: Any) -> bool:
+            if entity["type"] == "primary":
+                return True
+            fields = columns.get(entity["expr"]) if isinstance(columns, dict) else None
+            references = fields.get("references") if isinstance(fields, dict) else None
+            if not references:
+                return entity["name"] in anchored
+            name, joined = _foreign_entity(entity["expr"], references, lookup)
+            return joined is not None and name == entity["name"] and name in anchored
+
+        primaries = dict(drafts)
+        for _ in range(2 * len(planned_marts) + 2):
+            refined: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+            for declaration in planned_marts:
+                if declaration.model not in drafts:
+                    continue
+                lookup = {
+                    **on_ref,
+                    **{m: d for m, d in drafts.items() if m != declaration.model},
+                }
+                body = derive(
+                    declaration.model,
+                    declaration.declared,
+                    column_types=declaration.column_types,
+                    on_ref=lookup,
+                    reserved=reserved_for(declaration.model),
+                    primary_name=settled[declaration.model],
+                    drafted=every_planned,
+                ).body
+                if body is None:
+                    refined[declaration.model] = drafts[declaration.model]
+                    continue
+                columns = declaration.declared.get("columns")
+                entities = [
+                    e for e in body.get("entities", []) if anchors(e, columns, lookup)
+                ]
+                refined[declaration.model] = [
+                    ("", {"name": body["name"], "entities": entities})
+                ]
+            if refined == drafts:
+                break
+            drafts = refined
+        else:
+            drafts = primaries
+        foreign_ref = {model: list(found) for model, found in on_ref.items()}
+        foreign_ref.update(drafts)
+        for declaration in _parents_first(request.declarations):
             model, sql_path = declaration.model, declaration.source_path
             derivation = derive(
                 model,
                 declaration.declared,
                 column_types=declaration.column_types,
-                on_ref=on_ref,
+                on_ref={m: found for m, found in foreign_ref.items() if m != model},
+                reserved=reserved_for(model),
+                primary_name=settled.get(model),
+                drafted=every_planned,
             )
             derivations.append(derivation)
             if derivation.body is None or derivation.status == "skipped":
@@ -994,8 +1333,13 @@ class MetricFlowDerivation:
                 )
             if name and derivation.status != "failed":
                 # Reserve the name only for a derivation that stays in the plan,
-                # so one that is rejected here cannot refuse a later mart.
+                # so one that is rejected here cannot refuse a later mart; the
+                # names its body adds are held for the marts derived after it.
                 claimed[name] = derivation.model
+                for kind, names in _layer_names(
+                    {model: [(derivation.path or "", derivation.body)]}
+                ).items():
+                    held[kind] |= names
 
         ready = [d for d in derivations if d.status == "proposed"]
         derived_edits = _spliced_edits(ready, files, edits)
@@ -1008,6 +1352,7 @@ class MetricFlowDerivation:
                 project=self.project,
                 target=self.target,
                 spine=[] if layer else shadow_spine(view),
+                parse=self.parse,
             )
             for derivation in ready:
                 outcome = derivation.validation["parse"]["result"]
@@ -1027,10 +1372,43 @@ class MetricFlowDerivation:
         return (
             derivations,
             edits,
-            _proposal(derivations, layer=layer, spine_missing=spine_missing),
+            _proposal(
+                derivations,
+                layer=layer,
+                spine_missing=spine_missing,
+                parse_skipped=not self.parse,
+            ),
             _warnings(derivations),
             parse_result,
         )
+
+
+def _parents_first(declarations: Iterable[Any]) -> list[Any]:
+    """The declarations with each mart a foreign key references ahead of the mart
+    that holds it, otherwise in the order given, so a child finds its parent's
+    entity name whatever order the plan listed them in."""
+
+    pending = list(declarations)
+    by_model: dict[str, list[Any]] = {}
+    for declaration in pending:
+        by_model.setdefault(declaration.model, []).append(declaration)
+    ordered: list[Any] = []
+    seen: set[int] = set()
+
+    def visit(declaration: Any) -> None:
+        if id(declaration) in seen:
+            return
+        seen.add(id(declaration))  # also stops a reference cycle
+        for fields in (declaration.declared.get("columns") or {}).values():
+            ref = fields.get("references") if isinstance(fields, dict) else None
+            if isinstance(ref, str) and "." in ref:
+                for parent in by_model.get(ref.rsplit(".", 1)[0], []):
+                    visit(parent)
+        ordered.append(declaration)
+
+    for declaration in pending:
+        visit(declaration)
+    return ordered
 
 
 def _definition(derivation: Derivation) -> Any:
@@ -1082,12 +1460,19 @@ def _with_derived(edits: list[PlanEdit], derived: list[PlanEdit]) -> list[PlanEd
 
 
 def _proposal(
-    derivations: list[Derivation], *, layer: bool, spine_missing: bool
+    derivations: list[Derivation],
+    *,
+    layer: bool,
+    spine_missing: bool,
+    parse_skipped: bool = False,
 ) -> dict[str, Any]:
-    proposed = [d for d in derivations if d.status == "proposed"]
+    # A no-parse plan (#1517) adds nothing to itself, so a derivation that
+    # passed every check but dbt's parse is offered for the side that parses.
+    offered = ("proposed", "unvalidated") if parse_skipped else ("proposed",)
+    proposed = [d for d in derivations if d.status in offered]
     data: dict[str, Any] = {
         "vendor": "dbt",
-        "mode": "included" if layer else "proposed",
+        "mode": "included" if layer and not parse_skipped else "proposed",
         "time_spine": "missing" if spine_missing else "present",
         "definitions": [
             {"kind": "semantic_model", "path": d.path, "content": d.content}
@@ -1109,11 +1494,17 @@ def _proposal(
             + "; nothing was added to the plan. Adopting one is the project "
             "owner's choice"
         )
+    if layer and parse_skipped:
+        notes.append(
+            "the plan was stored with no_parse, so no derivation was parsed or "
+            "added to it"
+        )
     if proposed:
         data["next"] = (
             "save this object as a file and pass it to `semantic plan "
             "--definitions-file <file>` to add it as a reviewable plan"
             + (", once the project has a time spine" if spine_missing else "")
+            + (", where dbt may parse it" if parse_skipped else "")
             + "; author the metrics on its measures there too"
         )
     data["notes"] = notes
@@ -1138,8 +1529,16 @@ def _warnings(derivations: list[Derivation]) -> list[str]:
                 ),
                 derivation.status,
             )
+            # An unvalidated derivation can still be offered under
+            # `definitions` (a no-parse plan, #1517); it is only kept out of
+            # the plan, so say that rather than "not offered".
+            outcome = (
+                "not added to this plan"
+                if derivation.status == "unvalidated"
+                else "not offered"
+            )
             out.append(
-                f"semantic model for '{derivation.model}' was derived and not "
-                f"offered ({derivation.status}): {reason}"
+                f"semantic model for '{derivation.model}' was derived and "
+                f"{outcome} ({derivation.status}): {reason}"
             )
     return out

@@ -440,12 +440,12 @@ def test_the_store_is_never_read_on_the_document_path(authored, tmp_path):
 NESTED_INTENT = "add stg_two"
 NESTED_PATH = "models/staging/stg_two.sql"
 NESTED_SQL = "select id from {{ ref('stg_one') }}\n"
-NESTED_PLAN_ID = "p3c7aee5fd9"
+NESTED_PLAN_ID = "pfddea9171e"
 NESTED_DIGEST = (
-    "sha256:de9e8e4322df2c954cd4b2c876a67827d7a5545d0d3f59fda410e8d5117811b6"
+    "sha256:1972db2811c0804d2e6d9c0f59fc9fee6ab61fef40dca7eb6766d4233d465ce1"
 )
 WINDOWS_DIGEST = (
-    "sha256:2886d0133c336590012c93b5c15727622bf82ad355e054679a7d6f51a742b0ad"
+    "sha256:e356106129ffb09a3335e5aec15232847c4554aa7f058efd4c99710941a9bde7"
 )
 
 

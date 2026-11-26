@@ -45,11 +45,25 @@ name: Integration
 #   scripts/setup_postgres_dev.sh applies locally): free, keyless, and
 #   fork-runnable by construction, kept here for pattern parity with the other
 #   connectors rather than as a cost decision.
+#   Elementary: no setup. The fixture's two files run in a step of the postgres
+#   job and in the elementary_duckdb job, installing the package from the dbt
+#   package hub; neither needs an account.
 #   ClickHouse: the exhaustive suite remains a free, keyless, fork-runnable
 #   container started by scripts/setup_clickhouse_dev.sh. A separate narrow
 #   ClickHouse Cloud job uses the protected clickhouse-cloud-integration
 #   environment, refuses on the UTC-day CHC threshold before any SQL connection
 #   wakes the service, and shares the same parameterized data fixture.
+#   Cube: the `cube` job needs no setup: render-only Cube Core containers (dex
+#   executes, #913) and executing ones (`--api`, #914) started by
+#   scripts/setup_cube_dev.sh, over the Postgres service container and an
+#   in-memory DuckDB. The render-only path also runs over ClickHouse and Trino
+#   (#1410): the job starts its own keyless containers with the scripts the
+#   `clickhouse` and `trino` jobs use. A separate narrow `cube_cloud` job asks a
+#   Cube Cloud deployment serving the same model
+#   (scripts/setup_cube_cloud_ci.sh) under the
+#   protected cube-cloud-integration environment, with a one-hour token minted
+#   per run from the deployment's API secret; the deployment's warehouse is an
+#   in-memory DuckDB it builds itself, so it reaches nothing.
 #   Trino: no setup for the exhaustive suite. It runs against a container pair
 #   started by scripts/setup_trino_dev.sh (Trino plus the Postgres database its
 #   keyless Iceberg catalog keeps table pointers in): free, keyless, and
@@ -69,9 +83,12 @@ on:
       - "scripts/setup_clickhouse_cloud_ci.sh"
       - "scripts/postgres_seed.sql"
       - "scripts/check_container_hardening.sh"
+      - "scripts/check_no_skips.py"
       - "scripts/trino*"
       - "scripts/trino/**"
       - "scripts/cube/**"
+      - "scripts/cube_cloud/**"
+      - "scripts/setup_cube_cloud_ci.sh"
       - "scripts/setup_trino_iceberg_ci.sh"
       - ".github/workflows/integration.yml"
   schedule:
@@ -241,7 +258,11 @@ jobs:
   databricks:
     if: github.repository == 'exmergo/dex'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25, not the usual 15: the suite took ten minutes on 2026-11-23 and ran
+    # past fifteen later that day once the generated-test parity harness grew
+    # (temporal, freshness and continuity rows), with warehouse cold starts
+    # on top. Every statement stays capped by STATEMENT_TIMEOUT.
+    timeout-minutes: 25
     # The environment carries the Databricks variables and, via its deployment
     # branch policy (main only), refuses this job to a workflow modified on a
     # branch before the token is minted. The Databricks-side pin mirrors it:
@@ -377,7 +398,13 @@ jobs:
     # container, so there is nothing to authenticate against and nothing a
     # fork could spend.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 30, double the usual 15: the Elementary step below builds six
+    # variants at each Postgres slot of the release matrix. At two releases it
+    # took 6:25 to 9:22 on hosted runners on main (2026-11-23 and 24), and the
+    # whole job 8:47 to 12:42. The third slot, 0.20.0 (#1446), adds 11 of the
+    # step's 33 cases and one more build inside a twelfth, about 3 to 5
+    # minutes, so the job stays under 18.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/dex-core
@@ -434,17 +461,71 @@ jobs:
       - name: Sync (postgres + duckdb + slayer + dev extras)
         run: uv sync --extra postgres --extra duckdb --extra slayer --extra dev
       - name: Live Postgres integration suite
-        run: uv run pytest tests/integration -q -m postgres
+        run: >-
+          uv run pytest tests/integration -q -m postgres
+          --ignore=tests/integration/test_postgres_elementary.py
+      # The Elementary fixture at the matrix's Postgres slots (POSTGRES_VERSIONS
+      # in tests/transform/elementary_fixture.py; how a release is added is in
+      # CONTRIBUTING.md, "The release matrix"). Its own step, with DEX_TEST_ELEMENTARY on the step
+      # rather than the job, so the suite above never runs it a second time. The
+      # file skips itself without the variable, and pytest counts a skip as a
+      # pass, so check_no_skips.py fails the step on any skip rather than
+      # letting a dropped variable read as green.
+      - name: Elementary fixture on Postgres
+        env:
+          DEX_TEST_ELEMENTARY: "1"
+        run: |
+          uv run pytest tests/integration/test_postgres_elementary.py -q -m postgres \
+            --junitxml "$RUNNER_TEMP/elementary-postgres.xml"
+          uv run python ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-postgres.xml"
+
+  elementary_duckdb:
+    # The Elementary fixture's own file, on local DuckDB at the releases that
+    # carry DuckDB macros. It needs no service and no account, only the dbt
+    # package hub, so like postgres it has no repository gate. It is here
+    # rather than in ci.yml because installing the package needs the network,
+    # and pull requests stay deterministic (#1380).
+    runs-on: ubuntu-latest
+    # The file's 55 cases took 14:47 and 23:33 on two hosted runs on main
+    # (2026-11-23). Open pull requests add cases to it, so the limit leaves
+    # room for a slow runner: a run that hits it is cancelled, and main reads
+    # red.
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Sync (duckdb + dev extras)
+        run: uv sync --extra duckdb --extra dev
+      # As on Postgres: the file skips itself without the variable, so any skip
+      # fails the step.
+      - name: Elementary fixture on DuckDB
+        env:
+          DEX_TEST_ELEMENTARY: "1"
+        run: |
+          uv run pytest tests/transform/test_elementary_fixture.py -q \
+            --junitxml "$RUNNER_TEMP/elementary-duckdb.xml"
+          uv run python ../../scripts/check_no_skips.py "$RUNNER_TEMP/elementary-duckdb.xml"
 
   cube:
     # No repository gate and no environment: a governed Cube query (#913) is
     # rendered by Cube Core and executed by dex, and both the renderer and the
-    # warehouse are containers this job starts. The Cube containers are
-    # render-only (scripts/setup_cube_dev.sh): they know the warehouse's type
-    # and hold no credential for it, so every number this job checks was
-    # executed by dex. Their API secret is random per run and stays in a file.
+    # warehouse are containers this job starts. The render containers know the
+    # warehouse's type and hold no credential for it, so every number they
+    # answer was executed by dex. The executing containers (`--api`, #914) run
+    # the same questions themselves, over the Postgres service as its read-only
+    # role and an in-memory DuckDB built from scripts/cube/shop.sql. Their API
+    # secret is random per run and stays in a file. ClickHouse and Trino (#1410)
+    # are rendered for and executed by dex only, over seeded containers this job
+    # starts with the `clickhouse` and `trino` jobs' own scripts, which is what
+    # the longer timeout is for.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: packages/dex-core
@@ -469,6 +550,8 @@ jobs:
           --memory 1g
     env:
       DEX_TEST_PG_DSN: postgresql://dex_ro:dex_ro@localhost:5432/dex_dogfood
+      DEX_TEST_CH_DSN: clickhouse://dex_ro:dex_ro@127.0.0.1:8124/app
+      DEX_TEST_TRINO_URL: http://dex_ro@127.0.0.1:8085
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Refuse an unhardened service container
@@ -485,25 +568,85 @@ jobs:
             -c "CREATE DATABASE dex_dogfood"
           PGPASSWORD=postgres psql -h localhost -U postgres -d dex_dogfood \
             -v ON_ERROR_STOP=1 -f scripts/postgres_seed.sql
-      - name: Start render-only Cube Core for DuckDB and Postgres
+      - name: Start render-only and executing Cube Core for DuckDB and Postgres
         working-directory: .
         run: |
           scripts/setup_cube_dev.sh --db duckdb
           scripts/setup_cube_dev.sh --db postgres
+          scripts/setup_cube_dev.sh --execute --db duckdb
+          scripts/setup_cube_dev.sh --execute --db postgres
+      # dex names every Trino relation with its catalog, so the Trino renderer
+      # serves a copy of the model with each table under the seeded `memory`
+      # catalog; the test makes the same copy.
+      - name: Start ClickHouse and Trino, and a render-only Cube Core for each
+        working-directory: .
+        run: |
+          scripts/setup_clickhouse_dev.sh
+          scripts/setup_trino_dev.sh
+          cp -r scripts/cube/model "$RUNNER_TEMP/cube-trino-model"
+          sed -i 's/sql_table: app\./sql_table: memory.app./' \
+            "$RUNNER_TEMP"/cube-trino-model/cubes/*.yml
+          scripts/setup_cube_dev.sh --db clickhouse
+          scripts/setup_cube_dev.sh --db trino --model "$RUNNER_TEMP/cube-trino-model"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           python-version: "3.14"
-      - name: Sync (postgres + duckdb + cube + semantic-api + dev extras)
+      - name: Sync (postgres + duckdb + clickhouse + trino + cube + semantic-api + dev extras)
         run: >-
-          uv sync --extra postgres --extra duckdb --extra cube
-          --extra semantic-api --extra dev
+          uv sync --extra postgres --extra duckdb --extra clickhouse --extra trino
+          --extra cube --extra semantic-api --extra dev
       # The secret and the URLs come from the file the setup script wrote, read
       # in the one step whose tests use them.
       - name: Live Cube integration suite
         run: |
           source ~/.cache/dex-dogfood/cube.env
           uv run pytest tests/integration -q -m cube
+
+  cube_cloud:
+    # A Cube Cloud deployment (#914) serving scripts/cube/model over an
+    # in-memory DuckDB it builds from scripts/cube/shop.sql, asked both ways:
+    # Cube Cloud executes (`--api`), and Cube Cloud renders for dex to execute
+    # (`--local`) on a DuckDB file built from the same statements. The protected
+    # environment carries the deployment's URL and its API secret; a one-hour
+    # token is minted from the secret in the one step whose tests use it.
+    if: github.repository == 'exmergo/dex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: cube-cloud-integration
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    env:
+      DEX_TEST_CUBE_CLOUD_URL: ${{ vars.DEX_TEST_CUBE_CLOUD_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Require the protected Cloud configuration
+        run: |
+          test -n "$DEX_TEST_CUBE_CLOUD_URL" || {
+            echo "::error::DEX_TEST_CUBE_CLOUD_URL is missing; run scripts/setup_cube_cloud_ci.sh"
+            exit 1
+          }
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Sync (duckdb + cube + semantic-api + dev extras)
+        run: uv sync --extra duckdb --extra cube --extra semantic-api --extra dev
+      - name: Narrow Cube Cloud integration suite
+        env:
+          CUBE_CLOUD_API_SECRET: ${{ secrets.CUBE_CLOUD_API_SECRET }}
+        run: |
+          # Without it the suite skips itself green; refuse instead.
+          if [ -z "$CUBE_CLOUD_API_SECRET" ]; then
+            echo "::error::CUBE_CLOUD_API_SECRET is missing from the cube-cloud-integration environment; re-run scripts/setup_cube_cloud_ci.sh"
+            exit 1
+          fi
+          CUBE_API_TOKEN="$(python3 ../../scripts/cube_cloud/mint_token.py)"
+          echo "::add-mask::$CUBE_API_TOKEN"
+          unset CUBE_CLOUD_API_SECRET
+          export CUBE_API_TOKEN
+          uv run pytest tests/integration/test_cube_cloud.py -q --tb=line -m cube_cloud
 
   clickhouse:
     # No repository gate and no environment: the target is a container this job

@@ -65,6 +65,8 @@ def semantic_list(
     from . import SemanticBackendError, SemanticQuery, resolve_backend
 
     backend = resolve_backend(engine, api=api, local=local)
+    # The local backend adds why a name may be unknown: a stale manifest.
+    stale_noted = getattr(backend, "with_stale_note", lambda message: message)
     if deployed:
         # Read off a capability rather than a vendor name: a layer with a
         # deployment it can read says so.
@@ -110,10 +112,12 @@ def semantic_list(
         groupable, unknown = catalog.metrics_for_dimensions(slicing)
         if unknown:
             raise SemanticBackendError(
-                f"no such dimension in this semantic layer: {', '.join(unknown)}. "
-                "List without --for-dimension to see what it exposes, and note "
-                "that a dimension reached through a join is only in the list when "
-                "the read resolved the join graph (see dimension_scope)"
+                stale_noted(
+                    f"no such dimension in this semantic layer: {', '.join(unknown)}. "
+                    "List without --for-dimension to see what it exposes, and note "
+                    "that a dimension reached through a join is only in the list "
+                    "when the read resolved the join graph (see dimension_scope)"
+                )
             )
         if wanted:
             # An explicit metric that cannot be grouped by the named dimensions is
@@ -152,8 +156,10 @@ def semantic_list(
         catalog, unknown = catalog.narrowed_to(wanted)
         if unknown:
             raise SemanticBackendError(
-                f"no such metric in this semantic layer: {', '.join(unknown)}. "
-                "List without --metric to see what it exposes"
+                stale_noted(
+                    f"no such metric in this semantic layer: {', '.join(unknown)}. "
+                    "List without --metric to see what it exposes"
+                )
             )
         catalog.scoped_to = wanted
         catalog.for_dimensions = slicing

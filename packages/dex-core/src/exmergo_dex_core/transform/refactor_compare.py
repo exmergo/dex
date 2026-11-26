@@ -46,6 +46,7 @@ from .expected_change import (
     lookup_relations,
     resolve_refs,
 )
+from .global_edits import COMPARE_GLOBAL_KINDS
 from .multiset_compare import (
     ReasonCode,
     RefactorCompareResult,
@@ -65,13 +66,6 @@ COMMAND = "transform compare"
 #: Edits that change a relation both sides read, which no inlining can undo: the
 #: dev relation still holds what the last build wrote.
 _UNSYNCHRONIZING_KINDS = frozenset({EditKind.SEED_CSV, EditKind.SNAPSHOT_SQL})
-
-#: Edits that can change how an untouched parent compiles. Its dev relation keeps
-#: what it was built with, so both graphs are compiled through their ancestors and
-#: any parent that compiles differently makes the inputs unsynchronized.
-_GLOBAL_KINDS = frozenset(
-    {EditKind.MACRO_SQL, EditKind.PROJECT_YML, EditKind.PACKAGES_YML}
-)
 
 _NONDETERMINISTIC_NODES: tuple[type[exp.Expression], ...] = (
     exp.Rand,
@@ -131,6 +125,8 @@ class _Side:
     #: Each upstream model read from the warehouse, by a digest of its compiled SQL.
     #: Filled only when the plan can change how an untouched parent compiles.
     parents: dict[str, str] = field(default_factory=dict)
+    #: The project path of every project seed and snapshot upstream of the model.
+    seeds: frozenset[str] = frozenset()
 
 
 def compare(
@@ -278,7 +274,9 @@ def _compare(
     project = repo_root / stored.project_dir
     config = engine.config
     target = target or config.dbt_target or "dev"
-    assert_dev_target(target, config.dbt_target)
+    assert_dev_target(
+        target, config.dbt_target, prod=getattr(config, "dbt_prod_target", None)
+    )
     connector = engine.connector or config.connector
     if not connector:
         raise ValueError(
@@ -308,15 +306,6 @@ def _compare(
             "plan_stale",
             "changed since planning: " + ", ".join(stale),
         )
-    unsynchronized = [
-        edit.path for edit in stored.edits if edit.kind in _UNSYNCHRONIZING_KINDS
-    ]
-    if unsynchronized:
-        return not_checked(
-            "inputs_unsynchronized",
-            "this plan changes a seed or a snapshot, and the dev relation still "
-            "holds what the last build wrote: " + ", ".join(unsynchronized),
-        )
     blocked = _blocked_parents(
         project, chosen, {Path(edit.path).stem for edit in _touched(stored)}
     )
@@ -338,7 +327,7 @@ def _compare(
             "baseline, and a repair added to this plan would leave the comparison "
             "nothing built to read.",
         )
-    through_ancestors = any(edit.kind in _GLOBAL_KINDS for edit in stored.edits)
+    through_ancestors = any(edit.kind in COMPARE_GLOBAL_KINDS for edit in stored.edits)
 
     effective = config.model_copy(update={"connector": connector})
     warnings.extend(
@@ -459,6 +448,23 @@ def _compare(
                 proposed = replace(proposed, parents=current)
     except _NotComparableError as exc:
         return not_checked(exc.code, exc.detail)
+    # Per model (#1429): a seed or snapshot the plan changes blocks only a
+    # proposal that reads it, since dev still holds its old rows. The baseline
+    # reading those old rows is what it should read.
+    unsynchronized = sorted(
+        edit.path
+        for edit in stored.edits
+        if edit.kind in _UNSYNCHRONIZING_KINDS
+        and Path(edit.path).as_posix() in proposed.seeds
+    )
+    if unsynchronized:
+        return not_checked(
+            "inputs_unsynchronized",
+            f"this plan changes {', '.join(unsynchronized)}, which {chosen} reads, "
+            "and the dev relation still holds what the last build wrote. Plan "
+            "the seed or snapshot change on its own, apply and build it, then "
+            "plan the model edits again and compare them",
+        )
     moved = sorted(
         name
         for name in baseline.parents.keys() & proposed.parents.keys()
@@ -611,7 +617,20 @@ def _compare(
         accepted_type_changes=accepted_type_changes,
         expectation=expectation,
     )
+    unbuilt = None
+    if verdict.status != "not_checked":
+        with contextlib.suppress(Exception):
+            unbuilt = baseline_never_built(
+                project,
+                chosen,
+                {Path(edit.path).stem for edit in _touched(stored)},
+                adapter,
+                verdict.multiset.left_rows if verdict.multiset else None,
+            )
+    if unbuilt is not None:
+        warnings.append(_unbuilt_warning(chosen, unbuilt))
     result = _result(identity, verdict, warnings, profiled)
+    result.baseline_never_built = unbuilt
     return command_args.stamp_spend(result, adapter)
 
 
@@ -896,6 +915,7 @@ def _compile_side(
         digest=hashlib.sha256(sql.encode("utf-8")).hexdigest()[:16],
         grain=[str(column) for column in grain] if isinstance(grain, list) else [],
         parents=_built_parents(manifest, node) if through_ancestors else {},
+        seeds=_upstream_seeds(manifest, node),
     )
 
 
@@ -1079,6 +1099,109 @@ def inputs_built_by(project: Path, model: str) -> dict[str, Any] | None:
     }
 
 
+def baseline_never_built(
+    project: Path,
+    model: str,
+    touched: set[str],
+    adapter: Any,
+    baseline_rows: int | None,
+) -> dict[str, Any] | None:
+    """Evidence that an input changed after the compared model's last build (#1387).
+
+    The baseline is the model's current SQL re-run on today's inputs. When an
+    input moved after the build that wrote the model's dev relation, that
+    baseline is a state no build wrote and nothing served, and a verdict against
+    it can blame the change for what the new inputs did. Two signals:
+
+    - ``rebuilt_after``: untouched upstream models a later run rebuilt, read
+      from the run results, free on every connector.
+    - ``row_count``: the built relation's row count against the baseline's, which
+      also sees a source reloaded outside dbt. Only where ``table_metadata``
+      counts exactly (an adapter offering ``table_columns``, DuckDB): an
+      estimate would differ with nothing changed.
+
+    Run results keep each node's latest attempt only, so a model the latest
+    runs did not attempt counts as built before all of them, and its
+    ``model_built_at`` is ``None``. ``None`` with no evidence, for a model the
+    manifest does not hold, and for one whose latest attempt failed. A view reads
+    today's inputs whenever it is read, so it is never judged.
+    """
+
+    upstream = _upstream(project, model)
+    if upstream is None:
+        return None
+    graph, seen, runs = upstream
+    nodes = graph["nodes"]
+    own = next(
+        (
+            uid
+            for uid, node in nodes.items()
+            if uid.startswith("model.") and model in graph["names"](node)
+        ),
+        None,
+    )
+    if own is None:
+        return None
+    node, run = nodes[own], runs.nodes.get(own)
+    if (node.get("config") or {}).get("materialized") in ("view", "ephemeral"):
+        return None
+    if run is not None and run.status != BUILT_STATUS:
+        return None
+    # A model the latest runs did not attempt was built before all of them.
+    built_at = (run.generated_at if run else None) or ""
+    rebuilt = sorted(
+        str(nodes[uid].get("name"))
+        for uid in seen
+        if uid in runs.nodes
+        and runs.nodes[uid].status == BUILT_STATUS
+        and (runs.nodes[uid].generated_at or "") > built_at
+        and not graph["names"](nodes[uid]) & touched
+        and ((nodes[uid].get("config") or {}).get("materialized") != "ephemeral")
+    )
+    evidence: dict[str, Any] = {}
+    if rebuilt:
+        evidence["rebuilt_after"] = rebuilt
+    relation = node.get("relation_name")
+    if (
+        baseline_rows is not None
+        and isinstance(relation, str)
+        and getattr(adapter, "table_columns", None) is not None
+    ):
+        from ..dbt_project import strip_relation_quoting
+
+        meta, _ = adapter.table_metadata(strip_relation_quoting(relation))
+        if meta.row_count is not None and meta.row_count != baseline_rows:
+            evidence["row_count"] = {
+                "last_build": meta.row_count,
+                "baseline": baseline_rows,
+            }
+    if not evidence:
+        return None
+    return {"model_built_at": run.generated_at if run else None, **evidence}
+
+
+def _unbuilt_warning(model: str, unbuilt: Mapping[str, Any]) -> str:
+    """The sentence that goes with ``baseline_never_built``."""
+
+    seen = []
+    if unbuilt.get("rebuilt_after"):
+        seen.append("rebuilt since: " + ", ".join(unbuilt["rebuilt_after"]))
+    if unbuilt.get("row_count"):
+        counts = unbuilt["row_count"]
+        seen.append(
+            f"the baseline returns {counts['baseline']} row(s) where the last "
+            f"build wrote {counts['last_build']}"
+        )
+    return (
+        f"an input of {model} changed after its last build "
+        f"({unbuilt.get('model_built_at') or 'before the latest run'}; "
+        f"{'; '.join(seen)}), so the verdict is "
+        "computed against a baseline that was never built or served: the current "
+        "SQL on today's inputs. Read a difference with that in mind before "
+        "calling it a defect of the change"
+    )
+
+
 def _built_parents(
     manifest: Mapping[str, Any], node: Mapping[str, Any]
 ) -> dict[str, str]:
@@ -1102,6 +1225,40 @@ def _built_parents(
             compiled.encode("utf-8")
         ).hexdigest()[:16]
     return found
+
+
+def _upstream_seeds(
+    manifest: Mapping[str, Any], node: Mapping[str, Any]
+) -> frozenset[str]:
+    """The file of every project seed and snapshot upstream of ``node``.
+
+    The walk goes through any node, a package's included, but only the project's
+    own seeds and snapshots are collected: a package records its paths relative
+    to the package, where they can match a project file they are not. A manifest
+    that names no project keeps every one, so a stale read is refused rather
+    than compared.
+    """
+
+    nodes = manifest.get("nodes", {})
+    project = (manifest.get("metadata") or {}).get("project_name")
+    found: set[str] = set()
+    pending = list((node.get("depends_on") or {}).get("nodes") or [])
+    seen: set[str] = set()
+    while pending:
+        unique_id = pending.pop()
+        if unique_id in seen or unique_id not in nodes:
+            continue
+        seen.add(unique_id)
+        parent = nodes[unique_id] or {}
+        pending.extend((parent.get("depends_on") or {}).get("nodes") or [])
+        path = parent.get("original_file_path")
+        if (
+            unique_id.startswith(("seed.", "snapshot."))
+            and (project is None or parent.get("package_name") == project)
+            and isinstance(path, str)
+        ):
+            found.add(Path(path).as_posix())
+    return frozenset(found)
 
 
 def _compile_detail(message: str) -> str:

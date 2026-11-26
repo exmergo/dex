@@ -124,6 +124,20 @@ that names nothing refuses and lists what exists. It is never written back to
 config. The per-connector vocabulary is in
 [`command-contract.md`](command-contract.md).
 
+## Production's catalog
+
+`<connector>.prod` names where the project's models build in production. It is
+not a source allowlist and is not narrowed or widened by `--scope`. Committing
+it authorizes one read only: the catalog metadata (row counts and bytes) of the
+relations Dex's generated tests read there, which a plan uses to price each
+test per production run. No row is read, and no statement runs over the data.
+That read is free on DuckDB, BigQuery (the table API), Snowflake (`SHOW`),
+Postgres, Redshift provisioned, ClickHouse and Trino. It bills on Redshift
+Serverless (a wake, with its 60-second minimum), and on Databricks a size needs
+a billed `DESCRIBE DETAIL`, so on both a plan reports the estimate as unknown
+rather than spend unasked. `dbt_prod_target`, the production dbt target, is
+refused by name by every guarded dbt call.
+
 ## Pricing an auto-profile
 
 `explore query` and `explore cluster` profile an object they name that the

@@ -83,7 +83,15 @@ the project edits, migrations and dev builds described below.
    which rows may be `added` and `removed` (`"none"`, `"any"`, or
    `{"where": "<predicate over output columns>"}`, which may test a column
    with `IN (SELECT <column> FROM ref('<model>') WHERE ...)`), the
-   `changed_columns` a kept key may change, and that the key holds.
+   `changed_columns` a kept key may change, and `"key": "unchanged"` (or
+   `"any"` when the key may stop being unique). The same object can come from
+   a file with `--expect-file <f>`; a complete one:
+
+   ```json
+   {"added": {"where": "region = 'emea'"}, "removed": "none",
+    "changed_columns": ["amount"], "key": "unchanged"}
+   ```
+
    `as_expected` is the verdict to relay; `unexpected` is a defect, as
    `different` is: its `findings` and `unexpected_keys` name the rows the
    change reached beyond its statement.
@@ -153,7 +161,14 @@ the project edits, migrations and dev builds described below.
    re-drive the model from the child table. A change of driving relation or
    parent is `redriven` in `data.change_scope`, settled only at `request` or
    `contract` tier.
-6. **Maintain.** `dex maintain verify` checks the project as it stands;
+6. **Maintain.** When a test fails or a model is wrong, run
+   `dex maintain incidents` first, then `dex maintain diagnose` for an open
+   incident's cause and `dex maintain verify` on the models whose tests they
+   name. Where its `data.sources` reports Elementary `missing` or `refused`,
+   the run history was not read, which is not a clean history: the source's
+   `reason_code` says why, and for a project without the package
+   `data.next_steps` names the install `dex init` offers, which starts it.
+   `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
 

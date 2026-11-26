@@ -10,7 +10,7 @@ connection.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any, NamedTuple
 
 
@@ -97,17 +97,52 @@ def incremental_unit_tests(manifest: dict, node: dict) -> list[IncrementalUnitTe
     return sorted(found, key=lambda test: test.name)
 
 
+def unit_test_overrides(manifest: dict, node: dict) -> dict[str, str]:
+    """What each unit test on this model overrides, keyed by its run name.
+
+    A mutant is the model compiled once, with the project's own vars, env vars
+    and macros, so a unit test's ``overrides`` cannot reach it and the test can
+    fail against an unmutated model that passes it in a build (#1396). The
+    value names the overridden keys, e.g. ``"vars gta_6_year, gta_v_year"``.
+    ``is_incremental`` is left out: the incremental branch is planted apart.
+    """
+
+    found: dict[str, str] = {}
+    for unit in (manifest.get("unit_tests") or {}).values():
+        if not covers(unit, node) or not unit.get("name"):
+            continue
+        parts = []
+        for kind, values in sorted((unit.get("overrides") or {}).items()):
+            keys = sorted(
+                str(key)
+                for key in (values if isinstance(values, dict) else {})
+                if not (kind == "macros" and key == "is_incremental")
+            )
+            if keys:
+                parts.append(f"{kind} {', '.join(keys)}")
+        if parts:
+            version = unit.get("version")
+            name = unit["name"] if version is None else f"{unit['name']}_v{version}"
+            found[name] = "; ".join(parts)
+    return found
+
+
 def runs_full_build(
-    manifest: dict, node: dict, incremental: Sequence[IncrementalUnitTest]
+    manifest: dict,
+    node: dict,
+    incremental: Sequence[IncrementalUnitTest],
+    *,
+    left_out: Collection[str] = (),
 ) -> bool:
     """Whether any test of the model's own runs its full build.
 
     Compared by unique id, which is what tells one version's unit test from
     another's: a unit test that tests another version of the model, or one that
-    runs the incremental branch, does not count.
+    runs the incremental branch, does not count. Nor does a test in
+    ``left_out``, the unique ids a run keeps out of every invocation (#1307).
     """
 
-    branch = {test.unique_id for test in incremental}
+    branch = {test.unique_id for test in incremental} | set(left_out)
     units = manifest.get("unit_tests") or {}
     return any(
         unique_id not in branch

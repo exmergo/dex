@@ -1,0 +1,959 @@
+"""The generated-test parity harness on DuckDB, in the offline suite (#1450).
+
+Each row of :data:`generated_parity.ROWS` builds a violating and a clean
+fixture model through the CLI and holds the generated test's verdict to
+``maintain verify``'s. The same runner carries Postgres and the billed dialects
+in ``integration.yml`` (#1451). The planted macros show the harness is not
+vacuous: a ``duckdb__`` override that passes a duplicated key fails it, and a
+broken override for another dialect leaves DuckDB's answer alone, since dbt's
+dispatch picks one implementation per adapter.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from transform.generated_parity import (
+    CONTINUITY_BY,
+    CONTINUITY_DAY,
+    CONTINUITY_HOUR,
+    CONTINUITY_MONTH,
+    CONTINUITY_WEEK,
+    FRESHNESS_AT_LIMIT,
+    FRESHNESS_EMPTY,
+    FRESHNESS_STALE,
+    JOIN_COVERAGE_FILTERED,
+    JOIN_COVERAGE_INNER,
+    JOIN_COVERAGE_LEFT,
+    JOIN_COVERAGE_NO_MATCH,
+    PARENT_MISSING,
+    PARENT_MISSING_FILTERED,
+    PARENT_MISSING_UNAPPLIED,
+    PARENT_UNEXPECTED,
+    POPULATION_EXCLUDES,
+    POPULATION_INCLUDES,
+    POPULATION_INCLUDES_NULL,
+    REFERENCED_KEY,
+    RELATIONSHIPS_LEFT_JOIN,
+    ROWS,
+    TEMPORAL_LATEST,
+    TEMPORAL_TRANSITIONS,
+    UNIQUE_COMBINATION,
+    UNIT_FRACTION,
+    UNIT_PERCENT,
+    run_parity,
+)
+
+from exmergo_dex_core import generated_tests as gt
+from exmergo_dex_core.cli import main
+
+pytest.importorskip("dbt.cli.main")
+pytest.importorskip("dbt.adapters.duckdb")
+
+
+@pytest.fixture
+def repo(dbt_project_dir: Path, tmp_path: Path) -> Path:
+    # Only the fixture models: the project's own staging model reads nothing
+    # this dev database has, and is never selected.
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex" / "config.yml").write_text(
+        f"connector: duckdb\nduckdb:\n  path: {tmp_path / 'dev.duckdb'}\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _runner(capsys):
+    def run(argv: list[str]) -> tuple[int, dict]:
+        rc = main(argv)
+        return rc, json.loads(capsys.readouterr().out)
+
+    return run
+
+
+def _planted(
+    adapter: str,
+    sql: str,
+    test: str = "dex_unique_combination",
+    signature: str = "model, columns",
+) -> dict:
+    """A per-dialect implementation of the test, as a project would override it."""
+
+    return {
+        "path": f"macros/{adapter}__{test}.sql",
+        "kind": "macro_sql",
+        "content": (
+            f"{{% macro {adapter}__{test}({signature}) %}}\n{sql}\n{{% endmacro %}}\n"
+        ),
+    }
+
+
+#: Only the composite-grain row, for the checks that plant its macro.
+GRAIN_ONLY = (UNIQUE_COMBINATION,)
+
+
+#: Passes on any model: no row, whatever the grain holds.
+PASSES_ANYWAY = "select 1 as dex_duplicate_rows where 1 = 0"
+#: Not SQL any warehouse runs.
+BROKEN = "this is not sql"
+
+
+def test_every_row_agrees_with_maintain_verify_on_duckdb(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(_runner(capsys), repo, dbt_project_dir, connector="duckdb")
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in ROWS if row.withheld is None]
+    assert report.unsupported == []
+    assert report.withheld == [UNIT_PERCENT.label, JOIN_COVERAGE_LEFT.label]
+
+
+def test_the_plan_writes_the_shipped_macro_beside_the_rendered_test(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(_runner(capsys), repo, dbt_project_dir, connector="duckdb")
+
+    paths = report.envelopes["plan"]["data"]["paths"]
+    assert "macros/dex_unique_combination.sql" in paths
+    written = (dbt_project_dir / "macros" / "dex_unique_combination.sql").read_text()
+    assert "{% test dex_unique_combination(model, columns) %}" in written
+    # Counts only: the test selects the duplicate count, never a key column.
+    assert "select dex_duplicate_rows" in written
+
+
+def test_a_macro_that_passes_a_duplicated_key_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=GRAIN_ONLY,
+        extra_edits=[_planted("duckdb", PASSES_ANYWAY)],
+    )
+
+    violating = UNIQUE_COMBINATION.model("violating")
+    assert report.disagreements == [
+        f"dex_unique_combination on {violating}: the test should fail on the "
+        "violating fixture, dbt says 'pass'"
+    ]
+
+
+def test_a_broken_macro_for_another_dialect_leaves_duckdb_agreeing(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # #1451: one dialect's macro is that dialect's job's to catch, no other's.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=GRAIN_ONLY,
+        extra_edits=[_planted("bigquery", BROKEN), _planted("snowflake", BROKEN)],
+    )
+
+    assert report.disagreements == [], report.disagreements
+
+
+def test_a_dialect_the_test_does_not_support_renders_nothing_and_says_so(
+    repo: Path, dbt_project_dir: Path, capsys, monkeypatch: pytest.MonkeyPatch
+):
+    # #1451: a kind that does not list the connector renders no test there,
+    # and maintain verify alone still answers.
+    shipped = next(k for k in gt.kinds() if k.name == gt.UNIQUE_COMBINATION)
+    narrowed = gt.GeneratedTestKind(
+        shipped.name,
+        shipped.cadence,
+        shipped.instances,
+        macro=shipped.macro,
+        dialects=frozenset({"postgres"}),
+    )
+    gt.unregister(shipped.name)
+    gt.register(narrowed)
+    try:
+        report = run_parity(
+            _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=GRAIN_ONLY
+        )
+    finally:
+        gt.unregister(shipped.name)
+        gt.register(shipped)
+
+    assert report.disagreements == [], report.disagreements
+    assert report.unsupported == [gt.UNIQUE_COMBINATION]
+    planned = report.envelopes["plan"]["data"]
+    assert planned["generated_tests"]["counts"] == {"not_rendered": 2}
+    assert "macros/dex_unique_combination.sql" not in planned["paths"]
+
+
+#: Counts duplicate groups rather than the rows beyond the first of each.
+COUNTS_GROUPS = (
+    "select count(*) as dex_duplicate_rows from (\n"
+    "  select 1 as g from {{ model }} group by {{ columns | join(', ') }}\n"
+    "  having count(*) > 1\n"
+    ") as dex_groups having count(*) > 0"
+)
+
+
+def test_a_macro_that_counts_groups_not_rows_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # It fails the violating fixture as it should, but says 2 where
+    # maintain verify counts 3: the verdicts agree, the numbers do not.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=GRAIN_ONLY,
+        extra_edits=[_planted("duckdb", COUNTS_GROUPS)],
+    )
+
+    violating = UNIQUE_COMBINATION.model("violating")
+    assert report.disagreements == [
+        f"dex_unique_combination on {violating}: dbt counts 2 failure(s), "
+        "maintain verify counts 3"
+    ]
+
+
+# --- dex_population_filter (#1453) -------------------------------------------------
+
+POPULATION_SIGNATURE = "model, column_name, includes, excludes"
+
+#: Treats a NULL as inside an ``includes`` list, which maintain verify does not.
+NULL_IS_INSIDE = (
+    "select count(*) as dex_violating_rows from {{ model }}\n"
+    "where {{ column_name }} not in ("
+    "{% for v in (excludes or includes) %}'{{ v }}'{% if not loop.last %}, "
+    "{% endif %}{% endfor %})\n"
+    "having count(*) > 0"
+)
+
+
+def test_the_plan_writes_the_population_filter_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(POPULATION_EXCLUDES,),
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert (
+        "macros/dex_population_filter.sql" in report.envelopes["plan"]["data"]["paths"]
+    )
+    written = (dbt_project_dir / "macros" / "dex_population_filter.sql").read_text()
+    # Counts only: the test selects the violating count, never the column.
+    assert "select dex_violating_rows" in written
+
+
+def test_a_macro_that_lets_a_null_into_an_includes_list_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # Agrees on a value outside the list; disagrees on the NULL alone.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(POPULATION_INCLUDES, POPULATION_INCLUDES_NULL),
+        extra_edits=[
+            _planted(
+                "duckdb", NULL_IS_INSIDE, gt.POPULATION_FILTER, POPULATION_SIGNATURE
+            )
+        ],
+    )
+
+    violating = POPULATION_INCLUDES_NULL.model("violating")
+    assert report.agreed == [POPULATION_INCLUDES.label]
+    assert report.disagreements == [
+        f"{POPULATION_INCLUDES_NULL.label} on {violating}: the test should fail on "
+        "the violating fixture, dbt says 'pass'"
+    ]
+
+
+def test_a_refused_clean_probe_is_not_read_as_measured():
+    # The violating fixture's filter was measured, so the population class is
+    # not suppressed; the clean fixture's statement was refused, which only a
+    # per-model warning says. An absent finding there is no verdict.
+    clean = POPULATION_EXCLUDES.model("clean")
+    measured = POPULATION_EXCLUDES.measured
+    assert measured is not None
+    verify = {
+        "suppressed": {},
+        "_warnings": [
+            f"the declared facts on {clean} could not be measured: the warehouse "
+            "refused the statement (Timeout)"
+        ],
+    }
+    assert measured(verify, clean) is False
+    assert measured(verify, POPULATION_EXCLUDES.model("violating")) is True
+    assert measured({"suppressed": {"population": "x"}}, clean) is False
+
+
+# --- dex_parent_population (#1454) -------------------------------------------------
+
+PARENT_ROWS = (
+    PARENT_MISSING,
+    PARENT_UNEXPECTED,
+    PARENT_MISSING_FILTERED,
+    PARENT_MISSING_UNAPPLIED,
+)
+PARENT_SIGNATURE = "model, parent, key, direction, filters"
+
+#: Counts the model's rows the parent lacks, not its distinct keys: a key the
+#: model holds twice is counted twice, where maintain verify counts it once.
+COUNTS_ROWS = (
+    "{% set k = (key.keys() | list)[0] %}{% set pk = (key.values() | list)[0] %}\n"
+    "select count(*) as dex_violating_keys from {{ model }} m\n"
+    "where m.{{ k }} is not null and m.{{ k }} not in "
+    "(select {{ pk }} from {{ parent }} where {{ pk }} is not null)\n"
+    "{% if direction == 'missing' %}and 1 = 0{% endif %}\n"
+    "having count(*) > 0"
+)
+
+#: Ignores the declaration's filters: every parent key is owed.
+IGNORES_FILTERS = (
+    "{% set k = (key.keys() | list)[0] %}{% set pk = (key.values() | list)[0] %}\n"
+    "select count(*) as dex_violating_keys from (select distinct {{ pk }} as k "
+    "from {{ parent }} where {{ pk }} is not null) p\n"
+    "where p.k not in (select {{ k }} from {{ model }} where {{ k }} is not null)\n"
+    "{% if direction == 'unexpected' %}and 1 = 0{% endif %}\n"
+    "having count(*) > 0"
+)
+
+
+def test_the_parent_rows_agree_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=PARENT_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in PARENT_ROWS]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_parent_population.sql" in plan["paths"]
+    mine = [
+        t for t in plan["generated_tests"]["tests"] if t["test"] == gt.PARENT_POPULATION
+    ]
+    # Two directions on each of eight declared fixtures.
+    assert len(mine) == 16
+    assert {t["cadence"] for t in mine} == {gt.SCHEDULED}
+    written = (dbt_project_dir / "macros" / "dex_parent_population.sql").read_text()
+    # Counts only: the test selects the violating count, never a key.
+    assert "select dex_violating_keys" in written
+
+
+def test_a_macro_that_counts_rows_not_keys_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(PARENT_UNEXPECTED,),
+        extra_edits=[
+            _planted("duckdb", COUNTS_ROWS, gt.PARENT_POPULATION, PARENT_SIGNATURE)
+        ],
+    )
+
+    violating = PARENT_UNEXPECTED.model("violating")
+    assert report.disagreements == [
+        f"{PARENT_UNEXPECTED.label} on {violating}: dbt counts 3 failure(s), "
+        "maintain verify counts 2"
+    ]
+
+
+def test_a_macro_that_ignores_the_filters_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    # Without the filter the churned parent is owed, so the clean fixture,
+    # which leaves it out as the declaration says, fails.
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(PARENT_MISSING, PARENT_MISSING_FILTERED),
+        extra_edits=[
+            _planted("duckdb", IGNORES_FILTERS, gt.PARENT_POPULATION, PARENT_SIGNATURE)
+        ],
+    )
+
+    clean = PARENT_MISSING_FILTERED.model("clean")
+    assert report.agreed == [PARENT_MISSING.label]
+    assert (
+        f"{PARENT_MISSING_FILTERED.label} on {clean}: the test should pass on the "
+        "clean fixture, dbt says 'fail'"
+    ) in report.disagreements
+
+
+def test_a_left_join_read_as_optional_despite_its_references_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys, monkeypatch: pytest.MonkeyPatch
+):
+    """#1459: the reading before the fix, a `references` with no
+    `foreign_key` role leaving the LEFT join optional, is a disagreement the
+    harness names: dbt's `relationships` fails and verify raises nothing."""
+
+    import dataclasses
+
+    from exmergo_dex_core.maintain import verify as verify_mod
+
+    real = verify_mod.join_policy
+
+    def optional(candidate, ctx):
+        policy = real(candidate, ctx)
+        if policy.required_by and "declares references" in policy.required_by:
+            return dataclasses.replace(policy, required_by=None)
+        return policy
+
+    monkeypatch.setattr(verify_mod, "join_policy", optional)
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(RELATIONSHIPS_LEFT_JOIN,),
+    )
+
+    violating = RELATIONSHIPS_LEFT_JOIN.model("violating")
+    assert report.agreed == []
+    assert report.disagreements == [
+        f"{RELATIONSHIPS_LEFT_JOIN.label} on {violating}: maintain verify raised "
+        f"none of {sorted(RELATIONSHIPS_LEFT_JOIN.codes)} on the violating fixture"
+    ]
+
+
+# --- dex_unit_range (#1455) ----------------------------------------------------------
+
+UNIT_ROWS = (UNIT_FRACTION, UNIT_PERCENT)
+
+#: Checks only the upper bound: a negative share passes.
+ONLY_ABOVE_ONE = (
+    "select count(*) as dex_violating_rows from {{ model }} "
+    "where {{ column_name }} > 1 having count(*) > 0"
+)
+
+
+def test_the_unit_rows_agree_and_a_percent_renders_nothing(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=UNIT_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [UNIT_FRACTION.label]
+    assert report.withheld == [UNIT_PERCENT.label]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_unit_range.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["status"], t.get("reason"))
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.UNIT_RANGE
+    )
+    assert rows == sorted(
+        [
+            (UNIT_FRACTION.model("violating"), "added", None),
+            (UNIT_FRACTION.model("clean"), "added", None),
+            (UNIT_PERCENT.model("violating"), "not_rendered", gt.HEURISTIC_ONLY),
+            (UNIT_PERCENT.model("clean"), "not_rendered", gt.HEURISTIC_ONLY),
+        ]
+    )
+    written = (dbt_project_dir / "macros" / "dex_unit_range.sql").read_text()
+    assert "select dex_violating_rows" in written
+
+
+def test_a_macro_missing_the_lower_bound_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(UNIT_FRACTION,),
+        extra_edits=[
+            _planted("duckdb", ONLY_ABOVE_ONE, gt.UNIT_RANGE, "model, column_name")
+        ],
+    )
+
+    violating = UNIT_FRACTION.model("violating")
+    assert report.disagreements == [
+        f"{UNIT_FRACTION.label} on {violating}: dbt counts 1 failure(s), "
+        "maintain verify counts 2"
+    ]
+
+
+# --- dex_join_coverage (#1456) -------------------------------------------------------
+
+JOIN_ROWS = (
+    JOIN_COVERAGE_INNER,
+    JOIN_COVERAGE_NO_MATCH,
+    JOIN_COVERAGE_FILTERED,
+    JOIN_COVERAGE_LEFT,
+)
+JOIN_SIGNATURE = (
+    "model, child, child_columns, parent, parent_columns, child_where, "
+    "parent_where, null_keys"
+)
+
+#: Reads the model's output, as `relationships` does: an INNER join has already
+#: dropped the unmatched rows there, so it passes the violating fixture.
+READS_THE_OUTPUT = (
+    "select count(*) as dex_unmatched_rows from {{ model }} m "
+    "where m.{{ child_columns[0] }} is not null and m.{{ child_columns[0] }} "
+    "not in (select {{ parent_columns[0] }} from {{ parent }} "
+    "where {{ parent_columns[0] }} is not null) having count(*) > 0"
+)
+#: Reads the driving input whole, ignoring the filter the model applies to it.
+IGNORES_THE_FILTER = (
+    "select count(*) as dex_unmatched_rows from {{ child }} c "
+    "where c.{{ child_columns[0] }} is not null and c.{{ child_columns[0] }} "
+    "not in (select {{ parent_columns[0] }} from {{ parent }} "
+    "where {{ parent_columns[0] }} is not null) having count(*) > 0"
+)
+
+
+def test_the_join_rows_agree_and_a_left_join_renders_nothing(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=JOIN_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [
+        JOIN_COVERAGE_INNER.label,
+        JOIN_COVERAGE_NO_MATCH.label,
+        JOIN_COVERAGE_FILTERED.label,
+    ]
+    assert report.withheld == [JOIN_COVERAGE_LEFT.label]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_join_coverage.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["status"], t.get("reason"))
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.JOIN_COVERAGE
+    )
+    assert rows == sorted(
+        [
+            *(
+                (row.model(side), "added", None)
+                for row in JOIN_ROWS[:3]
+                for side in ("violating", "clean")
+            ),
+            (
+                JOIN_COVERAGE_LEFT.model("violating"),
+                "not_rendered",
+                "covered_by_builtin",
+            ),
+            (JOIN_COVERAGE_LEFT.model("clean"), "not_rendered", "covered_by_builtin"),
+        ]
+    )
+    written = (dbt_project_dir / "macros" / "dex_join_coverage.sql").read_text()
+    assert "select dex_unmatched_rows" in written
+
+
+def test_a_macro_reading_the_output_misses_the_inner_join_and_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(JOIN_COVERAGE_INNER,),
+        extra_edits=[
+            _planted("duckdb", READS_THE_OUTPUT, gt.JOIN_COVERAGE, JOIN_SIGNATURE)
+        ],
+    )
+
+    violating = JOIN_COVERAGE_INNER.model("violating")
+    assert report.disagreements == [
+        f"{JOIN_COVERAGE_INNER.label} on {violating}: the test should fail on the "
+        "violating fixture, dbt says 'pass'"
+    ]
+
+
+def test_a_macro_ignoring_the_filter_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(JOIN_COVERAGE_FILTERED,),
+        extra_edits=[
+            _planted("duckdb", IGNORES_THE_FILTER, gt.JOIN_COVERAGE, JOIN_SIGNATURE)
+        ],
+    )
+
+    label = JOIN_COVERAGE_FILTERED.label
+    violating = JOIN_COVERAGE_FILTERED.model("violating")
+    clean = JOIN_COVERAGE_FILTERED.model("clean")
+    assert report.disagreements == [
+        f"{label} on {violating}: dbt counts 2 failure(s), maintain verify counts 1",
+        f"{label} on {clean}: the test should pass on the clean fixture, dbt "
+        "says 'fail'",
+    ]
+
+
+# --- dex_referenced_key (#1457) -----------------------------------------------------
+
+#: A ``duckdb__dex_referenced_key`` that counts repeated NULLs as a repeated key:
+#: dbt's own ``unique`` ignores them, and a NULL never matches a join.
+COUNTS_NULL_KEYS = """
+select dex_duplicate_rows from (
+    select sum(dex_rows) - count(*) as dex_duplicate_rows
+    from (
+        select count(*) as dex_rows from {{ model }}
+        group by {{ column_name }} having count(*) > 1
+    ) as dex_groups
+) as dex_violations where dex_duplicate_rows > 0
+"""
+
+
+def test_the_referenced_key_row_agrees_and_renders_on_the_parent(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(REFERENCED_KEY,),
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [REFERENCED_KEY.label]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_referenced_key.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["column"], t["status"], tuple(t["referenced_by"]))
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.REFERENCED_KEY
+    )
+    assert rows == [
+        (
+            REFERENCED_KEY.model(side),
+            "customer_id",
+            "added",
+            (f"{REFERENCED_KEY.model('child_' + side)}.customer_id",),
+        )
+        for side in ("clean", "violating")
+    ]
+    written = (dbt_project_dir / "macros" / "dex_referenced_key.sql").read_text()
+    assert "select dex_duplicate_rows" in written
+
+
+def test_a_macro_counting_null_keys_fails_the_harness_on_the_clean_parent(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(REFERENCED_KEY,),
+        extra_edits=[
+            _planted(
+                "duckdb", COUNTS_NULL_KEYS, gt.REFERENCED_KEY, "model, column_name"
+            )
+        ],
+    )
+
+    clean = REFERENCED_KEY.model("clean")
+    assert report.disagreements == [
+        f"{REFERENCED_KEY.label} on {clean}: the test should pass on the clean "
+        "fixture, dbt says 'fail'"
+    ]
+
+
+#: The temporal rows (#1458): their own snapshot, models and tests.
+TEMPORAL_ROWS = (TEMPORAL_TRANSITIONS, TEMPORAL_LATEST)
+
+#: The temporal test's whole signature, for a planted override.
+TEMPORAL_SIGNATURE = (
+    "model, snapshot, entity, status_column, target, measure, measure_column, "
+    "order_column, time_column, initial_observation, null_status, provenance"
+)
+
+#: Fails every model by one entity: a flag, not a count of entities.
+ONE_MISMATCH = "select 1 as dex_mismatched_entities"
+
+
+def test_the_temporal_rows_agree_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=TEMPORAL_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in TEMPORAL_ROWS]
+    assert report.snapshots == sorted(row.model("snap") for row in TEMPORAL_ROWS)
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_temporal_contract.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["variant"], t["status"])
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.TEMPORAL_CONTRACT
+    )
+    assert rows == sorted(
+        (row.model(side), measure, "added")
+        for row, measure in (
+            (TEMPORAL_TRANSITIONS, "transition_count"),
+            (TEMPORAL_LATEST, "latest_target_transition_at"),
+        )
+        for side in ("violating", "clean")
+    )
+
+
+def test_a_temporal_macro_returning_a_flag_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(TEMPORAL_TRANSITIONS,),
+        extra_edits=[
+            _planted("duckdb", ONE_MISMATCH, gt.TEMPORAL_CONTRACT, TEMPORAL_SIGNATURE)
+        ],
+    )
+
+    violating = TEMPORAL_TRANSITIONS.model("violating")
+    clean = TEMPORAL_TRANSITIONS.model("clean")
+    assert report.disagreements == [
+        f"{TEMPORAL_TRANSITIONS.label} on {violating}: dbt counts 1 failure(s), "
+        "maintain verify counts 2",
+        f"{TEMPORAL_TRANSITIONS.label} on {clean}: the test should pass on the "
+        "clean fixture, dbt says 'fail'",
+    ]
+
+
+# --- dex_freshness (#1460) -------------------------------------------------------
+
+FRESHNESS_ROWS = (FRESHNESS_STALE, FRESHNESS_AT_LIMIT, FRESHNESS_EMPTY)
+
+#: No rows read as fresh: an empty model passes.
+EMPTY_IS_FRESH = """select 1 as dex_violating_rows
+from (
+    select cast(floor(epoch(current_timestamp)) as bigint)
+        - cast(floor(epoch(max({{ column_name }}))) as bigint) as dex_lag
+    from {{ model }}
+) as dex_newest
+where dex_lag > {{ max_lag_seconds }}"""
+
+#: The limit read as exclusive: a value exactly at it fails.
+LIMIT_EXCLUSIVE = """select 1 as dex_violating_rows
+from (
+    select count({{ column_name }}) as dex_values,
+        cast(floor(epoch(current_timestamp)) as bigint)
+        - cast(floor(epoch(max({{ column_name }}))) as bigint) as dex_lag
+    from {{ model }}
+) as dex_newest
+where dex_values = 0 or dex_lag >= {{ max_lag_seconds }}"""
+
+FRESHNESS_SIGNATURE = "model, column_name, max_lag_seconds"
+
+
+def test_the_freshness_rows_agree_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys), repo, dbt_project_dir, connector="duckdb", rows=FRESHNESS_ROWS
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in FRESHNESS_ROWS]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_freshness.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["variant"], t["status"])
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.FRESHNESS
+    )
+    assert rows == sorted(
+        (row.model(side), "capture", "added")
+        for row in FRESHNESS_ROWS
+        for side in ("violating", "clean")
+    )
+
+
+def test_a_freshness_macro_reading_an_empty_model_as_fresh_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(FRESHNESS_EMPTY,),
+        extra_edits=[
+            _planted("duckdb", EMPTY_IS_FRESH, gt.FRESHNESS, FRESHNESS_SIGNATURE)
+        ],
+    )
+
+    violating = FRESHNESS_EMPTY.model("violating")
+    assert report.disagreements == [
+        f"{FRESHNESS_EMPTY.label} on {violating}: the test should fail on the "
+        "violating fixture, dbt says 'pass'"
+    ]
+
+
+def test_a_freshness_macro_reading_the_limit_as_exclusive_fails_the_harness(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(FRESHNESS_AT_LIMIT,),
+        extra_edits=[
+            _planted("duckdb", LIMIT_EXCLUSIVE, gt.FRESHNESS, FRESHNESS_SIGNATURE)
+        ],
+    )
+
+    clean = FRESHNESS_AT_LIMIT.model("clean")
+    assert report.disagreements == [
+        f"{FRESHNESS_AT_LIMIT.label} on {clean}: the test should pass on the "
+        "clean fixture, dbt says 'fail'"
+    ]
+
+
+# --- dex_continuity (#1461): no maintain verify twin, dbt's count is the verdict --
+
+CONTINUITY_ROWS = (
+    CONTINUITY_DAY,
+    CONTINUITY_BY,
+    CONTINUITY_WEEK,
+    CONTINUITY_MONTH,
+    CONTINUITY_HOUR,
+)
+
+#: The day's buckets as DuckDB numbers them, for a planted macro.
+_DAYS = """select distinct
+            cast(floor(epoch(cast({{ column_name }} as timestamp)) / 86400) as bigint)
+                as dex_bucket
+        from {{ model }}
+        where {{ column_name }} is not null"""
+
+#: Counts the empty buckets, not the runs of them.
+COUNTS_BUCKETS = f"""select dex_gaps
+from (
+    select coalesce(sum(dex_bucket - dex_previous - 1), 0) as dex_gaps
+    from (
+        select dex_bucket, lag(dex_bucket) over (order by dex_bucket) as dex_previous
+        from ({_DAYS}) as dex_buckets
+    ) as dex_steps
+    where dex_bucket - dex_previous > 1
+) as dex_continuity
+where dex_gaps > 0"""  # noqa: S608 - a fixture macro
+
+#: Reads the bucket before the data's first as empty: an edge counted as a gap.
+COUNTS_THE_EDGE = f"""select dex_gaps
+from (
+    select count(*) as dex_gaps
+    from (
+        select dex_bucket,
+            coalesce(lag(dex_bucket) over (order by dex_bucket), dex_bucket - 2)
+                as dex_previous
+        from ({_DAYS}) as dex_buckets
+    ) as dex_steps
+    where dex_bucket - dex_previous > 1
+) as dex_continuity
+where dex_gaps > 0"""  # noqa: S608 - a fixture macro
+
+CONTINUITY_SIGNATURE = "model, column_name, grain, by"
+
+
+def test_the_continuity_rows_hold_and_the_plan_writes_their_macro(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=CONTINUITY_ROWS,
+    )
+
+    assert report.disagreements == [], report.disagreements
+    assert report.agreed == [row.label for row in CONTINUITY_ROWS]
+    plan = report.envelopes["plan"]["data"]
+    assert "macros/dex_continuity.sql" in plan["paths"]
+    rows = sorted(
+        (t["model"], t["variant"], t["cadence"], t["status"])
+        for t in plan["generated_tests"]["tests"]
+        if t["test"] == gt.CONTINUITY
+    )
+    assert rows == sorted(
+        (
+            row.model(side),
+            row.declaration["columns"][next(iter(row.declaration["columns"]))][
+                "continuity"
+            ]["grain"],
+            gt.SCHEDULED,
+            "added",
+        )
+        for row in CONTINUITY_ROWS
+        for side in ("violating", "clean")
+    )
+
+
+def test_a_continuity_macro_counting_empty_buckets_fails_on_the_count(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(CONTINUITY_DAY,),
+        extra_edits=[
+            _planted("duckdb", COUNTS_BUCKETS, gt.CONTINUITY, CONTINUITY_SIGNATURE)
+        ],
+    )
+
+    violating = CONTINUITY_DAY.model("violating")
+    assert report.disagreements == [
+        f"{CONTINUITY_DAY.label} on {violating}: the test should fail on the "
+        "violating fixture with 2 failure(s), dbt says 'fail' with 3"
+    ]
+
+
+def test_a_continuity_macro_counting_an_edge_fails_on_the_clean_fixture(
+    repo: Path, dbt_project_dir: Path, capsys
+):
+    report = run_parity(
+        _runner(capsys),
+        repo,
+        dbt_project_dir,
+        connector="duckdb",
+        rows=(CONTINUITY_DAY,),
+        extra_edits=[
+            _planted("duckdb", COUNTS_THE_EDGE, gt.CONTINUITY, CONTINUITY_SIGNATURE)
+        ],
+    )
+
+    clean = CONTINUITY_DAY.model("clean")
+    violating = CONTINUITY_DAY.model("violating")
+    assert report.disagreements == [
+        f"{CONTINUITY_DAY.label} on {violating}: the test should fail on the "
+        "violating fixture with 2 failure(s), dbt says 'fail' with 3",
+        f"{CONTINUITY_DAY.label} on {clean}: the test should pass on the clean "
+        "fixture, dbt says 'fail'",
+    ]

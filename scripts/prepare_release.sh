@@ -43,6 +43,8 @@
 # packages/dex-core/tests/test_plugin_manifests.py fails the release gate on it. The
 # plugin version is semver, distinct from the engine's PEP 440 string, so it is set
 # explicitly rather than copied (0.1.0a1 is valid PEP 440 but not valid semver).
+# A leading v is dropped from either version; a plugin version that is still not
+# semver is refused before anything is written.
 #
 # Towncrier renders the notes, fetched by uvx at the version packages/dex-core/uv.lock
 # pins (scripts/uvx_locked.py reads it, so the release runs the towncrier CI and
@@ -55,6 +57,17 @@ shopt -s nullglob
 ENGINE_VERSION="${1:?usage: prepare_release.sh <engine-version> [plugin-semver]}"
 ENGINE_VERSION="${ENGINE_VERSION#v}"
 PLUGIN_VERSION="${2:-}"
+# A tag is spelled with a v and a manifest is not, so a leading v is dropped from
+# the plugin version as from the engine's. Anything else that is not semver 2.0 is
+# refused here, before a file is touched: the manifests take the string as given.
+# scripts/check_release_versions.py holds the same rule in CI.
+PLUGIN_VERSION="${PLUGIN_VERSION#v}"
+SEMVER_ID='(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)'
+SEMVER_RE="^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-${SEMVER_ID}(\.${SEMVER_ID})*)?(\+[0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*)?$"
+if [[ -n "${PLUGIN_VERSION}" && ! "${PLUGIN_VERSION}" =~ ${SEMVER_RE} ]]; then
+  echo "plugin version \"${PLUGIN_VERSION}\" is not semver 2.0 (for example 1.18.1 or 0.1.0-alpha.1); nothing was changed." >&2
+  exit 1
+fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RELEASE_DATE="$(date -u +%Y-%m-%d)"
 if [[ -n "${TOWNCRIER:-}" ]]; then
@@ -99,7 +112,7 @@ else
     "${TOWNCRIER_CMD[@]}" build --yes --version "${ENGINE_VERSION}" --date "${RELEASE_DATE}"
   ) >/dev/null; then
     echo "towncrier could not build the notes; nothing was changed." >&2
-    echo "python3 scripts/check_changelog_fragments.py names the fragment at fault." >&2
+    echo "uv run --project packages/dex-core --no-sync python scripts/check_changelog_fragments.py names the fragment at fault." >&2
     exit 1
   fi
 fi

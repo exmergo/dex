@@ -121,8 +121,8 @@ dex init analytics
 
 ### Demo
 
-Try Dex in a demo experience with no existing database, no credentials, 
-no cloud account, and no network once the package is installed:
+Try Dex in a demo experience with no existing database, no credentials and
+no cloud warehouse: every query runs against a local DuckDB file.
 
 ```bash
 uv tool install "exmergo-dex-core[duckdb]"
@@ -132,9 +132,15 @@ dex explore map
 
 `dex init analytics --mode demo` creates the e-commerce DuckDB warehouse
 (`dex_demo.duckdb`, 7 tables, 29,512 rows), a dbt project under `analytics/`,
-repository-level Dex configuration, and onboarding documentation. Reruns preserve
-authored files. The lower-level `dex demo` command remains available for creating
-just the warehouse and config. The data comes from a pinned seed.
+repository-level Dex configuration, and onboarding documentation. The dbt project
+declares the [Elementary](https://github.com/elementary-data/elementary) package,
+disabled on the dev target, so `dex transform deps` (or the first build) fetches it
+from the dbt package hub; `--no-elementary` leaves it out. Reruns preserve
+authored files. The lower-level `dex demo` command creates the warehouse and config
+with a smaller dbt project under `demo_project/` and the seeded history of its builds in Elementary's
+tables, in which one test starts failing, so `dex maintain incidents` and
+`dex maintain diagnose` have an incident to read, and a small semantic layer, one
+semantic model of which is keyed on the failing column. The data comes from a pinned seed.
 
 `explore map` maps all 7 tables, infers 5 joins, flags 6 columns as personal data,
 and reports 6 data-quality findings. Every command answers with one JSON envelope.
@@ -267,12 +273,12 @@ Configure the choice in `.dex/config.yml`.
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------: | :----: | :-------: | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | <img src="https://www.exmergo.com/connectors/ossie.png" width="20" height="20" alt=""> **[Apache Ossie](https://github.com/apache/ossie)** (incubating)                                     | ✅          | ❌      | ❌         | `ossie` / `local`              | Native documents in the repository, no dbt or MetricFlow in the path                                                                                          | [Docs](https://docs.exmergo.com/dex/semantic-layers/ossie)                                                |
 | <img src="https://www.exmergo.com/connectors/dbt.png" width="20" height="20" alt=""> **[dbt](https://github.com/dbt-labs/dbt-core)**                                                        | ✅          | ✅      | ✅         | `dbt` / `local` or `dbt_cloud` | MetricFlow locally, run through the Dex connector and its cost guard, or the hosted dbt Cloud Semantic Layer API                                              | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#choosing-a-backend-ambient-like-a-connector) |
-| <img src="https://www.exmergo.com/connectors/databricks.png" width="20" height="20" alt=""> **[Databricks Metric Views](https://docs.databricks.com/aws/en/metric-views/)**                 | ✅          | 🚧      | 🚧         | `databricks` / `local`         | Metric View YAML files in the repository, read and authored statically with no workspace connection; nothing is deployed, and querying is not yet supported   | [Docs](https://github.com/exmergo/dex/tree/main/packages/dex-core#semantic-layers)                        |
+| <img src="https://www.exmergo.com/connectors/databricks.png" width="20" height="20" alt=""> **[Databricks Metric Views](https://docs.databricks.com/aws/en/metric-views/)**                 | ✅          | ✅      | ✅         | `databricks` / `local` or `databricks_workspace` | Metric View YAML files in the repository, read and authored statically, or the views deployed in Unity Catalog; Dex renders `SELECT ... MEASURE(...)` and runs it under the cost guard. Under `local` (or `--local`) the deployed view is checked against its file first; workspace results name a matching file but are not checked against it | [Docs](https://docs.exmergo.com/dex/semantic-layers/databricks-metric-views)                        |
 | <img src="https://www.exmergo.com/connectors/snowflake.png" width="20" height="20" alt=""> **[Snowflake Semantic Views](https://docs.snowflake.com/en/user-guide/views-semantic/overview)** | ✅          | ✅      | ✅         | `snowflake` / `local` or `snowflake_account` | Semantic View YAML files in the repository, read and authored statically, or the views deployed on the account; Dex renders `SEMANTIC_VIEW()` and runs it under the cost guard. Under `local` (or `--local`) the deployed view is checked against its file first; account results name a matching file but are not checked against it | [Docs](https://docs.exmergo.com/dex/semantic-layers/snowflake-semantic-views)                             |
 | <img src="https://raw.githubusercontent.com/exmergo/dex/main/assets/motley-logo.jpeg" width="20" height="20" alt=""> **[SLayer](https://github.com/MotleyAI/slayer)** (by Motley)                                                              | ✅          | 🚧      | ✅         | `slayer` / `local`             | SLayer model files, validated by one pinned release; SLayer renders, Dex runs it under the cost guard                                                         | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#slayer-models-vendor-slayer)                 |
-| <img src="https://raw.githubusercontent.com/exmergo/dex/main/assets/cube-logo.png" width="20" height="20" alt=""> **[Cube](https://github.com/cube-js/cube)**                                                                                  | ✅          | 🚧      | ✅         | `cube` / `local`               | Plain YAML model files, read statically with no Node or Cube server; querying asks a running Cube server to render, Dex runs it under the cost guard          | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#cube-models-vendor-cube)                     |
+| <img src="https://raw.githubusercontent.com/exmergo/dex/main/assets/cube-logo.png" width="20" height="20" alt=""> **[Cube](https://github.com/cube-js/cube)**                                                                                  | ✅          | ✅      | ✅         | `cube` / `local` or `cube_cloud` | Plain YAML model files, read statically with no Node or Cube server; on a Cube Core, Cube renders and Dex runs it under the cost guard (`--api` has Cube run it); on Cube Cloud, Cube runs it by default from the deployment's catalog (`--local` has Dex run it under the cost guard) | [Docs](https://docs.exmergo.com/dex/semantic-layers/overview#cube-models-vendor-cube)                     |
 
-**Coming next:** hosted Cube, hosted SLayer, hosted and queryable Databricks Metric Views, and Looker / LookML.
+**Coming next:** hosted SLayer and Looker / LookML.
 
 ## Dex Semantics
 

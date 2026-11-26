@@ -34,6 +34,7 @@ from ..guards.pii_meta import stamp_lines
 from ..storage import ExploreStore, readable_cache
 from ..yaml_spans import uses_anchors_or_aliases
 from .plans import EditKind, PlanEdit
+from .rewrite import _unsampled
 
 _SOURCES_FILE = "models/staging/_dex_sources.yml"
 
@@ -59,6 +60,59 @@ MACRO_ASSETS: dict[str, str] = {
         "drop named warehouse relations that no longer have a backing model "
         "or source; dry-run by default, refuses to run at all if any named "
         "relation is still a live model, seed, or snapshot"
+    ),
+    "dex_unique_combination": (
+        "the generic test a declared composite grain renders (#1452): fails "
+        "with the count of rows beyond the first of each grain value, never a "
+        "key value; a declaration plan adds it where the project lacks it"
+    ),
+    "dex_population_filter": (
+        "the generic test a declared population filter renders (#1453): fails "
+        "with the count of rows whose column breaks the filter's includes or "
+        "excludes list, never a value; a declaration plan adds it where the "
+        "project lacks it"
+    ),
+    "dex_parent_population": (
+        "the generic test a declared parent population renders (#1454), once per "
+        "direction: fails with the count of eligible parent keys the model lacks "
+        "(missing) or of model keys the parent lacks (unexpected), never a key; "
+        "a declaration plan adds it where the project lacks it"
+    ),
+    "dex_unit_range": (
+        "the generic test a column declared a fraction renders (#1455): fails "
+        "with the count of rows whose value sits below 0 or above 1, never a "
+        "value; a declaration plan adds it where the project lacks it"
+    ),
+    "dex_freshness": (
+        "the generic test a time column's declared freshness renders (#1460): "
+        "fails with one row when the column's newest value trails the "
+        "warehouse's clock by more than max_lag, or when it holds no value, "
+        "counting rows within the limit and never computing the newest value; a "
+        "declaration plan adds "
+        "it where the project lacks it"
+    ),
+    "dex_continuity": (
+        "the generic test a time column's declared continuity renders (#1461): "
+        "fails with the count of gaps, runs of empty buckets at the declared "
+        "grain between two buckets holding rows (per `by` key), never a date or "
+        "a key; a declaration plan adds it where the project lacks it"
+    ),
+    "dex_join_coverage": (
+        "the generic test an INNER join a declared references requires renders "
+        "(#1456): fails with the count of the join's eligible driving rows that "
+        "find no parent row, never a key; a declaration plan adds it where the "
+        "project lacks it"
+    ),
+    "dex_referenced_key": (
+        "the generic test a column another model references renders on the "
+        "parent (#1457): fails with the count of rows repeating a non-NULL key, "
+        "never a key; a declaration plan adds it where the project lacks it"
+    ),
+    "dex_temporal_contract": (
+        "the generic test a declared history renders per measure (#1458): fails "
+        "with the count of entities whose column disagrees with what the "
+        "snapshot's versions and the declared policy give, never a key; a "
+        "declaration plan adds it where the project lacks it"
     ),
 }
 
@@ -155,10 +209,101 @@ def macro_edit(name: str, macro_dir: str) -> PlanEdit:
         / f"{name}.sql"
     )
     return PlanEdit(
-        path=f"{macro_dir}/{name}.sql",
+        path=f"{macro_dir.rstrip('/')}/{name}.sql",
         kind=EditKind.MACRO_SQL,
         new_content=asset.read_text(encoding="utf-8"),
     )
+
+
+def defines_test(view: DbtProjectView, edits: list[PlanEdit], name: str) -> bool:
+    """Whether the project or this plan already defines the generic test
+    ``name`` (``{% test name(`` under a macro or test path, or in a macro or
+    test edit the plan carries, outside Jinja comments). Presence-based, as
+    :func:`missing_macro_warnings` is: a copy that differs from the shipped one
+    is the project's, and ``transform macro <name>`` reconciles it."""
+
+    return _defined(view, edits, "test", name)
+
+
+def _defined(
+    view: DbtProjectView, edits: list[PlanEdit], keyword: str, name: str
+) -> bool:
+    """Whether any file dbt reads definitions from, as this plan leaves the
+    project, defines ``{% keyword name(``: the project's macro and test files
+    the plan does not rewrite, then the plan's own macro and test edits."""
+
+    roots = [root.rstrip("/") for root in (*view.macro_paths, *view.test_paths)]
+    planned = {e.path for e in edits}
+    for source in view.files.values():
+        if source.path in planned:
+            continue
+        if any(source.path.startswith(f"{root}/") for root in roots) and (
+            _defines(source.content, keyword, name)
+        ):
+            return True
+    return any(
+        e.kind in (EditKind.MACRO_SQL, EditKind.TEST_SQL)
+        and e.new_content is not None
+        and _defines(e.new_content, keyword, name)
+        for e in edits
+    )
+
+
+_JINJA_COMMENT = re.compile(r"\{#.*?#\}", re.DOTALL)
+_DEFINITION = re.compile(
+    r"\{%-?\s*(macro|test)\s+(\w+)\s*\(.*?\{%-?\s*end\1\s*-?%\}", re.DOTALL
+)
+
+
+def _defines(content: str, keyword: str, name: str) -> bool:
+    """Whether ``content`` defines ``{% keyword name(``, outside Jinja comments,
+    which dbt never executes."""
+
+    live = _JINJA_COMMENT.sub("", content)
+    return (
+        re.search(r"\{%-?\s*" + keyword + r"\s+" + re.escape(name) + r"\s*\(", live)
+        is not None
+    )
+
+
+def with_shipped_test(
+    view: DbtProjectView, edits: list[PlanEdit], name: str
+) -> list[PlanEdit]:
+    """``edits`` with the shipped generic test ``name`` written into the project.
+
+    Each definition the asset holds (the test, its ``default__`` macro) is
+    written only where no file dbt reads already defines it, since dbt refuses
+    one name defined twice. A free asset path gets the asset as shipped when
+    every definition is missing, and only the missing ones otherwise. A file
+    already at the path (one holding a ``postgres__<name>`` override, say)
+    keeps every byte and gains the missing definitions after them."""
+
+    edit = macro_edit(name, view.macro_paths[0])
+    asset = edit.new_content or ""
+    blocks = list(_DEFINITION.finditer(asset))
+    missing = [
+        match.group(0)
+        for match in blocks
+        if not _defined(view, edits, match.group(1), match.group(2))
+    ]
+    if not missing:
+        return list(edits)
+    planned = next((e for e in edits if e.path == edit.path), None)
+    if planned is not None:
+        existing = planned.new_content
+    else:
+        source = view.files.get(edit.path)
+        existing = source.content if source is not None else None
+    if existing is None:
+        content = asset if len(missing) == len(blocks) else "\n\n".join(missing) + "\n"
+    else:
+        content = existing.rstrip("\n") + "\n\n" + "\n\n".join(missing) + "\n"
+    if planned is not None:
+        return [
+            e.model_copy(update={"new_content": content}) if e is planned else e
+            for e in edits
+        ]
+    return [*edits, edit.model_copy(update={"new_content": content})]
 
 
 def missing_macro_warnings(edits: list[PlanEdit], view: DbtProjectView) -> list[str]:
@@ -553,5 +698,12 @@ def _model_yaml(dataset: Dataset) -> str:
         elif column.nullable is False or column.null_fraction == 0.0:
             tests = ["not_null"]
         if tests:
-            lines.append(f"        data_tests: [{', '.join(tests)}]")
+            rendered = [
+                yaml.safe_dump(
+                    _unsampled(name, personal=column.pii is not None),
+                    default_flow_style=True,
+                ).strip()
+                for name in tests
+            ]
+            lines.append(f"        data_tests: [{', '.join(rendered)}]")
     return "\n".join(lines) + "\n"

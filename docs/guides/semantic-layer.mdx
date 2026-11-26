@@ -16,8 +16,8 @@ backend that can execute queries.
 | dbt Cloud Semantic Layer | Hosted catalog and query API | [Hosted backend](/semantic-layers/overview#hosted-backend-api-dbt-cloud-semantic-layer) |
 | Apache Ossie | Native YAML documents in the repository | [Ossie walkthrough](/guides/ossie-semantic-layer) |
 | SLayer | Native model files in the repository | [SLayer support](/semantic-layers/overview#slayer-models-vendor-slayer) |
-| Cube | Cube YAML model files in the repository | [Cube compatibility](/semantic-layers/cube) |
-| Databricks Metric Views | Metric View YAML files in the repository | [Metric View compatibility](/semantic-layers/databricks-metric-views) |
+| Cube | Cube YAML model files in the repository. On a Cube Core, Dex executes by default and `--api` has Cube execute; on Cube Cloud, Cube executes by default from the deployment's catalog and `--local` has Dex execute against the files | [Cube compatibility](/semantic-layers/cube) |
+| Databricks Metric Views | Metric View YAML files in the repository, deployed by you; or the views deployed in Unity Catalog, read alone (`deployment: databricks_workspace`) | [Metric View compatibility](/semantic-layers/databricks-metric-views) |
 | Snowflake Semantic Views | Semantic View YAML files in the repository, deployed by you; or the views deployed on the account, read alone (`deployment: snowflake_account`) | [Semantic View compatibility](/semantic-layers/snowflake-semantic-views) |
 
 Use the configuration and extras for that backend. Keep the existing format as

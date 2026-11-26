@@ -45,6 +45,9 @@ from typing import TYPE_CHECKING, Any
 import sqlglot
 import sqlglot.expressions as exp
 
+from ..manifest_paths import node_file, posix
+from .global_edits import IMPACT_GLOBAL_KINDS
+
 if TYPE_CHECKING:
     from ..adapters.base import Adapter
     from ..engine import DexEngine
@@ -65,8 +68,6 @@ SETTLING_TIERS = frozenset({"request", "contract"})
 AXIS = "downstream_impact"
 CODE = "downstream_population_changed"
 
-#: Edit kinds whose effect on a model the re-executed baseline cannot isolate.
-_GLOBAL_KINDS = frozenset({"macro_sql", "project_yml", "packages_yml"})
 #: Edit kinds that change a relation both sides read: the dev relation already
 #: holds what this build wrote.
 _UNSYNCHRONIZING_KINDS = frozenset({"seed_csv", "snapshot_sql"})
@@ -141,7 +142,7 @@ def select_targets(
 
     selection = Selection()
     kinds = {_kind(edit) for edit in edits}
-    if kinds & _GLOBAL_KINDS:
+    if kinds & IMPACT_GLOBAL_KINDS:
         selection.reason_code = "global_edit"
         selection.reason = (
             "the plan edits a macro, the project config or the packages, which "
@@ -170,7 +171,7 @@ def select_targets(
         ):
             path = node.get("original_file_path")
             if isinstance(path, str):
-                by_file[PurePosixPath(path).as_posix()] = str(uid)
+                by_file[posix(path)] = str(uid)
 
     roots: dict[str, str] = {}
     for edit in edits:
@@ -313,7 +314,7 @@ def select_targets(
         entry = Target(
             unique_id=uid,
             label=label.get(uid, uid),
-            path=PurePosixPath(str(node.get("original_file_path") or "")).as_posix(),
+            path=node_file(node),
             role=role,
             distance=distance[uid],
             upstream=sorted(upstream.get(uid, set()) - {label.get(uid, uid)})
@@ -348,7 +349,7 @@ def select_targets(
     for uid in measured | ancestors | set(roots):
         path = (nodes.get(uid) or {}).get("original_file_path")
         if isinstance(path, str):
-            selection.inline.add(PurePosixPath(path).as_posix())
+            selection.inline.add(posix(path))
     return selection
 
 
@@ -437,9 +438,13 @@ def _git_head(repo_root: Path | None, project_dir: str, path: str) -> str | None
     if completed.returncode != 0:
         return None
     try:
-        return completed.stdout.decode("utf-8")
+        text = completed.stdout.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    # Read as the project's own files are (universal newlines), so a file
+    # committed with CRLF, as Git for Windows commits one by default, hashes
+    # to the preimage the plan recorded.
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 # --- the two compiles ----------------------------------------------------------

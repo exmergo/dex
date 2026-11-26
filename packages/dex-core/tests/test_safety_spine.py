@@ -1615,8 +1615,15 @@ def test_the_grain_estimate_prices_every_scan_the_grain_run_executes():
 def test_pii_flag_cannot_carry_an_example_value():
     # Structural guarantee: the flag type has no field for a sample value, so PII
     # can be recorded as (column, category, confidence) but never surfaced.
-    assert set(PIIFlag.model_fields) == {"category", "confidence"}
+    assert set(PIIFlag.model_fields) == {"category", "confidence", "refinement"}
     assert "value" not in ColumnProfile.model_fields
+    # The one field added since (#647) is a closed vocabulary naming the shape
+    # rule that decided, so it cannot hold free text either.
+    from exmergo_dex_core.cache import ShapeRefinement
+
+    assert PIIFlag.model_fields["refinement"].annotation == ShapeRefinement | None
+    with pytest.raises(ValueError):
+        PIIFlag(category="name", confidence=0.6, refinement="Ada Lovelace")
 
 
 def test_pii_flag_lives_on_the_column_profile():
@@ -3624,7 +3631,7 @@ def test_demo_refuses_to_overwrite_an_existing_warehouse(tmp_path: Path, capsys)
 def test_demo_creates_only_what_it_names_and_never_a_second_config(
     tmp_path: Path, monkeypatch, capsys
 ):
-    """Two artifacts, both reported, and never one that shadows a real project.
+    """Every artifact reported, and never one that shadows a real project.
 
     A `.dex/config.yml` written into a subdirectory of someone's repo would
     silently capture every command run there, which is the same class of harm as
@@ -3656,10 +3663,12 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     payload = json.loads(capsys.readouterr().out)
     assert payload["data"]["created"] == ["scratch/second.duckdb"]
     assert not (tmp_path / "scratch" / ".dex").exists()
+    # Nor the dbt project, which no command under that config would find.
+    assert not (tmp_path / "scratch" / "demo_project").exists()
     assert committed.read_text(encoding="utf-8") == before
     assert any("left untouched" in w for w in payload["warnings"])
 
-    # And driven from elsewhere with --repo-root, both artifacts land in the
+    # And driven from elsewhere with --repo-root, every artifact lands in the
     # named root and nothing lands in the cwd, however well a .gitignore there
     # would hide them. The root is its own git checkout, so the project config
     # above does not own it and the demo writes its config too.
@@ -3669,7 +3678,10 @@ def test_demo_creates_only_what_it_names_and_never_a_second_config(
     monkeypatch.chdir(elsewhere)
     assert main(["--repo-root", str(repo), "demo"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["data"]["created"] == ["dex_demo.duckdb", ".dex/config.yml"]
+    assert payload["data"]["created"][:2] == ["dex_demo.duckdb", ".dex/config.yml"]
+    assert all(
+        path.startswith("demo_project/dbt/") for path in payload["data"]["created"][2:]
+    )
     written = sorted(
         p.relative_to(repo).as_posix() for p in repo.rglob("*") if p.is_file()
     )
