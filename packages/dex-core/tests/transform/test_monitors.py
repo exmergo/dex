@@ -1498,8 +1498,16 @@ def test_each_qualifying_dimension_gets_its_own_test():
     ("cache", "reason", "command"),
     [
         (None, mon.NOT_PROFILED, "explore profile dev.main.fct_orders --target dev"),
-        ("no_column", mon.NOT_PROFILED, "explore profile dev.main.fct_orders"),
-        ("no_count", mon.NOT_PROFILED, "explore profile dev.main.fct_orders"),
+        (
+            "no_column",
+            mon.NOT_PROFILED,
+            "explore profile dev.main.fct_orders --target dev",
+        ),
+        (
+            "no_count",
+            mon.NOT_PROFILED,
+            "explore profile dev.main.fct_orders --target dev",
+        ),
     ],
 )
 def test_a_dimension_with_no_cached_count_is_left_out_and_named(cache, reason, command):
@@ -2145,3 +2153,175 @@ def test_an_approximate_count_with_no_complete_domain_is_read_as_counted():
 
     row = _dimension_rows(rows)["sku"]
     assert (row["reason"], row["distinct_count_exact"]) == (mon.DOMAIN_TOO_LARGE, False)
+
+
+# --- review follow-ups ------------------------------------------------------------
+
+_VERSIONED = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    latest_version: 2\n"
+    "    versions:\n"
+    "      - v: 1\n"
+    "        config:\n"
+    "          alias: fct_orders\n"
+    "      - v: 2\n"
+)
+
+
+def _versioned_cache(*datasets):
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier=f"dev.main.{name}", columns=[_profile("ordered_at", 9), c]
+            )
+            for name, c in datasets
+        ]
+    )
+
+
+def test_a_version_with_an_alias_reads_the_relation_dbt_builds():
+    files = {"models/marts/fct_orders.yml": _VERSIONED}
+    domains = mon.Domains(
+        cache=_versioned_cache(("fct_orders", _profile("status", 4))),
+        files=files,
+        dev_namespace="dev.main",
+    )
+
+    reading = domains.read("fct_orders.v1", "status")
+
+    assert (reading.status, reading.distinct_count) == (mon.MEASURED, 4)
+    assert reading.identifier == "dev.main.fct_orders"
+
+
+def test_a_shared_versioned_entry_screens_every_version():
+    from exmergo_dex_core.cache import PIICategory, PIIFlag
+
+    files = {"models/marts/fct_orders.yml": _VERSIONED}
+    flag = PIIFlag(category=PIICategory.EMAIL, confidence=0.3)
+    flagged = mon.Domains(
+        cache=_versioned_cache(
+            ("fct_orders", _profile("status", 4)),
+            ("fct_orders_v2", _profile("status", 4, pii=flag)),
+        ),
+        files=files,
+    )
+    clean = mon.Domains(
+        cache=_versioned_cache(
+            ("fct_orders", _profile("status", 4)),
+            ("fct_orders_v2", _profile("status", 12)),
+        ),
+        files=files,
+    )
+
+    # Every version inherits a test on the shared entry, so a flag on any
+    # version keeps the column out, and the count is the largest.
+    assert flagged.read("fct_orders", "status").pii is True
+    assert clean.read("fct_orders", "status").distinct_count == 12
+
+
+def test_a_reprofile_of_a_dev_relation_names_target_dev():
+    rows: list = []
+
+    _render(
+        _dims("status"),
+        rows=rows,
+        domains=_domains(cache=_cache(_profile("status", None))),
+    )
+
+    assert _dimension_rows(rows)["status"]["command"] == (
+        "explore profile dev.main.fct_orders --target dev"
+    )
+
+
+def test_a_reprofile_outside_the_dev_namespace_needs_no_target():
+    rows: list = []
+
+    _render(
+        _dims("status"),
+        rows=rows,
+        domains=_domains(
+            cache=_cache(_profile("status", None), identifier="raw.app.fct_orders")
+        ),
+    )
+
+    assert _dimension_rows(rows)["status"]["command"] == (
+        "explore profile raw.app.fct_orders"
+    )
+
+
+def test_a_dimension_whose_time_column_is_not_output_is_not_written():
+    rows: list = []
+
+    out = _render(
+        _dims("status"),
+        rows=rows,
+        outputs=frozenset({"status"}),
+        domains=_domains(_profile("status", 4)),
+    )
+
+    assert _dimension_tests(out) == []
+    row = _dimension_rows(rows)["status"]
+    assert row["reason"] == mon.COLUMN_NOT_OUTPUT
+    assert "distinct_count" not in row
+
+
+def test_transform_declare_with_nothing_to_propose_names_the_profile_owed(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, current_timestamp as signed_up_at, 'pro' as tier\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n"
+        "      - name: tier\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: dimension\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    def declare() -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+            capsys,
+        )
+
+    # The time monitors are owed and written; the dimension waits on a profile.
+    first = declare()
+    assert first["data"]["plan_id"] is not None, first["errors"]
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+
+    again = declare()
+
+    assert again["data"]["plan_id"] is None
+    said = json.dumps(again["data"]["notes"])
+    assert "stg_customers.tier" in said
+    assert "explore profile" in said

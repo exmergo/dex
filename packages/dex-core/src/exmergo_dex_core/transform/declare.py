@@ -600,6 +600,44 @@ def _owes_monitors(
     return any(row["status"] == "added" for row in rows)
 
 
+def unwritten_monitor_notes(
+    models: Iterable[str],
+    view: Any,
+    monitors: Any,
+    dialect: str | None = None,
+    domains: Any = None,
+) -> list[str]:
+    """Why a monitor the declarations give was not written, for models with
+    nothing left to propose (#1484): a dimension column the cache holds no
+    count for is not owed, so the model is skipped, and only this note says
+    which profile would settle it. Reads the repository and the cache only."""
+
+    from .monitors import domain_note
+
+    if monitors is None or not monitors.open or domains is None:
+        return []
+    files = {path: source.content for path, source in view.files.items()}
+    rows: list[dict[str, Any]] = []
+    for model in models:
+        path = declarations_mod.schema_path(files, model)
+        if path is None:
+            continue
+        try:
+            declarations_mod.render(
+                files.get(path),
+                Declaration(model=model),
+                outputs=declarations_mod.model_outputs(files, view.model_paths, model),
+                dialect=dialect,
+                monitors=monitors,
+                monitor_rows=rows,
+                monitor_domains=domains,
+            )
+        except (RewriteError, DeclarationError):
+            continue
+    note = domain_note(rows)
+    return [note] if note is not None else []
+
+
 def _merge(
     payload: dict[str, Any], given: Declaration
 ) -> tuple[dict[str, Any], list[str]]:

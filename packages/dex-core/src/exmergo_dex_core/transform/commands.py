@@ -2385,6 +2385,9 @@ def declare(
         return drafts.get(model), warnings
 
     monitor_gate = _monitor_gate(engine, [])
+    monitor_domains = (
+        _monitor_domains(engine, view, []) if monitor_gate is not None else None
+    )
     outcome = declare_mod.propose(
         view,
         selection.models,
@@ -2394,9 +2397,7 @@ def declare(
         render_tests=engine.config.declarations.render_tests,
         dialect=_dialect(engine),
         monitors=monitor_gate,
-        monitor_domains=(
-            _monitor_domains(engine, view, []) if monitor_gate is not None else None
-        ),
+        monitor_domains=monitor_domains,
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2425,6 +2426,13 @@ def declare(
         closed = monitor_gate.warning() if monitor_gate is not None else None
         if closed is not None:
             notes.append(closed)
+        # A dimension the cache holds no count for is owed nothing, so its
+        # model is skipped; the profile that would settle it is said (#1484).
+        notes.extend(
+            declare_mod.unwritten_monitor_notes(
+                selection.models, view, monitor_gate, _dialect(engine), monitor_domains
+            )
+        )
         return DeclareResult(notes=notes, **common)
 
     payload = [

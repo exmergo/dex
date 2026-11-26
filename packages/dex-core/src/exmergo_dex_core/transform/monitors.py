@@ -696,18 +696,42 @@ class Domains:
     note: str | None = None
 
     def read(self, model: str, column: str) -> DomainReading:
-        """``column`` of ``model`` (a version label reads that version)."""
+        """``column`` of ``model`` (a version label reads that version).
+
+        A versioned model's bare name is its shared entry, whose tests every
+        version inherits, so each version's relation is read and the column
+        qualifies only where it does on all of them: flagged on any is flagged,
+        unread on any is unread, and the count is the largest.
+        """
 
         from .. import model_versions as mv
-        from ..cache import match_identifier
-        from .drafting import _alias_of_model, _column, dataset_for
 
         base, version = mv.split_label(model)
-        relation = (
-            _alias_of_model(self.files, self.model_paths, base)
-            if version is None
-            else None
-        ) or (base if version is None else f"{base}_v{version}")
+        versions = _version_relations(self.files, base)
+        if version is not None:
+            relation = (versions or {}).get(str(version)) or f"{base}_v{version}"
+            return self._read_relation(model, relation, column)
+        if versions:
+            readings = [
+                self._read_relation(model, relation, column)
+                for relation in versions.values()
+            ]
+            for reading in readings:
+                if reading.pii:
+                    return reading
+            for reading in readings:
+                if reading.status != MEASURED:
+                    return reading
+            return max(readings, key=lambda r: r.distinct_count or 0)
+        from .drafting import _alias_of_model
+
+        relation = _alias_of_model(self.files, self.model_paths, base) or base
+        return self._read_relation(model, relation, column)
+
+    def _read_relation(self, model: str, relation: str, column: str) -> DomainReading:
+        from ..cache import match_identifier
+        from .drafting import _column, dataset_for
+
         dataset = dataset_for(self.cache, relation, manifest=self.manifest)
         if dataset is None and self.cache is not None:
             matched = match_identifier(
@@ -716,6 +740,7 @@ class Domains:
             if len(matched) > 1:
                 return DomainReading(
                     PROFILE_AMBIGUOUS,
+                    pii=_named_as_pii(column),
                     detail=(
                         f"'{relation}' matches {len(matched)} relations in the "
                         f"cache ({', '.join(matched)}), so which one is the model's "
@@ -740,7 +765,7 @@ class Domains:
                 ),
                 identifier=dataset.identifier,
                 profiled_at=dataset.profiled_at,
-                command=f"explore profile {dataset.identifier}",
+                command=self._profile_again(dataset.identifier),
                 detail=(
                     f"the cached profile of {dataset.identifier} holds no column "
                     f"'{column}'"
@@ -765,6 +790,16 @@ class Domains:
             profiled_at=dataset.profiled_at,
         )
 
+    def _profile_again(self, identifier: str) -> str:
+        """The profile that reads ``identifier`` again: with ``--target dev``
+        where it is a relation in the dev namespace, which a plain profile,
+        reading the source allowlist only, cannot reach."""
+
+        namespace = identifier.rsplit(".", 1)[0].lower() if "." in identifier else ""
+        dev = (self.dev_namespace or "").lower()
+        in_dev = bool(dev) and (namespace == dev or namespace.endswith(f".{dev}"))
+        return f"explore profile {identifier}" + (" --target dev" if in_dev else "")
+
     def _command(self, model: str, relation: str) -> str:
         profile = (
             f"explore profile {relation}"
@@ -775,6 +810,40 @@ class Domains:
             # Built by this plan: there is nothing on dev to profile yet.
             return f"transform build --target dev, then {profile}"
         return profile
+
+
+def _version_relations(files: Mapping[str, str], base: str) -> dict[str, str] | None:
+    """Each version of ``base`` and the relation dbt builds it as (its
+    ``alias``, else ``<base>_v<N>``), or ``None`` where ``base`` declares no
+    ``versions:`` in the project's YAML."""
+
+    for path, content in files.items():
+        if not path.endswith((".yml", ".yaml")) or "versions:" not in (content or ""):
+            continue
+        try:
+            loaded = yaml.safe_load(content)
+        except yaml.YAMLError:
+            continue
+        entries = loaded.get("models") if isinstance(loaded, Mapping) else None
+        for entry in entries or []:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("name", "")).lower() != base.lower():
+                continue
+            items = entry.get("versions")
+            if not isinstance(items, list) or not items:
+                continue
+            out: dict[str, str] = {}
+            for item in items:
+                if not isinstance(item, Mapping) or item.get("v") is None:
+                    continue
+                config = item.get("config")
+                alias = (
+                    config.get("alias") if isinstance(config, Mapping) else None
+                ) or item.get("alias")
+                out[str(item["v"])] = str(alias) if alias else f"{base}_v{item['v']}"
+            return out or None
+    return None
 
 
 def _named_as_pii(column: str) -> bool:
@@ -898,6 +967,9 @@ def _dimension_monitors(
             withheld = NO_TIME_COLUMN
         elif timestamp is None:
             withheld = AMBIGUOUS_TIME_COLUMN
+        elif outputs is not None and timestamp.lower() not in outputs:
+            # The time column the test would read is not one the model outputs.
+            withheld = COLUMN_NOT_OUTPUT
         else:
             reading = domains.read(model, name)
             if reading.pii or name.lower() in marked:

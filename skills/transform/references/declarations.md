@@ -975,7 +975,11 @@ models:
   and the row and one plan warning name the `explore profile` that would
   supply one (on a model the plan creates, `transform build --target dev`
   first). A model name the cache holds several relations for is
-  `profile_ambiguous`. Declare again once it is profiled.
+  `profile_ambiguous`. Declare again once it is profiled. A version reads
+  the relation dbt builds it as (its `alias`, else `<model>_v<N>`), and a
+  versioned model's shared entry, whose tests every version inherits, is
+  read on every version: flagged on any is flagged, unread on any is
+  unread, and the count is the largest.
 
   ```yaml
       - elementary.dimension_anomalies:
