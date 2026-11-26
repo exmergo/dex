@@ -2325,3 +2325,97 @@ def test_transform_declare_with_nothing_to_propose_names_the_profile_owed(
     said = json.dumps(again["data"]["notes"])
     assert "stg_customers.tier" in said
     assert "explore profile" in said
+
+
+def test_a_new_version_file_is_built_before_it_is_profiled():
+    from exmergo_dex_core.cache import DexCache
+
+    files = {
+        "models/marts/fct_orders.yml": _VERSIONED,
+        "models/marts/fct_orders.sql": "select 1 as order_id\n",
+        "models/marts/fct_orders_v2.sql": "select 1 as order_id\n",
+    }
+    domains = mon.Domains(
+        cache=DexCache(),
+        files=files,
+        model_paths=["models"],
+        dev_namespace="dev.main",
+        created=frozenset({"fct_orders_v2"}),
+    )
+
+    assert domains.read("fct_orders.v2", "status").command == (
+        "transform build --target dev, then "
+        "explore profile dev.main.fct_orders_v2 --target dev"
+    )
+    # v1's file already exists: a profile alone settles it.
+    assert domains.read("fct_orders.v1", "status").command == (
+        "explore profile dev.main.fct_orders --target dev"
+    )
+
+
+def test_transform_declare_names_the_profile_a_skipped_model_owes_beside_a_proposal(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    staging = dbt_project_dir / "models" / "staging"
+    for name in ("stg_customers", "stg_accounts"):
+        (staging / f"{name}.sql").write_text(
+            "select 1 as id, current_timestamp as signed_up_at, 'pro' as tier\n",
+            encoding="utf-8",
+        )
+    entry = (
+        "  - name: {name}\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n"
+        "      - name: tier\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: dimension\n"
+    )
+    (staging / "schema.yml").write_text(
+        "version: 2\nmodels:\n" + entry.format(name="stg_customers"), encoding="utf-8"
+    )
+    _repo(tmp_path)
+
+    def declare(*models: str) -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", *models], capsys
+        )
+
+    # stg_customers gets its time monitors; its dimension waits on a profile.
+    assert declare("stg_customers")["data"]["plan_id"] is not None
+    assert (
+        _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)["status"]
+        == "ok"
+    )
+    # stg_accounts owes its time monitors, so a plan is stored for it, while
+    # stg_customers is skipped: its note still names the profile it owes.
+    schema = staging / "schema.yml"
+    schema.write_text(
+        schema.read_text(encoding="utf-8") + entry.format(name="stg_accounts"),
+        encoding="utf-8",
+    )
+
+    both = declare("stg_customers", "stg_accounts")
+
+    assert both["data"]["plan_id"] is not None, both["errors"]
+    assert [p["model"] for p in both["data"]["proposed"]] == ["stg_accounts"]
+    said = json.dumps(both["data"]["notes"])
+    assert "stg_customers.tier" in said
+    assert "stg_accounts.tier" not in said

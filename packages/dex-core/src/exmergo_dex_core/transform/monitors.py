@@ -800,13 +800,30 @@ class Domains:
         in_dev = bool(dev) and (namespace == dev or namespace.endswith(f".{dev}"))
         return f"explore profile {identifier}" + (" --target dev" if in_dev else "")
 
+    def _created(self, model: str) -> bool:
+        """Whether the plan creates the SQL file that builds ``model``: for a
+        version label, the file the version is defined in (its ``defined_in``,
+        else ``<model>_v<N>``), never its relation, which an ``alias`` names."""
+
+        from .. import model_versions as mv
+
+        if model.lower() in self.created:
+            return True
+        base, version = mv.split_label(model)
+        if version is None:
+            return False
+        found = mv.lookup(mv.cached_version_map(self.files, self.model_paths), base)
+        item = found.version(str(version)) if found is not None else None
+        stem = item.stem if item is not None else None
+        return (stem or f"{base}_v{version}").lower() in self.created
+
     def _command(self, model: str, relation: str) -> str:
         profile = (
             f"explore profile {relation}"
             if self.dev_namespace is None
             else f"explore profile {self.dev_namespace}.{relation} --target dev"
         )
-        if model.lower() in self.created:
+        if self._created(model):
             # Built by this plan: there is nothing on dev to profile yet.
             return f"transform build --target dev, then {profile}"
         return profile

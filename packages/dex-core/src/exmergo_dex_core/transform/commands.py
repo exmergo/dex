@@ -2435,6 +2435,24 @@ def declare(
         )
         return DeclareResult(notes=notes, **common)
 
+    # A selected model left unproposed whose only owed monitor is a dimension
+    # waiting on a profile is named here; the proposed ones report theirs in
+    # the plan's own data.monitors (#1484).
+    proposed = {p.model.lower() for p in outcome.proposals}
+    elided = {m.lower() for m in outcome.elided}
+    notes.extend(
+        declare_mod.unwritten_monitor_notes(
+            [
+                m
+                for m in selection.models
+                if m.lower() not in proposed and m.lower() not in elided
+            ],
+            view,
+            monitor_gate,
+            _dialect(engine),
+            monitor_domains,
+        )
+    )
     payload = [
         p.declaration.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
         | {"model": p.model}
