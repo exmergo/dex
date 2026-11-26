@@ -906,7 +906,17 @@ Dex cannot write (its column not output, a list mixing text with numbers or
 booleans, a Jinja delimiter, a line break in a value, or a quoting or escaping
 rule with no connector to name it)
 withholds the model's monitors (`filter_column_not_output`,
-`filter_unwritable`), never writes them unfiltered. Dex chooses no training setting (sensitivity,
+`filter_unwritable`), never writes them unfiltered. A column declared with
+role `dimension` becomes an `elementary.dimension_anomalies` (#1484), one test
+per column (`dimensions: [<column>]`, since the package groups a list by the
+columns' combination) on the model's one time column, only where the
+exploration cache's `distinct_count` for the model's relation is at most 20.
+The bound is inclusive, written into the marker and named in the decision.
+The domain is read, never measured: over the bound is `domain_too_large`, no
+cached count is `not_profiled` with the `explore profile` that would supply
+one, and a column flagged as personal data (by the cached profile at any
+confidence, after `pii_overrides`, or by the YAML) is `pii_flagged` at any
+domain. Dex chooses no training setting (sensitivity,
 `days_back`, seasonality stay the package's defaults). A monitor is written
 only where the package is installed (or the same plan adds it) and where the
 repository's `dbt_project.yml` enables it on the production target: its

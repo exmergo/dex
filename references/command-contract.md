@@ -1674,7 +1674,28 @@ default, or a filter or operator after it is refused. A key naming a location
   `filter: population.filters`. A stale monitor's row says what `changed`
   (`timestamp_column` or `where_expression`) and, where only the
   `where_expression` did, the current one's `replacement` status, so the note
-  asks for removal only once the current one is listed. Nothing is
+  asks for removal only once the current one is listed. A column declared
+  with role `dimension` becomes an `elementary.dimension_anomalies` (#1484),
+  one per column with `dimensions: [<column>]` and the model's one time column
+  as `timestamp_column`, never one listing several, since the package groups
+  a `dimensions` list by the columns' combination: only where the exploration
+  cache's `distinct_count` for the model's built relation is at most 20
+  (`DIMENSION_MAX_DISTINCT`, inclusive, written into the marker as
+  `max_distinct` and named in the decision's `detail`). Read, never measured:
+  over the bound is `domain_too_large` with the count, no cached count is
+  `not_profiled` with the `explore profile` that would supply one (named in a
+  warning too), a name several cached relations match is `profile_ambiguous`,
+  and a column the cached profile flags as personal data at any confidence
+  (after `pii_overrides`) or the YAML marks is `pii_flagged` at any domain,
+  with no count reported. No time column, or several, withholds it as it
+  withholds `volume_anomalies`. Its row adds `bound`, `distinct_count`,
+  `distinct_count_exact`, `profile` (`identifier`, `profiled_at`) and, where
+  the cache could not say, `command` and `detail`; its `column` is the
+  dimension column. A stale one says `changed: dimensions` with its `cause`
+  where the column no longer qualifies, and one whose column the cache no
+  longer counts stays `already_listed`. A hand-written `dimension_anomalies`
+  on the same one column is `hand_written`; one grouping by several columns
+  is another monitor. Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an

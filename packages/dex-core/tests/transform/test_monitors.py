@@ -53,6 +53,7 @@ def _render(
     notes=None,
     outputs=None,
     dialect=None,
+    domains=None,
 ):
     [declaration] = parse_declarations([payload])
     return render(
@@ -63,6 +64,7 @@ def _render(
         dialect=dialect,
         monitors=gate,
         monitor_rows=rows,
+        monitor_domains=domains,
     )
 
 
@@ -471,7 +473,9 @@ def _install(project: Path, enabled: str | None = "\"{{ target.name != 'dev' }}\
         "{% test volume_anomalies(model, timestamp_column, where_expression=none) %}"
         "select 1 where false{% endtest %}\n"
         "{% test freshness_anomalies(model, timestamp_column, where_expression=none) %}"
-        "select 1 where false{% endtest %}\n",
+        "select 1 where false{% endtest %}\n"
+        "{% test dimension_anomalies(model, dimensions, timestamp_column=none,"
+        " where_expression=none) %}select 1 where false{% endtest %}\n",
         encoding="utf-8",
     )
     (project / "packages.yml").write_text(
@@ -1362,3 +1366,1056 @@ def test_a_stale_monitor_is_kept_when_its_new_filter_is_unwritable():
         assert mon.FILTER_UNWRITABLE in note
         assert "remove it, since" not in note
         assert "declare the time column again" not in note
+
+
+# --- small-domain dimensions as dimension_anomalies (#1484) ------------------------
+
+DIMENSION = "elementary.dimension_anomalies"
+
+
+def _profile(name: str, distinct: int | None, *, exact: bool = True, pii=None):
+    from exmergo_dex_core.cache import ColumnProfile
+
+    return ColumnProfile(
+        name=name,
+        data_type="varchar",
+        distinct_count=distinct,
+        distinct_count_exact=exact,
+        pii=pii,
+    )
+
+
+def _cache(*columns, identifier: str = "dev.main.fct_orders"):
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier=identifier,
+                columns=[_profile("ordered_at", 400), *columns],
+                profiled_at="2026-11-26T00:00:00Z",
+            )
+        ]
+    )
+
+
+def _domains(*columns, cache=None, **kwargs) -> mon.Domains:
+    return mon.Domains(
+        cache=cache if cache is not None else _cache(*columns),
+        dev_namespace="dev.main",
+        **kwargs,
+    )
+
+
+def _dims(*dimensions: str, times: tuple[str, ...] = ("ordered_at",)) -> dict:
+    return {
+        "model": "fct_orders",
+        "columns": {
+            **{t: {"role": "time"} for t in times},
+            **{d: {"role": "dimension"} for d in dimensions},
+        },
+    }
+
+
+def _dimension_tests(content: str) -> list[dict]:
+    return [
+        next(iter(t.values()))
+        for t in _tests(content)
+        if isinstance(t, dict) and next(iter(t)) == DIMENSION
+    ]
+
+
+def _dimension_rows(rows: list) -> dict:
+    return {r["column"]: r for r in rows if r["test"] == DIMENSION}
+
+
+def test_a_small_domain_dimension_is_written_with_the_time_column():
+    rows: list = []
+
+    out = _render(_dims("status"), rows=rows, domains=_domains(_profile("status", 4)))
+
+    [test] = _dimension_tests(out)
+    assert test["arguments"] == {
+        "dimensions": ["status"],
+        "timestamp_column": "ordered_at",
+    }
+    marker = test["config"]["meta"]["dex"]["monitor"]
+    assert marker == {
+        "vendor": "elementary",
+        "from": "columns.status.role: dimension",
+        "max_distinct": mon.DIMENSION_MAX_DISTINCT,
+    }
+    assert "dex_monitor" in test["config"]["tags"]
+    row = _dimension_rows(rows)["status"]
+    assert row["status"] == mon.ADDED
+    assert (row["distinct_count"], row["distinct_count_exact"], row["bound"]) == (
+        4,
+        True,
+        20,
+    )
+    assert row["profile"]["identifier"] == "dev.main.fct_orders"
+    # The time monitors are unchanged beside it.
+    assert {r["test"] for r in rows} == {VOLUME, FRESHNESS, DIMENSION}
+
+
+@pytest.mark.parametrize(("distinct", "written"), [(20, True), (21, False)])
+def test_the_bound_is_inclusive(distinct, written):
+    rows: list = []
+
+    out = _render(
+        _dims("channel"), rows=rows, domains=_domains(_profile("channel", distinct))
+    )
+
+    assert bool(_dimension_tests(out)) is written
+    row = _dimension_rows(rows)["channel"]
+    if written:
+        assert row["status"] == mon.ADDED
+    else:
+        assert (row["status"], row["reason"]) == (
+            mon.NOT_RENDERED,
+            mon.DOMAIN_TOO_LARGE,
+        )
+        assert row["distinct_count"] == 21
+
+
+def test_each_qualifying_dimension_gets_its_own_test():
+    # The package groups a `dimensions` list by the columns' combination, so
+    # two columns in one test would be up to 4 x 3 series, not 4 + 3.
+    out = _render(
+        _dims("status", "channel", "city"),
+        domains=_domains(
+            _profile("status", 4), _profile("channel", 3), _profile("city", 812)
+        ),
+    )
+
+    assert [t["arguments"]["dimensions"] for t in _dimension_tests(out)] == [
+        ["status"],
+        ["channel"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cache", "reason", "command"),
+    [
+        (None, mon.NOT_PROFILED, "explore profile dev.main.fct_orders --target dev"),
+        (
+            "no_column",
+            mon.NOT_PROFILED,
+            "explore profile dev.main.fct_orders --target dev",
+        ),
+        (
+            "no_count",
+            mon.NOT_PROFILED,
+            "explore profile dev.main.fct_orders --target dev",
+        ),
+    ],
+)
+def test_a_dimension_with_no_cached_count_is_left_out_and_named(cache, reason, command):
+    from exmergo_dex_core.cache import DexCache
+
+    caches = {
+        None: DexCache(),
+        "no_column": _cache(),
+        "no_count": _cache(_profile("status", None)),
+    }
+    rows: list = []
+    notes: list = []
+
+    out = _render(
+        _dims("status"),
+        rows=rows,
+        notes=notes,
+        domains=_domains(cache=caches[cache]),
+    )
+
+    assert _dimension_tests(out) == []
+    row = _dimension_rows(rows)["status"]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, reason)
+    assert row["command"] == command
+    assert "distinct_count" not in row
+    [note] = [n for n in notes if "dimension_anomalies" in n]
+    assert f"fct_orders.status (`{command}`)" in note
+    assert "does not profile" in note
+
+
+def test_a_model_the_plan_creates_is_built_before_it_is_profiled():
+    from exmergo_dex_core.cache import DexCache
+
+    rows: list = []
+
+    _render(
+        _dims("status"),
+        rows=rows,
+        domains=_domains(cache=DexCache(), created=frozenset({"fct_orders"})),
+    )
+
+    assert _dimension_rows(rows)["status"]["command"] == (
+        "transform build --target dev, then "
+        "explore profile dev.main.fct_orders --target dev"
+    )
+
+
+def test_a_name_matching_several_profiles_is_ambiguous():
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    cache = DexCache(
+        datasets=[
+            Dataset(identifier=i, columns=[_profile("status", 4)])
+            for i in ("dev.main.fct_orders", "prod.main.fct_orders")
+        ]
+    )
+    rows: list = []
+
+    out = _render(_dims("status"), rows=rows, domains=_domains(cache=cache))
+
+    assert _dimension_tests(out) == []
+    row = _dimension_rows(rows)["status"]
+    assert row["reason"] == mon.PROFILE_AMBIGUOUS
+    assert "2 relations" in row["detail"]
+
+
+def test_a_column_flagged_as_personal_data_is_never_a_dimension():
+    from exmergo_dex_core.cache import PIICategory, PIIFlag
+
+    rows: list = []
+    flag = PIIFlag(category=PIICategory.EMAIL, confidence=0.1)
+
+    out = _render(
+        _dims("contact"),
+        rows=rows,
+        domains=_domains(_profile("contact", 3, pii=flag)),
+    )
+
+    assert _dimension_tests(out) == []
+    row = _dimension_rows(rows)["contact"]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, mon.PII_FLAGGED)
+    # Its domain is never reported.
+    assert "distinct_count" not in row
+
+
+def test_a_flagged_column_with_no_count_reads_as_flagged_not_unprofiled():
+    from exmergo_dex_core.cache import PIICategory, PIIFlag
+
+    rows: list = []
+    flag = PIIFlag(category=PIICategory.EMAIL, confidence=0.9)
+
+    _render(
+        _dims("contact"),
+        rows=rows,
+        domains=_domains(_profile("contact", None, pii=flag)),
+    )
+
+    assert _dimension_rows(rows)["contact"]["reason"] == mon.PII_FLAGGED
+
+
+def test_a_column_the_yaml_marks_as_personal_data_is_never_a_dimension():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    columns:\n"
+        "      - name: contact\n"
+        "        config:\n"
+        "          meta:\n"
+        "            contains_pii: true\n"
+    )
+    rows: list = []
+
+    out = _render(
+        _dims("contact"),
+        content=content,
+        rows=rows,
+        domains=_domains(_profile("contact", 3)),
+    )
+
+    assert _dimension_tests(out) == []
+    assert _dimension_rows(rows)["contact"]["reason"] == mon.PII_FLAGGED
+
+
+def test_a_pii_override_clears_a_cached_flag(tmp_path: Path):
+    from exmergo_dex_core.cache import PIICategory, PIIFlag, mask_overridden
+    from exmergo_dex_core.config import PIIOverride, pii_override_paths
+
+    flag = PIIFlag(category=PIICategory.NAME, confidence=0.4)
+    cache = mask_overridden(
+        _cache(_profile("plan_name", 3, pii=flag)),
+        pii_override_paths([PIIOverride(column="dev.main.fct_orders.plan_name")]),
+    )
+
+    out = _render(_dims("plan_name"), domains=_domains(cache=cache))
+
+    assert [t["arguments"]["dimensions"] for t in _dimension_tests(out)] == [
+        ["plan_name"]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("times", "reason"),
+    [
+        ((), mon.NO_TIME_COLUMN),
+        (("ordered_at", "shipped_at"), mon.AMBIGUOUS_TIME_COLUMN),
+    ],
+)
+def test_a_dimension_follows_the_time_column_rule(times, reason):
+    rows: list = []
+
+    out = _render(
+        _dims("status", times=times),
+        rows=rows,
+        domains=_domains(_profile("status", 4)),
+    )
+
+    assert _dimension_tests(out) == []
+    row = _dimension_rows(rows)["status"]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, reason)
+    # Whether it qualifies is never read where it could not be written anyway.
+    assert "distinct_count" not in row
+    assert "command" not in row
+
+
+def test_a_dimension_the_model_does_not_output_is_not_written():
+    rows: list = []
+
+    _render(
+        _dims("status"),
+        rows=rows,
+        outputs=frozenset({"ordered_at"}),
+        domains=_domains(_profile("status", 4)),
+    )
+
+    assert _dimension_rows(rows)["status"]["reason"] == mon.COLUMN_NOT_OUTPUT
+
+
+def test_without_a_domain_reader_no_dimension_monitor_is_planned():
+    rows: list = []
+
+    _render(_dims("status"), rows=rows)
+
+    assert DIMENSION not in {r["test"] for r in rows}
+
+
+def test_a_dimension_monitor_carries_the_population_filter():
+    payload = _dims("status")
+    payload["population"] = {"filters": [{"column": "region", "excludes": ["test"]}]}
+    payload["columns"]["region"] = {"role": "attribute"}
+
+    out = _render(payload, domains=_domains(_profile("status", 4)), dialect="duckdb")
+
+    [test] = _dimension_tests(out)
+    assert test["arguments"]["where_expression"] == (
+        "(region not in ('test') or region is null)"
+    )
+    assert test["config"]["meta"]["dex"]["monitor"]["filter"] == "population.filters"
+
+
+def test_an_unwritable_filter_withholds_the_dimension_monitor_too():
+    payload = _dims("status")
+    payload["population"] = {"filters": [{"column": "region", "includes": ["a\nb"]}]}
+    rows: list = []
+
+    out = _render(payload, rows=rows, domains=_domains(_profile("status", 4)))
+
+    assert _dimension_tests(out) == []
+    assert _dimension_rows(rows)["status"]["reason"] == mon.FILTER_UNWRITABLE
+
+
+def test_a_hand_written_dimension_monitor_on_the_column_is_kept():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    data_tests:\n"
+        "      - elementary.dimension_anomalies:\n"
+        "          dimensions: [STATUS]\n"
+        "          anomaly_sensitivity: 2\n"
+    )
+    rows: list = []
+
+    out = _render(
+        _dims("status"),
+        content=content,
+        rows=rows,
+        domains=_domains(_profile("status", 4)),
+    )
+
+    assert _dimension_tests(out) == [
+        {"dimensions": ["STATUS"], "anomaly_sensitivity": 2}
+    ]
+    assert _dimension_rows(rows)["status"]["status"] == mon.HAND_WRITTEN
+
+
+def test_a_hand_written_combined_dimension_monitor_is_another_monitor():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    data_tests:\n"
+        "      - elementary.dimension_anomalies:\n"
+        "          dimensions: [status, channel]\n"
+    )
+    rows: list = []
+
+    out = _render(
+        _dims("status"),
+        content=content,
+        rows=rows,
+        domains=_domains(_profile("status", 4)),
+    )
+
+    dims = [t.get("arguments", t)["dimensions"] for t in _dimension_tests(out)]
+    assert dims == [["status", "channel"], ["status"]]
+    assert _dimension_rows(rows)["status"]["status"] == mon.ADDED
+
+
+def test_declaring_again_lists_each_dimension_monitor_once():
+    domains = _domains(_profile("status", 4))
+    before = _render(_dims("status"), domains=domains)
+    rows: list = []
+
+    after = _render(_dims("status"), content=before, rows=rows, domains=domains)
+
+    assert after == before
+    assert _dimension_rows(rows)["status"]["status"] == mon.ALREADY_LISTED
+
+
+def test_a_listed_monitor_whose_profile_is_gone_stays_listed():
+    from exmergo_dex_core.cache import DexCache
+
+    before = _render(_dims("status"), domains=_domains(_profile("status", 4)))
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        _dims("status"),
+        content=before,
+        rows=rows,
+        notes=notes,
+        domains=_domains(cache=DexCache()),
+    )
+
+    assert after == before
+    row = _dimension_rows(rows)["status"]
+    assert row["status"] == mon.ALREADY_LISTED
+    assert not any("stale" in n or "no longer" in n for n in notes)
+
+
+@pytest.mark.parametrize(
+    ("after_payload", "domains", "cause"),
+    [
+        (_dims("status"), ("status", 25, None), mon.DOMAIN_TOO_LARGE),
+        (_dims(), ("status", 4, None), "not_declared"),
+        (_dims("status"), ("status", 4, "email"), mon.PII_FLAGGED),
+    ],
+)
+def test_a_dimension_that_no_longer_qualifies_is_stale_and_kept(
+    after_payload, domains, cause
+):
+    from exmergo_dex_core.cache import PIICategory, PIIFlag
+
+    before = _render(_dims("status"), domains=_domains(_profile("status", 4)))
+    name, distinct, pii = domains
+    flag = PIIFlag(category=PIICategory(pii), confidence=0.5) if pii else None
+    if after_payload["columns"].get("status") is None:
+        # Declared again as an attribute: no longer a dimension.
+        after_payload = {
+            **after_payload,
+            "columns": {**after_payload["columns"], "status": {"role": "attribute"}},
+        }
+    rows: list = []
+    notes: list = []
+
+    after = _render(
+        after_payload,
+        content=before,
+        rows=rows,
+        notes=notes,
+        domains=_domains(_profile(name, distinct, pii=flag)),
+    )
+
+    assert _dimension_tests(after) == _dimension_tests(before)
+    [stale] = [r for r in rows if r["status"] == mon.STALE]
+    assert (stale["test"], stale["column"], stale["changed"], stale["cause"]) == (
+        DIMENSION,
+        "status",
+        "dimensions",
+        cause,
+    )
+    if cause == mon.DOMAIN_TOO_LARGE:
+        assert stale["distinct_count"] == 25
+    else:
+        assert "distinct_count" not in stale
+    [note] = [n for n in notes if "no longer qualifies" in n]
+    assert "dex leaves it in place" in note
+
+
+def test_a_dimension_monitor_whose_filter_moved_is_stale_with_its_replacement():
+    domains = _domains(_profile("status", 4))
+    before = _render(_dims("status"), domains=domains)
+    payload = _dims("status")
+    payload["population"] = {"filters": [{"column": "status", "includes": ["placed"]}]}
+    rows: list = []
+
+    _render(payload, content=before, rows=rows, domains=domains)
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == DIMENSION]
+    assert stale["changed"] == "where_expression"
+    assert stale["replacement"]["status"] == mon.ADDED
+
+
+def test_a_dimension_monitor_on_a_moved_time_column_is_stale():
+    before = _render(_dims("status"), domains=_domains(_profile("status", 4)))
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _dims("status", times=("placed_at",)),
+        content=before,
+        rows=rows,
+        notes=notes,
+        domains=_domains(_profile("status", 4)),
+    )
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == DIMENSION]
+    assert stale["changed"] == "timestamp_column"
+    assert any("timestamp_column ordered_at" in n for n in notes)
+
+
+def test_a_versioned_model_takes_its_dimension_monitor_on_the_version():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    latest_version: 1\n"
+        "    versions:\n"
+        "      - v: 1\n"
+        "      - v: 2\n"
+    )
+    payload = {**_dims("status"), "model": "fct_orders.v2"}
+
+    out = _render(
+        payload,
+        content=content,
+        domains=_domains(
+            cache=_cache(_profile("status", 4), identifier="dev.main.fct_orders_v2")
+        ),
+    )
+
+    tests = _tests(out, version=2)
+    assert any(isinstance(t, dict) and next(iter(t)) == DIMENSION for t in tests)
+    assert _tests(out, version=1) == []
+
+
+def test_a_dimension_decision_names_its_dimensions_and_the_bound():
+    out = _render(_dims("status"), domains=_domains(_profile("status", 4)))
+
+    found = decisions({"models/schema.yml": out}, ["fct_orders"])
+    [dimension] = [d for d in found if d["monitor"] == DIMENSION]
+
+    assert dimension["chosen"] == "dimensions: [status]; timestamp_column: ordered_at"
+    assert dimension["field"] == "columns.status.role: dimension"
+    assert "at most 20 distinct values" in dimension["detail"]
+    assert "column" not in dimension
+
+
+def test_a_dimension_decision_settles_no_population_change():
+    decision = {
+        "model": "fct_orders",
+        "decision": "Monitor elementary.dimension_anomalies",
+        "chosen": "dimensions: [status]; timestamp_column: ordered_at",
+        "evidence": "contract",
+        "monitor": DIMENSION,
+        "field": "columns.status.role: dimension",
+    }
+    report = change_scope.analyze(
+        [
+            (
+                "models/marts/fct_orders.sql",
+                "select order_id, status from orders\n",
+                "select order_id, status from orders where status = 'placed'\n",
+            )
+        ],
+        [decision],
+        "duckdb",
+    )
+
+    assert report is not None
+    [scope] = report["models"]
+    assert scope["population"] == "changed"
+    assert all(c["status"] == "undeclared" for c in scope["changes"] if "status" in c)
+
+
+def test_a_closed_gate_writes_no_dimension_monitor():
+    rows: list = []
+    gate = mon.Gate(
+        "elementary", mon.INSTALLED, "0.26.1", mon.DISABLED, mon.LITERAL, "prod"
+    )
+
+    out = _render(
+        _dims("status"), gate=gate, rows=rows, domains=_domains(_profile("status", 4))
+    )
+
+    assert _dimension_tests(out) == []
+    assert _dimension_rows(rows)["status"]["reason"] == mon.PRODUCTION_DISABLED
+
+
+# --- the plan, end to end ---------------------------------------------------------
+
+DIMENSIONED = {
+    **DECLARED,
+    "columns": {**DECLARED["columns"], "status": {"role": "dimension"}},
+}
+
+
+def _save(tmp_path: Path, cache) -> None:
+    from exmergo_dex_core.storage import FilesystemStore
+
+    FilesystemStore(tmp_path).save_cache(cache)
+
+
+def test_the_plan_writes_a_dimension_monitor_from_the_cached_domain(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    _save(tmp_path, _cache(_profile("status", 3)))
+
+    planned = _plan(tmp_path, capsys, DIMENSIONED)
+
+    assert planned["status"] == "ok", planned["errors"]
+    rows = _dimension_rows(planned["data"]["monitors"]["monitors"])
+    assert rows["status"]["status"] == mon.ADDED
+    assert rows["status"]["distinct_count"] == 3
+    chosen = [
+        d["chosen"]
+        for d in planned["data"]["decisions"]
+        if d.get("monitor") == DIMENSION
+    ]
+    assert chosen == ["dimensions: [status]; timestamp_column: ordered_at"]
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "marts" / "fct_orders.yml").read_text(
+        encoding="utf-8"
+    )
+    assert [t["arguments"]["dimensions"] for t in _dimension_tests(written)] == [
+        ["status"]
+    ]
+
+
+def test_the_plan_names_the_profile_a_dimension_needs(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+
+    planned = _plan(tmp_path, capsys, DIMENSIONED)
+
+    assert planned["status"] == "ok", planned["errors"]
+    row = _dimension_rows(planned["data"]["monitors"]["monitors"])["status"]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, mon.NOT_PROFILED)
+    assert row["command"].startswith(
+        "transform build --target dev, then explore profile"
+    )
+    assert any(
+        "dimension_anomalies" in w and "does not profile" in w
+        for w in planned["warnings"]
+    )
+    assert DIMENSION not in json.dumps(planned["diffs"])
+
+
+def test_transform_declare_writes_an_owed_dimension_monitor(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, current_timestamp as signed_up_at, 'pro' as tier\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n"
+        "      - name: tier\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: dimension\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    _save(
+        tmp_path,
+        DexCache(
+            datasets=[
+                Dataset(
+                    identifier="dev.main.stg_customers",
+                    columns=[_profile("id", 1), _profile("tier", 3)],
+                )
+            ]
+        ),
+    )
+
+    def declare() -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+            capsys,
+        )
+
+    proposed = declare()
+
+    assert proposed["status"] == "ok", proposed["errors"]
+    [proposal] = proposed["data"]["proposed"]
+    assert [m["test"] for m in proposal["fields"]["monitors"]["value"]] == [
+        VOLUME,
+        FRESHNESS,
+        DIMENSION,
+    ]
+    # The stored plan's monitor report rides on the declare envelope too.
+    assert _dimension_rows(proposed["data"]["monitors"]["monitors"])["tier"][
+        "status"
+    ] == (mon.ADDED)
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    assert declare()["data"]["plan_id"] is None
+
+
+@pytest.mark.parametrize(
+    ("column", "reason"),
+    [("customer_email", mon.PII_FLAGGED), ("plan_name", mon.NOT_PROFILED)],
+)
+def test_an_unprofiled_column_named_as_personal_data_is_not_sent_to_profile(
+    column, reason
+):
+    from exmergo_dex_core.cache import DexCache
+
+    rows: list = []
+    notes: list = []
+
+    _render(_dims(column), rows=rows, notes=notes, domains=_domains(cache=DexCache()))
+
+    # A name the detector flags outright is out before any profile; a generic
+    # `*_name` match is provisional, left to the profile's value-shape check.
+    assert _dimension_rows(rows)[column]["reason"] == reason
+    assert any(column in n for n in notes) is (reason == mon.NOT_PROFILED)
+
+
+def test_the_profile_note_names_each_command_once():
+    from exmergo_dex_core.cache import DexCache
+
+    notes: list = []
+
+    _render(_dims("status", "channel"), notes=notes, domains=_domains(cache=DexCache()))
+
+    [note] = [n for n in notes if "dimension_anomalies" in n]
+    assert note.count("explore profile") == 1
+    assert "fct_orders.status, fct_orders.channel (`explore profile" in note
+
+
+def test_a_complete_value_domain_counts_the_domain_exactly():
+    from exmergo_dex_core.cache import ValueCount, ValueDomain
+
+    profile = _profile("status", 22, exact=False)
+    profile.value_domain = ValueDomain(
+        values=[ValueCount(value=f"s{i}", count=1) for i in range(19)], elided=0
+    )
+    rows: list = []
+
+    out = _render(_dims("status"), rows=rows, domains=_domains(profile))
+
+    # The estimate says 22; the domain the profile listed in full says 19.
+    row = _dimension_rows(rows)["status"]
+    assert (row["distinct_count"], row["distinct_count_exact"]) == (19, True)
+    assert _dimension_tests(out)
+
+
+def test_an_approximate_count_with_no_complete_domain_is_read_as_counted():
+    rows: list = []
+
+    _render(_dims("sku"), rows=rows, domains=_domains(_profile("sku", 30, exact=False)))
+
+    row = _dimension_rows(rows)["sku"]
+    assert (row["reason"], row["distinct_count_exact"]) == (mon.DOMAIN_TOO_LARGE, False)
+
+
+# --- review follow-ups ------------------------------------------------------------
+
+_VERSIONED = (
+    "version: 2\n"
+    "models:\n"
+    "  - name: fct_orders\n"
+    "    latest_version: 2\n"
+    "    versions:\n"
+    "      - v: 1\n"
+    "        config:\n"
+    "          alias: fct_orders\n"
+    "      - v: 2\n"
+)
+
+
+def _versioned_cache(*datasets):
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    return DexCache(
+        datasets=[
+            Dataset(
+                identifier=f"dev.main.{name}", columns=[_profile("ordered_at", 9), c]
+            )
+            for name, c in datasets
+        ]
+    )
+
+
+def test_a_version_with_an_alias_reads_the_relation_dbt_builds():
+    files = {"models/marts/fct_orders.yml": _VERSIONED}
+    domains = mon.Domains(
+        cache=_versioned_cache(("fct_orders", _profile("status", 4))),
+        files=files,
+        dev_namespace="dev.main",
+    )
+
+    reading = domains.read("fct_orders.v1", "status")
+
+    assert (reading.status, reading.distinct_count) == (mon.MEASURED, 4)
+    assert reading.identifier == "dev.main.fct_orders"
+
+
+def test_a_shared_versioned_entry_screens_every_version():
+    from exmergo_dex_core.cache import PIICategory, PIIFlag
+
+    files = {"models/marts/fct_orders.yml": _VERSIONED}
+    flag = PIIFlag(category=PIICategory.EMAIL, confidence=0.3)
+    flagged = mon.Domains(
+        cache=_versioned_cache(
+            ("fct_orders", _profile("status", 4)),
+            ("fct_orders_v2", _profile("status", 4, pii=flag)),
+        ),
+        files=files,
+    )
+    clean = mon.Domains(
+        cache=_versioned_cache(
+            ("fct_orders", _profile("status", 4)),
+            ("fct_orders_v2", _profile("status", 12)),
+        ),
+        files=files,
+    )
+
+    # Every version inherits a test on the shared entry, so a flag on any
+    # version keeps the column out, and the count is the largest.
+    assert flagged.read("fct_orders", "status").pii is True
+    assert clean.read("fct_orders", "status").distinct_count == 12
+
+
+def test_a_reprofile_of_a_dev_relation_names_target_dev():
+    rows: list = []
+
+    _render(
+        _dims("status"),
+        rows=rows,
+        domains=_domains(cache=_cache(_profile("status", None))),
+    )
+
+    assert _dimension_rows(rows)["status"]["command"] == (
+        "explore profile dev.main.fct_orders --target dev"
+    )
+
+
+def test_a_reprofile_outside_the_dev_namespace_needs_no_target():
+    rows: list = []
+
+    _render(
+        _dims("status"),
+        rows=rows,
+        domains=_domains(
+            cache=_cache(_profile("status", None), identifier="raw.app.fct_orders")
+        ),
+    )
+
+    assert _dimension_rows(rows)["status"]["command"] == (
+        "explore profile raw.app.fct_orders"
+    )
+
+
+def test_a_dimension_whose_time_column_is_not_output_is_not_written():
+    rows: list = []
+
+    out = _render(
+        _dims("status"),
+        rows=rows,
+        outputs=frozenset({"status"}),
+        domains=_domains(_profile("status", 4)),
+    )
+
+    assert _dimension_tests(out) == []
+    row = _dimension_rows(rows)["status"]
+    assert row["reason"] == mon.COLUMN_NOT_OUTPUT
+    assert "distinct_count" not in row
+
+
+def test_transform_declare_with_nothing_to_propose_names_the_profile_owed(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    (dbt_project_dir / "models" / "staging" / "stg_customers.sql").write_text(
+        "select 1 as id, current_timestamp as signed_up_at, 'pro' as tier\n",
+        encoding="utf-8",
+    )
+    (dbt_project_dir / "models" / "staging" / "schema.yml").write_text(
+        "version: 2\n"
+        "models:\n"
+        "  - name: stg_customers\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n"
+        "      - name: tier\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: dimension\n",
+        encoding="utf-8",
+    )
+    _repo(tmp_path)
+
+    def declare() -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", "stg_customers"],
+            capsys,
+        )
+
+    # The time monitors are owed and written; the dimension waits on a profile.
+    first = declare()
+    assert first["data"]["plan_id"] is not None, first["errors"]
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+
+    again = declare()
+
+    assert again["data"]["plan_id"] is None
+    said = json.dumps(again["data"]["notes"])
+    assert "stg_customers.tier" in said
+    assert "explore profile" in said
+
+
+def test_a_new_version_file_is_built_before_it_is_profiled():
+    from exmergo_dex_core.cache import DexCache
+
+    files = {
+        "models/marts/fct_orders.yml": _VERSIONED,
+        "models/marts/fct_orders.sql": "select 1 as order_id\n",
+        "models/marts/fct_orders_v2.sql": "select 1 as order_id\n",
+    }
+    domains = mon.Domains(
+        cache=DexCache(),
+        files=files,
+        model_paths=["models"],
+        dev_namespace="dev.main",
+        created=frozenset({"fct_orders_v2"}),
+    )
+
+    assert domains.read("fct_orders.v2", "status").command == (
+        "transform build --target dev, then "
+        "explore profile dev.main.fct_orders_v2 --target dev"
+    )
+    # v1's file already exists: a profile alone settles it.
+    assert domains.read("fct_orders.v1", "status").command == (
+        "explore profile dev.main.fct_orders --target dev"
+    )
+
+
+def test_transform_declare_names_the_profile_a_skipped_model_owes_beside_a_proposal(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    staging = dbt_project_dir / "models" / "staging"
+    for name in ("stg_customers", "stg_accounts"):
+        (staging / f"{name}.sql").write_text(
+            "select 1 as id, current_timestamp as signed_up_at, 'pro' as tier\n",
+            encoding="utf-8",
+        )
+    entry = (
+        "  - name: {name}\n"
+        "    description: One row per customer.\n"
+        "    config:\n"
+        "      meta:\n"
+        "        dex:\n"
+        "          grain: [id]\n"
+        "    columns:\n"
+        "      - name: id\n"
+        "        data_tests: [unique, not_null]\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: key\n"
+        "      - name: signed_up_at\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: time\n"
+        "      - name: tier\n"
+        "        config:\n"
+        "          meta:\n"
+        "            dex:\n"
+        "              role: dimension\n"
+    )
+    (staging / "schema.yml").write_text(
+        "version: 2\nmodels:\n" + entry.format(name="stg_customers"), encoding="utf-8"
+    )
+    _repo(tmp_path)
+
+    def declare(*models: str) -> dict:
+        return _dex(
+            ["--repo-root", str(tmp_path), "transform", "declare", *models], capsys
+        )
+
+    # stg_customers gets its time monitors; its dimension waits on a profile.
+    assert declare("stg_customers")["data"]["plan_id"] is not None
+    assert (
+        _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)["status"]
+        == "ok"
+    )
+    # stg_accounts owes its time monitors, so a plan is stored for it, while
+    # stg_customers is skipped: its note still names the profile it owes.
+    schema = staging / "schema.yml"
+    schema.write_text(
+        schema.read_text(encoding="utf-8") + entry.format(name="stg_accounts"),
+        encoding="utf-8",
+    )
+
+    both = declare("stg_customers", "stg_accounts")
+
+    assert both["data"]["plan_id"] is not None, both["errors"]
+    assert [p["model"] for p in both["data"]["proposed"]] == ["stg_accounts"]
+    said = json.dumps(both["data"]["notes"])
+    assert "stg_customers.tier" in said
+    assert "stg_accounts.tier" not in said

@@ -886,19 +886,24 @@ def _declare(
     monitor_gate = _monitor_gate(engine, edits) if parsed else None
     if parsed:
         cache = None
-        if any(d.population and d.population.filters for d in parsed):
+        cache_note: str | None = None
+        filtered = any(d.population and d.population.filters for d in parsed)
+        if filtered or monitor_gate is not None:
             from ..storage import CacheUnreadableError
 
-            # An unreadable cache narrows the filter check to column names; it
-            # never stops the plan, and the narrowing is said out loud.
+            # An unreadable cache narrows the filter check to column names, and
+            # leaves every dimension monitor unwritten (#1484); it never stops
+            # the plan, and the narrowing is said out loud.
             try:
                 cache = readable_cache(engine.store)
             except CacheUnreadableError:
                 cache = None
-                warnings.append(
-                    "the exploration cache could not be read, so population filters "
-                    "were checked against their column names only"
-                )
+                cache_note = "the exploration cache could not be read"
+                if filtered:
+                    warnings.append(
+                        "the exploration cache could not be read, so population "
+                        "filters were checked against their column names only"
+                    )
         edits, rendered_warnings = declarations_mod.apply_declarations(
             parsed,
             view,
@@ -910,6 +915,11 @@ def _declare(
             dialect=_dialect(engine),
             monitors=monitor_gate,
             monitor_rows=monitor_rows,
+            monitor_domains=(
+                _monitor_domains(engine, view, edits, cache, cache_note)
+                if monitor_gate is not None
+                else None
+            ),
         )
         warnings.extend(rendered_warnings)
         edits = _with_generated_macros(view, edits, generated)
@@ -978,6 +988,55 @@ def _monitor_gate(engine: DexEngine, edits: list[PlanEdit]) -> Any:
         edits,
         engine.config.monitors.vendor,
         engine.config.dbt_prod_target,
+    )
+
+
+def _monitor_domains(
+    engine: DexEngine,
+    view: Any,
+    edits: list[PlanEdit],
+    cache: Any = None,
+    note: str | None = None,
+) -> Any:
+    """What the exploration cache says about the domains of the columns a
+    plan declares ``role: dimension`` (#1484): read, never measured. ``cache``
+    is one the caller already read; ``pii_overrides`` are applied to it, so a
+    column a human cleared is not held back as personal data."""
+
+    from ..cache import mask_overridden
+    from . import declarations as declarations_mod
+
+    if cache is None and note is None:
+        from ..storage import CacheUnreadableError
+
+        try:
+            cache = readable_cache(engine.store)
+        except CacheUnreadableError:
+            note = "the exploration cache could not be read"
+    if cache is None and note is None:
+        note = "there is no exploration cache yet"
+    if cache is not None:
+        cache = mask_overridden(
+            cache.model_copy(deep=True),
+            pii_override_paths(engine.config.pii_overrides),
+        )
+    files = declarations_mod.post_change_files(view, edits)
+    prior = {path: source.content for path, source in view.files.items()}
+    created = frozenset(
+        Path(edit.path).stem.lower()
+        for edit in edits
+        if edit.kind is EditKind.MODEL_SQL
+        and edit.op is EditOp.UPSERT
+        and edit.path not in prior
+    )
+    return _monitors().Domains(
+        cache=cache,
+        files=files,
+        model_paths=list(view.model_paths),
+        dev_namespace=_dev_namespace(engine),
+        manifest=getattr(view, "manifest", None),
+        created=created,
+        note=note,
     )
 
 
@@ -2326,6 +2385,9 @@ def declare(
         return drafts.get(model), warnings
 
     monitor_gate = _monitor_gate(engine, [])
+    monitor_domains = (
+        _monitor_domains(engine, view, []) if monitor_gate is not None else None
+    )
     outcome = declare_mod.propose(
         view,
         selection.models,
@@ -2335,6 +2397,7 @@ def declare(
         render_tests=engine.config.declarations.render_tests,
         dialect=_dialect(engine),
         monitors=monitor_gate,
+        monitor_domains=monitor_domains,
     )
     skipped = selection.skipped + outcome.skipped
     notes: list[str] = []
@@ -2363,8 +2426,33 @@ def declare(
         closed = monitor_gate.warning() if monitor_gate is not None else None
         if closed is not None:
             notes.append(closed)
+        # A dimension the cache holds no count for is owed nothing, so its
+        # model is skipped; the profile that would settle it is said (#1484).
+        notes.extend(
+            declare_mod.unwritten_monitor_notes(
+                selection.models, view, monitor_gate, _dialect(engine), monitor_domains
+            )
+        )
         return DeclareResult(notes=notes, **common)
 
+    # A selected model left unproposed whose only owed monitor is a dimension
+    # waiting on a profile is named here; the proposed ones report theirs in
+    # the plan's own data.monitors (#1484).
+    proposed = {p.model.lower() for p in outcome.proposals}
+    elided = {m.lower() for m in outcome.elided}
+    notes.extend(
+        declare_mod.unwritten_monitor_notes(
+            [
+                m
+                for m in selection.models
+                if m.lower() not in proposed and m.lower() not in elided
+            ],
+            view,
+            monitor_gate,
+            _dialect(engine),
+            monitor_domains,
+        )
+    )
     payload = [
         p.declaration.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
         | {"model": p.model}
@@ -2394,6 +2482,9 @@ def declare(
         declarations=planned.declarations,
         semantic_proposal=planned.semantic_proposal,
         generated_tests=planned.generated_tests,
+        # Which monitors were written and why the rest were not (#1484): a
+        # dimension left out for its domain says so only here.
+        monitors=planned.monitors,
         pii_tags=planned.pii_tags,
         notes=notes + planned.notes,
         **common,
