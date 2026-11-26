@@ -787,9 +787,18 @@ class Domains:
                 relation, [d.identifier for d in self.cache.datasets]
             )
             if len(matched) > 1:
+                # Which relation is the model's build is not settled, so a
+                # flag on any of them counts: a column monitor reads no count,
+                # only whether the column is personal data.
+                candidates = [
+                    _column(d, column)
+                    for d in self.cache.datasets
+                    if d.identifier in matched
+                ]
                 return DomainReading(
                     PROFILE_AMBIGUOUS,
-                    pii=_named_as_pii(column),
+                    pii=_named_as_pii(column)
+                    or any(c is not None and c.pii is not None for c in candidates),
                     detail=(
                         f"'{relation}' matches {len(matched)} relations in the "
                         f"cache ({', '.join(matched)}), so which one is the model's "

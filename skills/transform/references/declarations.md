@@ -1058,7 +1058,8 @@ models:
   monitors by time, which a per-bucket `sum` needs, so with no `time` column
   or several none is written. A column the model does not output, or one
   flagged as personal data (the YAML mark, the cached profile at any
-  confidence after `pii_overrides`, or an unprofiled name the detector flags
+  confidence after `pii_overrides`, on any relation the model's name matches
+  where the cache holds several, or an unprofiled name the detector flags
   outright), gets none (`column_not_output`, `pii_flagged`): the monitors
   store the column's minimum, maximum and sum.
 - **Dex chooses no statistic.** Only `timestamp_column`, `dimensions`, a

@@ -3144,3 +3144,55 @@ def test_transform_declare_writes_an_owed_column_monitor(
         "arguments"
     ]["column_anomalies"] == ["min", "max"]
     assert declare()["data"]["plan_id"] is None
+
+
+def test_a_column_any_ambiguous_profile_flags_gets_no_column_monitor():
+    from exmergo_dex_core.cache import (
+        Dataset,
+        DexCache,
+        PIICategory,
+        PIIFlag,
+    )
+
+    flag = PIIFlag(category=PIICategory("financial"), confidence=0.4)
+    cache = DexCache(
+        datasets=[
+            Dataset(
+                identifier="dev.main.fct_orders",
+                columns=[_profile("amount", 900)],
+            ),
+            Dataset(
+                identifier="prod.main.fct_orders",
+                columns=[_profile("amount", 900, pii=flag)],
+            ),
+        ]
+    )
+    rows: list = []
+
+    _render(
+        _cols({"amount": {"role": "measure", "additivity": "additive"}}),
+        rows=rows,
+        domains=mon.Domains(cache=cache),
+    )
+
+    assert _column_rows(rows)["amount"]["reason"] == mon.PII_FLAGGED
+
+
+def test_an_ambiguous_profile_flagging_nothing_still_writes_the_column_monitor():
+    from exmergo_dex_core.cache import Dataset, DexCache
+
+    cache = DexCache(
+        datasets=[
+            Dataset(identifier=i, columns=[_profile("amount", 900)])
+            for i in ("dev.main.fct_orders", "prod.main.fct_orders")
+        ]
+    )
+    rows: list = []
+
+    _render(
+        _cols({"amount": {"role": "measure", "additivity": "additive"}}),
+        rows=rows,
+        domains=mon.Domains(cache=cache),
+    )
+
+    assert _column_rows(rows)["amount"]["status"] == mon.ADDED
