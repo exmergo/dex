@@ -104,8 +104,8 @@ makes it run differently from the rest:
   `allowed_tools`.
 
 Such a case runs with `--output-format stream-json --verbose`, and both arms
-start with `--setting-sources project --strict-mcp-config
---no-session-persistence`: the fresh directory has no project settings, so the
+start with `--setting-sources project`, `--strict-mcp-config` and
+`--no-session-persistence`: the fresh directory has no project settings, so the
 machine's installed plugins, the user's hooks and their MCP servers stay out,
 and the baseline arm is the agent with no dex at all. `--transcripts DIR`
 writes each run's transcript to `DIR/case-<id>-<skill|baseline>.jsonl`.
