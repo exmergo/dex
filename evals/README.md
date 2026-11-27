@@ -98,12 +98,14 @@ makes it run differently from the rest:
   neither is a call the permissions refused (a `permission_denied` event, or
   the result's `permission_denials`); a call that ran and returned an error
   still counts. For a `no_dex_command`, a `--sql-file` call is also read
-  through what the file it names held when the query ran: the successful
-  operations before it on that path (resolved against the working
-  directory), where a `Write` sets the contents, an `Edit` adds to contents
-  already shown, and a shell redirect (`> q.sql`, `tee`, `Set-Content`,
-  `Out-File`) sets them to its command's text. A file those operations do
-  not establish, such as one only listed with `ls`, counts as a match.
+  through the file its own invocation names, and fails closed: the file's
+  contents count as known only from a successful, unrefused `Write` of the
+  whole file before the query, at the same path inside the workspace, with
+  nothing touching that path between the `Write` and the query. Anything
+  else leaves them unknown, and unknown counts as a match: an `Edit` or
+  `MultiEdit`, a failed or refused write, any shell command that names the
+  file (a redirect, an append, `tee`, `cat`), the query's own command naming
+  it again, or a write at a spelling that cannot be placed.
 
   `no_file_writes` may take `within`, paths relative to the run's working
   directory (the transcript's `init` `cwd`; `"."` is the whole workspace).
@@ -117,10 +119,12 @@ makes it run differently from the rest:
   could not be read in either snapshot is counted as changed. `ignore` names
   the files a read changes by itself (the engine's `.dex/cache.json`,
   `.dex/cache.lock` and `.dex/queries.jsonl`). The tool calls are read too:
-  the workspace is found in a path by its own directory name, which is
-  unique to the run, so a path spelled another way above it
-  (`/c/Users/...`, an 8.3 short name, `~/...`) is still placed. A file edit
-  the permissions refused, or that failed, wrote nothing and is not counted.
+  a path is in the workspace when it begins with the workspace's own path,
+  in one of its known spellings (as `cwd` gives it, Git Bash's
+  `/c/Users/...`, `~` for this user's home, an 8.3 short name), so
+  `/srv/work/x.sql` is not in `/work`. Paths compare case-insensitively
+  only for a Windows workspace. A file edit the permissions refused, or
+  that failed, wrote nothing and is not counted.
 
   Dex calls are read from the `Bash` and `PowerShell` tools with the metadata
   eval's parser, and only where the call names the wrapper (or a Bash alias
@@ -143,8 +147,9 @@ authenticate`, `PASS123` and `PASS_X` are no verdict). A judge that raised, time
 reported `is_error`, or that answered neither PASS nor FAIL gives no verdict,
 and that is the case's run error, never a FAIL, since it says nothing about
 the agent. Each judged assertion carries the judge's text (`verdict` in
-`--json`; a failed line prints it), and `--transcripts DIR` also writes each
-case's graded assertions beside its transcript, under the same stem
+`--json`; a failed line prints it), and on a `--case` run `--transcripts DIR`
+also writes each case's graded assertions beside its transcript, under the
+same stem
 (`case-7-skill-2.jsonl` gets `case-7-skill-2.judge.json`; a run that wrote no
 transcript gets `case-<id>-<arm>-no-transcript.judge.json`).
 

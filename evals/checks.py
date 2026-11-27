@@ -28,7 +28,9 @@ Stdlib only, like the rest of the Tier-2 core.
 from __future__ import annotations
 
 import json
+import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -125,11 +127,9 @@ def skill_invoked(events: list[dict[str, Any]], name: str) -> bool:
 
 def dex_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Every Dex call the agent made, in order: its ``label`` (``maintain
-    incidents``) and the whole ``command`` the Bash call ran."""
-
-    # Imported here, not at the top: evals.metadata.live imports the live
-    # backend, which imports the scoring core, which imports this module.
-    from .metadata.live import Session, summarize
+    incidents``), its ``flags``, the whole ``command`` the shell call ran, and
+    for a ``--sql-file`` call the file its own invocation names
+    (``sql_file``), not the first one the command holds."""
 
     calls = []
     denied = _denied_uses(events)
@@ -138,24 +138,61 @@ def dex_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # A call the permissions refused never ran. One that ran and
             # returned an error still did.
             continue
-        # One tool call at a time, so each call keeps the command it came from.
-        # The parser reads the Bash tool; a PowerShell call is read the same
-        # way, since the wrapper's command line is spelled alike in both.
-        block = {**use, "name": "Bash"}
-        session = summarize(
-            [{"type": "assistant", "message": {"content": [block]}}], Session()
-        )
         command = str((use.get("input") or {}).get("command") or "")
-        calls.extend(
-            {
-                "label": c["label"],
-                "flags": c.get("flags") or [],
-                "command": command,
-                "position": position,
-            }
-            for c in session.dex_calls
-        )
+        for start, label, flags, quoted in _calls_in(command):
+            calls.append(
+                {
+                    "label": label,
+                    "flags": flags,
+                    "command": command,
+                    "position": position,
+                    "sql_file": (
+                        _sql_file_argument(command, start, quoted)
+                        if "sql-file" in flags
+                        else None
+                    ),
+                }
+            )
     return calls
+
+
+def _calls_in(command: str) -> list[tuple[int, str, list[str], list[tuple[int, int]]]]:
+    """The Dex calls in one shell command, in the order the shell runs them,
+    found as the metadata eval's parser finds them (``summarize``), with
+    where each starts. A PowerShell call is read the same way, since the
+    wrapper's command line is spelled alike in both shells."""
+
+    # Imported here, not at the top: evals.metadata.live imports the live
+    # backend, which imports the scoring core, which imports this module.
+    from .metadata import live
+
+    patterns = [live._DEX_CALL] + [live._alias_call(n) for n in live._aliases(command)]
+    quoted = live._quoted_spans(command)
+    found = []
+    for pattern in patterns:
+        for match in pattern.finditer(command):
+            if live._is_quoted_data(command, match.start(), match.end(), quoted):
+                continue
+            group, sub = match.group(1), match.group(2)
+            label = f"{group} {sub}" if sub else group
+            flags = live._flags(command, match.start(), quoted)
+            found.append((match.start(), label, flags, quoted))
+    return sorted(found, key=lambda f: f[0])
+
+
+def _sql_file_argument(
+    command: str, start: int, quoted: list[tuple[int, int]]
+) -> str | None:
+    """The ``--sql-file`` argument of the call starting at ``start``: the
+    first one after it that is not inside quoted text. The call's own flags
+    say it has one, and they are read up to its own separator, so this is
+    that one."""
+
+    for match in _SQL_FILE.finditer(command, start):
+        if any(b <= match.start() < e for b, e in quoted):
+            continue
+        return next((g for g in match.groups() if g), None)
+    return None
 
 
 def _denied_uses(events: list[dict[str, Any]]) -> set[str]:
@@ -348,67 +385,66 @@ def _changes(check: Check, changes: list[str] | None) -> tuple[list[str], list[s
 
 
 def _folded(path: str) -> str:
-    return "/".join(_segments(path)).casefold()
+    """A path inside the workspace, as this machine's file system compares it:
+    the workspace changes come from it, case-insensitively on Windows."""
+
+    joined = "/".join(_segments(path))
+    return joined.casefold() if os.name == "nt" else joined
 
 
 def _reads_match(
     call: dict[str, Any], events: list[dict[str, Any]], pattern: re.Pattern
 ) -> bool:
     """Whether what a call reads matches: its own command, and for a
-    ``--sql-file`` call also what the file held when the query ran.
+    ``--sql-file`` call also the file its own invocation names.
 
-    That is read from the successful operations before the query, in order,
-    on the file the argument names (the same path, resolved against the
-    run's working directory): a ``Write`` sets its contents, an ``Edit``
-    adds to contents already shown, and a shell command that writes the file
-    by redirection (``> q.sql``, ``tee``, ``Set-Content``, ``Out-File``) sets
-    them to that command's text, a heredoc's included. A file whose contents
-    those operations do not establish counts as a match, since an unread
-    file is no evidence it is clean."""
+    The file's contents count as established only by a successful ``Write``
+    of the whole file, before the query, at a path that is the same file
+    inside the workspace, with nothing touching that file between the
+    ``Write`` and the query. Anything else leaves them unknown: an ``Edit``
+    or ``MultiEdit``, a failed or refused write, a shell command that names
+    the file (a redirect, an append, a ``cat``), the query's own command
+    naming it again, or a write at a spelling that cannot be placed. Unknown
+    contents count as a match, since an unread file is no evidence it is
+    clean."""
 
     text = call["command"]
     if pattern.search(text):
         return True
     if "sql-file" not in call["flags"]:
         return False
-    found = _SQL_FILE.search(text)
-    argument = next((g for g in found.groups() if g), "") if found else ""
-    if not argument:
-        return True
+    argument = call.get("sql_file")
     root = _root(events)
+    target = _locate(argument or "", root)
+    if target is None:
+        return True
+    name = target.parts[-1].casefold() if target.parts else ""
     failed = _failed_uses(events) | _denied_uses(events)
-    contents: list[str] | None = None
+    contents: str | None = None
     for use in tool_uses(events)[: call["position"]]:
-        if str(use.get("id")) in failed:
-            continue
         payload = use.get("input") or {}
-        name = use.get("name")
-        if name in WRITE_TOOLS:
+        tool = use.get("name")
+        if tool in WRITE_TOOLS:
             path = str(payload.get("file_path") or payload.get("notebook_path") or "")
-            if not _same_file(path, argument, root):
+            place = _locate(path, root)
+            if place is None or place != target:
+                same_name = bool(_segments(path)) and (
+                    _segments(path)[-1].casefold() == name
+                )
+                unplaced = place is None or not place.inside or not target.inside
+                if same_name and unplaced:
+                    # A spelling that cannot be told apart from the file.
+                    contents = None
                 continue
-            if name == "Write":
-                contents = [str(payload.get("content") or "")]
-            elif contents is not None:
-                contents.append(_written_text(payload))
-        elif name in SHELL_TOOLS:
-            other = str(payload.get("command") or "")
-            if any(_same_file(t, argument, root) for t in _redirect_targets(other)):
-                contents = [other]
-    return contents is None or any(pattern.search(s) for s in contents)
-
-
-#: A shell command's write targets: `> f`, `>> f`, `tee [-a] f`,
-#: `Set-Content [-Path] f`, `Out-File [-FilePath] f`.
-_REDIRECT = re.compile(
-    r"""(?:>>?|\btee(?:\s+-a)?|\bSet-Content(?:\s+-Path)?|\bOut-File(?:\s+-FilePath)?)"""
-    r"""\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|<>]+))""",
-    re.IGNORECASE,
-)
-
-
-def _redirect_targets(command: str) -> list[str]:
-    return [next(g for g in m.groups() if g) for m in _REDIRECT.finditer(command)]
+            ok = tool == "Write" and str(use.get("id")) not in failed
+            contents = str(payload.get("content") or "") if ok else None
+        elif tool in SHELL_TOOLS:
+            if name and name in str(payload.get("command") or "").casefold():
+                contents = None
+    if name and text.casefold().count(name) > 1:
+        # The query's own command does something else with the file too.
+        contents = None
+    return contents is None or bool(pattern.search(contents))
 
 
 def _root(events: list[dict[str, Any]]) -> str:
@@ -424,54 +460,27 @@ def _root(events: list[dict[str, Any]]) -> str:
     )
 
 
-def _same_file(path: str, other: str, root: str) -> bool:
-    """Whether two spellings name one file: both read against ``root`` when
-    relative, and compared from the workspace's own directory down where both
-    hold it, so ``/c/...`` and ``C:\\...`` agree."""
-
-    a, b = _resolved(path, root), _resolved(other, root)
-    if not a or not b:
-        return False
-    name = _segments(root)[-1].casefold() if _segments(root) else ""
-    if name and name in a and name in b:
-        a = a[len(a) - a[::-1].index(name) :]
-        b = b[len(b) - b[::-1].index(name) :]
-    return a == b
-
-
-def _resolved(path: str, root: str) -> list[str]:
-    relative = not (path.startswith(("/", "\\", "~")) or _DRIVE.match(path))
-    parts = _segments(root) + _segments(path) if relative else _segments(path)
-    return [p.casefold() for p in parts]
-
-
 #: The file a ``--sql-file`` argument names, quoted or not.
 _SQL_FILE = re.compile(r"""--sql-file(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))""")
-
-
-def _written_text(payload: dict[str, Any]) -> str:
-    parts = [str(payload.get("content") or ""), str(payload.get("new_string") or "")]
-    parts += [str(e.get("new_string") or "") for e in payload.get("edits") or []]
-    return " ".join(parts)
 
 
 def _file_writes(
     check: Check, events: list[dict[str, Any]]
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Each file-writing tool call as (tool, path shown), split into those the
-    check counts and those outside its ``within``. Paths are read against the
-    run's working directory, the ``init`` event's ``cwd``; with no ``cwd`` to
-    read them against, every write counts, so an unreadable place never
-    passes."""
+    check counts and those outside its ``within``. Paths are placed against
+    the run's working directory, the ``init`` event's ``cwd``; with no
+    ``cwd`` to place them against, every write counts, so an unreadable place
+    never passes. A write that failed or that the permissions refused wrote
+    nothing."""
 
     root = _root(events)
     inside: list[tuple[str, str]] = []
     outside: list[tuple[str, str]] = []
-    failed = _failed_uses(events)
+    skipped = _failed_uses(events) | _denied_uses(events)
     for use in tool_uses(events):
         name = str(use.get("name"))
-        if name not in WRITE_TOOLS or use.get("id") in failed:
-            # A refused or failed write wrote nothing.
+        if name not in WRITE_TOOLS or str(use.get("id")) in skipped:
             continue
         payload = use.get("input") or {}
         path = str(payload.get("file_path") or payload.get("notebook_path") or "")
@@ -485,12 +494,16 @@ def _file_writes(
 
 #: A Windows path with a drive, absolute whatever OS reads the transcript.
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+#: Git Bash's spelling of a drive: `/c/Users/...`.
+_GIT_BASH_DRIVE = re.compile(r"^[A-Za-z]$")
+#: An 8.3 short name: up to six characters, `~`, a number (`PROGRA~1`).
+_SHORT_NAME = re.compile(r"^(.{1,6})~\d+$")
 
 
 def _segments(path: str) -> list[str]:
     """A path's parts as written, with either slash: a transcript's paths are
     another machine's, so they are read by their spelling, never against this
-    filesystem. Compare them with ``casefold``."""
+    filesystem."""
 
     out: list[str] = []
     for part in path.replace("\\", "/").split("/"):
@@ -503,28 +516,113 @@ def _segments(path: str) -> list[str]:
     return out
 
 
+@dataclass(frozen=True)
+class _Located:
+    """Where a path is: ``inside`` the workspace with ``parts`` below it, or
+    outside it with its whole ``parts``; compared case-insensitively only
+    for a Windows-style workspace (``folds``)."""
+
+    inside: bool
+    parts: tuple[str, ...]
+    folds: bool
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _Located):
+            return NotImplemented
+        if self.inside != other.inside or len(self.parts) != len(other.parts):
+            return False
+        return all(
+            _same_part(a, b, self.folds)
+            for a, b in zip(self.parts, other.parts, strict=True)
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.inside, len(self.parts)))
+
+
+def _windows_style(path: str) -> bool:
+    return bool(_DRIVE.match(path))
+
+
+def _absolute(path: str, root: str) -> list[str] | None:
+    """``path`` as absolute parts, read against ``root``. The known alias
+    spellings of a Windows path are turned into its drive form: Git Bash's
+    `/c/...`, and `~` for this user's home. ``None`` for no path."""
+
+    if not path:
+        return None
+    windows = _windows_style(root)
+    if path.startswith("~"):
+        home = str(Path.home())
+        rest = path[1:].lstrip("/\\")
+        return _segments(home) + _segments(rest)
+    if _DRIVE.match(path):
+        return _segments(path)
+    if path.startswith(("/", "\\")):
+        parts = _segments(path)
+        if windows and parts and _GIT_BASH_DRIVE.match(parts[0]):
+            return [f"{parts[0].upper()}:", *parts[1:]]
+        return parts
+    return _segments(root) + _segments(path)
+
+
+def _locate(path: str, root: str) -> _Located | None:
+    """Where ``path`` is against the workspace ``root``: under it when its
+    parts begin with all of the root's parts (each compared as
+    ``_same_part`` compares them), not when the workspace's name merely
+    appears in it."""
+
+    base = _segments(root)
+    parts = _absolute(path, root)
+    if parts is None or not base:
+        return None
+    folds = _windows_style(root)
+    if len(parts) >= len(base) and all(
+        _same_part(a, b, folds) for a, b in zip(parts, base, strict=False)
+    ):
+        return _Located(True, tuple(parts[len(base) :]), folds)
+    return _Located(False, tuple(parts), folds)
+
+
+def _same_part(a: str, b: str, folds: bool) -> bool:
+    """One path part against another: exactly on a case-sensitive file
+    system; on Windows case-insensitively, and an 8.3 short name
+    (`PROGRA~1`) against the long name it abbreviates."""
+
+    if not folds:
+        return a == b
+    if a.casefold() == b.casefold():
+        return True
+    return _short_for(a, b) or _short_for(b, a)
+
+
+def _short_for(short: str, long: str) -> bool:
+    match = _SHORT_NAME.match(short)
+    if not match:
+        return False
+    squeezed = long.replace(" ", "").replace(".", "").upper()
+    return squeezed.startswith(match.group(1).upper()) and squeezed != short.upper()
+
+
 def _place(path: str, root: str, within: list[str]) -> tuple[str, bool]:
     """``path`` as shown in the report (from the workspace down, when it is
     under it), and whether it sits under one of ``within``.
 
-    The workspace is placed by its own directory name, the last part of
-    ``root``, which is unique to the run (``tempfile.mkdtemp``). So a path is
-    under it however the part above it is spelled: Git Bash's ``/c/Users/...``,
-    an 8.3 short name, ``~/...``. A relative path is read from ``root``."""
+    A path is under the workspace when it begins with the workspace's own
+    path, in any of its known spellings: as `cwd` gives it, Git Bash's
+    `/c/...`, `~` for the home directory, 8.3 short names. `/srv/work/x.sql`
+    is not under `/work`. A relative path is read from the workspace."""
 
-    relative = not (path.startswith(("/", "\\", "~")) or _DRIVE.match(path))
-    base = _segments(root)
-    parts = base + _segments(path) if relative else _segments(path)
-    folded = [p.casefold() for p in parts]
-    name = base[-1].casefold() if base else ""
-    if not name or name not in folded:
+    place = _locate(path, root)
+    if place is None or not place.inside:
         return path, False
-    start = len(folded) - folded[::-1].index(name)
-    below = parts[start:]
+    below = list(place.parts)
     for scope in within:
         # An empty scope (`"."`) is the whole workspace.
-        wanted = [p.casefold() for p in _segments(scope)]
-        if folded[start : start + len(wanted)] == wanted:
+        wanted = _segments(scope)
+        if len(below) >= len(wanted) and all(
+            _same_part(a, b, place.folds) for a, b in zip(below, wanted, strict=False)
+        ):
             return "/".join(below), True
     return "/".join(below), False
 

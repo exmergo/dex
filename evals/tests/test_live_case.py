@@ -1131,11 +1131,10 @@ def test_a_judge_whose_cli_reports_an_error_gives_no_verdict(cli):
         BS.join(["C:", "Users", "U~1", "AppData", "Local", "Temp", "dex-eval-7-abc"])
         + BS
         + BS.join(["demo_project", "x.sql"]),
-        "~/AppData/Local/Temp/dex-eval-7-abc/demo_project/x.sql",
         # Another case.
         WIN_ROOT.upper() + BS + BS.join(["DEMO_PROJECT", "X.SQL"]),
     ],
-    ids=["git_bash", "short_name", "home", "case"],
+    ids=["git_bash", "short_name", "case"],
 )
 def test_a_project_write_is_placed_however_the_root_is_spelled(path):
     events = _wrote(_write(2, path), cwd=WIN_ROOT)
@@ -1372,8 +1371,9 @@ def test_a_sql_file_is_matched_by_its_path_not_its_name():
 def test_a_mention_of_the_file_is_not_its_contents():
     events = _wrote(_bash(2, "ls q.sql"), _q(3))
     assert not checks.grade(NO_ELEMENTARY, events)[0]
+    # A shell command that writes it leaves the contents unknown too.
     events = _wrote(_bash(2, "echo 'select 1' > q.sql"), _q(3))
-    assert checks.grade(NO_ELEMENTARY, events)[0]
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
 
 
 def _denial(n: int, tool: str) -> dict:
@@ -1599,3 +1599,124 @@ def test_the_committed_case_fails_a_plan_stored_by_another_command(command):
 def test_the_committed_plan_check_ignores_a_help_call():
     events = [*passing()[:-1], _bash(9, f"{WRAP} transform plan --help"), _done(ANSWER)]
     assert checks.grade(_committed_check("no_dex_command", "transform plan"), events)[0]
+
+
+# --- CodeRabbit's second review: fail closed, and anchor at the workspace --------
+
+
+def _err(n: int) -> dict:
+    result = _res(n, "exit 1")
+    result["message"]["content"][0]["is_error"] = True
+    return result
+
+
+def test_each_sql_file_call_reads_its_own_argument():
+    both = (
+        f"{WRAP} explore query --sql-file clean.sql && "
+        f"{WRAP} explore query --sql-file forbidden.sql"
+    )
+    writes = (
+        _w(2, "/work/clean.sql", "select 1"),
+        _w(3, "/work/forbidden.sql", ELEMENTARY_SQL),
+    )
+    events = _wrote(*writes, _bash(4, both))
+    assert [c["sql_file"] for c in checks.dex_calls(events)[1:]] == [
+        "clean.sql",
+        "forbidden.sql",
+    ]
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+    reverse = (
+        f"{WRAP} explore query --sql-file forbidden.sql && "
+        f"{WRAP} explore query --sql-file clean.sql"
+    )
+    assert not checks.grade(NO_ELEMENTARY, _wrote(*writes, _bash(4, reverse)))[0]
+    clean = (_w(2, "/work/clean.sql", "select 1"), _w(3, "/work/other.sql", "select 2"))
+    two_clean = both.replace("forbidden.sql", "other.sql")
+    assert checks.grade(NO_ELEMENTARY, _wrote(*clean, _bash(4, two_clean)))[0]
+
+
+@pytest.mark.parametrize(
+    "touch",
+    [
+        "printf '\\n' >> q.sql",
+        "echo x | tee -a q.sql",
+        "cat source.sql > q.sql",
+        "cat q.sql",
+    ],
+    ids=["append", "tee_append", "cat_into", "cat_out"],
+)
+def test_a_shell_command_naming_the_file_leaves_it_unknown(touch):
+    for first in ("select 1", ELEMENTARY_SQL):
+        events = _wrote(_w(2, "/work/q.sql", first), _bash(3, touch), _q(4))
+        assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_an_edit_after_the_write_leaves_the_file_unknown():
+    edit = _use(
+        3, "Edit", {"file_path": "/work/q.sql", "old_string": "1", "new_string": "2"}
+    )
+    events = _wrote(_w(2, "/work/q.sql", "select 1"), edit, _q(4))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+    # A whole-file Write after the Edit establishes it again.
+    events = _wrote(
+        _w(2, "/work/q.sql", "select 1"), edit, _w(5, "/work/q.sql", "select 3"), _q(6)
+    )
+    assert checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_failed_redirect_leaves_the_file_unknown():
+    failed = _bash(3, "printf 'select * from dbt_invocations;' > q.sql; exit 1")
+    events = _wrote(_w(2, "/work/q.sql", "select 1"), failed, _err(3), _q(4))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_the_query_command_writing_the_file_too_leaves_it_unknown():
+    same = f"echo 'select 1' > q.sql && {WRAP} explore query --sql-file q.sql"
+    events = _wrote(_w(2, "/work/q.sql", "select 1"), _bash(3, same))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_write_under_a_directory_named_like_the_workspace_is_not_the_file():
+    nested = _w(2, "/work/scratch/work/private/q.sql", "select 1")
+    assert not checks.grade(NO_ELEMENTARY, _wrote(nested, _q(3, "private/q.sql")))[0]
+    right = _w(2, "/work/private/q.sql", "select 1")
+    assert checks.grade(NO_ELEMENTARY, _wrote(right, _q(3, "private/q.sql")))[0]
+
+
+def test_a_path_outside_the_workspace_is_outside_whatever_its_name():
+    whole = Check(check="no_file_writes", assertion="x", within=["."])
+    elsewhere = _wrote(_write(2, "/srv/work/x.sql"))
+    assert checks.grade(whole, elsewhere)[0]
+    assert checks.information(whole, elsewhere) == (
+        "wrote outside the project: ['/srv/work/x.sql']"
+    )
+    assert not checks.grade(whole, _wrote(_write(2, "/work/x.sql")))[0]
+
+
+def test_a_posix_path_keeps_its_case_and_a_windows_path_does_not():
+    upper = _w(2, "/work/Q.sql", "select 1")
+    assert not checks.grade(NO_ELEMENTARY, _wrote(upper, _q(3)))[0]
+    win_upper = _w(2, BS.join([WIN_ROOT, "Q.sql"]), "select 1")
+    assert checks.grade(NO_ELEMENTARY, _wrote(win_upper, _q(3), cwd=WIN_ROOT))[0]
+
+
+def test_a_refused_write_is_not_a_write_to_the_project():
+    events = _wrote(_write(2, "/work/demo_project/x.sql"), _denial(2, "Write"))
+    assert checks.grade(PROJECT_ONLY, events)[0]
+
+
+def test_home_is_this_users_home_directory():
+    home = Path.home()
+    root = str(home / "AppData" / "Local" / "Temp" / "dex-eval-7-abc")
+    inside = "~/AppData/Local/Temp/dex-eval-7-abc/demo_project/x.sql"
+    assert not checks.grade(PROJECT_ONLY, _wrote(_write(2, inside), cwd=root))[0]
+    other = "~/elsewhere/dex-eval-7-abc/demo_project/x.sql"
+    assert checks.grade(PROJECT_ONLY, _wrote(_write(2, other), cwd=root))[0]
+
+
+def test_a_same_name_write_that_may_alias_the_file_leaves_it_unknown():
+    # A spelling outside the workspace's known ones (a UNC path, a link) may
+    # still be the file, so a write there makes its contents unknown.
+    unc = _w(3, "//server/share/work/q.sql", "select 1")
+    events = _wrote(_w(2, "/work/q.sql", "select 1"), unc, _q(4))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
