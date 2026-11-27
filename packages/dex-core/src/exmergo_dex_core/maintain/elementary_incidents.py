@@ -960,7 +960,7 @@ class _Observations:
             held = kept.get(key)
             if held is not None:
                 self.merged += 1
-                if _PRECEDENCE[row.status] >= _PRECEDENCE[held.status]:
+                if _rank(row) >= _rank(held):
                     continue
             kept[key] = row
         self.passes_unobserved = sum(1 for row in kept.values() if row.pass_unread)
@@ -968,6 +968,19 @@ class _Observations:
             _observation(subject, row, *placed[row.run])
             for (subject, _, _), row in sorted(kept.items(), key=_kept_order(placed))
         )
+
+
+#: The outcome a run keeps when one subject and signal has several rows: a
+#: failure over an observed pass over an unobserved one.
+_OUTCOME_RANK = {"bad": 0, "good": 1, "unobserved": 2}
+
+
+def _rank(row: _Row) -> tuple[int, int]:
+    """Which of two rows a run keeps, lower first: by outcome, so an observed
+    pass is kept over a pass its release could not tell from a failure
+    (#1470), then by the status precedence dbt's results use."""
+
+    return (_OUTCOME_RANK[row.outcome], _PRECEDENCE[row.status])
 
 
 def _kept_order(placed: Mapping[str, tuple[int, _Invocation]]) -> Callable[..., tuple]:

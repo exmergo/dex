@@ -359,7 +359,7 @@ exactly; any other release is `elementary_release_untested` and no table is
 read. Both releases lay out `dbt_invocations` and `elementary_test_results`
 alike and write the same values into every column the reader reads, so one
 read may span rows each wrote, as a table upgraded from one to the other holds.
-Rows written by any other release are refused (`elementary_release_mixed`). Two
+Rows written by any other release are refused (`elementary_rows_untested_release`). Two
 differences are named rather than absorbed:
 
 - 0.16.4's `test_result_rows` has no `row_index`. The layout check reports it

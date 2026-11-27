@@ -1294,3 +1294,24 @@ def test_with_no_threshold_known_every_0_16_4_pass_is_unobserved(tmp_path: Path)
     # The pass before it was unobserved, so no observed pass dates its start.
     assert incident.first_observed == "unknown"
     assert incident.state == "open"
+
+
+def test_of_two_tests_on_one_claim_the_observed_pass_is_kept(tmp_path: Path):
+    """Two tests carrying one claim pass in one 0.16.4 run: one with dbt's
+    default thresholds, one whose threshold may hold at zero. The run keeps the
+    observed pass, whichever id sorts first, never the unobserved one."""
+
+    other = "test.shop.not_null_orders_id_zero.zz9"
+    claims = {TEST: "orders.id.present", other: "orders.id.present"}
+    runs = _old_runs(1)
+    for ids in (("a", "b"), ("b", "a")):
+        results = [
+            Result(f"{ids[0]}-1", "inv-1", test=other),
+            Result(f"{ids[1]}-1", "inv-1"),
+        ]
+        (tmp_path / ids[0]).mkdir()
+        path = _warehouse(tmp_path / ids[0] / "dev.duckdb", runs, results, OLD)
+        read = _read(_engine(path), release=OLD, claims=claims, zero_means_pass={TEST})
+        [observation] = read.observations
+        assert observation.outcome == "good", ids
+        assert read.passes_unobserved == 0
