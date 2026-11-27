@@ -13,6 +13,7 @@ third-party runtime dependency.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,15 +31,71 @@ class TriggeringCases:
     negative: list[str] = field(default_factory=list)
 
 
+#: The deterministic checks a case can name, graded from the agent's tool calls
+#: (``evals/checks.py``) rather than by the judge, which reads only the final text.
+CHECK_KINDS = ("first_dex_command", "no_dex_command", "no_file_writes")
+
+
+@dataclass
+class Check:
+    """One assertion graded from the transcript's tool calls, not by the judge.
+
+    ``assertion`` is the sentence the report prints. ``first_dex_command``
+    needs ``group`` and ``command`` (the first ``group`` command the agent ran
+    is ``command``); ``no_dex_command`` needs ``command`` and ``matching``, a
+    regular expression no such call may hold; ``no_file_writes`` takes neither.
+    """
+
+    check: str
+    assertion: str
+    group: str = ""
+    command: str = ""
+    matching: str = ""
+
+
+@dataclass
+class AgentConfig:
+    """How a case's agent is started: its tool permissions and its limits.
+
+    The permission fields become ``--permission-mode``, ``--allowedTools`` and
+    ``--disallowedTools``; ``timeout`` (seconds) replaces the CLI's
+    ``--timeout`` for this case's agent runs, not for the judge.
+    """
+
+    permission_mode: str = ""
+    allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(default_factory=list)
+    timeout: int | None = None
+    max_turns: int | None = None
+    max_budget_usd: float | None = None
+
+
 @dataclass
 class EvalCase:
-    """One output-quality case: a prompt and the assertions its output must pass."""
+    """One output-quality case: a prompt and the assertions its output must pass.
+
+    A case with ``setup`` runs in a fresh, empty working directory of its own:
+    each entry is one ``dex`` command (its arguments, without ``dex``) the
+    harness runs there before the agent starts, so its output never reaches the
+    agent. ``checks`` are graded from the tool calls, next to ``assertions``,
+    which the judge grades from the final text.
+    """
 
     id: int
     prompt: str
     expected_output: str = ""
     files: list[str] = field(default_factory=list)
     assertions: list[str] = field(default_factory=list)
+    setup: list[list[str]] = field(default_factory=list)
+    agent: AgentConfig | None = None
+    checks: list[Check] = field(default_factory=list)
+
+    @property
+    def streamed(self) -> bool:
+        """Whether this case needs the transcript: its own workspace, or a
+        check that reads the tool calls."""
+
+        return bool(self.setup or self.checks or self.agent)
 
 
 @dataclass
@@ -109,6 +166,7 @@ def _suite_from_dict(raw: dict[str, Any], path: Path) -> EvalSuite:
     for i, entry in enumerate(raw.get("evals", [])):
         if "prompt" not in entry:
             raise InvalidSuiteError(f"{path}: evals[{i}] has no 'prompt'")
+        where = f"{path}: evals[{i}]"
         cases.append(
             EvalCase(
                 id=entry.get("id", i),
@@ -116,9 +174,71 @@ def _suite_from_dict(raw: dict[str, Any], path: Path) -> EvalSuite:
                 expected_output=entry.get("expected_output", ""),
                 files=list(entry.get("files", [])),
                 assertions=list(entry.get("assertions", [])),
+                setup=_setup_from(entry.get("setup", []), where),
+                agent=_agent_from(entry.get("agent"), where),
+                checks=[
+                    _check_from(c, f"{where}.checks[{j}]")
+                    for j, c in enumerate(entry.get("checks", []))
+                ],
             )
         )
     return EvalSuite(skill_name=skill_name, triggering=triggering, evals=cases)
+
+
+def _setup_from(raw: Any, where: str) -> list[list[str]]:
+    if not isinstance(raw, list) or not all(
+        isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd)
+        for cmd in raw
+    ):
+        raise InvalidSuiteError(
+            f"{where}.setup must be a list of dex commands, each a non-empty "
+            'list of arguments such as ["demo"]'
+        )
+    return [list(cmd) for cmd in raw]
+
+
+def _agent_from(raw: Any, where: str) -> AgentConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise InvalidSuiteError(f"{where}.agent must be an object")
+    unknown = sorted(set(raw) - set(AgentConfig.__dataclass_fields__))
+    if unknown:
+        raise InvalidSuiteError(f"{where}.agent has unknown key(s) {unknown}")
+    for key in ("allowed_tools", "disallowed_tools"):
+        value = raw.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+            raise InvalidSuiteError(f"{where}.agent.{key} must be a list of strings")
+    return AgentConfig(**raw)
+
+
+def _check_from(raw: Any, where: str) -> Check:
+    if not isinstance(raw, dict):
+        raise InvalidSuiteError(f"{where} must be an object")
+    kind = raw.get("check")
+    if kind not in CHECK_KINDS:
+        raise InvalidSuiteError(f"{where}.check must be one of {list(CHECK_KINDS)}")
+    if not isinstance(raw.get("assertion"), str) or not raw["assertion"]:
+        raise InvalidSuiteError(f"{where} needs an 'assertion' to report")
+    required = {
+        "first_dex_command": ("group", "command"),
+        "no_dex_command": ("command", "matching"),
+        "no_file_writes": (),
+    }[kind]
+    missing = [key for key in required if not raw.get(key)]
+    if missing:
+        raise InvalidSuiteError(f"{where} ({kind}) needs {missing}")
+    if raw.get("matching"):
+        try:
+            re.compile(raw["matching"])
+        except re.error as exc:
+            raise InvalidSuiteError(
+                f"{where}.matching does not compile: {exc}"
+            ) from None
+    unknown = sorted(set(raw) - set(Check.__dataclass_fields__))
+    if unknown:
+        raise InvalidSuiteError(f"{where} has unknown key(s) {unknown}")
+    return Check(**raw)
 
 
 def load_corpus(path: Path | str) -> Corpus:

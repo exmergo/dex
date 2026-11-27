@@ -20,10 +20,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from . import checks
 from .runner import AgentResult, ClassifyResult
-from .suite import EvalCase
+from .suite import AgentConfig, EvalCase
 
 
 class ClaudeNotAvailableError(RuntimeError):
@@ -76,6 +80,127 @@ def _invoke(binary: str, args: list[str], prompt: str, timeout: int) -> str:
         return proc.stdout
 
 
+#: For a case with its own workspace, both arms load only the project's settings
+#: (a fresh workspace has none), so the machine's installed plugins, the user's
+#: hooks and memory stay out, and the baseline arm is the agent with no dex at
+#: all. The same isolation the metadata eval's live runs use (#791).
+ISOLATION_ARGS = [
+    "--setting-sources",
+    "project",
+    "--strict-mcp-config",
+    "--no-session-persistence",
+]
+#: How long one setup command may take: the first one can install the engine.
+SETUP_TIMEOUT = 900
+
+
+def agent_args(config: AgentConfig | None) -> list[str]:
+    """The CLI flags a case's ``agent`` block asks for."""
+
+    if config is None:
+        return []
+    args: list[str] = []
+    if config.permission_mode:
+        args += ["--permission-mode", config.permission_mode]
+    if config.max_turns is not None:
+        args += ["--max-turns", str(config.max_turns)]
+    if config.max_budget_usd is not None:
+        args += ["--max-budget-usd", str(config.max_budget_usd)]
+    # Variadic in the CLI, so each list is closed by the next flag.
+    if config.allowed_tools:
+        args += ["--allowedTools", *config.allowed_tools]
+    if config.disallowed_tools:
+        args += ["--disallowedTools", *config.disallowed_tools]
+    return args
+
+
+def run_setup(
+    case: EvalCase, workspace: Path, plugin_dir: Path | None, skill_name: str
+) -> str | None:
+    """Run the case's setup commands in ``workspace``; why they failed, or
+    ``None``.
+
+    Each runs through the plugin's own skill wrapper, the command the skill
+    tells the agent to run, so the setup and the agent use one engine. Their
+    output is read here and never reaches the agent: ``dex demo`` prints the
+    defect it plants.
+    """
+
+    if not case.setup:
+        return None
+    if plugin_dir is None:
+        return "a case with setup needs the plugin directory (--plugin-dir)"
+    wrapper = Path(plugin_dir) / "skills" / skill_name / "scripts" / "run.py"
+    if not wrapper.is_file():
+        return f"no skill wrapper at {wrapper}"
+    uv = shutil.which("uv")
+    if uv is None:
+        return "setup runs dex through uv, which was not found on PATH"
+    for argv in case.setup:
+        shown = "dex " + " ".join(argv)
+        try:
+            proc = subprocess.run(
+                [uv, "run", "--no-project", "--script", str(wrapper), *argv],
+                cwd=workspace,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=SETUP_TIMEOUT,
+                env=_child_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return f"setup `{shown}` timed out after {SETUP_TIMEOUT}s"
+        try:
+            envelope = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            envelope = {}
+        status = envelope.get("status") if isinstance(envelope, dict) else None
+        if proc.returncode != 0 or status != "ok":
+            errors = (
+                envelope.get("errors") if isinstance(envelope, dict) else None
+            ) or [proc.stderr.strip()[-300:]]
+            outcome = status or f"exit {proc.returncode}"
+            return f"setup `{shown}` returned {outcome}: {errors[0]}"
+    return None
+
+
+def _invoke_stream(
+    binary: str, args: list[str], prompt: str, timeout: int, cwd: Path
+) -> tuple[str, str | None]:
+    """Run ``claude -p`` in ``cwd`` with a ``stream-json`` transcript; return
+    the transcript and why the process failed (``None`` if it did not). A
+    timed-out run keeps what it wrote, which says how far it got."""
+
+    try:
+        proc = subprocess.run(
+            [
+                binary,
+                "-p",
+                prompt,
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                *args,
+            ],
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            cwd=cwd,
+            env=_child_env(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        return partial, f"timed out after {timeout}s"
+    if proc.returncode != 0:
+        return proc.stdout, proc.stderr.strip()[
+            -2000:
+        ] or f"claude exited {proc.returncode}"
+    return proc.stdout, None
+
+
 @dataclass
 class ClaudeCliAgent:
     """Drives Claude Code on a prompt, with a skill-on and a baseline arm.
@@ -85,6 +210,14 @@ class ClaudeCliAgent:
     is detected by ``trigger_marker`` appearing in the run output, defaulting to
     the namespaced skill invocation (e.g. ``/dex:explore``); override it if your
     transcript surfaces tool use differently.
+
+    A case that needs more than its prompt (``EvalCase.streamed``) runs in a
+    fresh temporary directory, set up by its ``setup`` commands and removed
+    afterwards unless ``keep_workspaces``, with ``ISOLATION_ARGS`` and its
+    ``agent`` flags, and its ``stream-json`` transcript parsed into
+    ``AgentResult.events`` and written to ``transcripts`` when that is set.
+    ``plugin_dir`` is the plugin under test: setup runs its wrapper, and the
+    skill arm's transcript must show it loaded.
     """
 
     skill_name: str
@@ -94,8 +227,15 @@ class ClaudeCliAgent:
     skill_args: list[str] = field(default_factory=list)
     baseline_args: list[str] = field(default_factory=list)
     trigger_marker: str | None = None
+    plugin_dir: Path | None = None
+    transcripts: Path | None = None
+    keep_workspaces: bool = False
 
-    def run(self, prompt: str, *, skill_enabled: bool) -> AgentResult:
+    def run(
+        self, prompt: str, *, skill_enabled: bool, case: EvalCase | None = None
+    ) -> AgentResult:
+        if case is not None and case.streamed:
+            return self._run_case(prompt, case, skill_enabled)
         binary = _require_claude(self.binary)
         args = list(self.skill_args if skill_enabled else self.baseline_args)
         if self.model:
@@ -107,6 +247,57 @@ class ClaudeCliAgent:
             return AgentResult(error=str(exc))
         marker = self.trigger_marker or f"/{self._plugin}:{self.skill_name}"
         return AgentResult(output=output, triggered=marker in output)
+
+    def _run_case(
+        self, prompt: str, case: EvalCase, skill_enabled: bool
+    ) -> AgentResult:
+        binary = _require_claude(self.binary)
+        args = list(self.skill_args if skill_enabled else self.baseline_args)
+        args += ISOLATION_ARGS
+        if self.model:
+            args += ["--model", self.model]
+        args += agent_args(case.agent)
+        timeout = (case.agent.timeout if case.agent else None) or self.timeout
+        workspace = Path(tempfile.mkdtemp(prefix=f"dex-eval-{case.id}-"))
+        try:
+            failed = run_setup(case, workspace, self.plugin_dir, self.skill_name)
+            if failed:
+                return AgentResult(error=failed)
+            text, failed = _invoke_stream(binary, args, prompt, timeout, workspace)
+            self._keep_transcript(case, skill_enabled, text)
+            events = checks.parse_stream(text)
+            output = checks.final_text(events)
+            error = failed or checks.run_error(
+                events,
+                skill_enabled=skill_enabled,
+                plugin=self._plugin,
+                plugin_dir=self.plugin_dir,
+            )
+            marker = self.trigger_marker or f"/{self._plugin}:{self.skill_name}"
+            triggered = marker in output or checks.skill_invoked(
+                events, f"{self._plugin}:{self.skill_name}"
+            )
+            return AgentResult(
+                output=output, triggered=triggered, events=events, error=error
+            )
+        finally:
+            if self.keep_workspaces:
+                print(f"case {case.id} workspace kept at {workspace}", file=sys.stderr)
+            else:
+                shutil.rmtree(workspace, ignore_errors=True)
+
+    def _keep_transcript(self, case: EvalCase, skill_enabled: bool, text: str) -> None:
+        if self.transcripts is None:
+            return
+        self.transcripts.mkdir(parents=True, exist_ok=True)
+        stem = f"case-{case.id}-{'skill' if skill_enabled else 'baseline'}"
+        path = self.transcripts / f"{stem}.jsonl"
+        n = 2
+        while path.exists():
+            path = self.transcripts / f"{stem}-{n}.jsonl"
+            n += 1
+        path.write_text(text, encoding="utf-8", newline="")
+        print(f"case {case.id} transcript written to {path}", file=sys.stderr)
 
     @property
     def _plugin(self) -> str:
