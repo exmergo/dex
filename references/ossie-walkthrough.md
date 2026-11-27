@@ -476,10 +476,10 @@ grain came from rather than leaving that silent:
 
 That is the case the declaration earns its keep in. Nothing keys this table:
 `order_item_id` is unique on 13,000 of its 14,000 rows because a batch was
-loaded twice, and the column pairs that are unique here are unique only because
-of that shortfall, so profiling reports none of them and says so in
-`key_evidence`. A declaration cannot fix duplicates, and it does not claim to.
-It states what the grain is meant to be, `maintain grain` is where that gets
+loaded twice, and the batch repeats whole rows, so no set of columns is unique
+either. Profiling reports no key and says why in `key_evidence`. A declaration
+cannot fix duplicates, and it does not claim to. It states what the grain is
+meant to be, `maintain grain` is where that gets
 verified against the data, and the measurement keeps the finding.
 
 **The declared joins**, at confidence 1.0, with the composite kept whole:
@@ -560,7 +560,7 @@ dex maintain grain
 ```
 
 > [high] (order_id, product_id) on dex_demo.main.order_items is no longer
-> unique: 13952 distinct combinations over 14000 rows (~48 duplicate rows);
+> unique: 12961 distinct combinations over 14000 rows (~1039 duplicate rows);
 > no known join uses it
 
 The declared composite reached the grain channel, was measured as a composite,
