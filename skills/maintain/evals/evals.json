@@ -146,7 +146,7 @@
         "max_budget_usd": 5
       },
       "assertions": [
-        "Names the seeded incident's subject: the `unique` test on `stg_order_items.order_item_id` (`unique_stg_order_items_order_item_id`), as the incident Dex reported",
+        "Names the seeded incident's subject: the `unique` test on `stg_order_items.order_item_id` (the test the prompt names; its full name is not required), with when it started failing",
         "Names the cause: the loader delivered rows of `order_items` more than once (a batch loaded twice), so `order_item_id` holds duplicates, and nothing in the dbt model caused it",
         "Names the fix (repair the load, or keep one row per `order_item_id` in `stg_order_items`) and hands it to transform as a plan to author, without claiming to have changed the project or stored a plan"
       ],
@@ -166,6 +166,12 @@
         {
           "check": "no_file_writes",
           "assertion": "Writes nothing: no file edit and no `transform apply`"
+        },
+        {
+          "check": "no_dex_command",
+          "assertion": "Stores no plan: a question stops before `transform plan`",
+          "command": "transform plan",
+          "matching": "."
         }
       ]
     }

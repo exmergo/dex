@@ -647,6 +647,7 @@ def _demo_case() -> EvalCase:
 def test_the_committed_demo_case_runs_on_a_fresh_demo_with_the_records_flags():
     case = _demo_case()
     assert case.prompt == f"the {TEST} test started failing; work out why"
+    assert case.agent.timeout == 900
     assert agent_args(case.agent) == [
         "--permission-mode",
         "acceptEdits",
@@ -657,17 +658,63 @@ def test_the_committed_demo_case_runs_on_a_fresh_demo_with_the_records_flags():
         "--disallowedTools",
         "PowerShell",
     ]
-    # The two points about tool calls are checks; the rest is for the judge.
+    # The points about tool calls are checks; the rest is for the judge.
     kinds = sorted(c.check for c in case.checks)
-    assert kinds == ["first_dex_command", "no_dex_command", "no_file_writes"]
+    assert kinds == [
+        "first_dex_command",
+        "no_dex_command",
+        "no_dex_command",
+        "no_file_writes",
+    ]
+
+
+def _committed(case: EvalCase, events: list[dict]) -> dict[str, bool]:
+    return {c.assertion: checks.grade(c, events)[0] for c in case.checks}
 
 
 def test_the_committed_checks_pass_the_procedure_and_fail_each_departure():
     case = _demo_case()
-    graded = [checks.grade(c, passing())[0] for c in case.checks]
-    assert graded == [True, True, True]
-    graded = [checks.grade(c, failing())[0] for c in case.checks]
-    assert graded == [False, False, False]
+    assert all(_committed(case, passing()).values())
+    first, elementary, writes, plan = (c.assertion for c in case.checks)
+    assert _committed(case, failing()) == {
+        first: False,
+        elementary: False,
+        writes: False,
+        plan: True,
+    }
+    planned = [
+        *passing()[:-1],
+        _bash(9, f'{WRAP} transform plan "keep one row" --edits-file -'),
+        _done(ANSWER),
+    ]
+    assert _committed(case, planned) == {
+        first: True,
+        elementary: True,
+        writes: True,
+        plan: False,
+    }
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "main_elementary.dbt_invocations",
+        "elementary_test_results",
+        "dbt_run_results",
+        "test_result_rows",
+        "data_monitoring_metrics",
+    ],
+)
+def test_the_committed_pattern_catches_each_of_elementarys_tables(table):
+    case = _demo_case()
+    [check] = [c for c in case.checks if c.command == "explore query"]
+    read = " ".join(("select count(*) from", table))
+    events = [
+        *passing()[:-1],
+        _bash(9, f'{WRAP} explore query "{read}"'),
+        _done(ANSWER),
+    ]
+    assert not checks.grade(check, events)[0]
 
 
 # --- review follow-ups (#1625) ---------------------------------------------------

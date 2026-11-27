@@ -962,7 +962,7 @@ def _files(root: Path) -> dict[Path, bytes]:
 
 
 @pytest.mark.parametrize("selector", [(), ("stg_order_items",)], ids=["all", "model"])
-def test_the_procedure_s_commands_in_its_order_reach_the_incident_and_its_cause(
+def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
     run_from, no_network, capsys, selector
 ):
     """#1480's deterministic arm: the live eval's case, with no agent. Asked why
@@ -972,7 +972,10 @@ def test_the_procedure_s_commands_in_its_order_reach_the_incident_and_its_cause(
     there, since a question writes nothing. Run in that order on one demo, the
     first returns the incident, the second that incident's cause and the
     semantic-layer reader of its column, and the dbt project is left as the demo
-    wrote it. The no-defect twin is
+    wrote it. Each command reads the demo on its own, so the order is the
+    procedure's, not a dependency this test could catch breaking; the live
+    case's ``first_dex_command`` check holds the agent to it. The no-defect
+    twin is
     ``test_the_same_demo_with_the_failing_runs_removed_returns_no_incident``."""
 
     pytest.importorskip("duckdb")
