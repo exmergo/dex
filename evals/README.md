@@ -55,13 +55,59 @@ versus baseline), so the same invocation works locally and as a release gate.
 `--plugin-dir`, which defaults to this checkout, so a branch is evaluated with its
 own skill text. Every run prints the path on stderr. Pass `--plugin-dir <path>` to
 evaluate another copy. The baseline arm of the uplift check passes no plugin flag,
-so it still sees whatever dex plugin the machine has installed. `--corpus` runs
+so it still sees whatever dex plugin the machine has installed, except on a case
+with a workspace (below), whose arms load no user settings. `--corpus` runs
 use `--plugin-dir` too.
 
 **Running a few cases.** `--case ID` (repeatable) runs only those output-quality
 cases, with the skill on, and skips triggering and the uplift baseline. The ids
 are the `id` fields in the suite's `evals.json`; an unknown id is an error. It
-exits non-zero unless every selected case passes.
+exits non-zero unless every selected case passes. `--case ID --uplift` also runs
+each selected case once without the skill and reports the uplift, which records
+a case against the agent alone without running the whole suite; it then exits
+non-zero unless every selected case passes with the skill and the uplift is not
+negative.
+
+**Cases with a workspace.** A case may carry three more fields, and any of them
+makes it run differently from the rest:
+
+- `setup`: a list of `dex` commands, each its arguments without `dex`
+  (`[["demo"]]`). The case runs in a fresh, empty temporary directory, and the
+  harness runs each command there first, through the plugin's own skill wrapper
+  (`uv run --no-project --script <plugin-dir>/skills/<skill>/scripts/run.py`),
+  so the setup and the agent use one engine. The setup's output is read by the
+  harness and never reaches the agent; a setup that does not return `ok` is the
+  case's error, and the agent does not start. The directory is removed after
+  the run unless `--keep-workspaces` is given.
+- `agent`: how the agent starts: `permission_mode`, `allowed_tools` and
+  `disallowed_tools` (Claude Code's `--permission-mode`, `--allowedTools` and
+  `--disallowedTools`), and `timeout` (seconds, in place of `--timeout` for
+  this case's agent runs), `max_turns` and `max_budget_usd`.
+- `checks`: assertions graded from the agent's tool calls rather than by the
+  judge, which reads only the final text (`evals/checks.py`). Each has the
+  sentence the report prints (`assertion`) and a `check`:
+  `first_dex_command` (the first `group` command the agent ran is `command`),
+  `no_dex_command` (no `command` call's shell command matches `matching`, a
+  case-insensitive regular expression) and `no_file_writes` (no `Write`,
+  `Edit`, `MultiEdit` or `NotebookEdit` call and no `transform apply`). Dex
+  calls are read from the `Bash` tool with the metadata eval's parser, so a
+  case graded this way disallows `PowerShell`.
+
+Such a case runs with `--output-format stream-json --verbose`, and both arms
+start with `--setting-sources project --strict-mcp-config
+--no-session-persistence`: the fresh directory has no project settings, so the
+machine's installed plugins, the user's hooks and their MCP servers stay out,
+and the baseline arm is the agent with no dex at all. `--transcripts DIR`
+writes each run's transcript to `DIR/case-<id>-<skill|baseline>.jsonl`.
+
+The transcript also decides whether there was a run to grade. A run with no
+`init` or `result` event, or whose `result` says `is_error` or a
+`terminal_reason` holding `error`, is the case's error, and every check fails
+with it: a failed sign-in ends with a `result` of subtype `success`, and an
+empty transcript holds no forbidden command. So does a skill arm whose `init`
+event does not list the dex plugin from `--plugin-dir`, and a baseline arm
+whose `init` event lists any dex plugin, since either would compare one release
+with another.
 
 **Running from inside a Claude Code session.** A session exports `CLAUDECODE`,
 `CLAUDE_CODE_SESSION_ID` and other `CLAUDE*` variables that describe it, and a
@@ -109,7 +155,10 @@ runs as measuring drift from that number rather than pass/fail).
   or a classifier by dependency injection.
 - `claude_agent.py` is the live backend: the `AgentRunner`/`Judge`/`Classifier`
   protocols driven by the `claude` CLI. A non-Claude agent is a second backend
-  behind the same protocols, with no change to the core.
+  behind the same protocols, with no change to the core. It also runs a case
+  with a workspace: its setup, its flags and its `stream-json` transcript.
+- `checks.py` grades a case's `checks` from a `stream-json` transcript, and
+  decides whether the transcript describes a finished run at all.
 - `__main__.py` is the CLI.
 - `tests/` covers the scoring core with fake backends, and the CLI and live
   backend with `subprocess.run` patched out (no model, free, in CI).

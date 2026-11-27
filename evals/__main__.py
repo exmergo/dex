@@ -31,7 +31,15 @@ from .claude_agent import (
     ClaudeCliJudge,
     ClaudeNotAvailableError,
 )
-from .runner import CorpusReport, run_corpus, run_quality, run_suite, run_triggering
+from .runner import (
+    CorpusReport,
+    run_corpus,
+    run_quality,
+    run_suite,
+    run_triggering,
+    uplift_from,
+    uplift_score,
+)
 from .suite import load_corpus, load_suite
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -83,6 +91,23 @@ def main(argv: list[str] | None = None) -> int:
             "and the uplift baseline"
         ),
     )
+    parser.add_argument(
+        "--uplift",
+        action="store_true",
+        help="with --case, also run each selected case once without the skill",
+    )
+    parser.add_argument(
+        "--transcripts",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="write each workspace case's stream-json transcript into DIR",
+    )
+    parser.add_argument(
+        "--keep-workspaces",
+        action="store_true",
+        help="keep each workspace case's working directory (its path on stderr)",
+    )
     args = parser.parse_args(argv)
 
     plugin_dir = args.plugin_dir.resolve()
@@ -90,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--plugin-dir {plugin_dir} has no .claude-plugin/plugin.json")
     if args.cases and (args.triggering or args.corpus):
         parser.error("--case only applies to a skill's output-quality cases")
+    if args.uplift and not args.cases:
+        parser.error("--uplift applies to --case; the full suite already runs it")
     plugin_args = ["--plugin-dir", str(plugin_dir)]
     # stderr, so --json output stays parseable.
     print(f"evaluating the dex plugin at {plugin_dir}", file=sys.stderr)
@@ -116,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             timeout=args.timeout,
             skill_args=plugin_args,
+            plugin_dir=plugin_dir,
+            transcripts=args.transcripts,
+            keep_workspaces=args.keep_workspaces,
         )
 
         if args.cases:
@@ -125,11 +155,32 @@ def main(argv: list[str] | None = None) -> int:
             suite.evals = [c for c in suite.evals if c.id in args.cases]
             judge = ClaudeCliJudge(model=args.model, timeout=args.timeout)
             cases = run_quality(suite, agent, judge)
+            passed = all(c.passed for c in cases)
+            if not args.uplift:
+                if args.json:
+                    print(json.dumps([c.to_dict() for c in cases], indent=2))
+                else:
+                    _print_quality(suite.skill_name, cases)
+                return 0 if passed else 1
+            baseline = run_quality(suite, agent, judge, skill_enabled=False)
+            rows = uplift_from(cases, baseline)
+            score = uplift_score(rows)
             if args.json:
-                print(json.dumps([c.to_dict() for c in cases], indent=2))
+                print(
+                    json.dumps(
+                        {
+                            "quality": [c.to_dict() for c in cases],
+                            "baseline": [c.to_dict() for c in baseline],
+                            "uplift_score": score,
+                        },
+                        indent=2,
+                    )
+                )
             else:
                 _print_quality(suite.skill_name, cases)
-            return 0 if all(c.passed for c in cases) else 1
+                _print_quality(f"{suite.skill_name}, without the skill", baseline)
+                print(f"[{suite.skill_name}] uplift vs baseline {score:+.0%}")
+            return 0 if passed and score >= 0.0 else 1
 
         if args.triggering:
             trig = run_triggering(suite, agent)
@@ -193,9 +244,12 @@ def _print_quality(skill: str, cases) -> None:
     for case in cases:
         mark = "ok " if case.passed else "FAIL"
         print(f"  {mark} #{case.id} {case.prompt[:60]!r}")
+        if case.error:
+            print(f"        - run error: {case.error}")
         for a in case.assertions:
             if not a.passed:
-                print(f"        - failed: {a.assertion}")
+                why = f" [{a.graded_by}: {a.detail}]" if a.detail else ""
+                print(f"        - failed: {a.assertion}{why}")
 
 
 def _print_report(report) -> None:
