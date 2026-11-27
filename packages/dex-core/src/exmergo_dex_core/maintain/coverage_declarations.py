@@ -216,8 +216,14 @@ class _Tests:
             return False
         key = _bare(column)
         zone = str(declared.get("timezone") or "")
+        want_days = _weekdays(declared.get("days"))
         for name, _col, kwargs, _reads in self.by_model.get(model, []):
             if _base(name) != "data_freshness_sla":
+                continue
+            # A test checked on fewer days than declared leaves a declared day
+            # unchecked; one with no day_of_week runs every day.
+            runs = _weekdays(kwargs.get("day_of_week"))
+            if runs is not None and (want_days is None or not want_days <= runs):
                 continue
             if _bare(str(kwargs.get("timestamp_column") or "")) != key:
                 continue
@@ -319,6 +325,17 @@ class _Tests:
                     return True
                 continue
         return False
+
+
+def _weekdays(value: Any) -> frozenset[str] | None:
+    """Weekdays as three-letter lower-case names (``mon``), from a declared
+    ``days`` or a test's ``day_of_week`` (a name or a list, short or full), or
+    ``None`` for every day. An unreadable day reads as no day at all."""
+
+    if value is None or value == "" or value == []:
+        return None
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return frozenset(str(v).strip().lower()[:3] for v in items)
 
 
 def _bare(name: str) -> str:

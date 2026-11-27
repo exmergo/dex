@@ -2028,9 +2028,11 @@ def stale_note(row: Mapping[str, Any]) -> str:
                 "one in place: remove it, since two such monitors on one model each "
                 "count its rows"
             )
-        if replacement.get("reason") == SLA_FILTER_QUOTE:
-            # The listed one cannot compile here either (#1486): nothing is
-            # gained by keeping it.
+        listed_where = str((row.get("arguments") or {}).get("where_expression") or "")
+        if replacement.get("reason") == SLA_FILTER_QUOTE and "\\'" in listed_where:
+            # The listed one repeats a backslash-escaped quote in its message
+            # too (#1486), so it cannot compile here: nothing is gained by
+            # keeping it. One without such a quote still runs and is kept.
             return (
                 f"'{row['model']}' lists {row['test']} on {row.get('column')}, "
                 "written by dex, which fails to compile on this connector: the "

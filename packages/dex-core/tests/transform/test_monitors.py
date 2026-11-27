@@ -3588,3 +3588,24 @@ def test_a_listed_sla_the_quote_now_holds_back_is_named_for_removal():
     stale = [r for r in rows if r["status"] == mon.STALE and r["test"] == SLA]
     assert stale and stale[0]["replacement"]["reason"] == mon.SLA_FILTER_QUOTE
     assert any("fails to compile on this connector" in n for n in notes)
+
+
+def test_a_listed_sla_without_a_quote_is_kept_when_the_quote_holds_back_its_successor():
+    # Written before the population was declared: no where_expression, so
+    # nothing in its message breaks, and it still runs.
+    first = _render(_deadline(), dialect="bigquery")
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _quoted_population(_deadline()),
+        content=first,
+        rows=rows,
+        notes=notes,
+        dialect="bigquery",
+    )
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == SLA]
+    assert stale["replacement"]["reason"] == mon.SLA_FILTER_QUOTE
+    assert not any("fails to compile on this connector" in n for n in notes)
+    assert any("keep this one" in n and SLA in n for n in notes)

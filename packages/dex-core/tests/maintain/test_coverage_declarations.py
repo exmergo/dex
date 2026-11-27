@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from exmergo_dex_core.maintain.coverage_declarations import FACT_CAP, declarations
 
 PROJECT = "shop"
@@ -343,6 +345,38 @@ def test_a_deadline_is_checked_by_verify_and_by_its_elementary_test() -> None:
     assert _fact(out, "freshness", "loaded_at", model="moved")["checked_by"] == (
         "dex_verify"
     )
+
+
+@pytest.mark.parametrize(
+    ("declared_days", "test_days", "covered"),
+    [
+        (["mon"], ["Tuesday"], False),
+        (["mon", "fri"], ["Monday"], False),
+        (["mon"], ["Monday", "Friday"], True),
+        (["mon"], None, True),
+        (None, ["Monday"], False),
+        (None, None, True),
+    ],
+)
+def test_a_deadline_test_covers_it_only_on_every_declared_day(
+    declared_days, test_days, covered
+) -> None:
+    freshness: dict = {"deadline": "07:00", "timezone": "UTC", "basis": "capture"}
+    if declared_days is not None:
+        freshness["days"] = declared_days
+    kwargs: dict = {
+        "timestamp_column": "loaded_at",
+        "sla_time": "07:00",
+        "timezone": "UTC",
+    }
+    if test_days is not None:
+        kwargs["day_of_week"] = test_days
+    manifest = _manifest(
+        [_model("m", columns={"loaded_at": {"role": "time", "freshness": freshness}})],
+        [_test("data_freshness_sla", "m", namespace="elementary", kwargs=kwargs)],
+    )
+    fact = _fact(_run(manifest), "freshness", "loaded_at", model="m")
+    assert (fact["checked_by"] == "both") is covered
 
 
 def test_a_lag_and_a_deadline_are_two_facts() -> None:
