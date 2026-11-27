@@ -145,8 +145,58 @@ def test_the_lineage_holds_what_the_test_reads_and_nothing_else():
         "seeds/codes.csv",
         "macros/m.sql",
     }
-    # A relationships test pairs its model with the model it points at.
-    assert found.pairs == (("model.shop.fct", "model.shop.dim"),)
+    # The tested model pairs with each model it reads.
+    assert found.pairs == (
+        ("model.shop.fct", "model.shop.stg"),
+        ("model.shop.fct", "model.shop.dim"),
+    )
+    assert found.readers["source.shop.raw.o"] == ("",)
+    assert not found.truncated
+
+
+def test_a_model_a_test_reads_beside_its_own_is_no_pair_unless_it_reads_it():
+    manifest = _manifest()
+    fct = manifest["nodes"]["model.shop.fct"]
+    fct["depends_on"]["nodes"] = ["model.shop.stg"]
+    found = ck.lineage(manifest, "test.shop.t")
+
+    # The relationships test reads dim; fct does not, so no build order of
+    # dim can stale fct.
+    assert found is not None
+    assert found.pairs == (("model.shop.fct", "model.shop.stg"),)
+
+
+def test_a_macro_reached_through_another_is_read_with_its_package():
+    manifest = _manifest()
+    manifest["nodes"]["model.shop.stg"]["depends_on"]["macros"] = ["macro.shop.wrap"]
+    manifest["macros"] = {
+        "macro.shop.wrap": {
+            "original_file_path": "macros/wrap.sql",
+            "depends_on": {"macros": ["macro.dbt_expectations.expect"]},
+        }
+    }
+    found = ck.lineage(manifest, "test.shop.t")
+
+    assert found is not None
+    assert "dbt_expectations" in found.packages
+    # A changed project macro is judged on the model that calls it.
+    assert found.macro_callers["macro.shop.wrap"] == ("model.shop.stg",)
+    change = ck.project_change(found, ["macros/wrap.sql"], 1)
+    assert change.models == ("model.shop.stg",)
+
+
+def test_a_walk_cut_at_its_limit_rules_nothing_out_by_absence():
+    found = ck.lineage(_manifest(), "test.shop.t", limit=2)
+
+    assert found is not None
+    assert found.truncated
+    [held] = ck.seed_candidates(found, {}, BOUNDS, {})
+    unproven = ck.unproven(held, "lineage_truncated", "the walk stopped")
+    assert (unproven.status, unproven.reason) == ("not_checked", "lineage_truncated")
+    assert unproven.evidence["would_rule_out"] == "no_seed_in_lineage"
+    # A positive answer stands.
+    seed = ck.Candidate(owner="seed", kind="seed_edited", status="confirmed")
+    assert ck.unproven(seed, "lineage_truncated", "x") is seed
 
 
 def test_a_test_on_one_model_pairs_it_with_each_parent_model():
@@ -282,13 +332,43 @@ def test_a_retyped_column_no_model_reads_rules_the_loader_out():
     assert held.evidence["retyped_not_read"] == ["dev.raw.o.amount"]
 
 
-def test_with_no_model_code_a_retype_still_confirms_and_says_so():
+def test_with_no_model_code_a_retype_is_named_not_confirmed():
     [held] = ck.retype_candidates(
         _lineage(), {"dev.raw.o": [_retyped("amount")]}, {}, checked=["dev.raw.o"]
     )
 
-    assert held.status == "confirmed"
-    assert held.evidence["read_by_lineage"] == "unknown"
+    assert (held.status, held.reason) == ("not_checked", "column_read_unknown")
+    assert held.evidence["type_after"] == "VARCHAR"
+
+
+def test_a_retype_is_matched_against_the_models_reading_that_source():
+    found = _lineage(
+        readers={
+            "source.shop.raw.o": ("select * from raw_o",),
+            "source.shop.raw.p": ("select amount from raw_p",),
+        },
+        code=("select * from raw_o", "select amount from raw_p"),
+    )
+    # raw_o is read through a wildcard: its amount is read unspelled, so the
+    # retype is not ruled out on the word missing, and a reader of raw_p
+    # spelling amount does not confirm raw_o's.
+    [held] = ck.retype_candidates(
+        found,
+        {"dev.raw.o": [_retyped("amount")]},
+        {},
+        checked=["dev.raw.o"],
+        sources={"dev.raw.o": "source.shop.raw.o"},
+    )
+    assert (held.status, held.reason) == ("not_checked", "column_read_unknown")
+
+    [spelled] = ck.retype_candidates(
+        found,
+        {"dev.raw.p": [_retyped("amount")]},
+        {},
+        checked=["dev.raw.p"],
+        sources={"dev.raw.p": "source.shop.raw.p"},
+    )
+    assert spelled.status == "confirmed"
 
 
 # --- a package ------------------------------------------------------------------------
@@ -555,3 +635,53 @@ def test_dex_s_own_state_and_dbt_s_output_belong_to_no_owner():
     )
 
     assert owned == {"seed": (), "package": (), "project": ("models/a.sql",)}
+
+
+def test_a_moved_package_past_the_evidence_cap_is_still_matched():
+    names = [f"p{n:02d}" for n in range(25)]
+    lock = "packages:\n" + "".join(
+        f"  - package: x/{n}\n    version: {{v}}\n    name: {n}\n" for n in names
+    )
+    held = ck.package_candidate(
+        _lineage(packages=("p24",)),
+        ck.parse_lock(lock.format(v="1.0.0")),
+        ck.parse_lock(lock.format(v="2.0.0")),
+        declared=True,
+        bounds=BOUNDS,
+    )
+
+    assert held.status == "confirmed"
+    assert held.evidence["packages"] == ["p24"]
+    assert "p24 1.0.0 to 2.0.0" in (held.detail or "")
+
+
+def test_a_conflict_resolution_s_own_edit_is_a_change_in_the_range(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "a.sql").write_text("select 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "root")
+    base = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "a.sql").write_text("select 2\n")
+    _git(repo, "commit", "-qam", "side")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "a.sql").write_text("select 3\n")
+    _git(repo, "commit", "-qam", "main")
+    subprocess.run(  # noqa: S603
+        ["git", "-C", str(repo), "merge", "-q", "side"],  # noqa: S607
+        capture_output=True,
+        env=git_env(),
+        check=False,
+    )
+    # The breaking line exists only in the resolution.
+    (repo / "a.sql").write_text("select broken\n")
+    _git(repo, "commit", "-qam", "merge")
+    merge = _git(repo, "rev-parse", "HEAD")
+    # Bounded by both parents, only the merge itself is in the range.
+    parents = _git(repo, "rev-parse", f"{merge}^1", f"{merge}^2").split()
+    touched, count = GitHistory(repo).touching(merge, [base, *parents])
+
+    assert count == 1
+    assert touched == ((merge, ("a.sql",)),)

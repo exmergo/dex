@@ -462,19 +462,27 @@ and takes each open incident to a cause, or to none.
     of `maintain check` (`column_retyped`) on each source the lineage reads,
     between `snapshots.before` and `snapshots.after`, or the live catalog
     where no later snapshot exists (metadata only, free). Confirmed for a
-    column the tested model reads: the tested column, or a word in a model's
-    code on the path (where the manifest holds no code, any column, and the
-    evidence says `read_by_lineage: unknown`). With no snapshot before the
-    break it is `not_checked` (`no_measured_before`): a type needs a baseline.
+    column the tested model reads: the tested column, or a word in the code
+    of a model that reads that source directly. Where that cannot be told (no
+    code in the manifest, or a wildcard projection reading the column
+    unspelled) the retype is named `not_checked` (`column_read_unknown`),
+    never a cause. A source is matched to its relation by database, schema
+    and name, and one two relations could be is not measured. With no
+    snapshot before the break it is `not_checked` (`no_measured_before`): a
+    type needs a baseline.
   - *The project changed a model in the range* (`project_change`): the files
     the break's commit range touched (`git log` over the commits the failing
     commit has and no bounding passing commit has, not capped at the 50
-    `onset.commits` lists), kept where the lineage is built or patched from
-    them (a project macro it calls, and `dbt_project.yml`, count for the
-    tested model). Then `maintain verify` on the changed models, in the same
-    process: a finding of medium or high severity on a changed model
-    confirms; a build finding on a test node never does, so the incident's
-    own failure cannot confirm itself. Ruled out where nothing in the range
+    `onset.commits` lists, a merge's own conflict resolution included), kept
+    where the lineage is built or patched from them (a project macro counts
+    for the models that call it, directly or through another macro, and
+    `dbt_project.yml` for the tested model). Then `maintain verify` on the
+    changed models, in the same process: a finding of medium or high
+    severity on a changed model confirms; a build finding on a test node
+    never does, so the incident's own failure cannot confirm itself. Verify
+    reads the project as it stands, so where a changed file reads otherwise
+    now than at the failing commit its answer is kept as evidence and the
+    candidate is `not_checked` (`changed_since_failure`). Ruled out where nothing in the range
     touches the lineage (`not_in_lineage`) or verify finds nothing
     (`verify_clean`); `not_checked` where verify's scan was offered
     (`scan_offered`) or its data checks were all suppressed
@@ -494,9 +502,10 @@ and takes each open incident to a cause, or to none.
     content a passing commit already held never counts; ruled out on
     `same_hash` or `no_seed_in_lineage`. Hashes only, never a row.
   - *The schedule built a parent after its child* (`built_before_parent`):
-    for each child and parent model the failing test reads (a
-    `relationships` test's two models, else the tested model and each parent
-    model it reads), both models' last successful builds, read from
+    for the tested model and each model it reads directly (a model a test
+    reads beside it, such as a `relationships` test's other side, is a pair
+    only where the tested model reads it), both models' last successful
+    builds, read from
     Elementary's `dbt_run_results`. The build a run's test read is the one
     that run made itself, else the newest that completed before the run
     started. Confirmed where, at the last passing run, the parent's build
@@ -510,7 +519,9 @@ and takes each open incident to a cause, or to none.
     The read is one bounded statement (ids and execution times of successful
     model rows, never `compiled_code`, `message` or `adapter_response`, which
     a profile withholds), through the query firewall and priced into the
-    checks' one handshake.
+    checks' one handshake. Where the grain checks fit what the ceiling has
+    left and the two together do not, the grain checks run and the read alone
+    is offered (`price.checks.schedule_offered`).
 
   The range's files have one owner each: a seed's CSV is the seed's,
   `packages.yml`, `dependencies.yml` and `package-lock.yml` the package's,
@@ -518,7 +529,12 @@ and takes each open incident to a cause, or to none.
   Where the failing commit passed earlier (`same_commit`) the project, seed
   and package are ruled out together; where the commits the break spans are
   not known they are `not_checked` (`no_commit_history`,
-  `commit_range_unknown`).
+  `commit_range_unknown`). A rule-out that rests on something being absent
+  (`not_in_lineage`, `no_seed_in_lineage`, `no_parent_model`) is
+  `not_checked` where the read was incomplete: the walk upstream stopped at
+  its limit (`lineage_truncated`) or the range's commits were listed in part
+  (`range_truncated`), with the rule-out it would have been under
+  `would_rule_out`.
 - **No cause is an answer.** `verdict` is `cause`, `several` (each named, none
   preferred) or `no_cause`. With no confirmed candidate the answer is
   `ruled_out` and `unseen`; the most likely candidate is never named as the

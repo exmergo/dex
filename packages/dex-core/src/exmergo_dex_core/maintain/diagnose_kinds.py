@@ -132,7 +132,7 @@ def git_kinds(
     from .commit_history import HistoryUnreadableError
 
     try:
-        touched, _count = history.touching(bounds.through, bounds.after)
+        touched, count = history.touching(bounds.through, bounds.after)
     except (HistoryUnreadableError, ValueError) as exc:
         for owner, kind in (
             ("project", "project_change"),
@@ -160,6 +160,27 @@ def git_kinds(
     def commits_of(paths: Sequence[str]) -> int:
         return len({sha for path in paths for sha in by_file.get(path, ())})
 
+    cut = count > len(touched)
+
+    def settle(candidate: diag.Candidate, *, by_range: bool = False) -> diag.Candidate:
+        """A rule-out an incomplete read cannot support, as not checked."""
+
+        if by_range and cut:
+            candidate = ck.unproven(
+                candidate,
+                "range_truncated",
+                f"the break's range holds {count} commits and {len(touched)} "
+                "were listed",
+            )
+        if found is not None and found.truncated:
+            candidate = ck.unproven(
+                candidate,
+                "lineage_truncated",
+                "the walk upstream of the failing test stopped at its limit with "
+                "nodes left unread",
+            )
+        return candidate
+
     # The project.
     if found is None:
         work.candidates.append(
@@ -174,13 +195,21 @@ def git_kinds(
         )
         if not change.files:
             work.candidates.append(
-                ck.project_not_in_lineage(change, len(owned["project"]))
+                settle(
+                    ck.project_not_in_lineage(change, len(owned["project"])),
+                    by_range=True,
+                )
             )
         elif not change.models:
             work.candidates.append(ck.project_test_only(change))
         else:
             candidate = _verify(
-                engine, found, change, {} if verified is None else verified
+                engine,
+                found,
+                change,
+                {} if verified is None else verified,
+                history=history,
+                through=bounds.through,
             )
             work.candidates.append(candidate)
             if candidate.status == "confirmed":
@@ -198,6 +227,7 @@ def git_kinds(
     for candidate in ck.seed_candidates(
         lineage, hashes, bounds, {p: by_file.get(p, []) for p in owned["seed"]}
     ):
+        candidate = settle(candidate)
         work.candidates.append(candidate)
         if candidate.status == "confirmed":
             work.next_steps.append(_seed_step(candidate))
@@ -216,6 +246,7 @@ def git_kinds(
             {sha for path in owned["package"] for sha in by_file.get(path, ())}
         ),
     )
+    candidate = settle(candidate)
     work.candidates.append(candidate)
     if candidate.status == "confirmed":
         work.next_steps.append(_package_step(candidate))
@@ -243,10 +274,18 @@ def _verify(
     found: ck.Lineage,
     change: ck.ProjectChange,
     verified: dict[tuple[str, ...], Any],
+    *,
+    history: Any = None,
+    through: str | None = None,
 ) -> diag.Candidate:
     """``maintain verify`` on the changed models, in this process. ``verified``
     holds each sweep for the life of one command, so two incidents on one
-    changed model are judged by one sweep."""
+    changed model are judged by one sweep.
+
+    Verify reads the project as it stands. Where a changed file reads
+    otherwise now than at the failing run's commit (a repair, or a later
+    edit), its findings describe today's model, not the one that failed: they
+    are kept as evidence and the candidate is not checked."""
 
     from ..errors import DexError
 
@@ -266,13 +305,59 @@ def _verify(
             detail=f"maintain verify on the changed model was refused: {exc}",
             evidence={"models": sorted(names.values())},
         )
-    return ck.project_verified(
+    candidate = ck.project_verified(
         change,
         names,
         result.findings,
         offered=getattr(result, "pending_offer", None) is not None,
         suppressed=result.suppressed,
     )
+    moved = _moved_since(engine, history, through, change.files)
+    if moved and candidate.status in ("confirmed", "ruled_out"):
+        return candidate.model_copy(
+            update={
+                "status": "not_checked",
+                "reason": "changed_since_failure",
+                "detail": f"{', '.join(moved)} changed after the failing run's "
+                "commit, so maintain verify judged today's model, not the one "
+                f"that failed (it would read {candidate.status}"
+                + (f": {candidate.finding}" if candidate.finding else "")
+                + ")",
+                "evidence": {
+                    **candidate.evidence,
+                    "changed_since_failure": moved,
+                    "verify_today": candidate.status,
+                },
+            }
+        )
+    return candidate
+
+
+def _moved_since(
+    engine: DexEngine, history: Any, through: str | None, files: Sequence[str]
+) -> list[str]:
+    """The files that read otherwise in the working tree than at ``through``."""
+
+    from pathlib import Path
+
+    from ..errors import DexError
+
+    if history is None or through is None:
+        return []
+    try:
+        root = Path(engine.project_dir())
+    except (DexError, ValueError):
+        return []
+    moved: list[str] = []
+    for path in files:
+        then = _text(history, through, path)
+        try:
+            now = (root / path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            now = None
+        if then != now:
+            moved.append(path)
+    return moved
 
 
 # --- the loader: a retyped source column ---------------------------------------------
@@ -326,13 +411,17 @@ def retype(
     checked: list[str] = []
     unmeasured: list[str] = []
     retyped: dict[str, list[Any]] = {}
+    relation_sources: dict[str, str] = {}
     for uid in found.sources:
         source = sources.get(uid) or {}
         identifier = _match(
             list(baseline),
             str(source.get("schema") or ""),
             str(source.get("identifier") or source.get("name") or ""),
+            str(source.get("database") or "") or None,
         )
+        if identifier is not None:
+            relation_sources[identifier] = uid
         if identifier is None or not baseline[identifier].columns:
             name = source.get("identifier") or source.get("name")
             unmeasured.append(f"{source.get('schema')}.{name}")
@@ -359,22 +448,38 @@ def retype(
         else "the live catalog"
     )
     for candidate in ck.retype_candidates(
-        found, retyped, against, checked=checked, unmeasured=unmeasured
+        found,
+        retyped,
+        against,
+        checked=checked,
+        unmeasured=unmeasured,
+        sources=relation_sources,
     ):
         work.candidates.append(candidate)
         if candidate.status == "confirmed":
             work.next_steps.append(_retype_step(candidate))
 
 
-def _match(identifiers: Sequence[str], schema: str, name: str) -> str | None:
+def _match(
+    identifiers: Sequence[str], schema: str, name: str, database: str | None = None
+) -> str | None:
+    """The one identifier naming the source, by database where the manifest
+    names one; ``None`` where none does, or several do and nothing tells them
+    apart (never the first of them)."""
+
     want_schema, want_name = schema.casefold(), name.casefold()
+    want_db = (database or "").casefold()
+    found: list[str] = []
     for identifier in sorted(identifiers):
         parts = identifier.split(".")
         if len(parts) < 2:
             continue
-        if parts[-1].casefold() == want_name and parts[-2].casefold() == want_schema:
-            return identifier
-    return None
+        if parts[-1].casefold() != want_name or parts[-2].casefold() != want_schema:
+            continue
+        if want_db and len(parts) >= 3 and parts[-3].casefold() != want_db:
+            continue
+        found.append(identifier)
+    return found[0] if len(found) == 1 else None
 
 
 def _live(adapter: Adapter, identifier: str) -> list[Dataset]:

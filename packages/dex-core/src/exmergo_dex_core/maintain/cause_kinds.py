@@ -210,6 +210,15 @@ class Lineage:
     pairs: tuple[tuple[str, str], ...] = ()
     code: tuple[str, ...] = ()
     columns: tuple[str, ...] = ()
+    #: The code of the models that read each source directly, so a retyped
+    #: column is matched against the models that read that relation.
+    readers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: The models each project macro is reached from, directly or through
+    #: another macro, so a changed macro is judged on the models that call it.
+    macro_callers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Whether the walk stopped at its limit with nodes left unvisited: an
+    #: absence (no seed, no package, no file) then proves nothing.
+    truncated: bool = False
 
 
 def _patch(path: Any) -> str | None:
@@ -264,6 +273,7 @@ def lineage(
             queue.extend(
                 str(d) for d in (held.get("depends_on") or {}).get("nodes") or ()
             )
+    truncated = any(uid not in seen for uid in queue)
 
     files: dict[str, list[str]] = {}
     packages: list[str] = []
@@ -271,11 +281,29 @@ def lineage(
     seeds: dict[str, str] = {}
     found_sources: list[str] = []
     code: list[str] = []
-    used_macros: list[str] = []
+    readers: dict[str, list[str]] = {}
+    callers: dict[str, list[str]] = {}
 
     def own(path: str | None, uid: str) -> None:
         if path:
             files.setdefault(_norm(path), []).append(uid)
+
+    def macro_closure(start: Iterable[str]) -> list[str]:
+        """Every macro reached from ``start``, through the macros each calls."""
+
+        reached: list[str] = []
+        pending = list(start)
+        while pending and len(reached) < limit:
+            uid = pending.pop(0)
+            if uid in reached:
+                continue
+            reached.append(uid)
+            macro = macros.get(uid)
+            if isinstance(macro, Mapping):
+                pending.extend(
+                    str(m) for m in (macro.get("depends_on") or {}).get("macros") or ()
+                )
+        return reached
 
     namespace = (node.get("test_metadata") or {}).get("namespace")
     if namespace:
@@ -303,20 +331,24 @@ def lineage(
             own(_patch(held.get("patch_path")), uid)
         if kind == "model":
             models[uid] = str(held.get("name") or uid.split(".")[-1])
-            code.extend(
+            texts = [
                 text
                 for text in (held.get("raw_code"), held.get("compiled_code"))
                 if isinstance(text, str) and text
-            )
+            ]
+            code.extend(texts)
+            for dep in (held.get("depends_on") or {}).get("nodes") or ():
+                if str(dep).startswith("source."):
+                    readers.setdefault(str(dep), []).extend(texts or [""])
         elif kind == "seed":
             path = held.get("original_file_path")
             if isinstance(path, str) and path and package == project:
                 seeds[uid] = _norm(path)
-        used_macros.extend(
-            str(m) for m in (held.get("depends_on") or {}).get("macros") or ()
-        )
+        direct = [str(m) for m in (held.get("depends_on") or {}).get("macros") or ()]
+        for macro_uid in macro_closure(direct):
+            callers.setdefault(macro_uid, []).append(uid)
 
-    for uid in dict.fromkeys(used_macros):
+    for uid in callers:
         owner = _macro_package(uid)
         if owner is None:
             continue
@@ -331,11 +363,12 @@ def lineage(
             # dbt_utils, dbt_expectations: a package, not dbt's or an adapter's.
             packages.append(package)
 
+    # A schedule can only stale a model through a model it reads: each pair is
+    # the tested model and a model parent it depends on directly. A model a
+    # test reads beside it (a relationships test's other side) is a pair only
+    # where the tested model reads it.
     pairs: list[tuple[str, str]] = []
-    dep_models = [d for d in deps if d.startswith("model.")]
-    if model is not None and len(dep_models) >= 2:
-        pairs.extend((model, other) for other in dep_models if other != model)
-    elif model is not None:
+    if model is not None:
         held = nodes.get(model)
         if isinstance(held, Mapping):
             parents = (held.get("depends_on") or {}).get("nodes") or ()
@@ -360,6 +393,12 @@ def lineage(
         pairs=tuple(dict.fromkeys(pairs))[:MAX_PAIRS],
         code=tuple(code),
         columns=tuple(columns),
+        readers={uid: tuple(texts) for uid, texts in readers.items()},
+        macro_callers={
+            uid: tuple(dict.fromkeys(c for c in calling if c in models or c == test))
+            for uid, calling in callers.items()
+        },
+        truncated=truncated,
     )
 
 
@@ -400,9 +439,13 @@ def project_change(
                 models.append(uid)
             elif uid == found.test:
                 test_changed = True
-            elif uid.startswith("macro.") and found.model is not None:
-                # A project macro the lineage calls: judged on the tested model.
-                models.append(found.model)
+            elif uid.startswith("macro."):
+                # A project macro the lineage calls, directly or through another
+                # macro: judged on the models that call it.
+                calling = found.macro_callers.get(uid, ())
+                models.extend(c for c in calling if c in found.models)
+                if found.test in calling:
+                    test_changed = True
     if wide and found.model is not None:
         models.append(found.model)
     return ProjectChange(
@@ -411,6 +454,29 @@ def project_change(
         models=tuple(dict.fromkeys(models)),
         test_changed=test_changed,
         project_wide=wide,
+    )
+
+
+#: The rule-outs that rest on something being absent from the lineage or the
+#: range: an incomplete walk or a cut listing cannot support them.
+_ABSENCE = frozenset(
+    {"not_in_lineage", "no_seed_in_lineage", "no_parent_model", "no_packages"}
+)
+
+
+def unproven(candidate: Candidate, reason: str, detail: str) -> Candidate:
+    """``candidate`` as ``not_checked`` where its rule-out rests on an absence
+    an incomplete read cannot show; any other answer as it stands."""
+
+    if candidate.status != "ruled_out" or candidate.reason not in _ABSENCE:
+        return candidate
+    return candidate.model_copy(
+        update={
+            "status": "not_checked",
+            "reason": reason,
+            "detail": f"{detail}, so {candidate.reason} cannot be shown",
+            "evidence": {**candidate.evidence, "would_rule_out": candidate.reason},
+        }
     )
 
 
@@ -547,18 +613,30 @@ def project_verified(
 # --- the loader: a retyped source column ---------------------------------------------
 
 
-def reads_column(found: Lineage, column: str) -> bool | None:
-    """Whether the lineage reads ``column``: the tested column, or a word in a
-    model's code on the path. ``None`` where no model's code is in the manifest,
-    so nothing says which columns it reads."""
+#: A projection that reads every column: a retyped column is read through it
+#: whether or not the code spells the column.
+_WILDCARD = re.compile(r"(?:\bselect\s+(?:distinct\s+)?|,\s*|\.)\*", re.IGNORECASE)
+
+
+def reads_column(found: Lineage, column: str, source: str | None = None) -> bool | None:
+    """Whether the lineage reads ``column`` of ``source``: the tested column, or
+    a word in the code of a model that reads that source directly. ``None``
+    where it cannot be told: no code for those models in the manifest, or a
+    wildcard projection that reads the column without spelling it."""
 
     wanted = column.casefold()
     if any(c.casefold() == wanted for c in found.columns):
         return True
-    if not found.code:
+    texts = found.readers.get(source, ()) if source is not None else found.code
+    texts = tuple(t for t in texts if t)
+    if not texts:
         return None
     pattern = re.compile(rf"(?<![\w$]){re.escape(wanted)}(?![\w$])", re.IGNORECASE)
-    return any(pattern.search(text) for text in found.code)
+    if any(pattern.search(text) for text in texts):
+        return True
+    if any(_WILDCARD.search(text) for text in texts):
+        return None
+    return False
 
 
 def retype_candidates(
@@ -568,30 +646,56 @@ def retype_candidates(
     *,
     checked: Sequence[str],
     unmeasured: Sequence[str] = (),
+    sources: Mapping[str, str] | None = None,
 ) -> list[Candidate]:
     """The loader's retype candidates, from the schema axis's ``column_retyped``
-    findings per relation (``retyped``), over the relations ``checked``."""
+    findings per relation (``retyped``), over the relations ``checked``.
+    ``sources`` maps each relation to the manifest source it is, so a column is
+    matched against the models that read that relation.
+
+    A retype is confirmed only where the lineage is shown to read the column;
+    where that cannot be told, it is named ``not_checked``, never a cause."""
 
     confirmed: list[Candidate] = []
+    unknown: list[Candidate] = []
     unread: list[str] = []
     for relation in checked:
+        source = (sources or {}).get(relation)
         for finding in retyped.get(relation, ()):
             column = str(finding.column or "")
-            read = reads_column(found, column)
+            read = reads_column(found, column, source)
             if read is False:
                 unread.append(f"{relation}.{column}")
                 continue
             data = finding.data or {}
-            detail = (
+            evidence = {
+                "type_before": data.get("type_before"),
+                "type_after": data.get("type_after"),
+                "measured_against": measured_against,
+            }
+            moved = (
                 f"{relation}.{column} was retyped from {data.get('type_before')} "
                 f"to {data.get('type_after')} since the snapshot that bounds the "
                 "break"
             )
             if read is None:
-                detail += (
-                    "; the manifest holds no model code, so the column is not "
-                    "shown to be one the tested model reads"
+                unknown.append(
+                    Candidate(
+                        owner="loader",
+                        kind="source_retyped",
+                        relation=relation,
+                        columns=(column,),
+                        status="not_checked",
+                        check=SCHEMA_CHECK,
+                        finding="column_retyped",
+                        reason="column_read_unknown",
+                        detail=moved + "; the manifest does not show whether the "
+                        "models reading it read this column (no code, or a "
+                        "wildcard projection), so it is named and not confirmed",
+                        evidence=evidence,
+                    )
                 )
+                continue
             confirmed.append(
                 Candidate(
                     owner="loader",
@@ -601,25 +705,20 @@ def retype_candidates(
                     status="confirmed",
                     check=SCHEMA_CHECK,
                     finding="column_retyped",
-                    detail=detail,
-                    evidence={
-                        "type_before": data.get("type_before"),
-                        "type_after": data.get("type_after"),
-                        "measured_against": measured_against,
-                        **({"read_by_lineage": "unknown"} if read is None else {}),
-                    },
+                    detail=moved,
+                    evidence=evidence,
                 )
             )
     if confirmed:
-        return confirmed
-    held: list[Candidate] = []
-    if checked:
-        evidence: dict[str, Any] = {
+        return [*confirmed, *unknown]
+    held: list[Candidate] = list(unknown)
+    if checked and not unknown:
+        evidence_out: dict[str, Any] = {
             "relations": list(checked),
             "measured_against": measured_against,
         }
         if unread:
-            evidence["retyped_not_read"] = unread[:_MAX_FILES]
+            evidence_out["retyped_not_read"] = unread[:_MAX_FILES]
         held.append(
             Candidate(
                 owner="loader",
@@ -629,7 +728,7 @@ def retype_candidates(
                 reason="no_retype",
                 detail="no column the tested model reads was retyped on "
                 f"{', '.join(checked)} since the snapshot that bounds the break",
-                evidence=evidence,
+                evidence=evidence_out,
             )
         )
     if unmeasured:
@@ -785,7 +884,10 @@ def package_candidate(
     if commits:
         evidence["commits"] = list(commits[:_MAX_FILES])
     if hits:
-        first = next(c for c in evidence["changed"] if c["package"] == hits[0])
+        first = {
+            "version_before": before[hits[0]].version if hits[0] in before else None,
+            "version_after": after[hits[0]].version if hits[0] in after else None,
+        }
         return Candidate(
             **base,
             status="confirmed",
@@ -1122,4 +1224,5 @@ __all__ = [
     "schedule_unread",
     "seed_candidates",
     "unknown_range",
+    "unproven",
 ]

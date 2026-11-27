@@ -768,19 +768,33 @@ def _confirm_all(
         estimate += total
         for key, value in per.items():
             per_table[key] = per_table.get(key, 0.0) + value
-    if schedule is not None:
-        estimate += schedule.estimate
-        for key, value in schedule.per_table.items():
-            per_table[key] = per_table.get(key, 0.0) + value
-    price: dict[str, Any] = {"estimate": estimate, "per_table": per_table}
-    if not planned and schedule is None:
-        return price
     gate = command_args.cost_gate(adapter)
     left = (
         None
         if gate is None or gate.ceiling is None
         else max(gate.ceiling - spent_before, 0.0)
     )
+    offered_alone: dict[str, Any] | None = None
+    if schedule is not None:
+        if left is not None and planned and estimate + schedule.estimate > left:
+            # Together they do not fit: the grain checks, which can confirm a
+            # cause on their own, keep the room, and the build-times read is
+            # offered rather than taking both down with it.
+            dk.offer_schedule(schedule)
+            offered_alone = {
+                "estimate": schedule.estimate,
+                "per_table": schedule.per_table,
+            }
+            schedule = None
+        else:
+            estimate += schedule.estimate
+            for key, value in schedule.per_table.items():
+                per_table[key] = per_table.get(key, 0.0) + value
+    price: dict[str, Any] = {"estimate": estimate, "per_table": per_table}
+    if offered_alone is not None:
+        price["schedule_offered"] = offered_alone
+    if not planned and schedule is None:
+        return price
     if left is not None and estimate > left:
         # One confirmation covers the whole command: what the incident read
         # spent comes out of the same per-command ceiling, and checks that no

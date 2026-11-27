@@ -347,10 +347,25 @@ def _build(tmp_path: Path, shop: Shop) -> tuple[Path, Path]:
         f"CREATE TABLE raw.orders (order_id INTEGER, status_code INTEGER, "
         f"amount {shop.amount_type})"
     )
-    con.execute("INSERT INTO raw.orders SELECT range, 1, 1 FROM range(1, 101)")
-    con.execute("CREATE TABLE main.stg_orders AS SELECT * FROM raw.orders")
+    if shop.amount_type == "INTEGER":
+        con.execute("INSERT INTO raw.orders SELECT range, 1, 1 FROM range(1, 101)")
+    else:
+        # The loader's new type carries text the staging cast cannot read, so
+        # the tested claim (amount is never NULL) breaks.
+        con.execute(
+            "INSERT INTO raw.orders SELECT range, 1, "
+            "CASE WHEN range > 90 THEN 'n/a' ELSE '1' END FROM range(1, 101)"
+        )
+    con.execute(
+        "CREATE TABLE main.stg_orders AS SELECT order_id, status_code, "
+        "TRY_CAST(amount AS INTEGER) AS amount FROM raw.orders"
+    )
     con.execute("CREATE TABLE main.dim_status (status_code INTEGER, label VARCHAR)")
-    con.execute("INSERT INTO main.dim_status VALUES (1, 'placed'), (2, 'shipped')")
+    # The dimension is built from the seed as the failing commit holds it.
+    seed = {**BASE_FILES, **shop.edits}["seeds/status_codes.csv"]
+    for line in seed.strip().splitlines()[1:]:
+        code, label = line.split(",")
+        con.execute("INSERT INTO main.dim_status VALUES (?, ?)", [int(code), label])
     columns = {
         "order_id": "1 AS order_id",
         "status_code": "1 AS status_code",
@@ -372,6 +387,16 @@ def _in_order(runs: list[Run]) -> list[tuple]:
 
     rows: list[tuple] = []
     for run in runs:
+        stg_start = run.started + timedelta(seconds=30)
+        rows.append(
+            (
+                STG,
+                run.id,
+                _iso(stg_start),
+                _iso(stg_start + timedelta(seconds=20)),
+                run.started + timedelta(minutes=5),
+            )
+        )
         dim_start = run.started + timedelta(minutes=1)
         fct_start = run.started + timedelta(minutes=2)
         rows.append(
@@ -404,8 +429,13 @@ def _split(*, parent_last: bool) -> Callable[[list[Run]], list[tuple]]:
         held = list(_in_order(runs[:2]))
         for run in runs[2:]:
             fact_at = run.started - timedelta(minutes=10)
+            stg_at = fact_at - timedelta(minutes=1)
             dim_at = run.started - timedelta(minutes=5 if parent_last else 15)
-            for uid, at, job in ((FCT, fact_at, "f"), (DIM, dim_at, "d")):
+            for uid, at, job in (
+                (STG, stg_at, "f"),
+                (FCT, fact_at, "f"),
+                (DIM, dim_at, "d"),
+            ):
                 held.append(
                     (
                         uid,
@@ -464,10 +494,27 @@ def _assert_no_value(data: dict[str, Any]) -> None:
 # --- the loader: a source column retyped ----------------------------------------------
 
 
+def _count(warehouse: Path, sql: str) -> int:
+    con = duckdb.connect(str(warehouse), read_only=True)
+    try:
+        return int(con.execute(sql).fetchone()[0])
+    finally:
+        con.close()
+
+
+NULL_AMOUNTS = "SELECT count(*) FROM main.stg_orders WHERE amount IS NULL"
+ORPHANS = (
+    "SELECT count(*) FROM main.fct_orders f LEFT JOIN main.dim_status d "
+    "USING (status_code) WHERE d.status_code IS NULL"
+)
+
+
 def test_a_source_column_retyped_is_named_as_the_loader_cause(tmp_path: Path):
     root, warehouse = _build(
         tmp_path, Shop(failing=NOT_NULL, amount_type="VARCHAR", snapshot=True)
     )
+    # The retype breaks the tested claim in the warehouse itself.
+    assert _count(warehouse, NULL_AMOUNTS) > 0
     diagnosis = _one(_diagnose(root, warehouse))
     cause = _the_cause(diagnosis, "source_retyped")
 
@@ -486,6 +533,7 @@ def test_a_source_column_retyped_is_named_as_the_loader_cause(tmp_path: Path):
 
 def test_the_same_source_with_no_retype_reports_no_cause(tmp_path: Path):
     root, warehouse = _build(tmp_path, Shop(failing=NOT_NULL, snapshot=True))
+    assert _count(warehouse, NULL_AMOUNTS) == 0
     diagnosis = _one(_diagnose(root, warehouse))
     held = _no_cause(diagnosis, "source_retyped")
 
@@ -614,6 +662,8 @@ def test_a_seed_edited_in_the_range_is_the_cause_with_its_file_hashes(
         tmp_path,
         Shop(edits={"seeds/status_codes.csv": "status_code,label\n2,shipped\n"}),
     )
+    # The edit orphans the fact's key, so the relationships test breaks.
+    assert _count(warehouse, ORPHANS) > 0
     data = _diagnose(root, warehouse)
     diagnosis = _one(data)
     cause = _the_cause(diagnosis, "seed_edited")
@@ -631,6 +681,7 @@ def test_a_seed_edited_in_the_range_is_the_cause_with_its_file_hashes(
 
 def test_the_same_seed_at_both_commits_reports_no_cause(tmp_path: Path):
     root, warehouse = _build(tmp_path, Shop())
+    assert _count(warehouse, ORPHANS) == 0
     held = _no_cause(_one(_diagnose(root, warehouse)), "seed_edited")
 
     assert held["reason"] == "same_hash"
@@ -660,9 +711,17 @@ def test_a_dimension_built_after_its_fact_is_the_schedule_cause(tmp_path: Path):
 
 def test_a_dimension_built_before_its_fact_reports_no_cause(tmp_path: Path):
     root, warehouse = _build(tmp_path, Shop(builds=_split(parent_last=False)))
-    held = _no_cause(_one(_diagnose(root, warehouse)), "built_before_parent")
+    diagnosis = _one(_diagnose(root, warehouse))
 
-    assert held["reason"] == "parent_first"
+    assert diagnosis["verdict"] == "no_cause", diagnosis["causes"]
+    held = {
+        c["evidence"]["parent"]: (c["status"], c["reason"])
+        for c in _kind(diagnosis, "built_before_parent")
+    }
+    assert held == {
+        "dim_status": ("ruled_out", "parent_first"),
+        "stg_orders": ("ruled_out", "parent_first"),
+    }
 
 
 def test_with_no_dbt_run_results_the_schedule_is_not_checked(tmp_path: Path):
@@ -701,3 +760,97 @@ def test_two_candidates_in_one_range_name_the_confirmed_one_and_rule_out_the_oth
     assert package["status"] == "ruled_out"
     assert package["reason"] == "not_in_lineage"
     assert package["evidence"]["changed"][0]["package"] == "codegen"
+
+
+# --- the review's findings ---------------------------------------------------------
+
+
+def test_a_model_changed_again_since_the_failure_is_not_judged_by_today_s_verify(
+    tmp_path: Path,
+):
+    root, warehouse = _build(
+        tmp_path,
+        Shop(
+            edits={"models/fct_orders.sql": "select order_id, status_code from x\n"},
+            fct_columns=("order_id", "status_code", "label"),
+        ),
+    )
+    # A repair in the working tree: verify would read today's model.
+    (root / "models" / "fct_orders.sql").write_text("select * from stg_orders\n")
+    [held] = _kind(_one(_diagnose(root, warehouse)), "project_change")
+
+    assert (held["status"], held["reason"]) == ("not_checked", "changed_since_failure")
+    assert held["evidence"]["changed_since_failure"] == ["models/fct_orders.sql"]
+    assert held["evidence"]["verify_today"] == "confirmed"
+
+
+def test_a_source_two_databases_hold_is_not_matched_to_either():
+    from exmergo_dex_core.maintain.diagnose_kinds import _match
+
+    both = ["a.raw.orders", "b.raw.orders"]
+    assert _match(both, "raw", "orders", "b") == "b.raw.orders"
+    assert _match(both, "raw", "orders") is None
+    assert _match(["a.raw.orders"], "raw", "orders") == "a.raw.orders"
+
+
+def test_grain_checks_that_fit_run_when_the_build_times_read_does_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.envelope import Paradigm
+    from exmergo_dex_core.guards.cost_guard import CostGate
+    from exmergo_dex_core.maintain import drift as drift_mod
+    from exmergo_dex_core.maintain import run_times
+
+    root, warehouse = _build(tmp_path, Shop(failing=COMBO))
+    engine = DexEngine(connector="duckdb", path=str(warehouse), repo_root=str(root))
+    opened = engine._adapter
+
+    def gated(*args, **kwargs):
+        adapter = opened(*args, **kwargs)
+        adapter.cost_gate = CostGate(
+            paradigm=Paradigm.BYTES_SCANNED,
+            ceiling=1_000.0,
+            session_ceiling=100_000_000.0,
+            session_spent=0.0,
+            confirmed=True,
+            connector="bigquery",
+            command="maintain diagnose",
+        )
+        return adapter
+
+    monkeypatch.setattr(engine, "_adapter", gated)
+    monkeypatch.setattr(
+        drift_mod, "grain_estimate", lambda adapter, plan, batched=None: (400.0, {})
+    )
+    monkeypatch.setattr(
+        run_times, "price", lambda engine, adapter, held: (800.0, {"read": 800.0})
+    )
+    data = to_envelope(engine.diagnose()).data
+    diagnosis = _one(data)
+
+    # The grain check ran and answered; the build-times read alone was offered.
+    [loader] = _kind(diagnosis, "duplicate_load")
+    assert loader["reason"] != "scan_offered"
+    assert "offered" not in data["price"]["checks"]
+    assert data["price"]["checks"]["schedule_offered"]["estimate"] == 800.0
+    schedule = _kind(diagnosis, "built_before_parent")
+    assert schedule and all(c["reason"] == "scan_offered" for c in schedule)
+
+
+def test_a_range_listed_in_part_rules_no_project_change_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.maintain.commit_history import GitHistory
+
+    real = GitHistory.touching
+
+    def cut(self, bad, goods, limit=200):
+        touched, count = real(self, bad, goods, limit)
+        return touched, count + 300  # older commits past the listing
+
+    monkeypatch.setattr(GitHistory, "touching", cut)
+    root, warehouse = _build(tmp_path, Shop())
+    [held] = _kind(_one(_diagnose(root, warehouse)), "project_change")
+
+    assert (held["status"], held["reason"]) == ("not_checked", "range_truncated")
+    assert held["evidence"]["would_rule_out"] == "not_in_lineage"

@@ -300,8 +300,11 @@ class GitHistory:
         first and at most ``limit`` of them, and how many such commits there are.
 
         Renames are listed as the path removed and the path added, so a file
-        moved out of a seed directory is still a seed edit. A merge lists no
-        files of its own: the commits it brings in are listed instead.
+        moved out of a seed directory is still a seed edit. A merge lists the
+        files its own resolution changed (those that differ from every parent,
+        git's combined diff), beside the commits it brings in, so a breaking
+        line written only while resolving a conflict is still a change in the
+        range.
         """
 
         head = _held(bad)
@@ -312,6 +315,7 @@ class GitHistory:
             "log",
             "--relative",
             "--no-renames",
+            "--diff-merges=dense-combined",
             "--name-only",
             "--format=%x01%H",
             *spec,
