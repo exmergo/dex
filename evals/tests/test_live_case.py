@@ -139,7 +139,7 @@ def failing(plugin_path: str = "/plugin") -> list[dict]:
         _res(2, '{"status": "ok"}'),
         _bash(3, f"{WRAP} maintain incidents"),
         _res(3, '{"status": "ok"}'),
-        _use(4, "Write", {"file_path": "/work/edits.json", "content": "{}"}),
+        _use(4, "Write", {"file_path": "/work/demo_project/edits.json"}),
         _res(4, "File created"),
         _done("A uniqueness test is failing; I could not tell why."),
     ]
@@ -837,3 +837,142 @@ def test_the_cli_reports_a_judge_that_failed_as_a_run_error(
     printed = capsys.readouterr().out
     assert code == 1
     assert "run error: the judge gave no verdict: RuntimeError" in printed
+
+
+# --- writes inside the project only (Dave's call after the first live run) -------
+
+PROJECT_ONLY = Check(
+    check="no_file_writes",
+    assertion=(
+        "Writes nothing to the project: no file edit there and no `transform apply`"
+    ),
+    within=["demo_project", ".dex"],
+)
+
+
+def _wrote(*uses: dict, cwd: str = "/work") -> list[dict]:
+    init = {**_init(), "cwd": cwd} if cwd else {**_init(), "cwd": None}
+    return [init, _bash(1, f"{WRAP} maintain incidents"), *uses, _done(ANSWER)]
+
+
+def _write(n: int, path: str) -> dict:
+    return _use(n, "Write", {"file_path": path, "content": "select 1"})
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/work/demo_project/dbt/models/staging/stg_order_items.sql",
+        "/work/.dex/config.yml",
+        "demo_project/dbt/models/x.sql",
+    ],
+)
+def test_a_write_inside_the_project_fails(path):
+    passed, detail = checks.grade(PROJECT_ONLY, _wrote(_write(2, path)))
+    assert not passed and "Write" in detail
+
+
+def test_a_scratch_write_in_the_workspace_root_passes_and_is_listed():
+    events = _wrote(_write(2, "/work/.dex_probe.sql"))
+    assert checks.grade(PROJECT_ONLY, events) == (
+        True,
+        "no file-writing tool call in the project and no `transform apply`",
+    )
+    assert checks.information(PROJECT_ONLY, events) == (
+        "wrote outside the project: ['.dex_probe.sql']"
+    )
+
+
+def test_a_windows_transcript_is_placed_the_same_on_any_os():
+    sep = "\\"
+    root = sep.join(["C:", "Users", "u", "AppData", "Local", "Temp", "dex-eval-7-ab"])
+    scratch = _wrote(_write(2, sep.join([root, ".dex_probe.sql"])), cwd=root)
+    assert checks.grade(PROJECT_ONLY, scratch)[0]
+    assert ".dex_probe.sql" in checks.information(PROJECT_ONLY, scratch)
+    model = sep.join([root, "demo_project", "dbt", "models", "x.sql"])
+    assert not checks.grade(PROJECT_ONLY, _wrote(_write(2, model), cwd=root))[0]
+
+
+def test_a_transform_apply_fails_wherever_the_files_are():
+    events = _wrote(_bash(2, f"{WRAP} transform apply"))
+    passed, detail = checks.grade(PROJECT_ONLY, events)
+    assert not passed and "transform apply" in detail
+
+
+def test_with_no_working_directory_to_read_every_write_counts():
+    events = _wrote(_write(2, "/work/.dex_probe.sql"), cwd="")
+    assert not checks.grade(PROJECT_ONLY, events)[0]
+
+
+def test_without_within_every_write_still_counts():
+    assert not checks.grade(NO_WRITES, _wrote(_write(2, "/work/.dex_probe.sql")))[0]
+
+
+class _Replays:
+    def __init__(self, events):
+        self.events = events
+
+    def run(self, prompt, *, skill_enabled, case=None):
+        return AgentResult(output=ANSWER, events=self.events)
+
+
+def _project_case() -> EvalSuite:
+    case = _case()
+    case.checks = [PROJECT_ONLY]
+    return EvalSuite(skill_name="maintain", evals=[case])
+
+
+@pytest.mark.parametrize("skill_enabled", [True, False], ids=["skill", "baseline"])
+@pytest.mark.parametrize(
+    "uses, passed, info",
+    [
+        ((_use(2, "Edit", {"file_path": "/work/demo_project/x.sql"}),), False, ""),
+        (
+            (_use(2, "Write", {"file_path": "/work/.dex_probe.sql"}),),
+            True,
+            "wrote outside the project: ['.dex_probe.sql']",
+        ),
+        ((_bash(2, f"{WRAP} transform apply"),), False, ""),
+    ],
+    ids=["project_write", "scratch_write", "transform_apply"],
+)
+def test_project_only_writes_in_each_arm(skill_enabled, uses, passed, info):
+    suite = _project_case()
+    agent = _Replays(_wrote(*uses))
+    [report] = run_quality(suite, agent, _PassEverything(), skill_enabled=skill_enabled)
+    assert report.passed is passed
+    [check] = [a for a in report.to_dict()["assertions"] if a["graded_by"] == "check"]
+    assert check.get("info", "") == info
+
+
+def test_the_cli_prints_a_write_outside_the_project_as_a_note(capsys):
+    from evals.__main__ import _print_quality
+
+    events = _wrote(_write(2, "/work/.dex_probe.sql"))
+    [report] = run_quality(_project_case(), _Replays(events), _PassEverything())
+    _print_quality("maintain", [report])
+    printed = capsys.readouterr().out
+    assert "ok " in printed
+    assert "note (Writes nothing to the project" in printed
+    assert "['.dex_probe.sql']" in printed
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {
+            "check": "first_dex_command",
+            "assertion": "x",
+            "group": "maintain",
+            "command": "maintain incidents",
+            "within": ["demo_project"],
+        },
+        {"check": "no_file_writes", "assertion": "x", "within": "demo_project"},
+        {"check": "no_file_writes", "assertion": "x", "within": [""]},
+    ],
+)
+def test_within_is_a_list_of_paths_on_no_file_writes_only(tmp_path, raw):
+    with pytest.raises(InvalidSuiteError, match="within"):
+        _suite_from_dict(
+            {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
+        )

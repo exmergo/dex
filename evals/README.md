@@ -90,7 +90,13 @@ makes it run differently from the rest:
   `no_dex_command` (no `command` call's shell command matches `matching`, a
   case-insensitive regular expression) and `no_file_writes` (no `Write`,
   `Edit`, `MultiEdit` or `NotebookEdit` call, no `transform apply`, `init` or
-  `deps`, and no confirmed `config set` or `unset`). Dex calls are read from
+  `deps`, and no confirmed `config set` or `unset`). `no_file_writes` may
+  take `within`, paths relative to the run's working directory (the
+  transcript's `init` `cwd`): then only a file edit under one of them fails
+  it, and a file written elsewhere, such as a scratch file in the workspace
+  root, is listed as the check's `info` (in `--json`, and as a `note` line in
+  the text report) without failing it. A Dex call that writes the project
+  fails it either way. Dex calls are read from
   the `Bash` and `PowerShell` tools with the metadata eval's parser. Two
   things are not read: a file a shell command writes itself (a redirect,
   `sed -i`), and SQL a call takes from a file or a variable, since `matching`

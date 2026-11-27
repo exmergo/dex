@@ -43,7 +43,10 @@ class Check:
     ``assertion`` is the sentence the report prints. ``first_dex_command``
     needs ``group`` and ``command`` (the first ``group`` command the agent ran
     is ``command``); ``no_dex_command`` needs ``command`` and ``matching``, a
-    regular expression no such call may hold; ``no_file_writes`` takes neither.
+    regular expression no such call may hold. ``no_file_writes`` may take
+    ``within``, paths relative to the run's working directory: only a write
+    under one of them fails the check, and a write elsewhere is listed as
+    information. Without ``within``, every write fails it.
     """
 
     check: str
@@ -51,6 +54,7 @@ class Check:
     group: str = ""
     command: str = ""
     matching: str = ""
+    within: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -243,6 +247,14 @@ def _check_from(raw: Any, where: str) -> Check:
     for key in ("group", "command", "matching"):
         if not isinstance(raw.get(key, ""), str):
             raise InvalidSuiteError(f"{where}.{key} must be a string")
+    within = raw.get("within", [])
+    well_formed = isinstance(within, list) and all(
+        isinstance(p, str) and p.strip() for p in within
+    )
+    if not well_formed or (within and kind != "no_file_writes"):
+        raise InvalidSuiteError(
+            f"{where}.within must be a list of paths, and only on no_file_writes"
+        )
     if kind == "first_dex_command" and raw["command"].split()[0] != raw["group"]:
         raise InvalidSuiteError(
             f"{where}.command must be a `{raw['group']}` command, written "

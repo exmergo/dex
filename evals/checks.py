@@ -23,6 +23,7 @@ Stdlib only, like the rest of the Tier-2 core.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,10 @@ def tool_uses(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     uses = []
     for event in _of_type(events, "assistant"):
-        content = (event.get("message") or {}).get("content") or []
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content") or []
         uses.extend(
             block
             for block in (content if isinstance(content, list) else [])
@@ -213,9 +217,8 @@ def grade(check: Check, events: list[dict[str, Any]]) -> tuple[bool, str]:
         made = sum(c["label"] == check.command for c in calls)
         return True, f"{made} `{check.command}` call(s), none matching"
     if check.check == "no_file_writes":
-        writes = [
-            u.get("name") for u in tool_uses(events) if u.get("name") in WRITE_TOOLS
-        ]
+        inside, _ = _file_writes(check, events)
+        writes = [name for name, _ in inside]
         applies = [
             c["label"]
             for c in calls
@@ -223,6 +226,88 @@ def grade(check: Check, events: list[dict[str, Any]]) -> tuple[bool, str]:
             or (c["label"] in CONFIRMED_WRITE_DEX_CALLS and "confirm" in c["flags"])
         ]
         if writes or applies:
-            return False, f"wrote with {sorted(set(writes + applies))}"
-        return True, "no file-writing tool call and no `transform apply`"
+            shown = sorted({shown for _, shown in inside})
+            where = f" ({shown})" if check.within and shown else ""
+            return False, f"wrote with {sorted(set(writes + applies))}{where}"
+        scope = " in the project" if check.within else ""
+        return True, f"no file-writing tool call{scope} and no `transform apply`"
     raise ValueError(f"unknown check {check.check!r}")
+
+
+def information(check: Check, events: list[dict[str, Any]]) -> str:
+    """What a check saw that does not decide it, for the report: the files a
+    ``no_file_writes`` with ``within`` saw written outside the project."""
+
+    if check.check != "no_file_writes" or not check.within:
+        return ""
+    _, outside = _file_writes(check, events)
+    if not outside:
+        return ""
+    return f"wrote outside the project: {sorted({shown for _, shown in outside})}"
+
+
+def _file_writes(
+    check: Check, events: list[dict[str, Any]]
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Each file-writing tool call as (tool, path shown), split into those the
+    check counts and those outside its ``within``. Paths are read against the
+    run's working directory, the ``init`` event's ``cwd``; with no ``cwd`` to
+    read them against, every write counts, so an unreadable place never
+    passes."""
+
+    root = next(
+        (
+            str(e.get("cwd") or "")
+            for e in _of_type(events, "system")
+            if e.get("subtype") == "init"
+        ),
+        "",
+    )
+    inside: list[tuple[str, str]] = []
+    outside: list[tuple[str, str]] = []
+    for use in tool_uses(events):
+        name = str(use.get("name"))
+        if name not in WRITE_TOOLS:
+            continue
+        payload = use.get("input") or {}
+        path = str(payload.get("file_path") or payload.get("notebook_path") or "")
+        if not check.within or not root or not path:
+            inside.append((name, path))
+            continue
+        shown, counted = _place(path, root, check.within)
+        (inside if counted else outside).append((name, shown))
+    return inside, outside
+
+
+#: A Windows path with a drive, absolute whatever OS reads the transcript.
+_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _norm(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path.replace("\\", "/")))
+
+
+def _place(path: str, root: str, within: list[str]) -> tuple[str, bool]:
+    """``path`` as shown in the report (relative to ``root`` when under it),
+    and whether it sits under one of ``within``."""
+
+    # Strings, not Path: a transcript's paths are another machine's, so they
+    # are read by their spelling, never against this filesystem.
+    absolute = (
+        os.path.isabs(path)  # noqa: PTH117
+        or path.startswith(("/", "\\"))
+        or _DRIVE.match(path) is not None
+    )
+    full = _norm(path if absolute else os.path.join(root, path))  # noqa: PTH118
+    base = _norm(root)
+    if os.path.splitdrive(full)[0] != os.path.splitdrive(base)[0]:
+        return path, False
+    if os.path.commonpath([full, base]) != base:
+        return path, False
+    relative = os.path.relpath(full, base)
+    shown = relative.replace(os.sep, "/")
+    for part in within:
+        scope = _norm(part)
+        if relative == scope or relative.startswith(scope + os.sep):
+            return shown, True
+    return shown, False
