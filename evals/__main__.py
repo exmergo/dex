@@ -274,6 +274,8 @@ def _print_quality(skill: str, cases) -> None:
                     said = " ".join(a.verdict.split())[:120]
                     why = f" [judge answered: {said!r}]"
                 print(f"        - failed: {a.assertion}{why}")
+            if a.info:
+                print(f"        - note ({a.assertion}): {a.info}")
 
 
 def _print_report(report) -> None:

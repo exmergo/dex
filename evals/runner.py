@@ -194,6 +194,8 @@ class AssertionResult:
     graded_by: str = "judge"
     detail: str = ""
     verdict: str | None = None
+    #: What a check saw that does not decide it (writes outside the project).
+    info: str = ""
 
 
 @dataclass
@@ -225,6 +227,7 @@ class CaseReport:
                     "graded_by": a.graded_by,
                     **({"detail": a.detail} if a.detail else {}),
                     **({"verdict": a.verdict} if a.verdict is not None else {}),
+                    **({"info": a.info} if a.info else {}),
                 }
                 for a in self.assertions
             ],
@@ -417,15 +420,17 @@ def _grade(case: EvalCase, result: AgentResult, judge: Judge) -> list[AssertionR
     graded = [_judged(judge, case, a, result) for a in case.assertions]
     for check in case.checks:
         if result.error:
-            passed, detail = False, f"not graded: {result.error}"
+            passed, detail, info = False, f"not graded: {result.error}", ""
         else:
             passed, detail = checks.grade(check, result.events)
+            info = checks.information(check, result.events)
         graded.append(
             AssertionResult(
                 assertion=check.assertion,
                 passed=passed,
                 graded_by="check",
                 detail=detail,
+                info=info,
             )
         )
     return graded
