@@ -284,3 +284,42 @@ def test_the_command_keeps_what_is_committed_and_carries_the_comment():
     )
     # Single-quoted in the shell, so the comment holds no single quote.
     assert "'" not in schema.COMMENT
+
+
+def test_a_bare_bigquery_dataset_covers_only_the_connection_project():
+    """A bare entry reads the connection's own project, never another's."""
+
+    other = Located("observability", "analytics_elementary")
+    assert schema.entries("bigquery", other, project="acme") == [
+        "observability.analytics_elementary"
+    ]
+    same = Located("acme", "analytics_elementary")
+    assert schema.entries("bigquery", same, project="acme") == [
+        "acme.analytics_elementary",
+        "analytics_elementary",
+    ]
+
+
+def test_the_package_is_read_from_packages_install_path(tmp_path):
+    root = _project(tmp_path)
+    text = (root / "dbt_project.yml").read_text()
+    (root / "dbt_project.yml").write_text(text + "packages-install-path: vendor\n")
+    package = root / "vendor" / "elementary"
+    package.mkdir(parents=True)
+    (package / "dbt_project.yml").write_text(
+        yaml.safe_dump(
+            {"name": "elementary", "models": {"elementary": {"+schema": "edr"}}}
+        )
+    )
+    found = schema.production_namespace(root, _bq(), "bigquery")
+    assert found == Resolved(Located("acme", "analytics_edr"), "prod")
+
+
+def test_a_schema_holding_a_quote_cannot_break_out_of_the_command():
+    import shlex
+
+    command = schema.allowlist_command("postgres", ["raw"], "x' ; printf HI ; #")
+    argv = shlex.split(command)
+    assert argv[:4] == ["dex", "config", "set", "postgres.schemas"]
+    assert argv[4] == "[raw, x' ; printf HI ; #]"
+    assert argv[5:] == ["--comment", schema.COMMENT]

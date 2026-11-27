@@ -995,6 +995,7 @@ def test_a_schema_the_connection_cannot_open_is_not_proposed(tmp_path, why, stat
         probe=lambda entry: (False, why),
     )
     assert allowlist["status"] == status
+    assert "command" not in allowlist
     (missing,) = result.missing_inputs
     assert missing["blocking"] is False and "command" not in missing
     assert why in missing["detail"]

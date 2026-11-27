@@ -596,7 +596,10 @@ class ConfigDocument:
         if not (
             isinstance(current, list)
             and len(value) > len(current)
-            and value[: len(current)] == current
+            and all(
+                type(old) is type(new) and old == new
+                for old, new in zip(current, value, strict=False)
+            )
         ):
             return None
         chain = self._locate(parts)

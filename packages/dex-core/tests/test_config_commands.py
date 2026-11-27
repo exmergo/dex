@@ -707,3 +707,20 @@ def test_the_command_init_proposes_runs_as_written(tmp_path, capsys):
     assert COMMENT.split()[0] in path.read_text()
     config = load_config(tmp_path)
     assert config.bigquery.datasets == ["raw", "acme.analytics_elementary"]
+
+
+def test_a_prefix_item_that_changes_type_is_replaced_not_appended(tmp_path, capsys):
+    """`[True] == [1]` in Python, so the append path compares types too."""
+
+    path = _repo(
+        tmp_path,
+        "connector: duckdb\nduckdb:\n  path: demo.duckdb\ncache:\n  options:\n"
+        "    items:\n      - true\n",
+    )
+    _run(
+        capsys, tmp_path, "config", "set", "cache.options.items", "[1, 2]", "--confirm"
+    )
+    import yaml
+
+    assert yaml.safe_load(path.read_text())["cache"]["options"]["items"] == [1, 2]
+    assert "true" not in path.read_text()

@@ -920,7 +920,11 @@ def _elementary_allowlist(
             )
         return
     located = found.located
-    spelled = schema.entries(connector, located)
+    spelled = schema.entries(
+        connector,
+        located,
+        project=getattr(getattr(config, connector, None), "project", None),
+    )
     base = {
         "namespace": located.spelled(),
         "source": found.source,
@@ -939,7 +943,6 @@ def _elementary_allowlist(
         report["allowlist"] = {
             "status": "unreadable" if unreadable else "not_created",
             **base,
-            "command": command,
         }
         then = (
             "grant this principal read on it, then run dex init again for the "

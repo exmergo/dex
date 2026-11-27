@@ -527,8 +527,10 @@ def _declared_namespace(manifest: Mapping[str, Any]) -> _Located | None:
     return None
 
 
-def _entries(connector: str, located: _Located) -> list[str]:
-    return entries(connector, located)
+def _entries(
+    connector: str, located: _Located, project: str | None = None
+) -> list[str]:
+    return entries(connector, located, project=project)
 
 
 def _allowlist_refusal(
@@ -551,7 +553,7 @@ def _allowlist_refusal(
     narrowed = datasets if flag == "--dataset" else []
     narrowed = narrowed or list(getattr(engine, "scopes", None) or [])
     allowlist = source_scope(connector, target, narrowed or None)
-    entries = _entries(connector, located)
+    entries = _entries(connector, located, getattr(target, "project", None))
     if not allowlist or any(scope_within(entry, allowlist) for entry in entries):
         return None
     field_name = _SCOPE_FIELDS[connector]

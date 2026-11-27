@@ -88,12 +88,25 @@ class Unresolved:
     ask: str | None
 
 
-def entries(connector: str, located: Located) -> list[str]:
+def entries(
+    connector: str, located: Located, *, project: str | None = None
+) -> list[str]:
     """How the connector's source allowlist spells ``located``: the forms one
-    entry may take, finest first. The first is what a proposed entry adds."""
+    entry may take, finest first. The first is what a proposed entry adds.
+
+    On BigQuery a bare dataset entry reads the connection's own ``project``, so
+    it spells ``located`` only where that is the project it sits in."""
 
     qualified = located.spelled()
-    if connector in {"bigquery", "snowflake"}:
+    if connector == "bigquery":
+        if (
+            located.database
+            and project
+            and located.database.casefold() != project.casefold()
+        ):
+            return [qualified]
+        return [qualified, located.schema]
+    if connector == "snowflake":
         return [qualified, located.schema]
     if connector in {"databricks", "trino"}:
         return [qualified]
@@ -105,11 +118,13 @@ def allowlist_command(connector: str, committed: Sequence[str], entry: str) -> s
     with the comment saying why it is there. Shown, never run: ``config set``
     answers with the diff and writes only on ``--confirm``."""
 
+    from shlex import quote
+
     from ..connect import _SCOPE_FIELDS
 
     field = _SCOPE_FIELDS[connector]
-    listed = ", ".join([*committed, entry])
-    return f"dex config set {connector}.{field} '[{listed}]' --comment '{COMMENT}'"
+    listed = quote("[" + ", ".join([*committed, entry]) + "]")
+    return f"dex config set {connector}.{field} {listed} --comment {quote(COMMENT)}"
 
 
 def allowlist_template(connector: str, committed: Sequence[str]) -> str:
@@ -239,10 +254,17 @@ def _placement(
 
     models = root.get("models")
     package = models.get("elementary") if isinstance(models, Mapping) else None
-    try:
-        own = _yaml(project / "dbt_packages" / "elementary" / "dbt_project.yml")
-    except (OSError, yaml.YAMLError):
-        own = {}
+    from .package_overrides import _installed
+
+    # Through the reader every package lookup uses, so packages-install-path
+    # is honored rather than assuming dbt_packages/.
+    own: Mapping[str, Any] = {}
+    for name, directory, _ in _installed(project):
+        if name == "elementary":
+            try:
+                own = _yaml(directory / "dbt_project.yml")
+            except (OSError, yaml.YAMLError):
+                own = {}
     own_models = own.get("models")
     own_package = (
         own_models.get("elementary") if isinstance(own_models, Mapping) else None
