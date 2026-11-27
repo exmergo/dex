@@ -711,7 +711,8 @@ def test_the_committed_checks_pass_the_procedure_and_fail_each_departure():
 @pytest.mark.parametrize(
     "table",
     [
-        "main_elementary.dbt_invocations",
+        "dbt_invocations",
+        "main_elementary.model_runs",
         "elementary_test_results",
         "dbt_run_results",
         "test_result_rows",
