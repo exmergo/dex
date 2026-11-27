@@ -279,13 +279,18 @@ def _placement(
         )
     found: dict[str, Any] = {}
     for name in ("schema", "database"):
-        for block in (package, models, own_package):
-            value = _config(block, name)
+        # The planned install writes models.elementary.+schema, which ranks with
+        # the package block: ahead of a root-level value and the package's own.
+        planned = planned_schema if name == "schema" else None
+        for value in (
+            _config(package, name),
+            planned,
+            _config(models, name),
+            _config(own_package, name),
+        ):
             if value is not None:
                 found[name] = value
                 break
-    if "schema" not in found and planned_schema:
-        found["schema"] = planned_schema
     for name, value in found.items():
         if _templated(value):
             return Unresolved(

@@ -323,3 +323,13 @@ def test_a_schema_holding_a_quote_cannot_break_out_of_the_command():
     assert argv[:4] == ["dex", "config", "set", "postgres.schemas"]
     assert argv[4] == "[raw, x' ; printf HI ; #]"
     assert argv[5:] == ["--comment", schema.COMMENT]
+
+
+def test_a_planned_install_wins_over_a_root_level_schema(tmp_path):
+    """The install writes models.elementary.+schema, which dbt ranks ahead."""
+
+    root = _project(tmp_path, models={"+schema": "marts"})
+    found = schema.production_namespace(
+        root, _bq(), "bigquery", planned_schema="elementary"
+    )
+    assert found == Resolved(Located("acme", "analytics_elementary"), "prod")
