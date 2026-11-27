@@ -410,6 +410,16 @@ REFERENCE_PAGES: tuple[ReferencePage, ...] = (
         ),
     ),
     ReferencePage(
+        "dex-telemetry.md",
+        "reference/dex-telemetry",
+        PageMeta(
+            "Dex Telemetry",
+            "What Dex Telemetry is: every dbt run recorded, declared rules "
+            "checked as tests and monitors, failures folded into incidents, and "
+            "each incident taken to a cause.",
+        ),
+    ),
+    ReferencePage(
         "incidents.md",
         "reference/incidents",
         PageMeta(
