@@ -46,8 +46,8 @@ class Check:
     regular expression no such call may hold. ``no_file_writes`` may take
     ``within``, paths relative to the run's working directory: only a write
     under one of them fails the check, and a write elsewhere is listed as
-    information. Without ``within``, every write fails it. ``ignore`` names
-    files under ``within`` a read changes by itself (the engine's
+    information. Without ``within``, every write and every workspace change
+    fails it. ``ignore`` names files a read changes by itself (the engine's
     ``.dex/cache.json``), which the workspace comparison leaves out.
     """
 
@@ -185,10 +185,14 @@ def _suite_from_dict(raw: dict[str, Any], path: Path) -> EvalSuite:
                 agent=_agent_from(entry.get("agent"), where),
                 checks=[
                     _check_from(c, f"{where}.checks[{j}]")
-                    for j, c in enumerate(entry.get("checks", []))
+                    for j, c in enumerate(_checks_list(entry, where))
                 ],
             )
         )
+    ids = [c.id for c in cases]
+    repeated = sorted({i for i in ids if ids.count(i) > 1})
+    if repeated:
+        raise InvalidSuiteError(f"{path}: evals reuses id(s) {repeated}")
     return EvalSuite(skill_name=skill_name, triggering=triggering, evals=cases)
 
 
@@ -263,8 +267,6 @@ def _check_from(raw: Any, where: str) -> Check:
             raise InvalidSuiteError(
                 f"{where}.{key} must be a list of paths, and only on no_file_writes"
             )
-    if raw.get("ignore") and not raw.get("within"):
-        raise InvalidSuiteError(f"{where}.ignore applies only beside within")
     if kind == "first_dex_command" and raw["command"].split()[0] != raw["group"]:
         raise InvalidSuiteError(
             f"{where}.command must be a `{raw['group']}` command, written "
@@ -280,6 +282,11 @@ def _check_from(raw: Any, where: str) -> Check:
     unknown = sorted(set(raw) - set(Check.__dataclass_fields__))
     if unknown:
         raise InvalidSuiteError(f"{where} has unknown key(s) {unknown}")
+    # One spelling for validation and grading: `maintain  incidents` is
+    # `maintain incidents`, the label the transcript is read into.
+    for key in ("group", "command"):
+        if raw.get(key):
+            raw = {**raw, key: " ".join(raw[key].split())}
     return Check(**raw)
 
 
@@ -325,3 +332,10 @@ def load_corpus(path: Path | str) -> Corpus:
     if not cases:
         raise InvalidSuiteError(f"{path}: 'cases' is empty")
     return Corpus(name=name, source=source, cases=cases)
+
+
+def _checks_list(entry: dict[str, Any], where: str) -> list[Any]:
+    raw = entry.get("checks", [])
+    if not isinstance(raw, list):
+        raise InvalidSuiteError(f"{where}.checks must be a list")
+    return raw

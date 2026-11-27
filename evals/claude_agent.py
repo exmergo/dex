@@ -202,10 +202,15 @@ def workspace_files(root: Path) -> dict[str, str]:
 
 
 def changed_files(before: dict[str, str], after: dict[str, str]) -> list[str]:
-    """The files added, changed or removed between two ``workspace_files``."""
+    """The files added, changed or removed between two ``workspace_files``. A
+    file unreadable in either is listed as changed: its bytes were not
+    compared, so it is not shown unchanged."""
 
     return sorted(
-        k for k in before.keys() | after.keys() if before.get(k) != after.get(k)
+        k
+        for k in before.keys() | after.keys()
+        if before.get(k) != after.get(k)
+        or "unreadable" in (before.get(k), after.get(k))
     )
 
 
@@ -228,6 +233,9 @@ def _invoke_stream(
             cwd=cwd,
             env=_child_env(),
         )
+    except OSError as exc:
+        # The binary went away after it was found, or would not start.
+        return "", f"could not start claude: {exc}"
     except subprocess.TimeoutExpired as exc:
         partial = exc.stdout or ""
         if isinstance(partial, bytes):
@@ -305,7 +313,7 @@ class ClaudeCliAgent:
             before = workspace_files(workspace)
             text, failed = _invoke_stream(binary, args, prompt, timeout, workspace)
             changes = changed_files(before, workspace_files(workspace))
-            self._keep_transcript(case, skill_enabled, text)
+            transcript = self._keep_transcript(case, skill_enabled, text)
             events = checks.parse_stream(text)
             output = checks.final_text(events)
             error = failed or checks.run_error(
@@ -324,6 +332,7 @@ class ClaudeCliAgent:
                 events=events,
                 error=error,
                 changes=changes,
+                transcript=transcript,
             )
         finally:
             if self.keep_workspaces:
@@ -331,9 +340,11 @@ class ClaudeCliAgent:
             else:
                 shutil.rmtree(workspace, ignore_errors=True)
 
-    def _keep_transcript(self, case: EvalCase, skill_enabled: bool, text: str) -> None:
+    def _keep_transcript(
+        self, case: EvalCase, skill_enabled: bool, text: str
+    ) -> str | None:
         if self.transcripts is None:
-            return
+            return None
         self.transcripts.mkdir(parents=True, exist_ok=True)
         stem = f"case-{case.id}-{'skill' if skill_enabled else 'baseline'}"
         path = self.transcripts / f"{stem}.jsonl"
@@ -343,6 +354,7 @@ class ClaudeCliAgent:
             n += 1
         path.write_text(text, encoding="utf-8", newline="")
         print(f"case {case.id} transcript written to {path}", file=sys.stderr)
+        return str(path)
 
     @property
     def _plugin(self) -> str:
