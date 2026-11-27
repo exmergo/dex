@@ -438,9 +438,12 @@ def _reads_match(
                 continue
             ok = tool == "Write" and str(use.get("id")) not in failed
             contents = str(payload.get("content") or "") if ok else None
-        elif tool in SHELL_TOOLS:
-            if name and name in str(payload.get("command") or "").casefold():
-                contents = None
+        elif (
+            tool in SHELL_TOOLS
+            and name
+            and name in str(payload.get("command") or "").casefold()
+        ):
+            contents = None
     if name and text.casefold().count(name) > 1:
         # The query's own command does something else with the file too.
         contents = None
