@@ -100,10 +100,11 @@ between them, ran every collected test exactly once
 (`scripts/check_test_groups.py`).
 
 Transform groups cover builds, dependencies, artifact edits, retirement,
-refactors, contracts (including semantic authoring) and planning. Real dbt
+refactors, contracts, semantic derivation, monitors, PII and planning. Real dbt
 mutation cases run separately for coverage, equivalence and downstream routing;
 their command doubles stay with planning.
-Explore/maintain and packaging also have their own groups. Each job uploads
+Explore, maintain (split into incidents, coverage, diagnosis and the rest), the
+native semantic vendors and packaging also have their own groups. Each job uploads
 JUnit test timings alongside the coverage report; use those to rebalance files
 when a group approaches five minutes including setup.
 
