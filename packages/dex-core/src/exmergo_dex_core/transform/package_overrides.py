@@ -19,6 +19,7 @@ YAML. Nothing here opens a connection or runs dbt.
 from __future__ import annotations
 
 import contextlib
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,7 +34,7 @@ class PackageModel:
 
     package: str
     name: str
-    enabled: bool
+    enabled: bool | None
 
 
 @dataclass(frozen=True)
@@ -87,17 +88,86 @@ def package_custom_schema(
     return custom
 
 
+def is_target_dependent(val: Any) -> bool:
+    """Whether ``val`` is an expression referencing dbt's target or dynamic Jinja."""
+    if not isinstance(val, str):
+        return False
+    return "target." in val or "target[" in val or "{{" in val or "{%" in val
+
+
+def resolve_target_enabled(
+    expr: str,
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    target: str | None = None,
+) -> bool | None:
+    """Resolve a target-dependent enablement expression against target evidence.
+
+    Returns ``None`` when reliable target evidence is absent or unmatched.
+    """
+    manifest_target: str | None = None
+    if isinstance(manifest, Mapping):
+        meta = manifest.get("metadata")
+        if isinstance(meta, Mapping):
+            t = meta.get("target_name")
+            if isinstance(t, str) and t.strip():
+                manifest_target = t.strip()
+
+    if target is not None and manifest_target is not None and target != manifest_target:
+        return None
+
+    target_name = target if target is not None else manifest_target
+    if target_name is None:
+        return None
+
+    stripped = expr.strip()
+    m_ne = re.match(
+        r"^\{\{[-+]?\s*target\.name\s*!=\s*['\"]([^'\"]+)['\"]\s*[-+]?\}\}$",
+        stripped,
+    )
+    if m_ne:
+        return target_name != m_ne.group(1)
+    m_eq = re.match(
+        r"^\{\{[-+]?\s*target\.name\s*==\s*['\"]([^'\"]+)['\"]\s*[-+]?\}\}$",
+        stripped,
+    )
+    if m_eq:
+        return target_name == m_eq.group(1)
+
+    with contextlib.suppress(Exception):
+        import jinja2
+
+        env = jinja2.Environment(undefined=jinja2.StrictUndefined, autoescape=True)
+        rendered = (
+            env.from_string(stripped)
+            .render(target={"name": target_name})
+            .strip()
+            .lower()
+        )
+        if rendered == "true":
+            return True
+        if rendered == "false":
+            return False
+    return None
+
+
 def package_enabled(
-    project_config: Mapping[str, Any], package: str, parts: Iterable[str]
-) -> bool:
+    project_config: Mapping[str, Any],
+    package: str,
+    parts: Iterable[str],
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    target: str | None = None,
+) -> bool | None:
     """Whether the project leaves a package model enabled.
 
     dbt reads ``enabled`` from the most specific level of
     ``models.<package>.<folder>...<model>``, and that is what is read here.
-    Package SQL that disables itself with ``config(enabled=false)`` is not read.
+    Literal true and false keep their existing meaning. Target-dependent
+    expressions without reliable target-specific evidence return ``None``.
     """
 
-    state = True
+    state: bool | None = True
     level: Any = project_config.get(package)
     for part in [None, *parts]:
         if part is not None:
@@ -105,8 +175,14 @@ def package_enabled(
         if not isinstance(level, dict):
             break
         for key in ("+enabled", "enabled"):
-            if isinstance(level.get(key), bool):
-                state = level[key]
+            if key in level:
+                raw = level[key]
+                if isinstance(raw, bool):
+                    state = raw
+                elif is_target_dependent(raw):
+                    state = resolve_target_enabled(
+                        raw, manifest=manifest, target=target
+                    )
     return state
 
 
@@ -138,7 +214,12 @@ def _installed(root: Path) -> list[tuple[str, Path, list[Path]]]:
 
 
 def package_models(
-    root: Path | str, names: set[str], project_yml: str | None
+    root: Path | str,
+    names: set[str],
+    project_yml: str | None,
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    target: str | None = None,
 ) -> list[PackageModel]:
     """The installed package models named in ``names``, with whether the
     project's ``dbt_project.yml`` (``project_yml``, the text after a plan)
@@ -159,7 +240,11 @@ def package_models(
                         package=package,
                         name=path.stem,
                         enabled=package_enabled(
-                            project_config, package, [*folders, path.stem]
+                            project_config,
+                            package,
+                            [*folders, path.stem],
+                            manifest=manifest,
+                            target=target,
                         ),
                     )
                 )
@@ -191,7 +276,12 @@ def _documented(directory: Path, roots: list[Path], names: set[str]) -> dict[str
 
 
 def documented_overrides(
-    root: Path | str, models: Iterable[str], project_yml: str | None
+    root: Path | str,
+    models: Iterable[str],
+    project_yml: str | None,
+    *,
+    manifest: Mapping[str, Any] | None = None,
+    target: str | None = None,
 ) -> dict[str, DocumentedOverride]:
     """The project models in ``models`` that override a package model the
     package documents, by model name.
@@ -215,7 +305,16 @@ def documented_overrides(
                 if path.suffix not in (".sql", ".py") or path.stem not in names:
                     continue
                 folders = list(path.relative_to(base).parent.parts)
-                if not package_enabled(project_config, package, [*folders, path.stem]):
+                if (
+                    package_enabled(
+                        project_config,
+                        package,
+                        [*folders, path.stem],
+                        manifest=manifest,
+                        target=target,
+                    )
+                    is False
+                ):
                     disabled.add(path.stem)
         if not disabled:
             continue
