@@ -10,6 +10,8 @@ regression instead of a fixture regression.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import re
 from pathlib import Path
 
@@ -30,7 +32,21 @@ from exmergo_dex_core.demo import (
 # column names quoted in README.md, packages/dex-core/README.md, and
 # references/duckdb.md have to be re-checked against real output and updated in
 # the same change; then, and only then, update this value.
-GOLDEN_DIGEST = "bb3dc590fd38eca798b0bfd28619d3e974f66107ec88535e8fb577806126a37f"
+GOLDEN_DIGEST = "85cdbd2e67f3fcc7850fb8804b5a98e1acff20cf0fc638cda1ccdd63e71a8384"
+
+# Measured before #1621, when the batch loaded twice held new rows reusing a
+# key: every table but `order_items`, the 13,000 rows `order_items` loaded
+# first, and the ids of the 1,000 rows loaded again, in order. Making the
+# reloaded rows copies moved none of them, and nothing should.
+GOLDEN_OTHER_TABLES_DIGEST = (
+    "42a37b55b418378e54aaf61a3d2b7033bb623e660737a16325c6e528e339a386"
+)
+GOLDEN_LOADED_ITEMS_DIGEST = (
+    "3b97031d848c8f070255dc4d574da7cc3b463ad73ea41d4c97bbb6b2b152e42a"
+)
+GOLDEN_RELOADED_IDS_DIGEST = (
+    "91d49a990f055708e17c3caea0ee6b25f63822825293e65f3e63124448995c0d"
+)
 
 EXPECTED_ROWS = {
     "customers": 1200,
@@ -98,6 +114,41 @@ def test_the_order_item_key_repeats_a_double_loaded_batch():
     ids = [row[_column(items, "order_item_id")] for row in items.rows]
     assert len(ids) == 14000
     assert len(set(ids)) == 13000, "1000 rows come from a batch loaded twice"
+
+
+def test_every_reloaded_order_item_is_a_copy_of_the_loaded_row():
+    """A batch loaded twice repeats rows, so the repair a diagnosis offers,
+    keeping one row per key, loses nothing (#1621). New rows that only reuse a
+    key would be a different defect, which that repair would make worse."""
+
+    items = _table("order_items")
+    key = _column(items, "order_item_id")
+    first: dict[int, tuple] = {}
+    for row in items.rows:
+        first.setdefault(row[key], row)
+    assert [row[key] for row in items.rows[:13000]] == list(range(1, 13001))
+    reloaded = items.rows[13000:]
+    assert len(reloaded) == 1000
+    assert [row for row in reloaded if row != first[row[key]]] == []
+    assert len(set(items.rows)) == 13000, "every repeated id repeats its whole row"
+
+
+def test_the_reloaded_batch_moves_no_other_row():
+    """The copies change no draw, so the generator's stream is the one it was:
+    every other table, the rows loaded first, and which ids were loaded again
+    are unchanged."""
+
+    tables = build_tables()
+    others = tuple(t for t in tables if t.name != "order_items")
+    assert len(others) == len(tables) - 1
+    assert row_digest(others) == GOLDEN_OTHER_TABLES_DIGEST
+    items = _table("order_items")
+    loaded = dataclasses.replace(items, rows=items.rows[:13000])
+    assert row_digest((loaded,)) == GOLDEN_LOADED_ITEMS_DIGEST
+    key = _column(items, "order_item_id")
+    reloaded_ids = ",".join(str(row[key]) for row in items.rows[13000:])
+    digest = hashlib.sha256(reloaded_ids.encode("utf-8")).hexdigest()
+    assert digest == GOLDEN_RELOADED_IDS_DIGEST
 
 
 def test_the_sku_key_is_unique_but_mixes_two_id_schemes():

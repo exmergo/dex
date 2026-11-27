@@ -337,7 +337,7 @@ def build_tables(seed: int = DEMO_SEED) -> tuple[DemoTable, ...]:
     # was loaded twice. The key is the table's own, so profiling reports it as
     # broken grain rather than shrugging at a repeated foreign key.
     item_ids = list(range(1, 13001)) + [1 + rnd.randrange(13000) for _ in range(1000)]
-    order_items = [
+    drawn = [
         (
             item_id,
             1 + rnd.randrange(5000),
@@ -347,6 +347,12 @@ def build_tables(seed: int = DEMO_SEED) -> tuple[DemoTable, ...]:
         )
         for item_id in item_ids
     ]
+    # A batch loaded twice repeats rows already loaded, so each extra row is a
+    # copy of the loaded row with its id. Its own four values are still drawn,
+    # and dropped, so the generator's stream, and every table built after this
+    # one, is the same draw for draw.
+    loaded = drawn[:13000]
+    order_items = loaded + [loaded[item_id - 1] for item_id in item_ids[13000:]]
 
     # --- web_events: the join that has to be declined, and epoch milliseconds --
     # `customer_id` shares the parent's name and type, so an edge is inferred on
