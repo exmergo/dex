@@ -131,10 +131,9 @@ def _dbt_parent_resolvable(
     # unparseable project SELECT is.
     from .package_targets import configured_dbt_target, find_package_target
 
+    cfg = getattr(engine, "config", None)
     target = (
-        getattr(engine.config, "dbt_target", None)
-        or configured_dbt_target(view.root)
-        or "dev"
+        getattr(cfg, "dbt_target", None) or configured_dbt_target(view.root) or "dev"
     )
     packaged = find_package_target(
         view.root,
