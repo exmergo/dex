@@ -85,14 +85,15 @@ _WORD = re.compile(r"[A-Za-z]+")
 
 
 def read_verdict(text: str) -> Verdict:
-    """A judge's answer, read tolerantly: the first word, whatever markdown or
+    """A judge's answer, read tolerantly: the first word must be PASS or FAIL
+    itself (``Failed to authenticate`` is no verdict), whatever markdown or
     punctuation surrounds it and in any case (``**PASS**``, ``Pass.``)."""
 
     found = _WORD.search(text)
     word = found.group(0).upper() if found else ""
-    if word in ("PASS", "PASSED"):
+    if word == "PASS":
         return Verdict(passed=True, text=text)
-    if word in ("FAIL", "FAILED"):
+    if word == "FAIL":
         return Verdict(passed=False, text=text)
     shown = text.strip()[:200] or "nothing"
     return Verdict(
@@ -196,6 +197,8 @@ class AssertionResult:
     verdict: str | None = None
     #: What a check saw that does not decide it (writes outside the project).
     info: str = ""
+    #: Why the judge gave no verdict, which makes the case's run an error.
+    judge_error: str = ""
 
 
 @dataclass
@@ -236,9 +239,15 @@ class CaseReport:
 
 @dataclass
 class UpliftCaseReport:
+    """One case's two arms. ``error`` is set when either arm errored (the run
+    or its judge): the row then measures nothing, so it is left out of the
+    uplift and fails the suite, rather than counting as a failed arm, which
+    would credit the skill with a broken baseline."""
+
     id: int
     passed_with_skill: bool
     passed_without_skill: bool
+    error: str | None = None
 
 
 @dataclass
@@ -261,7 +270,12 @@ class SuiteReport:
     @property
     def passed(self) -> bool:
         # Triggering must be clean and the skill must not regress against baseline.
-        return self.triggering.passed and self.uplift_score >= 0.0
+        # An uplift row with an error measured nothing, so the suite cannot pass.
+        return (
+            self.triggering.passed
+            and not any(u.error for u in self.uplift_cases)
+            and self.uplift_score >= 0.0
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -274,6 +288,7 @@ class SuiteReport:
                     "id": u.id,
                     "passed_with_skill": u.passed_with_skill,
                     "passed_without_skill": u.passed_without_skill,
+                    **({"error": u.error} if u.error else {}),
                 }
                 for u in self.uplift_cases
             ],
@@ -326,14 +341,19 @@ def run_quality(
 def run_uplift(
     suite: EvalSuite, runner: AgentRunner, judge: Judge
 ) -> list[UpliftCaseReport]:
-    return [
-        UpliftCaseReport(
-            id=case.id,
-            passed_with_skill=_all_pass(case, runner, judge, skill=True),
-            passed_without_skill=_all_pass(case, runner, judge, skill=False),
+    rows = []
+    for case in suite.evals:
+        with_skill, skill_error = _arm(case, runner, judge, skill=True)
+        without, baseline_error = _arm(case, runner, judge, skill=False)
+        rows.append(
+            UpliftCaseReport(
+                id=case.id,
+                passed_with_skill=with_skill,
+                passed_without_skill=without,
+                error=_arm_error(skill_error, baseline_error),
+            )
         )
-        for case in suite.evals
-    ]
+    return rows
 
 
 def uplift_from(
@@ -341,21 +361,33 @@ def uplift_from(
 ) -> list[UpliftCaseReport]:
     """Pair each case's two arms, already run, into uplift rows."""
 
-    baseline = {c.id: c.passed for c in without_skill}
+    baseline = {c.id: c for c in without_skill}
     return [
         UpliftCaseReport(
-            id=c.id, passed_with_skill=c.passed, passed_without_skill=baseline[c.id]
+            id=c.id,
+            passed_with_skill=c.passed,
+            passed_without_skill=baseline[c.id].passed,
+            error=_arm_error(c.error, baseline[c.id].error),
         )
         for c in with_skill
     ]
 
 
 def uplift_score(cases: list[UpliftCaseReport]) -> float:
-    """Net fraction of cases the skill turns from failing to passing."""
+    """Net fraction of cases the skill turns from failing to passing, over the
+    cases both of whose arms ran; a row with an error measures nothing."""
 
-    with_skill = _rate([u.passed_with_skill for u in cases])
-    without = _rate([u.passed_without_skill for u in cases])
+    measured = [u for u in cases if not u.error]
+    with_skill = _rate([u.passed_with_skill for u in measured])
+    without = _rate([u.passed_without_skill for u in measured])
     return round(with_skill - without, 4)
+
+
+def _arm_error(skill: str | None, baseline: str | None) -> str | None:
+    said = [
+        f"{arm} arm: {e}" for arm, e in (("skill", skill), ("baseline", baseline)) if e
+    ]
+    return "; ".join(said) or None
 
 
 def run_suite(suite: EvalSuite, runner: AgentRunner, judge: Judge) -> SuiteReport:
@@ -369,13 +401,15 @@ def run_suite(suite: EvalSuite, runner: AgentRunner, judge: Judge) -> SuiteRepor
     )
 
 
-def _all_pass(
+def _arm(
     case: EvalCase, runner: AgentRunner, judge: Judge, *, skill: bool
-) -> bool:
+) -> tuple[bool, str | None]:
+    """One arm of one case: whether it passed, and its error if it has one."""
+
     result = _run_case(runner, case, skill)
     graded = _grade(case, result, judge)
-    # A judge that gave no verdict has already failed its assertion.
-    return not result.error and bool(graded) and all(a.passed for a in graded)
+    error = result.error or _judge_error(graded)
+    return (not error and bool(graded) and all(a.passed for a in graded)), error
 
 
 def _judge_error(graded: list[AssertionResult]) -> str | None:
@@ -383,8 +417,8 @@ def _judge_error(graded: list[AssertionResult]) -> str | None:
     that failed is no evidence about the agent, so it is not a FAIL."""
 
     for a in graded:
-        if a.graded_by == "judge" and a.detail.startswith("no verdict"):
-            return f"the judge gave {a.detail} on {a.assertion!r}"
+        if a.judge_error:
+            return f"the judge gave no verdict: {a.judge_error} on {a.assertion!r}"
     return None
 
 
@@ -400,6 +434,7 @@ def _judged(judge: Judge, case: EvalCase, assertion: str, result: AgentResult):
             passed=False,
             detail=f"no verdict: {said.error}",
             verdict=said.text,
+            judge_error=said.error,
         )
     return AssertionResult(
         assertion=assertion, passed=said.passed, verdict=said.text or None

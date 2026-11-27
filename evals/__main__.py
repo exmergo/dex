@@ -167,12 +167,14 @@ def main(argv: list[str] | None = None) -> int:
             _write_verdicts(args.transcripts, baseline, "baseline")
             rows = uplift_from(cases, baseline)
             score = uplift_score(rows)
+            errored = [r for r in rows if r.error]
             if args.json:
                 print(
                     json.dumps(
                         {
                             "quality": [c.to_dict() for c in cases],
                             "baseline": [c.to_dict() for c in baseline],
+                            "uplift_errors": {r.id: r.error for r in errored},
                             "uplift_score": score,
                         },
                         indent=2,
@@ -181,8 +183,9 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 _print_quality(suite.skill_name, cases)
                 _print_quality(f"{suite.skill_name}, without the skill", baseline)
-                print(f"[{suite.skill_name}] uplift vs baseline {score:+.0%}")
-            return 0 if passed and score >= 0.0 else 1
+                _print_uplift(suite.skill_name, rows, score)
+            # An arm that errored measured nothing: no uplift, and no pass.
+            return 0 if passed and not errored and score >= 0.0 else 1
 
         if args.triggering:
             trig = run_triggering(suite, agent)
@@ -278,10 +281,21 @@ def _print_quality(skill: str, cases) -> None:
                 print(f"        - note ({a.assertion}): {a.info}")
 
 
+def _print_uplift(skill: str, rows, score: float) -> None:
+    errored = [r for r in rows if r.error]
+    for row in errored:
+        print(f"[{skill}] uplift not measured for #{row.id}: {row.error}")
+    measured = len(rows) - len(errored)
+    if errored and not measured:
+        print(f"[{skill}] uplift vs baseline: not measured")
+        return
+    print(f"[{skill}] uplift vs baseline {score:+.0%}")
+
+
 def _print_report(report) -> None:
     _print_triggering(report.skill_name, report.triggering)
     _print_quality(report.skill_name, report.quality)
-    print(f"[{report.skill_name}] uplift vs baseline {report.uplift_score:+.0%}")
+    _print_uplift(report.skill_name, report.uplift_cases, report.uplift_score)
     print(f"[{report.skill_name}] {'PASS' if report.passed else 'FAIL'}")
 
 

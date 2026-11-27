@@ -424,7 +424,8 @@ def cli(monkeypatch, plugin):
         calls: ClassVar[list[dict]] = []
         events: ClassVar[list[dict]] = passing(str(plugin))
         setup_status = "ok"
-        judge_answer: str | Exception = "PASS"
+        judge_answer: str | dict | Exception = "PASS"
+        baseline_events: ClassVar[list[dict] | None] = None
 
     def fake_run(cmd, **kwargs):
         cwd = kwargs.get("cwd")
@@ -441,12 +442,14 @@ def cli(monkeypatch, plugin):
             out = json.dumps({"status": Recorder.setup_status, "errors": ["no room"]})
             return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
         if "stream-json" in cmd:
-            return subprocess.CompletedProcess(
-                cmd, 0, stdout=_jsonl(Recorder.events), stderr=""
-            )
+            events = Recorder.events
+            if Recorder.baseline_events is not None and "--plugin-dir" not in cmd:
+                events = Recorder.baseline_events
+            return subprocess.CompletedProcess(cmd, 0, stdout=_jsonl(events), stderr="")
         if isinstance(Recorder.judge_answer, Exception):
             raise Recorder.judge_answer
-        out = json.dumps({"result": Recorder.judge_answer})
+        answer = Recorder.judge_answer
+        out = json.dumps(answer if isinstance(answer, dict) else {"result": answer})
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(claude_agent.shutil, "which", lambda binary: binary)
@@ -611,26 +614,31 @@ def test_the_core_grades_checks_from_the_backends_transcript(cli, plugin):
     ] * 3
 
 
-def test_case_with_uplift_runs_the_case_once_in_each_arm(
-    cli, plugin, monkeypatch, tmp_path
-):
-    suite = tmp_path / "evals.json"
-    entry = _entry(
-        setup=[["demo"]],
-        agent={"permission_mode": "acceptEdits"},
-        checks=[{"check": "no_file_writes", "assertion": "Wrote nothing"}],
-    )
-    suite.write_text(
-        json.dumps({"skill_name": "maintain", "evals": [entry]}), encoding="utf-8"
-    )
-    (plugin / ".claude-plugin").mkdir()
-    (plugin / ".claude-plugin" / "plugin.json").write_text("{}", encoding="utf-8")
+def test_case_with_uplift_runs_the_case_once_in_each_arm(cli, plugin, tmp_path):
+    cli.baseline_events = failing(None)
+    suite = _suite_file(tmp_path, plugin)
     code = main([str(suite), "--case", "7", "--uplift", "--plugin-dir", str(plugin)])
     agents = [c["cmd"] for c in cli.calls if "stream-json" in c["cmd"]]
     assert [("--plugin-dir" in cmd) for cmd in agents] == [True, False]
-    # The baseline's transcript names a dex plugin, so that arm is an error,
-    # and the uplift is the skill arm's pass over the baseline's failure.
+    # The baseline ran, with no dex, and wrote a file: a failed arm, not an
+    # errored one, so the uplift is the skill arm's pass over it.
     assert code == 0
+
+
+def test_an_errored_baseline_leaves_the_uplift_unmeasured_and_fails(
+    cli, plugin, tmp_path, capsys
+):
+    """The baseline's transcript lists a dex plugin, so that arm is an error:
+    scored as a failed arm it would credit the skill with +100%."""
+
+    suite = _suite_file(tmp_path, plugin)
+    code = main([str(suite), "--case", "7", "--uplift", "--plugin-dir", str(plugin)])
+    printed = capsys.readouterr().out
+    assert code == 1
+    assert (
+        "uplift not measured for #7: baseline arm: the baseline arm loaded" in printed
+    )
+    assert "uplift vs baseline: not measured" in printed
 
 
 def test_uplift_without_case_is_an_error(cli):
@@ -865,9 +873,11 @@ def test_a_plain_fail_fails_with_no_error_in_each_arm(skill_enabled):
     assert (graded.passed, graded.verdict, graded.detail) == (False, "FAIL", "")
 
 
-def test_a_judge_that_gives_no_verdict_fails_the_uplift_arm_too():
+def test_a_judge_that_gives_no_verdict_makes_the_uplift_row_an_error():
     [row] = run_uplift(_PLAIN, _Answers(), _SaysJudge("Hmm."))
     assert not row.passed_with_skill and not row.passed_without_skill
+    assert row.error.startswith("skill arm: the judge gave no verdict")
+    assert "; baseline arm: the judge gave no verdict" in row.error
 
 
 def test_the_live_judge_sends_its_whole_prompt_on_stdin(cli):
@@ -1081,3 +1091,119 @@ def test_within_is_a_list_of_paths_on_no_file_writes_only(tmp_path, raw):
         _suite_from_dict(
             {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
         )
+
+
+# --- the second cold review of #1625 ---------------------------------------------
+
+BS = chr(92)
+WIN_ROOT = BS.join(["C:", "Users", "u", "AppData", "Local", "Temp", "dex-eval-7-abc"])
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["Failed to authenticate. API Error: 401", "PASSED", "Failure", "PASSING"],
+)
+def test_only_pass_or_fail_itself_is_a_verdict(answer):
+    assert read_verdict(answer).error is not None
+
+
+def test_a_judge_whose_cli_reports_an_error_gives_no_verdict(cli):
+    cli.judge_answer = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": True,
+        "terminal_reason": "api_error",
+        "result": "Failed to authenticate. API Error: 401",
+    }
+    said = claude_agent.ClaudeCliJudge().verdict(_case(), "a", AgentResult(output="x"))
+    assert not said.passed
+    assert said.error.startswith("RuntimeError: claude reported an error (api_error)")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        # Git Bash's spelling of the same directory.
+        "/c/Users/u/AppData/Local/Temp/dex-eval-7-abc/demo_project/x.sql",
+        # An 8.3 short name above the workspace.
+        BS.join(["C:", "Users", "U~1", "AppData", "Local", "Temp", "dex-eval-7-abc"])
+        + BS
+        + BS.join(["demo_project", "x.sql"]),
+        "~/AppData/Local/Temp/dex-eval-7-abc/demo_project/x.sql",
+        # Another case.
+        WIN_ROOT.upper() + BS + BS.join(["DEMO_PROJECT", "X.SQL"]),
+    ],
+    ids=["git_bash", "short_name", "home", "case"],
+)
+def test_a_project_write_is_placed_however_the_root_is_spelled(path):
+    events = _wrote(_write(2, path), cwd=WIN_ROOT)
+    assert not checks.grade(PROJECT_ONLY, events)[0]
+
+
+@pytest.mark.parametrize(
+    "path, shown",
+    [
+        ("/srv/x.sql", "/srv/x.sql"),
+        (BS.join(["D:", "x.sql"]), BS.join(["D:", "x.sql"])),
+        ("../elsewhere.sql", "../elsewhere.sql"),
+        (
+            "/c/Users/u/AppData/Local/Temp/dex-eval-7-abc/.dex_probe.sql",
+            ".dex_probe.sql",
+        ),
+    ],
+    ids=["outside_root", "other_drive", "parent", "git_bash_scratch"],
+)
+def test_a_write_outside_the_project_passes_and_is_listed(path, shown):
+    events = _wrote(_write(2, path), cwd=WIN_ROOT)
+    assert checks.grade(PROJECT_ONLY, events)[0]
+    assert checks.information(PROJECT_ONLY, events) == (
+        f"wrote outside the project: [{shown!r}]"
+    )
+
+
+def test_a_refused_write_in_the_project_wrote_nothing():
+    refused = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_2",
+                    "content": "Permission to use Write has been denied.",
+                    "is_error": True,
+                }
+            ]
+        },
+    }
+    events = _wrote(_write(2, "/work/demo_project/x.sql"), refused)
+    assert checks.grade(PROJECT_ONLY, events)[0]
+
+
+def test_a_whitespace_command_is_refused_with_its_place(tmp_path):
+    raw = {"check": "first_dex_command", "assertion": "x", "group": "maintain"}
+    with pytest.raises(InvalidSuiteError, match=r"needs \['command'\]"):
+        _suite_from_dict(
+            {
+                "skill_name": "maintain",
+                "evals": [_entry(checks=[{**raw, "command": "  "}])],
+            },
+            tmp_path,
+        )
+
+
+def test_a_suite_whose_uplift_row_errored_does_not_pass():
+    from evals.runner import SuiteReport, TriggeringReport, UpliftCaseReport
+
+    clean = TriggeringReport(
+        positives_total=0, positives_fired=0, negatives_total=0, negatives_fired=0
+    )
+    row = UpliftCaseReport(
+        id=7,
+        passed_with_skill=True,
+        passed_without_skill=False,
+        error="baseline arm: x",
+    )
+    report = SuiteReport(skill_name="maintain", triggering=clean, uplift_cases=[row])
+    assert report.uplift_score == 0.0
+    assert not report.passed
+    assert report.to_dict()["uplift_cases"][0]["error"] == "baseline arm: x"

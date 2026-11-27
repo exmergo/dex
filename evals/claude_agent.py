@@ -83,9 +83,20 @@ def _invoke(binary: str, args: list[str], prompt: str, timeout: int) -> str:
     # Headless JSON wraps the assistant result; fall back to raw stdout if the
     # shape changes so a CLI update degrades to "gradeable text", not a crash.
     try:
-        return str(json.loads(proc.stdout).get("result", proc.stdout))
+        answer = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return proc.stdout
+    if not isinstance(answer, dict):
+        return proc.stdout
+    if answer.get("is_error"):
+        # A failed sign-in exits 0 and says so only here; its text ("Failed
+        # to authenticate") must never be read as an answer.
+        said = str(answer.get("result") or "").strip().splitlines()
+        raise RuntimeError(
+            f"claude reported an error ({answer.get('terminal_reason') or 'is_error'})"
+            + (f": {said[0][:200]}" if said else "")
+        )
+    return str(answer.get("result", proc.stdout))
 
 
 #: For a case with its own workspace, both arms load only the project's settings
