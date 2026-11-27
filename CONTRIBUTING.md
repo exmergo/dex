@@ -962,17 +962,14 @@ python3 scripts/check_no_em_dashes.py path/to/file.md
 
 ## The documentation site
 
-The site at https://docs.exmergo.com is served from
-[exmergo/docs](https://github.com/exmergo/docs), which owns the site's settings
-and home page. Dex is one section of it, at https://docs.exmergo.com/dex, and
-this repository builds and publishes that section: `scripts/build_docs_site.py`
-assembles the `dex/` folder from four sources, and nothing it produces is
-committed to `main` here:
+The site at https://docs.trydex.ai is a Mintlify site of its own, deployed from
+[exmergo/dex-docs](https://github.com/exmergo/dex-docs).
+`scripts/build_docs_site.py` assembles the whole site from four sources, and nothing it produces is committed to `main`:
 
-- `docs/`: hand-written pages (`.mdx`), and `section.json`, the section's
-  navigation and redirects. Site-wide settings (name, colours, navbar,
-  analytics, the product switcher, `skill.md`) belong to exmergo/docs, and the
-  build refuses any in `section.json`.
+- `docs/`: hand-written pages (`.mdx`), assets (the logo, the favicon, images),
+  `skill.md` (what an agent reading the site is told to install), and
+  `docs.json`, the site's settings, navigation and redirects. The build
+  completes the menu and redirects and publishes every other setting as written.
 - `references/`: each file is published at the route `REFERENCE_PAGES` in the
   build script gives it. The H1 is replaced by the title in that table, links
   between references are rewritten to site routes, and every other relative link
@@ -997,44 +994,39 @@ contracts into guides. The generated CLI pages keep command headings linkable
 and collapse their full usage and argument tables.
 
 **Linking.** A page under `docs/` links by site route
-(`/dex/guardrails/cost-controls`), never by file, and to the rest of the site by
-its full URL. A reference links by relative path
+(`/guardrails/cost-controls`), never by file. A reference links by relative path
 (`cost-controls.md#the-one-time-ask`), as it always has. An anchor must resolve
 on GitHub and on the site, which name a few headings differently: avoid a `/` or
 an apostrophe in a heading you link to, and repeated heading text.
 
 **Adding a page.** A new reference needs a row in `REFERENCE_PAGES` (route,
 title, a description of 140 to 160 characters) and an entry in the
-`section.json` navigation. A new hand-written page needs `title` and
-`description` frontmatter and a navigation entry. Navigation names pages as the
-section sees them (`connectors/bigquery`); the build moves them under `dex/`.
-The build fails on a page missing from navigation, on navigation naming a page
+`docs.json` navigation. A new hand-written page needs `title` and
+`description` frontmatter and a navigation entry. Navigation names pages by
+route without the leading slash (`connectors/bigquery`). The build fails on a page missing from navigation, on navigation naming a page
 that does not exist, and on a reference with no row.
 
-**Building and previewing locally.** Previewing needs a checkout of exmergo/docs
-beside this one, because the site's settings live there:
+**Building and previewing locally.**
 
 ```
-git clone https://github.com/exmergo/docs ../docs
-uv run --project packages/dex-core python scripts/build_docs_site.py --require-help --site ../docs
+uv run --project packages/dex-core python scripts/build_docs_site.py --require-help
 cd build/docs-site && npx --yes mint@4.2.994 dev
 ```
 
-Then open http://localhost:3000/dex. The build prints every problem as
-`path:line: message` and writes nothing unless it is clean; without `--site` it
-writes only the `dex/` folder. Pull requests that touch the sources run the same
-build in CI against the current exmergo/docs, then `mint validate`,
-`mint broken-links --check-anchors` and `mint a11y` over the whole site.
+Then open http://localhost:3000. The build prints every problem as
+`path:line: message` and writes nothing unless it is clean. Pull requests that
+touch the sources run the same build in CI, then `mint validate`,
+`mint broken-links --check-anchors` and `mint a11y` over the site.
 `MINT_VERSION` in `.github/workflows/docs-site.yml` is the one place the Mintlify
 CLI version is set; keep the command above in step with it. On Windows,
-`mint broken-links` reports every link to a page two folders deep as broken
+`mint broken-links` reports every link to a page in a folder as broken
 (a path-separator bug in the checker); CI runs on Linux and is the one to trust.
 
 **When it goes live.** After PyPI publish, the release workflow commits the
-built `dex/` folder to exmergo/docs, replacing that folder and nothing else, and
-Mintlify deploys it. A documentation fix therefore ships with the next release.
-Never edit `dex/` in exmergo/docs or use Mintlify's web editor: the next release
-replaces the folder.
+built site to exmergo/dex-docs, replacing its whole tree, and Mintlify
+deploys it. A documentation fix therefore ships with the next release. Never
+edit exmergo/dex-docs or use Mintlify's web editor: the next release
+replaces it.
 
 **Claims.** Public pages state only what dex does today:
 
@@ -1277,15 +1269,16 @@ credentials:
   when PyPI answers 404 for the name. For protection before that release, you can
   publish a stub once by hand; the CI job then simply skips it. To reserve another
   name, add a stub package, a matrix entry, and a pending publisher.
-- **Documentation site:** Mintlify serves exmergo/docs (branch `main`, at the
-  root) on the custom domain `docs.exmergo.com` (a `CNAME docs` record to the
-  target Mintlify gives). This repository publishes its `dex/` folder there
-  through an organization GitHub App (the organization disables deploy keys),
-  installed on exmergo/docs only with Contents: read and write. Its client ID is
-  the `DOCS_APP_CLIENT_ID` variable and its private key the
+- **Documentation site:** Mintlify serves exmergo/dex-docs (branch `main`, at
+  the root) on the custom domain `docs.trydex.ai` (a `CNAME docs` record to the
+  target Mintlify gives). The `Docs site` workflow publishes there through the
+  organization's docs publisher GitHub App (the organization disables deploy
+  keys), installed on exmergo/dex-docs with Contents: read and write. Its client
+  ID is the `DOCS_APP_CLIENT_ID` variable and its private key the
   `DOCS_APP_PRIVATE_KEY` secret of the `docs-site` environment here, whose
-  deployment rule allows `main` and `v*` tags. To publish outside a release,
-  dispatch the `Docs site` workflow from `main` with `allow_untagged`.
+  deployment rule allows `main` and `v*` tags. To publish outside a release, dispatch the
+  `Docs site` workflow from `main` with `allow_untagged`. The old address,
+  `docs.exmergo.com/dex`, redirects here from exmergo/docs.
 - **ADE-bench spike:** stand up ADE-bench locally on DuckDB against the no-plugin
   baseline to confirm the runner before depending on it (the exact command is in
   `benchmarks/ade_bench/README.md`).

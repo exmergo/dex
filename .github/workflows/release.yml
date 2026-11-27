@@ -6,7 +6,8 @@ name: Release
 # are written before tagging (scripts/prepare_release.sh), so this workflow never
 # writes back to this repository; it verifies the tagged commit is
 # self-consistent before it publishes. Its one write outside PyPI is the Dex
-# section of the documentation site, committed to exmergo/docs after publish.
+# documentation site, which docs-site.yml commits after publish to
+# exmergo/dex-docs, the repository docs.trydex.ai is deployed from.
 #
 # There is no test gate here. A tag points at a commit on main, every commit on
 # main arrived through a pull request, and ci.yml's `tests` and `safety` jobs
@@ -145,7 +146,7 @@ jobs:
 
   # The documentation site, published from the tag only after PyPI accepted the
   # release, so the docs always describe what `pip install` gives you. Build,
-  # validation and the commit to exmergo/docs live in docs-site.yml.
+  # validation and the commit to exmergo/dex-docs live in docs-site.yml.
   #
   # Started as a run of its own (workflow_dispatch) rather than called as a
   # reusable workflow: its deploy job reads the docs publisher app's key from

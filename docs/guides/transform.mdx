@@ -6,7 +6,7 @@ description: Take a model change from verified source data through a reviewable 
 
 **Outcome:** a reviewed project change, built on dev, with evidence that its
 rows match the request. You need a connected warehouse and a dbt project with a
-dev target. Start with [Connect your data](/dex/connect) if either is missing.
+dev target. Start with [Connect your data](/connect) if either is missing.
 
 ## 1. State what the model should mean
 
@@ -32,7 +32,7 @@ repository; `dbt_project_dir` can select one when the repository holds several.
 
 The generated dev profile still needs a valid target. For DuckDB, a new dev file
 that reads sources must be populated before the build can succeed. Follow the
-[DuckDB dev-target guidance](/dex/connectors/duckdb#dev-target-seeding-convention).
+[DuckDB dev-target guidance](/connectors/duckdb#dev-target-seeding-convention).
 
 </Accordion>
 
@@ -116,7 +116,7 @@ leaves alone. They read each model's own SQL, so check a roster's rows on the
 build as well. Whether the account directory filters too is a decision to record
 rather than a side effect, and when the request leaves it open it is a `default`.
 
-Read the [command contract](/dex/reference/command-contract#how-authored-content-reaches-the-engine)
+Read the [command contract](/reference/command-contract#how-authored-content-reaches-the-engine)
 when you need to construct the edits payload yourself.
 
 ## 3. Apply the reviewed plan
@@ -137,7 +137,7 @@ dex transform build --target dev --verify --for-plan PLAN_ID
 ```
 
 On a metered connector, review the estimate and follow the
-[cost confirmation flow](/dex/guardrails/cost-controls). A successful dbt build
+[cost confirmation flow](/guardrails/cost-controls). A successful dbt build
 is only part of the result. Read `data.completion` first. It is the first key
 of the payload and is held to 4 KiB, so it survives a cut-off read even when
 hundreds of nodes follow it. With `--for-plan`, its `deliverables` say which of
@@ -171,7 +171,7 @@ available. This history survives pricing and confirmation retries without an
 extra build. It may describe a different selection or source tree, so it does
 not establish whether the plan caused the failure or change `plan_relation`.
 
-The [command contract](/dex/reference/command-contract) gives every
+The [command contract](/reference/command-contract) gives every
 field. Then read `data.outcome` (only `validated` means every required node ran
 and passed) and `data.verification.ran`, its findings,
 and `suppressed` checks. Missing parents, multiplied rows, or an entirely NULL column
@@ -253,12 +253,12 @@ than mixing them with another runtime's artifacts. The build result's
 `data.artifact_directory` names the directory used. Follow that path when
 investigating a failure instead of assuming the project's previous manifest
 describes this run. See the
-[build command contract](/dex/reference/command-contract).
+[build command contract](/reference/command-contract).
 
 </Accordion>
 
 ## Keep it correct
 
-Once the change is verified, [establish a maintenance baseline](/dex/guides/maintain).
+Once the change is verified, [establish a maintenance baseline](/guides/maintain).
 For refactoring tools, test scaffolding, mutation testing, and every build flag,
-see [`dex transform`](/dex/cli/transform).
+see [`dex transform`](/cli/transform).

@@ -1,0 +1,30 @@
+/*
+ * Dex's design on top of Mintlify's theme: the "engineering drawing" tokens
+ * trydex.ai and exmergo.com share. Paper grounds and blue linework come from
+ * docs.json (background, colors); this file adds what docs.json cannot set.
+ * Mintlify loads every .css file in the site on every page.
+ */
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+:root {
+  --dex-rule: #dad7cc;
+  --dex-paper-raised: #fbfaf7;
+}
+
+/* Code in IBM Plex Mono, as on trydex.ai. */
+code,
+kbd,
+pre,
+pre code {
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* Cards and code blocks drawn with the site's warm rule rather than grey. */
+html:not(.dark) .card,
+html:not(.dark) .code-block {
+  border-color: var(--dex-rule);
+}
+
+html:not(.dark) .card {
+  background-color: var(--dex-paper-raised);
+}
