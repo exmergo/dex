@@ -104,6 +104,7 @@
           {
             "group": "Project quality",
             "pages": [
+              "reference/dex-telemetry",
               "reference/evaluation",
               "reference/incidents"
             ]
