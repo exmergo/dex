@@ -288,8 +288,9 @@ GROUPS: dict[str, tuple[str, ...]] = {
         "tests/maintain/test_coverage_refresh.py",
         "tests/maintain/test_coverage_strength.py",
     ),
-    "maintain-diagnose": (  # 105s
+    "maintain-diagnose": (  # 105s, plus 20s for the cause kinds (#1476)
         "tests/maintain/test_diagnose.py",
+        "tests/maintain/test_diagnose_kinds.py",
         "tests/maintain/test_coverage_dbt.py",
     ),
     "maintain": ("tests/maintain/",),  # 132s

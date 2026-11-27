@@ -25,6 +25,7 @@ from exmergo_dex_core.maintain.elementary_layouts import (
     ElementaryLayoutError,
     adapter_catalog,
     check_layouts,
+    compatible_releases,
     layout_for,
     parse_layouts,
     reader_status,
@@ -43,6 +44,7 @@ TABLES = (
     "elementary_test_results",
     "dbt_invocations",
     "test_result_rows",
+    "dbt_run_results",
     "data_monitoring_metrics",
 )
 
@@ -717,3 +719,38 @@ def test_pass_at_zero_failures_must_be_a_boolean():
     )
     with pytest.raises(ValueError, match="true or false"):
         parse_layouts(text)
+
+
+# --- dbt_run_results, read by maintain diagnose (#1476) -----------------------------
+
+
+@pytest.mark.parametrize("release", ["0.16.4", "0.26.1"])
+def test_dbt_run_results_is_read_for_ids_and_build_times_only(release: str):
+    table = layout_for(release).tables["dbt_run_results"]
+
+    assert set(table.reads) == {
+        "unique_id",
+        "invocation_id",
+        "resource_type",
+        "status",
+        "execute_started_at",
+        "execute_completed_at",
+        "created_at",
+    }
+    # The columns that can quote a value are recorded, never read.
+    assert not {"compiled_code", "message", "adapter_response"} & set(table.reads)
+    names = [name for name, _ in table.columns]
+    assert ("group_name" in names) == (release == "0.26.1")
+    assert table.family("execute_started_at") == "text"
+
+
+def test_both_releases_read_dbt_run_results_alike():
+    assert compatible_releases("0.26.1", ["dbt_run_results"]) == ("0.16.4", "0.26.1")
+
+
+def test_a_build_time_retyped_in_dbt_run_results_refuses():
+    catalog = FakeCatalog().retype("dbt_run_results", "unique_id", "INTEGER")
+    with pytest.raises(ElementaryLayoutError) as caught:
+        check_layouts(RELEASE, catalog, tables=("dbt_run_results",))
+
+    assert caught.value.code == COLUMN_RETYPED

@@ -390,3 +390,14 @@ def test_a_profile_withholds_the_columns_that_can_quote_a_value():
     # Only on the package's own models: a project's column of the same name is
     # the project's, judged by its flags.
     assert elementary_values.withheld_columns("dev.main.orders", names) == set()
+
+
+def test_a_profile_of_dbt_run_results_withholds_its_code_and_messages():
+    """#1476: ``maintain diagnose`` reads build times from dbt_run_results, whose
+    compiled SQL, error message and adapter response can quote a value."""
+
+    names = ["unique_id", "execute_started_at", "compiled_code", "message"]
+    names.append("adapter_response")
+    held = elementary_values.withheld_columns(f"{SCHEMA}.dbt_run_results", names)
+    assert held == {"compiled_code", "message", "adapter_response"}
+    assert elementary_values.withheld_columns("dev.main.orders", names) == set()
