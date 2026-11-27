@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import checks
-from .runner import AgentResult, ClassifyResult
+from .runner import AgentResult, ClassifyResult, Verdict, read_verdict
 from .suite import AgentConfig, EvalCase
 
 
@@ -61,12 +61,20 @@ def _child_env() -> dict[str, str]:
 
 
 def _invoke(binary: str, args: list[str], prompt: str, timeout: int) -> str:
-    """Run ``claude -p`` and return its textual result, or raise on failure."""
+    """Run ``claude -p`` and return its textual result, or raise on failure.
+
+    The prompt goes on stdin, never in argv: on Windows ``claude`` is usually
+    npm's ``claude.cmd`` shim, and cmd.exe ends an argument at its first
+    newline, so a multi-line prompt (every judge prompt) reached the model as
+    its first line, and every flag after it was dropped.
+    """
 
     proc = subprocess.run(
-        [binary, "-p", prompt, "--output-format", "json", *args],
+        [binary, "-p", "--output-format", "json", *args],
+        input=prompt,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         env=_child_env(),
     )
@@ -169,19 +177,13 @@ def _invoke_stream(
 ) -> tuple[str, str | None]:
     """Run ``claude -p`` in ``cwd`` with a ``stream-json`` transcript; return
     the transcript and why the process failed (``None`` if it did not). A
-    timed-out run keeps what it wrote, which says how far it got."""
+    timed-out run keeps what it wrote, which says how far it got. The prompt
+    goes on stdin, as in ``_invoke``."""
 
     try:
         proc = subprocess.run(
-            [
-                binary,
-                "-p",
-                prompt,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                *args,
-            ],
+            [binary, "-p", "--output-format", "stream-json", "--verbose", *args],
+            input=prompt,
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -352,8 +354,16 @@ class ClaudeCliJudge:
     timeout: int = 120
 
     def grade(self, case: EvalCase, assertion: str, result: AgentResult) -> bool:
+        return self.verdict(case, assertion, result).passed
+
+    def verdict(self, case: EvalCase, assertion: str, result: AgentResult) -> Verdict:
+        """The judge's answer, read tolerantly; a judge that failed or
+        answered neither PASS nor FAIL comes back as ``error``, never as a
+        FAIL, since it says nothing about the agent."""
+
         if result.error:
-            return False
+            # The run is the case's error already; there is nothing to judge.
+            return Verdict(passed=False)
         binary = _require_claude(self.binary)
         prompt = (
             "You are grading an agent's output against one requirement. "
@@ -364,7 +374,8 @@ class ClaudeCliJudge:
         )
         args = ["--model", self.model] if self.model else []
         try:
-            verdict = _invoke(binary, args, prompt, self.timeout)
-        except Exception:
-            return False  # a judge failure is a non-pass, never a crash
-        return verdict.strip().upper().startswith("PASS")
+            answer = _invoke(binary, args, prompt, self.timeout)
+        except Exception as exc:
+            # A judge failure is no verdict, never a crash and never a FAIL.
+            return Verdict(passed=False, error=f"{type(exc).__name__}: {exc}"[:500])
+        return read_verdict(answer)

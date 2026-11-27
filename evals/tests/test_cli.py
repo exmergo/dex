@@ -26,7 +26,9 @@ def calls(monkeypatch):
     recorded: list[dict] = []
 
     def fake_run(cmd, **kwargs):
-        recorded.append({"cmd": cmd, "env": kwargs.get("env")})
+        recorded.append(
+            {"cmd": cmd, "env": kwargs.get("env"), "input": kwargs.get("input")}
+        )
         out = json.dumps({"result": "PASS /dex:explore"})
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
@@ -36,8 +38,9 @@ def calls(monkeypatch):
 
 
 def _prompt(call: dict) -> str:
-    cmd = call["cmd"]
-    return cmd[cmd.index("-p") + 1]
+    # The prompt goes on stdin; on Windows, cmd.exe cuts an argv prompt at
+    # its first newline (see claude_agent._invoke).
+    return call["input"]
 
 
 def test_plugin_dir_defaults_to_this_checkout(calls, capsys):
