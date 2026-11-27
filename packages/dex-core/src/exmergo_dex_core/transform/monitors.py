@@ -1,5 +1,5 @@
 """Vendor monitors written from a model's declaration (#1444, #1482, #1484,
-#1485, #1591).
+#1485, #1486, #1591).
 
 A declaration already says which column is a model's time. An observability
 vendor's monitors need the same fact, and a project that writes it twice, by
@@ -8,7 +8,7 @@ hand, in two places, lets the two drift. With ``monitors.vendor`` set in
 vendor's own tests into the same YAML entry, in the same plan and diff, parsed
 by dbt before the plan is stored.
 
-One vendor today, the Elementary dbt package, and four mapping rows:
+One vendor today, the Elementary dbt package, and five mapping rows:
 
 * a column declared with role ``time`` becomes the ``timestamp_column`` of
   ``elementary.volume_anomalies`` and ``elementary.freshness_anomalies``.
@@ -46,6 +46,17 @@ One vendor today, the Elementary dbt package, and four mapping rows:
   package would run its defaults, some of which mean nothing for some
   columns, so the list is always written. A column Dex flags as personal
   data gets none: the monitors store its values.
+
+* a time column declaring a daily deadline, ``freshness: {deadline,
+  timezone, days}`` (#1486), becomes an ``elementary.data_freshness_sla`` on
+  it, with that ``sla_time``, ``timezone`` and, where ``days`` limits it, the
+  ``day_of_week`` (Elementary's full day names). A ``max_lag`` is never read
+  as a deadline: "six hours behind" is not "updated by 07:00". The test
+  passes once the column holds a value from today in the zone, so on a
+  ``business`` basis column (yesterday's events, loaded today) the plan
+  warns. Withheld below Elementary 0.23.1, which first ships it, and where a
+  population value holds a quote on a connector that escapes it with a
+  backslash (:func:`_sla_breaks_on_quote`).
 
 What this module never does:
 
@@ -99,6 +110,12 @@ VOLUME = "volume_anomalies"
 FRESHNESS = "freshness_anomalies"
 DIMENSION = "dimension_anomalies"
 COLUMN = "column_anomalies"
+SLA = "data_freshness_sla"
+
+#: The first Elementary release that ships ``data_freshness_sla`` (#1486): it
+#: is absent at 0.23.0 and unchanged from 0.23.1 through 0.26.1. Below it the
+#: test does not exist, and dbt's parse would refuse the plan.
+SLA_SINCE = "0.23.1"
 
 #: The monitors a declared unit gives a column (#1485): its minimum and
 #: maximum, watched for a shift inside the bound ``dex_unit_range`` checks.
@@ -156,6 +173,10 @@ PACKAGE_NOT_INSTALLED = "package_not_installed"
 PRODUCTION_DISABLED = "production_disabled"
 PRODUCTION_UNKNOWN = "production_unknown"
 DECLARATION_CHANGED = "declaration_changed"
+RELEASE_UNSUPPORTED = "release_unsupported"
+#: Why a ``data_freshness_sla`` alone is withheld (#1486): its population
+#: holds a quote the package cannot re-escape (:func:`_sla_breaks_on_quote`).
+SLA_FILTER_QUOTE = "sla_filter_quote"
 # Why a model's population filters could not be written as a where_expression
 # (#1483), so no monitor was written for it: one written without the filter
 # would measure rows the model does not promise.
@@ -976,6 +997,13 @@ class Monitor:
     column: str | None = None
     monitors: tuple[str, ...] = ()
     sources: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    #: A ``data_freshness_sla``'s deadline (#1486): the time of day, its zone,
+    #: the days it is checked on as Elementary spells them (``None``: every
+    #: day), and the declared basis of its column.
+    sla_time: str | None = None
+    timezone: str | None = None
+    days: tuple[str, ...] | None = None
+    basis: str | None = None
 
     def _arguments(self, with_where: bool) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -985,6 +1013,11 @@ class Monitor:
             out["dimensions"] = [self.dimension]
         if self.timestamp_column is not None:
             out["timestamp_column"] = self.timestamp_column
+        if self.test == SLA:
+            out["sla_time"] = self.sla_time
+            out["timezone"] = self.timezone
+            if self.days is not None:
+                out["day_of_week"] = list(self.days)
         if with_where and self.where_expression is not None:
             out["where_expression"] = self.where_expression
         return out
@@ -1177,6 +1210,7 @@ def planned(
     quoted: frozenset[str] = frozenset(),
     domains: Domains | None = None,
     marked: frozenset[str] = frozenset(),
+    release: str | None = None,
 ) -> list[Monitor]:
     """Every monitor ``declaration`` (as the entry states it) gives.
 
@@ -1194,6 +1228,10 @@ def planned(
     Each column whose unit or additivity gives monitors gives one
     ``column_anomalies`` on it (#1485, #1591; :func:`_column_monitors`), on the
     same time column rule, listed under the column rather than the model.
+
+    Each time column declaring a ``freshness.deadline`` gives a
+    ``data_freshness_sla`` on it (#1486; :func:`_sla_monitors`), withheld
+    where the installed ``release`` predates the test.
 
     Each monitor written carries the ``where_expression`` the population
     filters give (:func:`where_expression`), on ``dialect``. Where they cannot
@@ -1261,7 +1299,83 @@ def planned(
         )
         for column in times
     )
+    out.extend(
+        _sla_monitors(
+            declaration,
+            times,
+            withheld,
+            where,
+            release,
+            _sla_breaks_on_quote(declaration, dialect),
+        )
+    )
     return out + dimensions
+
+
+def _sla_breaks_on_quote(declaration: Declaration, dialect: str | None) -> bool:
+    """Whether the package's ``data_freshness_sla`` would fail to compile with
+    the population's ``where_expression`` (#1486). It repeats the expression in
+    its result message, inside a single-quoted literal, re-escaping each quote
+    (``\\'`` on BigQuery, ``''`` elsewhere: ``get_data_freshness_sla_query``
+    at 0.26.1). A quote Dex wrote as ``\\'``, as it must on a connector where a
+    backslash escapes, then closes that literal, and the warehouse refuses
+    the statement. Doubled quotes (DuckDB, Postgres, ClickHouse) survive it.
+    The other monitors do not repeat the expression and are unaffected."""
+
+    if dialect not in _BACKSLASH_DIALECTS:
+        return False
+    filters = declaration.population.filters if declaration.population else []
+    return any(
+        isinstance(value, str) and "'" in value
+        for entry in filters
+        for value in (entry.includes or []) + (entry.excludes or [])
+    )
+
+
+def _sla_monitors(
+    declaration: Declaration,
+    times: list[str],
+    withheld: Any,
+    where: str | None,
+    release: str | None,
+    quote_breaks: bool = False,
+) -> list[Monitor]:
+    """One ``data_freshness_sla`` per time column declaring a
+    ``freshness.deadline`` (#1486), with its ``sla_time``, ``timezone`` and,
+    where ``days`` limits it, its ``day_of_week``. A ``max_lag`` alone gives
+    none: a lag is not a deadline. Withheld where the time column is not
+    output or the population cannot be written (``withheld``), and where the
+    installed ``release`` is readable and older than :data:`SLA_SINCE`; an
+    unread release is left to dbt's parse. ``quote_breaks`` withholds it as
+    ``sla_filter_quote`` (:func:`_sla_breaks_on_quote`)."""
+
+    from .elementary import release_key
+
+    old = release is not None and (
+        (key := release_key(release)) is not None and key < release_key(SLA_SINCE)  # type: ignore[operator]
+    )
+    out: list[Monitor] = []
+    for column in times:
+        freshness = declaration.columns[column].freshness
+        if freshness is None or freshness.deadline is None:
+            continue
+        out.append(
+            Monitor(
+                declaration.model,
+                SLA,
+                column,
+                f"columns.{column}.freshness.deadline: {freshness.deadline}",
+                withheld(column)
+                or (RELEASE_UNSUPPORTED if old else None)
+                or (SLA_FILTER_QUOTE if quote_breaks and where else None),
+                where_expression=where,
+                sla_time=freshness.deadline,
+                timezone=freshness.timezone,
+                days=tuple(freshness.day_names) if freshness.day_names else None,
+                basis=getattr(freshness.basis, "value", str(freshness.basis)),
+            )
+        )
+    return out
 
 
 def is_monitor(spec: Any) -> bool:
@@ -1362,6 +1476,20 @@ def _monitor_set(test: Any) -> frozenset[str]:
     return frozenset(m.lower() for m in _monitors_of(test) or [])
 
 
+def _deadline_of(test: Any) -> tuple[str | None, str | None, tuple[str, ...]]:
+    """A listed ``data_freshness_sla``'s ``sla_time``, ``timezone`` and
+    ``day_of_week`` (lower-cased, as a sorted tuple; empty: every day)."""
+
+    days = _argument_raw(test, "day_of_week")
+    if days is None:
+        listed: tuple[str, ...] = ()
+    elif isinstance(days, (list, tuple)):
+        listed = tuple(sorted(str(d).strip().lower() for d in days))
+    else:
+        listed = (str(days).strip().lower(),)
+    return _argument_of(test, "sla_time"), _argument_of(test, "timezone"), listed
+
+
 def _arguments_of(test: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
     monitors = _monitors_of(test)
@@ -1370,10 +1498,15 @@ def _arguments_of(test: Any) -> dict[str, Any]:
     dimensions = _dimensions_of(test)
     if dimensions is not None:
         out["dimensions"] = dimensions
-    for name in ("timestamp_column", "where_expression"):
+    for name in ("timestamp_column", "sla_time", "timezone", "where_expression"):
         value = _argument_of(test, name)
         if value is not None:
             out[name] = value
+    days = _argument_raw(test, "day_of_week")
+    if days is not None:
+        out["day_of_week"] = (
+            [str(d) for d in days] if isinstance(days, (list, tuple)) else [str(days)]
+        )
     return out
 
 
@@ -1399,6 +1532,11 @@ def matches(spec: Any, listed: Any) -> bool:
     by several columns at once is another monitor, since the package groups by
     their combination.
 
+    A ``data_freshness_sla`` (#1486) Dex wrote matches only on the same
+    ``sla_time``, ``timezone`` and ``day_of_week`` too, so one written from a
+    deadline the declaration no longer states is stale; a hand-written one
+    matches on the same ``timestamp_column``, its deadline being its author's.
+
     A ``column_anomalies`` (#1485, #1591) is compared against the tests its
     own column lists. One Dex wrote matches only on the same monitor list,
     compared as a set without case, as well as the same time column and
@@ -1421,6 +1559,10 @@ def matches(spec: Any, listed: Any) -> bool:
         if _bare(_test_name(spec)).lower() == COLUMN and _monitor_set(
             spec
         ) != _monitor_set(listed):
+            return False
+        if _bare(_test_name(spec)).lower() == SLA and _deadline_of(
+            spec
+        ) != _deadline_of(listed):
             return False
         return same and (_where_of(spec) or "") == (_where_of(listed) or "")
     if _bare(_test_name(spec)).lower() == VOLUME:
@@ -1581,7 +1723,9 @@ def decide(
     closed = the_gate.closed_reason
     to_write: list[Monitor] = []
     rows: list[dict[str, Any]] = []
-    gives = planned(declaration, outputs, dialect, quoted, domains, marked)
+    gives = planned(
+        declaration, outputs, dialect, quoted, domains, marked, the_gate.release
+    )
     current_specs = [m.spec() for m in gives if m.withheld is None and m.test != COLUMN]
     for monitor in gives:
         row: dict[str, Any] = {
@@ -1593,6 +1737,8 @@ def decide(
         }
         if monitor.test == DIMENSION:
             row.update(_domain_fields(monitor))
+        if monitor.test == SLA:
+            row["basis"] = monitor.basis
         if monitor.test == COLUMN:
             # A column monitor is listed under its column (#1485, #1591).
             row["sources"] = [
@@ -1625,7 +1771,7 @@ def decide(
         found = next((t for t in here if matches(monitor.spec(), t)), None)
         if found is not None:
             row["status"] = ALREADY_LISTED if is_monitor(found) else HAND_WRITTEN
-            if not is_monitor(found) and monitor.test == COLUMN:
+            if not is_monitor(found) and monitor.test in (COLUMN, SLA):
                 # The author's own list stands; the row says what it holds.
                 row["arguments"] = dict(_arguments_of(found))
         elif closed is not None:
@@ -1658,6 +1804,17 @@ def decide(
             and m.timestamp_column.lower() == (_timestamp_of(test) or "").lower()
             for m in gives
         )
+        # A deadline monitor on the same column whose deadline moved (#1486)
+        # is stale on the deadline, whatever its filter.
+        # A removed deadline is a moved one too: the column is still the
+        # model's time column, so "timestamp_column" would misname it.
+        moved_deadline = _bare(_test_name(test)).lower() == SLA and not any(
+            m.test == SLA
+            and (m.timestamp_column or "").lower()
+            == (_timestamp_of(test) or "").lower()
+            and _deadline_of(m.spec()) == _deadline_of(test)
+            for m in gives
+        )
         stale: dict[str, Any] = {
             "model": declaration.model,
             "test": _test_name(test),
@@ -1666,10 +1823,18 @@ def decide(
             "field": marker.get("from"),
             "status": STALE,
             "reason": DECLARATION_CHANGED,
-            "changed": "where_expression" if same_time else "timestamp_column",
+            "changed": (
+                "deadline"
+                if moved_deadline
+                else "where_expression"
+                if same_time
+                else "timestamp_column"
+            ),
         }
         if same_time:
             stale["replacement"] = _replacement(rows, stale["test"], stale["column"])
+        elif moved_deadline:
+            stale["replacement"] = {"status": NOT_RENDERED, "reason": "not_declared"}
         rows.append(stale)
     for column, test in _listed_column_tests(content, declaration.model):
         if not is_monitor(test) or _bare(_test_name(test)).lower() != COLUMN:
@@ -1825,6 +1990,31 @@ _DIMENSION_CAUSE = {
 
 
 def stale_note(row: Mapping[str, Any]) -> str:
+    if row.get("changed") == "deadline":
+        arguments = row.get("arguments") or {}
+        replacement = row.get("replacement") or {}
+        lead = (
+            f"'{row['model']}' lists {row['test']} on {row.get('column')}, written "
+            f"by dex with sla_time {arguments.get('sla_time')} "
+            f"{arguments.get('timezone')}, a deadline the declared "
+            "freshness.deadline no longer gives"
+        )
+        if replacement.get("status") in _REPLACED:
+            return (
+                f"{lead}; the current one is listed beside it and dex leaves this "
+                "one in place: remove it, since the old deadline still alerts"
+            )
+        if replacement.get("reason") == "not_declared":
+            return (
+                f"{lead}: the column declares no deadline now; dex leaves it in "
+                "place: remove it, or keep it as your own by removing its "
+                "config.meta.dex marker"
+            )
+        why = replacement.get("reason") or "it was not written"
+        return (
+            f"{lead}; dex did not write the current one ({why}), so keep this one "
+            "until it can be written, then remove it"
+        )
     if row.get("changed") == "where_expression":
         replacement = row.get("replacement") or {}
         lead = (
@@ -1837,6 +2027,16 @@ def stale_note(row: Mapping[str, Any]) -> str:
                 f"{lead}; the current one is listed beside it and dex leaves this "
                 "one in place: remove it, since two such monitors on one model each "
                 "count its rows"
+            )
+        if replacement.get("reason") == SLA_FILTER_QUOTE:
+            # The listed one cannot compile here either (#1486): nothing is
+            # gained by keeping it.
+            return (
+                f"'{row['model']}' lists {row['test']} on {row.get('column')}, "
+                "written by dex, which fails to compile on this connector: the "
+                "package repeats its where_expression, which holds a quote, inside "
+                "its result message; remove it, since maintain verify still checks "
+                "the deadline"
             )
         why = replacement.get("reason") or "it was not written"
         return (
@@ -1923,6 +2123,55 @@ def _stale_column_note(row: Mapping[str, Any]) -> str:
     return (
         f"{lead}, with {what}; dex did not write the current one ({why}), so keep "
         "this one until it can be written, then remove it"
+    )
+
+
+def deadline_note(rows: Iterable[Mapping[str, Any]]) -> str | None:
+    """One sentence for the deadlines on a column of ``business`` basis
+    (#1486), or ``None``. Elementary's ``data_freshness_sla`` passes only when
+    the column holds a value from today in the deadline's zone, so a load of
+    the previous day's events, which a business time records, fails it every
+    day; a capture time is the column a load deadline belongs on."""
+
+    business = sorted(
+        {
+            f"{r['model']}.{r.get('column')}"
+            for r in rows
+            if _bare(str(r.get("test", ""))).lower() == SLA
+            and r.get("basis") == "business"
+            and r.get("status") in (ADDED, ALREADY_LISTED)
+        }
+    )
+    if not business:
+        return None
+    return (
+        f"{SLA} on {', '.join(business)} reads a business time: it passes only "
+        "once that column holds an event from today (in the deadline's time "
+        "zone), so a load of the previous day's events fails it every day; where "
+        "the deadline is for the load, declare it on the time rows were loaded "
+        "(basis: capture)"
+    )
+
+
+def sla_quote_note(rows: Iterable[Mapping[str, Any]]) -> str | None:
+    """One sentence for the deadlines withheld as ``sla_filter_quote``
+    (#1486), or ``None``."""
+
+    held = sorted(
+        {
+            f"{r['model']}.{r.get('column')}"
+            for r in rows
+            if r.get("reason") == SLA_FILTER_QUOTE
+        }
+    )
+    if not held:
+        return None
+    return (
+        f"{SLA} was not written on {', '.join(held)}: the declared "
+        "population.filters hold a value with a quote, which this connector "
+        "escapes with a backslash, and Elementary repeats the where_expression "
+        "inside its own result message, re-escaping each quote, so the test "
+        "would fail to compile; the deadline is still checked by maintain verify"
     )
 
 
@@ -2025,6 +2274,14 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
                     f"[{', '.join(dimensions)}]" if dimensions is not None else None,
                 ),
                 ("timestamp_column", timestamp),
+                ("sla_time", _argument_of(test, "sla_time")),
+                ("timezone", _argument_of(test, "timezone")),
+                (
+                    "day_of_week",
+                    f"[{', '.join(_arguments_of(test)['day_of_week'])}]"
+                    if _argument_raw(test, "day_of_week") is not None
+                    else None,
+                ),
                 ("where_expression", where),
             )
             if value is not None
@@ -2061,8 +2318,13 @@ def decisions(label: str, entry: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "chosen": "; ".join(chosen) or "the package's defaults",
                 "evidence": "contract",
                 "detail": (
-                    f"written from {' and '.join(sources)}; training settings "
-                    "are the package's defaults"
+                    f"written from {' and '.join(sources)}"
+                    + (
+                        # A deadline check trains nothing (#1486).
+                        ""
+                        if _bare(name).lower() == SLA
+                        else "; training settings are the package's defaults"
+                    )
                     if sources
                     else "written by dex from the model's declaration"
                 ),

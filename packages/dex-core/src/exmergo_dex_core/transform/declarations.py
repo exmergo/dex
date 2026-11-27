@@ -1562,6 +1562,12 @@ def render(
             unread = monitors_mod.domain_note(rows)
             if unread is not None and unread not in notes:
                 notes.append(unread)
+            for note in (
+                monitors_mod.deadline_note(rows),
+                monitors_mod.sla_quote_note(rows),
+            ):
+                if note is not None and note not in notes:
+                    notes.append(note)
     if not gt.kinds():
         # No kind registered: nothing to generate, so no entry to read back.
         if watched:
@@ -1596,8 +1602,21 @@ def render(
                 generated.append(row)
             if notes is not None:
                 notes.append(_stale_note(row))
+    # A freshness that now states a deadline and no lag (#1486) gives no
+    # dex_freshness, so one the column lists holds it to a lag it dropped.
+    lagless = frozenset(
+        name.lower()
+        for name, column in declaration.columns.items()
+        if column.freshness is not None and column.freshness.max_lag is None
+    )
     for test in (gt.FRESHNESS, gt.CONTINUITY):
-        for row in _stale_column_tests(content, declaration.model, planned, test):
+        for row in _stale_column_tests(
+            content,
+            declaration.model,
+            planned,
+            test,
+            cleared=lagless if test == gt.FRESHNESS else frozenset(),
+        ):
             if generated is not None:
                 generated.append(row)
             if notes is not None:
@@ -1887,8 +1906,8 @@ def _stale_note(row: Mapping[str, Any]) -> str:
         return (
             f"'{row['model']}.{row['column']}' lists a {gt.FRESHNESS} test (claim "
             f"{row['claim']}) for a freshness it no longer declares (its max_lag "
-            "changed); it still holds the column to the old lag, so remove it "
-            "from the YAML"
+            "changed, or was dropped for a deadline); it still holds the column "
+            "to the old lag, so remove it from the YAML"
         )
     if row["test"] == gt.CONTINUITY:
         return (
@@ -2054,7 +2073,11 @@ _STALE_REASONS: Mapping[str, tuple[str, str]] = {
 
 
 def _stale_column_tests(
-    content: str | None, model: str, planned: list[dict[str, Any]], test: str
+    content: str | None,
+    model: str,
+    planned: list[dict[str, Any]],
+    test: str,
+    cleared: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """The ``test`` tests a column lists whose claim the declaration no longer
     gives: a ``dex_freshness`` whose ``max_lag`` changed (#1460), a
@@ -2062,8 +2085,10 @@ def _stale_column_tests(
     holds the column to the old fact. Each is a ``data.generated_tests`` row
     with ``status: stale``, a ``reason`` and the kind's cadence
     (:data:`_STALE_REASONS`). Only the
-    columns this declaration gives the kind are read: a column it says nothing
-    about keeps what it lists."""
+    columns this declaration gives the kind are read, and ``cleared``, the
+    columns it speaks to while giving the kind none (a freshness with a
+    deadline and no ``max_lag``, #1486): a column it says nothing about keeps
+    what it lists."""
 
     node = _listed_entry(content, model)
     if node is None:
@@ -2072,6 +2097,8 @@ def _stale_column_tests(
     for g in planned:
         if g["test"] == test and g["column"] is not None:
             current.setdefault(str(g["column"]).lower(), []).append(g["spec"])
+    for name in cleared:
+        current.setdefault(name, [])
     out: list[dict[str, Any]] = []
     for column in node.get("columns") or []:
         if not isinstance(column, Mapping) or not isinstance(column.get("name"), str):
@@ -2562,7 +2589,9 @@ def _rendered_columns(
             if value is not None
         }
         if column.freshness is not None:
-            entry["dex"]["freshness"] = column.freshness.model_dump(mode="json")
+            entry["dex"]["freshness"] = column.freshness.model_dump(
+                mode="json", exclude_none=True
+            )
         if column.continuity is not None:
             entry["dex"]["continuity"] = column.continuity.model_dump(mode="json")
         if column.null_rule is not None and column.null_rule.strip().lower() == "never":

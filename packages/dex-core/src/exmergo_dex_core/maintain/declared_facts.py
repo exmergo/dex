@@ -351,7 +351,8 @@ def _read(node: dict[str, Any]):
 
 
 def _freshness_rules(node: dict[str, Any]) -> tuple[freshness_mod.FreshnessRule, ...]:
-    """Each column's declared ``freshness`` (#1460), in column order."""
+    """Each check each column's declared ``freshness`` states (#1460, #1486),
+    in column order."""
 
     out: list[freshness_mod.FreshnessRule] = []
     columns = node.get("columns")
@@ -362,9 +363,8 @@ def _freshness_rules(node: dict[str, Any]) -> tuple[freshness_mod.FreshnessRule,
         dex = entry_meta(column).get("dex")
         if not isinstance(name, str) or not name or not isinstance(dex, dict):
             continue
-        rule = freshness_mod.read_rule(name, dex.get("freshness"))
-        if rule is not None:
-            out.append(rule)
+        # A lag, a deadline (#1486), or both: one rule per check.
+        out.extend(freshness_mod.read_rules(name, dex.get("freshness")))
     return tuple(out)
 
 
@@ -444,9 +444,9 @@ class Prepared:
     #: Each contract no statement could be written for, with why (#1027).
     temporal_unwritten: dict[str, tuple[str, str]] = field(default_factory=dict)
     #: Every model in scope that declares a freshness (#1460), and each rule
-    #: no statement could be written for, by (model, column), with why.
+    #: no statement could be written for, by (model, column, check), with why.
     freshness_models: list[DeclaredModel] = field(default_factory=list)
-    freshness_unwritten: dict[tuple[str, str], tuple[str, str]] = field(
+    freshness_unwritten: dict[tuple[str, str, str], tuple[str, str]] = field(
         default_factory=dict
     )
     #: Each parent check no statement could be written for, with code and why.

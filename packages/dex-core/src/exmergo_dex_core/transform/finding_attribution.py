@@ -97,6 +97,7 @@ _CODE_CLASSES: tuple[tuple[str, frozenset[str]], ...] = (
     ("no_entity_comparable", frozenset({"temporal"})),
     ("policy_missing", frozenset({"temporal"})),
     ("freshness_exceeded", frozenset({"freshness"})),
+    ("deadline_missed", frozenset({"freshness"})),
 )
 
 

@@ -35,7 +35,7 @@ uses), and the finding and record say the lag is withheld.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -51,34 +51,135 @@ COLUMN_MISSING = "column_missing"
 LAG_UNREADABLE = "lag_unreadable"
 
 
+#: The two checks a declared freshness can state, one record each.
+MAX_LAG = "max_lag"
+DEADLINE = "deadline"
+
+#: The finding a missed daily deadline raises (#1486).
+DEADLINE_CODE = "deadline_missed"
+
+#: Why a declared deadline had nothing to judge on this run.
+NOT_SCHEDULED = "not_scheduled"
+BEFORE_DEADLINE = "before_deadline"
+
+
 @dataclass(frozen=True)
 class FreshnessRule:
-    """One declared ``freshness``: its column as declared, the lag in seconds
-    and as written (normalized), and the basis."""
+    """One check a declared ``freshness`` states, on its column as declared.
+
+    ``check`` is ``max_lag`` (#1460: the lag in seconds and as written,
+    normalized) or ``deadline`` (#1486: a time of day in ``timezone``, on
+    every day or only on ``days``, three-letter, Monday first). A column
+    declaring both gives two rules. ``basis`` is the column's either way."""
 
     column: str
-    max_lag: str
-    max_lag_seconds: int
+    max_lag: str | None
+    max_lag_seconds: int | None
     basis: str
+    check: str = MAX_LAG
+    deadline: str | None = None
+    timezone: str | None = None
+    days: tuple[str, ...] | None = None
+
+
+def read_rules(column: str, value: Any) -> list[FreshnessRule]:
+    """Each check a column's ``dex.freshness`` states (a lag, a deadline, or
+    both), or none where it states one the declaration schema would refuse (a
+    hand edit): an unreadable rule is never guessed into a check."""
+
+    from pydantic import ValidationError
+
+    from ..semantic_declarations import Freshness
+
+    if not isinstance(value, dict):
+        return []
+    try:
+        declared = Freshness.model_validate(value)
+    except (ValidationError, ValueError, TypeError):
+        return []
+    basis = declared.basis.value
+    out: list[FreshnessRule] = []
+    if declared.max_lag is not None:
+        out.append(
+            FreshnessRule(
+                column, declared.max_lag, declared.max_lag_seconds, basis, MAX_LAG
+            )
+        )
+    if declared.deadline is not None:
+        out.append(
+            FreshnessRule(
+                column,
+                None,
+                None,
+                basis,
+                DEADLINE,
+                deadline=declared.deadline,
+                timezone=declared.timezone,
+                days=tuple(declared.days) if declared.days else None,
+            )
+        )
+    return out
 
 
 def read_rule(column: str, value: Any) -> FreshnessRule | None:
-    """The rule a column's ``dex.freshness`` states, or ``None`` where it states
-    none or one the declaration schema would refuse (a hand edit): an unreadable
-    rule is never guessed into a check."""
+    """The lag rule a column's ``dex.freshness`` states, or ``None`` where it
+    states none or one the declaration schema would refuse."""
 
-    from ..semantic_declarations import lag_seconds, normalized_lag
+    return next((r for r in read_rules(column, value) if r.check == MAX_LAG), None)
 
-    if not isinstance(value, dict):
-        return None
-    lag, basis = value.get("max_lag"), value.get("basis")
-    if not isinstance(lag, str) or basis not in ("business", "capture"):
-        return None
-    try:
-        seconds = lag_seconds(lag)
-    except ValueError:
-        return None
-    return FreshnessRule(column, normalized_lag(seconds), seconds, basis)
+
+# --- the deadline's day ---------------------------------------------------------
+
+
+def clock() -> Any:
+    """The runner's clock, as an aware UTC datetime: the seam tests freeze."""
+
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class DeadlineWindow:
+    """Today in a deadline's time zone, as Elementary's ``data_freshness_sla``
+    computes it: the local date, whether ``days`` schedules it, and, as whole
+    UTC epoch seconds, the local midnight starting it and the deadline."""
+
+    target_date: str
+    weekday: str
+    scheduled: bool
+    day_start: int
+    deadline: int
+
+
+def deadline_window(rule: FreshnessRule, now: Any = None) -> DeadlineWindow:
+    """The window ``rule``'s deadline judges on the runner's ``now``.
+
+    The day is the runner's, read in the declared zone, as the package reads
+    it when it compiles the test; whether the deadline has passed is the
+    warehouse's clock, compared in the statement, as the package compares it.
+    A local time a clock change skips or repeats resolves as ``zoneinfo``
+    resolves it (the earlier offset)."""
+
+    from datetime import UTC, datetime, time
+    from zoneinfo import ZoneInfo
+
+    from ..semantic_declarations import WEEKDAYS, deadline_parts
+
+    zone = ZoneInfo(str(rule.timezone))
+    current = (now or clock()).astimezone(zone)
+    local_day = current.date()
+    hour, minute = deadline_parts(str(rule.deadline))
+    start = datetime.combine(local_day, time(0, 0), tzinfo=zone).astimezone(UTC)
+    due = datetime.combine(local_day, time(hour, minute), tzinfo=zone).astimezone(UTC)
+    weekday = WEEKDAYS[local_day.weekday()][0]
+    return DeadlineWindow(
+        target_date=local_day.isoformat(),
+        weekday=weekday,
+        scheduled=rule.days is None or weekday in rule.days,
+        day_start=int(start.timestamp()),
+        deadline=int(due.timestamp()),
+    )
 
 
 # --- the expressions, per warehouse ----------------------------------------------
@@ -193,6 +294,23 @@ def within_sql(dialect: str, quoted_column: str, kind: str, max_lag: int) -> str
     )
 
 
+def today_sql(dialect: str, quoted_column: str, kind: str, day_start: int) -> str:
+    """The count of rows whose value falls on or after the local midnight
+    ``day_start`` (whole UTC epoch seconds): the column holds today's data
+    exactly where this is above zero. A count, never a value, so a column
+    that looks like personal data is judged the same way."""
+
+    row_epoch = epoch_sql(dialect, quoted_column, kind)
+    return f"COUNT(CASE WHEN ({row_epoch}) >= {int(day_start)} THEN 1 END)"
+
+
+def due_sql(dialect: str, deadline: int) -> str:
+    """1 where the warehouse's clock has reached ``deadline`` (whole UTC epoch
+    seconds), else 0: a constant, read once with the counts."""
+
+    return f"CASE WHEN ({now_sql(dialect)}) >= {int(deadline)} THEN 1 ELSE 0 END"
+
+
 def lag_sql(dialect: str, quoted_column: str, kind: str) -> str:
     """The lag, in seconds, of the column's newest value behind the clock."""
 
@@ -223,6 +341,8 @@ class Written:
     #: and whether its lag may be shown (``False`` on a column that looks like
     #: personal data, measured by a count that never computes its newest value)
     rules: list[tuple[int, FreshnessRule, str, str | None, bool]]
+    #: Each deadline rule's window (#1486), by alias index.
+    windows: dict[int, DeadlineWindow] = field(default_factory=dict)
 
 
 def write_probe(
@@ -246,6 +366,8 @@ def write_probe(
     model = probe.model
     parts = ["COUNT(*) AS dex_rows"]
     rules: list[tuple[int, FreshnessRule, str, str | None, bool]] = []
+    windows: dict[int, DeadlineWindow] = {}
+    now = clock()
     for index, rule in enumerate(model.freshness):
         if live is None:
             spelled, data_type = rule.column, model_type(model, rule.column)
@@ -253,12 +375,12 @@ def write_probe(
             found = live.get(rule.column.lower())
             if found is None:
                 why = (
-                    f"the declared freshness on {model.model}.{rule.column} was not "
-                    "checked: the built relation has no such column"
+                    f"the declared {_what(rule)} on {model.model}.{rule.column} "
+                    "was not checked: the built relation has no such column"
                 )
                 prepared.notes.append(why)
                 prepared.dropped["freshness"].append(f"{model.model}: {why}")
-                prepared.freshness_unwritten[(model.model, rule.column)] = (
+                prepared.freshness_unwritten[(model.model, rule.column, rule.check)] = (
                     COLUMN_MISSING,
                     "the built relation has no such column",
                 )
@@ -267,23 +389,36 @@ def write_probe(
         kind = temporal_kind(dialect, data_type)
         if kind is None:
             why = (
-                f"the declared freshness on {model.model}.{rule.column} was not "
+                f"the declared {_what(rule)} on {model.model}.{rule.column} was not "
                 f"checked: the column is {data_type}, not a date or timestamp"
             )
             prepared.notes.append(why)
             prepared.dropped["freshness"].append(f"{model.model}: {why}")
-            prepared.freshness_unwritten[(model.model, rule.column)] = (
+            prepared.freshness_unwritten[(model.model, rule.column, rule.check)] = (
                 NOT_TEMPORAL,
                 f"the column is {data_type}, not a date or timestamp",
             )
             continue
         q = _quote(dialect, spelled)
+        if rule.check == DEADLINE:
+            # Counts and a constant only, so no value is computed, on a
+            # column that looks like personal data too.
+            window = deadline_window(rule, now)
+            windows[index] = window
+            parts.append(
+                f"COUNT({q}) AS dex_fresh_n_{index}, "
+                f"{today_sql(dialect, q, kind, window.day_start)} "
+                f"AS dex_sla_today_{index}, "
+                f"{due_sql(dialect, window.deadline)} AS dex_sla_due_{index}"
+            )
+            rules.append((index, rule, spelled, data_type, True))
+            continue
         shown = _lag_shown(probe.identifier, spelled, data_type, pii_overrides)
         if shown:
             measure = f"{lag_sql(dialect, q, kind)} AS dex_fresh_lag_{index}"
         else:
             measure = (
-                f"{within_sql(dialect, q, kind, rule.max_lag_seconds)} "
+                f"{within_sql(dialect, q, kind, int(rule.max_lag_seconds or 0))} "
                 f"AS dex_fresh_in_{index}"
             )
         parts.append(f"COUNT({q}) AS dex_fresh_n_{index}, {measure}")
@@ -291,7 +426,7 @@ def write_probe(
     if not rules:
         return
     sql = f"SELECT {', '.join(parts)} FROM {_relation(dialect, probe.identifier)}"  # noqa: S608
-    probe.freshness = Written(assert_select_only(sql, dialect=dialect), rules)
+    probe.freshness = Written(assert_select_only(sql, dialect=dialect), rules, windows)
 
 
 def model_type(model: Any, column: str) -> str | None:
@@ -349,6 +484,11 @@ def run_probe(
     row = {str(k).lower(): v for k, v in row.items()}
     rows = _int(row.get("dex_rows")) or 0
     for index, rule, _spelled, _type, shown in written.rules:
+        if rule.check == DEADLINE:
+            _judge_deadline(
+                model, rule, written.windows[index], row, index, rows, result, checked
+            )
+            continue
         values = _int(row.get(f"dex_fresh_n_{index}")) or 0
         lag = _int(row.get(f"dex_fresh_lag_{index}"))
         if rows == 0 or values == 0:
@@ -396,7 +536,7 @@ def run_probe(
             )
             continue
         checked["freshness"] += 1
-        if lag > rule.max_lag_seconds:
+        if lag > int(rule.max_lag_seconds or 0):
             result.freshness.append(
                 record(model, rule, "contradicted", lag_seconds=lag, rows=rows)
             )
@@ -405,6 +545,66 @@ def run_probe(
         result.freshness.append(
             record(model, rule, "satisfied", lag_seconds=lag, rows=rows)
         )
+
+
+def _judge_deadline(
+    model: str,
+    rule: FreshnessRule,
+    window: DeadlineWindow,
+    row: dict[str, Any],
+    index: int,
+    rows: int,
+    result: DeclaredFactsResult,
+    checked: dict[str, int],
+) -> None:
+    """Judge one declared deadline (#1486) as Elementary's
+    ``data_freshness_sla`` does: nothing is due on a day ``days`` leaves out or
+    before the deadline; once it has passed, the column must hold a value from
+    today (local midnight onward), and no rows or no value is no data."""
+
+    checked["freshness"] += 1
+    if not window.scheduled:
+        result.freshness.append(
+            record(
+                model,
+                rule,
+                "not_applicable",
+                reason_code=NOT_SCHEDULED,
+                rows=rows,
+                window=window,
+            )
+        )
+        return
+    if not _int(row.get(f"dex_sla_due_{index}")):
+        result.freshness.append(
+            record(
+                model,
+                rule,
+                "not_applicable",
+                reason_code=BEFORE_DEADLINE,
+                rows=rows,
+                window=window,
+            )
+        )
+        return
+    values = _int(row.get(f"dex_fresh_n_{index}")) or 0
+    today = _int(row.get(f"dex_sla_today_{index}")) or 0
+    if rows and values and today:
+        result.freshness.append(
+            record(model, rule, "satisfied", rows=rows, window=window)
+        )
+        return
+    reason = "no_rows" if rows == 0 else "all_null" if values == 0 else "not_today"
+    result.freshness.append(
+        record(
+            model, rule, "contradicted", reason_code=reason, rows=rows, window=window
+        )
+    )
+    result.findings.append(deadline_finding(model, rule, window, reason, rows))
+
+
+def _what(rule: FreshnessRule) -> str:
+    return "deadline" if rule.check == DEADLINE else "freshness"
 
 
 def _lag_shown(
@@ -432,20 +632,33 @@ def record(
     reason_code: str | None = None,
     reason: str | None = None,
     lag_withheld: bool = False,
+    window: DeadlineWindow | None = None,
 ) -> dict[str, Any]:
-    """A ``data.freshness`` record: the declaration, what was measured, and a
-    status of ``satisfied``, ``contradicted`` or ``unchecked``."""
+    """A ``data.freshness`` record: which ``check`` (``max_lag`` or
+    ``deadline``), the declaration, what was measured, and a status of
+    ``satisfied``, ``contradicted``, ``unchecked``, or, for a deadline with
+    nothing due on this run, ``not_applicable``."""
 
     out: dict[str, Any] = {
         "model": model,
         "column": rule.column,
-        "max_lag": rule.max_lag,
-        "max_lag_seconds": rule.max_lag_seconds,
-        "basis": rule.basis,
-        "status": status,
+        "check": rule.check,
     }
+    if rule.check == DEADLINE:
+        out["deadline"] = rule.deadline
+        out["timezone"] = rule.timezone
+        if rule.days is not None:
+            out["days"] = list(rule.days)
+    else:
+        out["max_lag"] = rule.max_lag
+        out["max_lag_seconds"] = rule.max_lag_seconds
+    out["basis"] = rule.basis
+    out["status"] = status
     if status == "contradicted":
-        out["finding"] = CODE
+        out["finding"] = DEADLINE_CODE if rule.check == DEADLINE else CODE
+    if window is not None:
+        # The local day judged: a date, never a value from the column.
+        out["target_date"] = window.target_date
     if rows is not None:
         out["rows"] = rows
     if lag_withheld:
@@ -543,6 +756,65 @@ def finding(
     )
 
 
+def deadline_finding(
+    model: str,
+    rule: FreshnessRule,
+    window: DeadlineWindow,
+    reason: str,
+    rows: int,
+) -> DriftFinding:
+    """``deadline_missed`` (#1486): the deadline has passed today and the
+    column holds no value from today. Never a timestamp: the counts and the
+    day judged."""
+
+    from .drift import DriftFinding
+
+    path = f"'{model}.{rule.column}'"
+    if reason == "no_rows":
+        found = "the model holds no rows"
+    elif reason == "all_null":
+        found = f"the column is NULL on all {rows} row(s)"
+    else:
+        found = "its newest value is from an earlier day"
+    days = f" on {', '.join(rule.days)}" if rule.days else ""
+    if rule.basis == "capture":
+        why = "it is the time rows were loaded, so today's load is late or missing"
+        severity = "high"
+    else:
+        why = (
+            "it is the event's own time, so either today's load is late or the "
+            "events loaded by the deadline are from earlier days (a nightly load "
+            "of yesterday's events never meets a same-day deadline on a business "
+            "time; declare it on the load time instead)"
+        )
+        severity = "medium"
+    detail = (
+        f"{path} must hold a value from today by {rule.deadline} {rule.timezone}"
+        f"{days} ({rule.basis} time), but on {window.target_date} the deadline has "
+        f"passed and {found}; {why}"
+    )
+    data: dict[str, Any] = {
+        "column": rule.column,
+        "check": DEADLINE,
+        "deadline": rule.deadline,
+        "timezone": rule.timezone,
+        "days": list(rule.days) if rule.days else None,
+        "basis": rule.basis,
+        "target_date": window.target_date,
+        "reason": reason,
+        "rows": rows,
+    }
+    return DriftFinding(
+        axis="declaration",
+        code=DEADLINE_CODE,
+        identifier=model,
+        column=rule.column,
+        severity=severity,
+        detail=detail,
+        data=data,
+    )
+
+
 def record_unmeasured(
     prepared: Prepared,
     result: DeclaredFactsResult,
@@ -552,10 +824,12 @@ def record_unmeasured(
     """A record for every declared freshness that has none, so one nothing
     measured reads as unchecked rather than as absent."""
 
-    recorded = {(r["model"], r["column"]) for r in result.freshness}
+    recorded = {
+        (r["model"], r["column"], r.get("check", MAX_LAG)) for r in result.freshness
+    }
     for model in prepared.freshness_models:
         for rule in model.freshness:
-            key = (model.model, rule.column)
+            key = (model.model, rule.column, rule.check)
             if key in recorded:
                 continue
             code, why = prepared.freshness_unwritten.get(key, (reason_code, reason))

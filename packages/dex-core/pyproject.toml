@@ -83,10 +83,14 @@ classifiers = [
 # CI and nothing else; only a floor here constrains a fresh install from PyPI or
 # a skill wrapper. See
 # https://discuss.python.org/t/information-for-python-users-regarding-emudhra-emsign-ca-certificate-security-incident/109576
+# tzdata on Windows only: a declared freshness deadline names an IANA time zone,
+# read through the standard library's zoneinfo, which finds no zone database on
+# Windows unless this package supplies one. Linux and macOS ship it.
 dependencies = [
   "certifi>=2026.10.19",
   "pydantic>=2",
   "pyyaml>=6",
+  "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 
 [project.scripts]
