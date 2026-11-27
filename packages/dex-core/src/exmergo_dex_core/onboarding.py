@@ -53,6 +53,11 @@ class SetupResult(Result):
     connector: str | None = None
     created: list[str] = Field(default_factory=list)
     updated: list[str] = Field(default_factory=list)
+    # Each entry names what setup still needs and how to give it. One marked
+    # ``blocking: False`` (#1473) leaves setup complete: it names a step a later
+    # command needs, such as the source allowlist entry ``maintain incidents``
+    # reads Elementary's tables through, and never turns the result into an
+    # error.
     missing_inputs: list[dict[str, Any]] = Field(default_factory=list)
     candidates: list[str] = Field(default_factory=list)
     readiness: dict[str, Any] = Field(default_factory=dict)
@@ -86,13 +91,12 @@ class SetupResult(Result):
 
 def setup_envelope(result: SetupResult) -> env.Envelope:
     envelope = to_envelope(result)
-    if result.pending_confirmation is None and (
-        result.missing_inputs or result.problems
-    ):
+    blocking = [row for row in result.missing_inputs if row.get("blocking", True)]
+    if result.pending_confirmation is None and (blocking or result.problems):
         envelope.status = env.Status.ERROR
         envelope.reason = result.failure_reason or env.Reason.REQUEST
         envelope.errors = result.problems or [
-            f"provide {row['name']}: {row['detail']}" for row in result.missing_inputs
+            f"provide {row['name']}: {row['detail']}" for row in blocking
         ]
     if result.connection:
         envelope.connection = env.Connection.model_validate(result.connection)
@@ -816,6 +820,233 @@ def _elementary(
                 *production,
             ]
     result.next_steps.extend(steps)
+    if report["install"] in ("written", "planned", "present"):
+        _elementary_allowlist(
+            config,
+            project,
+            result,
+            report,
+            planned=report["install"] in ("written", "planned"),
+            probe=lambda entry: _probe_entry(engine, config, root, result, entry),
+        )
+
+
+def _elementary_allowlist(
+    config: DexConfig,
+    project: Path,
+    result: SetupResult,
+    report: dict[str, Any],
+    *,
+    planned: bool,
+    probe: Any = None,
+) -> None:
+    """Propose the schema the Elementary package writes in production for the
+    committed source allowlist (#1473), so ``dex maintain incidents`` can read
+    the package's tables.
+
+    Never written by init: the proposal is the ``dex config set`` that adds the
+    entry, with the comment saying why it is there, and ``config set`` writes
+    only on ``--confirm``. Where the schema cannot be worked out for production,
+    the missing input names what to commit. Both are non-blocking: the project
+    is set up either way, and only the incidents read is affected.
+    """
+
+    from .adapters.base import scope_within
+    from .connect import _SCOPE_FIELDS, source_scope
+    from .transform import elementary_install as install
+    from .transform import elementary_schema as schema
+
+    connector = result.connector or config.connector
+    if connector is None or connector not in _SCOPE_FIELDS:
+        report["allowlist"] = {
+            "status": "not_applicable",
+            "reason_code": "no_allowlist",
+            "detail": "this connector has no source allowlist to add a schema to",
+        }
+        return
+    field = _SCOPE_FIELDS[connector]
+    committed = source_scope(connector, getattr(config, connector, None))
+    if not committed:
+        report["allowlist"] = {
+            "status": "reached",
+            "reason_code": "unrestricted",
+            "field": f"{connector}.{field}",
+            "detail": (
+                "the source allowlist is empty, so every schema the connection "
+                "reaches is read, the package's included"
+            ),
+        }
+        return
+    found = schema.production_namespace(
+        project,
+        config,
+        connector,
+        planned_schema=install.SCHEMA if planned else None,
+    )
+    if isinstance(found, schema.Unresolved):
+        report["allowlist"] = {
+            "status": "unresolved",
+            "reason_code": found.reason_code,
+            "field": f"{connector}.{field}",
+            "detail": found.detail,
+            "command": found.ask,
+        }
+        purpose = (
+            "the schema the Elementary package writes in production is not known: "
+            f"{found.detail}; dex maintain incidents reads the package's tables "
+            f"only where {connector}.{field} reaches that schema"
+        )
+        result.missing_inputs.append(
+            {
+                "name": "elementary_schema",
+                "blocking": False,
+                "detail": purpose,
+                "command": found.ask,
+            }
+        )
+        if found.ask:
+            result.next_steps.append(
+                {
+                    "command": found.ask,
+                    "purpose": (
+                        "commit what production is named, then run dex init again "
+                        "to get the allowlist entry"
+                        if found.reason_code
+                        in (schema.PROD_UNSET, schema.PROD_TARGET_UNSET)
+                        else "fill in the schema the Elementary package writes in "
+                        "production, review the diff, then re-run with --confirm"
+                    ),
+                }
+            )
+        return
+    located = found.located
+    spelled = schema.entries(connector, located)
+    base = {
+        "namespace": located.spelled(),
+        "source": found.source,
+        "field": f"{connector}.{field}",
+    }
+    if any(scope_within(entry, committed) for entry in spelled):
+        report["allowlist"] = {"status": "reached", **base}
+        return
+    command = schema.allowlist_command(connector, committed, spelled[0])
+    # An allowlist entry naming a namespace the warehouse does not have makes
+    # every command refuse the allowlist, so a schema the package has not built
+    # yet (a new install, before its first production run) is not proposed.
+    exists, why = probe(spelled[0]) if probe is not None else (None, None)
+    if exists is False:
+        unreadable = why == _UNREADABLE
+        report["allowlist"] = {
+            "status": "unreadable" if unreadable else "not_created",
+            **base,
+            "command": command,
+        }
+        then = (
+            "grant this principal read on it, then run dex init again for the "
+            "allowlist entry"
+            if unreadable
+            else "once the package's first production run creates it, run dex init "
+            "again for the allowlist entry"
+        )
+        result.missing_inputs.append(
+            {
+                "name": "source_allowlist",
+                "blocking": False,
+                "detail": (
+                    f"{located.spelled()}, the schema the Elementary package writes "
+                    f"in production, {why}; {then}. An entry naming a schema the "
+                    "connection cannot open makes every command refuse the "
+                    "allowlist, so it is not proposed before then"
+                ),
+            }
+        )
+        return
+    report["allowlist"] = {"status": "proposed", **base, "command": command}
+    if exists is None:
+        report["allowlist"]["exists"] = None
+    detail = (
+        f"add {located.spelled()}, the schema the Elementary package writes in "
+        f"production, to {connector}.{field}, so dex maintain incidents can read "
+        "its run history; the allowlist is a cost boundary, so nothing past it "
+        "is read"
+    )
+    if exists is None:
+        detail += (
+            "; whether the schema exists was not checked (the connection did not "
+            "open), and an entry naming one that does not exist yet makes every "
+            "command refuse the allowlist, so add it once the package has built "
+            "there"
+        )
+    result.missing_inputs.append(
+        {
+            "name": "source_allowlist",
+            "blocking": False,
+            "detail": detail,
+            "command": command,
+        }
+    )
+    result.next_steps.append(
+        {
+            "command": command,
+            "purpose": (
+                "propose the allowlist entry as a diff to .dex/config.yml, with a "
+                "comment saying why it is there; nothing is written until the same "
+                "command runs again with --confirm"
+            ),
+        }
+    )
+
+
+_NOT_CREATED = "does not exist in the warehouse yet"
+_UNREADABLE = "is not readable by this principal"
+
+
+def _probe_entry(
+    engine: DexEngine,
+    config: DexConfig,
+    root: Path,
+    result: SetupResult,
+    entry: str,
+) -> tuple[bool | None, str | None]:
+    """Whether the warehouse has the namespace ``entry`` names, read the way
+    every command reads its allowlist: a connection opened with ``entry`` as
+    the whole allowlist, which the connector proves exists and is readable
+    from metadata alone. ``(None, None)`` where that could not be asked."""
+
+    from .connect import _SCOPE_FIELDS
+    from .engine import DexEngine
+
+    connector = result.connector or config.connector
+    if (
+        result.readiness.get("connection", {}).get("status") != "passed"
+        or connector not in _SCOPE_FIELDS
+    ):
+        return None, None
+    target = getattr(config, connector, None)
+    if target is None:
+        return None, None
+    narrowed = config.model_copy(
+        update={
+            connector: target.model_copy(update={_SCOPE_FIELDS[connector]: [entry]})
+        }
+    )
+    try:
+        with DexEngine(
+            config=narrowed,
+            store=engine.store,
+            repo_root=root,
+            connection=engine.connection,
+            session_ceiling_cap=engine.session_ceiling_cap,
+        ) as check:
+            check.connect_test()
+    except Exception as exc:
+        text = str(exc)
+        if "does not exist" in text:
+            return False, _NOT_CREATED
+        if "not readable" in text:
+            return False, _UNREADABLE
+        return None, None
+    return True, None
 
 
 def _store_install_plan(

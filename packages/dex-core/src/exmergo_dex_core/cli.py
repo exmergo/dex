@@ -816,6 +816,14 @@ def _build_parser() -> argparse.ArgumentParser:
                             "change"
                         ),
                     )
+                    sp.add_argument(
+                        "--comment",
+                        default=None,
+                        help=(
+                            "a reason written into the file beside the value "
+                            "(one pair only)"
+                        ),
+                    )
                 if group == "config" and name == "unset":
                     # Counted in the handler too, so a call naming no key still
                     # gets an envelope.

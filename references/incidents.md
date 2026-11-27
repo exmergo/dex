@@ -382,7 +382,9 @@ hold the longer run history.
   or `refused` with a reason code: no package (`not_installed`, with the
   `dex init` that offers it), a package whose uploads are off (`not_uploading`),
   a schema outside the source allowlist (`outside_allowlist`, with the
-  `dex config set` that adds it; nothing is read past the allowlist), a
+  `dex config set` that adds it, carrying the comment the entry keeps in the
+  file; nothing is read past the allowlist, and `dex init` proposes the same
+  entry for the schema the package writes in production), a
   connection or catalog that could not be read (`connection_unavailable`,
   `catalog_unavailable`), a read that could not be priced (`unpriced`: it is
   never asked for at a lower price than it would spend), a statement the

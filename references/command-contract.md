@@ -152,7 +152,13 @@ dex config set <key> <value>      -> an in-place edit that keeps every comment, 
                                      is repaired one key at a time. Refuses a
                                      credential-like name in the key or inside the
                                      value. data.changes is one row per value (key,
-                                     before, after, or withheld)
+                                     before, after, or withheld). --comment "<text>"
+                                     (one pair only) writes # lines saying why the
+                                     value is there: above the first item a list gains
+                                     (a one-line flow list becomes a block list), else
+                                     above the key; a list the value extends keeps
+                                     every line it had, its comments included. A
+                                     comment reading as a credential is refused (#1473)
 dex config unset <key> [<key>...] -> removes settings with the same in-place edit and
                                      handshake as set. Takes a key dex does not read and
                                      a whole block; a block left empty goes too, with
@@ -310,6 +316,35 @@ dex init [<name>]                -> complete project setup: new dbt-backed Dex p
                                      `dex transform deps` and, as the user's to run,
                                      `dbt deps` and `dbt run --select elementary --target
                                      <dbt_prod_target>` on production (#1464).
+                                     Where the package is present or offered,
+                                     data.elementary.allowlist says whether the committed
+                                     source allowlist reaches the schema it writes in
+                                     production (#1473): `not_applicable` (no allowlist,
+                                     DuckDB), `reached` (`unrestricted` when empty),
+                                     `proposed` (namespace, source `prod` or `profile`,
+                                     and the `dex config set ... --comment` that adds
+                                     it, never written by init; checked first by
+                                     opening a connection with that entry alone, and
+                                     `exists: null` where that could not be asked),
+                                     `not_created` or `unreadable` (the connection
+                                     cannot open it yet, so no command is proposed: an
+                                     entry naming a schema that does not exist makes
+                                     every command refuse the allowlist; rerun init
+                                     after the package's first production run), or
+                                     `unresolved`
+                                     (reason_code `prod_unset`, `prod_target_unset`,
+                                     `custom_schema_naming`, `templated_config`,
+                                     `nested_schema_config`, with the command that
+                                     settles it or a template to fill in). The schema is
+                                     dbt's naming of the package's +schema for
+                                     production (<prod>_<custom>, or <custom>_<prod
+                                     target> under the layered override), production
+                                     read from <connector>.prod else the profile output
+                                     dbt_prod_target names, never the dev namespace.
+                                     `proposed` and `unresolved` add a missing input
+                                     (source_allowlist, elementary_schema) with
+                                     blocking: false: a non-blocking input leaves init
+                                     ok, and only blocking inputs make it an error.
 dex transform init "<name>"       -> legacy bootstrap of a dbt project skeleton; requires an explicit
                                      --connector (never defaults); refuses if a project exists;
                                      --layered-schemas routes staging/intermediate/marts to their

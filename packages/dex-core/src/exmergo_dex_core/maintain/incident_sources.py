@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .. import command_args
 from ..errors import RequestError
+from ..transform.elementary_schema import Located, allowlist_command, entries
 from ..values_free import require_allowed
 from .commit_history import CommitHistory
 from .coverage_runs import current_tests, parse_time
@@ -507,15 +508,9 @@ def _elementary(
     )
 
 
-@dataclass(frozen=True)
-class _Located:
-    """Where the manifest says the package builds its tables."""
-
-    database: str | None
-    schema: str
-
-    def spelled(self) -> str:
-        return f"{self.database}.{self.schema}" if self.database else self.schema
+#: Where the manifest says the package builds its tables, spelled as the
+#: allowlist entries ``dex init`` proposes (#1473).
+_Located = Located
 
 
 def _declared_namespace(manifest: Mapping[str, Any]) -> _Located | None:
@@ -532,17 +527,8 @@ def _declared_namespace(manifest: Mapping[str, Any]) -> _Located | None:
     return None
 
 
-#: How each connector's source allowlist spells a schema: the forms one entry
-#: may take, finest first. The first is what a proposed entry adds.
 def _entries(connector: str, located: _Located) -> list[str]:
-    qualified = (
-        f"{located.database}.{located.schema}" if located.database else located.schema
-    )
-    if connector in {"bigquery", "snowflake"}:
-        return [qualified, located.schema]
-    if connector in {"databricks", "trino"}:
-        return [qualified]
-    return [located.schema]
+    return entries(connector, located)
 
 
 def _allowlist_refusal(
@@ -579,8 +565,7 @@ def _allowlist_refusal(
             f"out {located.spelled()}, the schema the Elementary package writes",
             {"namespace": located.spelled()},
         )
-    proposed = [*committed, entries[0]]
-    command = f"dex config set {connector}.{field_name} '[{', '.join(proposed)}]'"
+    command = allowlist_command(connector, committed, entries[0])
     steps.append(
         {
             "command": command,
