@@ -14,6 +14,104 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.19.1] - 2026-11-27
+
+### Added
+
+- **A unit or a measure's additivity now writes an Elementary column monitor.**
+  With `monitors.vendor: elementary`, a column declared `unit: fraction` or
+  `unit: percent` gets an `elementary.column_anomalies` under the column with
+  the monitors `min` and `max`, which watch it shift inside the bound
+  `dex_unit_range` already checks. A column declared `role: measure` gets one
+  with the monitors its `additivity` makes meaningful: `sum`, `average` and
+  `zero_count` for `additive`, `min`, `max` and `average` for `semi_additive`,
+  and `average` for `non_additive`, so `sum` is never written where adding the
+  column means nothing. A column both rows reach gets one test whose list is
+  the union. Each is written on the model's one time column, carries the
+  population's `where_expression`, is reported in `data.monitors` with the
+  declaration fields it came from, and names them in `data.decisions`. A
+  hand-written `column_anomalies` on the same column and time column is left
+  as written, and a column flagged as personal data gets none. ([#1610](https://github.com/exmergo/dex/pull/1610))
+- **A declared daily deadline now writes an Elementary `data_freshness_sla`, and
+  `maintain verify` judges it.** A time column's `freshness` may state a
+  `deadline` (`"07:00"`), its required IANA `timezone`, and optional `days`,
+  beside or instead of a `max_lag`; a lag is never read as a deadline. With
+  `monitors.vendor: elementary`, the plan writes `elementary.data_freshness_sla`
+  with that `timestamp_column`, `sla_time`, `timezone` and `day_of_week`, carrying
+  the population's `where_expression`, reported in `data.monitors` and named in
+  `data.decisions` by its `freshness.deadline` field (withheld below Elementary
+  0.23.1, which first ships it, and where a population value holds a quote on a
+  connector that escapes it with a backslash, which the package's own message
+  re-escaping breaks). `maintain verify` and `transform build --verify`
+  raise `deadline_missed` once the deadline has passed with no value from today,
+  by counts alone, with one `data.freshness` record per check. A deadline on a
+  `business` basis column is written with a warning: the test needs a value from
+  today, which a load of the previous day's events never holds. ([#1611](https://github.com/exmergo/dex/pull/1611))
+- **`dex init` proposes the schema the Elementary package writes in production
+  for the source allowlist.** Where the package is present or offered,
+  `data.elementary.allowlist` says whether the committed allowlist reaches that
+  schema, and where it does not, init lists the entry as a non-blocking missing
+  input with the `dex config set ... --comment` that adds it. Init never writes
+  it: `config set` shows the diff and writes on `--confirm`. A schema the
+  connection cannot open yet (the package has not run in production) is reported
+  `not_created` and not proposed, since an allowlist entry naming a schema that
+  does not exist makes every command refuse. The schema is dbt's
+  naming of the package's `+schema` for production, read from `<connector>.prod`
+  or the profile output `dbt_prod_target` names, never from the dev namespace;
+  where a project's own `generate_schema_name` or a Jinja `+schema` keeps it
+  unknown, the missing input says what to commit. A missing input marked
+  `blocking: false` no longer makes init an error. `dex config set` gains
+  `--comment`, which writes the reason beside the value, and a list it extends
+  keeps every line it had, comments included. ([#1618](https://github.com/exmergo/dex/pull/1618))
+- **`dex maintain incidents` reads Elementary 0.16.4's tables.** The reader
+  records the package's layouts at 0.16.4, the series most installs pin, beside
+  0.26.1's, each matched exactly; a 0.16.4 project's failing test is now an
+  incident rather than `elementary_release_untested`. Both releases write the
+  columns the reader reads alike, so a table upgraded from one to the other reads
+  as one history. 0.16.4 records `pass` for any test with zero failures, whatever
+  dbt said, so in a run it wrote a pass from a test whose `warn_if` or `error_if`
+  can hold at zero failures is read as unobserved, counted under
+  `passes_unobserved` with a warning, never as a pass. A column the reader uses
+  that a release does not have (0.16.4's `test_result_rows.row_index`) is
+  reported unobserved at that release. ([#1619](https://github.com/exmergo/dex/pull/1619))
+- **`dex maintain diagnose` checks every cause owner, not only a duplicate
+  delivery.** Each open incident now gets an answer for each owner. All are
+  judged over the failing test's lineage, at the runs that bound the break:
+
+  - the loader retyping a source column, from the schema axis between the
+    bounding snapshot and the warehouse after it;
+  - the project changing a model in the commit range, from `maintain verify` on
+    the changed model;
+  - a package upgrade, from the versions `package-lock.yml` pins at the two
+    commits;
+  - an edited seed, from the seed file's git hash at the two commits;
+  - the schedule building a parent model after its child, from both models'
+    build times in Elementary's `dbt_run_results`.
+
+  The build-times read is one bounded statement of ids and times, priced with
+  the other checks. A profile of `dbt_run_results` withholds its compiled SQL,
+  messages and adapter responses. Where the evidence is missing, a candidate is
+  `not_checked` with a reason, such as `unpinned` with no lock committed or
+  `no_measured_before` with no snapshot. A `no_cause` answer therefore names
+  what it could not rule out.
+
+  ([#1620](https://github.com/exmergo/dex/pull/1620))
+- **Dex Telemetry has an overview page.** It covers how `dex init`, your
+  declarations, `maintain incidents` and `maintain diagnose` work together to
+  monitor a dbt pipeline, and the README has a matching section.
+
+### Fixed
+
+- **The refactor comparison now treats a `profiles.yml` edit as global.** A plan that rewrites a model and also edits `profiles.yml` is compiled through the ancestors of the model on both sides, so a profile edit that moves the dev schema or database no longer makes the two sides resolve `ref()` to different relations without saying so. A plan that only rewrites the model is compared as before. ([#1617](https://github.com/exmergo/dex/pull/1617))
+- **Profiling a boolean column on Postgres or Redshift no longer fails the whole
+  profile.** Neither warehouse takes `MIN` or `MAX` of a boolean, so the profile
+  statement of any table holding one was refused; this stopped the first
+  `dex maintain incidents` read of Elementary's tables on Postgres
+  (`dbt_invocations.full_refresh`). A boolean column now gets its non-null count
+  and no minimum or maximum. ([#1619](https://github.com/exmergo/dex/pull/1619))
+- **`dex demo`'s batch loaded twice now holds copies of loaded rows.** The 1,000 extra `order_items` rows repeat the row already loaded with each `order_item_id`, in every column, where before they reused the key with new values. So the repair `maintain diagnose` offers, keeping one row per `order_item_id`, now loses no line item. Every other table, the rows loaded first, and every count the demo quotes (14,000 rows, 13,000 distinct ids, 1,000 rows to remove, 92.9%) are unchanged. Column pairs that held no repeat before, such as `(order_item_id, order_id)`, now repeat with the batch, since every repeated id repeats its whole row. ([#1622](https://github.com/exmergo/dex/pull/1622))
+
+
 ## [1.19.0] - 2026-11-26
 
 ### Added
