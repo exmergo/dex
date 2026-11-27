@@ -104,6 +104,19 @@ machine's installed plugins, the user's hooks and their MCP servers stay out,
 and the baseline arm is the agent with no dex at all. `--transcripts DIR`
 writes each run's transcript to `DIR/case-<id>-<skill|baseline>.jsonl`.
 
+**The judge's own answer is kept.** The judge's verdict is read from the first
+word of its answer, whatever markdown or punctuation surrounds it (`**PASS**`
+and `Pass.` both pass). A judge that raised, timed out, or answered neither
+PASS nor FAIL gives no verdict, and that is the case's run error, never a
+FAIL, since it says nothing about the agent. Each judged assertion carries the
+judge's text (`verdict` in `--json`; a failed line prints it), and
+`--transcripts DIR` also writes each case's graded assertions to
+`DIR/case-<id>-<skill|baseline>.judge.json`. Every `claude -p` the backend
+starts, the agent's and the judge's, takes its prompt on stdin, not in argv:
+on Windows `claude` is usually npm's `claude.cmd`, and cmd.exe ends an
+argument at its first newline, which cut every multi-line judge prompt to its
+first line and dropped the flags after it.
+
 The transcript also decides whether there was a run to grade. A run with no
 `init` or `result` event, whose `result` subtype is not `success` (a run cut
 off by `max_turns` or `max_budget_usd`), or whose `result` says `is_error` or

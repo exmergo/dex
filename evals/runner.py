@@ -16,6 +16,7 @@ runtime dependency.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -58,9 +59,45 @@ class AgentRunner(Protocol):
 
 @runtime_checkable
 class Judge(Protocol):
-    """Decides whether an agent result satisfies one assertion."""
+    """Decides whether an agent result satisfies one assertion.
+
+    A judge that can say what it answered also has ``verdict(case, assertion,
+    result) -> Verdict``, which the core reads in place of ``grade``: a judge
+    that gave no verdict is then the case's error rather than a failed
+    assertion, and its text reaches the report.
+    """
 
     def grade(self, case: EvalCase, assertion: str, result: AgentResult) -> bool: ...
+
+
+@dataclass
+class Verdict:
+    """What a judge said about one assertion: ``passed``, the ``text`` it
+    answered, and ``error`` when it gave no verdict (it failed, timed out, or
+    answered neither PASS nor FAIL)."""
+
+    passed: bool
+    text: str = ""
+    error: str | None = None
+
+
+_WORD = re.compile(r"[A-Za-z]+")
+
+
+def read_verdict(text: str) -> Verdict:
+    """A judge's answer, read tolerantly: the first word, whatever markdown or
+    punctuation surrounds it and in any case (``**PASS**``, ``Pass.``)."""
+
+    found = _WORD.search(text)
+    word = found.group(0).upper() if found else ""
+    if word in ("PASS", "PASSED"):
+        return Verdict(passed=True, text=text)
+    if word in ("FAIL", "FAILED"):
+        return Verdict(passed=False, text=text)
+    shown = text.strip()[:200] or "nothing"
+    return Verdict(
+        passed=False, text=text, error=f"answered neither PASS nor FAIL: {shown!r}"
+    )
 
 
 @dataclass
@@ -148,13 +185,15 @@ class TriggeringReport:
 @dataclass
 class AssertionResult:
     """One assertion's verdict. ``graded_by`` is ``judge`` for a judged
-    assertion and ``check`` for one read from the tool calls, whose ``detail``
-    says what it found."""
+    assertion and ``check`` for one read from the tool calls. ``detail`` says
+    what a check found, or why a judge gave no verdict; ``verdict`` is the text
+    a judge answered, where it can report one."""
 
     assertion: str
     passed: bool
     graded_by: str = "judge"
     detail: str = ""
+    verdict: str | None = None
 
 
 @dataclass
@@ -185,6 +224,7 @@ class CaseReport:
                     "passed": a.passed,
                     "graded_by": a.graded_by,
                     **({"detail": a.detail} if a.detail else {}),
+                    **({"verdict": a.verdict} if a.verdict is not None else {}),
                 }
                 for a in self.assertions
             ],
@@ -268,12 +308,13 @@ def run_quality(
     reports: list[CaseReport] = []
     for case in suite.evals:
         result = _run_case(runner, case, skill_enabled)
+        graded = _grade(case, result, judge)
         reports.append(
             CaseReport(
                 id=case.id,
                 prompt=case.prompt,
-                error=result.error,
-                assertions=_grade(case, result, judge),
+                error=result.error or _judge_error(graded),
+                assertions=graded,
             )
         )
     return reports
@@ -330,7 +371,36 @@ def _all_pass(
 ) -> bool:
     result = _run_case(runner, case, skill)
     graded = _grade(case, result, judge)
+    # A judge that gave no verdict has already failed its assertion.
     return not result.error and bool(graded) and all(a.passed for a in graded)
+
+
+def _judge_error(graded: list[AssertionResult]) -> str | None:
+    """The first judge that gave no verdict, as the case's error: a judge
+    that failed is no evidence about the agent, so it is not a FAIL."""
+
+    for a in graded:
+        if a.graded_by == "judge" and a.detail.startswith("no verdict"):
+            return f"the judge gave {a.detail} on {a.assertion!r}"
+    return None
+
+
+def _judged(judge: Judge, case: EvalCase, assertion: str, result: AgentResult):
+    reads = getattr(judge, "verdict", None)
+    if reads is None:
+        passed = judge.grade(case, assertion, result)
+        return AssertionResult(assertion=assertion, passed=passed)
+    said = reads(case, assertion, result)
+    if said.error:
+        return AssertionResult(
+            assertion=assertion,
+            passed=False,
+            detail=f"no verdict: {said.error}",
+            verdict=said.text,
+        )
+    return AssertionResult(
+        assertion=assertion, passed=said.passed, verdict=said.text or None
+    )
 
 
 def _run_case(runner: AgentRunner, case: EvalCase, skill: bool) -> AgentResult:
@@ -344,10 +414,7 @@ def _grade(case: EvalCase, result: AgentResult, judge: Judge) -> list[AssertionR
     that errored passes no check: an empty transcript holds no forbidden call,
     which is no evidence the agent avoided one."""
 
-    graded = [
-        AssertionResult(assertion=a, passed=judge.grade(case, a, result))
-        for a in case.assertions
-    ]
+    graded = [_judged(judge, case, a, result) for a in case.assertions]
     for check in case.checks:
         if result.error:
             passed, detail = False, f"not graded: {result.error}"

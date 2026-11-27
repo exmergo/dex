@@ -155,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
             suite.evals = [c for c in suite.evals if c.id in args.cases]
             judge = ClaudeCliJudge(model=args.model, timeout=args.timeout)
             cases = run_quality(suite, agent, judge)
+            _write_verdicts(args.transcripts, cases, "skill")
             passed = all(c.passed for c in cases)
             if not args.uplift:
                 if args.json:
@@ -163,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
                     _print_quality(suite.skill_name, cases)
                 return 0 if passed else 1
             baseline = run_quality(suite, agent, judge, skill_enabled=False)
+            _write_verdicts(args.transcripts, baseline, "baseline")
             rows = uplift_from(cases, baseline)
             score = uplift_score(rows)
             if args.json:
@@ -227,6 +229,25 @@ def _print_corpus(report: CorpusReport) -> None:
             print(f"    {r.task_id}: {r.error}")
 
 
+def _write_verdicts(directory: Path | None, reports, arm: str) -> None:
+    """Each case's graded assertions, the judge's own answers included, beside
+    its transcript as ``case-<id>-<arm>.judge.json``, so a failed grade can be
+    told from a failed agent after the run."""
+
+    if directory is None:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    for report in reports:
+        stem = f"case-{report.id}-{arm}"
+        path = directory / f"{stem}.judge.json"
+        n = 2
+        while path.exists():
+            path = directory / f"{stem}-{n}.judge.json"
+            n += 1
+        path.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
+        print(f"case {report.id} verdicts written to {path}", file=sys.stderr)
+
+
 def _print_triggering(skill: str, report) -> None:
     fired = f"{report.positives_fired}/{report.positives_total} positives fired"
     print(f"[{skill}] triggering")
@@ -249,6 +270,9 @@ def _print_quality(skill: str, cases) -> None:
         for a in case.assertions:
             if not a.passed:
                 why = f" [{a.graded_by}: {a.detail}]" if a.detail else ""
+                if not why and a.verdict is not None:
+                    said = " ".join(a.verdict.split())[:120]
+                    why = f" [judge answered: {said!r}]"
                 print(f"        - failed: {a.assertion}{why}")
 
 

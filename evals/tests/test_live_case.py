@@ -25,7 +25,7 @@ import pytest
 
 from evals import checks, claude_agent
 from evals.__main__ import main
-from evals.runner import AgentResult, run_quality, run_uplift
+from evals.runner import AgentResult, Verdict, read_verdict, run_quality, run_uplift
 from evals.suite import (
     AgentConfig,
     Check,
@@ -422,6 +422,7 @@ def cli(monkeypatch, plugin):
         calls: ClassVar[list[dict]] = []
         events: ClassVar[list[dict]] = passing(str(plugin))
         setup_status = "ok"
+        judge_answer: str | Exception = "PASS"
 
     def fake_run(cmd, **kwargs):
         cwd = kwargs.get("cwd")
@@ -430,6 +431,7 @@ def cli(monkeypatch, plugin):
                 "cmd": cmd,
                 "cwd": cwd,
                 "seen": sorted(p.name for p in Path(cwd).iterdir()) if cwd else None,
+                "input": kwargs.get("input"),
             }
         )
         if cmd[0] == "uv":
@@ -440,7 +442,9 @@ def cli(monkeypatch, plugin):
             return subprocess.CompletedProcess(
                 cmd, 0, stdout=_jsonl(Recorder.events), stderr=""
             )
-        out = json.dumps({"result": "PASS"})
+        if isinstance(Recorder.judge_answer, Exception):
+            raise Recorder.judge_answer
+        out = json.dumps({"result": Recorder.judge_answer})
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
     monkeypatch.setattr(claude_agent.shutil, "which", lambda binary: binary)
@@ -679,3 +683,157 @@ def test_dex_calls_through_powershell_are_read_too():
 def test_a_dex_command_that_writes_the_project_counts_as_a_write(command, writes):
     events = [*passing()[:-1], _bash(9, f"{WRAP} {command}"), _done(ANSWER)]
     assert checks.grade(NO_WRITES, events)[0] is not writes
+
+
+# --- the judge's verdict, made visible (#1480's first live run) ------------------
+
+
+@pytest.mark.parametrize(
+    "answer, passed, error",
+    [
+        ("PASS", True, False),
+        ("**PASS**", True, False),
+        ("Pass.", True, False),
+        ("pass\n\nThe answer names the loader.", True, False),
+        ("FAIL", False, False),
+        ("**Fail**: no cause named", False, False),
+        ("I would need more context.", False, True),
+        ("", False, True),
+    ],
+)
+def test_a_verdict_is_read_from_its_first_word(answer, passed, error):
+    said = read_verdict(answer)
+    assert (said.passed, said.error is not None, said.text) == (passed, error, answer)
+
+
+class _SaysJudge:
+    """A judge that answers one fixed text, or raises."""
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    def grade(self, case, assertion, result):
+        raise AssertionError("the core reads verdict() where a judge has one")
+
+    def verdict(self, case, assertion, result):
+        if isinstance(self.answer, Exception):
+            return Verdict(passed=False, error=f"{self.answer}")
+        return read_verdict(self.answer)
+
+
+class _Answers:
+    def run(self, prompt, *, skill_enabled):
+        return AgentResult(output="the loader delivered rows twice")
+
+
+_PLAIN = EvalSuite(
+    skill_name="maintain", evals=[EvalCase(id=1, prompt="why", assertions=["a"])]
+)
+
+
+@pytest.mark.parametrize("skill_enabled", [True, False], ids=["skill", "baseline"])
+def test_a_judge_that_gives_no_verdict_is_a_run_error_in_each_arm(skill_enabled):
+    judge = _SaysJudge(RuntimeError("judge timed out"))
+    [report] = run_quality(_PLAIN, _Answers(), judge, skill_enabled=skill_enabled)
+    assert not report.passed
+    assert report.error == "the judge gave no verdict: judge timed out on 'a'"
+    [graded] = report.assertions
+    assert graded.detail == "no verdict: judge timed out"
+
+
+@pytest.mark.parametrize("skill_enabled", [True, False], ids=["skill", "baseline"])
+def test_a_bold_pass_passes_and_its_text_is_kept_in_each_arm(skill_enabled):
+    [report] = run_quality(
+        _PLAIN, _Answers(), _SaysJudge("**PASS**"), skill_enabled=skill_enabled
+    )
+    assert report.passed and report.error is None
+    assert report.to_dict()["assertions"][0]["verdict"] == "**PASS**"
+
+
+@pytest.mark.parametrize("skill_enabled", [True, False], ids=["skill", "baseline"])
+def test_a_plain_fail_fails_with_no_error_in_each_arm(skill_enabled):
+    [report] = run_quality(
+        _PLAIN, _Answers(), _SaysJudge("FAIL"), skill_enabled=skill_enabled
+    )
+    assert not report.passed and report.error is None
+    [graded] = report.assertions
+    assert (graded.passed, graded.verdict, graded.detail) == (False, "FAIL", "")
+
+
+def test_a_judge_that_gives_no_verdict_fails_the_uplift_arm_too():
+    [row] = run_uplift(_PLAIN, _Answers(), _SaysJudge("Hmm."))
+    assert not row.passed_with_skill and not row.passed_without_skill
+
+
+def test_the_live_judge_sends_its_whole_prompt_on_stdin(cli):
+    """cmd.exe cuts an argv argument at its first newline, so a judge prompt
+    in argv reached the model as its first line, and the flags after it were
+    dropped."""
+
+    judge = claude_agent.ClaudeCliJudge(model="claude-opus-5-5")
+    result = AgentResult(output="line one\nthe loader delivered rows twice")
+    said = judge.verdict(_case(), "Names the cause", result)
+    assert said == Verdict(passed=True, text="PASS")
+    [call] = cli.calls
+    assert not any("\n" in arg for arg in call["cmd"])
+    assert _flag(call["cmd"], "--model") == ["claude-opus-5-5"]
+    assert "Requirement:\nNames the cause" in call["input"]
+    assert "the loader delivered rows twice" in call["input"]
+
+
+def test_the_agent_sends_its_prompt_on_stdin(cli, plugin):
+    _agent(plugin).run("why\nand how", skill_enabled=True, case=_case())
+    agent = cli.calls[1]
+    assert agent["input"] == "why\nand how"
+    assert not any("\n" in arg for arg in agent["cmd"])
+
+
+def test_the_live_judge_reports_an_exception_as_no_verdict(cli):
+    cli.judge_answer = subprocess.TimeoutExpired(["claude"], 120)
+    said = claude_agent.ClaudeCliJudge().verdict(_case(), "a", AgentResult(output="x"))
+    assert not said.passed and said.error.startswith("TimeoutExpired")
+
+
+def _suite_file(tmp_path: Path, plugin: Path) -> Path:
+    path = tmp_path / "evals.json"
+    entry = _entry(
+        setup=[["demo"]],
+        agent={"permission_mode": "acceptEdits"},
+        checks=[{"check": "no_file_writes", "assertion": "Wrote nothing"}],
+    )
+    path.write_text(
+        json.dumps({"skill_name": "maintain", "evals": [entry]}), encoding="utf-8"
+    )
+    (plugin / ".claude-plugin").mkdir(exist_ok=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text("{}", encoding="utf-8")
+    return path
+
+
+def test_the_cli_shows_the_judges_answer_and_writes_it_beside_the_transcript(
+    cli, plugin, tmp_path, capsys
+):
+    cli.judge_answer = "**FAIL**: the cause is not named"
+    out = tmp_path / "t"
+    suite = _suite_file(tmp_path, plugin)
+    args = [str(suite), "--case", "7", "--uplift", "--plugin-dir", str(plugin)]
+    code = main([*args, "--transcripts", str(out)])
+    printed = capsys.readouterr().out
+    assert code == 1
+    assert "[judge answered: '**FAIL**: the cause is not named']" in printed
+    names = sorted(p.name for p in out.iterdir())
+    assert "case-7-skill.judge.json" in names
+    assert "case-7-baseline.judge.json" in names
+    graded = json.loads((out / "case-7-skill.judge.json").read_text(encoding="utf-8"))
+    [judged] = [a for a in graded["assertions"] if a["graded_by"] == "judge"]
+    assert judged["verdict"] == "**FAIL**: the cause is not named"
+
+
+def test_the_cli_reports_a_judge_that_failed_as_a_run_error(
+    cli, plugin, tmp_path, capsys
+):
+    cli.judge_answer = RuntimeError("OAuth session expired")
+    suite = _suite_file(tmp_path, plugin)
+    code = main([str(suite), "--case", "7", "--plugin-dir", str(plugin)])
+    printed = capsys.readouterr().out
+    assert code == 1
+    assert "run error: the judge gave no verdict: RuntimeError" in printed
