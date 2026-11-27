@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from exmergo_dex_core.maintain import cause_kinds as ck
 from exmergo_dex_core.maintain import diagnosis as diag
 from exmergo_dex_core.maintain.incidents import (
     Observation,
@@ -214,14 +215,9 @@ def test_no_confirmed_candidate_is_no_cause_and_names_none():
     assert result.verdict == "no_cause"
     assert result.causes == ()
     assert [c.kind for c in result.ruled_out] == ["duplicate_load"]
-    # The project and the owners this release does not check are listed, so
-    # no_cause never reads as having ruled them out.
-    assert {c.owner for c in result.not_checked} == {
-        "project",
-        "seed",
-        "package",
-        "schedule",
-    }
+    # Only the candidates the caller's checks answered: no owner is added here
+    # as not checked, or dropped (#1476).
+    assert result.not_checked == ()
     assert result.unseen
     # Nothing is handed to transform without a confirmed cause.
     assert result.next_steps == ()
@@ -262,27 +258,50 @@ def _range(status: str, **extra) -> diag.DiagnosisRange:
     )
 
 
-def test_the_failing_commit_having_passed_earlier_rules_the_project_out():
-    candidate = diag.project_candidate(_range("same_commit"))
+def test_the_failing_commit_having_passed_earlier_is_a_range_with_no_bound():
+    bounds = ck.range_bounds(_range("same_commit"))
 
+    assert isinstance(bounds, ck.Bounds)
+    assert bounds.after == ()
+    candidate = ck.same_commit("project", "project_change", bounds.through)
     assert candidate.status == "ruled_out"
     assert candidate.reason == "same_commit"
     assert candidate.check == "onset.commits"
 
 
-@pytest.mark.parametrize("status", ["ordered", "unknown", "not_ordered"])
-def test_any_other_commit_range_leaves_the_project_not_checked(status: str):
-    candidate = diag.project_candidate(_range(status, count=3))
+@pytest.mark.parametrize("status", ["unknown", "not_ordered"])
+def test_a_range_with_no_ordered_bound_leaves_the_git_kinds_not_checked(status: str):
+    template = ck.range_bounds(_range(status, count=3))
 
-    assert candidate.status == "not_checked"
+    assert isinstance(template, diag.Candidate)
+    assert template.status == "not_checked"
+    assert template.reason == "commit_range_unknown"
+    seed = ck.unknown_range(template, "seed", "seed_edited")
+    assert (seed.owner, seed.kind, seed.status) == (
+        "seed",
+        "seed_edited",
+        "not_checked",
+    )
 
 
-def test_with_no_history_read_the_project_is_not_checked():
+def test_an_ordered_range_is_bounded_by_the_last_passing_commit():
+    good = CommitRef(commit="a" * 40, run="inv-1", sequence=1, basis="git_sha")
+    bounds = ck.range_bounds(
+        _range("ordered", count=3, after=(good,), last_good_run=good)
+    )
+
+    assert isinstance(bounds, ck.Bounds)
+    assert bounds.after == ("a" * 40,)
+    assert bounds.last_good == "a" * 40
+    assert bounds.through == "b" * 40
+
+
+def test_with_no_history_read_the_git_kinds_are_not_checked():
     span = diag.bisect(_onset({1: "good", 2: "bad"}))
-    candidate = diag.project_candidate(span)
+    template = ck.range_bounds(span)
 
-    assert candidate.status == "not_checked"
-    assert candidate.reason == "no_commit_history"
+    assert isinstance(template, diag.Candidate)
+    assert template.reason == "no_commit_history"
 
 
 # --- a snapshot is placed by when its warehouse state was measured ----------------

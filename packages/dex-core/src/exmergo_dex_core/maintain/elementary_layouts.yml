@@ -161,6 +161,48 @@ releases:
           - created_at
         unobserved:
           - row_index
+      dbt_run_results:
+        # models/edr/dbt_artifacts/dbt_run_results.sql:19 calls
+        # get_dbt_run_results_empty_table_query(),
+        # macros/edr/dbt_artifacts/upload_run_results.sql:12-37. One row per
+        # node per invocation (models, seeds, snapshots and tests alike), with
+        # dbt's own status. execute_started_at and execute_completed_at are
+        # strings, filled from the run result's timing as dbt writes it.
+        source: macros/edr/dbt_artifacts/upload_run_results.sql:12-37
+        columns:
+          - [model_execution_id, long_string]
+          - [unique_id, long_string]
+          - [invocation_id, string]
+          - [generated_at, string]
+          - [created_at, timestamp]
+          - [name, long_string]
+          - [message, long_string]
+          - [status, string]
+          - [resource_type, string]
+          - [execution_time, float]
+          - [execute_started_at, string]
+          - [execute_completed_at, string]
+          - [compile_started_at, string]
+          - [compile_completed_at, string]
+          - [rows_affected, bigint]
+          - [full_refresh, boolean]
+          - [compiled_code, long_string]
+          - [failures, bigint]
+          - [query_id, string]
+          - [thread_id, string]
+          - [materialization, string]
+          - [adapter_response, string]
+        reads:
+          # The ids and build times ``maintain diagnose`` reads to order a
+          # model's build against its parent's (#1476). Never compiled_code,
+          # message or adapter_response, which can quote a value.
+          - unique_id
+          - invocation_id
+          - resource_type
+          - status
+          - execute_started_at
+          - execute_completed_at
+          - created_at
       data_monitoring_metrics:
         # models/edr/data_monitoring/data_monitoring/data_monitoring_metrics.sql:17
         # calls empty_data_monitoring_metrics(),
@@ -323,6 +365,50 @@ releases:
           - detected_at
           - created_at
           - row_index
+      dbt_run_results:
+        # elementary-data/dbt-data-reliability, tag 0.26.1, commit
+        # 3f8e79b357123ed70f7c4b0e74490dd5177a7cbb.
+        # models/edr/dbt_artifacts/dbt_run_results.sql:26 calls
+        # get_dbt_run_results_empty_table_query(),
+        # macros/edr/dbt_artifacts/upload_run_results.sql:19-48: 0.16.4's
+        # columns in the same order, then group_name. The timing strings pass
+        # through truncate_to_microseconds first.
+        source: macros/edr/dbt_artifacts/upload_run_results.sql:19-48
+        columns:
+          - [model_execution_id, long_string]
+          - [unique_id, long_string]
+          - [invocation_id, string]
+          - [generated_at, string]
+          - [created_at, timestamp]
+          - [name, long_string]
+          - [message, long_string]
+          - [status, string]
+          - [resource_type, string]
+          - [execution_time, float]
+          - [execute_started_at, string]
+          - [execute_completed_at, string]
+          - [compile_started_at, string]
+          - [compile_completed_at, string]
+          - [rows_affected, bigint]
+          - [full_refresh, boolean]
+          - [compiled_code, long_string]
+          - [failures, bigint]
+          - [query_id, string]
+          - [thread_id, string]
+          - [materialization, string]
+          - [adapter_response, string]
+          - [group_name, string]
+        reads:
+          # The ids and build times ``maintain diagnose`` reads to order a
+          # model's build against its parent's (#1476). Never compiled_code,
+          # message or adapter_response, which can quote a value.
+          - unique_id
+          - invocation_id
+          - resource_type
+          - status
+          - execute_started_at
+          - execute_completed_at
+          - created_at
       data_monitoring_metrics:
         # models/edr/data_monitoring/data_monitoring/data_monitoring_metrics.sql:26
         # calls empty_data_monitoring_metrics(), which dispatches:

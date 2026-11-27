@@ -450,17 +450,85 @@ and takes each open incident to a cause, or to none.
   (`several_sources`, not checked). A source the bounding snapshot measured
   not unique while the test passed is ruled out
   (`not_unique_at_before_snapshot`); a relation nothing counted is
-  `not_checked` (`uncounted`), never ruled out. The project
-  is ruled out where the failing commit itself passed earlier (`onset.commits`
-  reads `same_commit`). Seed, package and schedule causes are listed
-  `not_checked` until their checks are read.
+  `not_checked` (`uncounted`), never ruled out.
+- **The other cause kinds (#1476).** Every owner is answered for every open
+  incident, each by evidence read at the runs that bound the break, so a
+  `no_cause` answer names what it could not rule out. The evidence is read
+  over the failing test's lineage: the test, the model it is attached to and
+  every model, seed, snapshot and source upstream of them in the manifest, the
+  files they are built and patched from, and the packages they read through a
+  node or a macro.
+  - *The loader retyped a source column* (`source_retyped`): the schema axis
+    of `maintain check` (`column_retyped`) on each source the lineage reads,
+    between `snapshots.before` and `snapshots.after`, or the live catalog
+    where no later snapshot exists (metadata only, free). Confirmed for a
+    column the tested model reads: the tested column, or a word in a model's
+    code on the path (where the manifest holds no code, any column, and the
+    evidence says `read_by_lineage: unknown`). With no snapshot before the
+    break it is `not_checked` (`no_measured_before`): a type needs a baseline.
+  - *The project changed a model in the range* (`project_change`): the files
+    the break's commit range touched (`git log` over the commits the failing
+    commit has and no bounding passing commit has, not capped at the 50
+    `onset.commits` lists), kept where the lineage is built or patched from
+    them (a project macro it calls, and `dbt_project.yml`, count for the
+    tested model). Then `maintain verify` on the changed models, in the same
+    process: a finding of medium or high severity on a changed model
+    confirms; a build finding on a test node never does, so the incident's
+    own failure cannot confirm itself. Ruled out where nothing in the range
+    touches the lineage (`not_in_lineage`) or verify finds nothing
+    (`verify_clean`); `not_checked` where verify's scan was offered
+    (`scan_offered`) or its data checks were all suppressed
+    (`verify_suppressed`), and where only the failing test's own definition
+    changed (`test_definition_changed`: a changed claim verify cannot judge).
+  - *A package was upgraded* (`package_upgraded`): `package-lock.yml` at the
+    last passing run's commit and the failing one, each entry keyed by the
+    `name` dbt 1.7 writes, else its source's last path part. Confirmed where a
+    package the lineage reads moved; ruled out where every pin is the same
+    (`same_versions`) or only packages the lineage does not read moved
+    (`not_in_lineage`). With no lock committed it is `not_checked`
+    (`unpinned`): `packages.yml`'s ranges can resolve differently on the same
+    commit, so the versions each run installed are not recorded.
+  - *A seed was edited* (`seed_edited`): each seed in the lineage's file hash
+    (git's blob name) at each bounding commit and at the failing one.
+    Confirmed where the failing commit's hash differs from every bound's, so
+    content a passing commit already held never counts; ruled out on
+    `same_hash` or `no_seed_in_lineage`. Hashes only, never a row.
+  - *The schedule built a parent after its child* (`built_before_parent`):
+    for each child and parent model the failing test reads (a
+    `relationships` test's two models, else the tested model and each parent
+    model it reads), both models' last successful builds, read from
+    Elementary's `dbt_run_results`. The build a run's test read is the one
+    that run made itself, else the newest that completed before the run
+    started. Confirmed where, at the last passing run, the parent's build
+    completed before the child's started, and at the first failing run it
+    completed after: the child read an older parent than the one the test
+    reads. Ruled out where the parent was built first at the failing run
+    (`parent_first`) or the order was already reversed at the last pass
+    (`order_unchanged`). `not_checked` where Elementary's tables were not
+    read or `dbt_run_results` does not hold build times Dex can read
+    (`no_run_times`), or a model has no recorded build (`no_build_recorded`).
+    The read is one bounded statement (ids and execution times of successful
+    model rows, never `compiled_code`, `message` or `adapter_response`, which
+    a profile withholds), through the query firewall and priced into the
+    checks' one handshake.
+
+  The range's files have one owner each: a seed's CSV is the seed's,
+  `packages.yml`, `dependencies.yml` and `package-lock.yml` the package's,
+  and every other file the project's, so one edit is never claimed twice.
+  Where the failing commit passed earlier (`same_commit`) the project, seed
+  and package are ruled out together; where the commits the break spans are
+  not known they are `not_checked` (`no_commit_history`,
+  `commit_range_unknown`).
 - **No cause is an answer.** `verdict` is `cause`, `several` (each named, none
   preferred) or `no_cause`. With no confirmed candidate the answer is
   `ruled_out` and `unseen`; the most likely candidate is never named as the
   cause.
-- **The repair is `transform`'s.** A confirmed cause carries the
-  `dex transform plan` step that would repair it under `next_steps`. Nothing
-  here writes it.
+- **The repair is `transform`'s.** A confirmed cause carries the step that
+  would repair it under `next_steps`: a `dex transform plan` for a duplicate
+  delivery, a seed or a package pin, `explore profile` before a retype's
+  cast, `maintain verify` on a changed model, and for the schedule the
+  incident read again once the jobs are reordered (an orchestrator's
+  schedule is not a project file). Nothing here writes it.
 - **Who reads it.** Beside the cause, `semantic_readers` (#1478) names the
   semantic-layer objects that read the failing test's columns: the model and
   columns come from the test's node in the manifest (a uniqueness test's

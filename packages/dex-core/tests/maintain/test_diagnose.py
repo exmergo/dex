@@ -285,7 +285,7 @@ def test_a_failure_with_no_defect_seeded_reports_no_cause_and_what_was_ruled_out
 
     assert diagnosis["verdict"] == "no_cause"
     assert diagnosis["causes"] == []
-    [ruled_out] = [c for c in diagnosis["ruled_out"] if c["owner"] == "loader"]
+    [ruled_out] = [c for c in diagnosis["ruled_out"] if c["kind"] == "duplicate_load"]
     assert ruled_out["kind"] == "duplicate_load"
     assert ruled_out["reason"] == "still_unique"
     assert ruled_out["check"] == "maintain check: grain axis"
@@ -353,7 +353,7 @@ def test_with_a_series_and_no_defect_the_snapshot_bounds_a_no_cause_answer(
     [diagnosis] = data["diagnoses"]
 
     assert diagnosis["verdict"] == "no_cause"
-    [ruled_out] = [c for c in diagnosis["ruled_out"] if c["owner"] == "loader"]
+    [ruled_out] = [c for c in diagnosis["ruled_out"] if c["kind"] == "duplicate_load"]
     assert ruled_out["finding"] == "key_lost_uniqueness"
     assert diagnosis["snapshots"]["before"] is not None
 
@@ -384,17 +384,22 @@ def test_the_same_run_observed_narrows_the_range(tmp_path: Path):
 # --- the answer's other parts -----------------------------------------------------
 
 
-def test_the_owners_this_release_does_not_check_are_listed_as_not_checked(
-    tmp_path: Path,
-):
+def test_every_owner_is_answered_and_none_is_left_out(tmp_path: Path):
+    # No commit carries the runs, so the git-read kinds are not checked, and no
+    # snapshot measured a type, so a retype is not either (#1476).
     root, warehouse, _ = _project(tmp_path, duplicated=True)
     [diagnosis] = _diagnose(root, warehouse)["diagnoses"]
 
-    assert {c["owner"] for c in diagnosis["not_checked"]} >= {
-        "seed",
-        "package",
-        "schedule",
+    kinds = {
+        c["kind"]: c["status"]
+        for part in ("causes", "ruled_out", "not_checked")
+        for c in diagnosis[part]
     }
+    assert kinds["duplicate_load"] == "confirmed"
+    for kind in ("project_change", "seed_edited", "package_upgraded"):
+        assert kinds[kind] == "not_checked", kind
+    assert kinds["source_retyped"] == "not_checked"
+    assert "built_before_parent" in kinds
 
 
 def test_a_test_that_is_not_a_uniqueness_test_checks_no_loader_candidate(
@@ -410,7 +415,7 @@ def test_a_test_that_is_not_a_uniqueness_test_checks_no_loader_candidate(
     [diagnosis] = _diagnose(root, warehouse)["diagnoses"]
 
     assert diagnosis["verdict"] == "no_cause"
-    assert not [c for c in diagnosis["ruled_out"] if c["owner"] == "loader"]
+    assert not [c for c in diagnosis["ruled_out"] if c["kind"] == "duplicate_load"]
 
 
 def test_no_value_from_the_data_reaches_the_envelope(tmp_path: Path):
@@ -487,7 +492,7 @@ def _loader(diagnosis: dict[str, Any]) -> list[dict[str, Any]]:
         c
         for part in ("causes", "ruled_out", "not_checked")
         for c in diagnosis[part]
-        if c["owner"] == "loader"
+        if c["kind"] == "duplicate_load"
     ]
 
 

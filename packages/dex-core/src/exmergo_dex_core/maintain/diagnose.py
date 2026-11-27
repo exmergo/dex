@@ -25,8 +25,13 @@ spans (#1467). Each open incident is then diagnosed (:mod:`.diagnosis`):
      the failing test's own claim held to the source relation today
      (``declared_grain_not_unique``).
 
-   The project is ruled out where the failing commit itself passed earlier
-   (``onset.commits``); the other owners are listed as not checked (#1476).
+   The other owners are checked from evidence Dex already has, read at the
+   runs that bound the break (:mod:`.cause_kinds`, :mod:`.diagnose_kinds`,
+   #1476): a source column the loader retyped (the schema axis), a model the
+   project changed in the range (``maintain verify`` on it), a package version
+   ``package-lock.yml`` moved, a seed whose file hash changed, and a parent
+   model built after its child (both models' build times from Elementary's
+   ``dbt_run_results``).
 4. **Answer.** One confirmed cause, several, or none. With none, the answer is
    what was ruled out and the window that could not be seen; the most likely
    candidate is never named. A confirmed cause's repair is handed to
@@ -52,6 +57,7 @@ from typing import TYPE_CHECKING, Any
 from .. import command_args
 from ..cache import Dataset
 from ..values_free import require_allowed
+from . import diagnose_kinds as dk
 from . import diagnosis as diag
 from . import incident_sources
 from . import semantic_readers as sr
@@ -144,8 +150,40 @@ def diagnose(
         work = [
             _Work(incident, _specs(manifest, incident)) for incident in open_incidents
         ]
-        if any(w.specs for w in work):
-            adapter = engine._adapter(COMMAND)
+        opened: list[Adapter] = []
+
+        def adapter_for() -> Adapter:
+            # One acquisition for every check: the engine rebuilds the cost
+            # gate on each call, which would settle the reservation.
+            if not opened:
+                opened.append(engine._adapter(COMMAND))
+            return opened[0]
+
+        kinds = [
+            dk.KindWork(
+                item.incident,
+                dk.merged_lineage(
+                    manifest,
+                    item.incident,
+                    [
+                        c
+                        for t in _tested_columns(manifest, item.incident)
+                        for c in t.columns
+                    ],
+                ),
+                diag.bisect(item.incident.onset),  # type: ignore[arg-type]
+            )
+            for item in work
+        ]
+        verified: dict[tuple[str, ...], Any] = {}
+        for kind in kinds:
+            dk.git_kinds(engine, history, kind, verified)
+            dk.retype(kind, manifest, series_read, adapter_for)
+        schedule = dk.plan_schedule(
+            engine, kinds, read.sources.get(incident_sources.ELEMENTARY), adapter_for
+        )
+        if any(w.specs for w in work) or schedule is not None:
+            adapter = adapter_for()
             checks_price = _confirm_all(
                 engine,
                 adapter,
@@ -153,7 +191,13 @@ def diagnose(
                 series_read,
                 spent_before=_billed(read.spend),
                 warnings=warnings,
+                schedule=schedule,
             )
+        elif opened:
+            adapter = opened[0]
+        for item, kind in zip(work, kinds, strict=True):
+            item.candidates.extend(kind.candidates)
+            item.next_steps.extend(kind.next_steps)
         layer = _Layer.read(engine)
         if layer.unread_files:
             warnings.append(
@@ -616,6 +660,7 @@ def _confirm_all(
     *,
     spent_before: float = 0.0,
     warnings: list[str] | None = None,
+    schedule: dk.SchedulePlan | None = None,
 ) -> dict[str, Any]:
     """Plan every candidate's check, price them as one handshake, run them,
     and record each candidate's answer on its work item.
@@ -723,8 +768,12 @@ def _confirm_all(
         estimate += total
         for key, value in per.items():
             per_table[key] = per_table.get(key, 0.0) + value
+    if schedule is not None:
+        estimate += schedule.estimate
+        for key, value in schedule.per_table.items():
+            per_table[key] = per_table.get(key, 0.0) + value
     price: dict[str, Any] = {"estimate": estimate, "per_table": per_table}
-    if not planned:
+    if not planned and schedule is None:
         return price
     gate = command_args.cost_gate(adapter)
     left = (
@@ -737,6 +786,8 @@ def _confirm_all(
         # spent comes out of the same per-command ceiling, and checks that no
         # longer fit are offered rather than asked for a second time.
         price["offered"] = True
+        if schedule is not None:
+            dk.offer_schedule(schedule)
         for item, held_plan in planned:
             item.candidates.append(
                 _loader(
@@ -757,11 +808,27 @@ def _confirm_all(
         estimate,
         per_table=per_table,
         notes=[
-            f"{len(planned)} uniqueness check(s) of the grain axis, one per "
-            "source relation a failing uniqueness test's model reads"
+            *(
+                [
+                    f"{len(planned)} uniqueness check(s) of the grain axis, one "
+                    "per source relation a failing uniqueness test's model reads"
+                ]
+                if planned
+                else []
+            ),
+            *(
+                [
+                    "one read of Elementary's dbt_run_results for the build "
+                    "times of the failing tests' models and their parents"
+                ]
+                if schedule is not None
+                else []
+            ),
         ],
-        axes=["grain"],
+        axes=["grain"] if planned else [],
     )
+    if schedule is not None:
+        dk.run_schedule(engine, adapter, schedule, COMMAND)
 
     config = engine.config
     for item, held_plan in planned:

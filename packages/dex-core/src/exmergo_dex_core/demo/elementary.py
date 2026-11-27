@@ -61,6 +61,12 @@ RELEASE = "0.26.1"
 #: then the ``+schema: elementary`` the project sets.
 SCHEMA = "main_elementary"
 
+#: The recorded tables the demo does not seed: ``dbt_run_results`` holds build
+#: times, which only ``maintain diagnose``'s schedule kind reads (#1476), and
+#: the demo's failing test is on a model no other model builds, so there is no
+#: build order to read. Leaving it out keeps the demo's object counts.
+NOT_SEEDED = frozenset({"dbt_run_results"})
+
 #: How the package casts each layout type name on DuckDB (``empty_column``).
 _DUCKDB_TYPES = {
     "boolean": "BOOLEAN",
@@ -308,6 +314,7 @@ def elementary_tables(
 
 
 __all__ = [
+    "NOT_SEEDED",
     "RELEASE",
     "SCHEMA",
     "SeededRun",

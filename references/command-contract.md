@@ -988,9 +988,19 @@ dex maintain diagnose [<models>] [--invocations N]
                                      key twice, with the grain axis on each source the tested model
                                      reads: key_lost_uniqueness against a bounding snapshot that
                                      proved the key unique, else the declared-claim check
-                                     (declared_grain_not_unique). The project is ruled out where the
-                                     failing commit passed earlier; seed, package and schedule are
-                                     not_checked. verdict is cause, several or no_cause; no_cause
+                                     (declared_grain_not_unique). The other owners are answered over
+                                     the failing test's lineage at the runs that bound the break
+                                     (#1476): source_retyped (the schema axis's column_retyped between
+                                     the bounding snapshot and the later one or the live catalog),
+                                     project_change (files the commit range touched that the lineage
+                                     is built from, then maintain verify on the changed models),
+                                     package_upgraded (package-lock.yml's pins at the two commits),
+                                     seed_edited (the seed file's git hash at the two commits) and
+                                     built_before_parent (a parent model built after its child at the
+                                     failing run and before it at the last pass, from Elementary's
+                                     dbt_run_results, priced with the checks). Each range file has one
+                                     owner; same_commit rules project, seed and package out.
+                                     verdict is cause, several or no_cause; no_cause
                                      answers with ruled_out and unseen and never names the likeliest
                                      candidate. A confirmed cause's repair is handed to transform
                                      under next_steps, never written. Beside the cause,

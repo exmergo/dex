@@ -285,6 +285,73 @@ class GitHistory:
         shas = tuple(every[: max(limit, 0)])
         return shas, count
 
+    # --- the files a range touched (#1476) ----------------------------------------
+    #
+    # Paths here are relative to ``repo_root`` (the dbt project directory where
+    # the project sits in a subdirectory of the repository), as a manifest's
+    # ``original_file_path`` is: ``git log --relative`` lists only the files
+    # under it and spells them from it, and ``<commit>:./<path>`` reads one.
+
+    def touching(
+        self, bad: str, goods: Sequence[str], limit: int = 200
+    ) -> tuple[tuple[tuple[str, tuple[str, ...]], ...], int]:
+        """The commits reachable from ``bad`` and from none of ``goods`` that
+        touched a file under the root, each with the files it touched, newest
+        first and at most ``limit`` of them, and how many such commits there are.
+
+        Renames are listed as the path removed and the path added, so a file
+        moved out of a seed directory is still a seed edit. A merge lists no
+        files of its own: the commits it brings in are listed instead.
+        """
+
+        head = _held(bad)
+        excluded = [_held(g) for g in goods]
+        self._repository()
+        spec = [head, "--not", *excluded] if excluded else [head]
+        listed = self._git(
+            "log",
+            "--relative",
+            "--no-renames",
+            "--name-only",
+            "--format=%x01%H",
+            *spec,
+            "--",
+            ".",
+        )
+        if listed.returncode != 0:
+            raise HistoryUnreadableError("log failed")
+        found: list[tuple[str, tuple[str, ...]]] = []
+        for block in listed.stdout.split("\x01"):
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if not lines or not _COMMIT.fullmatch(lines[0]):
+                continue
+            found.append((lines[0].lower(), tuple(dict.fromkeys(lines[1:]))))
+        if self._boundary.intersection(sha for sha, _ in found):
+            raise HistoryUnreadableError(
+                "the range reaches a shallow clone's boundary", code="shallow"
+            )
+        return tuple(found[: max(limit, 0)]), len(found)
+
+    def blob_id(self, commit: str, path: str) -> str | None:
+        """The object name of ``path`` as ``commit`` holds it, or ``None`` where
+        the commit holds no such file. Two commits holding the same bytes give
+        the same name, so it is the file's hash at that commit."""
+
+        name = _held(commit)
+        self._repository()
+        done = self._git("rev-parse", "--verify", "--quiet", f"{name}:./{path}")
+        held = done.stdout.strip() if done.returncode == 0 else ""
+        return held.lower() if _COMMIT.fullmatch(held) else None
+
+    def blob(self, commit: str, path: str) -> str | None:
+        """``path``'s text as ``commit`` holds it, or ``None`` where it holds
+        no such file (or the file is not text)."""
+
+        name = _held(commit)
+        self._repository()
+        done = self._git("show", f"{name}:./{path}")
+        return done.stdout if done.returncode == 0 else None
+
 
 class MappedHistory:
     """A commit graph held in memory: each commit's parents.

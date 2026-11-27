@@ -312,81 +312,6 @@ def decide(
     return verdict, confirmed, ruled_out, not_checked
 
 
-def project_candidate(span: DiagnosisRange) -> Candidate:
-    """The project as a cause, read off the commit range the break spans.
-
-    Ruled out where the failing commit itself passed earlier (``same_commit``):
-    no project file changed across the break. Otherwise not checked here: a
-    model or test changed in the range is confirmed by ``maintain verify`` on
-    the changed model, which #1476 proves.
-    """
-
-    commits = span.commits
-    if commits is None:
-        return Candidate(
-            owner="project",
-            kind="project_change",
-            status="not_checked",
-            reason="no_commit_history",
-            detail="the repository's history was not read, so the commits the "
-            "break spans are not known",
-        )
-    if commits.status == "same_commit":
-        return Candidate(
-            owner="project",
-            kind="project_change",
-            status="ruled_out",
-            check="onset.commits",
-            reason="same_commit",
-            detail=f"commit {commits.through.commit} passed in an earlier run and "
-            "failed in this one, so no project file changed across the break",
-            evidence={"commit": commits.through.commit},
-        )
-    evidence: dict[str, Any] = {"status": commits.status}
-    if commits.count is not None:
-        evidence["count"] = commits.count
-    if commits.reason is not None:
-        evidence["reason"] = commits.reason
-    return Candidate(
-        owner="project",
-        kind="project_change",
-        status="not_checked",
-        reason="kind_not_proven_here",
-        detail="a model or test changed in the break's commit range is confirmed "
-        "by maintain verify on the changed model, which this release does not "
-        "run for diagnosis",
-        evidence=evidence,
-    )
-
-
-#: The owners whose cause kinds this release does not check, each named so a
-#: ``no_cause`` answer never reads as having ruled them out.
-_UNCHECKED_OWNERS: tuple[tuple[Owner, str, str], ...] = (
-    ("seed", "seed_edited", "a seed's file hash at the two bounding runs"),
-    ("package", "package_upgraded", "the package versions at the two bounding runs"),
-    (
-        "schedule",
-        "built_before_parent",
-        "both models' run times, from dbt_invocations or the orchestrator",
-    ),
-)
-
-
-def unchecked_owners() -> tuple[Candidate, ...]:
-    """A ``not_checked`` candidate for each owner this release does not check."""
-
-    return tuple(
-        Candidate(
-            owner=owner,
-            kind=kind,
-            status="not_checked",
-            reason="kind_not_proven_here",
-            detail=f"confirmed by {evidence}, which this release does not read",
-        )
-        for owner, kind, evidence in _UNCHECKED_OWNERS
-    )
-
-
 def diagnosis(
     *,
     subject: str,
@@ -398,13 +323,12 @@ def diagnosis(
     semantic_readers: SemanticReaders | None = None,
 ) -> Diagnosis:
     """One incident's diagnosis from its onset, the series and the candidates
-    its checks answered. ``candidates`` are the checked ones; the project and
-    the owners this release does not check are added here."""
+    its checks answered: every owner's, confirmed, ruled out or not checked
+    (#1476), so a ``no_cause`` answer names what it could not rule out."""
 
     span = bisect(onset)
     bounds = bound(series, span)
-    held = [*candidates, project_candidate(span), *unchecked_owners()]
-    verdict, confirmed, ruled_out, not_checked = decide(held)
+    verdict, confirmed, ruled_out, not_checked = decide(candidates)
     return Diagnosis(
         subject=subject,
         tests=tuple(tests),
@@ -437,7 +361,5 @@ __all__ = [
     "bound",
     "decide",
     "diagnosis",
-    "project_candidate",
-    "unchecked_owners",
     "unseen",
 ]

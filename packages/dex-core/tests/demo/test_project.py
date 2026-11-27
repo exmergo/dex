@@ -306,7 +306,8 @@ def _differences(columns: Callable[[str], tuple[tuple[str, str], ...]]) -> list[
     return [
         table
         for table in layout.tables
-        if columns(table)
+        if table not in seeded.NOT_SEEDED
+        and columns(table)
         != tuple(
             (name, DUCKDB_TYPES[kind]) for name, kind in layout.tables[table].columns
         )
@@ -318,12 +319,16 @@ def _layout_check(path: Path):
     from exmergo_dex_core.maintain.elementary_layouts import (
         adapter_catalog,
         check_layouts,
+        layout_for,
     )
 
     adapter = DuckDBAdapter(path)
     try:
         catalog = adapter_catalog(adapter, f"{path.stem}.{seeded.SCHEMA}")
-        return check_layouts(seeded.RELEASE, catalog)
+        tables = [
+            t for t in layout_for(seeded.RELEASE).tables if t not in seeded.NOT_SEEDED
+        ]
+        return check_layouts(seeded.RELEASE, catalog, tables=tables)
     finally:
         adapter.close()
 
@@ -338,7 +343,9 @@ def test_the_seeded_tables_are_the_recorded_layout_column_for_column():
     assert _differences(seeded._columns) == []
     layout = layout_for(seeded.RELEASE)
     assert {t.name: t.columns for t in _history()} == {
-        table: seeded._columns(table) for table in layout.tables
+        table: seeded._columns(table)
+        for table in layout.tables
+        if table not in seeded.NOT_SEEDED
     }
 
 

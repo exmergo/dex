@@ -91,10 +91,19 @@ ROW_VALUE_COLUMNS = frozenset({"result_row", "result_rows"})
 DIMENSION_VALUE_COLUMN = "dimension_value"
 
 #: Columns of the documented models whose text can quote a value: a result
-#: message, compiled SQL, a test's arguments. A profile withholds their values;
-#: the firewall does not hold them.
+#: message, compiled SQL, a test's arguments, an adapter's response. A profile
+#: withholds their values; the firewall does not hold them. ``message``,
+#: ``compiled_code`` and ``adapter_response`` are ``dbt_run_results``'s, which
+#: ``maintain diagnose`` reads build times from (#1476).
 QUOTING_COLUMNS = frozenset(
-    {"test_results_description", "test_results_query", "test_params"}
+    {
+        "test_results_description",
+        "test_results_query",
+        "test_params",
+        "message",
+        "compiled_code",
+        "adapter_response",
+    }
 )
 
 SCHEMA_NAME = "elementary"
