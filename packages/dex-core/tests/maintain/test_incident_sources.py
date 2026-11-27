@@ -34,6 +34,7 @@ from exmergo_dex_core.maintain.incident_sources import (
 )
 from exmergo_dex_core.maintain.results import IncidentsResult
 from exmergo_dex_core.results import to_envelope
+from exmergo_dex_core.transform import elementary_schema
 
 duckdb = pytest.importorskip("duckdb")
 
@@ -401,7 +402,10 @@ def test_a_schema_outside_the_allowlist_is_refused_and_never_queried(
         "refused",
         "outside_allowlist",
     )
-    command = "dex config set postgres.schemas '[analytics, main_elementary]'"
+    command = (
+        "dex config set postgres.schemas '[analytics, main_elementary]' "
+        f"--comment '{elementary_schema.COMMENT}'"
+    )
     assert elementary["config_set"] == command
     assert command in [s["command"] for s in data["next_steps"]]
     assert engine.store._queries == []
