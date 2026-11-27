@@ -818,8 +818,12 @@ dex maintain verify [<models>]    -> is the project correct right now, no .dex/s
                                      freshness_exceeded (a time column's declared freshness: its
                                      newest value trails the warehouse's clock by more than max_lag,
                                      or it holds no value; lag in seconds, never a value, one
-                                     data.freshness record per declared column; high on a capture
-                                     basis, medium on business; #1460),
+                                     data.freshness record per declared check, check: max_lag or
+                                     deadline; high on a capture basis, medium on business; #1460),
+                                     deadline_missed (a declared freshness.deadline passed today, in
+                                     its timezone and on a day its days include, with no value from
+                                     today in the column; counts only; not_applicable before the
+                                     deadline or on an unscheduled day; #1486),
                                      population_delta (a built model declaring no parent, against the
                                      parent dex drafts for it: orphan_keys, missing_parents, empty_rows,
                                      one data.population_delta record per model, needs_decision listed
@@ -1611,7 +1615,8 @@ default, or a filter or operator after it is refused. A key naming a location
   zone read as UTC, so a value exactly at the limit passes; a column that is no
   date or timestamp errors the test and is `unchecked` (`not_temporal`) in
   `maintain verify`. A listed `dex_freshness` whose claim the column's declared
-  freshness no longer gives (its `max_lag` changed) is reported `stale`,
+  freshness no longer gives (its `max_lag` changed, or was dropped for a
+  `deadline`, which renders no `dex_freshness`) is reported `stale`,
   `reason: freshness_changed`, with a warning, and is never removed; a change
   of `basis` alone keeps the listed test, which behaves the same. It renders
   `dex_continuity` (#1461) under each column declaring `continuity` (the column
@@ -1717,7 +1722,20 @@ default, or a filter or operator after it is refused. A key naming a location
   `timestamp_column` is `hand_written`, whatever its list; a Dex-written one
   is stale with `changed: column` and a `cause` where the column no longer
   gives one, or `changed: column_anomalies` with the current `monitors` and a
-  `replacement` where the list moved. Nothing is
+  `replacement` where the list moved. A time column whose `freshness` declares
+  a `deadline` (`HH:MM`, with a required IANA `timezone` and optional `days`,
+  #1486) gives an `elementary.data_freshness_sla` on the model with that
+  `timestamp_column`, `sla_time`, `timezone` and, from `days`, `day_of_week`
+  as Elementary's full day names; a `max_lag` is never read as a deadline and
+  alone gives none. It is `release_unsupported` below Elementary 0.23.1, which
+  first ships the test, and `sla_filter_quote` where a population filter value
+  holds a quote on BigQuery, Snowflake, Databricks or Redshift (the package
+  repeats the `where_expression` inside a message literal, and its re-escaping
+  breaks the `\'` those connectors take); a hand-written one on the same `timestamp_column` is
+  `hand_written` whatever deadline it states, and a Dex-written one is stale
+  with `changed: deadline` where the deadline moved or was removed. On a
+  `business` basis column the plan writes it and warns: the test needs a value
+  from today, which a load of the previous day's events never holds. Nothing is
   written unless the package is installed (or the plan adds it) and the
   repository's `dbt_project.yml` enables `models: elementary` on the production
   target, read with `target.name` replaced by `dbt_prod_target`: a literal, an
@@ -2256,7 +2274,8 @@ default, or a filter or operator after it is refused. A key naming a location
   declared `history` to the snapshot's versions (`temporal_*`, #1027, one record
   per contract under `data.verification.temporal_contracts`), and a time
   column's declared `freshness` to the warehouse's clock (`freshness_exceeded`,
-  #1460, one record per declared column under `data.verification.freshness`). A
+  #1460, and a declared daily `deadline`, `deadline_missed`, #1486, one record
+  per declared check under `data.verification.freshness`). A
   built model that
   declares no parent is measured against the parent dex drafts for it (#1228):
   orphan keys, missing parents and rows whose child columns are all NULL or zero

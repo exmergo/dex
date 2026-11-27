@@ -1,4 +1,4 @@
-"""Vendor monitors written from a declaration (#1482, #1484, #1485, #1591).
+"""Vendor monitors written from a declaration (#1482, #1484, #1485, #1486, #1591).
 
 With ``monitors.vendor: elementary``, a column declared with role ``time``
 becomes the ``timestamp_column`` of ``elementary.volume_anomalies`` and
@@ -7,7 +7,8 @@ same plan as the declaration. A monitor is written only where the package is
 installed and the repository shows it enabled on the production target; a
 hand-written monitor is never touched, and ``data.decisions`` is read back from
 the tests Dex wrote. A fraction or percent unit and a measure's additivity
-write a ``column_anomalies`` under the column, one per column.
+write a ``column_anomalies`` under the column, one per column. A declared daily
+deadline writes a ``data_freshness_sla`` on its time column (#1486).
 
 The package here is a stand-in: an ``elementary`` project under
 ``dbt_packages`` whose two test macros select nothing, so dbt parses the plan
@@ -479,6 +480,9 @@ def _install(project: Path, enabled: str | None = "\"{{ target.name != 'dev' }}\
         " where_expression=none) %}select 1 where false{% endtest %}\n"
         "{% test column_anomalies(model, column_name, column_anomalies=none,"
         " timestamp_column=none, where_expression=none) %}"
+        "select 1 where false{% endtest %}\n"
+        "{% test data_freshness_sla(model, timestamp_column, sla_time, timezone,"
+        " day_of_week=none, day_of_month=none, where_expression=none) %}"
         "select 1 where false{% endtest %}\n",
         encoding="utf-8",
     )
@@ -3196,3 +3200,412 @@ def test_an_ambiguous_profile_flagging_nothing_still_writes_the_column_monitor()
     )
 
     assert _column_rows(rows)["amount"]["status"] == mon.ADDED
+
+
+# --- a declared daily deadline as data_freshness_sla (#1486) ----------------------
+
+SLA = "elementary.data_freshness_sla"
+
+
+def _deadline(freshness: dict | None = None, **columns: dict) -> dict:
+    freshness = (
+        {"deadline": "07:00", "timezone": "America/Chicago", "basis": "capture"}
+        if freshness is None
+        else freshness
+    )
+    return {
+        "model": "fct_orders",
+        "columns": {
+            "ordered_at": {"role": "time", "freshness": freshness},
+            **columns,
+        },
+    }
+
+
+def _sla(content: str) -> list[dict]:
+    return [t[SLA] for t in _tests(content) if isinstance(t, dict) and SLA in t]
+
+
+def test_a_declared_deadline_writes_the_sla_with_its_time_and_zone():
+    rows: list = []
+
+    out = _render(_deadline(), rows=rows)
+
+    [sla] = _sla(out)
+    assert sla["arguments"] == {
+        "timestamp_column": "ordered_at",
+        "sla_time": "07:00",
+        "timezone": "America/Chicago",
+    }
+    assert sla["config"]["tags"] == [mon.TAG]
+    assert sla["config"]["meta"]["dex"]["monitor"] == {
+        "vendor": "elementary",
+        "from": "columns.ordered_at.freshness.deadline: 07:00",
+    }
+    [row] = [r for r in rows if r["test"] == SLA]
+    assert (row["status"], row["column"], row["basis"]) == (
+        mon.ADDED,
+        "ordered_at",
+        "capture",
+    )
+    # The deadline is no reason to drop the time column's own monitors.
+    assert {r["test"] for r in rows} == {VOLUME, FRESHNESS, SLA}
+
+
+def test_the_decision_names_the_freshness_field_and_the_deadline():
+    out = _render(_deadline())
+
+    [found] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == SLA
+    ]
+
+    assert found["field"] == "columns.ordered_at.freshness.deadline: 07:00"
+    assert found["chosen"] == (
+        "timestamp_column: ordered_at; sla_time: 07:00; timezone: America/Chicago"
+    )
+    # A deadline check trains nothing, so no training clause.
+    assert "training" not in found["detail"]
+    assert "column" not in found
+
+
+def test_a_lag_alone_writes_no_sla():
+    rows: list = []
+
+    out = _render(_deadline({"max_lag": "6h", "basis": "capture"}), rows=rows)
+
+    assert _sla(out) == []
+    assert SLA not in {r["test"] for r in rows}
+
+
+def test_a_lag_beside_a_deadline_is_never_its_sla_time():
+    freshness = {
+        "max_lag": "6h",
+        "deadline": "7:30",
+        "timezone": "Europe/London",
+        "basis": "capture",
+    }
+
+    [sla] = _sla(_render(_deadline(freshness)))
+
+    assert (sla["arguments"]["sla_time"], sla["arguments"]["timezone"]) == (
+        "07:30",
+        "Europe/London",
+    )
+
+
+def test_days_are_written_as_elementarys_day_of_week():
+    freshness = {
+        "deadline": "07:00",
+        "timezone": "America/Chicago",
+        "days": ["fri", "Monday", "wed"],
+        "basis": "capture",
+    }
+
+    out = _render(_deadline(freshness))
+
+    [sla] = _sla(out)
+    assert sla["arguments"]["day_of_week"] == ["Monday", "Wednesday", "Friday"]
+    [found] = [
+        d
+        for d in decisions({"models/schema.yml": out}, ["fct_orders"])
+        if d["monitor"] == SLA
+    ]
+    assert "day_of_week: [Monday, Wednesday, Friday]" in found["chosen"]
+
+
+def test_the_sla_carries_the_declared_population():
+    payload = _deadline()
+    payload["columns"]["status"] = {"role": "dimension"}
+    payload["population"] = {
+        "rule": "Placed orders.",
+        "filters": [{"column": "status", "includes": ["placed"]}],
+    }
+
+    [sla] = _sla(_render(payload, dialect="duckdb"))
+
+    assert sla["arguments"]["where_expression"] == "status in ('placed')"
+
+
+def test_a_time_column_the_model_does_not_output_gets_no_sla():
+    rows: list = []
+
+    out = _render(_deadline(), rows=rows, outputs=frozenset({"order_id"}))
+
+    assert _sla(out) == []
+    [row] = [r for r in rows if r["test"] == SLA]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, mon.COLUMN_NOT_OUTPUT)
+
+
+@pytest.mark.parametrize(("release", "written"), [("0.23.0", False), ("0.23.1", True)])
+def test_a_release_before_the_test_existed_gets_no_sla(release, written):
+    gate = mon.Gate(
+        "elementary", mon.INSTALLED, release, mon.ENABLED, mon.NOT_SET, "prod"
+    )
+    rows: list = []
+
+    out = _render(_deadline(), gate=gate, rows=rows)
+
+    assert bool(_sla(out)) is written
+    [row] = [r for r in rows if r["test"] == SLA]
+    if not written:
+        assert (row["status"], row["reason"]) == (
+            mon.NOT_RENDERED,
+            mon.RELEASE_UNSUPPORTED,
+        )
+    # The other monitors exist at every release and are written.
+    assert {r["status"] for r in rows if r["test"] != SLA} == {mon.ADDED}
+
+
+def test_a_hand_written_sla_on_the_column_is_kept_as_written():
+    content = (
+        "version: 2\n"
+        "models:\n"
+        "  - name: fct_orders\n"
+        "    data_tests:\n"
+        "      - elementary.data_freshness_sla:\n"
+        "          timestamp_column: ordered_at\n"
+        "          sla_time: 6am\n"
+        "          timezone: UTC\n"
+    )
+    rows: list = []
+
+    out = _render(_deadline(), content=content, rows=rows)
+
+    [sla] = _sla(out)
+    assert sla == {
+        "timestamp_column": "ordered_at",
+        "sla_time": "6am",
+        "timezone": "UTC",
+    }
+    [row] = [r for r in rows if r["test"] == SLA]
+    assert row["status"] == mon.HAND_WRITTEN
+    assert row["arguments"]["sla_time"] == "6am"
+
+
+def test_declaring_the_deadline_again_lists_it_once():
+    first = _render(_deadline())
+    rows: list = []
+
+    again = _render(_deadline(), content=first, rows=rows)
+
+    assert again == first
+    assert {r["status"] for r in rows if r["test"] == SLA} == {mon.ALREADY_LISTED}
+
+
+def test_a_moved_deadline_leaves_the_old_sla_stale_beside_the_new_one():
+    first = _render(_deadline())
+    moved = _deadline(
+        {"deadline": "09:00", "timezone": "America/Chicago", "basis": "capture"}
+    )
+    rows: list = []
+    notes: list = []
+
+    out = _render(moved, content=first, rows=rows, notes=notes)
+
+    assert sorted(s["arguments"]["sla_time"] for s in _sla(out)) == ["07:00", "09:00"]
+    [stale] = [r for r in rows if r["status"] == mon.STALE]
+    assert (stale["test"], stale["changed"], stale["replacement"]["status"]) == (
+        SLA,
+        "deadline",
+        mon.ADDED,
+    )
+    assert any("sla_time 07:00" in n and "remove it" in n for n in notes)
+
+
+def test_a_deadline_dropped_for_a_lag_reports_the_sla_stale():
+    first = _render(_deadline())
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _deadline({"max_lag": "6h", "basis": "capture"}),
+        content=first,
+        rows=rows,
+        notes=notes,
+    )
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE]
+    assert (stale["test"], stale["changed"]) == (SLA, "deadline")
+    assert any("declares no deadline now" in n for n in notes)
+
+
+def test_a_deadline_on_a_business_time_warns_that_it_needs_todays_events():
+    notes: list = []
+
+    _render(
+        _deadline(
+            {"deadline": "07:00", "timezone": "America/Chicago", "basis": "business"}
+        ),
+        notes=notes,
+    )
+
+    assert any(
+        "business time" in n and "basis: capture" in n and "fct_orders.ordered_at" in n
+        for n in notes
+    )
+
+
+def test_a_capture_time_deadline_carries_no_basis_warning():
+    notes: list = []
+
+    _render(_deadline(), notes=notes)
+
+    assert not any("business time" in n for n in notes)
+
+
+def test_the_plan_writes_the_sla_and_dbt_parses_it(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    declared = dict(DECLARED)
+    declared["columns"] = {
+        "order_id": {"role": "key"},
+        "ordered_at": {
+            "role": "time",
+            "freshness": {
+                "deadline": "07:00",
+                "timezone": "America/Chicago",
+                "days": ["mon", "tue", "wed", "thu", "fri"],
+                "basis": "capture",
+            },
+        },
+    }
+
+    planned = _plan(tmp_path, capsys, declared)
+
+    assert planned["status"] == "ok", planned["errors"]
+    assert planned["data"]["monitors"]["counts"] == {mon.ADDED: 3}
+    [decision] = [d for d in planned["data"]["decisions"] if d.get("monitor") == SLA]
+    assert decision["field"] == "columns.ordered_at.freshness.deadline: 07:00"
+    applied = _dex(["--repo-root", str(tmp_path), "transform", "apply"], capsys)
+    assert applied["status"] == "ok", applied["errors"]
+    written = (dbt_project_dir / "models" / "marts" / "fct_orders.yml").read_text(
+        encoding="utf-8"
+    )
+    [sla] = _sla(written)
+    assert sla["arguments"]["day_of_week"] == [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+    ]
+    # The deadline reads back as text: YAML 1.1 reads an unquoted 10:00 as 600,
+    # and the dumper quotes any time it would.
+    assert sla["arguments"]["sla_time"] == "07:00"
+    [column] = [
+        c
+        for c in yaml.safe_load(written)["models"][0]["columns"]
+        if c["name"] == "ordered_at"
+    ]
+    assert column["config"]["meta"]["dex"]["freshness"] == {
+        "basis": "capture",
+        "deadline": "07:00",
+        "timezone": "America/Chicago",
+        "days": ["mon", "tue", "wed", "thu", "fri"],
+    }
+
+
+def test_a_deadline_without_a_timezone_is_refused_naming_the_field(
+    dbt_project_dir: Path, tmp_path: Path, capsys
+):
+    _install(dbt_project_dir)
+    _repo(tmp_path)
+    declared = dict(DECLARED)
+    declared["columns"] = {
+        "order_id": {"role": "key"},
+        "ordered_at": {
+            "role": "time",
+            "freshness": {"deadline": "07:00", "basis": "capture"},
+        },
+    }
+
+    planned = _plan(tmp_path, capsys, declared)
+
+    assert planned["status"] == "error"
+    message = json.dumps(planned["errors"])
+    assert "freshness.timezone is required with freshness.deadline" in message
+    assert "ordered_at" in message
+
+
+def _quoted_population(payload: dict) -> dict:
+    payload["columns"]["status"] = {"role": "attribute"}
+    payload["population"] = {
+        "rule": "Orders not cancelled.",
+        "filters": [{"column": "status", "excludes": ["cancelled", "it's"]}],
+    }
+    return payload
+
+
+@pytest.mark.parametrize("dialect", ["bigquery", "snowflake", "databricks", "redshift"])
+def test_a_quote_in_the_population_withholds_the_sla_where_a_backslash_escapes(
+    dialect,
+):
+    # Elementary repeats the where_expression inside a single-quoted message
+    # literal, re-escaping each quote, which closes a literal holding \'.
+    rows: list = []
+    notes: list = []
+
+    out = _render(
+        _quoted_population(_deadline()), rows=rows, notes=notes, dialect=dialect
+    )
+
+    assert _sla(out) == []
+    [row] = [r for r in rows if r["test"] == SLA]
+    assert (row["status"], row["reason"]) == (mon.NOT_RENDERED, mon.SLA_FILTER_QUOTE)
+    # The other monitors do not repeat the expression and are written.
+    assert {r["status"] for r in rows if r["test"] != SLA} == {mon.ADDED}
+    assert any("repeats the where_expression" in n for n in notes)
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", "clickhouse"])
+def test_a_quote_in_the_population_is_written_where_it_is_doubled(dialect):
+    rows: list = []
+
+    out = _render(_quoted_population(_deadline()), rows=rows, dialect=dialect)
+
+    [sla] = _sla(out)
+    assert "it''s" in sla["arguments"]["where_expression"]
+
+
+def test_a_listed_sla_the_quote_now_holds_back_is_named_for_removal():
+    # Written before the quote rule, it cannot compile on this connector.
+    first = _render(_quoted_population(_deadline()), dialect="duckdb")
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _quoted_population(_deadline()),
+        content=first.replace("it''s", "it\\'s"),
+        rows=rows,
+        notes=notes,
+        dialect="bigquery",
+    )
+
+    stale = [r for r in rows if r["status"] == mon.STALE and r["test"] == SLA]
+    assert stale and stale[0]["replacement"]["reason"] == mon.SLA_FILTER_QUOTE
+    assert any("fails to compile on this connector" in n for n in notes)
+
+
+def test_a_listed_sla_without_a_quote_is_kept_when_the_quote_holds_back_its_successor():
+    # Written before the population was declared: no where_expression, so
+    # nothing in its message breaks, and it still runs.
+    first = _render(_deadline(), dialect="bigquery")
+    rows: list = []
+    notes: list = []
+
+    _render(
+        _quoted_population(_deadline()),
+        content=first,
+        rows=rows,
+        notes=notes,
+        dialect="bigquery",
+    )
+
+    [stale] = [r for r in rows if r["status"] == mon.STALE and r["test"] == SLA]
+    assert stale["replacement"]["reason"] == mon.SLA_FILTER_QUOTE
+    assert not any("fails to compile on this connector" in n for n in notes)
+    assert any("keep this one" in n and SLA in n for n in notes)

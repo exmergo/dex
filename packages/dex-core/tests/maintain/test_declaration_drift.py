@@ -779,6 +779,26 @@ def test_a_loosened_freshness_is_high_drift_naming_the_field():
     )
 
 
+def test_a_moved_deadline_is_high_drift_naming_the_field():
+    # A later deadline silences a late day with the SQL untouched (#1486).
+    due = DECLARED_YML.replace(
+        "      - name: customer_id\n        tests: [not_null]\n",
+        "      - name: customer_id\n        tests: [not_null]\n"
+        "      - name: loaded_at\n        config:\n          meta:\n            dex:\n"
+        "              role: time\n"
+        "              freshness: {deadline: '07:00', timezone: UTC, basis: capture}\n",
+    )
+    later = due.replace("'07:00'", "'09:00'")
+
+    [finding] = _drift(due, later)
+    assert (finding.code, finding.column, finding.data["field"]) == (
+        "declaration_changed",
+        "loaded_at",
+        "freshness",
+    )
+    assert finding.severity == "high"
+
+
 def test_a_changed_continuity_is_high_drift_naming_the_field():
     # A coarser grain or fewer keys stops a gap failing with the SQL untouched
     # (#1461).

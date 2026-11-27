@@ -807,7 +807,9 @@ def _declared_freshness(declaration: Any) -> list[Instance]:
     out: list[Instance] = []
     for name, column in (getattr(declaration, "columns", None) or {}).items():
         freshness = getattr(column, "freshness", None)
-        if freshness is None:
+        # A deadline alone (#1486) gives no dex_freshness: a lag is not a
+        # deadline, and the deadline is verify's and the vendor monitor's.
+        if freshness is None or freshness.max_lag_seconds is None:
             continue
         seconds = int(freshness.max_lag_seconds)
         basis = getattr(freshness.basis, "value", freshness.basis)

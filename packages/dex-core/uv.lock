@@ -1071,6 +1071,7 @@ dependencies = [
     { name = "certifi" },
     { name = "pydantic" },
     { name = "pyyaml" },
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
 
 [package.optional-dependencies]
@@ -1286,6 +1287,7 @@ requires-dist = [
     { name = "towncrier", marker = "extra == 'dev'", specifier = "==26.9.0" },
     { name = "trino", marker = "extra == 'all'", specifier = ">=0.336,<1" },
     { name = "trino", marker = "extra == 'trino'", specifier = ">=0.336,<1" },
+    { name = "tzdata", marker = "sys_platform == 'win32'", specifier = ">=2024.1" },
     { name = "urllib3", marker = "extra == 'all'", specifier = ">=2.8.0" },
     { name = "urllib3", marker = "extra == 'bigquery'", specifier = ">=2.8.0" },
     { name = "urllib3", marker = "extra == 'clickhouse'", specifier = ">=2.8.0" },

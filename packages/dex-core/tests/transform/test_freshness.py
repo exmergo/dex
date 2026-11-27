@@ -1,4 +1,5 @@
-"""``freshness`` on a declared time column, and ``dex_freshness`` (#1460).
+"""``freshness`` on a declared time column, and ``dex_freshness`` (#1460); a
+daily ``deadline`` in the same block (#1486).
 
 A column with role ``time`` may declare how old its newest value may be,
 ``freshness: {max_lag, basis}``. With ``declarations.render_tests`` on it renders
@@ -135,6 +136,138 @@ def test_it_renders_under_the_columns_dex_meta_normalized():
         "role": "time",
         "freshness": {"max_lag": "6h", "basis": "capture"},
     }
+
+
+# --- a daily deadline (#1486) ------------------------------------------------------
+
+
+def _deadline(**fields) -> dict:
+    freshness = {"deadline": "07:00", "timezone": "America/Chicago", "basis": "capture"}
+    freshness.update(fields)
+    return {
+        "model": "fct_orders",
+        "columns": {"loaded_at": {"role": "time", "freshness": freshness}},
+    }
+
+
+def test_a_deadline_alone_is_a_freshness_and_renders_without_a_lag():
+    content = _render(_deadline(), False)
+    assert _column(content)["config"]["meta"]["dex"]["freshness"] == {
+        "deadline": "07:00",
+        "timezone": "America/Chicago",
+        "basis": "capture",
+    }
+
+
+@pytest.mark.parametrize(
+    ("written", "normalized"),
+    [("7:00", "07:00"), ("23:59", "23:59"), ("0:05", "00:05")],
+)
+def test_a_deadline_is_written_back_as_hh_mm(written, normalized):
+    [declaration] = parse_declarations([_deadline(deadline=written)])
+    assert declaration.columns["loaded_at"].freshness.deadline == normalized
+
+
+@pytest.mark.parametrize("written", ["24:00", "7am", "07:60", "0700", ""])
+def test_a_deadline_that_is_no_time_of_day_is_refused(written):
+    with pytest.raises(DeclarationError, match="not a time of day"):
+        parse_declarations([_deadline(deadline=written)])
+
+
+def test_an_unquoted_yaml_time_read_as_a_number_is_refused_naming_the_fix():
+    # YAML 1.1 reads an unquoted 10:00 as 600.
+    with pytest.raises(DeclarationError, match="written as quoted text"):
+        parse_declarations([_deadline(deadline=600)])
+
+
+def test_a_deadline_without_a_timezone_is_refused_naming_the_field():
+    payload = _deadline()
+    del payload["columns"]["loaded_at"]["freshness"]["timezone"]
+    with pytest.raises(
+        DeclarationError,
+        match=r"freshness\.timezone is required with freshness\.deadline",
+    ) as refused:
+        parse_declarations([payload])
+    assert "loaded_at" in str(refused.value)
+
+
+@pytest.mark.parametrize("zone", ["Mars/Olympus_Mons", "posix/UTC", "../etc", "UTC "])
+def test_a_timezone_that_names_no_iana_zone_is_refused(zone):
+    if zone == "UTC ":
+        # Surrounding space is trimmed, not refused.
+        [declaration] = parse_declarations([_deadline(timezone=zone)])
+        assert declaration.columns["loaded_at"].freshness.timezone == "UTC"
+        return
+    with pytest.raises(DeclarationError, match="not an IANA time zone"):
+        parse_declarations([_deadline(timezone=zone)])
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"timezone": "UTC"}, {"days": ["mon"]}],
+)
+def test_a_timezone_or_days_without_a_deadline_is_refused(fields):
+    payload = {
+        "model": "fct_orders",
+        "columns": {
+            "loaded_at": {
+                "role": "time",
+                "freshness": {"max_lag": "6h", "basis": "capture", **fields},
+            }
+        },
+    }
+    with pytest.raises(DeclarationError, match=r"only read with freshness\.deadline"):
+        parse_declarations([payload])
+
+
+def test_neither_a_lag_nor_a_deadline_is_refused():
+    payload = _declared()
+    del payload["columns"]["loaded_at"]["freshness"]["max_lag"]
+    with pytest.raises(DeclarationError, match="a max_lag, a deadline, or both"):
+        parse_declarations([payload])
+
+
+def test_days_are_stored_three_letter_monday_first_once_each():
+    [declaration] = parse_declarations(
+        [_deadline(days=["Friday", "mon", "MON", "wed"])]
+    )
+    freshness = declaration.columns["loaded_at"].freshness
+    assert freshness.days == ["mon", "wed", "fri"]
+    assert freshness.day_names == ["Monday", "Wednesday", "Friday"]
+
+
+@pytest.mark.parametrize("days", [[], "mon", ["funday"], [1]])
+def test_days_that_are_no_weekdays_are_refused(days):
+    with pytest.raises(DeclarationError, match="days"):
+        parse_declarations([_deadline(days=days)])
+
+
+def test_a_deadline_alone_renders_no_freshness_test():
+    generated: list = []
+    content = _render(_deadline(), True, generated=generated)
+    assert _tests(content) == []
+    assert [g for g in generated if g["test"] == NAME] == []
+
+
+def test_a_lag_and_a_deadline_render_the_lag_test_only():
+    [test] = _tests(_render(_deadline(max_lag="6h"), True))
+    assert test[NAME]["arguments"] == {"max_lag_seconds": 21600}
+
+
+def test_a_lag_dropped_for_a_deadline_reports_its_test_stale_and_keeps_it():
+    once = _render(FRESH, True)
+    generated: list = []
+    notes: list = []
+    [declaration] = parse_declarations([_deadline()])
+    twice = render(
+        once, declaration, render_tests=True, generated=generated, notes=notes
+    )
+
+    assert len(_tests(twice)) == 1
+    assert [(g["status"], g.get("reason")) for g in generated] == [
+        ("stale", "freshness_changed")
+    ]
+    assert any("dropped for a deadline" in note for note in notes)
 
 
 # --- the kind ---------------------------------------------------------------------
