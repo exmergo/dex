@@ -9,7 +9,10 @@ built from that core and named for the check:
 
 * :data:`IMPACT_GLOBAL_KINDS` (downstream impact, ``global_edit``): the core.
 * :data:`COMPARE_GLOBAL_KINDS` (refactor comparison, compiled through
-  ancestors): the core.
+  ancestors): the core and the profiles. The proposed side writes a
+  ``profiles.yml`` edit into its copy while the baseline compiles the tree as
+  it stands, so an edit that moves the dev schema or database makes the two sides
+  resolve ``ref()`` to different relations (#1614).
 * :data:`PREREQUISITE_GLOBAL_KINDS` (a failed prerequisite's ``plan_relation``):
   the core, the profiles and the test files, any of which can change a node's
   result wherever it sits.
@@ -48,8 +51,11 @@ IMPACT_GLOBAL_KINDS = frozenset({*GLOBAL_KINDS})
 
 #: Edits that can change how an untouched parent compiles. Its dev relation keeps
 #: what it was built with, so both graphs are compiled through their ancestors and
-#: any parent that compiles differently makes the inputs unsynchronized.
-COMPARE_GLOBAL_KINDS = frozenset({*GLOBAL_KINDS})
+#: any parent that compiles differently makes the inputs unsynchronized. The
+#: profiles are in: the proposed side writes the edit into its copy, the baseline
+#: does not. Downstream impact keeps the core alone, because both of its sides
+#: copy the post-plan tree and so read the same profile.
+COMPARE_GLOBAL_KINDS = GLOBAL_KINDS | {EditKind.PROFILES_YML}
 
 #: The edit kinds that can change any node's result, wherever they sit.
 PREREQUISITE_GLOBAL_KINDS = GLOBAL_KINDS | {EditKind.PROFILES_YML, EditKind.TEST_SQL}
@@ -65,8 +71,8 @@ def changes_global(edits: Iterable[PlanEdit], prior: Mapping[str, str]) -> bool:
     """Whether the plan already changes a kind every check treats as global.
 
     Only the core counts (:data:`GLOBAL_KINDS`): a ``profiles_yml`` edit is
-    global to prerequisites and attribution but not to downstream impact or
-    the refactor comparison, so it does not make this true.
+    global to the refactor comparison, prerequisites and attribution but not to
+    downstream impact, so it does not make this true.
 
     ``prior`` maps each path the plan edits to its content before the plan. An
     edit that resends such a file unchanged is no change: the plan drops it
