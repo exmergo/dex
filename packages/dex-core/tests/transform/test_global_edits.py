@@ -48,11 +48,12 @@ def test_downstream_impact_holds_the_core() -> None:
     }
 
 
-def test_refactor_comparison_holds_the_core() -> None:
+def test_refactor_comparison_adds_the_profiles() -> None:
     assert _values(global_edits.COMPARE_GLOBAL_KINDS) == {
         "macro_sql",
         "project_yml",
         "packages_yml",
+        "profiles_yml",
     }
 
 
@@ -157,7 +158,7 @@ def test_finding_attribution_leaves_reach_unbounded_on_its_set() -> None:
     } == {"macro_sql", "project_yml", "packages_yml", "profiles_yml", "semantic_yml"}
 
 
-def test_the_comparison_offer_calls_a_plan_mixed_with_its_repair_on_the_core(
+def test_the_comparison_offer_calls_a_plan_mixed_with_its_repair_on_its_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The offer's second reader of the comparison set (#1114): with an input
@@ -191,6 +192,7 @@ def test_the_comparison_offer_calls_a_plan_mixed_with_its_repair_on_the_core(
         "macro_sql",
         "project_yml",
         "packages_yml",
+        "profiles_yml",
     }
 
 
@@ -227,8 +229,9 @@ def test_a_new_macro_and_a_deleted_one_are_changes() -> None:
 
 
 def test_a_kind_outside_the_core_is_not_asked_about() -> None:
-    """The question is the core's: a profiles edit is global to prerequisites
-    and attribution, never to the impact and comparison a switch would cost."""
+    """The question is the core's: a profiles edit is global to the comparison,
+    prerequisites and attribution, never to the downstream impact a switch would
+    cost."""
 
     edits = [
         PlanEdit(path="profiles.yml", kind=EditKind.PROFILES_YML, new_content="x"),

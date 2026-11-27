@@ -577,6 +577,63 @@ def test_a_project_edit_that_moves_an_untouched_parent_is_not_checked(project):
     assert "event_counts" in result.detail
 
 
+def _through_ancestors_seen(monkeypatch) -> list[bool]:
+    """Record the ``through_ancestors`` flag each baseline compile is asked for."""
+
+    from exmergo_dex_core.transform import refactor_compare
+
+    seen: list[bool] = []
+    real = refactor_compare._compile_baseline
+
+    def spy(
+        engine, stored, project, model, target, connector, through_ancestors=False, **kw
+    ):
+        seen.append(through_ancestors)
+        return real(
+            engine, stored, project, model, target, connector, through_ancestors, **kw
+        )
+
+    monkeypatch.setattr(refactor_compare, "_compile_baseline", spy)
+    return seen
+
+
+def test_a_profiles_edit_beside_a_model_rewrite_is_compared_through_ancestors(
+    project, monkeypatch
+):
+    """The comparison call site reads the profiles as global (#1614)."""
+
+    engine = _engine(project)
+    profiles = (project / "profiles.yml").read_text("utf-8")
+    plan_id = engine.plan(
+        "refactor",
+        edits=[
+            PlanEdit(
+                path="profiles.yml",
+                new_content=profiles + "      threads: 1\n",
+                kind=EditKind.PROFILES_YML,
+            ),
+            PlanEdit(
+                path="models/team_activity.sql",
+                new_content=_EQUIVALENT,
+                kind=EditKind.MODEL_SQL,
+            ),
+        ],
+    ).plan_id
+    seen = _through_ancestors_seen(monkeypatch)
+    engine.compare(plan_id, model="team_activity")
+    assert seen
+    assert all(seen)
+
+
+def test_a_model_only_rewrite_is_not_compared_through_ancestors(project, monkeypatch):
+    engine = _engine(project)
+    plan_id = _plan(engine, project, ("models/team_activity.sql", _EQUIVALENT))
+    seen = _through_ancestors_seen(monkeypatch)
+    engine.compare(plan_id, model="team_activity")
+    assert seen
+    assert not any(seen)
+
+
 def test_a_macro_edit_that_moves_no_parent_is_compared(project):
     macros = project / "macros"
     macros.mkdir()
