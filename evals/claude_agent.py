@@ -16,6 +16,7 @@ calibrating them never touches the core.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -183,6 +184,31 @@ def run_setup(
     return None
 
 
+def workspace_files(root: Path) -> dict[str, str]:
+    """Every file under ``root``, by its path relative to it, with a digest of
+    its bytes. A file that cannot be read (held open by another process) is
+    recorded as unreadable, so a change to it is not missed."""
+
+    found: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.relative_to(root).as_posix()
+        try:
+            found[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            found[name] = "unreadable"
+    return found
+
+
+def changed_files(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """The files added, changed or removed between two ``workspace_files``."""
+
+    return sorted(
+        k for k in before.keys() | after.keys() if before.get(k) != after.get(k)
+    )
+
+
 def _invoke_stream(
     binary: str, args: list[str], prompt: str, timeout: int, cwd: Path
 ) -> tuple[str, str | None]:
@@ -276,7 +302,9 @@ class ClaudeCliAgent:
             failed = run_setup(case, workspace, self.plugin_dir, self.skill_name)
             if failed:
                 return AgentResult(error=failed)
+            before = workspace_files(workspace)
             text, failed = _invoke_stream(binary, args, prompt, timeout, workspace)
+            changes = changed_files(before, workspace_files(workspace))
             self._keep_transcript(case, skill_enabled, text)
             events = checks.parse_stream(text)
             output = checks.final_text(events)
@@ -291,7 +319,11 @@ class ClaudeCliAgent:
                 events, f"{self._plugin}:{self.skill_name}"
             )
             return AgentResult(
-                output=output, triggered=triggered, events=events, error=error
+                output=output,
+                triggered=triggered,
+                events=events,
+                error=error,
+                changes=changes,
             )
         finally:
             if self.keep_workspaces:

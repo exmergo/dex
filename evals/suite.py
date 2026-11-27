@@ -46,7 +46,9 @@ class Check:
     regular expression no such call may hold. ``no_file_writes`` may take
     ``within``, paths relative to the run's working directory: only a write
     under one of them fails the check, and a write elsewhere is listed as
-    information. Without ``within``, every write fails it.
+    information. Without ``within``, every write fails it. ``ignore`` names
+    files under ``within`` a read changes by itself (the engine's
+    ``.dex/cache.json``), which the workspace comparison leaves out.
     """
 
     check: str
@@ -55,6 +57,7 @@ class Check:
     command: str = ""
     matching: str = ""
     within: list[str] = field(default_factory=list)
+    ignore: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -251,14 +254,17 @@ def _check_from(raw: Any, where: str) -> Check:
     for key in ("group", "command", "matching"):
         if not isinstance(raw.get(key, ""), str):
             raise InvalidSuiteError(f"{where}.{key} must be a string")
-    within = raw.get("within", [])
-    well_formed = isinstance(within, list) and all(
-        isinstance(p, str) and p.strip() for p in within
-    )
-    if not well_formed or (within and kind != "no_file_writes"):
-        raise InvalidSuiteError(
-            f"{where}.within must be a list of paths, and only on no_file_writes"
+    for key in ("within", "ignore"):
+        paths = raw.get(key, [])
+        well_formed = isinstance(paths, list) and all(
+            isinstance(p, str) and p.strip() for p in paths
         )
+        if not well_formed or (paths and kind != "no_file_writes"):
+            raise InvalidSuiteError(
+                f"{where}.{key} must be a list of paths, and only on no_file_writes"
+            )
+    if raw.get("ignore") and not raw.get("within"):
+        raise InvalidSuiteError(f"{where}.ignore applies only beside within")
     if kind == "first_dex_command" and raw["command"].split()[0] != raw["group"]:
         raise InvalidSuiteError(
             f"{where}.command must be a `{raw['group']}` command, written "

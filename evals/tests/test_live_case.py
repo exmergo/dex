@@ -991,7 +991,7 @@ def test_a_scratch_write_in_the_workspace_root_passes_and_is_listed():
     events = _wrote(_write(2, "/work/.dex_probe.sql"))
     assert checks.grade(PROJECT_ONLY, events) == (
         True,
-        "no file-writing tool call in the project and no `transform apply`",
+        "no file-writing tool call in the project and no Dex write",
     )
     assert checks.information(PROJECT_ONLY, events) == (
         "wrote outside the project: ['.dex_probe.sql']"
@@ -1207,3 +1207,135 @@ def test_a_suite_whose_uplift_row_errored_does_not_pass():
     assert report.uplift_score == 0.0
     assert not report.passed
     assert report.to_dict()["uplift_cases"][0]["error"] == "baseline arm: x"
+
+
+# --- the second cold review of #1626: making "nothing to the project" hold -------
+
+BOOKKEEPING = [".dex/cache.json", ".dex/cache.lock", ".dex/queries.jsonl"]
+PROJECT_ONLY_DIFFED = Check(
+    check="no_file_writes",
+    assertion="Writes nothing to the project",
+    within=["demo_project", ".dex"],
+    ignore=BOOKKEEPING,
+)
+
+
+@pytest.mark.parametrize(
+    "changes, passed",
+    [
+        (["demo_project/dbt/models/staging/stg_order_items.sql"], False),
+        ([".dex/snapshot.json"], False),
+        ([".dex/plans/abc.json"], False),
+        (BOOKKEEPING, True),
+        (["q.sql"], True),
+        ([], True),
+    ],
+    ids=["model", "snapshot", "plan", "bookkeeping", "scratch", "nothing"],
+)
+def test_a_change_in_the_project_fails_however_it_was_made(changes, passed):
+    # A Bash command made the change: no file tool shows it.
+    events = _wrote(_bash(2, "uv run python -c \"open('x','w')\""))
+    assert checks.grade(PROJECT_ONLY_DIFFED, events, changes)[0] is passed
+
+
+def test_a_scratch_change_is_listed_and_bookkeeping_is_not():
+    events = _wrote()
+    info = checks.information(PROJECT_ONLY_DIFFED, events, ["q.sql", *BOOKKEEPING])
+    assert info == "wrote outside the project: ['q.sql']"
+
+
+def test_the_backend_records_what_the_run_changed_in_its_workspace(
+    cli, plugin, monkeypatch
+):
+    original = claude_agent.subprocess.run
+
+    def run_and_write(cmd, **kwargs):
+        if "stream-json" in cmd:
+            cwd = Path(kwargs["cwd"])
+            (cwd / "demo_project").mkdir(exist_ok=True)
+            (cwd / "demo_project" / "x.sql").write_text("x", encoding="utf-8")
+            (cwd / "q.sql").write_text("select 1", encoding="utf-8")
+        return original(cmd, **kwargs)
+
+    monkeypatch.setattr(claude_agent.subprocess, "run", run_and_write)
+    result = _agent(plugin).run("why", skill_enabled=True, case=_case())
+    assert result.changes == ["demo_project/x.sql", "q.sql"]
+    assert not checks.grade(PROJECT_ONLY_DIFFED, result.events, result.changes)[0]
+
+
+ELEMENTARY_SQL = " ".join(("select * from", "main_elementary.elementary_test_results"))
+
+
+@pytest.mark.parametrize(
+    "uses, passed",
+    [
+        (
+            (
+                _use(
+                    2, "Write", {"file_path": "/work/q.sql", "content": ELEMENTARY_SQL}
+                ),
+                _bash(3, f"{WRAP} explore query --sql-file q.sql"),
+            ),
+            False,
+        ),
+        (
+            (
+                _use(2, "Write", {"file_path": "/work/q.sql", "content": "select 1"}),
+                _bash(3, f"{WRAP} explore query --sql-file q.sql"),
+            ),
+            True,
+        ),
+        (
+            (
+                _bash(2, f"cat > q.sql <<'SQL'\n{ELEMENTARY_SQL}\nSQL"),
+                _bash(3, f"{WRAP} explore query --sql-file q.sql"),
+            ),
+            False,
+        ),
+        ((_bash(3, f"{WRAP} explore query --sql-file q.sql"),), False),
+    ],
+    ids=["written_elementary", "written_clean", "heredoc", "unread_file"],
+)
+def test_a_sql_file_is_read_for_the_elementary_check(uses, passed):
+    assert checks.grade(NO_ELEMENTARY, _wrote(*uses))[0] is passed
+
+
+PLAN = Check(
+    check="no_dex_command",
+    assertion="Stores no plan",
+    command="transform plan",
+    matching=".",
+)
+
+
+def test_a_help_call_is_neither_a_plan_nor_a_write():
+    events = _wrote(_bash(2, f"{WRAP} transform plan --help"))
+    assert checks.grade(PLAN, events)[0]
+    assert checks.grade(NO_WRITES, events)[0]
+
+
+@pytest.mark.parametrize(
+    "command, writes",
+    [
+        ("maintain snapshot", True),
+        ("maintain reconcile", True),
+        ("transform repair stg_x", True),
+        ("transform place c --targets a,b --expr x", True),
+        ("transform place c --targets a,b --expr x --explain", False),
+        ("transform test --mutate stg_x", True),
+        ("transform test stg_x", True),
+        ("semantic define --edits-file e.json", True),
+        ("transform references order_item_id", False),
+    ],
+)
+def test_the_dex_calls_that_store_a_plan_or_snapshot_are_writes(command, writes):
+    events = _wrote(_bash(2, f"{WRAP} {command}"))
+    assert checks.grade(NO_WRITES, events)[0] is not writes
+
+
+def test_ignore_is_refused_without_within(tmp_path):
+    raw = {"check": "no_file_writes", "assertion": "x", "ignore": [".dex/cache.json"]}
+    with pytest.raises(InvalidSuiteError, match="ignore"):
+        _suite_from_dict(
+            {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
+        )
