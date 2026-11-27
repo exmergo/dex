@@ -699,10 +699,11 @@ def test_the_committed_checks_pass_the_procedure_and_fail_each_departure():
         _bash(9, f'{WRAP} transform plan "keep one row" --edits-file -'),
         _done(ANSWER),
     ]
+    # Storing a plan writes `.dex/plans`, so it fails "writes nothing" too.
     assert _committed(case, planned) == {
         first: True,
         elementary: True,
-        writes: True,
+        writes: False,
         plan: False,
     }
 
@@ -1339,3 +1340,57 @@ def test_ignore_is_refused_without_within(tmp_path):
         _suite_from_dict(
             {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
         )
+
+
+# --- the committed case against the second review's routes (#1626) --------------
+
+
+def _committed_check(kind: str, command: str = "") -> Check:
+    case = _demo_case()
+    [check] = [
+        c
+        for c in case.checks
+        if c.check == kind and (not command or c.command == command)
+    ]
+    return check
+
+
+@pytest.mark.parametrize(
+    "changes, passed",
+    [
+        ([".dex/snapshot.json"], False),
+        (["demo_project/dbt/models/staging/stg_order_items.sql"], False),
+        ([".dex/cache.json", ".dex/cache.lock", ".dex/queries.jsonl"], True),
+        ([".dex/spend.jsonl"], True),
+        ([".dex_probe.sql"], True),
+    ],
+    ids=["snapshot", "model_by_shell", "bookkeeping", "ledger", "scratch"],
+)
+def test_the_committed_write_check_reads_the_workspace(changes, passed):
+    check = _committed_check("no_file_writes")
+    assert checks.grade(check, passing(), changes)[0] is passed
+
+
+def test_the_committed_elementary_check_reads_a_sql_file():
+    check = _committed_check("no_dex_command", "explore query")
+    sql = " ".join(("select * from", "main_elementary.elementary_test_results"))
+    events = [
+        *passing()[:-1],
+        _use(9, "Write", {"file_path": "/work/q.sql", "content": sql}),
+        _bash(10, f"{WRAP} explore query --sql-file q.sql"),
+        _done(ANSWER),
+    ]
+    assert not checks.grade(check, events)[0]
+
+
+@pytest.mark.parametrize(
+    "command", ["transform repair stg_x", "transform place c --targets a --expr x"]
+)
+def test_the_committed_case_fails_a_plan_stored_by_another_command(command):
+    events = [*passing()[:-1], _bash(9, f"{WRAP} {command}"), _done(ANSWER)]
+    assert not checks.grade(_committed_check("no_file_writes"), events)[0]
+
+
+def test_the_committed_plan_check_ignores_a_help_call():
+    events = [*passing()[:-1], _bash(9, f"{WRAP} transform plan --help"), _done(ANSWER)]
+    assert checks.grade(_committed_check("no_dex_command", "transform plan"), events)[0]

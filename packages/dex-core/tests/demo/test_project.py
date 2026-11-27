@@ -961,6 +961,15 @@ def _files(root: Path) -> dict[Path, bytes]:
     return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
 
+#: What a read writes in `.dex/` by itself: the cache, its lock, the query log.
+_BOOKKEEPING = {"cache.json", "cache.lock", "queries.jsonl", "spend.jsonl"}
+
+
+def _state(root: Path) -> dict[Path, bytes]:
+    files = _files(root / ".dex")
+    return {p: b for p, b in files.items() if p.as_posix() not in _BOOKKEEPING}
+
+
 @pytest.mark.parametrize("selector", [(), ("stg_order_items",)], ids=["all", "model"])
 def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
     run_from, no_network, capsys, selector
@@ -982,6 +991,7 @@ def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
     _run(run_from.argv("demo"), capsys)
     project = run_from.root / PROJECT_DIR
     before = _files(project)
+    dex_before = _state(run_from.root)
 
     incidents = _run(run_from.argv("maintain", "incidents", *selector), capsys)
     [incident] = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
@@ -1004,8 +1014,8 @@ def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
     [step] = diagnosis["next_steps"]
     assert step["command"].startswith("dex transform plan ")
     assert _files(project) == before
-    plans = run_from.root / ".dex" / "plans"
-    assert not plans.exists() or not any(plans.iterdir())
+    # Nor anything in `.dex/` (a plan, a snapshot) but what a read writes itself.
+    assert _state(run_from.root) == dex_before
 
 
 def test_the_demo_s_semantic_layer_is_listed_from_its_seeded_artifacts(
