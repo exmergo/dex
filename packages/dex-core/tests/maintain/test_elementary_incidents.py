@@ -2,9 +2,11 @@
 the observations it hands the fold.
 
 Each warehouse here is a DuckDB file holding the package's two tables, built
-column for column from the recorded 0.26.1 layout, with rows written as the
-package writes them. The tables the package itself builds are read back in
-``tests/transform/test_elementary_fixture.py``, which needs the package.
+column for column from a recorded layout (0.26.1, or 0.16.4 where a case says
+so), with rows written as the package writes them. The tables the package
+itself builds are read back in ``tests/transform/test_elementary_fixture.py``
+and, for 0.16.4, ``tests/integration/test_postgres_elementary.py``, which need
+the package.
 """
 
 from __future__ import annotations
@@ -93,19 +95,26 @@ def _hourly(count: int, *, skip: Iterable[int] = ()) -> list[Run]:
     ]
 
 
-def _create(con, table: str) -> None:
+def _create(con, table: str, release: str = RELEASE) -> None:
     columns = ", ".join(
         f'"{name}" {_DUCKDB_TYPES[kind]}'
-        for name, kind in layout_for(RELEASE).tables[table].columns
+        for name, kind in layout_for(release).tables[table].columns
     )
     con.execute(f"CREATE TABLE main_elementary.{table} ({columns})")
 
 
-def _warehouse(path: Path, runs: Sequence[Run], results: Sequence[Result]) -> Path:
+def _warehouse(
+    path: Path,
+    runs: Sequence[Run],
+    results: Sequence[Result],
+    release: str = RELEASE,
+) -> Path:
+    """The two tables, built at ``release``'s recorded layout."""
+
     con = duckdb.connect(str(path))
     con.execute("CREATE SCHEMA main_elementary")
-    _create(con, "dbt_invocations")
-    _create(con, "elementary_test_results")
+    _create(con, "dbt_invocations", release)
+    _create(con, "elementary_test_results", release)
     for run in runs:
         con.execute(
             "INSERT INTO main_elementary.dbt_invocations "
@@ -158,8 +167,14 @@ def _engine(path: Path, **kwargs) -> DexEngine:
     return DexEngine(connector="duckdb", path=str(path), **kwargs)
 
 
-def _read(engine: DexEngine, *, since: datetime | None = None, **kwargs):
-    plan = plan_read(engine, NAMESPACE, RELEASE, since=since)
+def _read(
+    engine: DexEngine,
+    *,
+    since: datetime | None = None,
+    release: str = RELEASE,
+    **kwargs,
+):
+    plan = plan_read(engine, NAMESPACE, release, since=since)
     return read_elementary(engine, plan, **kwargs)
 
 
@@ -1147,3 +1162,135 @@ def test_result_rows_with_no_invocation_are_counted_only_inside_the_run_window(
     read = read_elementary(engine, plan_read(engine, NAMESPACE, RELEASE, last=3))
 
     assert read.measure.results_without_invocation == 1
+
+
+# --- 0.16.4 (#1470) ----------------------------------------------------------------
+
+OLD = "0.16.4"
+
+
+def _old_runs(count: int) -> list[Run]:
+    return [Run(run.id, run.started, version=OLD) for run in _hourly(count)]
+
+
+def test_0_16_4_s_tables_read_back_and_fold_into_an_open_incident(tmp_path: Path):
+    runs = _old_runs(3)
+    results = [
+        Result(f"r-{n}", f"inv-{n}", status="fail" if n == 3 else "pass")
+        for n in range(1, 4)
+    ]
+    path = _warehouse(tmp_path / "dev.duckdb", runs, results, OLD)
+    read = _read(_engine(path), release=OLD, zero_means_pass={TEST})
+
+    assert read.release == OLD
+    assert [(r.run, r.sequence) for r in read.history.runs] == [
+        ("inv-1", 1),
+        ("inv-2", 2),
+        ("inv-3", 3),
+    ]
+    assert [o.outcome for o in read.observations] == ["good", "good", "bad"]
+    assert read.passes_unobserved == 0
+    fold = fold_incidents(
+        read.observations, sources=[read.history], now=START + timedelta(hours=4)
+    )
+    [incident] = fold.incidents
+    assert incident.state == "open"
+    assert incident.first_observed.run == "inv-3"
+
+
+def test_a_column_dropped_from_0_16_4_s_tables_refuses_before_any_query(
+    tmp_path: Path,
+):
+    runs = _old_runs(1)
+    path = _warehouse(tmp_path / "dev.duckdb", runs, _passing(runs), OLD)
+    con = duckdb.connect(str(path))
+    con.execute("ALTER TABLE main_elementary.elementary_test_results DROP status")
+    con.close()
+    engine = _engine(path)
+    with pytest.raises(ElementaryLayoutError) as caught:
+        plan_read(engine, NAMESPACE, OLD)
+    assert caught.value.code == "elementary_column_missing"
+    assert [(p.table, p.column) for p in caught.value.problems] == [
+        ("elementary_test_results", "status")
+    ]
+    assert _log(engine) == []
+
+
+def test_a_table_upgraded_from_0_16_4_to_0_26_1_reads_as_one_history(tmp_path: Path):
+    """Rows both releases wrote read together, since the columns the adapter
+    reads match at both; the incident opens in a 0.16.4 run and stays open
+    across the upgrade."""
+
+    runs = [*_old_runs(2), Run("inv-3", START + timedelta(hours=3))]
+    results = [
+        Result("r-1", "inv-1"),
+        Result("r-2", "inv-2", status="fail"),
+        Result("r-3", "inv-3", status="fail"),
+    ]
+    path = _warehouse(tmp_path / "dev.duckdb", runs, results)
+    read = _read(_engine(path), zero_means_pass={TEST})
+
+    assert [r.run for r in read.history.runs] == ["inv-1", "inv-2", "inv-3"]
+    fold = fold_incidents(
+        read.observations, sources=[read.history], now=START + timedelta(hours=4)
+    )
+    [incident] = fold.incidents
+    assert (incident.state, incident.first_observed.run) == ("open", "inv-2")
+
+
+def test_rows_of_a_release_without_a_layout_still_refuse_beside_0_16_4(
+    tmp_path: Path,
+):
+    runs = [*_old_runs(1), Run("inv-2", START + timedelta(hours=2), version="0.20.0")]
+    path = _warehouse(tmp_path / "dev.duckdb", runs, _passing(runs))
+    refusal = _refusal(_engine(path))
+    assert (refusal.code, refusal.counts) == (
+        "elementary_rows_untested_release",
+        {"0.20.0": 1},
+    )
+
+
+def test_a_0_16_4_pass_is_unobserved_where_the_test_may_fail_at_zero(
+    tmp_path: Path,
+):
+    """0.16.4 writes pass for any test with zero failures, so a failure whose
+    threshold holds at zero is stored as one. A pass from a test not known to
+    fail only on a nonzero count is unobserved there, never good; the same row
+    written by 0.26.1, or from a test with dbt's default thresholds, is good."""
+
+    other = "test.shop.accepted_values_orders_status.zz9"
+    runs = [*_old_runs(1), Run("inv-2", START + timedelta(hours=2))]
+    results = [
+        Result("a-1", "inv-1"),
+        Result("b-1", "inv-1", test=other),
+        Result("a-2", "inv-2"),
+        Result("b-2", "inv-2", test=other),
+    ]
+    path = _warehouse(tmp_path / "dev.duckdb", runs, results)
+    read = _read(_engine(path), zero_means_pass={TEST})
+
+    outcomes = {(o.test, o.run): o.outcome for o in read.observations}
+    assert outcomes == {
+        (TEST, "inv-1"): "good",
+        (other, "inv-1"): "unobserved",
+        (TEST, "inv-2"): "good",
+        (other, "inv-2"): "good",
+    }
+    assert read.passes_unobserved == 1
+
+
+def test_with_no_threshold_known_every_0_16_4_pass_is_unobserved(tmp_path: Path):
+    runs = _old_runs(2)
+    results = [Result("r-1", "inv-1"), Result("r-2", "inv-2", status="fail")]
+    path = _warehouse(tmp_path / "dev.duckdb", runs, results, OLD)
+    read = _read(_engine(path), release=OLD)
+
+    assert [o.outcome for o in read.observations] == ["unobserved", "bad"]
+    assert read.passes_unobserved == 1
+    fold = fold_incidents(
+        read.observations, sources=[read.history], now=START + timedelta(hours=3)
+    )
+    [incident] = fold.incidents
+    # The pass before it was unobserved, so no observed pass dates its start.
+    assert incident.first_observed == "unknown"
+    assert incident.state == "open"

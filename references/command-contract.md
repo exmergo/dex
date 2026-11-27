@@ -955,7 +955,9 @@ dex maintain incidents [<models>] [--invocations N]
                                      the package is installed, enabled and uploading, then dbt's
                                      run_results.json. data.sources names each, read, missing or
                                      refused with a reason_code, and an empty data.incidents means no
-                                     failure only where a source reads read. Elementary's read is a run
+                                     failure only where a source reads read. Elementary's tables are
+                                     read at package releases 0.16.4 and 0.26.1 (any other is
+                                     elementary_release_untested). Elementary's read is a run
                                      count, never a number of days: the newest N dbt_invocations rows
                                      (20 by default, 2000 at most), through the query firewall, and
                                      its five statements (plus a first read's profiles) are priced as

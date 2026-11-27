@@ -1279,3 +1279,30 @@ def test_postgres_in_scope_respects_schemas_and_database(fake_pg_connection):
     scoped = make_adapter(fake_pg_connection, target=PostgresTarget(schemas=["shop"]))
     assert scoped.in_scope("dexdb.shop") is True
     assert scoped.in_scope("dexdb.legacy") is False
+
+
+def test_a_boolean_column_gets_no_min_or_max(fake_pg_connection):
+    """Postgres has no MIN(boolean), so asking for one refused the whole profile
+    of Elementary's dbt_invocations (its full_refresh column, #1470)."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    fake_pg_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 2, "nn_0": 2, "nn_1": 2, "mn_1": 1, "mx_1": 2}],
+        seconds=0.1,
+    )
+    adapter = make_adapter(fake_pg_connection)
+    columns = [
+        ColumnMeta("full_refresh", "boolean", True, 0),
+        ColumnMeta("threads", "integer", True, 1),
+    ]
+    aggregates = adapter.column_aggregates(
+        "dexdb.shop.customers", columns, safe_min_max={"full_refresh", "threads"}
+    )
+    sql = fake_pg_connection.data_statements[0].sql
+    assert 'MIN("full_refresh")' not in sql
+    assert 'MAX("full_refresh")' not in sql
+    assert 'MIN("threads")' in sql
+    by_name = {a.name: a for a in aggregates}
+    assert by_name["full_refresh"].min_value is None
+    assert by_name["full_refresh"].null_fraction == 0.0

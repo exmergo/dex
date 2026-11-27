@@ -1708,3 +1708,25 @@ def test_a_utc_session_is_pinned_only_when_asked(fake_redshift_connection):
     adapter.pin_utc_session()
     adapter.run_query("SELECT 1 AS n", max_rows=10, timeout_seconds=30.0)
     assert fake_redshift_connection.session_parameters["timezone"] == "UTC"
+
+
+def test_a_boolean_column_gets_no_min_or_max(fake_redshift_connection):
+    """Redshift's MIN and MAX take no boolean either (#1470)."""
+
+    from exmergo_dex_core.adapters.base import ColumnMeta
+
+    fake_redshift_connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n_total": 2, "nn_0": 2, "nd_0": 2, "nn_1": 2, "nd_1": 2}],
+        seconds=0.1,
+    )
+    adapter = make_adapter(fake_redshift_connection)
+    columns = [
+        ColumnMeta("full_refresh", "boolean", True, 0),
+        ColumnMeta("threads", "integer", True, 1),
+    ]
+    adapter.column_aggregates(
+        "dexdb.shop.customers", columns, safe_min_max={"full_refresh", "threads"}
+    )
+    sql = fake_redshift_connection.data_statements[0].sql
+    assert 'MIN("full_refresh")' not in sql
+    assert 'MIN("threads")' in sql

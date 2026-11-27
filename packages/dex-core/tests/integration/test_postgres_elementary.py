@@ -6,6 +6,8 @@ series most installs pin, nor 0.20.0, the sample-flag boundary (#1446).
 Postgres macros exist at all three, and the seeded container is free and
 keyless, so the same variants and the same census run here. The releases are
 ``POSTGRES_VERSIONS``, the Postgres slots of the fixture's release matrix.
+The incident reader's 0.16.4 layouts (#1470) are read back here too, since
+that release has no DuckDB macros.
 
 Opt-in twice over: ``DEX_TEST_PG_DSN`` for the database, like every Postgres
 integration test, and ``DEX_TEST_ELEMENTARY=1`` because installing the package
@@ -391,3 +393,137 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
         ["stg_orders"], declarations=[{"model": "stg_orders", "grain": ["id"]}]
     )
     assert not any("disable_test_samples" in w for w in result_b.warnings)
+
+
+# --- the incident reader at 0.16.4 (#1470) -----------------------------------------
+
+#: The release the reader gained: the series most installs pin, which builds on
+#: Postgres only.
+READER_OLD = "0.16.4"
+
+
+def _test_results(project: Path, *argv: str) -> dict:
+    """Run ``dbt test`` and return the run results it wrote."""
+
+    run_results = project / "target" / "run_results.json"
+    run_results.unlink(missing_ok=True)
+    _dbt(project, "test", *argv, check=False)
+    return json.loads(run_results.read_text(encoding="utf-8"))
+
+
+def _elementary_columns(dsn: str, schema: str, table: str) -> list[tuple[str, str]]:
+    import psycopg
+
+    with psycopg.connect(dsn) as con:
+        return con.execute(
+            "select column_name, data_type from information_schema.columns "
+            "where table_schema = %s and table_name = %s order by ordinal_position",
+            (schema, table),
+        ).fetchall()
+
+
+@pytest.mark.parametrize("variant", ["a", "b"])
+def test_the_reader_reads_what_0_16_4_recorded_and_refuses_a_dropped_column(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    target: PostgresTarget,
+    dev_dsn: str,
+    variant: str,
+):
+    """#1470 on the package itself. At 0.16.4 the four tables are built as the
+    recorded layout says, column for column, and the catalog check passes on
+    them through the Postgres adapter. One ``dbt run`` and two ``dbt test`` give
+    three runs in start order; every test is observed with dbt's outcome, and
+    the grain's ``unique`` test, failing on one duplicated key, is one open
+    incident through ``maintain incidents``. Variant a runs the tests through
+    Elementary's materialization and b through dbt's. Dropping a column the
+    reader reads then refuses ``elementary_column_missing``."""
+
+    import psycopg
+    from psycopg import sql
+
+    from exmergo_dex_core.maintain.elementary_layouts import (
+        ElementaryLayoutError,
+        adapter_catalog,
+        check_layouts,
+        layout_for,
+        type_family,
+    )
+    from exmergo_dex_core.results import to_envelope
+
+    project = elementary_project(
+        tmp_path, variant, elementary_installs(READER_OLD), postgres=target
+    )
+    _with_one_duplicated_key(project)
+    run_results = project / "target" / "run_results.json"
+    _dbt(project, "run")
+    ran = json.loads(run_results.read_text(encoding="utf-8"))
+    tested = [_test_results(project) for _ in range(2)]
+    [unique] = [
+        r
+        for r in tested[-1]["results"]
+        if r["unique_id"].split(".")[2] == "unique_fct_id"
+    ]
+    assert (unique["status"], unique["failures"]) == ("fail", 1)
+
+    schema = target.elementary_schema
+    layout = layout_for(READER_OLD)
+    for table, recorded in layout.tables.items():
+        built = _elementary_columns(dev_dsn, schema, table)
+        assert [name for name, _ in built] == [name for name, _ in recorded.columns]
+        for name, data_type in built:
+            assert type_family(data_type) == recorded.family(name), (table, name)
+
+    engine = _engine(project)
+    adapter = engine._adapter("maintain incidents")
+    namespace = f"{target.dbname}.{schema}"
+    check = check_layouts(READER_OLD, adapter_catalog(adapter, namespace))
+    assert check.release == READER_OLD
+    [rows] = [t for t in check.tables if t.table == "test_result_rows"]
+    assert rows.unobserved == ("row_index",)
+
+    data = to_envelope(engine.incidents()).data
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["release"]) == ("read", READER_OLD), (
+        elementary
+    )
+    assert elementary["passes_unobserved"] == 0
+    runs = [ran, *tested]
+    assert data["window"]["count"] >= len(runs)
+    opened = [
+        i
+        for i in data["incidents"]
+        if any(test.split(".")[2] == "unique_fct_id" for test in i["tests"])
+    ]
+    [incident] = opened
+    assert (incident["state"], incident["opening_source"]) == ("open", "elementary")
+    # The dbt run tests nothing and both test runs fail, so no observed pass
+    # precedes the failure and nothing dates its start.
+    assert incident["first_observed"] == "unknown"
+    ledger = (project.parent / ".dex" / "queries.jsonl").read_text(encoding="utf-8")
+    entries = [json.loads(line) for line in ledger.splitlines() if line.strip()]
+    assert entries
+    for entry in entries:
+        lowered = entry["sql"].lower()
+        for column in ("result_rows", "test_results_description", "test_params"):
+            assert column not in lowered, (column, entry["decision"])
+
+    with psycopg.connect(dev_dsn, autocommit=True) as con:
+        con.execute(
+            sql.SQL("alter table {} drop column status cascade").format(
+                sql.Identifier(schema, "elementary_test_results")
+            )
+        )
+    with pytest.raises(ElementaryLayoutError) as caught:
+        check_layouts(
+            READER_OLD,
+            adapter_catalog(_engine(project)._adapter("maintain incidents"), namespace),
+        )
+    assert [(p.code, p.table, p.column) for p in caught.value.problems] == [
+        ("elementary_column_missing", "elementary_test_results", "status")
+    ]
+    after = to_envelope(_engine(project).incidents()).data["sources"]["elementary"]
+    assert (after["status"], after["reason_code"]) == (
+        "refused",
+        "elementary_column_missing",
+    )
