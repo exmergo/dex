@@ -25,6 +25,7 @@ import pytest
 
 from evals import checks, claude_agent
 from evals.__main__ import main
+from evals.claude_agent import agent_args
 from evals.runner import AgentResult, run_quality
 from evals.suite import (
     AgentConfig,
@@ -33,6 +34,7 @@ from evals.suite import (
     EvalSuite,
     InvalidSuiteError,
     _suite_from_dict,
+    load_suite,
 )
 
 TEST = "unique_stg_order_items_order_item_id"
@@ -603,3 +605,38 @@ def test_uplift_without_case_is_an_error(cli):
     with pytest.raises(SystemExit) as exc:
         main(["skills/maintain", "--uplift"])
     assert exc.value.code == 2
+
+
+# --- the committed case (#1480) ------------------------------------------------
+
+
+def _demo_case() -> EvalCase:
+    suite = load_suite(Path(__file__).resolve().parents[2] / "skills" / "maintain")
+    [case] = [c for c in suite.evals if c.setup == [["demo"]]]
+    return case
+
+
+def test_the_committed_demo_case_runs_on_a_fresh_demo_with_the_records_flags():
+    case = _demo_case()
+    assert case.prompt == f"the {TEST} test started failing; work out why"
+    assert agent_args(case.agent) == [
+        "--permission-mode",
+        "acceptEdits",
+        "--max-budget-usd",
+        "5",
+        "--allowedTools",
+        "Bash(uv run *)",
+        "--disallowedTools",
+        "PowerShell",
+    ]
+    # The two points about tool calls are checks; the rest is for the judge.
+    kinds = sorted(c.check for c in case.checks)
+    assert kinds == ["first_dex_command", "no_dex_command", "no_file_writes"]
+
+
+def test_the_committed_checks_pass_the_procedure_and_fail_each_departure():
+    case = _demo_case()
+    graded = [checks.grade(c, passing())[0] for c in case.checks]
+    assert graded == [True, True, True]
+    graded = [checks.grade(c, failing())[0] for c in case.checks]
+    assert graded == [False, False, False]

@@ -957,6 +957,54 @@ def test_diagnosis_names_the_semantic_model_keyed_on_the_failing_column(
     assert readers["unread_files"] == []
 
 
+def _files(root: Path) -> dict[Path, bytes]:
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("selector", [(), ("stg_order_items",)], ids=["all", "model"])
+def test_the_procedure_s_commands_in_its_order_reach_the_incident_and_its_cause(
+    run_from, no_network, capsys, selector
+):
+    """#1480's deterministic arm: the live eval's case, with no agent. Asked why
+    a test started failing, the shipped procedure has the agent run
+    ``maintain incidents`` first, then ``maintain diagnose`` for the open
+    incident it found (with or without the model as the selector), and stop
+    there, since a question writes nothing. Run in that order on one demo, the
+    first returns the incident, the second that incident's cause and the
+    semantic-layer reader of its column, and the dbt project is left as the demo
+    wrote it. The no-defect twin is
+    ``test_the_same_demo_with_the_failing_runs_removed_returns_no_incident``."""
+
+    pytest.importorskip("duckdb")
+    _run(run_from.argv("demo"), capsys)
+    project = run_from.root / PROJECT_DIR
+    before = _files(project)
+
+    incidents = _run(run_from.argv("maintain", "incidents", *selector), capsys)
+    [incident] = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
+    assert incident["subject"] == {"kind": "unique_id", "key": FAILING_TEST}
+
+    diagnose = _run(run_from.argv("maintain", "diagnose", *selector), capsys)
+    [diagnosis] = diagnose["data"]["diagnoses"]
+    assert diagnosis["subject"] == incident["subject"]["key"]
+    assert diagnosis["verdict"] == "cause"
+    [cause] = diagnosis["causes"]
+    assert (cause["owner"], cause["kind"]) == ("loader", "duplicate_load")
+    assert cause["relation"] == "dex_demo.main.order_items"
+    [reader] = diagnosis["semantic_readers"]["readers"]
+    assert (reader["semantic_model"], reader["kind"], reader["name"]) == (
+        "order_items",
+        "entity",
+        "order_item",
+    )
+    # The fix is named and handed to transform; nothing is written.
+    [step] = diagnosis["next_steps"]
+    assert step["command"].startswith("dex transform plan ")
+    assert _files(project) == before
+    plans = run_from.root / ".dex" / "plans"
+    assert not plans.exists() or not any(plans.iterdir())
+
+
 def test_the_demo_s_semantic_layer_is_listed_from_its_seeded_artifacts(
     run_from, no_network, capsys
 ):
