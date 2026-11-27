@@ -6,9 +6,11 @@ warehouse with real-looking e-commerce data and real, deliberately seeded flaws,
 so the first `explore` run reports findings instead of a clean bill of health.
 
 :mod:`.warehouse` generates and writes the file and is the only writable path in
-the engine; :mod:`.commands` is the CLI shim over it and owns the surrounding
-project wiring (the `.dex/config.yml` that lets every following command run with
-no flags at all).
+the engine; :mod:`.project` renders the small dbt project beside it, with the
+artifacts of a seeded build in which one test failed, so `dex maintain incidents`
+has an incident to read (#1477); :mod:`.commands` is the CLI shim over both and
+owns the surrounding project wiring (the `.dex/config.yml` that lets every
+following command run with no flags at all).
 """
 
 from __future__ import annotations

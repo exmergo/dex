@@ -35,6 +35,7 @@ from .config_document import (
     InvalidConfigError,
     parse_value,
 )
+from .envelope import redact
 from .errors import ConfigurationError, RequestError
 from .results import ConfirmationRequest, Result, to_envelope
 from .session_cap import (
@@ -155,8 +156,13 @@ def config_set(
     *,
     confirmed: bool,
     session_cap: SessionCeilingCap | None = None,
+    comment: str | None = None,
 ) -> ConfigChangeResult:
     """Set one or more keys, as a diff to confirm and then as a write.
+
+    ``comment`` (one pair only) is written into the file beside the value as
+    ``#`` lines saying why it is there, since the file is committed and carries
+    its reasoning (#1473). Refused where it reads as holding a credential.
 
     Several pairs are applied as one change and validated once, at the end,
     because some settings are only valid together: ``semantic.vendor ossie``
@@ -180,6 +186,22 @@ def config_set(
     keys = pairs[0::2]
     if repeated := sorted({key for key in keys if keys.count(key) > 1}):
         raise RequestError(f"{', '.join(repeated)} is set more than once in one call")
+    if comment is not None:
+        comment = " ".join(comment.split())
+        if not comment:
+            raise RequestError(
+                "--comment is empty; give the text the file should carry"
+            )
+        if len(keys) != 1:
+            raise RequestError(
+                "--comment goes beside one value, and this call sets "
+                f"{len(keys)}; set the commented key in a call of its own"
+            )
+        if redact(comment) != comment:
+            raise RequestError(
+                f"--comment reads as holding a credential, and {CONFIG_RELPATH} "
+                "is committed: credentials are read at run time, never written here"
+            )
     if caller_only := sorted(
         {key for key in keys if caller_only_message(key) is not None}
     ):
@@ -195,7 +217,7 @@ def config_set(
         current = after.written(key)
         if current is not ABSENT and current == value:
             continue
-        after = after.with_value(key, value)
+        after = after.with_value(key, value, comment=comment)
         changed.append(key)
     if not changed:
         return ConfigChangeResult(
@@ -484,6 +506,7 @@ def cmd_config(args: argparse.Namespace) -> env.Envelope:
                 list(getattr(args, "pairs", None) or []),
                 confirmed=confirmed,
                 session_cap=session_cap,
+                comment=getattr(args, "comment", None),
             )
         )
     except (InvalidConfigError, ConfigChangeRefusedError) as exc:

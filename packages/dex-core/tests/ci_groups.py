@@ -141,7 +141,26 @@ GROUPS: dict[str, tuple[str, ...]] = {
         f"{_T}test_transform_compare_expect.py",
         f"{_T}test_expected_change.py",
     ),
-    "transform-contracts": (  # 115s
+    # Contracts and semantic derivation (308s on 2026-11-26, Python 3.11),
+    # split three ways: the derivation file alone, its cross-mart naming
+    # cases by test, and the rest of the contracts.
+    "transform-semantic-derivation": (f"{_T}test_semantic_derivation.py",),  # 87s
+    "transform-semantic-derivation-names": _tests(  # 129s
+        "test_semantic_derivation.py",
+        "test_a_child_joins_the_renamed_entity_of_a_parent_derived_in_the_same_plan",
+        "test_a_replacement_name_stays_clear_of_another_mart_in_the_plan",
+        "test_marts_that_reference_each_other_join_by_final_entity_names",
+        "test_a_settled_primary_name_holds_whichever_mart_derives_first",
+        "test_two_settled_primary_names_never_meet",
+        "test_a_reference_to_a_non_grain_column_joins_the_same_name_in_a_cycle",
+        "test_a_numbered_entity_never_takes_a_parent_join_name",
+        "test_a_foreign_key_joins_a_parent_column_that_is_itself_a_planned_foreign_key",
+        "test_foreign_keys_that_only_reference_each_other_are_not_derived",
+        "test_a_foreign_key_to_an_anchored_entity_this_model_holds_is_not_derived",
+        "test_a_fallback_that_only_shares_an_authored_name_does_not_propagate",
+        "test_a_foreign_key_to_a_planned_mart_that_derives_nothing_is_not_derived",
+    ),
+    "transform-contracts": (  # 92s
         f"{_T}test_semantic",
         f"{_T}test_native_",
         f"{_T}test_parse.py",
@@ -252,14 +271,40 @@ GROUPS: dict[str, tuple[str, ...]] = {
         f"{_T}test_row_attribution.py",
         f"{_T}test_identifier_conversion.py",
     ),
-    # Planning, PII stamps and the fast mutation command doubles; also
-    # catches every new transform file by default.
-    "transform": (_T,),  # 127s
-    "explore-maintain": ("tests/explore/", "tests/maintain/", "tests/demo/"),  # 187s
+    # Elementary monitors written from declarations (146s), and the PII
+    # stamps and tags (154s), each a dbt parse per case.
+    "transform-monitors": (f"{_T}test_monitors.py",),  # 146s
+    "transform-pii": (f"{_T}test_pii_",),  # 154s
+    # Planning and the fast mutation command doubles; also catches every new
+    # transform file by default.
+    "transform": (_T,),  # 82s
+    # Explore and maintain (654s on 2026-11-26, Python 3.12), split by file.
+    "explore": ("tests/explore/", "tests/demo/"),  # 125s
+    "maintain-incidents": (  # 157s
+        "tests/maintain/test_elementary_incidents.py",
+        "tests/maintain/test_incident_sources.py",
+    ),
+    "maintain-coverage": (  # 134s
+        "tests/maintain/test_coverage_refresh.py",
+        "tests/maintain/test_coverage_strength.py",
+    ),
+    "maintain-diagnose": (  # 105s
+        "tests/maintain/test_diagnose.py",
+        "tests/maintain/test_coverage_dbt.py",
+    ),
+    "maintain": ("tests/maintain/",),  # 132s
     "packaging": ("tests/test_packaging.py",),  # 58s
-    # Connectors, guards, storage, native semantic vendors, top-level contracts,
-    # integration (skipped without credentials), and any new test directory.
-    CATCH_ALL: (),  # 172s
+    # The native semantic vendors (141s on 2026-11-26, Python 3.11).
+    "semantic-vendors": (
+        "tests/cube_vendor/",
+        "tests/metric_views_vendor/",
+        "tests/ossie/",
+        "tests/semantic_views_vendor/",
+        "tests/slayer_vendor/",
+    ),
+    # Connectors, guards, storage, top-level contracts, integration (skipped
+    # without credentials), and any new test directory.
+    CATCH_ALL: (),  # 118s
 }
 
 

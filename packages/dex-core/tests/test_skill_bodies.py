@@ -19,6 +19,7 @@ what an agent does (#489). Four properties are held here:
 
 from __future__ import annotations
 
+import importlib.util
 import re
 from pathlib import Path
 
@@ -144,6 +145,49 @@ def test_every_procedure_copy_is_the_engines_text():
         f"these copies of the procedure differ from the engine's text: {stale}. "
         "Edit packages/dex-core/src/exmergo_dex_core/procedure/procedure.md, then "
         "run `uv run --project packages/dex-core python scripts/sync_procedure.py`"
+    )
+
+
+def test_sync_procedure_writes_the_copies_with_lf_line_endings(tmp_path, monkeypatch):
+    """`scripts/sync_procedure.py` refreshes a copy with `Path.write_text`, which
+    on Windows translates every `\\n` to `\\r\\n` unless `newline="\\n"` is passed,
+    rewriting all of `AGENTS.md` as CRLF rather than the eight lines that changed
+    (#1599). `--check` and the test above read the copies back with `read_text`,
+    which folds CRLF to `\\n`, so neither sees it. The translation is emulated
+    here so the test holds on Linux too: a `write_text` with no `newline` writes
+    CRLF, as Windows would."""
+
+    spec = importlib.util.spec_from_file_location(
+        "sync_procedure", ROOT / "scripts" / "sync_procedure.py"
+    )
+    sync = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sync)
+
+    relpath = "AGENTS.md"
+    current = (ROOT / relpath).read_text(encoding="utf-8")
+    start, end = current.index(BEGIN) + len(BEGIN), current.index(END)
+    stale = current[:start] + "\nstale\n" + current[end:]
+    copy = tmp_path / relpath
+    copy.write_bytes(stale.encode("utf-8"))
+    monkeypatch.setattr(sync, "ROOT", tmp_path)
+    monkeypatch.setattr(sync, "COPIES", (relpath,))
+
+    posix_write_text = Path.write_text
+
+    def windows_write_text(self, data, encoding=None, errors=None, newline=None):
+        # Text mode with newline=None writes os.linesep, "\r\n" on Windows.
+        if newline is None:
+            data, newline = data.replace("\n", "\r\n"), "\n"
+        return posix_write_text(self, data, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "write_text", windows_write_text)
+
+    assert sync.main([]) == 0
+    written = copy.read_bytes()
+    assert b"\r" not in written, "the refreshed copy keeps LF line endings"
+    refreshed = current[:start] + "\n" + sync.text() + current[end:]
+    assert written.decode("utf-8") == refreshed, (
+        "a refresh changes only the lines between the procedure markers"
     )
 
 

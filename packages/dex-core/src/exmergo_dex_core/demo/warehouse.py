@@ -4,8 +4,9 @@ Everything else dex does against a warehouse is a read. This module is the singl
 exception, and it is deliberately its own path so that exception stays visible:
 it imports ``duckdb`` directly and never :mod:`..adapters.duckdb`, so the
 read-only open in the adapter has no branch that could ever be relaxed, and it
-never touches the SQL guard, because the statements here are ``CREATE TABLE`` and
-a ``COPY`` off a file this module just wrote, rather than anything an agent
+never touches the SQL guard, because the statements here are ``CREATE SCHEMA``,
+``CREATE TABLE``, a ``COPY`` off a file this module just wrote and a
+parameterised ``INSERT`` of rows it generated, rather than anything an agent
 authored. A safety-spine test asserts both of those mechanically rather than
 trusting this paragraph.
 
@@ -99,12 +100,21 @@ class DemoTable:
 
     ``note`` is user-facing. It is what lets the envelope say what each table is
     there to teach, so the first run is a tour rather than a pile of tables.
+    ``schema`` is ``None`` for the shop's own tables, which DuckDB puts in
+    ``main``; a table another tool writes (Elementary's, #1477) names its own.
     """
 
     name: str
     columns: tuple[tuple[str, str], ...]
     rows: tuple[tuple, ...]
     note: str
+    schema: str | None = None
+
+    @property
+    def qualified(self) -> str:
+        """The name a statement uses: ``schema.name``, or the bare name."""
+
+        return f"{self.schema}.{self.name}" if self.schema else self.name
 
 
 @dataclass(frozen=True)
@@ -478,7 +488,7 @@ def row_digest(tables: tuple[DemoTable, ...]) -> str:
 
     digest = hashlib.sha256()
     for table in tables:
-        digest.update(table.name.encode("utf-8"))
+        digest.update(table.qualified.encode("utf-8"))
         for name, sql_type in table.columns:
             digest.update(f"\x00{name}:{sql_type}".encode())
         for row in table.rows:
@@ -489,7 +499,10 @@ def row_digest(tables: tuple[DemoTable, ...]) -> str:
 
 
 def generate_demo_warehouse(
-    path: str | Path, *, seed: int = DEMO_SEED
+    path: str | Path,
+    *,
+    seed: int = DEMO_SEED,
+    extra: tuple[DemoTable, ...] = (),
 ) -> DemoWarehouse:
     """Create a new DuckDB file at ``path`` and seed it. Never overwrite.
 
@@ -510,13 +523,16 @@ def generate_demo_warehouse(
     the staging file lives in the system temp directory (never beside the
     target) so the command still creates exactly the one artifact it reports.
     Worth knowing if this data ever grows a nullable column: CSV cannot tell an
-    empty string from NULL, and every column generated here is non-null.
+    empty string from NULL, and every column the shop's tables generate is
+    non-null. ``extra`` tables (Elementary's, #1477) are a few rows each and do
+    hold NULLs, so they are bound as parameters instead, as
+    :func:`generate_fixture_warehouse` binds them.
     """
 
     target = Path(path)
     duckdb = _new_target(target)
 
-    tables = build_tables(seed)
+    tables = build_tables(seed) + extra
     connection = duckdb.connect(str(target))
     try:
         # Table and column names are module constants a few lines above, never
@@ -525,9 +541,18 @@ def generate_demo_warehouse(
         # binds as a parameter.
         with tempfile.TemporaryDirectory(prefix="dex-demo-") as staging:
             for table in tables:
-                columns = ", ".join(f"{name} {sql}" for name, sql in table.columns)
-                connection.execute(f"CREATE TABLE {table.name} ({columns})")
+                if table.schema:
+                    connection.execute(f"CREATE SCHEMA IF NOT EXISTS {table.schema}")
+                columns = ", ".join(f'"{name}" {sql}' for name, sql in table.columns)
+                connection.execute(f"CREATE TABLE {table.qualified} ({columns})")
                 if not table.rows:
+                    continue
+                if any(table is bound for bound in extra):
+                    marks = ", ".join("?" for _ in table.columns)
+                    connection.executemany(
+                        f"INSERT INTO {table.qualified} VALUES ({marks})",  # noqa: S608
+                        [list(row) for row in table.rows],
+                    )
                     continue
                 rows_csv = Path(staging) / f"{table.name}.csv"
                 with rows_csv.open("w", newline="", encoding="utf-8") as handle:
@@ -603,9 +628,9 @@ def _new_target(target: Path):
     parent = target.parent
     if not parent.is_dir():
         raise DemoPathError(
-            f"'{parent.as_posix()}' is not an existing directory; dex demo writes "
-            "one file and creates no directories. Create it first, or name a path "
-            "inside a directory that exists"
+            f"'{parent.as_posix()}' is not an existing directory; dex demo never "
+            "creates the directory its file goes in. Create it first, or name a "
+            "path inside a directory that exists"
         )
 
     try:

@@ -14,6 +14,215 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.19.0] - 2026-11-26
+
+### Added
+
+- **A declared population filter becomes the `where_expression` of the model's Elementary monitors.**
+  With `monitors.vendor: elementary`, every monitor a declaration writes now
+  carries the model's `population.filters` as its `where_expression`, so the
+  monitors measure the rows the model promises and a row outside them bends no
+  training history. `includes` is written `<column> in (...)` and `excludes`
+  `(<column> not in (...) or <column> is null)`, which keeps the NULL rows an
+  `excludes` keeps, unless the column declares `null_rule: never`; several filters
+  join with `and`.
+
+  - Each part holding an `or` is parenthesised, because Elementary appends the
+    expression to its own time-bucket filter with a bare `and`.
+  - Values are literals typed as declared, never cast, with text escaped as the
+    `dex_population_filter_literal` macro escapes it on the connector, so write
+    them in the column's type. The column is quoted as the adapter quotes it
+    where it must be.
+  - A filter Dex cannot write withholds the model's monitors
+    (`filter_column_not_output`, `filter_unwritable`) rather than writing them
+    unfiltered, and a monitor Dex wrote on another population is `stale` and
+    kept.
+
+  ([#1571](https://github.com/exmergo/dex/pull/1571))
+- **`dex maintain incidents` returns the incidents the run history holds for the selected models' tests.**
+  It reads Elementary's tables (`dbt_invocations` and `elementary_test_results`)
+  where the package is installed and uploading, and dbt's `run_results.json`, and
+  folds both through the one incident lifecycle rule. Elementary is read over the
+  newest 20 invocations by default (`--invocations <n>`, up to 2000): a run count,
+  so the price does not depend on the schedule. Every statement goes through the
+  query firewall and the source allowlist, and the whole read is priced before
+  anything runs, so on a billed connector the first call answers
+  `needs_confirmation` having sent no statement. `data.sources` reports each source as
+  `read`, `missing` or `refused` with a reason code. A schema outside the
+  committed allowlist is refused before any connection opens, with the
+  `dex config set` that adds it. With no package, the next steps name the install
+  `dex init` offers. `data.window` names the invocations read, `data.price` the
+  estimate and what it settled at, and each incident carries its coverage and
+  retention bound. `DexEngine.incidents()` returns the same result. ([#1572](https://github.com/exmergo/dex/pull/1572))
+- **`explore semantic query|values` on a Cube layer now runs `--local` on ClickHouse and Trino.**
+  Cube renders the SQL and Dex executes it through its own connector, under the PII gate and the cost guard, as on DuckDB, Postgres, BigQuery, Snowflake and Redshift.
+  Both dialects are held to a recorded golden of what Cube Core v1.8.14 renders.
+  The statement runs in a UTC session on both, so a timestamp with no zone means what Cube means whatever the machine's or the server's time zone.
+  A rolling window is the exception on ClickHouse: Cube renders a join on inequalities alone, which ClickHouse 25.3 refuses.
+  Databricks is still refused by name on `--local`. ([#1573](https://github.com/exmergo/dex/pull/1573))
+- **`dex maintain diagnose` takes each open test incident to a cause, or says no cause was confirmed.**
+  It reads the incidents as `dex maintain incidents` does and bisects each one
+  over its coverage timeline: after the last observed-good run, through the first
+  observed-bad one, where a run that recorded nothing widens the range and never
+  narrows it. The committed `maintain snapshot` series (the versions of
+  `.dex/snapshot.json` in the repository's history) bounds the break where there
+  is one; on a project's first day there is none, and the answer names the window
+  no recorded state of the warehouse covers. Each candidate cause is confirmed or
+  ruled out by a check Dex already has, named in the answer. This release checks
+  a uniqueness test failing because the loader delivered a key twice, with the
+  grain axis of `dex maintain check` on each source the tested model reads. With
+  no confirmed cause the answer lists what was ruled out and the unseen window,
+  and never names the likeliest candidate. A confirmed cause's repair is handed
+  to `transform` as a next step, never written. `DexEngine.diagnose()` returns the
+  same result. ([#1574](https://github.com/exmergo/dex/pull/1574))
+- **A plan tags the columns Dex marks as personal data so Elementary keeps no sample of them.**
+  With `monitors.vendor: elementary` and the package installed, each column a
+  written model's YAML marks as PII, at any confidence, gets Elementary's tag in
+  `config.meta.tags`, the model gets it in `config.tags`, and the plan adds
+  `disable_samples_on_pii_tags: true` under `vars:` in `dbt_project.yml`. The
+  project's own tests, not only Dex's, then keep no sample of those columns in
+  `test_result_rows`.
+
+  - The tag is `pii`, or the first entry of the project's own `pii_tags`.
+  - A plan that rewrites an existing model's SQL gets the tags without the
+    switch, which `transform declare` then adds in a plan of its own, so the
+    rewrite keeps its refactor comparison and downstream impact check.
+  - A warning states the trade: every test on a tagged model, the project's own
+    included, keeps no sample of its failing rows.
+  - `data.pii_tags.rule` says what the installed release does with the tags:
+    nothing before 0.19.2, the model tag only from 0.19.2 to 0.19.4, both from
+    0.20.0.
+  - A `false` a person wrote under a PII flag is never tagged, and a
+    `disable_samples_on_pii_tags` the project sets is kept as written.
+  - `transform declare` proposes a model whose marks predate the tag.
+
+  ([#1576](https://github.com/exmergo/dex/pull/1576))
+- **`dex demo` now shows an incident and its cause, offline.** Beside the warehouse
+  and its config, the demo writes a small dbt project under `demo_project/dbt/`: a source
+  over `orders` and `order_items`, a staging model over each, and a `unique` and a
+  `not_null` test on each key. Its `target/` holds the artifacts of a seeded
+  `dbt build` in which `unique_stg_order_items_order_item_id` failed, because of
+  the batch the demo loads twice.
+
+  - `dex maintain incidents` then returns that incident, open, with no build
+    first.
+  - `dex maintain diagnose` names the loader's duplicate delivery of
+    `order_item_id` as the cause, measured on the source the model reads.
+  - The printed next steps end with both commands.
+  - The demo still runs no dbt, installs no package and opens no network
+    connection; the artifacts are generated and pinned by a digest.
+  - The project sits one level down, so `analytics/`, the directory the docs give
+    your own project, stays free and `dex transform init analytics` still works
+    after the demo. An existing `demo_project/` beside the target is refused
+    before anything is written. Under an existing `.dex/config.yml` no project is
+    written, as no config is.
+  - Once the warehouse is written, a config or project write that fails or is
+    interrupted part way removes the project, the config and the warehouse it
+    made, and nothing it did not make: a config another `dex demo` wrote in the
+    same directory meanwhile is refused, never replaced. A failure while the
+    warehouse itself is loading removes it, as before; an interrupt there can
+    still leave it.
+
+  ([#1587](https://github.com/exmergo/dex/pull/1587))
+- **`dex demo` now shows the incident from Elementary's tables, with when it began.**
+  The demo seeds the history of seven weekly builds of its dbt project.
+
+  - **Elementary's tables**, in `main_elementary`: `dbt_invocations` and
+    `elementary_test_results`, built from the reader's recorded 0.26.1 layout, and
+    the layout's two other tables, empty. One week the package's hooks were off,
+    and it holds no row.
+  - **The package**, declared at 0.26.1 in `packages.yml`, with that release
+    recorded where the resolver reads it.
+
+  `unique_stg_order_items_order_item_id` passes in four builds and fails in the last
+  two, because of the batch the demo loads twice. So `dex maintain incidents`
+  returns the incident from the `elementary` source, with the build it was first
+  observed in, and the week with the hooks off read as a missed run inside its
+  onset. `dex maintain diagnose` names the loader's duplicate delivery over that
+  break.
+
+  - The builds are dated back from when `dex demo` ran, so the incident stays open
+    for about three weeks. The project's source files are dated a day before the
+    oldest build, so they move too. Every other date in the demo is still fixed.
+  - `explore map` leaves the package's tables out of the ranking, so the tour's
+    counts are unchanged.
+  - The demo still runs no dbt, installs no package and opens no network
+    connection. To build its project, run `dex transform deps` first: the build
+    reads the recorded release as an installed package and would not install it.
+
+  ([#1588](https://github.com/exmergo/dex/pull/1588))
+- **`maintain diagnose` names who reads what broke.** Each diagnosis carries
+  `semantic_readers`: the semantic models on the failing test's model whose
+  entities, dimensions and measures read its columns, and the metrics built on
+  those measures, read from dbt's semantic layer with no warehouse query. A
+  semantic model on a model built from the tested one is not followed, and each
+  read says so. A member whose expression is computed is listed as `unresolved`
+  rather than guessed, and so is a member reading a versioned model's column,
+  since the fingerprint records a `ref()` by name and not by version. A project with no semantic layer reads `absent`, not
+  an empty list. ([#1598](https://github.com/exmergo/dex/pull/1598))
+- **`dex demo` writes a semantic layer that reads its failing column.** The demo's
+  dbt project gains `models/semantic/`: the time spine dbt requires, an `orders`
+  semantic model with the metrics `orders`, `revenue` and `average_order_value`,
+  and an `order_items` semantic model whose primary entity is `order_item_id`,
+  the column the seeded test fails on. `maintain diagnose` names that entity
+  beside the cause, and the seeded `target/semantic_manifest.json` lets
+  `explore semantic list --local` read the layer with no `dbt parse` first. ([#1600](https://github.com/exmergo/dex/pull/1600))
+- **A small-domain dimension column writes an Elementary `dimension_anomalies`.**
+  With `monitors.vendor: elementary`, a column declared `role: dimension` whose
+  cached domain is at most 20 distinct values gets its own
+  `elementary.dimension_anomalies` (`dimensions: [<column>]`) on the model's one
+  time column, carrying the population's `where_expression`. Each column gets its
+  own test, because the package groups a `dimensions` list by the columns'
+  combination. The domain is read from the exploration cache, never measured. A
+  column over the bound is `domain_too_large`. A column with no cached count is
+  `not_profiled`, and a warning names the `explore profile` that would supply
+  one. A column Dex flags as personal data is `pii_flagged` at any size. A
+  monitor Dex wrote on a column that no longer qualifies is reported `stale` and
+  kept. `transform declare` now also returns `data.monitors`. ([#1609](https://github.com/exmergo/dex/pull/1609))
+
+### Changed
+
+- **Dex spells each connector's dev target as `dev`, beside `prod`, keeping the previous keys as aliases.**
+  Connector configuration now unifies the dev target namespace under the canonical `dev` key across all connectors, matching `prod`:
+
+  - DuckDB: `duckdb.dev` (database name)
+  - BigQuery: `bigquery.dev` (dataset or project.dataset)
+  - Snowflake: `snowflake.dev` (database.schema)
+  - Databricks: `databricks.dev` (catalog.schema)
+  - PostgreSQL: `postgres.dev` (schema)
+  - Redshift: `redshift.dev` (schema)
+  - ClickHouse: `clickhouse.dev` (database)
+  - Trino: `trino.dev` (catalog.schema)
+
+  The connector-specific keys (`dev_dataset`, `dev_database`, `dev_schema`, `dev_catalog`) remain supported as backward-compatible aliases. Existing configuration files validate without warnings and produce identical runtime behavior. New projects initialized with `transform init` render `dev`, while existing files retain their written spelling.
+
+  ([#1541](https://github.com/exmergo/dex/pull/1541))
+- **The agent procedure sends an agent to `dex maintain incidents` first when a test fails or a model is wrong.**
+  Step 6, **Maintain**, now opens with that routing: `dex maintain incidents` first, then `dex maintain diagnose` for an open incident's cause and `dex maintain verify` on the models whose tests they name. It also says what an empty answer means: where `data.sources` reports Elementary `missing` or `refused`, the run history was not read, which is not a clean history; the source's `reason_code` says why, and for a project without the package `data.next_steps` names the install `dex init` offers, which starts it. The `maintain` skill now triggers on "when did this test start failing" and "what changed when it broke".
+
+  `dex procedure` returns the new text and a new `digest`, so a copy pasted into a repository's own `CLAUDE.md` or `AGENTS.md` now reads `stale` under `dex procedure --check`, which exits as an error. Refresh it with `dex procedure --block`. ([#1597](https://github.com/exmergo/dex/pull/1597))
+
+### Fixed
+
+- **A mart whose grain is a single time column now derives a semantic model dbt parses.** The primary entity took the column's name, the same as the time dimension, so dbt rejected the model in any project that defines a metric. The entity is now named `<stem>_<column>` with `expr: <column>`, where the stem is the model name without its layer prefix (`fct_`, `fact_`, `dim_`, `mart_` or `marts_`), so `fct_daily` with grain `output_day` gets `daily_output_day`. It is chosen before the foreign keys so one that joins by the column's old name still joins. A plan settles every mart's primary entity name in a first pass, then drafts the foreign entities that join an existing entity or a settled primary until the drafts settle, and resolves every foreign key in the plan against those drafts and the layer as it stands. A mart therefore joins the same name whatever order the plan derives them in, including marts that reference each other and a reference to a parent column that is itself a foreign key. A foreign key that cannot join what it references (the plan derives that column with no entity, or its entity is one this model already uses) is not derived, and says so, rather than offered under a name that joins nothing. A dimension of the child that already has the parent's entity name is renamed `<stem>_<name>` with `expr: <name>` so the join name stays. Each replacement name, and a foreign key's fallback name, is numbered when the model's own elements, the entities its foreign keys join by, an entity name the layer or plan already uses, or another element type anywhere in the semantic layer or in another mart of the same plan already hold it. ([#1439](https://github.com/exmergo/dex/pull/1439))
+- **Stored plan IDs scope to the dbt project.** When multiple dbt projects share
+  a repository and plan store, identical edits and intent generated colliding plan
+  IDs, causing the second plan to overwrite the first plan's recorded project
+  directory. `_plan_id` now incorporates normalized relative project paths,
+  ensuring stable, portable identities across checkouts and operating systems
+  while existing stored plans remain retrievable and applicable by ID. ([#1547](https://github.com/exmergo/dex/pull/1547))
+- **`maintain incidents` no longer says no failure has a known start when
+  Elementary dates it.** When dbt's `run_results.json` has a place in
+  Elementary's order, as an invocation Elementary also recorded
+  (`placed: in_window`) or one that started after Elementary's newest run
+  (`placed: after_window`), the run-results note saying no failure has a known
+  start is left out, since a failure Elementary saw pass before that run is
+  dated. Where the run itself opened incidents with no known start (a test
+  Elementary holds no result for), a note in the same place counts those
+  incidents alone, so it holds beside an incident that is dated. A run read
+  alone, or with no place in Elementary's order, keeps the note as before. ([#1593](https://github.com/exmergo/dex/pull/1593))
+
+
 ## [1.18.5] - 2026-11-23
 
 ### Added

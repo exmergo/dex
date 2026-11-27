@@ -30,7 +30,13 @@ from collections.abc import Iterable, Mapping
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .errors import DexError
 from .project_definitions import (
@@ -248,21 +254,87 @@ def normalized_lag(seconds: int) -> str:
     return f"{seconds}s"  # pragma: no cover - a second divides every whole number
 
 
+#: The days a freshness ``deadline`` may be limited to, Monday first, by the
+#: three-letter spelling a declaration stores, with the full English name
+#: Elementary's ``day_of_week`` takes (#1486).
+WEEKDAYS: tuple[tuple[str, str], ...] = (
+    ("mon", "Monday"),
+    ("tue", "Tuesday"),
+    ("wed", "Wednesday"),
+    ("thu", "Thursday"),
+    ("fri", "Friday"),
+    ("sat", "Saturday"),
+    ("sun", "Sunday"),
+)
+_DEADLINE = re.compile(r"^\s*([0-9]{1,2}):([0-9]{2})\s*$")
+
+
+def deadline_parts(value: str) -> tuple[int, int]:
+    """The hour and minute a ``deadline`` such as ``07:00`` states. Refuses
+    anything but a 24-hour ``H:MM`` or ``HH:MM`` time of day."""
+
+    match = _DEADLINE.match(value) if isinstance(value, str) else None
+    if match is None or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise ValueError(
+            f"deadline '{value}' is not a time of day; write it as 24-hour HH:MM "
+            "(for example '07:00' or '14:30')"
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def valid_timezone(value: str) -> str:
+    """``value`` where it names an IANA time zone, else a refusal. A key under
+    ``posix/`` or ``right/`` is a system file, not a zone name."""
+
+    from zoneinfo import ZoneInfo
+
+    name = value.strip() if isinstance(value, str) else ""
+    if (
+        not name
+        or name.startswith(("posix/", "right/"))
+        or not re.fullmatch(r"[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*", name)
+    ):
+        raise ValueError(
+            f"timezone '{value}' is not an IANA time zone name (for example "
+            "'America/Chicago' or 'Europe/London')"
+        )
+    try:
+        ZoneInfo(name)
+    except Exception as exc:  # ZoneInfoNotFoundError, or a path the OS refuses
+        raise ValueError(
+            f"timezone '{value}' is not an IANA time zone name (for example "
+            "'America/Chicago' or 'Europe/London')"
+        ) from exc
+    return name
+
+
 class Freshness(_Strict):
-    """How old the newest value of a declared time column may be (#1460).
+    """How old the newest value of a declared time column may be (#1460), and
+    by when each day it must be current (#1486).
 
     ``max_lag`` is the longest the newest row may trail the warehouse's clock,
     ``basis`` whether the column is the event's own time (``business``, which a
     backfill can leave legitimately old) or when the row was loaded
     (``capture``, which nothing excuses). The lag is normalized to the largest
-    unit that divides it, so ``360m`` and ``6h`` are one declaration."""
+    unit that divides it, so ``360m`` and ``6h`` are one declaration.
 
-    max_lag: str
+    ``deadline`` is a time of day (``07:00``) in ``timezone`` by which the
+    column must hold a value from that day, on every day or only on ``days``.
+    A lag is not a deadline: "no more than six hours behind" is not "updated
+    by 07:00", so neither is read as the other. A block states a lag, a
+    deadline, or both; ``timezone`` comes with a deadline and never without."""
+
+    max_lag: str | None = None
     basis: TimeProvenance
+    deadline: str | None = None
+    timezone: str | None = None
+    days: list[str] | None = None
 
     @field_validator("max_lag", mode="before")
     @classmethod
-    def _lag(cls, value: Any) -> str:
+    def _lag(cls, value: Any) -> str | None:
+        if value is None:
+            return None
         if not isinstance(value, str):
             raise ValueError(
                 "max_lag is a whole number and a unit, s, m, h, d or w, written as "
@@ -270,9 +342,93 @@ class Freshness(_Strict):
             )
         return normalized_lag(lag_seconds(value))
 
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def _deadline(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            # YAML 1.1 reads an unquoted 07:00 as the number 420.
+            raise ValueError(
+                "deadline is a 24-hour time of day written as quoted text "
+                "(for example '07:00'); unquoted, YAML reads 07:00 as a number"
+            )
+        hour, minute = deadline_parts(value)
+        return f"{hour:02d}:{minute:02d}"
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _timezone(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(
+                "timezone is an IANA time zone name written as text (for example "
+                "'America/Chicago')"
+            )
+        return valid_timezone(value)
+
+    @field_validator("days", mode="before")
+    @classmethod
+    def _days(cls, value: Any) -> list[str] | None:
+        if value is None:
+            return None
+        if isinstance(value, str) or not isinstance(value, list) or not value:
+            raise ValueError(
+                "days is a list of weekdays, such as [mon, tue, wed, thu, fri]"
+            )
+        spelled = {short: short for short, _ in WEEKDAYS}
+        spelled.update({full.lower(): short for short, full in WEEKDAYS})
+        given: set[str] = set()
+        for day in value:
+            key = day.strip().lower() if isinstance(day, str) else None
+            if key not in spelled:
+                raise ValueError(
+                    f"days holds '{day}', which is not a weekday; write mon, tue, "
+                    "wed, thu, fri, sat or sun (or the full name)"
+                )
+            given.add(spelled[key])
+        return [short for short, _ in WEEKDAYS if short in given]
+
+    @model_validator(mode="after")
+    def _a_lag_or_a_deadline(self) -> Freshness:
+        if self.max_lag is None and self.deadline is None:
+            raise ValueError(
+                "freshness states a max_lag, a deadline, or both (for example "
+                "{max_lag: '6h', basis: capture} or {deadline: '07:00', timezone: "
+                "'America/Chicago', basis: capture})"
+            )
+        if self.deadline is not None and self.timezone is None:
+            raise ValueError(
+                "freshness.timezone is required with freshness.deadline: a time of "
+                "day means nothing without the zone it is read in (for example "
+                "timezone: 'America/Chicago')"
+            )
+        if self.deadline is None and self.timezone is not None:
+            raise ValueError(
+                "freshness.timezone is only read with freshness.deadline; declare "
+                "the deadline, or drop the timezone"
+            )
+        if self.deadline is None and self.days is not None:
+            raise ValueError(
+                "freshness.days is only read with freshness.deadline; declare the "
+                "deadline, or drop the days"
+            )
+        return self
+
     @property
-    def max_lag_seconds(self) -> int:
-        return lag_seconds(self.max_lag)
+    def max_lag_seconds(self) -> int | None:
+        return lag_seconds(self.max_lag) if self.max_lag is not None else None
+
+    @property
+    def day_names(self) -> list[str] | None:
+        """``days`` as the full English names Elementary's ``day_of_week``
+        takes, or ``None`` where every day is checked."""
+
+        if self.days is None:
+            return None
+        full = dict(WEEKDAYS)
+        return [full[day] for day in self.days]
 
 
 class ContinuityGrain(str, Enum):

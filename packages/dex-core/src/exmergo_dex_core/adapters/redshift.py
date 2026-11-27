@@ -964,7 +964,11 @@ class RedshiftAdapter:
                 # per statement (verified live) while HLL() carries no such
                 # limit, so a wide batch stays a single pass.
                 select_parts.append(f"HLL({qcol}) AS nd_{i}")
-            wants_min_max = (col.name in safe) and not degraded
+            # MIN and MAX take no boolean here, so asking for them refuses the
+            # whole statement (Elementary's dbt_invocations.full_refresh, #1470).
+            wants_min_max = (
+                (col.name in safe) and not degraded and not _is_boolean(col.data_type)
+            )
             if wants_min_max:
                 select_parts.append(f"MIN({qcol}) AS mn_{i}")
                 select_parts.append(f"MAX({qcol}) AS mx_{i}")
@@ -1475,6 +1479,12 @@ def _schema_filter(column: str) -> str:
 
     names = ", ".join(f"'{name}'" for name in _SYSTEM_SCHEMAS)
     return f"{column} NOT IN ({names}) AND {column} NOT LIKE 'pg\\_%'"
+
+
+def _is_boolean(data_type: str) -> bool:
+    """A boolean column, which MIN and MAX do not take on this connector."""
+
+    return data_type.strip().lower() in {"boolean", "bool"}
 
 
 def _truthy(value: Any) -> bool:

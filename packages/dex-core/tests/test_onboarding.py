@@ -897,3 +897,230 @@ def test_an_install_plan_pinned_to_an_older_file_is_not_reused(
         ]
         == 0
     )
+
+
+# --- the allowlist entry for Elementary's schema (#1473) --------------------------
+
+
+def _allowlist(
+    tmp_path,
+    *,
+    connector_config,
+    install="present",
+    models=None,
+    macro=None,
+    probe=lambda entry: (True, None),
+):
+    """Run the proposal on a project, as `_elementary` runs it."""
+
+    from exmergo_dex_core.config import DexConfig
+    from exmergo_dex_core.onboarding import SetupResult, _elementary_allowlist
+
+    project = {"name": "shop", "profile": "shop"}
+    if models is not None:
+        project["models"] = models
+    (tmp_path / "dbt_project.yml").write_text(yaml.safe_dump(project))
+    if macro is not None:
+        (tmp_path / "macros").mkdir()
+        (tmp_path / "macros/generate_schema_name.sql").write_text(macro)
+    config = DexConfig.model_validate(connector_config)
+    result = SetupResult(connector=config.connector, project_dir=".")
+    report = {"install": install}
+    _elementary_allowlist(
+        config,
+        tmp_path,
+        result,
+        report,
+        planned=install in ("written", "planned"),
+        probe=probe,
+    )
+    return result, report["allowlist"]
+
+
+def _bigquery(datasets=("raw",), prod="analytics"):
+    block = {"project": "acme", "datasets": list(datasets), "dev": "dbt_dev"}
+    if prod:
+        block["prod"] = prod
+    return {"connector": "bigquery", "bigquery": block}
+
+
+ELEMENTARY_MODELS = {"elementary": {"+schema": "elementary"}}
+
+
+def test_a_restricted_allowlist_gets_the_entry_as_a_non_blocking_input(tmp_path):
+    from exmergo_dex_core.transform.elementary_schema import COMMENT
+
+    result, allowlist = _allowlist(
+        tmp_path, connector_config=_bigquery(), models=ELEMENTARY_MODELS
+    )
+    command = (
+        "dex config set bigquery.datasets '[raw, acme.analytics_elementary]' "
+        f"--comment '{COMMENT}'"
+    )
+    assert allowlist == {
+        "status": "proposed",
+        "namespace": "acme.analytics_elementary",
+        "source": "prod",
+        "field": "bigquery.datasets",
+        "command": command,
+    }
+    (missing,) = result.missing_inputs
+    assert (missing["name"], missing["blocking"], missing["command"]) == (
+        "source_allowlist",
+        False,
+        command,
+    )
+    assert command in [step["command"] for step in result.next_steps]
+    # Non-blocking: setup is complete, so the envelope is not an error.
+    envelope = setup_envelope(result)
+    assert envelope.status.value == "ok"
+    assert envelope.errors == []
+
+
+@pytest.mark.parametrize(
+    ("why", "status"),
+    [
+        ("does not exist in the warehouse yet", "not_created"),
+        ("is not readable by this principal", "unreadable"),
+    ],
+)
+def test_a_schema_the_connection_cannot_open_is_not_proposed(tmp_path, why, status):
+    """An entry the connection cannot open makes every command refuse the
+    allowlist, so a schema the package has not built yet is not proposed."""
+
+    result, allowlist = _allowlist(
+        tmp_path,
+        connector_config=_bigquery(),
+        models=ELEMENTARY_MODELS,
+        probe=lambda entry: (False, why),
+    )
+    assert allowlist["status"] == status
+    assert "command" not in allowlist
+    (missing,) = result.missing_inputs
+    assert missing["blocking"] is False and "command" not in missing
+    assert why in missing["detail"]
+    assert not [s for s in result.next_steps if "config set" in s["command"]]
+
+
+def test_a_schema_not_probed_is_proposed_and_says_so(tmp_path):
+    _, allowlist = _allowlist(
+        tmp_path,
+        connector_config=_bigquery(),
+        models=ELEMENTARY_MODELS,
+        probe=lambda entry: (None, None),
+    )
+    assert (allowlist["status"], allowlist["exists"]) == ("proposed", None)
+
+
+def test_a_blocking_input_still_fails_setup():
+    from exmergo_dex_core.onboarding import SetupResult
+
+    result = SetupResult(missing_inputs=[{"name": "mode", "detail": "choose"}])
+    assert setup_envelope(result).status.value == "error"
+
+
+@pytest.mark.parametrize("install", ["written", "planned"])
+def test_an_install_init_offers_makes_the_same_offer(tmp_path, install):
+    """The project file does not say +schema yet; the stored install will."""
+
+    _, allowlist = _allowlist(tmp_path, connector_config=_bigquery(), install=install)
+    assert allowlist["status"] == "proposed"
+    assert allowlist["namespace"] == "acme.analytics_elementary"
+
+
+def test_an_empty_allowlist_already_reaches_the_schema(tmp_path):
+    result, allowlist = _allowlist(
+        tmp_path, connector_config=_bigquery(datasets=(), prod=None)
+    )
+    assert (allowlist["status"], allowlist["reason_code"]) == (
+        "reached",
+        "unrestricted",
+    )
+    assert result.missing_inputs == []
+
+
+def test_an_allowlist_that_already_holds_the_schema_asks_nothing(tmp_path):
+    result, allowlist = _allowlist(
+        tmp_path,
+        connector_config=_bigquery(datasets=("raw", "analytics_elementary")),
+        models=ELEMENTARY_MODELS,
+    )
+    assert allowlist["status"] == "reached"
+    assert result.missing_inputs == [] and result.next_steps == []
+
+
+def test_an_unknown_production_schema_asks_for_prod(tmp_path):
+    result, allowlist = _allowlist(
+        tmp_path, connector_config=_bigquery(prod=None), models=ELEMENTARY_MODELS
+    )
+    assert (allowlist["status"], allowlist["reason_code"]) == (
+        "unresolved",
+        "prod_unset",
+    )
+    (missing,) = result.missing_inputs
+    assert missing["name"] == "elementary_schema"
+    assert missing["blocking"] is False
+    assert missing["command"].startswith("dex config set bigquery.prod ")
+    # Never the dev dataset, which is where dev builds write.
+    assert "dbt_dev" not in json.dumps(allowlist)
+
+
+def test_a_project_naming_macro_gets_a_template_to_fill_in(tmp_path):
+    result, allowlist = _allowlist(
+        tmp_path,
+        connector_config=_bigquery(),
+        models=ELEMENTARY_MODELS,
+        macro="{% macro generate_schema_name(c, n) %}x{% endmacro %}",
+    )
+    assert allowlist["reason_code"] == "custom_schema_naming"
+    assert (
+        "<the schema the Elementary package writes"
+        in result.missing_inputs[0]["command"]
+    )
+
+
+def test_applying_the_proposed_entry_reaches_the_schema(tmp_path, capsys):
+    import shlex
+
+    (tmp_path / ".dex").mkdir()
+    (tmp_path / ".dex/config.yml").write_text(
+        yaml.safe_dump(_bigquery(), sort_keys=False)
+    )
+    _, allowlist = _allowlist(
+        tmp_path, connector_config=_bigquery(), models=ELEMENTARY_MODELS
+    )
+    argv = shlex.split(allowlist["command"])[1:]
+    main(["--repo-root", str(tmp_path), *argv, "--confirm"])
+    capsys.readouterr()
+    written = config(tmp_path)
+    _, again = _allowlist(tmp_path, connector_config=written, models=ELEMENTARY_MODELS)
+    assert again["status"] == "reached"
+
+
+def test_duckdb_has_no_allowlist_to_propose_for(tmp_path, capsys, duckdb_file):
+    _adoptable(
+        tmp_path,
+        duckdb_file,
+        packages="packages:\n  - package: elementary-data/elementary\n"
+        "    version: 0.26.1\n",
+        installed="0.26.1",
+    )
+    code, result = run(tmp_path, capsys)
+    assert code == 0, result
+    assert result["status"] == "ok"
+    allowlist = result["data"]["elementary"]["allowlist"]
+    assert (allowlist["status"], allowlist["reason_code"]) == (
+        "not_applicable",
+        "no_allowlist",
+    )
+    assert result["data"]["missing_inputs"] == []
+
+
+def test_a_project_without_the_package_hears_nothing_about_its_schema(
+    tmp_path, capsys, duckdb_file
+):
+    _adoptable(tmp_path, duckdb_file)
+    code, result = run(tmp_path, capsys, "--no-elementary")
+    assert code == 0, result
+    assert "allowlist" not in result["data"]["elementary"]
+    assert result["data"]["missing_inputs"] == []

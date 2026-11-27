@@ -35,6 +35,7 @@ from typing import Any, Literal
 from pydantic import Field
 
 from .observations import UNKNOWN, Value, utc
+from .semantic_readers import SemanticReaders
 from .timeline import Break, CommitRange, RunPoint, UnobservedReason
 
 #: Who owns a cause: the loader (a source changed), a seed, the project (a
@@ -166,6 +167,10 @@ class Diagnosis(Value):
     exactly one, ``several`` with more, and ``no_cause`` with none, in which
     case ``ruled_out`` and ``unseen`` are the answer. ``next_steps`` hands a
     confirmed cause's repair to ``transform``; nothing here writes it.
+
+    ``semantic_readers`` is who reads what broke (#1478): the semantic-layer
+    objects that read the failing test's columns, and the metrics built on
+    them (:mod:`.semantic_readers`). ``None`` where the caller did not look.
     """
 
     subject: str
@@ -178,6 +183,7 @@ class Diagnosis(Value):
     snapshots: SnapshotBounds
     unseen: tuple[UnseenWindow, ...] = ()
     next_steps: tuple[dict[str, str], ...] = ()
+    semantic_readers: SemanticReaders | None = None
 
 
 def bisect(onset: Break) -> DiagnosisRange:
@@ -389,6 +395,7 @@ def diagnosis(
     series: Series,
     candidates: Iterable[Candidate],
     next_steps: Iterable[dict[str, str]] = (),
+    semantic_readers: SemanticReaders | None = None,
 ) -> Diagnosis:
     """One incident's diagnosis from its onset, the series and the candidates
     its checks answered. ``candidates`` are the checked ones; the project and
@@ -409,6 +416,7 @@ def diagnosis(
         snapshots=bounds,
         unseen=unseen(span, bounds),
         next_steps=tuple(next_steps) if confirmed else (),
+        semantic_readers=semantic_readers,
     )
 
 

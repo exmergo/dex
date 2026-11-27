@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from exmergo_dex_core.maintain.coverage_declarations import FACT_CAP, declarations
 from exmergo_dex_core.transform.claims import claim_id
 
@@ -296,6 +298,107 @@ def test_a_freshness_is_checked_by_verify_and_by_its_generated_test() -> None:
     assert _fact(out, "freshness", "loaded_at", model="untested")["checked_by"] == (
         "dex_verify"
     )
+
+
+def test_a_deadline_is_checked_by_verify_and_by_its_elementary_test() -> None:
+    # A daily deadline (#1486) is its own fact: verify's deadline_missed, and
+    # the data_freshness_sla monitors.vendor writes, at the same time and zone.
+    sla = {
+        "role": "time",
+        "freshness": {
+            "deadline": "07:00",
+            "timezone": "America/Chicago",
+            "basis": "capture",
+        },
+    }
+    manifest = _manifest(
+        [
+            _model("tested", columns={"loaded_at": sla}),
+            _model("moved", columns={"loaded_at": sla}),
+        ],
+        [
+            _test(
+                "data_freshness_sla",
+                "tested",
+                namespace="elementary",
+                kwargs={
+                    "timestamp_column": "loaded_at",
+                    "sla_time": "7:00",
+                    "timezone": "America/Chicago",
+                },
+            ),
+            # At another deadline: permits a late day the declaration forbids.
+            _test(
+                "data_freshness_sla",
+                "moved",
+                namespace="elementary",
+                kwargs={
+                    "timestamp_column": "loaded_at",
+                    "sla_time": "09:00",
+                    "timezone": "America/Chicago",
+                },
+            ),
+        ],
+    )
+    out = _run(manifest)
+    tested = _fact(out, "freshness", "loaded_at", model="tested")
+    assert (tested["checked_by"], tested["tests"], tested["verify"]) == (
+        "both",
+        ["elementary.data_freshness_sla"],
+        ["deadline_missed"],
+    )
+    assert _fact(out, "freshness", "loaded_at", model="moved")["checked_by"] == (
+        "dex_verify"
+    )
+
+
+@pytest.mark.parametrize(
+    ("declared_days", "test_days", "covered"),
+    [
+        (["mon"], ["Tuesday"], False),
+        (["mon", "fri"], ["Monday"], False),
+        (["mon"], ["Monday", "Friday"], True),
+        (["mon"], None, True),
+        (None, ["Monday"], False),
+        (None, None, True),
+    ],
+)
+def test_a_deadline_test_covers_it_only_on_every_declared_day(
+    declared_days, test_days, covered
+) -> None:
+    freshness: dict = {"deadline": "07:00", "timezone": "UTC", "basis": "capture"}
+    if declared_days is not None:
+        freshness["days"] = declared_days
+    kwargs: dict = {
+        "timestamp_column": "loaded_at",
+        "sla_time": "07:00",
+        "timezone": "UTC",
+    }
+    if test_days is not None:
+        kwargs["day_of_week"] = test_days
+    manifest = _manifest(
+        [_model("m", columns={"loaded_at": {"role": "time", "freshness": freshness}})],
+        [_test("data_freshness_sla", "m", namespace="elementary", kwargs=kwargs)],
+    )
+    fact = _fact(_run(manifest), "freshness", "loaded_at", model="m")
+    assert (fact["checked_by"] == "both") is covered
+
+
+def test_a_lag_and_a_deadline_are_two_facts() -> None:
+    both = {
+        "role": "time",
+        "freshness": {
+            "max_lag": "6h",
+            "deadline": "07:00",
+            "timezone": "UTC",
+            "basis": "capture",
+        },
+    }
+    out = _run(_manifest([_model("m", columns={"loaded_at": both})], []))
+    verify = sorted(
+        tuple(f["verify"]) for f in out["facts"] if f["fact"] == "freshness"
+    )
+    assert verify == [("deadline_missed",), ("freshness_exceeded",)]
 
 
 def test_a_continuity_is_checked_by_its_generated_test_alone() -> None:

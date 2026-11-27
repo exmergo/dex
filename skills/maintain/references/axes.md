@@ -417,6 +417,18 @@ Needs no baseline. The classes of finding:
     with `not_temporal`, `column_missing`, `probe_refused` or `scan_offered`).
     A `business` time can be legitimately old after a quiet period or a
     backfill, which the finding says; a `capture` time cannot.
+  - `deadline_missed` (high on a `capture` basis, medium on `business`), for a
+    time column whose `freshness` declares a daily `deadline` in a `timezone`
+    (optionally on `days` only): the deadline has passed today on the
+    warehouse's clock and the column holds no value from today's local
+    midnight on (`reason: not_today`, `no_rows` or `all_null`). The day is read
+    from the runner's clock in that zone, as Elementary's `data_freshness_sla`
+    reads it, and the check is counts only. Each deadline has its own record
+    under `data.freshness` (`check: deadline`, beside a lag's `check:
+    max_lag`), `not_applicable` before the deadline (`before_deadline`) or on a
+    day `days` leaves out (`not_scheduled`). On a `business` time a nightly
+    load of the previous day's events misses every day: the deadline belongs on
+    the load time.
 
   `null_rule: never` is not checked here: it renders as a `not_null` test.
   `data.suppressed` names `unit`, `additivity`, `population`,
@@ -585,7 +597,8 @@ one coverage number.
 - **Declarations.** `data.declarations.facts` holds one record per declared fact
   on the selected models: `fact` (`grain`, `key`, `foreign_key`, `references`,
   `null_rule`, `population_filter`, `population_parent`, `population_rule`,
-  `unit`, `additivity`, `history`, `freshness`, `continuity`), `column`, and
+  `unit`, `additivity`, `history`, `freshness` (a lag and a deadline are two
+  records), `continuity`), `column`, and
   `checked_by`: `dbt_test` (the generic `tests` that assert it run on every `dbt build`), `dex_verify` (the
   `verify` finding codes that can judge it on `maintain verify` or
   `transform build --verify`; that verify *can* judge it, not that it ran), `both`, `none`,
@@ -743,6 +756,39 @@ Two things look like drift and are not:
   `semantic_format_changed`, with definitions not compared by content until
   `maintain snapshot` baselines the new format. Added and removed definitions are
   still reported.
+
+## `maintain diagnose`: who reads the broken column
+
+`maintain diagnose` takes each open incident to a cause. One field of a
+diagnosis answers the question a person reading a metric asks first: does this reach me?
+`data.diagnoses[].semantic_readers` (#1478) names the semantic-layer objects
+that read the failing test's columns, read from dbt's semantic layer the way
+`maintain snapshot` fingerprints it, with no warehouse query.
+
+- `readers`: each entity, dimension and measure of a semantic model on the
+  tested model itself whose column is a tested one, with its `semantic_model`, `model`, `kind`, `name` and
+  `column`. A measure carries `metrics`: every metric whose input is the
+  measure, and every metric built on those.
+- `unresolved`: a member on the tested model whose expression is computed
+  (`computed_expression`), and a semantic model whose `model` names nothing Dex
+  can read (`model_unresolved`). Dex cannot say which column it reads, or
+  whether it reads one; nothing here guesses. A test on a versioned model
+  lists the members that read its column here too (`version_unresolved`,
+  with the `column`), since the fingerprint does not record which version a
+  semantic model's `ref()` resolves to.
+- `status`: `read` (the lists stand; an empty `readers` means no resolved
+  member on the tested model reads the column, and an `unresolved` one
+  still may), `absent` (no semantic layer), `unreadable`
+  (`unparsed_files`, each named in `unread_files`; `project_unreadable`;
+  `no_project`), or
+  `not_read` with `reason` `no_tested_column` or `vendor_not_covered` (a native
+  `semantic.vendor`, which this release does not match to a dbt model).
+
+Report these beside the cause: name the semantic models and metrics, and say
+which objects are unresolved rather than leaving them out. A semantic model on
+a model built from the tested one (a mart over a staging model) is not
+followed, as every `read` says in its `detail`, so an empty list is not proof
+that no metric downstream reads the column.
 
 ## What each axis costs
 

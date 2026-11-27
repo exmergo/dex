@@ -573,3 +573,154 @@ def test_the_config_verbs_need_no_dialect_engine_or_connector(tmp_path):
     written = path.read_text(encoding="utf-8")
     assert "max_rows: 5" in written
     assert "session_celing" not in written
+
+
+# --- set --comment (#1473) ----------------------------------------------------------
+
+ALLOWLIST = """\
+connector: bigquery
+bigquery:
+  project: acme
+  datasets:
+    # the loader's landing dataset
+    - raw
+  prod: analytics
+"""
+
+WHY = "The schema the package writes. Read by maintain incidents, priced first."
+
+
+def _set_comment(capsys, root, key, value, *extra):
+    return _run(capsys, root, "config", "set", key, value, "--comment", WHY, *extra)
+
+
+def test_an_unconfirmed_comment_is_shown_and_not_written(tmp_path, capsys):
+    path = _repo(tmp_path, ALLOWLIST)
+    _, envelope = _set_comment(capsys, tmp_path, "bigquery.datasets", "[raw, acme.edr]")
+    assert envelope["status"] == "needs_confirmation"
+    assert path.read_text() == ALLOWLIST
+    (diff,) = envelope["diffs"]
+    assert f"+    # {WHY}" in diff["unified"]
+    assert "+    - acme.edr" in diff["unified"]
+
+
+def test_a_confirmed_comment_sits_above_the_appended_item_and_keeps_the_rest(
+    tmp_path, capsys
+):
+    path = _repo(tmp_path, ALLOWLIST)
+    _set_comment(capsys, tmp_path, "bigquery.datasets", "[raw, acme.edr]", "--confirm")
+    assert path.read_text() == ALLOWLIST.replace(
+        "    - raw\n", f"    - raw\n    # {WHY}\n    - acme.edr\n"
+    )
+    # Run again: the value is already there, so nothing changes, no second comment.
+    _, envelope = _set_comment(
+        capsys, tmp_path, "bigquery.datasets", "[raw, acme.edr]", "--confirm"
+    )
+    assert envelope["status"] == "ok"
+    assert path.read_text().count(WHY) == 1
+
+
+def test_a_later_append_keeps_an_earlier_comment(tmp_path, capsys):
+    path = _repo(tmp_path, ALLOWLIST)
+    _set_comment(capsys, tmp_path, "bigquery.datasets", "[raw, acme.edr]", "--confirm")
+    _, envelope = _run(
+        capsys,
+        tmp_path,
+        "config",
+        "set",
+        "bigquery.datasets",
+        "[raw, acme.edr, staging]",
+        "--confirm",
+    )
+    text = path.read_text()
+    assert "# the loader's landing dataset" in text and WHY in text
+    assert text.endswith("    - staging\n  prod: analytics\n")
+    assert not [w for w in envelope["warnings"] if "drops" in w]
+
+
+def test_a_one_line_flow_list_becomes_a_block_list_to_hold_the_comment(
+    tmp_path, capsys
+):
+    path = _repo(
+        tmp_path, "connector: bigquery\nbigquery:\n  datasets: [raw]  # sources\n"
+    )
+    _set_comment(capsys, tmp_path, "bigquery.datasets", "[raw, edr]", "--confirm")
+    text = path.read_text()
+    assert text == (
+        "connector: bigquery\nbigquery:\n  datasets:\n    - raw\n"
+        f"    # {WHY}\n    - edr  # sources\n"
+    )
+
+
+def test_a_comment_on_a_value_that_is_not_an_appended_list_sits_above_the_key(
+    tmp_path, capsys
+):
+    path = _repo(tmp_path)
+    _run(
+        capsys,
+        tmp_path,
+        "config",
+        "set",
+        "query.max_rows",
+        "100",
+        "--comment",
+        "Agents page through results.",
+        "--confirm",
+    )
+    assert "query:\n  # Agents page through results.\n  max_rows: 100\n" in (
+        path.read_text()
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (
+            ["query.max_rows", "10", "budget.ceiling", "5", "--comment", "x"],
+            "one value",
+        ),
+        (["query.max_rows", "10", "--comment", "   "], "empty"),
+        (["query.max_rows", "10", "--comment", "token=abc123"], "credential"),
+    ],
+)
+def test_a_comment_that_cannot_be_written_is_refused(tmp_path, capsys, argv, message):
+    path = _repo(tmp_path)
+    _, envelope = _run(capsys, tmp_path, "config", "set", *argv, "--confirm")
+    assert envelope["status"] == "error"
+    assert message in envelope["errors"][0]
+    assert path.read_text() == CONFIG
+
+
+def test_the_command_init_proposes_runs_as_written(tmp_path, capsys):
+    """The proposed string, split as a shell splits it, writes a file that loads."""
+
+    import shlex
+
+    from exmergo_dex_core.config import load_config
+    from exmergo_dex_core.transform.elementary_schema import COMMENT, allowlist_command
+
+    path = _repo(tmp_path, ALLOWLIST)
+    command = allowlist_command("bigquery", ["raw"], "acme.analytics_elementary")
+    argv = shlex.split(command)[1:]
+    _, envelope = _run(capsys, tmp_path, *argv, "--confirm")
+    assert envelope["status"] == "ok"
+    assert COMMENT.split()[0] in path.read_text()
+    config = load_config(tmp_path)
+    assert config.bigquery.datasets == ["raw", "acme.analytics_elementary"]
+
+
+def test_a_prefix_item_that_changes_type_is_replaced_not_appended(tmp_path, capsys):
+    """`[True] == [1]` in Python, so the append path compares types too."""
+
+    path = _repo(
+        tmp_path,
+        "connector: duckdb\nduckdb:\n  path: demo.duckdb\ncache:\n  options:\n"
+        "    items:\n      - true\n",
+    )
+    _run(
+        capsys, tmp_path, "config", "set", "cache.options.items", "[1, 2]", "--confirm"
+    )
+    import yaml
+
+    assert yaml.safe_load(path.read_text())["cache"]["options"]["items"] == [1, 2]
+    assert "true" not in path.read_text()

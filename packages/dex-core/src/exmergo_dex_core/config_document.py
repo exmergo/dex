@@ -526,7 +526,9 @@ class ConfigDocument:
 
     # --- edits ----------------------------------------------------------------
 
-    def with_value(self, key: str, value: Any) -> ConfigDocument:
+    def with_value(
+        self, key: str, value: Any, *, comment: str | None = None
+    ) -> ConfigDocument:
         """A new document with ``key`` set to ``value``, every other byte kept.
 
         A value already in the file is replaced in place, so its trailing comment
@@ -534,19 +536,128 @@ class ConfigDocument:
         there, and missing parent blocks are created. The result is loaded and
         compared with what was intended before it is returned, and anything that
         does not match is refused rather than written.
+
+        A list written in block style that ``value`` extends keeps every line it
+        has, comments inside it included, and gains the new items after its last
+        one. ``comment`` (#1473) is written as ``#`` lines saying why the value
+        is there: directly above the first item appended to a list (a list
+        written on one line in flow style becomes a block list to hold it), and
+        otherwise directly above the key's own line. A comment already written
+        there is not written twice.
         """
 
         self._require_editable()
         parts = key.split(".")
         warnings: list[str] = []
-        edits = self._set_edits(parts, value, warnings)
+        appended = self._append_edits(parts, value, comment)
+        edits = (
+            appended
+            if appended is not None
+            else self._set_edits(parts, value, warnings)
+        )
         expected = copy.deepcopy(self._mapping())
         _assign(expected, parts, value)
         if len(parts) == 2 and parts[1] == "dev" and parts[0] in DEV_ALIASES:
             for alias in DEV_ALIASES[parts[0]]:
                 if isinstance(expected.get(parts[0]), dict):
                     expected[parts[0]].pop(alias, None)
-        return self._verified(_splice(self.text, edits), expected, key, warnings)
+        document = self._verified(_splice(self.text, edits), expected, key, warnings)
+        if comment and appended is None:
+            document = document._comment_above_key(parts, comment, expected, key)
+        return document
+
+    def _comment_lines(self, comment: str, pad: int) -> list[str]:
+        import textwrap
+
+        width = max(40, 80 - pad - 2)
+        return [
+            " " * pad + "# " + line
+            for line in textwrap.wrap(" ".join(comment.split()), width=width)
+        ]
+
+    def _written_above(self, at: int, lines: list[str]) -> bool:
+        """Whether ``lines`` already sit directly above offset ``at``."""
+
+        above = self.text[:at].splitlines()
+        return len(above) >= len(lines) and [
+            line.rstrip() for line in above[-len(lines) :]
+        ] == [line.rstrip() for line in lines]
+
+    def _append_edits(
+        self, parts: list[str], value: Any, comment: str | None
+    ) -> list[tuple[int, int, str]] | None:
+        """Edits that append ``value``'s new items to the list ``parts`` writes,
+        keeping every line already there, or None where ``value`` is not that
+        list extended (the ordinary replacement then applies)."""
+
+        if not isinstance(value, list):
+            return None
+        current = self.written(".".join(parts))
+        if not (
+            isinstance(current, list)
+            and len(value) > len(current)
+            and all(
+                type(old) is type(new) and old == new
+                for old, new in zip(current, value, strict=False)
+            )
+        ):
+            return None
+        chain = self._locate(parts)
+        if chain is None:
+            return None
+        mapping, index = chain[-1]
+        key_node, node = mapping.value[index]
+        if not isinstance(node, yaml.SequenceNode):
+            return None
+        added = value[len(current) :]
+        if not all(_flow_ok(item) and not isinstance(item, list) for item in added):
+            return None
+        if node.flow_style is not True and node.value:
+            first = self._line_start(node.value[0].start_mark.index)
+            pad = indent_of(self.text, first)
+            at = before_trailing_blanks(self.text, self._collection_end(node))
+            lines = self._comment_lines(comment, pad) if comment else []
+            if lines and self._written_above(at, lines):
+                lines = []
+            lines += [" " * pad + "- " + _inline(item) for item in added]
+            text = self._newline.join(lines) + self._newline
+            if at == len(self.text) and self.text and not self.text.endswith("\n"):
+                text = self._newline + text.rstrip("\r\n")
+            return [(at, at, text)]
+        if not comment:
+            return None
+        if node.start_mark.line != node.end_mark.line:
+            raise ConfigEditError(
+                f"{key_node.value} is a flow list across several lines in "
+                f"{CONFIG_RELPATH}, so a comment has no line of its own to go on; "
+                "edit it by hand"
+            )
+        pad = key_node.start_mark.column + self._unit
+        lines = [" " * pad + "- " + _inline(item) for item in current]
+        lines += self._comment_lines(comment, pad)
+        lines += [" " * pad + "- " + _inline(item) for item in added]
+        return [
+            (
+                self._colon_after(key_node),
+                node.end_mark.index,
+                self._newline + self._newline.join(lines),
+            )
+        ]
+
+    def _comment_above_key(
+        self, parts: list[str], comment: str, expected: dict[str, Any], key: str
+    ) -> ConfigDocument:
+        chain = self._locate(parts)
+        if chain is None:  # pragma: no cover - the value was just written
+            return self
+        mapping, index = chain[-1]
+        key_node = mapping.value[index][0]
+        at = self._line_start(key_node.start_mark.index)
+        lines = self._comment_lines(comment, key_node.start_mark.column)
+        if self._written_above(at, lines):
+            return self
+        text = self._newline.join(lines) + self._newline
+        return self._verified(_splice(self.text, [(at, at, text)]), expected, key, [])
 
     def without(self, key: str, *, duplicate_only: bool = False) -> ConfigDocument:
         """A new document with ``key`` removed, or this one when it is absent.

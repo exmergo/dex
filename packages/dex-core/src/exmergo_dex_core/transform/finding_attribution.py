@@ -43,6 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..manifest_paths import patch_file, posix
+from .global_edits import ATTRIBUTION_UNBOUNDED_KINDS
 
 #: The sweep history, written beside ``dex_previous_build.json``.
 HISTORY = "dex_verify_history.json"
@@ -96,6 +97,7 @@ _CODE_CLASSES: tuple[tuple[str, frozenset[str]], ...] = (
     ("no_entity_comparable", frozenset({"temporal"})),
     ("policy_missing", frozenset({"temporal"})),
     ("freshness_exceeded", frozenset({"freshness"})),
+    ("deadline_missed", frozenset({"freshness"})),
 )
 
 
@@ -110,11 +112,6 @@ def _classes(axis: str, code: str) -> frozenset[str] | None:
     return _AXIS_CLASSES.get(axis)
 
 
-#: Edit kinds whose reach the manifest's lineage cannot bound: a macro, the
-#: project config or the packages can change how any model compiles.
-_UNBOUNDED_KINDS = frozenset(
-    {"macro_sql", "project_yml", "packages_yml", "profiles_yml", "semantic_yml"}
-)
 #: Edit kinds whose own path is a node's file.
 _NODE_KINDS = frozenset({"model_sql", "snapshot_sql", "seed_csv", "test_sql"})
 
@@ -391,7 +388,7 @@ def plan_reach(edits: Iterable[Any], manifest: Mapping[str, Any] | None) -> Reac
     for edit in edits:
         kind = _kind(edit)
         path = PurePosixPath(str(getattr(edit, "path", ""))).as_posix()
-        if _op(edit) == "delete" or kind in _UNBOUNDED_KINDS:
+        if _op(edit) == "delete" or kind in ATTRIBUTION_UNBOUNDED_KINDS:
             bounded = False
             continue
         if kind in _NODE_KINDS:

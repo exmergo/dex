@@ -105,6 +105,53 @@ jobs:
           echo "test groups finished with: ${{ needs.test.result }}"
           exit 1
 
+  # The tests that run `git`, on the git Ubuntu 24.04 packages (#1579). Every
+  # other job uses the hosted runner's git, which is newer than what most Linux
+  # installs ship, and the two can differ in exactly the flags Dex uses: on
+  # 2.43.0, `git log --diff-filter=d` listed no commit that added the file, and
+  # three diagnose tests failed there while CI was green (#1574). Offline and
+  # quick, so it runs on every pull request. These tests also run in the groups
+  # above; this job repeats them on the older git.
+  packaged-git:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/dex-core
+    steps:
+      # Before checkout, so actions/checkout clones with this git rather than
+      # falling back to a tarball with no history.
+      - name: Install git from apt
+        working-directory: /
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The workspace belongs to the runner's user, not the container's root, and
+      # git refuses to read a repository someone else owns. hatch-vcs reads the
+      # version from it during the sync.
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - name: Sync (duckdb + dev extras)
+        run: uv sync --locked --extra duckdb --extra dev --python 3.14
+      - name: The git under test
+        run: git --version
+      # Every test file that calls git, directly or through snapshot_series,
+      # commit_history or downstream_impact.
+      - name: Tests that run git
+        run: >-
+          uv run --no-sync pytest -q
+          tests/maintain/test_diagnose.py
+          tests/maintain/test_diagnosis.py
+          tests/maintain/test_commit_order.py
+          tests/transform/test_downstream_impact.py
+          tests/test_manifest_paths.py
+
   # The safety spine is broken out as its own gate so a regression on a
   # safety-critical assertion is unmistakable in the checks list. Strict: an
   # unexpected pass (a placeholder going green early) is fine; a real

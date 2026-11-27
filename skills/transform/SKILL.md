@@ -175,7 +175,14 @@ the project edits, migrations and dev builds described below.
    re-drive the model from the child table. A change of driving relation or
    parent is `redriven` in `data.change_scope`, settled only at `request` or
    `contract` tier.
-6. **Maintain.** `dex maintain verify` checks the project as it stands;
+6. **Maintain.** When a test fails or a model is wrong, run
+   `dex maintain incidents` first, then `dex maintain diagnose` for an open
+   incident's cause and `dex maintain verify` on the models whose tests they
+   name. Where its `data.sources` reports Elementary `missing` or `refused`,
+   the run history was not read, which is not a clean history: the source's
+   `reason_code` says why, and for a project without the package
+   `data.next_steps` names the install `dex init` offers, which starts it.
+   `dex maintain verify` checks the project as it stands;
    `dex maintain check` compares it with the last `dex maintain snapshot`;
    `dex maintain reconcile` proposes the fix as a plan for `transform apply`.
 
@@ -470,9 +477,15 @@ fetches the engine's dependencies from PyPI or your configured index.
    declaration renders, each with its cadence tag, only where the project's
    `declarations.render_tests` turns them on. Never set that switch unasked. Relay
    `data.monitors` where present: the Elementary monitors a declared time column
-   writes when the project sets `monitors.vendor`, filtered to the declared
-   population, or why none was written (the package missing, disabled or
-   unknown on `dbt_prod_target`, or a filter it cannot write); never set that
+   and each small-domain dimension column write when the project sets
+   `monitors.vendor`, and the column monitors a `fraction` or `percent` unit or
+   a measure's additivity write (one per column, its monitor list the union),
+   and the `data_freshness_sla` a time column's declared daily `deadline`
+   writes (a `max_lag` never becomes one; on a `business` time it warns),
+   filtered to the declared population, or why none was
+   written (the package missing, disabled or unknown on `dbt_prod_target`, a
+   filter it cannot write, a dimension over the bound or flagged as personal
+   data, or one the cache has not profiled, with the profile to run); never set that
    setting unasked either (`${CLAUDE_SKILL_DIR}/references/declarations.md`).
    Relay `data.pii_tags` where present: the same setting tags each
    personal-data column and its model for Elementary. Say what

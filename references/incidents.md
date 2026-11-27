@@ -354,6 +354,23 @@ from them has a known start wherever an observed pass precedes its first
 failure. `plan_read(..., last=n)` reads only the newest `n` invocation rows (by
 `created_at`, ties by id), so a window can be a run count rather than a time.
 
+The reader reads releases 0.16.4 and 0.26.1 of the package, each matched
+exactly; any other release is `elementary_release_untested` and no table is
+read. Both releases lay out `dbt_invocations` and `elementary_test_results`
+alike and write the same values into every column the reader reads, so one
+read may span rows each wrote, as a table upgraded from one to the other holds.
+Rows written by any other release are refused (`elementary_rows_untested_release`). Two
+differences are named rather than absorbed:
+
+- 0.16.4's `test_result_rows` has no `row_index`. The layout check reports it
+  unobserved at that release, never as passing.
+- 0.16.4 writes `pass` for any test with zero failures, whatever dbt said, so a
+  failure whose `warn_if` or `error_if` holds at zero (`>=0`, `=0`) is stored as
+  a pass. In a run that release wrote, a pass from a test whose thresholds the
+  manifest does not show fire on a nonzero count alone is unobserved, and
+  counted under `passes_unobserved` with a warning. dbt's default `!=0` is a
+  pass as written.
+
 ### `dex maintain incidents`
 
 The command (`DexEngine.incidents`) reads both sources and folds them together,
@@ -372,12 +389,19 @@ hold the longer run history.
   two starts; `generated_at` is the run's end). It is then named under
   `window.after_window`, outside the count, which never exceeds the run count. A run that
   is neither has no place in the order and is left out of the fold, with
-  `folded: false`.
+  `folded: false`. A run placed in Elementary's window or after it sits in
+  Elementary's order, so the run-results note that no failure has a known
+  start is left out there. Where the run itself opened incidents with no
+  known start (a test Elementary holds no result for), a note in its place
+  counts those incidents alone, since others in the same fold can be dated.
+  A run read alone, or with no place, keeps the note as written.
 - **Every source answers.** `data.sources` reports each source `read`, `missing`
   or `refused` with a reason code: no package (`not_installed`, with the
   `dex init` that offers it), a package whose uploads are off (`not_uploading`),
   a schema outside the source allowlist (`outside_allowlist`, with the
-  `dex config set` that adds it; nothing is read past the allowlist), a
+  `dex config set` that adds it, carrying the comment the entry keeps in the
+  file; nothing is read past the allowlist, and `dex init` proposes the same
+  entry for the schema the package writes in production), a
   connection or catalog that could not be read (`connection_unavailable`,
   `catalog_unavailable`), a read that could not be priced (`unpriced`: it is
   never asked for at a lower price than it would spend), a statement the
@@ -437,6 +461,37 @@ and takes each open incident to a cause, or to none.
 - **The repair is `transform`'s.** A confirmed cause carries the
   `dex transform plan` step that would repair it under `next_steps`. Nothing
   here writes it.
+- **Who reads it.** Beside the cause, `semantic_readers` (#1478) names the
+  semantic-layer objects that read the failing test's columns: the model and
+  columns come from the test's node in the manifest (a uniqueness test's
+  claim, else the column it is attached to), and the readers from dbt's
+  semantic layer as `maintain snapshot` fingerprints it, which maps each
+  entity, dimension and measure to the one column it references. Only the
+  semantic models on the tested model itself are matched: one on a mart that
+  selects the column from the tested staging model is not followed, and every
+  `read` says so in its `detail`. Each reader
+  names its semantic model, the model it sits on, its kind and column, and for
+  a measure the metrics built on it, through every metric built on those. A
+  member on the tested model whose expression is computed, and a semantic model
+  whose `model` names nothing readable, are listed as `unresolved`, never
+  guessed: Dex cannot say which column such a member reads, or whether it
+  reads one (`count` over `1` reads none). A test on a versioned model lists
+  the members that read its column as `unresolved` too (`version_unresolved`,
+  with the `column`), never as readers, since the fingerprint keeps a
+  semantic model's `ref()` by name and not the version it resolves to.
+  Three readings are kept apart: `read` with an empty `readers` list (the
+  layer was read and no resolved member on the tested model reads the
+  column; an `unresolved` member still may),
+  `absent` (the project declares no semantic layer) and `unreadable` (a layer
+  is there and could not be read: `unparsed_files`, each named in
+  `unread_files`, which beside a layer that was read means the list may be
+  short; `project_unreadable`; `no_project`). `not_read` says why the
+  layer was not looked up: `no_tested_column`, or `vendor_not_covered` where
+  `semantic.vendor` names a native layer, whose semantic models name a
+  relation rather than the dbt model a test is attached to. A metric's filter
+  or grouping on a dimension is not traced, nor is a semantic model written
+  inline under a model's `models:` entry, which the fingerprint does not read.
+  Repo-only: no warehouse query.
 - **Priced.** The incident read prices its own statements first; the checks
   are then priced together as one handshake before any probe runs, within
   what the per-command ceiling has left after the read. Checks that do not

@@ -53,15 +53,24 @@ How it maps:
   in a run, and nothing for every other test. dbt reports one result per test,
   so a column filled for a column-level generic test would put one failure on
   two keys: one from this source and one from ``run_results.json``.
-- Every invocation read must have been written by the release the layout check
-  held. A table built at an older release keeps its rows, and those are refused,
-  since nobody read what that release's rows mean; ``since`` reads past them.
+- Every invocation read must have been written by a release whose rows read as
+  the checked release's do (:func:`~.elementary_layouts.compatible_releases`):
+  the same columns of both tables, in the same families. 0.16.4 and 0.26.1 are,
+  so a table upgraded from one to the other reads whole (#1470). Rows of any
+  other release are refused, since nobody read what they mean; ``since`` reads
+  past them.
+- 0.16.4 writes ``pass`` for any test with zero failures, whatever dbt said
+  (``pass_at_zero_failures`` in the layout file), so a failure whose
+  ``warn_if`` or ``error_if`` holds at zero is stored as a pass. In a run that
+  release wrote, a pass is good only for a test the caller names in
+  ``zero_means_pass`` (its thresholds fire on a nonzero count alone); any other
+  pass is unobserved, and counted, never good.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -73,7 +82,13 @@ from ..command_args import billed_handshake
 from ..config import QueryLimits
 from ..transform.elementary import release_key
 from ..values_free import require_allowed
-from .elementary_layouts import CheckedTable, adapter_catalog, check_layouts
+from .elementary_layouts import (
+    CheckedTable,
+    adapter_catalog,
+    check_layouts,
+    compatible_releases,
+    layout_for,
+)
 from .elementary_refusals import (
     ID_TOO_LONG,
     INVOCATION_REPEATED,
@@ -245,6 +260,10 @@ class ElementaryRead:
     unplaced: int
     commits_unread: int
     severities_unread: int
+    #: Observations whose row said ``pass`` in a run whose release writes
+    #: ``pass`` for any test with zero failures, from a test not known to fail
+    #: only on a nonzero count: unobserved, since the row cannot tell (#1470).
+    passes_unobserved: int = 0
 
 
 @dataclass(frozen=True)
@@ -328,11 +347,16 @@ def read_elementary(
     bounds: ReadBounds | None = None,
     handshake: Callable[..., None] | None = None,
     adapter: Any | None = None,
+    zero_means_pass: Collection[str] | None = None,
 ) -> ElementaryRead:
     """Run ``plan`` and turn what it reads into observations and a history.
 
     ``claims`` maps a test's ``unique_id`` to the claim id its
-    ``config.meta.dex.claim`` carries, from the manifest. ``handshake`` stands
+    ``config.meta.dex.claim`` carries, from the manifest. ``zero_means_pass``
+    names the tests whose ``warn_if`` and ``error_if`` fire only on a nonzero
+    failure count, from the manifest: in a run written by a release that writes
+    ``pass`` for any test with zero failures (0.16.4), a pass from any other
+    test is unobserved. ``None`` knows no test's thresholds. ``handshake`` stands
     in for the billed handshake, which it must call or replace. ``adapter`` is
     the caller's open adapter, as on :func:`plan_read`: acquiring it again would
     settle the gate the caller reserved on and start a fresh one.
@@ -347,7 +371,7 @@ def read_elementary(
     invocation_rows = _rows(engine, adapter, plan.invocations, limit.invocations, spend)
     result_rows = _rows(engine, adapter, plan.results, limit.result_rows, spend)
     runs = _invocations(invocation_rows, plan.release)
-    built = _Observations(runs, dict(claims or {}))
+    built = _Observations(runs, dict(claims or {}), frozenset(zero_means_pass or ()))
     built.add(result_rows)
     observations = built.observations()
     return ElementaryRead(
@@ -372,6 +396,7 @@ def read_elementary(
         unplaced=built.unplaced,
         commits_unread=sum(1 for run in runs if run.commit is None),
         severities_unread=built.severities_unread,
+        passes_unobserved=built.passes_unobserved,
     )
 
 
@@ -692,9 +717,15 @@ def _distinct(rows: Iterable[_Invocation]) -> list[_Invocation]:
 
 
 def _one_release(rows: Iterable[_Invocation], release: str) -> None:
+    """Every run was written by a release whose rows read as ``release``'s."""
+
+    readable = {
+        release_key(known)
+        for known in compatible_releases(release, (INVOCATIONS, RESULTS))
+    }
     others: dict[str, int] = {}
     for invocation in rows:
-        if release_key(invocation.version) != release_key(release):
+        if release_key(invocation.version) not in readable:
             name = _release_label(invocation.version)
             others[name] = others.get(name, 0) + 1
     if others:
@@ -703,9 +734,9 @@ def _one_release(rows: Iterable[_Invocation], release: str) -> None:
         )
         raise ElementaryReadError(
             RELEASE_MIXED,
-            f"runs written by a release other than {release} ({named}); the reader "
-            f"reads only rows its layout check held, so read from after the "
-            "upgrade with since",
+            f"runs written by a release whose rows do not read as {release}'s "
+            f"({named}); the reader reads only rows its layout check holds, so "
+            "read from after the upgrade with since",
             others,
         )
 
@@ -763,6 +794,9 @@ class _Row:
     status: str
     #: The row named a severity that is not a token, so it carries none.
     severity_unread: bool = False
+    #: The row said ``pass``, and its run's release writes that for any test
+    #: with zero failures: read as unobserved.
+    pass_unread: bool = False
 
 
 def _severity(value: str | None) -> tuple[str | None, bool]:
@@ -800,6 +834,7 @@ class _Observations:
 
     runs: Sequence[_Invocation]
     claims: Mapping[str, str]
+    zero_means_pass: frozenset[str] = frozenset()
     duplicates: int = 0
     merged: int = 0
     unplaced: int = 0
@@ -815,9 +850,25 @@ class _Observations:
     def unattributed(self) -> int:
         return self._no_id + len(self._untested)
 
+    #: Kept observations read as unobserved for their release's pass rule.
+    passes_unobserved: int = 0
+
     @property
     def severities_unread(self) -> int:
         return sum(1 for row in self._seen.values() if row.severity_unread)
+
+    #: Each run, and whether its release writes ``pass`` for any test with zero
+    #: failures. Every run was held to a recorded release before this.
+    _forcing: dict[str, bool] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._forcing = {
+            invocation.run: layout_for(invocation.version).pass_at_zero_failures
+            for invocation in self.runs
+        }
+
+    def _forced_pass(self, run: str | None) -> bool:
+        return self._forcing.get(run or "", False)
 
     def add(self, rows: Iterable[Sequence[Any]]) -> None:
         # In order: the id is held to its length before it keys anything, a
@@ -888,7 +939,16 @@ class _Observations:
             else Signal()
         )
         token, unread = _severity(severity)
-        return _Row(rid, run or "", test, signal, outcome, token, word, unread)
+        pass_unread = (
+            word == "pass"
+            and test not in self.zero_means_pass
+            and self._forced_pass(run)
+        )
+        if pass_unread:
+            outcome = "unobserved"
+        return _Row(
+            rid, run or "", test, signal, outcome, token, word, unread, pass_unread
+        )
 
     def observations(self) -> tuple[Observation, ...]:
         placed = {run.run: (index, run) for index, run in enumerate(self.runs, start=1)}
@@ -900,13 +960,27 @@ class _Observations:
             held = kept.get(key)
             if held is not None:
                 self.merged += 1
-                if _PRECEDENCE[row.status] >= _PRECEDENCE[held.status]:
+                if _rank(row) >= _rank(held):
                     continue
             kept[key] = row
+        self.passes_unobserved = sum(1 for row in kept.values() if row.pass_unread)
         return tuple(
             _observation(subject, row, *placed[row.run])
             for (subject, _, _), row in sorted(kept.items(), key=_kept_order(placed))
         )
+
+
+#: The outcome a run keeps when one subject and signal has several rows: a
+#: failure over an observed pass over an unobserved one.
+_OUTCOME_RANK = {"bad": 0, "good": 1, "unobserved": 2}
+
+
+def _rank(row: _Row) -> tuple[int, int]:
+    """Which of two rows a run keeps, lower first: by outcome, so an observed
+    pass is kept over a pass its release could not tell from a failure
+    (#1470), then by the status precedence dbt's results use."""
+
+    return (_OUTCOME_RANK[row.outcome], _PRECEDENCE[row.status])
 
 
 def _kept_order(placed: Mapping[str, tuple[int, _Invocation]]) -> Callable[..., tuple]:

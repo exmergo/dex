@@ -1,9 +1,13 @@
-"""The Elementary fixture on Postgres, at the releases most installs pin (#1331).
+"""The Elementary fixture on Postgres, at the releases DuckDB cannot build (#1331).
 
 DuckDB can build only package 0.23.0 and later, so the fixture's own tests
 (``tests/transform/test_elementary_fixture.py``) never run the 0.15 and 0.16
-series. Postgres macros exist at both, and the seeded container is free and
-keyless, so the same variants and the same census run here.
+series most installs pin, nor 0.20.0, the sample-flag boundary (#1446).
+Postgres macros exist at all three, and the seeded container is free and
+keyless, so the same variants and the same census run here. The releases are
+``POSTGRES_VERSIONS``, the Postgres slots of the fixture's release matrix.
+The incident reader's 0.16.4 layouts (#1470) are read back here too, since
+that release has no DuckDB macros.
 
 Opt-in twice over: ``DEX_TEST_PG_DSN`` for the database, like every Postgres
 integration test, and ``DEX_TEST_ELEMENTARY=1`` because installing the package
@@ -12,6 +16,7 @@ needs the dbt package hub.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -21,6 +26,9 @@ from transform.elementary_fixture import (
     CURRENT_VERSION,
     LEGACY_VERSIONS,
     MATERIALIZATION_LINE,
+    POSTGRES_STG_ORDERS_SQL,
+    POSTGRES_VERSIONS,
+    SAMPLE_FLAG_VERSION,
     TEMP_TABLE_LINE,
     VARIANTS,
     PostgresTarget,
@@ -30,6 +38,7 @@ from transform.elementary_fixture import (
     footprint,
     postgres_census,
     requires_elementary,
+    strip_sampling_switch,
 )
 from transform.elementary_fixture import elementary_installs as elementary_installs
 
@@ -111,9 +120,9 @@ def _dbt(project: Path, *argv: str, check: bool = True) -> str:
     return dbt(*argv, *here, "--target", "dev", cwd=project, check=check)
 
 
-@pytest.mark.parametrize("version", LEGACY_VERSIONS)
+@pytest.mark.parametrize("version", POSTGRES_VERSIONS)
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_each_variant_builds_at_the_releases_most_installs_pin(
+def test_each_variant_builds_at_each_postgres_slot(
     tmp_path: Path,
     elementary_installs: Callable[[str], Path],
     target: PostgresTarget,
@@ -121,8 +130,8 @@ def test_each_variant_builds_at_the_releases_most_installs_pin(
     variant: str,
     version: str,
 ):
-    """Every variant parses and builds at 0.16 and 0.15, and the census tells
-    apart as it does on a current release. The census shows whether the
+    """Every variant parses and builds at 0.20.0, 0.16 and 0.15, and the census
+    tells apart as it does on a current release. The census shows whether the
     package's models built (not on d, which disables them for dev), and
     Elementary's debug log shows whether its ``test`` materialization handled
     the tests and routed them through temp tables. The census cannot stand in
@@ -148,7 +157,7 @@ def test_each_variant_builds_at_the_releases_most_installs_pin(
 
 @pytest.mark.parametrize(
     ("version", "variant"),
-    [(version, variant) for version in LEGACY_VERSIONS for variant in ("a", "e")],
+    [(version, variant) for version in POSTGRES_VERSIONS for variant in ("a", "e")],
 )
 def test_a_mutation_run_leaves_the_dev_schemas_as_it_found_them(
     tmp_path: Path,
@@ -161,8 +170,9 @@ def test_a_mutation_run_leaves_the_dev_schemas_as_it_found_them(
     """The holding arm (#1307) at the releases DuckDB cannot build. On variant a
     the copy disables the package's models, which at 0.15 and 0.16 is also what
     keeps its hooks from running, since those releases' hooks do not check that
-    the package is enabled; on variant e they stay enabled and only the
-    monitoring tests are left out. Either way the dev schemas are unchanged."""
+    the package is enabled (from 0.20.0 they do, and return early); on variant
+    e they stay enabled and only the monitoring tests are left out. Either way
+    the dev schemas are unchanged."""
 
     project = elementary_project(
         tmp_path, variant, elementary_installs(version), postgres=target
@@ -180,7 +190,7 @@ def test_a_mutation_run_leaves_the_dev_schemas_as_it_found_them(
     assert codes == {"elementary_history" if variant == "e" else "elementary_disabled"}
 
 
-@pytest.mark.parametrize("version", LEGACY_VERSIONS)
+@pytest.mark.parametrize("version", POSTGRES_VERSIONS)
 def test_without_the_fix_a_mutation_run_leaves_rows_in_the_dev_elementary_schema(
     tmp_path: Path,
     elementary_installs: Callable[[str], Path],
@@ -217,7 +227,11 @@ def test_without_the_fix_a_mutation_run_leaves_rows_in_the_dev_elementary_schema
 
 @pytest.mark.parametrize(
     ("version", "sampled"),
-    [*((version, 2) for version in LEGACY_VERSIONS), (CURRENT_VERSION, 1)],
+    [
+        *((version, 2) for version in LEGACY_VERSIONS),
+        (SAMPLE_FLAG_VERSION, 1),
+        (CURRENT_VERSION, 1),
+    ],
 )
 def test_the_per_test_sampling_switch_is_ignored_before_0_20(
     tmp_path: Path,
@@ -227,12 +241,15 @@ def test_the_per_test_sampling_switch_is_ignored_before_0_20(
     version: str,
     sampled: int,
 ):
-    """``meta: {disable_test_samples: true}`` first appears in package 0.20.0
-    (read in source on #1331; this runs it). Two tests fail alike, one carrying
-    the switch. At 0.16 and 0.15 Elementary stores a sample of the failing rows
-    for both; on a current release, on the same warehouse, only for the one
-    without it. So a test Dex renders with the switch (#1306) still has its
-    failing rows sampled on the older releases."""
+    """``meta: {disable_test_samples: true}`` is honoured at 0.20.0 and on a
+    current release, and ignored at 0.16 and 0.15 (#1331). Two tests fail
+    alike, one carrying the switch. At 0.16 and 0.15 Elementary stores a sample
+    of the failing rows for both; at 0.20.0 and on a current release, on the
+    same warehouse, only for the one without it. So a test Dex renders with the
+    switch (#1306) still has its failing rows sampled on the older releases.
+    Read in source at the package's tags, the switch is already in 0.19.2's
+    test materialization; the engine's warning (#1381), and this slot, draw
+    the line at 0.20.0."""
 
     project = elementary_project(
         tmp_path, "a", elementary_installs(version), postgres=target
@@ -249,6 +266,68 @@ def test_the_per_test_sampling_switch_is_ignored_before_0_20(
     assert now - was == sampled
 
 
+def _with_one_duplicated_key(project: Path) -> None:
+    """Give ``stg_orders`` the row for id 1 twice, so the grain's ``unique`` test
+    on ``fct`` fails on exactly one key. On DuckDB the row is inserted into the
+    raw table; on Postgres the staging model generates its rows, so it is
+    generated twice."""
+
+    rows = POSTGRES_STG_ORDERS_SQL.strip()
+    duplicated = (
+        f"select * from ({rows}) as s\nunion all\n"  # noqa: S608  (a fixed model)
+        f"select * from ({rows}) as d where d.id = 1\n"
+    )
+    (project / "models" / "stg_orders.sql").write_text(duplicated, encoding="utf-8")
+
+
+@pytest.mark.parametrize("version", [SAMPLE_FLAG_VERSION])
+def test_a_failing_rendered_test_keeps_no_sample_from_the_sample_flag_boundary(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    target: PostgresTarget,
+    dev_dsn: str,
+    version: str,
+):
+    """The DuckDB file's #1306 case, at the sample-flag boundary (#1446), on
+    variant a, where Elementary's materialization handles the tests. The
+    grain's ``unique`` test as Dex renders it carries ``disable_test_samples``,
+    so when it fails it adds no row to ``test_result_rows``; the same test with
+    the switch removed adds one, so the census can see a sample when there is
+    one. A render that lost the switch fails here, at the first release the
+    engine's warning (#1381) says honours it."""
+
+    project = elementary_project(
+        tmp_path, "a", elementary_installs(version), postgres=target
+    )
+    _with_one_duplicated_key(project)
+    _dbt(project, "run")
+    rows = (target.elementary_schema, "test_result_rows", "BASE TABLE")
+    run_results = project / "target" / "run_results.json"
+
+    def sampled() -> int:
+        before = postgres_census(dev_dsn)
+        # Removed first, so a run that wrote no results cannot be read as the
+        # previous arm's.
+        run_results.unlink(missing_ok=True)
+        log = _dbt(project, "test", "--select", "unique_fct_id", check=False)
+        # An errored test also leaves no sample, so only a completed failure on
+        # the one duplicated key measures the switch.
+        [result] = [
+            r
+            for r in json.loads(run_results.read_text(encoding="utf-8"))["results"]
+            if r["unique_id"].startswith("test.")
+        ]
+        assert (result["status"], result["failures"]) == ("fail", 1), (
+            f"the rendered unique test is meant to fail on one key:\n{log}"
+        )
+        was, now = footprint(before, postgres_census(dev_dsn)).get(rows, (0, 0))
+        return now - was
+
+    assert sampled() == 0, "the test Dex rendered kept a sample of its failing rows"
+    strip_sampling_switch(project)
+    assert sampled() == 1, "without the switch the failing test kept no sample"
+
+
 def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag(
     tmp_path: Path,
     elementary_installs: Callable[[str], Path],
@@ -256,9 +335,11 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
     dev_dsn: str,
 ):
     """At 0.16.4 variant a, declaring a model with a single-column grain warns that
-    Elementary ignores disable_test_samples; at 0.26.1 and on variant b, none (#1381).
+    Elementary ignores disable_test_samples; at 0.20.0, the first release the
+    warning treats as honouring it (#1446), at 0.26.1 and on variant b, none
+    (#1381).
 
-    The three builds share the dev schemas, so each starts from empty ones: a
+    The four builds share the dev schemas, so each starts from empty ones: a
     0.16.4 build over 0.26.1's tables fails migrating them, since 0.16.4 drops a
     column a view 0.26.1 built still reads.
     """
@@ -274,6 +355,20 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
     )
     assert any("ignores disable_test_samples" in w for w in result_016.warnings)
     assert any("0.16.4" in w for w in result_016.warnings)
+
+    # Variant a at 0.20.0, the boundary: no warning
+    _empty(dev_dsn, target)
+    project_020 = elementary_project(
+        tmp_path / "a_020",
+        "a",
+        elementary_installs(SAMPLE_FLAG_VERSION),
+        postgres=target,
+    )
+    _dbt(project_020, "build")
+    result_020 = _engine(project_020).declare(
+        ["stg_orders"], declarations=[{"model": "stg_orders", "grain": ["id"]}]
+    )
+    assert not any("disable_test_samples" in w for w in result_020.warnings)
 
     # Variant a at 0.26.1: Elementary honors disable_test_samples, so no warning
     _empty(dev_dsn, target)
@@ -298,3 +393,137 @@ def test_declaring_a_model_warns_when_installed_elementary_ignores_sampling_flag
         ["stg_orders"], declarations=[{"model": "stg_orders", "grain": ["id"]}]
     )
     assert not any("disable_test_samples" in w for w in result_b.warnings)
+
+
+# --- the incident reader at 0.16.4 (#1470) -----------------------------------------
+
+#: The release the reader gained: the series most installs pin, which builds on
+#: Postgres only.
+READER_OLD = "0.16.4"
+
+
+def _test_results(project: Path, *argv: str) -> dict:
+    """Run ``dbt test`` and return the run results it wrote."""
+
+    run_results = project / "target" / "run_results.json"
+    run_results.unlink(missing_ok=True)
+    _dbt(project, "test", *argv, check=False)
+    return json.loads(run_results.read_text(encoding="utf-8"))
+
+
+def _elementary_columns(dsn: str, schema: str, table: str) -> list[tuple[str, str]]:
+    import psycopg
+
+    with psycopg.connect(dsn) as con:
+        return con.execute(
+            "select column_name, data_type from information_schema.columns "
+            "where table_schema = %s and table_name = %s order by ordinal_position",
+            (schema, table),
+        ).fetchall()
+
+
+@pytest.mark.parametrize("variant", ["a", "b"])
+def test_the_reader_reads_what_0_16_4_recorded_and_refuses_a_dropped_column(
+    tmp_path: Path,
+    elementary_installs: Callable[[str], Path],
+    target: PostgresTarget,
+    dev_dsn: str,
+    variant: str,
+):
+    """#1470 on the package itself. At 0.16.4 the four tables are built as the
+    recorded layout says, column for column, and the catalog check passes on
+    them through the Postgres adapter. One ``dbt run`` and two ``dbt test`` give
+    three runs in start order; every test is observed with dbt's outcome, and
+    the grain's ``unique`` test, failing on one duplicated key, is one open
+    incident through ``maintain incidents``. Variant a runs the tests through
+    Elementary's materialization and b through dbt's. Dropping a column the
+    reader reads then refuses ``elementary_column_missing``."""
+
+    import psycopg
+    from psycopg import sql
+
+    from exmergo_dex_core.maintain.elementary_layouts import (
+        ElementaryLayoutError,
+        adapter_catalog,
+        check_layouts,
+        layout_for,
+        type_family,
+    )
+    from exmergo_dex_core.results import to_envelope
+
+    project = elementary_project(
+        tmp_path, variant, elementary_installs(READER_OLD), postgres=target
+    )
+    _with_one_duplicated_key(project)
+    run_results = project / "target" / "run_results.json"
+    _dbt(project, "run")
+    ran = json.loads(run_results.read_text(encoding="utf-8"))
+    tested = [_test_results(project) for _ in range(2)]
+    [unique] = [
+        r
+        for r in tested[-1]["results"]
+        if r["unique_id"].split(".")[2] == "unique_fct_id"
+    ]
+    assert (unique["status"], unique["failures"]) == ("fail", 1)
+
+    schema = target.elementary_schema
+    layout = layout_for(READER_OLD)
+    for table, recorded in layout.tables.items():
+        built = _elementary_columns(dev_dsn, schema, table)
+        assert [name for name, _ in built] == [name for name, _ in recorded.columns]
+        for name, data_type in built:
+            assert type_family(data_type) == recorded.family(name), (table, name)
+
+    engine = _engine(project)
+    adapter = engine._adapter("maintain incidents")
+    namespace = f"{target.dbname}.{schema}"
+    check = check_layouts(READER_OLD, adapter_catalog(adapter, namespace))
+    assert check.release == READER_OLD
+    [rows] = [t for t in check.tables if t.table == "test_result_rows"]
+    assert rows.unobserved == ("row_index",)
+
+    data = to_envelope(engine.incidents()).data
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["release"]) == ("read", READER_OLD), (
+        elementary
+    )
+    assert elementary["passes_unobserved"] == 0
+    runs = [ran, *tested]
+    assert data["window"]["count"] >= len(runs)
+    opened = [
+        i
+        for i in data["incidents"]
+        if any(test.split(".")[2] == "unique_fct_id" for test in i["tests"])
+    ]
+    [incident] = opened
+    assert (incident["state"], incident["opening_source"]) == ("open", "elementary")
+    # The dbt run tests nothing and both test runs fail, so no observed pass
+    # precedes the failure and nothing dates its start.
+    assert incident["first_observed"] == "unknown"
+    ledger = (project.parent / ".dex" / "queries.jsonl").read_text(encoding="utf-8")
+    entries = [json.loads(line) for line in ledger.splitlines() if line.strip()]
+    assert entries
+    for entry in entries:
+        lowered = entry["sql"].lower()
+        for column in ("result_rows", "test_results_description", "test_params"):
+            assert column not in lowered, (column, entry["decision"])
+
+    with psycopg.connect(dev_dsn, autocommit=True) as con:
+        con.execute(
+            sql.SQL("alter table {} drop column status cascade").format(
+                sql.Identifier(schema, "elementary_test_results")
+            )
+        )
+    with pytest.raises(ElementaryLayoutError) as caught:
+        check_layouts(
+            READER_OLD,
+            adapter_catalog(_engine(project)._adapter("maintain incidents"), namespace),
+        )
+    assert [(p.code, p.table, p.column) for p in caught.value.problems] == [
+        ("elementary_column_missing", "elementary_test_results", "status")
+    ]
+    after = to_envelope(_engine(project).incidents()).data["sources"]["elementary"]
+    assert (after["status"], after["reason_code"]) == (
+        "refused",
+        "elementary_column_missing",
+    )

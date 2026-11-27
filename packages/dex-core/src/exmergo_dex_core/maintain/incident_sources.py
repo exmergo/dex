@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from .. import command_args
 from ..errors import RequestError
+from ..transform.elementary_schema import Located, allowlist_command, entries
 from ..values_free import require_allowed
 from .commit_history import CommitHistory
 from .coverage_runs import current_tests, parse_time
@@ -215,6 +216,7 @@ def read(
     warnings.extend(elementary.extra.pop("_warnings", []))
     dbt = _dbt(project_dir, manifest, claims, elementary.history, steps, notes)
     warnings.extend(dbt.extra.pop("_warnings", []))
+    held_at: int | None = dbt.extra.pop("_held_note_at", None)
 
     read = [source for source in (elementary, dbt) if source.history is not None]
     observations = [
@@ -236,6 +238,17 @@ def read(
         now=datetime.now(UTC),
         history=history,
     )
+    if held_at is not None:
+        undated = sum(
+            1
+            for incident in fold.incidents
+            if incident.opening_source == "dbt_run_results"
+            and incident.first_observed == "unknown"
+        )
+        if undated:
+            # Where the file's own note would have been, so the notes keep the
+            # order every other placement gives them.
+            notes.insert(held_at, _only_dbt_reports(undated))
     if dbt.history is not None and elementary.status != "read":
         notes.append(
             "dbt's run_results.json holds one invocation, so a failure it reports "
@@ -491,19 +504,74 @@ def _elementary(
         refusal.extra["release"] = runtime.release
         return refusal
     return _read_elementary(
-        engine, located, runtime.release, claims, window_size, warned, command
+        engine,
+        located,
+        runtime.release,
+        claims,
+        window_size,
+        warned,
+        command,
+        zero_means_pass(manifest),
     )
 
 
-@dataclass(frozen=True)
-class _Located:
-    """Where the manifest says the package builds its tables."""
+#: A ``warn_if`` or ``error_if`` dbt accepts as Dex reads it: a comparison with
+#: one number, which dbt renders after the failure count (``count != 0``).
+_THRESHOLD = re.compile(r"^\s*(==|=|!=|<>|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
 
-    database: str | None
-    schema: str
+_AT_ZERO = {
+    "=": lambda n: n == 0,
+    "==": lambda n: n == 0,
+    "!=": lambda n: n != 0,
+    "<>": lambda n: n != 0,
+    "<": lambda n: n > 0,
+    "<=": lambda n: n >= 0,
+    ">": lambda n: n < 0,
+    ">=": lambda n: n <= 0,
+}
 
-    def spelled(self) -> str:
-        return f"{self.database}.{self.schema}" if self.database else self.schema
+
+def holds_at_zero(condition: Any) -> bool:
+    """Whether a test threshold can hold when the test counts zero failures.
+
+    dbt fails (or warns) where ``<failures> <condition>`` is true. A condition
+    that is not one comparison with a number is SQL Dex does not evaluate, and
+    reads as possibly true. dbt's default, ``!=0``, is false at zero.
+    """
+
+    if condition is None:
+        return False
+    match = _THRESHOLD.match(str(condition))
+    if match is None:
+        return True
+    operator, number = match.groups()
+    return _AT_ZERO[operator](float(number))
+
+
+def zero_means_pass(manifest: Mapping[str, Any]) -> frozenset[str]:
+    """The manifest's tests whose ``warn_if`` and ``error_if`` both fire on a
+    nonzero failure count alone, so zero failures is a pass (#1470).
+
+    A release that writes ``pass`` for any test with zero failures (0.16.4)
+    stores a failure of any other test as a pass; the Elementary reader reads
+    such a pass as unobserved. A test the manifest does not hold is not named.
+    """
+
+    named: set[str] = set()
+    for uid, node in (manifest.get("nodes") or {}).items():
+        if not isinstance(node, Mapping) or node.get("resource_type") != "test":
+            continue
+        config = node.get("config") or {}
+        if not isinstance(config, Mapping):
+            continue
+        if not any(holds_at_zero(config.get(key)) for key in ("warn_if", "error_if")):
+            named.add(str(uid))
+    return frozenset(named)
+
+
+#: Where the manifest says the package builds its tables, spelled as the
+#: allowlist entries ``dex init`` proposes (#1473).
+_Located = Located
 
 
 def _declared_namespace(manifest: Mapping[str, Any]) -> _Located | None:
@@ -520,17 +588,10 @@ def _declared_namespace(manifest: Mapping[str, Any]) -> _Located | None:
     return None
 
 
-#: How each connector's source allowlist spells a schema: the forms one entry
-#: may take, finest first. The first is what a proposed entry adds.
-def _entries(connector: str, located: _Located) -> list[str]:
-    qualified = (
-        f"{located.database}.{located.schema}" if located.database else located.schema
-    )
-    if connector in {"bigquery", "snowflake"}:
-        return [qualified, located.schema]
-    if connector in {"databricks", "trino"}:
-        return [qualified]
-    return [located.schema]
+def _entries(
+    connector: str, located: _Located, project: str | None = None
+) -> list[str]:
+    return entries(connector, located, project=project)
 
 
 def _allowlist_refusal(
@@ -553,7 +614,7 @@ def _allowlist_refusal(
     narrowed = datasets if flag == "--dataset" else []
     narrowed = narrowed or list(getattr(engine, "scopes", None) or [])
     allowlist = source_scope(connector, target, narrowed or None)
-    entries = _entries(connector, located)
+    entries = _entries(connector, located, getattr(target, "project", None))
     if not allowlist or any(scope_within(entry, allowlist) for entry in entries):
         return None
     field_name = _SCOPE_FIELDS[connector]
@@ -567,8 +628,7 @@ def _allowlist_refusal(
             f"out {located.spelled()}, the schema the Elementary package writes",
             {"namespace": located.spelled()},
         )
-    proposed = [*committed, entries[0]]
-    command = f"dex config set {connector}.{field_name} '[{', '.join(proposed)}]'"
+    command = allowlist_command(connector, committed, entries[0])
     steps.append(
         {
             "command": command,
@@ -614,6 +674,7 @@ def _read_elementary(
     window_size: int,
     warned: list[str],
     command: str = COMMAND,
+    passes: frozenset[str] = frozenset(),
 ) -> _Source:
     try:
         from . import elementary_incidents as reader
@@ -669,7 +730,13 @@ def _read_elementary(
         priced = _price(engine, adapter, plan, command)
         # From here a refusal may follow spend, so it keeps what was priced.
         base["_price"] = priced
-        read = reader.read_elementary(engine, plan, claims=claims, adapter=adapter)
+        read = reader.read_elementary(
+            engine,
+            plan,
+            claims=claims,
+            adapter=adapter,
+            zero_means_pass=passes,
+        )
     except ElementaryReadError as exc:
         # No run in the window is nothing to read rather than a refusal of what
         # was there: the package has not uploaded a run yet.
@@ -686,6 +753,13 @@ def _read_elementary(
         # kept. No cost refusal is this class. The words are masked as every
         # folded failure is: a conversion error can quote a row's value.
         return _Source("refused", "warehouse_refused", failure_text(exc), base)
+    if read.passes_unobserved:
+        warned.append(
+            f"{read.passes_unobserved} pass(es) read as unobserved: the release "
+            "that wrote them records pass for any test with zero failures, and "
+            "each test's warn_if or error_if can hold at zero, so the row cannot "
+            "tell a pass from a failure"
+        )
     priced["first_read"] = read.first_read
     priced["profiled"] = list(read.profiled)
     return _Source(
@@ -707,6 +781,7 @@ def _read_elementary(
             "unplaced": read.unplaced,
             "commits_unread": read.commits_unread,
             "severities_unread": read.severities_unread,
+            "passes_unobserved": read.passes_unobserved,
         },
         observations=read.observations,
         history=read.history,
@@ -881,8 +956,34 @@ def _dbt(
             "claims_unread": counts.claims_unread,
         },
     )
-    notes.extend(found.notes)
+    if placed_as in ("in_window", "after_window"):
+        # The run has a place in Elementary's order, as one of its invocations
+        # or after its newest one, so a failure Elementary saw pass before it is
+        # dated: the file's "no known start" note is left out here. :func:`read`
+        # puts a note in its place only for the incidents this run opened with
+        # no known start (a test Elementary holds no result for), and that note
+        # names those incidents alone, since others in the same fold can be
+        # dated. The run itself is still named, under this source's ``run`` and
+        # ``placed``. Read alone, the run keeps the file's note: nothing dates it.
+        extra["_held_note_at"] = len(notes)
+        notes.extend(n for n in found.notes if n != found.unknown_start_note)
+    else:
+        notes.extend(found.notes)
     return _Source("read", extra=extra, observations=observations, history=history)
+
+
+def _only_dbt_reports(count: int) -> str:
+    """The "no known start" note for a run placed in Elementary's order. It speaks
+    of the incidents dbt's run opened with no pass before them, never of every
+    failure, since the fold can date the others from Elementary's runs. Such an
+    incident can still carry Elementary's later failures (a run from an older
+    invocation Elementary recorded), so the note claims no single invocation."""
+
+    return (
+        f"{count} incident(s) opened by dbt_run_results have no known start "
+        "(first_observed: unknown): no passing run is observed before their "
+        "first failure, so every interval before it is unobserved"
+    )
 
 
 #: How dbt's run was placed in the one invocation order: ``alone`` (the only

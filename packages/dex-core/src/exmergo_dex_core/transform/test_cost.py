@@ -636,7 +636,7 @@ class _Resolver:
             ): node
             for node in (manifest.get("sources") or {}).values()
         }
-        self.naming = _schema_naming(view)
+        self.naming = schema_naming(view)
         #: Models whose placement the plan changes, and whether it may change
         #: every model's (a ``dbt_project.yml`` edit): set by :func:`price`.
         self.changed: frozenset[str] = frozenset()
@@ -1066,7 +1066,7 @@ def _nodes_by_name(manifest: Mapping[str, Any]) -> dict[tuple[str, str | None], 
     return out
 
 
-def _schema_naming(view: Any) -> str:
+def schema_naming(view: Any) -> str:
     """How the project names a custom schema: ``default`` (dbt's own),
     ``layered`` (the override ``transform init --layered-schemas`` scaffolds,
     byte for byte), or ``custom`` (any other override, which dex does not run)."""

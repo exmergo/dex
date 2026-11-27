@@ -74,7 +74,9 @@ How each fact kind is judged (dbt test; maintain verify codes):
   does not).
 - history: ``temporal_*``.
 - freshness (#1460): ``freshness_exceeded``, and dbt's ``dex_freshness`` where
-  the column carries it.
+  the column carries it; a declared deadline (#1486) is a second freshness
+  fact: ``deadline_missed``, and Elementary's ``data_freshness_sla`` where the
+  model carries one at the declared time and zone.
 - continuity (#1461): dbt's ``dex_continuity`` where the column carries one at
   the declared grain and ``by``; nothing in verify.
 """
@@ -244,6 +246,39 @@ class _Tests:
                 continue
         return False
 
+    def deadline(self, model: str, column: str, declared: dict) -> bool:
+        """Whether an ``elementary.data_freshness_sla`` on the model holds the
+        declared deadline on ``column`` (#1486): the same ``timestamp_column``,
+        ``sla_time`` and ``timezone``. A test at another time or zone permits a
+        late day the declaration forbids, so it does not check it."""
+
+        from ..semantic_declarations import deadline_parts
+
+        try:
+            want = deadline_parts(str(declared.get("deadline")))
+        except ValueError:
+            return False
+        key = _bare(column)
+        zone = str(declared.get("timezone") or "")
+        want_days = _weekdays(declared.get("days"))
+        for name, _col, kwargs, _reads in self.by_model.get(model, []):
+            if _base(name) != "data_freshness_sla":
+                continue
+            # A test checked on fewer days than declared leaves a declared day
+            # unchecked; one with no day_of_week runs every day.
+            runs = _weekdays(kwargs.get("day_of_week"))
+            if runs is not None and (want_days is None or not want_days <= runs):
+                continue
+            if _bare(str(kwargs.get("timestamp_column") or "")) != key:
+                continue
+            try:
+                same = deadline_parts(str(kwargs.get("sla_time"))) == want
+            except ValueError:
+                continue
+            if same and str(kwargs.get("timezone") or "") == zone:
+                return True
+        return False
+
     def continuity(self, model: str, column: str, declared: dict) -> bool:
         """Whether a ``dex_continuity`` on ``column`` searches the declared grain
         and ``by`` keys (#1461): a test left at another grain or other keys
@@ -334,6 +369,17 @@ class _Tests:
                     return True
                 continue
         return False
+
+
+def _weekdays(value: Any) -> frozenset[str] | None:
+    """Weekdays as three-letter lower-case names (``mon``), from a declared
+    ``days`` or a test's ``day_of_week`` (a name or a list, short or full), or
+    ``None`` for every day. An unreadable day reads as no day at all."""
+
+    if value is None or value == "" or value == []:
+        return None
+    items = value if isinstance(value, (list, tuple)) else [value]
+    return frozenset(str(v).strip().lower()[:3] for v in items)
 
 
 def _bare(name: str) -> str:
@@ -1105,6 +1151,26 @@ def _model_facts(
                 found,
                 ["freshness_exceeded"],
                 what=f"{freshness.get('max_lag')} {freshness.get('basis')}",
+            )
+        if isinstance(freshness, dict) and freshness.get("deadline"):
+            # A daily deadline (#1486) is its own fact: verify judges it, and
+            # the vendor monitor monitors.vendor writes for it is its test.
+            found = (
+                ["elementary.data_freshness_sla"]
+                if tests.deadline(uid, name, freshness)
+                else []
+            )
+            days = freshness.get("days")
+            add(
+                "freshness",
+                name,
+                found,
+                ["deadline_missed"],
+                what=(
+                    f"deadline {freshness.get('deadline')} "
+                    f"{freshness.get('timezone')} {freshness.get('basis')}"
+                    + (f" on {', '.join(map(str, days))}" if days else "")
+                ),
             )
         continuity = dex.get("continuity")
         if isinstance(continuity, dict):

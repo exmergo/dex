@@ -474,3 +474,287 @@ def test_a_lag_the_warehouse_returns_as_null_is_unchecked():
         freshness_mod.LAG_UNREADABLE,
     )
     assert checked["freshness"] == 0
+
+
+# --- a daily deadline (#1486) ------------------------------------------------------
+#
+# The day is the runner's (frozen here through ``freshness_mod.clock``), read in
+# the declared zone as Elementary's data_freshness_sla reads it; whether the
+# deadline has passed is the warehouse's clock, compared in the statement.
+
+
+def _deadline(
+    deadline: str = "00:00",
+    timezone: str = "UTC",
+    basis: str = "capture",
+    days: list[str] | None = None,
+    max_lag: str | None = None,
+) -> dict:
+    freshness: dict = {"deadline": deadline, "timezone": timezone, "basis": basis}
+    if days is not None:
+        freshness["days"] = days
+    if max_lag is not None:
+        freshness["max_lag"] = max_lag
+    return {"role": "time", "freshness": freshness}
+
+
+def _runner_at(monkeypatch, moment) -> None:
+    monkeypatch.setattr(freshness_mod, "clock", lambda: moment)
+
+
+def _now():
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC)
+
+
+def test_the_plan_reads_a_lag_and_a_deadline_as_two_checks(tmp_path: Path):
+    _manifest(
+        tmp_path,
+        {"model.p.fct": _model("fct", {"loaded_at": _deadline(max_lag="6h")})},
+    )
+    [model], _ = facts_mod.plan(tmp_path)
+    assert [(r.check, r.max_lag, r.deadline) for r in model.freshness] == [
+        ("max_lag", "6h", None),
+        ("deadline", None, "00:00"),
+    ]
+
+
+def test_a_deadline_the_schema_would_refuse_is_never_guessed_into_a_check():
+    bad = {"deadline": "07:00", "timezone": "Mars/Base", "basis": "capture"}
+    assert freshness_mod.read_rules("t", bad) == []
+    assert (
+        freshness_mod.read_rule("t", {"deadline": "07:00", "basis": "capture"}) is None
+    )
+
+
+def test_todays_value_after_the_deadline_is_satisfied(tmp_path: Path, monkeypatch):
+    from datetime import timedelta
+
+    # Yesterday's deadline (00:00 UTC) has passed, and a value from now falls
+    # on or after yesterday's midnight.
+    _runner_at(monkeypatch, _now() - timedelta(days=1))
+    result = _run(
+        tmp_path,
+        {"loaded_at": _deadline()},
+        _table("select current_timestamp as loaded_at"),
+    )
+    assert result.findings == []
+    [record] = result.freshness
+    assert record["check"] == "deadline"
+    assert record["status"] == "satisfied"
+    assert (record["deadline"], record["timezone"]) == ("00:00", "UTC")
+    assert "max_lag" not in record
+
+
+def test_an_earlier_days_value_after_the_deadline_is_missed(
+    tmp_path: Path, monkeypatch
+):
+    from datetime import timedelta
+
+    _runner_at(monkeypatch, _now() - timedelta(days=1))
+    result = _run(
+        tmp_path,
+        {"loaded_at": _deadline()},
+        _table("select timestamp '2020-01-01 06:00' as loaded_at"),
+    )
+    [finding] = result.findings
+    assert finding.code == "deadline_missed"
+    assert finding.severity == "high"
+    assert finding.data["reason"] == "not_today"
+    # Counts and the day judged, never a timestamp from the column.
+    assert "2020" not in finding.detail and "2020" not in json.dumps(finding.data)
+    [record] = result.freshness
+    assert (record["status"], record["finding"], record["reason_code"]) == (
+        "contradicted",
+        "deadline_missed",
+        "not_today",
+    )
+
+
+def test_a_business_time_misses_quietly_and_says_where_the_deadline_belongs(
+    tmp_path: Path, monkeypatch
+):
+    from datetime import timedelta
+
+    _runner_at(monkeypatch, _now() - timedelta(days=1))
+    result = _run(
+        tmp_path,
+        {"ordered_at": _deadline(basis="business")},
+        _table("select timestamp '2020-01-01' as ordered_at"),
+    )
+    [finding] = result.findings
+    assert finding.severity == "medium"
+    assert "load time" in finding.detail
+
+
+@pytest.mark.parametrize(
+    ("statement", "reason"),
+    [
+        ("create table fct (loaded_at timestamp)", "no_rows"),
+        ("create table fct as select cast(null as timestamp) as loaded_at", "all_null"),
+    ],
+)
+def test_no_rows_or_no_value_after_the_deadline_is_missed(
+    tmp_path: Path, monkeypatch, statement, reason
+):
+    from datetime import timedelta
+
+    _runner_at(monkeypatch, _now() - timedelta(days=1))
+    result = _run(tmp_path, {"loaded_at": _deadline()}, statement)
+    [finding] = result.findings
+    assert finding.data["reason"] == reason
+
+
+def test_before_the_deadline_nothing_is_due(tmp_path: Path, monkeypatch):
+    from datetime import timedelta
+
+    # A runner two days ahead puts the deadline in the warehouse's future.
+    _runner_at(monkeypatch, _now() + timedelta(days=2))
+    result = _run(
+        tmp_path,
+        {"loaded_at": _deadline()},
+        _table("select timestamp '2020-01-01' as loaded_at"),
+    )
+    assert result.findings == []
+    [record] = result.freshness
+    assert (record["status"], record["reason_code"]) == (
+        "not_applicable",
+        freshness_mod.BEFORE_DEADLINE,
+    )
+    assert "freshness" not in result.suppressed
+
+
+def test_a_day_the_days_leave_out_is_not_checked(tmp_path: Path, monkeypatch):
+    from datetime import UTC, datetime
+
+    # 2026-01-05 is a Monday.
+    _runner_at(monkeypatch, datetime(2026, 1, 5, 12, tzinfo=UTC))
+    result = _run(
+        tmp_path,
+        {"loaded_at": _deadline(days=["tue", "wed"])},
+        _table("select timestamp '2020-01-01' as loaded_at"),
+    )
+    assert result.findings == []
+    [record] = result.freshness
+    assert (record["status"], record["reason_code"], record["days"]) == (
+        "not_applicable",
+        freshness_mod.NOT_SCHEDULED,
+        ["tue", "wed"],
+    )
+    assert record["target_date"] == "2026-01-05"
+
+
+def test_a_lag_and_a_deadline_on_one_column_are_two_records(
+    tmp_path: Path, monkeypatch
+):
+    from datetime import timedelta
+
+    _runner_at(monkeypatch, _now() - timedelta(days=1))
+    result = _run(
+        tmp_path,
+        {"loaded_at": _deadline(max_lag="6h")},
+        _table("select timestamp '2020-01-01' as loaded_at"),
+    )
+    assert sorted(r["check"] for r in result.freshness) == ["deadline", "max_lag"]
+    assert sorted(f.code for f in result.findings) == [
+        "deadline_missed",
+        "freshness_exceeded",
+    ]
+
+
+def test_a_personal_data_column_is_judged_by_counts_alone(tmp_path: Path, monkeypatch):
+    from datetime import timedelta
+
+    _runner_at(monkeypatch, _now() - timedelta(days=1))
+    result = _run(
+        tmp_path,
+        {"date_of_birth": _deadline(basis="business")},
+        _table("select timestamp '1990-05-01' as date_of_birth"),
+    )
+    [finding] = result.findings
+    assert "1990" not in finding.detail and "1990" not in json.dumps(finding.data)
+
+
+def test_a_deadline_on_a_missing_column_reads_unchecked(tmp_path: Path, monkeypatch):
+    result = _run(
+        tmp_path,
+        {"loaded_at": _deadline()},
+        _table("select 1 as order_id"),
+    )
+    [record] = result.freshness
+    assert (record["check"], record["status"], record["reason_code"]) == (
+        "deadline",
+        "unchecked",
+        freshness_mod.COLUMN_MISSING,
+    )
+
+
+@pytest.mark.parametrize(
+    ("moment", "zone", "target", "start", "due"),
+    [
+        # Summer in Chicago is UTC-5: local midnight is 05:00Z, 07:00 is 12:00Z.
+        (
+            "2026-07-01T12:00:00+00:00",
+            "America/Chicago",
+            "2026-07-01",
+            "05:00",
+            "12:00",
+        ),
+        # Winter is UTC-6.
+        (
+            "2026-01-15T12:00:00+00:00",
+            "America/Chicago",
+            "2026-01-15",
+            "06:00",
+            "13:00",
+        ),
+        # 02:00Z is still the previous evening in Chicago.
+        (
+            "2026-07-02T02:00:00+00:00",
+            "America/Chicago",
+            "2026-07-01",
+            "05:00",
+            "12:00",
+        ),
+        # Tokyo is ahead: 20:00Z on the 1st is the 2nd there.
+        ("2026-07-01T20:00:00+00:00", "Asia/Tokyo", "2026-07-02", "15:00", "22:00"),
+    ],
+)
+def test_the_window_is_todays_in_the_declared_zone(moment, zone, target, start, due):
+    from datetime import UTC, datetime
+
+    rule = freshness_mod.read_rules(
+        "t", {"deadline": "07:00", "timezone": zone, "basis": "capture"}
+    )[0]
+    window = freshness_mod.deadline_window(rule, datetime.fromisoformat(moment))
+
+    def clock(epoch: int) -> str:
+        return datetime.fromtimestamp(epoch, UTC).strftime("%H:%M")
+
+    assert window.target_date == target
+    assert (clock(window.day_start), clock(window.deadline)) == (start, due)
+    assert window.scheduled is True
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [
+        "duckdb",
+        "postgres",
+        "redshift",
+        "bigquery",
+        "snowflake",
+        "databricks",
+        "clickhouse",
+        "trino",
+    ],
+)
+def test_each_dialects_deadline_parts_are_one_read_only_select(dialect):
+    from exmergo_dex_core.guards.sql_guard import assert_select_only
+
+    for kind in ("date", "ntz", "tz", "unknown"):
+        today = freshness_mod.today_sql(dialect, '"t"', kind, 1767225600)
+        due = freshness_mod.due_sql(dialect, 1767225600)
+        sql = f'SELECT COUNT(*) AS n, {today} AS today, {due} AS due FROM "db"."s"."m"'  # noqa: S608
+        assert assert_select_only(sql, dialect=dialect) == sql
