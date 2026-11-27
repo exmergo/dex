@@ -276,7 +276,7 @@ ossie = ["jsonschema>=4.26"]
 # FastAPI, uvicorn, mcp, duckdb, jafgen and tantivy. Nothing outside
 # `exmergo_dex_core.slayer` may import `slayer`, and that module imports it only
 # behind `ensure_available`; a packaging test holds both true.
-slayer = ["motley-slayer==1.8.4", "exmergo-dex-core[sql]"]
+slayer = ["motley-slayer==1.9.1", "exmergo-dex-core[sql]"]
 # Cube YAML model files (`semantic.vendor: cube`). Read statically, validated by
 # dex's own port of Cube's model rules, so there is no Cube package to install:
 # no Node, no Cube server, no `cube_dbt`. The one thing the reader needs is the
