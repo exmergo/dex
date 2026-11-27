@@ -165,7 +165,8 @@
         },
         {
           "check": "no_file_writes",
-          "assertion": "Writes nothing: no file edit and no `transform apply`"
+          "assertion": "Writes nothing to the project: no file edit there and no `transform apply`",
+          "within": ["demo_project", ".dex"]
         },
         {
           "check": "no_dex_command",

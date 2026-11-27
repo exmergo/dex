@@ -721,6 +721,27 @@ def test_the_committed_pattern_catches_each_of_elementarys_tables(table):
     assert not checks.grade(check, events)[0]
 
 
+@pytest.mark.parametrize(
+    "path, counted",
+    [
+        # The first live run's scratch file, in the workspace root.
+        ("/work/.dex_probe.sql", False),
+        ("/work/demo_project/dbt/models/staging/stg_order_items.sql", True),
+        ("/work/.dex/config.yml", True),
+    ],
+)
+def test_the_committed_write_check_counts_only_the_project(path, counted):
+    case = _demo_case()
+    [check] = [c for c in case.checks if c.check == "no_file_writes"]
+    events = [
+        *passing()[:-1],
+        _use(9, "Write", {"file_path": path, "content": "select 1"}),
+        _done(ANSWER),
+    ]
+    assert checks.grade(check, events)[0] is not counted
+    assert bool(checks.information(check, events)) is not counted
+
+
 # --- review follow-ups (#1625) ---------------------------------------------------
 
 
