@@ -22,11 +22,186 @@
 # value a test failed on (`result_rows`, `result_row`, `dimension_value`,
 # `source_value`, `test_results_description` and `test_results_query` are left
 # out on purpose).
+#
+# `unobserved` is the columns the reader uses at another release that this
+# release does not declare. The loader holds every release to every column any
+# release reads for a table: each is read or named unobserved, so a column never
+# drops out of a check unsaid, and the check reports it as not observed at that
+# release rather than as passing.
+#
+# `pass_at_zero_failures` says the release writes `pass` for any test whose
+# failure count is zero, whatever dbt's status was. A row then cannot tell a
+# pass from a failure whose threshold holds at zero, and the incident reader
+# reads that pass as unobserved.
 
 releases:
+  "0.16.4":
+    # elementary-data/dbt-data-reliability, tag 0.16.4, commit
+    # 6999ae36e28bf64f7fdf1b87439469e6474ba797.
+    # macros/edr/tests/on_run_end/handle_tests_results.sql:43-44 sets
+    # `status` to "pass" wherever `failures == 0`, for every test type.
+    pass_at_zero_failures: true
+    tables:
+      elementary_test_results:
+        # models/edr/run_results/elementary_test_results.sql:16 calls
+        # empty_elementary_test_results(),
+        # macros/edr/system/system_utils/empty_table.sql:1-32. The same columns
+        # as 0.26.1, in the same order.
+        source: macros/edr/system/system_utils/empty_table.sql:1-32
+        columns:
+          - [id, long_string]
+          - [data_issue_id, string]
+          - [test_execution_id, long_string]
+          - [test_unique_id, long_string]
+          - [model_unique_id, long_string]
+          - [invocation_id, string]
+          - [detected_at, timestamp]
+          - [created_at, timestamp]
+          - [database_name, string]
+          - [schema_name, string]
+          - [table_name, string]
+          - [column_name, string]
+          - [test_type, string]
+          - [test_sub_type, string]
+          - [test_results_description, long_string]
+          - [owners, string]
+          - [tags, string]
+          - [test_results_query, long_string]
+          - [other, string]
+          - [test_name, long_string]
+          - [test_params, long_string]
+          - [severity, string]
+          - [status, string]
+          - [failures, bigint]
+          - [test_short_name, string]
+          - [test_alias, string]
+          - [result_rows, long_string]
+          - [failed_row_count, bigint]
+        reads:
+          - id
+          - test_execution_id
+          - test_unique_id
+          - model_unique_id
+          - invocation_id
+          - detected_at
+          - created_at
+          - column_name
+          - test_type
+          - test_sub_type
+          - severity
+          - status
+          - failures
+          - failed_row_count
+      dbt_invocations:
+        # models/edr/dbt_artifacts/dbt_invocations.sql:17 calls
+        # get_dbt_invocations_empty_table_query(),
+        # macros/edr/dbt_artifacts/upload_dbt_invocation.sql:207-245. The same
+        # columns as 0.26.1; run_started_at, run_completed_at and generated_at
+        # are strings here too, in the same format (times.sql:1-11).
+        source: macros/edr/dbt_artifacts/upload_dbt_invocation.sql:207-245
+        columns:
+          - [invocation_id, long_string]
+          - [job_id, long_string]
+          - [job_name, long_string]
+          - [job_run_id, long_string]
+          - [run_started_at, string]
+          - [run_completed_at, string]
+          - [generated_at, string]
+          - [created_at, timestamp]
+          - [command, string]
+          - [dbt_version, string]
+          - [elementary_version, string]
+          - [full_refresh, boolean]
+          - [invocation_vars, long_string]
+          - [vars, long_string]
+          - [target_name, string]
+          - [target_database, string]
+          - [target_schema, string]
+          - [target_profile_name, string]
+          - [threads, int]
+          - [selected, long_string]
+          - [yaml_selector, long_string]
+          - [project_id, string]
+          - [project_name, string]
+          - [env, string]
+          - [env_id, string]
+          - [cause_category, string]
+          - [cause, long_string]
+          - [pull_request_id, string]
+          - [git_sha, string]
+          - [orchestrator, string]
+          - [dbt_user, string]
+          - [job_url, string]
+          - [job_run_url, string]
+          - [account_id, string]
+          - [target_adapter_specific_fields, long_string]
+        reads:
+          - invocation_id
+          - run_started_at
+          - run_completed_at
+          - generated_at
+          - created_at
+          - command
+          - elementary_version
+          - target_name
+          - git_sha
+      test_result_rows:
+        # models/edr/run_results/test_result_rows.sql:19-24, a literal
+        # empty_table list of four columns: no row_index and no test_type,
+        # which 0.26.1 adds.
+        source: models/edr/run_results/test_result_rows.sql:19-24
+        columns:
+          - [elementary_test_results_id, long_string]
+          - [result_row, long_string]
+          - [detected_at, timestamp]
+          - [created_at, timestamp]
+        reads:
+          - elementary_test_results_id
+          - detected_at
+          - created_at
+        unobserved:
+          - row_index
+      data_monitoring_metrics:
+        # models/edr/data_monitoring/data_monitoring/data_monitoring_metrics.sql:17
+        # calls empty_data_monitoring_metrics(),
+        # macros/edr/system/system_utils/empty_table.sql:56-76 (created_at
+        # appended, with_created_at defaulting to true). No ClickHouse variant.
+        source: macros/edr/system/system_utils/empty_table.sql:56-76
+        columns:
+          - [id, string]
+          - [full_table_name, string]
+          - [column_name, string]
+          - [metric_name, string]
+          - [metric_type, string]
+          - [metric_value, float]
+          - [source_value, string]
+          - [bucket_start, timestamp]
+          - [bucket_end, timestamp]
+          - [bucket_duration_hours, int]
+          - [updated_at, timestamp]
+          - [dimension, string]
+          - [dimension_value, string]
+          - [metric_properties, string]
+          - [created_at, timestamp]
+        reads:
+          - id
+          - full_table_name
+          - column_name
+          - metric_name
+          - metric_type
+          - metric_value
+          - bucket_start
+          - bucket_end
+          - bucket_duration_hours
+          - updated_at
+          - dimension
+          - created_at
   "0.26.1":
     # elementary-data/dbt-data-reliability, tag 0.26.1, commit
     # 3f8e79b357123ed70f7c4b0e74490dd5177a7cbb.
+    # macros/edr/tests/on_run_end/handle_tests_results.sql:62-77 forces "pass"
+    # on anomaly rows with no failure only, and keeps dbt's status otherwise.
+    pass_at_zero_failures: false
     tables:
       elementary_test_results:
         # models/edr/run_results/elementary_test_results.sql:24 calls

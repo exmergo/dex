@@ -354,6 +354,23 @@ from them has a known start wherever an observed pass precedes its first
 failure. `plan_read(..., last=n)` reads only the newest `n` invocation rows (by
 `created_at`, ties by id), so a window can be a run count rather than a time.
 
+The reader reads releases 0.16.4 and 0.26.1 of the package, each matched
+exactly; any other release is `elementary_release_untested` and no table is
+read. Both releases lay out `dbt_invocations` and `elementary_test_results`
+alike and write the same values into every column the reader reads, so one
+read may span rows each wrote, as a table upgraded from one to the other holds.
+Rows written by any other release are refused (`elementary_rows_untested_release`). Two
+differences are named rather than absorbed:
+
+- 0.16.4's `test_result_rows` has no `row_index`. The layout check reports it
+  unobserved at that release, never as passing.
+- 0.16.4 writes `pass` for any test with zero failures, whatever dbt said, so a
+  failure whose `warn_if` or `error_if` holds at zero (`>=0`, `=0`) is stored as
+  a pass. In a run that release wrote, a pass from a test whose thresholds the
+  manifest does not show fire on a nonzero count alone is unobserved, and
+  counted under `passes_unobserved` with a warning. dbt's default `!=0` is a
+  pass as written.
+
 ### `dex maintain incidents`
 
 The command (`DexEngine.incidents`) reads both sources and folds them together,

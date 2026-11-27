@@ -135,7 +135,7 @@ def _manifest(*, elementary: bool) -> dict[str, Any]:
     }
 
 
-def _project(root: Path, *, elementary: bool = False) -> Path:
+def _project(root: Path, *, elementary: bool = False, release: str = RELEASE) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "dbt_project.yml").write_text("name: shop\nversion: '1.0'\n")
     target = root / "target"
@@ -145,7 +145,7 @@ def _project(root: Path, *, elementary: bool = False) -> Path:
         package = root / "dbt_packages" / "elementary"
         package.mkdir(parents=True, exist_ok=True)
         (package / "dbt_project.yml").write_text(
-            f"name: elementary\nversion: '{RELEASE}'\n"
+            f"name: elementary\nversion: '{release}'\n"
         )
     return root
 
@@ -982,7 +982,7 @@ def test_a_later_dbt_run_never_lifts_the_count_past_the_window(tmp_path: Path):
 
 
 def test_a_read_refused_after_it_was_priced_keeps_its_price(tmp_path: Path):
-    runs = [*_hourly(2), Run("inv-old", START, version="0.16.4")]
+    runs = [*_hourly(2), Run("inv-old", START, version="0.20.0")]
     root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
     data = _data(_engine(root, warehouse).incidents())
 
@@ -1270,7 +1270,7 @@ def test_a_read_that_cannot_be_priced_is_never_asked_at_a_lower_price(
 
 
 def test_a_mixed_release_refusal_advises_invocations_not_since(tmp_path: Path):
-    runs = [*_hourly(2), Run("inv-old", START, version="0.16.4")]
+    runs = [*_hourly(2), Run("inv-old", START, version="0.20.0")]
     root, warehouse = _elementary_project(tmp_path, runs, _results(runs))
     detail = _data(_engine(root, warehouse).incidents())["sources"]["elementary"][
         "detail"
@@ -1509,3 +1509,113 @@ def test_a_warehouse_failure_mid_read_refuses_elementary_and_still_reads_dbt(
     assert [i["opening_source"] for i in data["incidents"]] == ["dbt_run_results"]
     # Priced before the failure, so the price is kept.
     assert "read result rows" in data["price"]["per_statement"]
+
+
+# --- 0.16.4, the series most installs pin (#1470) ----------------------------------
+
+OLD = "0.16.4"
+
+
+def _old_project(tmp_path: Path, *, failing: Sequence[str]) -> tuple[Path, Path]:
+    runs = [Run(run.id, run.started, version=OLD) for run in _recent(3)]
+    root = _project(tmp_path / "project", elementary=True, release=OLD)
+    warehouse = _warehouse(
+        tmp_path / "dev.duckdb", runs, _results(runs, failing=failing)
+    )
+    return root, warehouse
+
+
+def test_a_0_16_4_project_s_failing_test_is_an_elementary_incident(tmp_path: Path):
+    root, warehouse = _old_project(tmp_path, failing=["inv-3"])
+    data = _data(_engine(root, warehouse).incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["release"]) == ("read", OLD)
+    assert elementary["passes_unobserved"] == 0
+    [incident] = data["incidents"]
+    assert incident["opening_source"] == "elementary"
+    assert incident["state"] == "open"
+    # The tests use dbt's default thresholds, so 0.16.4's passes are passes.
+    assert incident["first_observed"]["run"] == "inv-3"
+
+
+def test_before_this_change_a_0_16_4_project_read_as_untested(
+    tmp_path: Path, monkeypatch
+):
+    """The arm built to break: the reader recording 0.26.1 alone refuses the same
+    project's tables with the release code and reads no row."""
+
+    from exmergo_dex_core.maintain import elementary_layouts as layouts
+
+    alone = {RELEASE: layouts.layouts()[RELEASE]}
+    monkeypatch.setattr(layouts, "layouts", lambda: alone)
+    monkeypatch.setattr(layouts, "READER_RELEASES", (RELEASE,))
+    root, warehouse = _old_project(tmp_path, failing=["inv-3"])
+    engine = _engine(root, warehouse)
+    data = _data(engine.incidents())
+
+    elementary = data["sources"]["elementary"]
+    assert (elementary["status"], elementary["reason_code"]) == (
+        "refused",
+        "elementary_release_untested",
+    )
+    assert not [i for i in data["incidents"] if i["opening_source"] == "elementary"]
+    assert list(engine.store._queries) == []
+
+
+def test_a_0_16_4_pass_from_a_test_that_can_fail_at_zero_is_unobserved(
+    tmp_path: Path,
+):
+    root, warehouse = _old_project(tmp_path, failing=["inv-3"])
+    manifest = root / "target" / "manifest.json"
+    document = json.loads(manifest.read_text())
+    document["nodes"][TEST]["config"]["error_if"] = ">=0"
+    manifest.write_text(json.dumps(document))
+    result = _engine(root, warehouse).incidents()
+    data = _data(result)
+
+    assert data["sources"]["elementary"]["passes_unobserved"] == 2
+    assert any("2 pass(es) read as unobserved" in w for w in result.warnings)
+    [incident] = data["incidents"]
+    # Both earlier passes were unobserved, so nothing dates the start.
+    assert incident["first_observed"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("condition", "holds"),
+    [
+        (None, False),
+        ("!=0", False),
+        ("!= 0", False),
+        ("<>0", False),
+        (">0", False),
+        (">10", False),
+        (">=1", False),
+        ("=1", False),
+        (">=0", True),
+        ("=0", True),
+        ("==0", True),
+        ("<1", True),
+        ("<=0", True),
+        ("!=1", True),
+        (">-1", True),
+        ("> 0 or 1=1", True),
+        ("{{ var('x') }}", True),
+        ("", True),
+    ],
+)
+def test_a_threshold_holds_at_zero_only_where_its_comparison_does(
+    condition: str | None, holds: bool
+):
+    from exmergo_dex_core.maintain.incident_sources import holds_at_zero
+
+    assert holds_at_zero(condition) is holds
+
+
+def test_only_tests_whose_thresholds_fire_on_a_nonzero_count_mean_pass_at_zero():
+    from exmergo_dex_core.maintain.incident_sources import zero_means_pass
+
+    manifest = _manifest(elementary=False)
+    manifest["nodes"][OTHER]["config"]["warn_if"] = "=0"
+    manifest["nodes"][TEST]["config"].update(warn_if="!=0", error_if=">5")
+    assert zero_means_pass(manifest) == {TEST}

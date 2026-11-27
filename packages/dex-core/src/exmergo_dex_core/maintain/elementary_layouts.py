@@ -15,7 +15,8 @@ release's tag, before the first query touches it:
   :data:`~exmergo_dex_core.transform.elementary.TESTED_RELEASES`, never more:
   loading the layouts refuses a release that is not one the fixture runs. Each
   release is matched exactly, so a release between two recorded ones is
-  untested here, since nobody read its layout.
+  untested here, since nobody read its layout. The reader reads 0.16.4 (the
+  series most installs pin, #1470) and 0.26.1.
 - **Then the catalog.** Each table's columns, as the warehouse's catalog lists
   them, are matched by name, case-insensitively (Snowflake folds unquoted names
   to upper case and keeps a quoted reserved word as written). Every column the
@@ -29,6 +30,13 @@ release's tag, before the first query touches it:
   refuses a table with more (``elementary_catalog_too_large``). That bounds the
   check, not the connector: every adapter's ``table_columns``,
   ``table_metadata`` and ``list_objects`` fetches its whole answer first.
+
+- **Unobserved, never passed.** A column the reader uses at one release that
+  another does not declare (``test_result_rows.row_index``, absent at 0.16.4)
+  is named ``unobserved`` at that release, and the check returns it under
+  :attr:`CheckedTable.unobserved` rather than as a column that held. Loading
+  refuses a release that neither reads nor names unobserved a column another
+  release reads for the same table.
 
 A catalog check sees names and types. It cannot see a column that kept both and
 changed its meaning, which is why each release here also has a fixture whose
@@ -162,6 +170,9 @@ class TableLayout:
     #: ``(name, the package's type name)``, in the package's order.
     columns: tuple[tuple[str, str], ...]
     reads: tuple[str, ...]
+    #: Columns the reader uses at another release that this one does not
+    #: declare, so nothing here observes them.
+    unobserved: tuple[str, ...] = ()
 
     def family(self, column: str) -> str:
         """The type family of a declared column."""
@@ -176,6 +187,10 @@ class ReleaseLayout:
 
     release: str
     tables: Mapping[str, TableLayout]
+    #: The release writes ``pass`` for any test whose failure count is zero,
+    #: whatever dbt's status was (0.16.4), so such a pass cannot be told from a
+    #: failure whose threshold holds at zero.
+    pass_at_zero_failures: bool = False
 
 
 @dataclass(frozen=True)
@@ -241,6 +256,9 @@ class CheckedTable:
 
     table: str
     columns: Mapping[str, str]
+    #: Columns the reader uses elsewhere that this release does not declare:
+    #: not checked and not observed, which is not a pass.
+    unobserved: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -268,7 +286,14 @@ def _parse_table(table: str, raw: Mapping[str, Any]) -> TableLayout:
         raise ValueError(f"{table} records type names the package does not use: {odd}")
     if unknown := [name for name in reads if name not in names]:
         raise ValueError(f"{table} reads undeclared columns {unknown}")
-    return TableLayout(table, str(raw["source"]), columns, reads)
+    unobserved = tuple(str(name) for name in raw.get("unobserved") or ())
+    # An unobserved column is one this release does not have: naming one it
+    # declares would take a column it could check out of the check.
+    if declared := [name for name in unobserved if name in names]:
+        raise ValueError(f"{table} names declared columns unobserved: {declared}")
+    if len(set(unobserved)) != len(unobserved):
+        raise ValueError(f"{table} names a column unobserved twice")
+    return TableLayout(table, str(raw["source"]), columns, reads, unobserved)
 
 
 def _parse_release(release: str, raw: Mapping[str, Any]) -> ReleaseLayout:
@@ -290,7 +315,10 @@ def _parse_release(release: str, raw: Mapping[str, Any]) -> ReleaseLayout:
         raise ValueError(f"{release} records no layout for {missing}")
     if empty := sorted(name for name, table in tables.items() if not table.reads):
         raise ValueError(f"{release} reads no column of {empty}")
-    return ReleaseLayout(release, tables)
+    flag = raw.get("pass_at_zero_failures", False)
+    if type(flag) is not bool:
+        raise ValueError(f"{release}: pass_at_zero_failures must be true or false")
+    return ReleaseLayout(release, tables, flag)
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -318,7 +346,33 @@ def parse_layouts(text: str) -> Mapping[str, ReleaseLayout]:
     keys = [release_key(release) for release in layouts]
     if len(set(keys)) != len(keys):
         raise ValueError(f"the layout file records one release twice: {list(layouts)}")
+    _every_read_accounted_for(layouts)
     return layouts
+
+
+def _every_read_accounted_for(layouts: Mapping[str, ReleaseLayout]) -> None:
+    """Every column any release reads for a table is, at every release, read or
+    named unobserved, so a column never drops out of one release's check unsaid;
+    and an unobserved column is one some release reads."""
+
+    for table in TABLES:
+        read_anywhere = {
+            name for layout in layouts.values() for name in layout.tables[table].reads
+        }
+        for release, layout in layouts.items():
+            held = layout.tables[table]
+            if missing := sorted(
+                read_anywhere - set(held.reads) - set(held.unobserved)
+            ):
+                raise ValueError(
+                    f"{release} neither reads nor names unobserved {table} "
+                    f"columns another release reads: {missing}"
+                )
+            if stray := sorted(set(held.unobserved) - read_anywhere):
+                raise ValueError(
+                    f"{release} names unobserved {table} columns no release "
+                    f"reads: {stray}"
+                )
 
 
 @functools.cache
@@ -360,6 +414,32 @@ def layout_for(release: str | None) -> ReleaseLayout:
     key = release_key(release)
     [known] = [known for known in READER_RELEASES if release_key(known) == key]
     return layouts()[known]
+
+
+def compatible_releases(release: str | None, tables: Sequence[str]) -> tuple[str, ...]:
+    """The reader releases whose rows in ``tables`` read as ``release``'s do.
+
+    Each must read the same columns of each table, in the same families, as
+    ``release``'s layout, so rows a table kept from before an upgrade are read
+    by the same statements (#1470). ``release`` itself is always one. Raises the
+    release refusal where ``release`` has no layout.
+    """
+
+    held = layout_for(release)
+
+    def reads(layout: ReleaseLayout) -> tuple:
+        return tuple(
+            tuple(
+                (name, layout.tables[table].family(name))
+                for name in sorted(layout.tables[table].reads)
+            )
+            for table in tables
+        )
+
+    wanted = reads(held)
+    return tuple(
+        known for known in READER_RELEASES if reads(layouts()[known]) == wanted
+    )
 
 
 def type_family(data_type: str) -> str | None:
@@ -416,7 +496,7 @@ def _check_table(
             )
         else:
             spelled[name] = found.name
-    return CheckedTable(layout.table, spelled), problems
+    return CheckedTable(layout.table, spelled, layout.unobserved), problems
 
 
 def check_layouts(

@@ -100,10 +100,11 @@ between them, ran every collected test exactly once
 (`scripts/check_test_groups.py`).
 
 Transform groups cover builds, dependencies, artifact edits, retirement,
-refactors, contracts (including semantic authoring) and planning. Real dbt
+refactors, contracts, semantic derivation, monitors, PII and planning. Real dbt
 mutation cases run separately for coverage, equivalence and downstream routing;
 their command doubles stay with planning.
-Explore/maintain and packaging also have their own groups. Each job uploads
+Explore, maintain (split into incidents, coverage, diagnosis and the rest), the
+native semantic vendors and packaging also have their own groups. Each job uploads
 JUnit test timings alongside the coverage report; use those to rebalance files
 when a group approaches five minutes including setup.
 
@@ -589,10 +590,20 @@ existed.
 The reader of the package's tables supports fewer releases than the fixture
 runs: those with a recorded layout in
 `packages/dex-core/src/exmergo_dex_core/maintain/elementary_layouts.yml`
-(0.26.1 today). Adding one means copying each table's columns from the
-package's model files at that release's tag, citing the file and lines, and
-adding a fixture case whose tables are read back to the run that wrote them.
-The loader refuses a release the fixture does not run.
+(0.16.4 and 0.26.1 today). Adding one means copying each table's columns from
+the package's model files at that release's tag, citing the file and lines, and
+adding a fixture case whose tables are read back to the run that wrote them:
+`tests/transform/test_elementary_fixture.py` on DuckDB, or
+`tests/integration/test_postgres_elementary.py` for a release with no DuckDB
+macros (0.16.4). The loader refuses a release the fixture does not run. A column
+the reader uses at another release that this one does not declare goes under
+the table's `unobserved` (0.16.4's `test_result_rows` has no `row_index`): the
+loader refuses a release that neither reads nor names unobserved a column
+another release reads, and the check reports it as unobserved rather than as
+passing. Set `pass_at_zero_failures` where the release writes `pass` for any
+test with zero failures, as 0.16.4 does. Read the macros that write each column
+the adapter reads, not only the model files: a release can keep a column's name
+and type and change what it holds.
 
 In CI both files run in the integration workflow
 (`.github/workflows/integration.yml`): on a push to `main` that matches the

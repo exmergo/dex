@@ -504,8 +504,69 @@ def _elementary(
         refusal.extra["release"] = runtime.release
         return refusal
     return _read_elementary(
-        engine, located, runtime.release, claims, window_size, warned, command
+        engine,
+        located,
+        runtime.release,
+        claims,
+        window_size,
+        warned,
+        command,
+        zero_means_pass(manifest),
     )
+
+
+#: A ``warn_if`` or ``error_if`` dbt accepts as Dex reads it: a comparison with
+#: one number, which dbt renders after the failure count (``count != 0``).
+_THRESHOLD = re.compile(r"^\s*(==|=|!=|<>|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
+
+_AT_ZERO = {
+    "=": lambda n: n == 0,
+    "==": lambda n: n == 0,
+    "!=": lambda n: n != 0,
+    "<>": lambda n: n != 0,
+    "<": lambda n: n > 0,
+    "<=": lambda n: n >= 0,
+    ">": lambda n: n < 0,
+    ">=": lambda n: n <= 0,
+}
+
+
+def holds_at_zero(condition: Any) -> bool:
+    """Whether a test threshold can hold when the test counts zero failures.
+
+    dbt fails (or warns) where ``<failures> <condition>`` is true. A condition
+    that is not one comparison with a number is SQL Dex does not evaluate, and
+    reads as possibly true. dbt's default, ``!=0``, is false at zero.
+    """
+
+    if condition is None:
+        return False
+    match = _THRESHOLD.match(str(condition))
+    if match is None:
+        return True
+    operator, number = match.groups()
+    return _AT_ZERO[operator](float(number))
+
+
+def zero_means_pass(manifest: Mapping[str, Any]) -> frozenset[str]:
+    """The manifest's tests whose ``warn_if`` and ``error_if`` both fire on a
+    nonzero failure count alone, so zero failures is a pass (#1470).
+
+    A release that writes ``pass`` for any test with zero failures (0.16.4)
+    stores a failure of any other test as a pass; the Elementary reader reads
+    such a pass as unobserved. A test the manifest does not hold is not named.
+    """
+
+    named: set[str] = set()
+    for uid, node in (manifest.get("nodes") or {}).items():
+        if not isinstance(node, Mapping) or node.get("resource_type") != "test":
+            continue
+        config = node.get("config") or {}
+        if not isinstance(config, Mapping):
+            continue
+        if not any(holds_at_zero(config.get(key)) for key in ("warn_if", "error_if")):
+            named.add(str(uid))
+    return frozenset(named)
 
 
 #: Where the manifest says the package builds its tables, spelled as the
@@ -613,6 +674,7 @@ def _read_elementary(
     window_size: int,
     warned: list[str],
     command: str = COMMAND,
+    passes: frozenset[str] = frozenset(),
 ) -> _Source:
     try:
         from . import elementary_incidents as reader
@@ -668,7 +730,13 @@ def _read_elementary(
         priced = _price(engine, adapter, plan, command)
         # From here a refusal may follow spend, so it keeps what was priced.
         base["_price"] = priced
-        read = reader.read_elementary(engine, plan, claims=claims, adapter=adapter)
+        read = reader.read_elementary(
+            engine,
+            plan,
+            claims=claims,
+            adapter=adapter,
+            zero_means_pass=passes,
+        )
     except ElementaryReadError as exc:
         # No run in the window is nothing to read rather than a refusal of what
         # was there: the package has not uploaded a run yet.
@@ -685,6 +753,13 @@ def _read_elementary(
         # kept. No cost refusal is this class. The words are masked as every
         # folded failure is: a conversion error can quote a row's value.
         return _Source("refused", "warehouse_refused", failure_text(exc), base)
+    if read.passes_unobserved:
+        warned.append(
+            f"{read.passes_unobserved} pass(es) read as unobserved: the release "
+            "that wrote them records pass for any test with zero failures, and "
+            "each test's warn_if or error_if can hold at zero, so the row cannot "
+            "tell a pass from a failure"
+        )
     priced["first_read"] = read.first_read
     priced["profiled"] = list(read.profiled)
     return _Source(
@@ -706,6 +781,7 @@ def _read_elementary(
             "unplaced": read.unplaced,
             "commits_unread": read.commits_unread,
             "severities_unread": read.severities_unread,
+            "passes_unobserved": read.passes_unobserved,
         },
         observations=read.observations,
         history=read.history,

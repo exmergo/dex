@@ -263,7 +263,10 @@ def _patch_above(release: str) -> str:
         "0.27.0",
         "1.0.0",
         "0.23.0",
-        "0.16.4",
+        # Either side of 0.16.4, which is matched exactly.
+        "0.16.3",
+        "0.16.5",
+        "0.15.2",
         # A prerelease of the recorded release is another release.
         "0.26.1-rc.1",
     ],
@@ -290,9 +293,11 @@ def test_a_release_that_cannot_be_read_refuses_without_querying_the_catalog(
     assert catalog.calls == []
 
 
-@pytest.mark.parametrize("release", ["0.26.1", "v0.26.1"])
+@pytest.mark.parametrize("release", ["0.26.1", "v0.26.1", "0.16.4", "v0.16.4"])
 def test_a_release_inside_the_range_runs_the_check(release: str):
-    catalog = FakeCatalog()
+    catalog = FakeCatalog(
+        {table: _columns(table, release.lstrip("v")) for table in TABLES}
+    )
 
     check_layouts(release, catalog)
 
@@ -317,7 +322,7 @@ def test_the_check_reads_only_the_tables_a_caller_names():
 
 def test_every_reader_release_is_one_the_fixture_runs():
     tested = {release_key(release) for release in TESTED_RELEASES}
-    assert READER_RELEASES == ("0.26.1",)
+    assert READER_RELEASES == ("0.16.4", "0.26.1")
     assert all(release_key(release) in tested for release in READER_RELEASES)
     assert all(reader_status(release) == "supported" for release in READER_RELEASES)
 
@@ -391,7 +396,8 @@ def test_a_layout_with_a_type_name_the_package_does_not_use_is_refused_on_load()
 
 def test_no_recorded_read_holds_a_sampled_row_or_a_failing_value():
     held = {"result_rows", "result_row", "dimension_value", "source_value"}
-    for table in layout_for(RELEASE).tables.values():
+    tables = [t for r in READER_RELEASES for t in layout_for(r).tables.values()]
+    for table in tables:
         assert held.isdisjoint(table.reads), table.table
         for name in table.reads:
             assert table.family(name) in {
@@ -564,3 +570,150 @@ def test_a_column_dropped_in_the_warehouse_refuses_through_the_adapter(tmp_path:
 
 def test_the_shipped_file_loads_once():
     assert layouts.layouts() is layouts.layouts()
+
+
+# --- 0.16.4, the series most installs pin (#1470) ----------------------------------
+
+OLD = "0.16.4"
+
+
+def _catalog(release: str) -> FakeCatalog:
+    return FakeCatalog({table: _columns(table, release) for table in TABLES})
+
+
+def test_0_16_4_s_recorded_layout_passes_and_names_every_column_it_reads():
+    check = check_layouts(OLD, _catalog(OLD))
+
+    assert check.release == OLD
+    for checked in check.tables:
+        layout = layout_for(OLD).tables[checked.table]
+        assert set(checked.columns) == set(layout.reads)
+
+
+def test_a_column_dropped_at_0_16_4_refuses_naming_the_table_and_the_column():
+    error = _refusal(_catalog(OLD).drop("dbt_invocations", "run_started_at"), OLD)
+
+    assert error.code == COLUMN_MISSING
+    assert [(p.table, p.column) for p in error.problems] == [
+        ("dbt_invocations", "run_started_at")
+    ]
+
+
+def test_row_index_is_unobserved_at_0_16_4_and_required_at_0_26_1():
+    """0.16.4's test_result_rows has no row_index. Its check passes and names
+    the column unobserved; the same catalog at 0.26.1 refuses it missing."""
+
+    check = check_layouts(OLD, _catalog(OLD), tables=["test_result_rows"])
+    [rows] = check.tables
+    assert rows.unobserved == ("row_index",)
+    assert "row_index" not in rows.columns
+
+    error = _refusal(
+        FakeCatalog(
+            {
+                **FakeCatalog().tables,
+                "test_result_rows": _columns("test_result_rows", OLD),
+            }
+        ),
+        RELEASE,
+    )
+    assert [(p.code, p.column) for p in error.problems] == [
+        (COLUMN_MISSING, "row_index")
+    ]
+    assert check_layouts(RELEASE, FakeCatalog()).tables[2].unobserved == ()
+
+
+def test_the_tables_the_adapter_reads_match_at_both_releases():
+    """dbt_invocations and elementary_test_results read the same columns in the
+    same families at both, so a read may span rows each wrote; test_result_rows
+    does not."""
+
+    adapter = ["dbt_invocations", "elementary_test_results"]
+    assert layouts.compatible_releases(OLD, adapter) == (OLD, RELEASE)
+    assert layouts.compatible_releases(RELEASE, adapter) == (OLD, RELEASE)
+    assert layouts.compatible_releases(RELEASE, ["test_result_rows"]) == (RELEASE,)
+    with pytest.raises(ElementaryLayoutError):
+        layouts.compatible_releases("0.20.0", adapter)
+
+
+def test_only_0_16_4_writes_pass_for_any_test_with_zero_failures():
+    assert layout_for(OLD).pass_at_zero_failures is True
+    assert layout_for(RELEASE).pass_at_zero_failures is False
+
+
+def _shipped_without(release: str):
+    """The shipped layouts with ``release`` taken out, parsed as a file."""
+
+    import yaml
+
+    text = (
+        layouts.resources.files("exmergo_dex_core.maintain")
+        .joinpath("elementary_layouts.yml")
+        .read_text("utf-8")
+    )
+    raw = yaml.safe_load(text)
+    del raw["releases"][release]
+    return parse_layouts(yaml.safe_dump(raw))
+
+
+def test_before_this_change_0_16_4_had_no_layout_and_was_untested(monkeypatch):
+    """The arm built to break: the reader as it was, recording 0.26.1 alone,
+    refuses 0.16.4 with the release code before reading the catalog. The
+    shipped file reads it."""
+
+    alone = _shipped_without(OLD)
+    assert tuple(alone) == (RELEASE,)
+    catalog = _catalog(OLD)
+    monkeypatch.setattr(layouts, "layouts", lambda: alone)
+    monkeypatch.setattr(layouts, "READER_RELEASES", (RELEASE,))
+    error = _refusal(catalog, OLD)
+    assert (error.code, catalog.calls) == (RELEASE_UNTESTED, [])
+
+    monkeypatch.undo()
+    assert check_layouts(OLD, _catalog(OLD)).release == OLD
+
+
+def _two_releases(old_reads: str, old_unobserved: str = "") -> str:
+    """0.16.4 and 0.26.1, each table one ``id`` column (0.26.1 also ``n``,
+    read)."""
+
+    def block(release: str, columns: str, reads: str, unobserved: str) -> str:
+        extra = f"        unobserved: {unobserved}\n" if unobserved else ""
+        body = "".join(
+            f"      {table}:\n        source: s\n        columns:\n{columns}"
+            f"        reads: {reads}\n{extra}"
+            for table in TABLES
+        )
+        return f'  "{release}":\n    tables:\n{body}'
+
+    new = "          - [id, long_string]\n          - [n, int]\n"
+    old = "          - [id, long_string]\n"
+    return (
+        "releases:\n"
+        + block(OLD, old, old_reads, old_unobserved)
+        + block(RELEASE, new, "[id, n]", "")
+    )
+
+
+def test_a_column_one_release_reads_and_another_neither_reads_nor_names_is_refused():
+    with pytest.raises(ValueError, match="neither reads nor names unobserved"):
+        parse_layouts(_two_releases("[id]"))
+    assert parse_layouts(_two_releases("[id]", "[n]"))
+
+
+def test_an_unobserved_column_the_release_declares_is_refused_on_load():
+    with pytest.raises(ValueError, match="declared columns unobserved"):
+        parse_layouts(_two_releases("[id]", "[id, n]"))
+
+
+def test_an_unobserved_column_no_release_reads_is_refused_on_load():
+    with pytest.raises(ValueError, match="no release reads"):
+        parse_layouts(_two_releases("[id]", "[n, ghost]"))
+
+
+def test_pass_at_zero_failures_must_be_a_boolean():
+    text = _one_release(RELEASE).replace(
+        "    tables:", "    pass_at_zero_failures: yes please\n    tables:", 1
+    )
+    with pytest.raises(ValueError, match="true or false"):
+        parse_layouts(text)
