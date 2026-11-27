@@ -89,9 +89,13 @@ makes it run differently from the rest:
   `first_dex_command` (the first `group` command the agent ran is `command`),
   `no_dex_command` (no `command` call's shell command matches `matching`, a
   case-insensitive regular expression) and `no_file_writes` (no `Write`,
-  `Edit`, `MultiEdit` or `NotebookEdit` call and no `transform apply`). Dex
-  calls are read from the `Bash` tool with the metadata eval's parser, so a
-  case graded this way disallows `PowerShell`.
+  `Edit`, `MultiEdit` or `NotebookEdit` call, no `transform apply`, `init` or
+  `deps`, and no confirmed `config set` or `unset`). Dex calls are read from
+  the `Bash` and `PowerShell` tools with the metadata eval's parser. Two
+  things are not read: a file a shell command writes itself (a redirect,
+  `sed -i`), and SQL a call takes from a file or a variable, since `matching`
+  is read against the shell command's text. A case bounds both with its
+  `allowed_tools`.
 
 Such a case runs with `--output-format stream-json --verbose`, and both arms
 start with `--setting-sources project --strict-mcp-config
@@ -101,10 +105,12 @@ and the baseline arm is the agent with no dex at all. `--transcripts DIR`
 writes each run's transcript to `DIR/case-<id>-<skill|baseline>.jsonl`.
 
 The transcript also decides whether there was a run to grade. A run with no
-`init` or `result` event, or whose `result` says `is_error` or a
-`terminal_reason` holding `error`, is the case's error, and every check fails
-with it: a failed sign-in ends with a `result` of subtype `success`, and an
-empty transcript holds no forbidden command. So does a skill arm whose `init`
+`init` or `result` event, whose `result` subtype is not `success` (a run cut
+off by `max_turns` or `max_budget_usd`), or whose `result` says `is_error` or
+a `terminal_reason` holding `error`, is the case's error: the case fails
+whatever its judge says, and every check fails with it. A failed sign-in
+ends with a `result` of subtype `success`, and an empty transcript holds no
+forbidden command. So does a skill arm whose `init`
 event does not list the dex plugin from `--plugin-dir`, and a baseline arm
 whose `init` event lists any dex plugin, since either would compare one release
 with another.
