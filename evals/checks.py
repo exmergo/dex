@@ -11,8 +11,11 @@ from one.
 
 Dex calls are read with the metadata eval's parser (``evals.metadata.live``),
 which follows the skill wrapper however its path is spelled and ignores a Dex
-command that is only quoted text. It reads the ``Bash`` tool only, so a case
-graded here disallows the ``PowerShell`` tool.
+command that is only quoted text. Calls through the ``Bash`` and
+``PowerShell`` tools are both read. ``no_dex_command`` matches its pattern
+against the whole shell command a call sits in, so SQL a call reads from a
+file (``--sql-file``) or a variable is not seen; a case bounds that with its
+``allowed_tools``.
 
 Stdlib only, like the rest of the Tier-2 core.
 """
@@ -26,10 +29,14 @@ from typing import Any
 
 from .suite import Check
 
-#: The tools that write a file. A Dex call that writes the project
-#: (``transform apply``) counts too.
+#: The tools that write a file. A Dex call that writes the project counts too:
+#: those that always write, and ``config set``/``unset`` when confirmed. A
+#: write made by a shell command (a redirect, ``sed -i``) is not read here; a
+#: case bounds those with its ``allowed_tools``.
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
-WRITE_DEX_CALLS = frozenset({"transform apply"})
+WRITE_DEX_CALLS = frozenset({"transform apply", "transform init", "transform deps"})
+CONFIRMED_WRITE_DEX_CALLS = frozenset({"config set", "config unset"})
+SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 
 
 def parse_stream(text: str) -> list[dict[str, Any]]:
@@ -97,15 +104,19 @@ def dex_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     calls = []
     for use in tool_uses(events):
-        if use.get("name") != "Bash":
+        if use.get("name") not in SHELL_TOOLS:
             continue
         # One tool call at a time, so each call keeps the command it came from.
+        # The parser reads the Bash tool; a PowerShell call is read the same
+        # way, since the wrapper's command line is spelled alike in both.
+        block = {**use, "name": "Bash"}
         session = summarize(
-            [{"type": "assistant", "message": {"content": [use]}}], Session()
+            [{"type": "assistant", "message": {"content": [block]}}], Session()
         )
         command = str((use.get("input") or {}).get("command") or "")
         calls.extend(
-            {"label": c["label"], "command": command} for c in session.dex_calls
+            {"label": c["label"], "flags": c.get("flags") or [], "command": command}
+            for c in session.dex_calls
         )
     return calls
 
@@ -132,6 +143,11 @@ def run_error(
         return "the transcript has no result event; the run did not finish"
     result = results[-1]
     reason = str(result.get("terminal_reason") or "")
+    subtype = str(result.get("subtype") or "")
+    if subtype != "success":
+        # `error_max_turns`, `error_max_budget_usd`: the run was cut off, and
+        # a check of what it did not do would read the cut as compliance.
+        return f"the run did not finish (result subtype {subtype or 'unset'})"
     if result.get("is_error") or "error" in reason:
         said = str(result.get("result") or "").strip().splitlines()
         return f"the run ended in error (terminal_reason {reason or 'unset'})" + (
@@ -200,7 +216,12 @@ def grade(check: Check, events: list[dict[str, Any]]) -> tuple[bool, str]:
         writes = [
             u.get("name") for u in tool_uses(events) if u.get("name") in WRITE_TOOLS
         ]
-        applies = [c["label"] for c in calls if c["label"] in WRITE_DEX_CALLS]
+        applies = [
+            c["label"]
+            for c in calls
+            if c["label"] in WRITE_DEX_CALLS
+            or (c["label"] in CONFIRMED_WRITE_DEX_CALLS and "confirm" in c["flags"])
+        ]
         if writes or applies:
             return False, f"wrote with {sorted(set(writes + applies))}"
         return True, "no file-writing tool call and no `transform apply`"

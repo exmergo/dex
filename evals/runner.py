@@ -166,7 +166,12 @@ class CaseReport:
 
     @property
     def passed(self) -> bool:
-        return bool(self.assertions) and all(a.passed for a in self.assertions)
+        # A run that errored is no result, whatever its graders said about it.
+        return (
+            not self.error
+            and bool(self.assertions)
+            and all(a.passed for a in self.assertions)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -323,8 +328,9 @@ def run_suite(suite: EvalSuite, runner: AgentRunner, judge: Judge) -> SuiteRepor
 def _all_pass(
     case: EvalCase, runner: AgentRunner, judge: Judge, *, skill: bool
 ) -> bool:
-    graded = _grade(case, _run_case(runner, case, skill), judge)
-    return bool(graded) and all(a.passed for a in graded)
+    result = _run_case(runner, case, skill)
+    graded = _grade(case, result, judge)
+    return not result.error and bool(graded) and all(a.passed for a in graded)
 
 
 def _run_case(runner: AgentRunner, case: EvalCase, skill: bool) -> AgentResult:

@@ -25,7 +25,7 @@ import pytest
 
 from evals import checks, claude_agent
 from evals.__main__ import main
-from evals.runner import AgentResult, run_quality
+from evals.runner import AgentResult, run_quality, run_uplift
 from evals.suite import (
     AgentConfig,
     Check,
@@ -244,6 +244,29 @@ def test_a_case_with_setup_agent_and_checks_loads_as_written(tmp_path):
             ]
         },
         {"checks": [{"check": "no_file_writes", "assertion": "x", "colour": "red"}]},
+        {"agent": {"timeout": "600"}},
+        {"agent": {"max_turns": 0}},
+        {"agent": {"permission_mode": 1}},
+        {
+            "checks": [
+                {
+                    "check": "first_dex_command",
+                    "assertion": "x",
+                    "group": "maintain",
+                    "command": "dex maintain incidents",
+                }
+            ]
+        },
+        {
+            "checks": [
+                {
+                    "check": "no_dex_command",
+                    "assertion": "x",
+                    "command": "explore query",
+                    "matching": ["main_elementary"],
+                }
+            ]
+        },
     ],
 )
 def test_a_malformed_case_is_refused_with_its_place(tmp_path, extra):
@@ -349,6 +372,11 @@ def test_a_failed_sign_in_is_an_error_and_passes_nothing():
     [
         ([], "no init event"),
         ([_init()], "no result event"),
+        ([_init(), _done("x", subtype="error_max_turns")], "error_max_turns"),
+        (
+            [_init(), _done("x", subtype="error_max_budget_usd")],
+            "error_max_budget_usd",
+        ),
         (
             [_init(), _done("x", terminal_reason="api_error", is_error=False)],
             "api_error",
@@ -603,3 +631,51 @@ def test_uplift_without_case_is_an_error(cli):
     with pytest.raises(SystemExit) as exc:
         main(["skills/maintain", "--uplift"])
     assert exc.value.code == 2
+
+
+# --- review follow-ups (#1625) ---------------------------------------------------
+
+
+def test_an_errored_run_fails_a_case_whose_judge_would_pass_it():
+    """A streamed case with judged assertions only: the error decides, in both
+    the quality report and the uplift row."""
+
+    case = _case()
+    case.checks = []
+
+    class Agent:
+        def run(self, prompt, *, skill_enabled, case=None):
+            return AgentResult(output="looks right", error="the baseline arm loaded")
+
+    suite = EvalSuite(skill_name="maintain", evals=[case])
+    [report] = run_quality(suite, Agent(), _PassEverything())
+    assert not report.passed
+    [row] = run_uplift(suite, Agent(), _PassEverything())
+    assert not row.passed_with_skill and not row.passed_without_skill
+
+
+def test_dex_calls_through_powershell_are_read_too():
+    events = [
+        _init(),
+        _use(1, "PowerShell", {"command": f"{WRAP} maintain check"}),
+        _bash(2, f"{WRAP} maintain incidents"),
+        _done(ANSWER),
+    ]
+    assert checks.grade(FIRST, events) == (
+        False,
+        "the first `maintain` command is `maintain check` (Dex call 1)",
+    )
+
+
+@pytest.mark.parametrize(
+    "command, writes",
+    [
+        ("transform init analytics --connector duckdb", True),
+        ("transform deps", True),
+        ("config set budget.ceiling 10 --confirm", True),
+        ("config set budget.ceiling 10", False),
+    ],
+)
+def test_a_dex_command_that_writes_the_project_counts_as_a_write(command, writes):
+    events = [*passing()[:-1], _bash(9, f"{WRAP} {command}"), _done(ANSWER)]
+    assert checks.grade(NO_WRITES, events)[0] is not writes

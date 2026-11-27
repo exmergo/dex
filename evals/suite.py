@@ -209,6 +209,18 @@ def _agent_from(raw: Any, where: str) -> AgentConfig | None:
         value = raw.get(key, [])
         if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
             raise InvalidSuiteError(f"{where}.agent.{key} must be a list of strings")
+    if not isinstance(raw.get("permission_mode", ""), str):
+        raise InvalidSuiteError(f"{where}.agent.permission_mode must be a string")
+    for key, kinds in (
+        ("timeout", (int,)),
+        ("max_turns", (int,)),
+        ("max_budget_usd", (int, float)),
+    ):
+        value = raw.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, kinds) or value <= 0
+        ):
+            raise InvalidSuiteError(f"{where}.agent.{key} must be a positive number")
     return AgentConfig(**raw)
 
 
@@ -228,6 +240,14 @@ def _check_from(raw: Any, where: str) -> Check:
     missing = [key for key in required if not raw.get(key)]
     if missing:
         raise InvalidSuiteError(f"{where} ({kind}) needs {missing}")
+    for key in ("group", "command", "matching"):
+        if not isinstance(raw.get(key, ""), str):
+            raise InvalidSuiteError(f"{where}.{key} must be a string")
+    if kind == "first_dex_command" and raw["command"].split()[0] != raw["group"]:
+        raise InvalidSuiteError(
+            f"{where}.command must be a `{raw['group']}` command, written "
+            "without `dex` (`maintain incidents`)"
+        )
     if raw.get("matching"):
         try:
             re.compile(raw["matching"])
