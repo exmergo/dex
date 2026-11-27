@@ -669,15 +669,32 @@ def test_a_conflict_resolution_s_own_edit_is_a_change_in_the_range(tmp_path: Pat
     _git(repo, "checkout", "-q", "main")
     (repo / "a.sql").write_text("select 3\n")
     _git(repo, "commit", "-qam", "main")
-    subprocess.run(  # noqa: S603
-        ["git", "-C", str(repo), "merge", "-q", "side"],  # noqa: S607
+    # Conflicts: the merge stops for its resolution (exit 1), with the same
+    # identity every commit here carries, since a runner has none of its own.
+    merged = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=dex",
+            "-c",
+            "user.email=dex@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "merge",
+            "-q",
+            "side",
+        ],
         capture_output=True,
         env=git_env(),
         check=False,
     )
+    assert merged.returncode == 1, merged.stderr
     # The breaking line exists only in the resolution.
     (repo / "a.sql").write_text("select broken\n")
-    _git(repo, "commit", "-qam", "merge")
+    _git(repo, "add", "a.sql")
+    _git(repo, "commit", "-q", "--no-edit")
     merge = _git(repo, "rev-parse", "HEAD")
     # Bounded by both parents, only the merge itself is in the range.
     parents = _git(repo, "rev-parse", f"{merge}^1", f"{merge}^2").split()
