@@ -95,13 +95,23 @@ makes it run differently from the rest:
   transcript's `init` `cwd`): then only a file edit under one of them fails
   it, and a file written elsewhere, such as a scratch file in the workspace
   root, is listed as the check's `info` (in `--json`, and as a `note` line in
-  the text report) without failing it. A Dex call that writes the project
-  fails it either way. Dex calls are read from
-  the `Bash` and `PowerShell` tools with the metadata eval's parser. Two
-  things are not read: a file a shell command writes itself (a redirect,
-  `sed -i`), and SQL a call takes from a file or a variable, since `matching`
-  is read against the shell command's text. A case bounds both with its
-  `allowed_tools`.
+  the text report) without failing it. The workspace is found in a path by
+  its own directory name, which is unique to the run, so a path spelled
+  another way above it (`/c/Users/...`, an 8.3 short name, `~/...`) is still
+  placed. A Dex call that writes the project fails it either way. A file edit
+  the permissions refused, or that failed, wrote nothing and is not counted;
+  a Dex call is counted whatever it returned.
+
+  Dex calls are read from the `Bash` and `PowerShell` tools with the metadata
+  eval's parser, and only where the call names the wrapper (or a Bash alias
+  or variable bound in the same command). A PowerShell call through a
+  variable (`$R = "..."; & $R ...`) or `Invoke-Expression` is not seen, so a
+  case graded on Dex calls disallows `PowerShell`. Three more things are not
+  read: a file a shell command writes itself (a redirect, `sed -i`, `uv run
+  python -c "open(...)"`), SQL a call takes from a file or a variable (since
+  `matching` is read against the shell command's text), and so neither is
+  ruled out by an allow-list as broad as `Bash(uv run *)`. A case that must
+  rule them out narrows its `allowed_tools`.
 
 Such a case runs with `--output-format stream-json --verbose`, and both arms
 start with `--setting-sources project`, `--strict-mcp-config` and
@@ -110,18 +120,28 @@ machine's installed plugins, the user's hooks and their MCP servers stay out,
 and the baseline arm is the agent with no dex at all. `--transcripts DIR`
 writes each run's transcript to `DIR/case-<id>-<skill|baseline>.jsonl`.
 
-**The judge's own answer is kept.** The judge's verdict is read from the first
-word of its answer, whatever markdown or punctuation surrounds it (`**PASS**`
-and `Pass.` both pass). A judge that raised, timed out, or answered neither
-PASS nor FAIL gives no verdict, and that is the case's run error, never a
-FAIL, since it says nothing about the agent. Each judged assertion carries the
-judge's text (`verdict` in `--json`; a failed line prints it), and
-`--transcripts DIR` also writes each case's graded assertions to
-`DIR/case-<id>-<skill|baseline>.judge.json`. Every `claude -p` the backend
-starts, the agent's and the judge's, takes its prompt on stdin, not in argv:
-on Windows `claude` is usually npm's `claude.cmd`, and cmd.exe ends an
-argument at its first newline, which cut every multi-line judge prompt to its
-first line and dropped the flags after it.
+**The judge's own answer is kept.** The judge's verdict is the first word of
+its answer, which must be PASS or FAIL itself, whatever markdown or
+punctuation surrounds it (`**PASS**` and `Pass.` both pass; `Failed to
+authenticate` is no verdict). A judge that raised, timed out, whose CLI
+reported `is_error`, or that answered neither PASS nor FAIL gives no verdict,
+and that is the case's run error, never a FAIL, since it says nothing about
+the agent. Each judged assertion carries the judge's text (`verdict` in
+`--json`; a failed line prints it), and `--transcripts DIR` also writes each
+case's graded assertions to `DIR/case-<id>-<skill|baseline>.judge.json`.
+
+**An arm that errored is not a result.** Its uplift row carries the error and
+is left out of the uplift score, and the run fails: scored as a failed arm, a
+baseline that loaded dex or never signed in would credit the skill with the
+difference. `--case ID --uplift` prints `uplift not measured` for such a case
+and exits non-zero.
+
+Every `claude -p` the skill evals' backend (`claude_agent.py`) starts, the
+agent's and the judge's, takes its prompt on stdin, not in argv: on Windows
+`claude` is usually npm's `claude.cmd`, and cmd.exe ends an argument at its
+first newline, which cut every multi-line judge prompt to its first line and
+dropped the flags after it. The metadata eval's live runs
+(`evals/metadata/live.py`) still pass their prompt in argv.
 
 The transcript also decides whether there was a run to grade. A run with no
 `init` or `result` event, whose `result` subtype is not `success` (a run cut

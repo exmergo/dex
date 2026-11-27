@@ -241,7 +241,11 @@ def _check_from(raw: Any, where: str) -> Check:
         "no_dex_command": ("command", "matching"),
         "no_file_writes": (),
     }[kind]
-    missing = [key for key in required if not raw.get(key)]
+    missing = [
+        key
+        for key in required
+        if not (raw.get(key).strip() if isinstance(raw.get(key), str) else raw.get(key))
+    ]
     if missing:
         raise InvalidSuiteError(f"{where} ({kind}) needs {missing}")
     for key in ("group", "command", "matching"):

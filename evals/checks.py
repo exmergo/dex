@@ -12,10 +12,13 @@ from one.
 Dex calls are read with the metadata eval's parser (``evals.metadata.live``),
 which follows the skill wrapper however its path is spelled and ignores a Dex
 command that is only quoted text. Calls through the ``Bash`` and
-``PowerShell`` tools are both read. ``no_dex_command`` matches its pattern
-against the whole shell command a call sits in, so SQL a call reads from a
-file (``--sql-file``) or a variable is not seen; a case bounds that with its
-``allowed_tools``.
+``PowerShell`` tools are both read, where the call names the wrapper; a
+PowerShell call through a variable or ``Invoke-Expression`` is not seen, so a
+case graded on Dex calls disallows PowerShell. ``no_dex_command`` matches its
+pattern against the whole shell command a call sits in, so SQL a call reads
+from a file (``--sql-file``) or a variable is not seen, and a file a shell
+command writes is not seen by ``no_file_writes``; an allow-list as broad as
+``Bash(uv run *)`` rules out neither.
 
 Stdlib only, like the rest of the Tier-2 core.
 """
@@ -23,7 +26,6 @@ Stdlib only, like the rest of the Tier-2 core.
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -32,8 +34,8 @@ from .suite import Check
 
 #: The tools that write a file. A Dex call that writes the project counts too:
 #: those that always write, and ``config set``/``unset`` when confirmed. A
-#: write made by a shell command (a redirect, ``sed -i``) is not read here; a
-#: case bounds those with its ``allowed_tools``.
+#: write made by a shell command (a redirect, ``sed -i``) is not read here, and
+#: an allow-list as broad as ``Bash(uv run *)`` does not rule one out.
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
 WRITE_DEX_CALLS = frozenset({"transform apply", "transform init", "transform deps"})
 CONFIRMED_WRITE_DEX_CALLS = frozenset({"config set", "config unset"})
@@ -265,9 +267,11 @@ def _file_writes(
     )
     inside: list[tuple[str, str]] = []
     outside: list[tuple[str, str]] = []
+    failed = _failed_uses(events)
     for use in tool_uses(events):
         name = str(use.get("name"))
-        if name not in WRITE_TOOLS:
+        if name not in WRITE_TOOLS or use.get("id") in failed:
+            # A refused or failed write wrote nothing.
             continue
         payload = use.get("input") or {}
         path = str(payload.get("file_path") or payload.get("notebook_path") or "")
@@ -283,31 +287,60 @@ def _file_writes(
 _DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
-def _norm(path: str) -> str:
-    return os.path.normcase(os.path.normpath(path.replace("\\", "/")))
+def _segments(path: str) -> list[str]:
+    """A path's parts as written, with either slash: a transcript's paths are
+    another machine's, so they are read by their spelling, never against this
+    filesystem. Compare them with ``casefold``."""
+
+    out: list[str] = []
+    for part in path.replace("\\", "/").split("/"):
+        if part in ("", "."):
+            continue
+        if part == ".." and out:
+            out.pop()
+            continue
+        out.append(part)
+    return out
 
 
 def _place(path: str, root: str, within: list[str]) -> tuple[str, bool]:
-    """``path`` as shown in the report (relative to ``root`` when under it),
-    and whether it sits under one of ``within``."""
+    """``path`` as shown in the report (from the workspace down, when it is
+    under it), and whether it sits under one of ``within``.
 
-    # Strings, not Path: a transcript's paths are another machine's, so they
-    # are read by their spelling, never against this filesystem.
-    absolute = (
-        os.path.isabs(path)  # noqa: PTH117
-        or path.startswith(("/", "\\"))
-        or _DRIVE.match(path) is not None
-    )
-    full = _norm(path if absolute else os.path.join(root, path))  # noqa: PTH118
-    base = _norm(root)
-    if os.path.splitdrive(full)[0] != os.path.splitdrive(base)[0]:
+    The workspace is placed by its own directory name, the last part of
+    ``root``, which is unique to the run (``tempfile.mkdtemp``). So a path is
+    under it however the part above it is spelled: Git Bash's ``/c/Users/...``,
+    an 8.3 short name, ``~/...``. A relative path is read from ``root``."""
+
+    relative = not (path.startswith(("/", "\\", "~")) or _DRIVE.match(path))
+    base = _segments(root)
+    parts = base + _segments(path) if relative else _segments(path)
+    folded = [p.casefold() for p in parts]
+    name = base[-1].casefold() if base else ""
+    if not name or name not in folded:
         return path, False
-    if os.path.commonpath([full, base]) != base:
-        return path, False
-    relative = os.path.relpath(full, base)
-    shown = relative.replace(os.sep, "/")
-    for part in within:
-        scope = _norm(part)
-        if relative == scope or relative.startswith(scope + os.sep):
-            return shown, True
-    return shown, False
+    start = len(folded) - folded[::-1].index(name)
+    below = parts[start:]
+    for scope in within:
+        wanted = [p.casefold() for p in _segments(scope)]
+        if wanted and folded[start : start + len(wanted)] == wanted:
+            return "/".join(below), True
+    return "/".join(below), False
+
+
+def _failed_uses(events: list[dict[str, Any]]) -> set[str]:
+    """The ids of the tool calls whose result is an error: refused by the
+    permissions, or failed."""
+
+    failed: set[str] = set()
+    for event in _of_type(events, "user"):
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for block in content if isinstance(content, list) else []:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("is_error")
+            ):
+                failed.add(str(block.get("tool_use_id")))
+    return failed
