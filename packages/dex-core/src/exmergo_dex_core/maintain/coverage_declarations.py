@@ -261,7 +261,7 @@ class _Tests:
         key = _bare(column)
         zone = str(declared.get("timezone") or "")
         want_days = _weekdays(declared.get("days"))
-        for name, _col, kwargs, _reads in self.by_model.get(model, []):
+        for name, _col, kwargs, _reads, _claim in self.by_model.get(model, []):
             if _base(name) != "data_freshness_sla":
                 continue
             # A test checked on fewer days than declared leaves a declared day
