@@ -89,16 +89,29 @@ makes it run differently from the rest:
   `first_dex_command` (the first `group` command the agent ran is `command`),
   `no_dex_command` (no `command` call's shell command matches `matching`, a
   case-insensitive regular expression) and `no_file_writes` (no `Write`,
-  `Edit`, `MultiEdit` or `NotebookEdit` call, no `transform apply`, `init` or
-  `deps`, and no confirmed `config set` or `unset`). `no_file_writes` may
-  take `within`, paths relative to the run's working directory (the
-  transcript's `init` `cwd`): then only a file edit under one of them fails
-  it, and a file written elsewhere, such as a scratch file in the workspace
-  root, is listed as the check's `info` (in `--json`, and as a `note` line in
-  the text report) without failing it. The workspace is found in a path by
-  its own directory name, which is unique to the run, so a path spelled
-  another way above it (`/c/Users/...`, an 8.3 short name, `~/...`) is still
-  placed. A Dex call that writes the project fails it either way. A file edit
+  `Edit`, `MultiEdit` or `NotebookEdit` call, and no Dex call that writes the
+  project or `.dex/`: `transform apply`, `plan`, `declare`, `rename`,
+  `remove`, `repair`, `build`, `init` or `deps`, `transform place` without
+  `--explain`, `transform test` (either mode), `maintain
+  snapshot` or `reconcile`, any `semantic` command, `demo`, and a confirmed
+  `config set` or `unset`). A call made with `--help` is not read. For a
+  `no_dex_command`, a `--sql-file` call is also read through the file it
+  names, as the transcript shows it written (a file tool or a heredoc); a
+  file whose contents the transcript does not show counts as a match.
+
+  `no_file_writes` may take `within`, paths relative to the run's working
+  directory (the transcript's `init` `cwd`). Then only a write under one of
+  them fails it, and a file written elsewhere, such as a scratch file in the
+  workspace root, is listed as the check's `info` (in `--json`, and as a
+  `note` line in the text report) without failing it. The backend hashes
+  every file in the workspace after the setup and again after the agent, so
+  a change under `within` fails the check however it was made: a shell
+  redirect, `uv run python -c "open(...)"`, a Dex command. `ignore` names the
+  files under `within` that a read changes by itself (the engine's
+  `.dex/cache.json`, `.dex/cache.lock` and `.dex/queries.jsonl`). The tool
+  calls are read too: the workspace is found in a path by its own directory
+  name, which is unique to the run, so a path spelled another way above it
+  (`/c/Users/...`, an 8.3 short name, `~/...`) is still placed. A file edit
   the permissions refused, or that failed, wrote nothing and is not counted;
   a Dex call is counted whatever it returned.
 
@@ -106,12 +119,8 @@ makes it run differently from the rest:
   eval's parser, and only where the call names the wrapper (or a Bash alias
   or variable bound in the same command). A PowerShell call through a
   variable (`$R = "..."; & $R ...`) or `Invoke-Expression` is not seen, so a
-  case graded on Dex calls disallows `PowerShell`. Three more things are not
-  read: a file a shell command writes itself (a redirect, `sed -i`, `uv run
-  python -c "open(...)"`), SQL a call takes from a file or a variable (since
-  `matching` is read against the shell command's text), and so neither is
-  ruled out by an allow-list as broad as `Bash(uv run *)`. A case that must
-  rule them out narrows its `allowed_tools`.
+  case graded on Dex calls disallows `PowerShell`. SQL a call takes from a
+  shell variable is not read either.
 
 Such a case runs with `--output-format stream-json --verbose`, and both arms
 start with `--setting-sources project`, `--strict-mcp-config` and

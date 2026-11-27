@@ -39,6 +39,9 @@ class AgentResult:
     triggered: bool = False
     envelopes: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
+    #: The files the run added, changed or removed in its workspace, relative
+    #: to it, or ``None`` where the backend gave it no workspace to compare.
+    changes: list[str] | None = None
     error: str | None = None
 
 
@@ -457,8 +460,8 @@ def _grade(case: EvalCase, result: AgentResult, judge: Judge) -> list[AssertionR
         if result.error:
             passed, detail, info = False, f"not graded: {result.error}", ""
         else:
-            passed, detail = checks.grade(check, result.events)
-            info = checks.information(check, result.events)
+            passed, detail = checks.grade(check, result.events, result.changes)
+            info = checks.information(check, result.events, result.changes)
         graded.append(
             AssertionResult(
                 assertion=check.assertion,

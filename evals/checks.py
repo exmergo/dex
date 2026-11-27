@@ -15,10 +15,12 @@ command that is only quoted text. Calls through the ``Bash`` and
 ``PowerShell`` tools are both read, where the call names the wrapper; a
 PowerShell call through a variable or ``Invoke-Expression`` is not seen, so a
 case graded on Dex calls disallows PowerShell. ``no_dex_command`` matches its
-pattern against the whole shell command a call sits in, so SQL a call reads
-from a file (``--sql-file``) or a variable is not seen, and a file a shell
-command writes is not seen by ``no_file_writes``; an allow-list as broad as
-``Bash(uv run *)`` rules out neither.
+pattern against the whole shell command a call sits in, and for a
+``--sql-file`` call against the file it names as the transcript shows it
+written; SQL held in a shell variable is not seen. ``no_file_writes`` reads
+the file-writing tool calls and, where the backend compared the workspace
+before and after the run (``AgentResult.changes``), every file the run
+changed, so a write a shell command made is caught there.
 
 Stdlib only, like the rest of the Tier-2 core.
 """
@@ -32,12 +34,33 @@ from typing import Any
 
 from .suite import Check
 
-#: The tools that write a file. A Dex call that writes the project counts too:
-#: those that always write, and ``config set``/``unset`` when confirmed. A
-#: write made by a shell command (a redirect, ``sed -i``) is not read here, and
-#: an allow-list as broad as ``Bash(uv run *)`` does not rule one out.
+#: The tools that write a file. A write made by a shell command (a redirect,
+#: ``sed -i``) is not a tool call; the workspace comparison catches it.
 WRITE_TOOLS = frozenset({"Write", "Edit", "MultiEdit", "NotebookEdit"})
-WRITE_DEX_CALLS = frozenset({"transform apply", "transform init", "transform deps"})
+#: Dex calls that write the project or ``.dex/`` (a plan, a snapshot): read
+#: from the command surface in AGENTS.md. ``transform place`` writes unless
+#: ``--explain``; ``transform test`` writes in either of its two modes (a
+#: stored plan, or a mutation record); every ``semantic`` command stores a
+#: plan. The engine's own bookkeeping on a read (``.dex/cache.json``,
+#: ``.dex/queries.jsonl``) is not a write here.
+WRITE_DEX_CALLS = frozenset(
+    {
+        "transform apply",
+        "transform init",
+        "transform deps",
+        "transform plan",
+        "transform declare",
+        "transform rename",
+        "transform remove",
+        "transform repair",
+        "transform build",
+        "transform test",
+        "maintain snapshot",
+        "maintain reconcile",
+        "demo",
+    }
+)
+WRITE_DEX_GROUPS = frozenset({"semantic"})
 CONFIRMED_WRITE_DEX_CALLS = frozenset({"config set", "config unset"})
 SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
 
@@ -181,10 +204,21 @@ def run_error(
     return None
 
 
-def grade(check: Check, events: list[dict[str, Any]]) -> tuple[bool, str]:
-    """Whether ``events`` satisfy ``check``, and the reason, for the report."""
+def grade(
+    check: Check,
+    events: list[dict[str, Any]],
+    changes: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Whether ``events`` satisfy ``check``, and the reason, for the report.
 
-    calls = dex_calls(events)
+    ``changes`` is what the run changed in its workspace (``AgentResult.
+    changes``), where the backend could read it: a ``no_file_writes`` with
+    ``within`` then fails on a change under the project however it was made
+    (a shell command, a script, a Dex command), not only on a write the tool
+    calls show. A call made with ``--help`` does nothing and is not read.
+    """
+
+    calls = [c for c in dex_calls(events) if "help" not in c["flags"]]
     if check.check == "first_dex_command":
         in_group = [c for c in calls if c["label"].split()[0] == check.group]
         if not in_group:
@@ -209,7 +243,7 @@ def grade(check: Check, events: list[dict[str, Any]]) -> tuple[bool, str]:
         hits = [
             c
             for c in calls
-            if c["label"] == check.command and pattern.search(c["command"])
+            if c["label"] == check.command and _reads_match(c, events, pattern)
         ]
         if hits:
             return (
@@ -221,31 +255,116 @@ def grade(check: Check, events: list[dict[str, Any]]) -> tuple[bool, str]:
     if check.check == "no_file_writes":
         inside, _ = _file_writes(check, events)
         writes = [name for name, _ in inside]
-        applies = [
-            c["label"]
-            for c in calls
-            if c["label"] in WRITE_DEX_CALLS
-            or (c["label"] in CONFIRMED_WRITE_DEX_CALLS and "confirm" in c["flags"])
-        ]
-        if writes or applies:
-            shown = sorted({shown for _, shown in inside})
-            where = f" ({shown})" if check.within and shown else ""
-            return False, f"wrote with {sorted(set(writes + applies))}{where}"
+        applies = [c["label"] for c in calls if _writes_project(c)]
+        changed, _ = _changes(check, changes)
+        if writes or applies or changed:
+            said = []
+            if writes or applies:
+                shown = sorted({shown for _, shown in inside})
+                where = f" ({shown})" if check.within and shown else ""
+                said.append(f"wrote with {sorted(set(writes + applies))}{where}")
+            if changed:
+                said.append(f"changed in the project: {changed}")
+            return False, "; ".join(said)
         scope = " in the project" if check.within else ""
-        return True, f"no file-writing tool call{scope} and no `transform apply`"
+        read = "" if changes is None else ", and nothing in it changed"
+        return True, f"no file-writing tool call{scope} and no Dex write{read}"
     raise ValueError(f"unknown check {check.check!r}")
 
 
-def information(check: Check, events: list[dict[str, Any]]) -> str:
+def information(
+    check: Check,
+    events: list[dict[str, Any]],
+    changes: list[str] | None = None,
+) -> str:
     """What a check saw that does not decide it, for the report: the files a
     ``no_file_writes`` with ``within`` saw written outside the project."""
 
     if check.check != "no_file_writes" or not check.within:
         return ""
     _, outside = _file_writes(check, events)
-    if not outside:
-        return ""
-    return f"wrote outside the project: {sorted({shown for _, shown in outside})}"
+    _, elsewhere = _changes(check, changes)
+    shown = sorted({shown for _, shown in outside} | set(elsewhere))
+    return f"wrote outside the project: {shown}" if shown else ""
+
+
+def _writes_project(call: dict[str, Any]) -> bool:
+    label, flags = call["label"], call["flags"]
+    if label in WRITE_DEX_CALLS or label.split()[0] in WRITE_DEX_GROUPS:
+        return True
+    if label in CONFIRMED_WRITE_DEX_CALLS:
+        return "confirm" in flags
+    if label == "transform place":
+        return "explain" not in flags
+    return False
+
+
+def _changes(check: Check, changes: list[str] | None) -> tuple[list[str], list[str]]:
+    """The workspace's changed files, split into those under ``within`` (minus
+    ``ignore``) and the rest (minus ``ignore``); both empty when the backend
+    could not read the workspace."""
+
+    if changes is None or not check.within:
+        return [], []
+    ignored = {_folded(p) for p in check.ignore}
+    inside, outside = [], []
+    for path in changes:
+        if _folded(path) in ignored:
+            continue
+        parts = _folded(path).split("/")
+        under = any(
+            parts[: len(scope)] == scope
+            for scope in (_folded(w).split("/") for w in check.within)
+        )
+        (inside if under else outside).append(path)
+    return sorted(inside), sorted(outside)
+
+
+def _folded(path: str) -> str:
+    return "/".join(_segments(path)).casefold()
+
+
+def _reads_match(
+    call: dict[str, Any], events: list[dict[str, Any]], pattern: re.Pattern
+) -> bool:
+    """Whether what a call reads matches: its own command, and for a
+    ``--sql-file`` call also every file the transcript shows written whose
+    name the command holds, and every other shell command that names it (a
+    heredoc). A ``--sql-file`` whose SQL the transcript does not show counts
+    as a match, since an unread file is no evidence it is clean."""
+
+    text = call["command"]
+    if pattern.search(text):
+        return True
+    if "sql-file" not in call["flags"]:
+        return False
+    found = _SQL_FILE.search(text)
+    argument = next((g for g in found.groups() if g), "") if found else ""
+    name = _segments(argument)[-1].casefold() if _segments(argument) else ""
+    seen: list[str] = []
+    for use in tool_uses(events) if name else []:
+        payload = use.get("input") or {}
+        if use.get("name") in WRITE_TOOLS:
+            path = str(payload.get("file_path") or payload.get("notebook_path") or "")
+            parts = _segments(path)
+            if parts and parts[-1].casefold() == name:
+                seen.append(_written_text(payload))
+        elif use.get("name") in SHELL_TOOLS:
+            other = str(payload.get("command") or "")
+            if other != text and name in other.casefold():
+                seen.append(other)
+    # Nothing showing what the file holds counts as a hit.
+    return not seen or any(pattern.search(s) for s in seen)
+
+
+#: The file a ``--sql-file`` argument names, quoted or not.
+_SQL_FILE = re.compile(r"""--sql-file(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))""")
+
+
+def _written_text(payload: dict[str, Any]) -> str:
+    parts = [str(payload.get("content") or ""), str(payload.get("new_string") or "")]
+    parts += [str(e.get("new_string") or "") for e in payload.get("edits") or []]
+    return " ".join(parts)
 
 
 def _file_writes(
