@@ -94,26 +94,33 @@ makes it run differently from the rest:
   `remove`, `repair`, `build`, `init` or `deps`, `transform place` without
   `--explain`, `transform test` (either mode), `maintain
   snapshot` or `reconcile`, any `semantic` command, `demo`, and a confirmed
-  `config set` or `unset`). A call made with `--help` is not read. For a
-  `no_dex_command`, a `--sql-file` call is also read through the file it
-  names, as the transcript shows it written (a file tool or a heredoc); a
-  file whose contents the transcript does not show counts as a match.
+  `config set` or `unset`). A call made with `--help` is not read, and
+  neither is a call the permissions refused (a `permission_denied` event, or
+  the result's `permission_denials`); a call that ran and returned an error
+  still counts. For a `no_dex_command`, a `--sql-file` call is also read
+  through what the file it names held when the query ran: the successful
+  operations before it on that path (resolved against the working
+  directory), where a `Write` sets the contents, an `Edit` adds to contents
+  already shown, and a shell redirect (`> q.sql`, `tee`, `Set-Content`,
+  `Out-File`) sets them to its command's text. A file those operations do
+  not establish, such as one only listed with `ls`, counts as a match.
 
   `no_file_writes` may take `within`, paths relative to the run's working
-  directory (the transcript's `init` `cwd`). Then only a write under one of
-  them fails it, and a file written elsewhere, such as a scratch file in the
-  workspace root, is listed as the check's `info` (in `--json`, and as a
-  `note` line in the text report) without failing it. The backend hashes
-  every file in the workspace after the setup and again after the agent, so
-  a change under `within` fails the check however it was made: a shell
-  redirect, `uv run python -c "open(...)"`, a Dex command. `ignore` names the
-  files under `within` that a read changes by itself (the engine's
-  `.dex/cache.json`, `.dex/cache.lock` and `.dex/queries.jsonl`). The tool
-  calls are read too: the workspace is found in a path by its own directory
-  name, which is unique to the run, so a path spelled another way above it
+  directory (the transcript's `init` `cwd`; `"."` is the whole workspace).
+  Then only a write under one of them fails it, and a file written
+  elsewhere, such as a scratch file in the workspace root, is listed as the
+  check's `info` (in `--json`, and as a `note` line in the text report)
+  without failing it. Without `within`, every write and every change fails
+  it. The backend hashes every file in the workspace after the setup and
+  again after the agent, so a change fails the check however it was made: a
+  shell redirect, `uv run python -c "open(...)"`, a Dex command. A file that
+  could not be read in either snapshot is counted as changed. `ignore` names
+  the files a read changes by itself (the engine's `.dex/cache.json`,
+  `.dex/cache.lock` and `.dex/queries.jsonl`). The tool calls are read too:
+  the workspace is found in a path by its own directory name, which is
+  unique to the run, so a path spelled another way above it
   (`/c/Users/...`, an 8.3 short name, `~/...`) is still placed. A file edit
-  the permissions refused, or that failed, wrote nothing and is not counted;
-  a Dex call is counted whatever it returned.
+  the permissions refused, or that failed, wrote nothing and is not counted.
 
   Dex calls are read from the `Bash` and `PowerShell` tools with the metadata
   eval's parser, and only where the call names the wrapper (or a Bash alias
@@ -132,18 +139,21 @@ writes each run's transcript to `DIR/case-<id>-<skill|baseline>.jsonl`.
 **The judge's own answer is kept.** The judge's verdict is the first word of
 its answer, which must be PASS or FAIL itself, whatever markdown or
 punctuation surrounds it (`**PASS**` and `Pass.` both pass; `Failed to
-authenticate` is no verdict). A judge that raised, timed out, whose CLI
+authenticate`, `PASS123` and `PASS_X` are no verdict). A judge that raised, timed out, whose CLI
 reported `is_error`, or that answered neither PASS nor FAIL gives no verdict,
 and that is the case's run error, never a FAIL, since it says nothing about
 the agent. Each judged assertion carries the judge's text (`verdict` in
 `--json`; a failed line prints it), and `--transcripts DIR` also writes each
-case's graded assertions to `DIR/case-<id>-<skill|baseline>.judge.json`.
+case's graded assertions beside its transcript, under the same stem
+(`case-7-skill-2.jsonl` gets `case-7-skill-2.judge.json`; a run that wrote no
+transcript gets `case-<id>-<arm>-no-transcript.judge.json`).
 
 **An arm that errored is not a result.** Its uplift row carries the error and
 is left out of the uplift score, and the run fails: scored as a failed arm, a
 baseline that loaded dex or never signed in would credit the skill with the
 difference. `--case ID --uplift` prints `uplift not measured` for such a case
-and exits non-zero.
+and exits non-zero. A full-suite run whose quality report holds an errored
+case fails the same way; a case that ran and failed is a result.
 
 Every `claude -p` the skill evals' backend (`claude_agent.py`) starts, the
 agent's and the judge's, takes its prompt on stdin, not in argv: on Windows

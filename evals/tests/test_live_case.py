@@ -1228,9 +1228,213 @@ def test_the_dex_calls_that_store_a_plan_or_snapshot_are_writes(command, writes)
     assert checks.grade(NO_WRITES, events)[0] is not writes
 
 
-def test_ignore_is_refused_without_within(tmp_path):
+# --- CodeRabbit's review of #1625 and #1626 --------------------------------------
+
+
+def _q(n: int, path: str = "q.sql") -> dict:
+    return _bash(n, f"{WRAP} explore query --sql-file {path}")
+
+
+def _w(n: int, path: str, content: str) -> dict:
+    return _use(n, "Write", {"file_path": path, "content": content})
+
+
+def test_a_sql_file_is_read_as_it_stood_when_the_query_ran():
+    # Elementary SQL queried, then overwritten with clean SQL: still a read.
+    events = _wrote(
+        _w(2, "/work/q.sql", ELEMENTARY_SQL), _q(3), _w(4, "/work/q.sql", "select 1")
+    )
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+    # Clean SQL queried, then overwritten with Elementary SQL: not a read.
+    events = _wrote(
+        _w(2, "/work/q.sql", "select 1"), _q(3), _w(4, "/work/q.sql", ELEMENTARY_SQL)
+    )
+    assert checks.grade(NO_ELEMENTARY, events)[0]
+    # Queried before any write showed it: unread, so a match.
+    events = _wrote(_q(2), _w(3, "/work/q.sql", "select 1"))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_sql_file_is_matched_by_its_path_not_its_name():
+    events = _wrote(_w(2, "/work/scratch/q.sql", "select 1"), _q(3, "private/q.sql"))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+    events = _wrote(_w(2, "/work/private/q.sql", "select 1"), _q(3, "private/q.sql"))
+    assert checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_mention_of_the_file_is_not_its_contents():
+    events = _wrote(_bash(2, "ls q.sql"), _q(3))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+    events = _wrote(_bash(2, "echo 'select 1' > q.sql"), _q(3))
+    assert checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def _denial(n: int, tool: str) -> dict:
+    return {
+        "type": "system",
+        "subtype": "permission_denied",
+        "tool_name": tool,
+        "tool_use_id": f"toolu_{n}",
+    }
+
+
+def test_a_refused_write_establishes_nothing():
+    events = _wrote(_w(2, "/work/q.sql", "select 1"), _denial(2, "Write"), _q(3))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_denied_shell_request_is_not_a_call():
+    events = [
+        _init(),
+        _bash(1, f"{WRAP} maintain incidents"),
+        _denial(1, "Bash"),
+        _bash(2, f"{WRAP} maintain diagnose"),
+        _done(ANSWER),
+    ]
+    assert checks.grade(FIRST, events) == (
+        False,
+        "the first `maintain` command is `maintain diagnose` (Dex call 1)",
+    )
+    # Listed only in the result's permission_denials: the same.
+    listed = {**_done(ANSWER), "permission_denials": [{"tool_use_id": "toolu_1"}]}
+    events = [
+        _init(),
+        _bash(1, f"{WRAP} maintain incidents"),
+        _bash(2, f"{WRAP} maintain diagnose"),
+        listed,
+    ]
+    assert not checks.grade(FIRST, events)[0]
+
+
+def test_a_call_that_ran_and_errored_still_counts():
+    errored = _res(1, '{"status": "error"}')
+    errored["message"]["content"][0]["is_error"] = True
+    events = [_init(), _bash(1, f"{WRAP} maintain incidents"), errored, _done(ANSWER)]
+    assert checks.grade(FIRST, events)[0]
+
+
+def test_a_quoted_wrapper_path_with_spaces_is_one_token():
+    parts = ["C:", "Program Files", "dex", "skills", "maintain", "scripts", "run.py"]
+    path = chr(92).join(parts)
+    command = f"& uv run --no-project --script '{path}' explore query --sql-file q.sql"
+    events = [_init(), _use(1, "PowerShell", {"command": command}), _done(ANSWER)]
+    [call] = checks.dex_calls(events)
+    assert call["label"] == "explore query"
+    assert "sql-file" in call["flags"]
+
+
+def test_an_unscoped_write_check_counts_every_change_but_its_ignore_list():
+    unscoped = Check(check="no_file_writes", assertion="x", ignore=[".dex/cache.json"])
+    assert not checks.grade(unscoped, _wrote(), ["x.sql"])[0]
+    assert checks.grade(unscoped, _wrote(), [".dex/cache.json"])[0]
+    assert checks.grade(unscoped, _wrote(), [])[0]
+
+
+def test_ignore_without_within_is_accepted(tmp_path):
     raw = {"check": "no_file_writes", "assertion": "x", "ignore": [".dex/cache.json"]}
-    with pytest.raises(InvalidSuiteError, match="ignore"):
-        _suite_from_dict(
-            {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
-        )
+    suite = _suite_from_dict(
+        {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
+    )
+    assert suite.evals[0].checks[0].ignore == [".dex/cache.json"]
+
+
+def test_within_dot_is_the_whole_workspace():
+    whole = Check(check="no_file_writes", assertion="x", within=["."])
+    assert not checks.grade(whole, _wrote(), ["x.sql"])[0]
+    assert not checks.grade(whole, _wrote(_write(2, "/work/x.sql")))[0]
+    assert checks.grade(whole, _wrote(_write(2, "/srv/x.sql")))[0]
+
+
+def test_an_unreadable_file_is_not_shown_unchanged():
+    before = {"a": "1", "b": "unreadable"}
+    assert claude_agent.changed_files(before, dict(before)) == ["b"]
+
+
+def test_a_streamed_launch_failure_is_a_case_error(monkeypatch, plugin):
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "uv":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout='{"status": "ok"}', stderr=""
+            )
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(claude_agent.shutil, "which", lambda binary: binary)
+    monkeypatch.setattr(claude_agent.subprocess, "run", fake_run)
+    result = _agent(plugin).run("why", skill_enabled=True, case=_case())
+    assert result.error.startswith("could not start claude")
+
+
+@pytest.mark.parametrize("answer", ["PASS123", "PASS_FAIL", "FAIL2"])
+def test_a_word_with_digits_or_underscores_is_no_verdict(answer):
+    assert read_verdict(answer).error is not None
+
+
+def test_a_suite_whose_quality_run_errored_does_not_pass():
+    from evals.runner import CaseReport, SuiteReport, TriggeringReport
+
+    clean = TriggeringReport(
+        positives_total=0, positives_fired=0, negatives_total=0, negatives_fired=0
+    )
+    errored = CaseReport(id=7, prompt="p", error="timed out after 900s")
+    report = SuiteReport(skill_name="maintain", triggering=clean, quality=[errored])
+    assert not report.passed
+
+
+def test_a_runner_without_a_case_keyword_cannot_run_a_streamed_case():
+    class Plain:
+        def run(self, prompt, *, skill_enabled):
+            raise AssertionError("never called")
+
+    suite = EvalSuite(skill_name="maintain", evals=[_case()])
+    [report] = run_quality(suite, Plain(), _PassEverything())
+    assert report.error.startswith("Plain.run takes no `case`")
+
+
+def test_a_suite_reusing_an_id_is_refused(tmp_path):
+    raw = {"skill_name": "maintain", "evals": [_entry(), _entry()]}
+    with pytest.raises(InvalidSuiteError, match="reuses id"):
+        _suite_from_dict(raw, tmp_path)
+
+
+def test_a_null_checks_list_is_refused_with_its_place(tmp_path):
+    raw = {"skill_name": "maintain", "evals": [_entry(checks=None)]}
+    with pytest.raises(InvalidSuiteError, match=r"evals\[0\]\.checks must be a list"):
+        _suite_from_dict(raw, tmp_path)
+
+
+def test_a_command_is_stored_as_the_transcript_spells_it(tmp_path):
+    raw = {
+        "check": "first_dex_command",
+        "assertion": "x",
+        "group": "maintain",
+        "command": "maintain   incidents",
+    }
+    suite = _suite_from_dict(
+        {"skill_name": "maintain", "evals": [_entry(checks=[raw])]}, tmp_path
+    )
+    [check] = suite.evals[0].checks
+    assert check.command == "maintain incidents"
+    assert checks.grade(check, passing())[0]
+
+
+def test_the_verdict_file_takes_its_transcripts_stem(cli, plugin, tmp_path):
+    out = tmp_path / "t"
+    out.mkdir()
+    (out / "case-7-skill.jsonl").write_text("", encoding="utf-8")
+    suite = _suite_file(tmp_path, plugin)
+    args = [str(suite), "--case", "7", "--plugin-dir", str(plugin)]
+    main([*args, "--transcripts", str(out)])
+    names = sorted(p.name for p in out.iterdir())
+    assert "case-7-skill-2.jsonl" in names
+    assert "case-7-skill-2.judge.json" in names
+    assert "case-7-skill.judge.json" not in names
+
+
+def test_a_run_with_no_transcript_gets_a_verdict_file_of_its_own(cli, plugin, tmp_path):
+    cli.setup_status = "error"
+    out = tmp_path / "t"
+    suite = _suite_file(tmp_path, plugin)
+    args = [str(suite), "--case", "7", "--plugin-dir", str(plugin)]
+    main([*args, "--transcripts", str(out)])
+    names = sorted(p.name for p in out.iterdir())
+    assert names == ["case-7-skill-no-transcript.judge.json"]

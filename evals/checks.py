@@ -132,8 +132,11 @@ def dex_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     from .metadata.live import Session, summarize
 
     calls = []
-    for use in tool_uses(events):
-        if use.get("name") not in SHELL_TOOLS:
+    denied = _denied_uses(events)
+    for position, use in enumerate(tool_uses(events)):
+        if use.get("name") not in SHELL_TOOLS or str(use.get("id")) in denied:
+            # A call the permissions refused never ran. One that ran and
+            # returned an error still did.
             continue
         # One tool call at a time, so each call keeps the command it came from.
         # The parser reads the Bash tool; a PowerShell call is read the same
@@ -144,10 +147,31 @@ def dex_calls(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
         command = str((use.get("input") or {}).get("command") or "")
         calls.extend(
-            {"label": c["label"], "flags": c.get("flags") or [], "command": command}
+            {
+                "label": c["label"],
+                "flags": c.get("flags") or [],
+                "command": command,
+                "position": position,
+            }
             for c in session.dex_calls
         )
     return calls
+
+
+def _denied_uses(events: list[dict[str, Any]]) -> set[str]:
+    """The ids of the tool calls the permissions refused: a ``system``
+    ``permission_denied`` event names each, and the ``result`` lists them."""
+
+    denied = {
+        str(e.get("tool_use_id"))
+        for e in _of_type(events, "system")
+        if e.get("subtype") == "permission_denied" and e.get("tool_use_id")
+    }
+    for result in _of_type(events, "result"):
+        for item in result.get("permission_denials") or []:
+            if isinstance(item, dict) and item.get("tool_use_id"):
+                denied.add(str(item["tool_use_id"]))
+    return denied
 
 
 def run_error(
@@ -304,17 +328,20 @@ def _changes(check: Check, changes: list[str] | None) -> tuple[list[str], list[s
     ``ignore``) and the rest (minus ``ignore``); both empty when the backend
     could not read the workspace."""
 
-    if changes is None or not check.within:
+    if changes is None:
         return [], []
     ignored = {_folded(p) for p in check.ignore}
+    kept = [p for p in changes if _folded(p) not in ignored]
+    if not check.within:
+        # Unscoped: every change counts.
+        return sorted(kept), []
     inside, outside = [], []
-    for path in changes:
-        if _folded(path) in ignored:
-            continue
-        parts = _folded(path).split("/")
+    for path in kept:
+        parts = [p.casefold() for p in _segments(path)]
+        # `_segments(".")` is empty: the scope is the whole workspace.
         under = any(
             parts[: len(scope)] == scope
-            for scope in (_folded(w).split("/") for w in check.within)
+            for scope in ([p.casefold() for p in _segments(w)] for w in check.within)
         )
         (inside if under else outside).append(path)
     return sorted(inside), sorted(outside)
@@ -328,10 +355,16 @@ def _reads_match(
     call: dict[str, Any], events: list[dict[str, Any]], pattern: re.Pattern
 ) -> bool:
     """Whether what a call reads matches: its own command, and for a
-    ``--sql-file`` call also every file the transcript shows written whose
-    name the command holds, and every other shell command that names it (a
-    heredoc). A ``--sql-file`` whose SQL the transcript does not show counts
-    as a match, since an unread file is no evidence it is clean."""
+    ``--sql-file`` call also what the file held when the query ran.
+
+    That is read from the successful operations before the query, in order,
+    on the file the argument names (the same path, resolved against the
+    run's working directory): a ``Write`` sets its contents, an ``Edit``
+    adds to contents already shown, and a shell command that writes the file
+    by redirection (``> q.sql``, ``tee``, ``Set-Content``, ``Out-File``) sets
+    them to that command's text, a heredoc's included. A file whose contents
+    those operations do not establish counts as a match, since an unread
+    file is no evidence it is clean."""
 
     text = call["command"]
     if pattern.search(text):
@@ -340,21 +373,76 @@ def _reads_match(
         return False
     found = _SQL_FILE.search(text)
     argument = next((g for g in found.groups() if g), "") if found else ""
-    name = _segments(argument)[-1].casefold() if _segments(argument) else ""
-    seen: list[str] = []
-    for use in tool_uses(events) if name else []:
+    if not argument:
+        return True
+    root = _root(events)
+    failed = _failed_uses(events) | _denied_uses(events)
+    contents: list[str] | None = None
+    for use in tool_uses(events)[: call["position"]]:
+        if str(use.get("id")) in failed:
+            continue
         payload = use.get("input") or {}
-        if use.get("name") in WRITE_TOOLS:
+        name = use.get("name")
+        if name in WRITE_TOOLS:
             path = str(payload.get("file_path") or payload.get("notebook_path") or "")
-            parts = _segments(path)
-            if parts and parts[-1].casefold() == name:
-                seen.append(_written_text(payload))
-        elif use.get("name") in SHELL_TOOLS:
+            if not _same_file(path, argument, root):
+                continue
+            if name == "Write":
+                contents = [str(payload.get("content") or "")]
+            elif contents is not None:
+                contents.append(_written_text(payload))
+        elif name in SHELL_TOOLS:
             other = str(payload.get("command") or "")
-            if other != text and name in other.casefold():
-                seen.append(other)
-    # Nothing showing what the file holds counts as a hit.
-    return not seen or any(pattern.search(s) for s in seen)
+            if any(_same_file(t, argument, root) for t in _redirect_targets(other)):
+                contents = [other]
+    return contents is None or any(pattern.search(s) for s in contents)
+
+
+#: A shell command's write targets: `> f`, `>> f`, `tee [-a] f`,
+#: `Set-Content [-Path] f`, `Out-File [-FilePath] f`.
+_REDIRECT = re.compile(
+    r"""(?:>>?|\btee(?:\s+-a)?|\bSet-Content(?:\s+-Path)?|\bOut-File(?:\s+-FilePath)?)"""
+    r"""\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|<>]+))""",
+    re.IGNORECASE,
+)
+
+
+def _redirect_targets(command: str) -> list[str]:
+    return [next(g for g in m.groups() if g) for m in _REDIRECT.finditer(command)]
+
+
+def _root(events: list[dict[str, Any]]) -> str:
+    """The run's working directory, from the ``init`` event."""
+
+    return next(
+        (
+            str(e.get("cwd") or "")
+            for e in _of_type(events, "system")
+            if e.get("subtype") == "init"
+        ),
+        "",
+    )
+
+
+def _same_file(path: str, other: str, root: str) -> bool:
+    """Whether two spellings name one file: both read against ``root`` when
+    relative, and compared from the workspace's own directory down where both
+    hold it, so ``/c/...`` and ``C:\\...`` agree."""
+
+    a, b = _resolved(path, root), _resolved(other, root)
+    if not a or not b:
+        return False
+    name = _segments(root)[-1].casefold() if _segments(root) else ""
+    if name and name in a and name in b:
+        a = a[len(a) - a[::-1].index(name) :]
+        b = b[len(b) - b[::-1].index(name) :]
+    return a == b
+
+
+def _resolved(path: str, root: str) -> list[str]:
+    relative = not (path.startswith(("/", "\\", "~")) or _DRIVE.match(path))
+    parts = _segments(root) + _segments(path) if relative else _segments(path)
+    return [p.casefold() for p in parts]
 
 
 #: The file a ``--sql-file`` argument names, quoted or not.
@@ -376,14 +464,7 @@ def _file_writes(
     read them against, every write counts, so an unreadable place never
     passes."""
 
-    root = next(
-        (
-            str(e.get("cwd") or "")
-            for e in _of_type(events, "system")
-            if e.get("subtype") == "init"
-        ),
-        "",
-    )
+    root = _root(events)
     inside: list[tuple[str, str]] = []
     outside: list[tuple[str, str]] = []
     failed = _failed_uses(events)
@@ -441,8 +522,9 @@ def _place(path: str, root: str, within: list[str]) -> tuple[str, bool]:
     start = len(folded) - folded[::-1].index(name)
     below = parts[start:]
     for scope in within:
+        # An empty scope (`"."`) is the whole workspace.
         wanted = [p.casefold() for p in _segments(scope)]
-        if wanted and folded[start : start + len(wanted)] == wanted:
+        if folded[start : start + len(wanted)] == wanted:
             return "/".join(below), True
     return "/".join(below), False
 

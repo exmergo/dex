@@ -234,19 +234,25 @@ def _print_corpus(report: CorpusReport) -> None:
 
 def _write_verdicts(directory: Path | None, reports, arm: str) -> None:
     """Each case's graded assertions, the judge's own answers included, beside
-    its transcript as ``case-<id>-<arm>.judge.json``, so a failed grade can be
-    told from a failed agent after the run."""
+    its transcript and under its stem (``case-7-skill-2.jsonl`` gets
+    ``case-7-skill-2.judge.json``), so a failed grade can be told from a
+    failed agent after the run. A run that wrote no transcript (its setup
+    failed) is written as ``case-<id>-<arm>-no-transcript.judge.json``."""
 
     if directory is None:
         return
     directory.mkdir(parents=True, exist_ok=True)
     for report in reports:
-        stem = f"case-{report.id}-{arm}"
-        path = directory / f"{stem}.judge.json"
-        n = 2
-        while path.exists():
-            path = directory / f"{stem}-{n}.judge.json"
-            n += 1
+        if report.transcript:
+            path = Path(report.transcript)
+            path = path.with_name(f"{path.stem}.judge.json")
+        else:
+            stem = f"case-{report.id}-{arm}-no-transcript"
+            path = directory / f"{stem}.judge.json"
+            n = 2
+            while path.exists():
+                path = directory / f"{stem}-{n}.judge.json"
+                n += 1
         path.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
         print(f"case {report.id} verdicts written to {path}", file=sys.stderr)
 

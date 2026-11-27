@@ -16,6 +16,7 @@ runtime dependency.
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -39,6 +40,8 @@ class AgentResult:
     triggered: bool = False
     envelopes: list[dict] = field(default_factory=list)
     events: list[dict] = field(default_factory=list)
+    #: Where the backend wrote the transcript (``--transcripts``), if it did.
+    transcript: str | None = None
     #: The files the run added, changed or removed in its workspace, relative
     #: to it, or ``None`` where the backend gave it no workspace to compare.
     changes: list[str] | None = None
@@ -84,7 +87,8 @@ class Verdict:
     error: str | None = None
 
 
-_WORD = re.compile(r"[A-Za-z]+")
+#: A whole word token, so `PASS123` and `PASS_X` are not read as `PASS`.
+_WORD = re.compile(r"\w+")
 
 
 def read_verdict(text: str) -> Verdict:
@@ -210,6 +214,8 @@ class CaseReport:
     prompt: str
     assertions: list[AssertionResult] = field(default_factory=list)
     error: str | None = None
+    #: Where the backend wrote this run's transcript, if it wrote one.
+    transcript: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -273,9 +279,11 @@ class SuiteReport:
     @property
     def passed(self) -> bool:
         # Triggering must be clean and the skill must not regress against baseline.
-        # An uplift row with an error measured nothing, so the suite cannot pass.
+        # A quality run or an uplift row with an error measured nothing, so the
+        # suite cannot pass; a quality case that ran and failed stays a result.
         return (
             self.triggering.passed
+            and not any(c.error for c in self.quality)
             and not any(u.error for u in self.uplift_cases)
             and self.uplift_score >= 0.0
         )
@@ -336,6 +344,7 @@ def run_quality(
                 prompt=case.prompt,
                 error=result.error or _judge_error(graded),
                 assertions=graded,
+                transcript=result.transcript,
             )
         )
     return reports
@@ -446,8 +455,25 @@ def _judged(judge: Judge, case: EvalCase, assertion: str, result: AgentResult):
 
 def _run_case(runner: AgentRunner, case: EvalCase, skill: bool) -> AgentResult:
     if case.streamed:
+        if not _takes_case(runner):
+            # A runner built for plain cases cannot set up a workspace, pass
+            # the flags or keep the transcript: the case is unmeasured.
+            return AgentResult(
+                error=f"{type(runner).__name__}.run takes no `case`, which a case "
+                "with setup, agent or checks needs"
+            )
         return runner.run(case.prompt, skill_enabled=skill, case=case)
     return runner.run(case.prompt, skill_enabled=skill)
+
+
+def _takes_case(runner: AgentRunner) -> bool:
+    try:
+        parameters = inspect.signature(runner.run).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        p.name == "case" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters
+    )
 
 
 def _grade(case: EvalCase, result: AgentResult, judge: Judge) -> list[AssertionResult]:
