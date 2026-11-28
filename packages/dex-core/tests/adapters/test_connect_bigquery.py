@@ -799,6 +799,351 @@ def test_the_profiles_own_aggregate_still_degrades_on_a_refused_dry_run(
     assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
 
 
+_PROBE_TABLE = "test-proj.shop.customers"
+_PROBE_REFUSAL = (
+    "Aggregate functions with DISTINCT cannot be used with arguments of type GEOGRAPHY"
+)
+_PROBES = {
+    "exact_distinct_counts": lambda a: a.exact_distinct_counts(_PROBE_TABLE, ["id"]),
+    "distinct_combination_counts": lambda a: a.distinct_combination_counts(
+        _PROBE_TABLE, [["id", "email"]]
+    ),
+    "value_domain_counts": lambda a: a.value_domain_counts(
+        _PROBE_TABLE, ["email"], limit=10
+    ),
+    "table_probe": lambda a: a.table_probe(
+        _PROBE_TABLE, distinct=["id"], combinations=[], null_columns=[]
+    ),
+}
+
+
+def _refuse_at(fake_bq_client, monkeypatch, door: str, refusal: Exception) -> None:
+    """Refuse at the dry run or at the billed job's insert, the way the real
+    client does: by raising from `query()` itself, before any job exists. The
+    refused call is still logged, so a test can count the inserts it reached."""
+
+    from fakes.bigquery import FakeQueryCall
+
+    plan = fake_bq_client.query
+
+    def refuse(sql, job_config=None, location=None):
+        dry = bool(job_config is not None and job_config.dry_run)
+        if dry == (door == "dry_run"):
+            fake_bq_client.query_calls.append(
+                FakeQueryCall(
+                    sql=sql, dry_run=dry, job_config=job_config, location=location
+                )
+            )
+            raise refusal
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse)
+
+
+@pytest.mark.parametrize("error", ["BadRequest", "NotFound"])
+@pytest.mark.parametrize(
+    ("probe", "door"),
+    [
+        (probe, door)
+        for probe in _PROBES
+        for door in ("dry_run", "insert")
+        # table_probe's own dry run hands back with None, both classes covered
+        # by the next test.
+        if (probe, door) != ("table_probe", "dry_run")
+    ],
+)
+def test_a_refusal_inside_a_statistics_probe_is_a_typed_plan_refusal(
+    fake_bq_client, monkeypatch, probe, door, error
+):
+    """The four statistics probes cross the same two doors `run_query` does, the
+    free dry run and the billed job's insert, and a refusal at either used to
+    reach the caller as a bare api exception, which reads `internal` at the
+    envelope (issue #1000). Neither door ran anything, so the refusal is the plan
+    door's, typed the way `run_query` types it, with BigQuery's own words."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.errors import StatementStage, WarehouseQueryError
+
+    refusal = getattr(api_exceptions, error)(_PROBE_REFUSAL)
+    _refuse_at(fake_bq_client, monkeypatch, door, refusal)
+    adapter = make_adapter(fake_bq_client)
+
+    with pytest.raises(WarehouseQueryError) as exc_info:
+        _PROBES[probe](adapter)
+
+    exc = exc_info.value
+    assert reason_for(exc) is Reason.EXECUTION_FAILURE
+    assert exc.stage is StatementStage.PLAN
+    assert _PROBE_REFUSAL in str(exc)  # BigQuery's own words, not a dex message
+    assert exc.__cause__ is refusal
+    billed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(billed) == (1 if door == "insert" else 0)
+
+
+@pytest.mark.parametrize("error", ["BadRequest", "NotFound"])
+def test_the_table_probes_refused_dry_run_still_hands_back_to_the_separate_probes(
+    fake_bq_client, monkeypatch, error
+):
+    """The other side of the test above: `table_probe` answers a dry run
+    BigQuery will not plan with `None`, which hands each probe back to its
+    caller to issue separately, on its own terms (#275). A `NotFound` there
+    used to escape bare and read `internal`; it now hands back too, and the
+    separate probes meet it at their own typed dry runs (issue #1000)."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    _refuse_at(
+        fake_bq_client,
+        monkeypatch,
+        "dry_run",
+        getattr(api_exceptions, error)(_PROBE_REFUSAL),
+    )
+    adapter = make_adapter(fake_bq_client)
+
+    assert _PROBES["table_probe"](adapter) is None
+    assert not [c for c in fake_bq_client.query_calls if not c.dry_run]
+
+
+def test_the_profiles_own_aggregate_still_degrades_on_a_refused_job_insert(
+    fake_bq_client, monkeypatch
+):
+    """`_run` now types a refusal at the job insert for every caller, and the
+    profile's aggregate reaches that insert through `_execute`. Its degrade to
+    metadata covered a `BadRequest` there before, and still does, with the same
+    note and without the server's words (#591)."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    _refuse_at(
+        fake_bq_client,
+        monkeypatch,
+        "insert",
+        api_exceptions.BadRequest("Permission denied while getting Drive credentials"),
+    )
+    adapter = make_adapter(fake_bq_client)
+    _meta, columns = adapter.table_metadata(_PROBE_TABLE)
+
+    aggregates = adapter.column_aggregates(_PROBE_TABLE, columns)
+
+    assert len(aggregates) == len(columns)  # metadata-only rows, not an exception
+    notes = adapter.table_notes(_PROBE_TABLE)
+    assert any("aggregate profiling failed and was skipped" in note for note in notes)
+    assert not any("Drive credentials" in note for note in notes)
+
+
+@pytest.mark.parametrize(
+    ("door", "error", "stage"),
+    [("insert", "NotFound", "plan"), ("result", "BadRequest", "run")],
+)
+def test_the_profiles_own_aggregate_still_raises_what_it_did_not_degrade_on(
+    fake_bq_client, monkeypatch, door, error, stage
+):
+    """The quiet side of the test above. The degrade reads a typed refusal only
+    where it stands for the bare `BadRequest` it caught before, a plan-stage one
+    caused by a `BadRequest`. A `NotFound` at the insert and a refusal at
+    `result()` propagated before, and still do, typed, with no note written."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    from exmergo_dex_core.errors import WarehouseQueryError
+
+    refusal = getattr(api_exceptions, error)(_PROBE_REFUSAL)
+    if door == "insert":
+        _refuse_at(fake_bq_client, monkeypatch, "insert", refusal)
+    else:
+        fake_bq_client.result_error = refusal
+    adapter = make_adapter(fake_bq_client)
+    _meta, columns = adapter.table_metadata(_PROBE_TABLE)
+
+    with pytest.raises(WarehouseQueryError) as exc_info:
+        adapter.column_aggregates(_PROBE_TABLE, columns)
+
+    assert exc_info.value.stage == stage
+    assert exc_info.value.__cause__ is refusal
+    assert not any(
+        "aggregate profiling failed" in note
+        for note in adapter.table_notes(_PROBE_TABLE)
+    )
+
+
+def test_a_bytes_billed_refusal_at_the_profiles_job_insert_widens_and_retries(
+    fake_bq_client, monkeypatch
+):
+    """A bytes-billed answer at the insert is not a statement BigQuery would
+    not plan, so the profile's aggregate does not degrade on it: it widens and
+    retries, and gets its aggregates, as it already did when the same answer
+    came from `result()`. Before the insert was typed it reached the degrade
+    bare and left the batch metadata-only, though the budget could cover it."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    plan = fake_bq_client.query
+    refused: list[int] = []
+
+    def refuse_once(sql, job_config=None, location=None):
+        if job_config is not None and not job_config.dry_run and not refused:
+            refused.append(1)
+            raise api_exceptions.BadRequest(
+                "Query exceeded limit for bytes billed: 1. "
+                f"{30 * MB} or higher required."
+            )
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse_once)
+    fake_bq_client.row_resolver = _aggregate_resolver
+    adapter = make_adapter(fake_bq_client, ceiling=1_000 * MB)
+    _meta, columns = adapter.table_metadata(_PROBE_TABLE)
+
+    aggregates = {a.name: a for a in adapter.column_aggregates(_PROBE_TABLE, columns)}
+
+    assert refused == [1]
+    assert aggregates["id"].is_unique is True  # measured, not metadata-only
+    assert not any(
+        "aggregate profiling failed" in note
+        for note in adapter.table_notes(_PROBE_TABLE)
+    )
+
+
+def test_a_bytes_billed_refusal_at_the_profiles_job_insert_past_the_budget_refuses(
+    fake_bq_client, monkeypatch
+):
+    """And past what is left, it refuses on cost rather than degrading, as the
+    same answer at `result()` already did: `explore profile` turns that
+    `OverCeilingError` into its partial-completion budget refusal."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    plan = fake_bq_client.query
+
+    def refuse(sql, job_config=None, location=None):
+        if job_config is not None and not job_config.dry_run:
+            raise api_exceptions.BadRequest(
+                "Query exceeded limit for bytes billed: 1. "
+                f"{900 * MB} or higher required."
+            )
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse)
+    adapter = make_adapter(fake_bq_client, ceiling=100 * MB)
+    _meta, columns = adapter.table_metadata(_PROBE_TABLE)
+
+    with pytest.raises(OverCeilingError):
+        adapter.column_aggregates(_PROBE_TABLE, columns)
+    assert not any(
+        "aggregate profiling failed" in note
+        for note in adapter.table_notes(_PROBE_TABLE)
+    )
+
+
+@pytest.mark.parametrize("error", ["BadRequest", "InternalServerError"])
+def test_a_bytes_billed_refusal_at_the_job_insert_still_widens_and_retries(
+    fake_bq_client, monkeypatch, error
+):
+    """The insert is a `jobs.insert` POST, and the client raises whatever that
+    POST answers from `query()` itself, so a bytes-billed refusal can surface
+    there as well as at `result()`. It is a budget verdict on a statement
+    BigQuery would have run, not a plan refusal: it takes the same widen-and-
+    retry it takes at `result()`, and never reads as `plan`."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    needed = 30 * MB
+    plan = fake_bq_client.query
+    refused: list[int | None] = []
+
+    def refuse_once(sql, job_config=None, location=None):
+        dry = bool(job_config is not None and job_config.dry_run)
+        if not dry and not refused:
+            refused.append(job_config.maximum_bytes_billed)
+            raise getattr(api_exceptions, error)(
+                f"Query exceeded limit for bytes billed: {refused[0]}. "
+                f"{needed} or higher required."
+            )
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse_once)
+    fake_bq_client.row_resolver = lambda sql: [{"d_0": 95}]
+    adapter = make_adapter(fake_bq_client, ceiling=1_000 * MB)
+    charged: list[float] = []
+    charge = adapter.cost_gate.charge
+
+    def spy(estimate: float) -> None:
+        charged.append(estimate)
+        charge(estimate)
+
+    monkeypatch.setattr(adapter.cost_gate, "charge", spy)
+
+    assert adapter.exact_distinct_counts(_PROBE_TABLE, ["id"]) == {"id": 95}
+
+    assert len(refused) == 1  # refused once, at the insert
+    billed = [c for c in fake_bq_client.query_calls if not c.dry_run]
+    assert len(billed) == 1  # and retried once, which reached the fake
+    # The probe's own charge, then the gap to what BigQuery said it needed.
+    assert len(charged) == 2
+    assert sum(charged) == needed
+
+
+def test_a_bytes_billed_refusal_at_the_job_insert_past_the_budget_refuses_on_cost(
+    fake_bq_client, monkeypatch
+):
+    """And where the real requirement is past what is left, the insert refuses
+    the way `result()` does: an `OverCeilingError` naming the budget, with no
+    second insert."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    plan = fake_bq_client.query
+    inserts: list[str] = []
+
+    def refuse(sql, job_config=None, location=None):
+        if job_config is not None and not job_config.dry_run:
+            inserts.append(sql)
+            raise api_exceptions.BadRequest(
+                "Query exceeded limit for bytes billed: 1. "
+                f"{900 * MB} or higher required."
+            )
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", refuse)
+    adapter = make_adapter(fake_bq_client, ceiling=100 * MB)
+
+    with pytest.raises(OverCeilingError) as exc_info:
+        adapter.exact_distinct_counts(_PROBE_TABLE, ["id"])
+    assert "budget" in str(exc_info.value)
+    assert len(inserts) == 1
+
+
+def test_a_second_bytes_billed_refusal_at_the_job_insert_refuses_without_a_third(
+    fake_bq_client, monkeypatch
+):
+    """The widen-and-retry runs once. A retry BigQuery answers with the same
+    refusal, though the widened charge was affordable, refuses on cost with
+    `_run`'s own message rather than retrying again."""
+
+    from google.api_core import exceptions as api_exceptions
+
+    plan = fake_bq_client.query
+    inserts: list[str] = []
+
+    def always_refuse(sql, job_config=None, location=None):
+        if job_config is not None and not job_config.dry_run:
+            inserts.append(sql)
+            raise api_exceptions.BadRequest(
+                "Query exceeded limit for bytes billed: 1. "
+                f"{30 * MB} or higher required."
+            )
+        return plan(sql, job_config=job_config, location=location)
+
+    monkeypatch.setattr(fake_bq_client, "query", always_refuse)
+    adapter = make_adapter(fake_bq_client, ceiling=1_000 * MB)
+
+    with pytest.raises(OverCeilingError) as exc_info:
+        adapter.exact_distinct_counts(_PROBE_TABLE, ["id"])
+    assert "server-side maximum_bytes_billed" in str(exc_info.value)
+    assert len(inserts) == 2
+
+
 def test_a_host_can_tell_a_statement_bigquery_would_not_plan_from_one_that_failed(
     fake_bq_client, monkeypatch
 ):
