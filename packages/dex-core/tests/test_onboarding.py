@@ -240,6 +240,33 @@ def test_exploration_without_dbt_and_optional_instructions(
     assert not (tmp_path / "AGENTS.md").exists()
 
 
+def test_init_never_grows_carriage_returns_in_authored_docs(
+    tmp_path, capsys, duckdb_file
+):
+    (tmp_path / "README.md").write_bytes(
+        b"# Our project\r\n\r\nKeep this byte for byte.\r\n"
+    )
+    (tmp_path / "AGENTS.md").write_bytes(b"# Team guidance\r\n")
+    run(tmp_path, capsys, "--mode", "explore", "--connector", "duckdb",
+        "--path", str(duckdb_file))
+    for name, authored in (
+        ("README.md", b"# Our project\r\n"),
+        ("AGENTS.md", b"# Team guidance\r\n"),
+    ):
+        data = (tmp_path / name).read_bytes()
+        assert data.startswith(authored)
+        assert b"\r\r" not in data
+    before = {
+        name: (tmp_path / name).read_bytes() for name in ("README.md", "AGENTS.md")
+    }
+    run(tmp_path, capsys, "--mode", "explore", "--connector", "duckdb",
+        "--path", str(duckdb_file))
+    after = {
+        name: (tmp_path / name).read_bytes() for name in ("README.md", "AGENTS.md")
+    }
+    assert after == before
+
+
 def test_standalone_semantics_are_preserved_without_dbt(tmp_path, capsys):
     # Discovery does not need to parse or rewrite the semantic definition.
     semantic = tmp_path / "shop.ossie.json"
