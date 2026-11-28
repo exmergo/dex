@@ -1072,7 +1072,9 @@ class BigQueryAdapter:
         )
         try:
             floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
-        except self._api_exceptions.BadRequest:
+        # Either class hands back to the separate probes, whose own dry runs
+        # then meet the same refusal typed as the plan door (issue #1000).
+        except (self._api_exceptions.BadRequest, self._api_exceptions.NotFound):
             return None
         if not self.cost_gate.try_charge(floored):
             return None
@@ -1483,13 +1485,13 @@ class BigQueryAdapter:
                 sql, timeout_seconds=timeout_seconds, max_results=max_rows + 1
             )
         except (self._api_exceptions.BadRequest, self._api_exceptions.NotFound) as exc:
-            # bigquery refused the statement before running it: at the dry run
-            # inside `_execute`, or at admission. `_run` already types the
-            # refusal it meets at execution; this is the same verdict a step
-            # earlier, typed the same way, so a host reads `execution_failure`
-            # and bigquery's own words rather than `internal` (issues #480, #1209).
-            # both are the plan door: nothing ran, so the statement itself has
-            # to change, and the stage says so without the text (issue #524).
+            # bigquery refused the statement before running it, at the dry run
+            # inside `_execute`; `_run` types admission and execution itself
+            # (issues #1000, #1209). this is the same verdict a step earlier,
+            # typed the same way, so a host reads `execution_failure` and
+            # bigquery's own words rather than `internal` (issue #480). it is
+            # the plan door: nothing ran, so the statement itself has to
+            # change, and the stage says so without the text (issue #524).
             raise warehouse_refusal(
                 _api_error_message(exc), stage=StatementStage.PLAN
             ) from exc
@@ -1686,8 +1688,9 @@ class BigQueryAdapter:
         ``_dry_run`` stays untyped on purpose: the profile's own aggregate
         statements cross it through ``_execute`` and the scan estimate, and
         ``table_probe`` crosses it to price its combined statement, and those
-        callers degrade on a ``badrequest`` rather than failing: the profile
-        to metadata, ``table_probe`` to the separate probes.
+        callers degrade on a refusal rather than failing: the profile to
+        metadata on a ``badrequest``, ``table_probe`` to the separate probes on
+        a ``badrequest`` or a ``notfound``.
 
         a refusal here is the plan door by definition, since a dry run runs
         nothing, so it carries :attr:`statementstage.plan` (issue #524).
