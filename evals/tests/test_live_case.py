@@ -967,9 +967,12 @@ PROJECT_ONLY = Check(
 )
 
 
-def _wrote(*uses: dict, cwd: str = "/work") -> list[dict]:
+def _wrote(*uses, cwd: str = "/work") -> list[dict]:
     init = {**_init(), "cwd": cwd} if cwd else {**_init(), "cwd": None}
-    return [init, _bash(1, f"{WRAP} maintain incidents"), *uses, _done(ANSWER)]
+    flat: list[dict] = []
+    for use in uses:
+        flat.extend(use if isinstance(use, tuple) else [use])
+    return [init, _bash(1, f"{WRAP} maintain incidents"), *flat, _done(ANSWER)]
 
 
 def _write(n: int, path: str) -> dict:
@@ -1282,6 +1285,7 @@ ELEMENTARY_SQL = " ".join(("select * from", "main_elementary.elementary_test_res
         (
             (
                 _use(2, "Write", {"file_path": "/work/q.sql", "content": "select 1"}),
+                _res(2, "File created"),
                 _bash(3, f"{WRAP} explore query --sql-file q.sql"),
             ),
             True,
@@ -1341,8 +1345,12 @@ def _q(n: int, path: str = "q.sql") -> dict:
     return _bash(n, f"{WRAP} explore query --sql-file {path}")
 
 
-def _w(n: int, path: str, content: str) -> dict:
-    return _use(n, "Write", {"file_path": path, "content": content})
+def _w(n: int, path: str, content: str, *, ok: bool = True) -> tuple[dict, ...]:
+    """A ``Write`` of the whole file, with its successful result unless ``ok`` is
+    false: the grader takes a write's contents only on its result."""
+
+    use = _use(n, "Write", {"file_path": path, "content": content})
+    return (use, _res(n, "File created")) if ok else (use,)
 
 
 def test_a_sql_file_is_read_as_it_stood_when_the_query_ran():
@@ -1793,3 +1801,45 @@ def test_the_long_name_spelled_exactly_still_proves_identity():
         cwd=_short(),
     )
     assert checks.grade(NO_ELEMENTARY, events)[0]
+
+
+# --- CodeRabbit's third review: the three fixed now ------------------------------
+
+
+def test_a_write_with_no_result_on_record_proves_nothing():
+    # No result at all.
+    events = _wrote(_w(2, "/work/q.sql", "select 1", ok=False), _q(3))
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+    # The result only arrives after the query.
+    late = _wrote(
+        _w(2, "/work/q.sql", "select 1", ok=False), _q(3), _res(2, "File created")
+    )
+    assert not checks.grade(NO_ELEMENTARY, late)[0]
+    # With its result before the query, it does.
+    assert checks.grade(NO_ELEMENTARY, _wrote(_w(2, "/work/q.sql", "select 1"), _q(3)))[
+        0
+    ]
+
+
+def test_a_dex_command_in_a_shell_comment_is_not_a_call():
+    command = f"{WRAP} maintain incidents # {WRAP} explore query --sql-file q.sql"
+    events = [_init(), _bash(1, command), _done(ANSWER)]
+    assert [c["label"] for c in checks.dex_calls(events)] == ["maintain incidents"]
+    # A `#` inside a word is not a comment.
+    inside = [
+        _init(),
+        _bash(1, f"{WRAP} explore query --sql-file a#b.sql"),
+        _done(ANSWER),
+    ]
+    [call] = checks.dex_calls(inside)
+    assert call["sql_file"] == "a#b.sql"
+
+
+def test_a_sql_file_argument_stops_at_its_own_call():
+    both = f"{WRAP} explore query --sql-file; {WRAP} explore query --sql-file clean.sql"
+    events = _wrote(_w(2, "/work/clean.sql", "select 1"), _bash(3, both))
+    first, second = checks.dex_calls(events)[1:]
+    assert first["sql_file"] is None
+    assert second["sql_file"] == "clean.sql"
+    # The first call reads no file anyone has shown: unknown, so a match.
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
