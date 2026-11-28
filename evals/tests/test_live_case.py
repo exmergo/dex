@@ -1171,6 +1171,8 @@ ELEMENTARY_SQL = " ".join(("select * from", "main_elementary.elementary_test_res
                 _use(
                     2, "Write", {"file_path": "/work/q.sql", "content": ELEMENTARY_SQL}
                 ),
+                # Its result, so the case fails on the SQL, not on unknown contents.
+                _res(2, "File created"),
                 _bash(3, f"{WRAP} explore query --sql-file q.sql"),
             ),
             False,
@@ -1681,4 +1683,20 @@ def test_a_sql_file_argument_stops_at_its_own_call():
     assert first["sql_file"] is None
     assert second["sql_file"] == "clean.sql"
     # The first call reads no file anyone has shown: unknown, so a match.
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_the_written_elementary_case_fails_on_its_sql_not_on_unknown_contents():
+    # With the pattern swapped for one that matches nothing, the case passes:
+    # the Write's contents were read, so the real case fails on the SQL.
+    nomatch = Check(
+        check="no_dex_command",
+        assertion="x",
+        command="explore query",
+        matching="nomatch_xyz",
+    )
+    write = _use(2, "Write", {"file_path": "/work/q.sql", "content": ELEMENTARY_SQL})
+    query = _bash(3, f"{WRAP} explore query --sql-file q.sql")
+    events = _wrote(write, _res(2, "File created"), query)
+    assert checks.grade(nomatch, events)[0]
     assert not checks.grade(NO_ELEMENTARY, events)[0]
