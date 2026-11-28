@@ -437,10 +437,11 @@ and takes each open incident to a cause, or to none.
   confirms a cause as present now, not when inside the break it entered. With a
   series, the unseen window is the stretch between the bounding snapshots.
 - **Confirm with a check Dex already has.** Each candidate names the check that
-  answered it and the finding code. This release checks the cause kind
-  `dex demo` seeds: a uniqueness test failing because the loader delivered a key
-  twice. It is held, on each source relation the tested model reads that carries
-  the tested columns, by the grain axis of `maintain check`:
+  answered it and the finding code. The loader's duplicate delivery
+  (`duplicate_load`, one of the two cause kinds `dex demo` seeds) is a
+  uniqueness test failing because the loader delivered a key twice. It is held,
+  on each source relation the tested model reads that carries the tested
+  columns, by the grain axis of `maintain check`:
   `key_lost_uniqueness` against `snapshots.before` where its measurement proved
   the key unique (the volume axis's row counts ride beside it as evidence), and
   otherwise the declared-claim check, which needs no baseline: the failing
@@ -522,6 +523,54 @@ and takes each open incident to a cause, or to none.
     checks' one handshake. Where the grain checks fit what the ceiling has
     left and the two together do not, the grain checks run and the read alone
     is offered (`price.checks.schedule_offered`).
+  - *A source's rows arrived after the run read them* (`source_arrived_late`,
+    #1623, the other cause kind `dex demo` seeds): the pipeline ran on time, the
+    loader was late, and the run built the model without rows that had not
+    landed. Answered for a failing completeness or freshness test
+    (`relationships`, `dex_parent_population`, `dex_freshness`, and
+    Elementary's `volume_anomalies`, `freshness_anomalies` and
+    `data_freshness_sla`); a uniqueness failure is the duplicate delivery's.
+    Each source the lineage reads is held by two of its columns:
+    - the **capture time**, when a row landed: the source's dbt
+      `loaded_at_field` (at the top level, or under `config` or
+      `config.freshness`), else a column that a model reading the source
+      directly declares with `freshness.basis: capture`. A business timestamp
+      is never read as an arrival time.
+    - the **event time**, which places a row in the window a run judged: the
+      failing test's own time column (Elementary's `timestamp_column`,
+      `dex_freshness`'s column), else, where the test names none or names the
+      capture column itself (a freshness monitor on when rows landed), the one
+      column the tested model declares with role `time` on another basis. It
+      has to be a column the lineage reads from that source.
+
+    The failing run judged the rows whose event time falls after the last
+    passing run started, through its own start; the last passing run, the
+    window of the same width before its start. Both starts are the runs'
+    `run_started_at` in `dbt_invocations`. Confirmed where some rows of the
+    failing run's window have a capture time after that run started, and no
+    row of the last pass's window landed after it started; the evidence is
+    both windows' row counts, the late rows, the rows with no capture time and
+    both runs' starts. Ruled out where every row of the failing window landed
+    before the run (`arrived_before_run`), or where the last pass's window held
+    late rows too (`lateness_unchanged`: lateness the test already passed
+    with, so a loader whose usual lag reaches past a run's start is ruled out
+    here, however late one batch was). `not_checked` where no capture time is
+    named or it is not a date or timestamp (`no_capture_time`), a run's start is
+    not recorded or no pass precedes the failure (`no_run_times`), or no event
+    column can be read for the test (`window_unknown`), where the
+    connection does not list the source (`source_not_listed`), and where the
+    read itself did not answer (`firewall_refused`, `warehouse_refused`,
+    `scan_offered`). The read is one
+    statement per source of five counts, never a value, each column read as
+    whole epoch seconds (a timestamp with no time zone as UTC), through the
+    query firewall and priced into the checks' one handshake, offered alone
+    (`price.checks.arrival_offered`) where the grain checks fit and the two
+    together do not. It reads the source as it stands at diagnosis, with no
+    snapshot needed: a row deleted or rewritten since the break is not seen,
+    and a row redelivered since reads as late. A freshness test
+    (`dex_freshness`, `freshness_anomalies`, `data_freshness_sla`) that also
+    failed on the lineage in the break's range is listed under
+    `corroborated_by`, and never decides the answer.
 
   The range's files have one owner each: a seed's CSV is the seed's,
   `packages.yml`, `dependencies.yml` and `package-lock.yml` the package's,
@@ -542,9 +591,12 @@ and takes each open incident to a cause, or to none.
 - **The repair is `transform`'s.** A confirmed cause carries the step that
   would repair it under `next_steps`: a `dex transform plan` for a duplicate
   delivery, a seed or a package pin, `explore profile` before a retype's
-  cast, `maintain verify` on a changed model, and for the schedule the
-  incident read again once the jobs are reordered (an orchestrator's
-  schedule is not a project file). Nothing here writes it.
+  cast, `maintain verify` on a changed model, for the schedule the
+  incident read again once the jobs are reordered, and for a late source the
+  incident read again after a rebuild once the rows have landed, with a
+  declared `freshness.deadline` on the event column, or a later schedule, where
+  the delay recurs (an orchestrator's schedule is not a project file). Nothing
+  here writes it.
 - **Who reads it.** Beside the cause, `semantic_readers` (#1478) names the
   semantic-layer objects that read the failing test's columns: the model and
   columns come from the test's node in the manifest (a uniqueness test's

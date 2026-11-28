@@ -702,3 +702,81 @@ def test_a_conflict_resolution_s_own_edit_is_a_change_in_the_range(tmp_path: Pat
 
     assert count == 1
     assert touched == ((merge, ("a.sql",)),)
+
+
+# --- the loader: rows that arrived after the run read them (#1623) ---------------
+
+
+COLUMNS = ck.ArrivalColumns("loaded_at", "loaded_at_field", "shipped_at", "x")
+
+
+def _span(after_at=T0, through_at=T0 + timedelta(hours=1)) -> diag.DiagnosisRange:
+    return diag.DiagnosisRange(
+        after=RunPoint(run="good", sequence=1, at=after_at),
+        through=RunPoint(run="bad", sequence=2, at=through_at),
+    )
+
+
+def _counts(**held) -> ck.ArrivalCounts:
+    base = {
+        "bad_window": 50,
+        "bad_late": 10,
+        "bad_null": 0,
+        "good_window": 50,
+        "good_late": 0,
+    }
+    base.update(held)
+    return ck.ArrivalCounts(**base)
+
+
+def test_late_rows_at_the_failure_and_none_at_the_last_pass_confirm_the_loader():
+    held = ck.arrival_candidate("dev.raw.orders", COLUMNS, _counts(), _span())
+
+    assert (held.owner, held.kind, held.status) == (
+        "loader",
+        "source_arrived_late",
+        "confirmed",
+    )
+    assert held.evidence["late_rows"] == 10
+    assert (
+        held.evidence["failing_run"]["started_at"]
+        == (T0 + timedelta(hours=1)).isoformat()
+    )
+    # The last pass judged the window of the same width before it.
+    assert held.evidence["last_passing_run"]["window"] == {
+        "after": (T0 - timedelta(hours=1)).isoformat(),
+        "through": T0.isoformat(),
+    }
+
+
+@pytest.mark.parametrize(
+    ("counts", "reason"),
+    [
+        ({"bad_late": 0}, "arrived_before_run"),
+        ({"bad_late": 0, "bad_window": 0}, "arrived_before_run"),
+        ({"good_late": 3}, "lateness_unchanged"),
+    ],
+)
+def test_rows_in_time_or_lateness_already_there_rule_the_loader_out(counts, reason):
+    held = ck.arrival_candidate("dev.raw.orders", COLUMNS, _counts(**counts), _span())
+
+    assert (held.status, held.reason) == ("ruled_out", reason)
+
+
+def test_with_no_run_start_the_arrival_is_not_checked():
+    unknown = diag.DiagnosisRange(
+        after="unknown", through=RunPoint(run="bad", sequence=2, at=T0)
+    )
+    for span in (unknown, _span(after_at=None), _span(through_at=T0)):
+        held = ck.arrival_candidate("dev.raw.orders", COLUMNS, _counts(), span)
+        assert (held.status, held.reason) == ("not_checked", "no_run_times")
+
+
+def test_corroboration_is_listed_and_never_decides():
+    also = [{"subject": "s", "test": "dex_freshness", "first_failed_run": "bad"}]
+    held = ck.arrival_candidate(
+        "dev.raw.orders", COLUMNS, _counts(bad_late=0), _span(), also
+    )
+
+    assert held.status == "ruled_out"
+    assert held.evidence["corroborated_by"] == also

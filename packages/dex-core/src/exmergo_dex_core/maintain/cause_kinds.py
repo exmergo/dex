@@ -1,8 +1,7 @@
-"""The cause kinds ``dex demo`` does not seed, decided from their evidence (#1476).
+"""The cause kinds beside the duplicate delivery, decided from evidence (#1476).
 
-#1475 confirms one cause kind, the loader's duplicate delivery. This module
-decides the rest, each from evidence Dex already has, read at the two runs that
-bound the break:
+#1475 confirms the loader's duplicate delivery. This module decides the rest,
+each from evidence Dex already has, read at the two runs that bound the break:
 
 - **the loader retyped a source column**: the schema drift axis
   (``column_retyped``) on a source relation the tested model reads, between the
@@ -16,7 +15,11 @@ bound the break:
   bounding commits;
 - **the schedule**: a parent model was built before its child at the last
   passing run and after it at the first failing run, read from both models'
-  build times (Elementary's ``dbt_run_results``).
+  build times (Elementary's ``dbt_run_results``);
+- **a source's rows arrived after the run read them** (#1623): rows of the
+  window the failing run judged, by the source's event time, whose capture time
+  is after that run started, where none of the window the last passing run
+  judged were (:mod:`.arrival` reads the counts).
 
 The range's files are split between owners first (:func:`partition`), so one
 edit is never claimed twice: a seed's file is the seed's, the package files are
@@ -46,6 +49,7 @@ VERIFY_CHECK = "maintain verify"
 PACKAGE_CHECK = "package-lock.yml at the bounding commits"
 SEED_CHECK = "seed file hash at the bounding commits"
 SCHEDULE_CHECK = "dbt_run_results: build order at the bounding runs"
+ARRIVAL_CHECK = "source capture time against the bounding runs' starts"
 
 #: The files a package owns: what dbt reads to install packages.
 PACKAGE_FILES = frozenset({"packages.yml", "dependencies.yml", "package-lock.yml"})
@@ -1198,14 +1202,193 @@ def no_pairs() -> Candidate:
     )
 
 
+# --- the loader: rows that arrived after the run read them (#1623) -------------------
+
+
+@dataclass(frozen=True)
+class ArrivalColumns:
+    """The two columns one source's arrival is read from: when a row landed
+    (``capture``) and when its event happened (``event``), with where each
+    was named."""
+
+    capture: str
+    capture_source: str
+    event: str
+    event_source: str
+
+
+@dataclass(frozen=True)
+class ArrivalCounts:
+    """The counts one statement read over a source, never a value.
+
+    ``bad_*`` are over the window the failing run judged (event time after the
+    last passing run's start, through the failing run's), ``good_*`` over the
+    window of the same width the last passing run judged. ``*_late`` counts the
+    rows whose capture time is after that run's start; ``bad_null`` the rows of
+    the failing window with no capture time.
+    """
+
+    bad_window: int
+    bad_late: int
+    bad_null: int
+    good_window: int
+    good_late: int
+
+
+def arrival_window(
+    span: DiagnosisRange,
+) -> tuple[datetime, datetime, datetime] | Candidate:
+    """The bounding runs' starts and the start of the last pass's window, or
+    the ``no_run_times`` answer where a start is not recorded."""
+
+    if span.after == UNKNOWN:
+        return arrival_unread(
+            "no_run_times",
+            "no passing run precedes the failure in what the sources hold, so "
+            "there is no run whose window can show the rows landed in time",
+        )
+    good_at, bad_at = span.after.at, span.through.at
+    if good_at is None or bad_at is None:
+        missing = [
+            name
+            for name, at in (("last passing", good_at), ("failing", bad_at))
+            if at is None
+        ]
+        return arrival_unread(
+            "no_run_times",
+            "the "
+            + " and ".join(missing)
+            + " run's start is not recorded (dbt_invocations' run_started_at), "
+            "so no capture time can be held to it",
+        )
+    good, bad = utc(good_at), utc(bad_at)
+    if bad <= good:
+        return arrival_unread(
+            "no_run_times",
+            "the failing run's recorded start is not after the last passing "
+            "run's, so the two runs' windows cannot be told apart",
+        )
+    return good - (bad - good), good, bad
+
+
+def _at(moment: datetime) -> str:
+    return utc(moment).isoformat()
+
+
+def arrival_candidate(
+    relation: str,
+    columns: ArrivalColumns,
+    counts: ArrivalCounts,
+    span: DiagnosisRange,
+    corroborated_by: Sequence[Mapping[str, Any]] = (),
+) -> Candidate:
+    """The late-arrival candidate for one source, from its counts.
+
+    Confirmed where some rows of the failing run's window landed after that
+    run started and none of the last passing run's window landed after it
+    started. ``corroborated_by`` (freshness failures in the same range) is
+    listed as evidence and never decides the answer.
+    """
+
+    window = arrival_window(span)
+    if isinstance(window, Candidate):
+        return window.model_copy(update={"relation": relation})
+    good_from, good_at, bad_at = window
+    good, bad = span.after, span.through
+    assert good != UNKNOWN  # noqa: S101
+    evidence: dict[str, Any] = {
+        "capture_column": columns.capture,
+        "capture_source": columns.capture_source,
+        "event_column": columns.event,
+        "event_source": columns.event_source,
+        "failing_run": {
+            "run": bad.run,
+            "started_at": _at(bad_at),
+            "window": {"after": _at(good_at), "through": _at(bad_at)},
+            "window_rows": counts.bad_window,
+            "late_rows": counts.bad_late,
+            "null_capture_rows": counts.bad_null,
+        },
+        "last_passing_run": {
+            "run": good.run,  # type: ignore[union-attr]
+            "started_at": _at(good_at),
+            "window": {"after": _at(good_from), "through": _at(good_at)},
+            "window_rows": counts.good_window,
+            "late_rows": counts.good_late,
+        },
+        "late_rows": counts.bad_late,
+        "read": "the source as it stands now",
+    }
+    if corroborated_by:
+        evidence["corroborated_by"] = [dict(c) for c in corroborated_by]
+    base = {
+        "owner": "loader",
+        "kind": "source_arrived_late",
+        "relation": relation,
+        "columns": (columns.event, columns.capture),
+        "check": ARRIVAL_CHECK,
+        "evidence": evidence,
+    }
+    if counts.bad_late == 0:
+        held = (
+            "the window the failing run judged holds no row today"
+            if counts.bad_window == 0
+            else f"every one of the {counts.bad_window} row(s) whose "
+            f"{columns.event} falls in the window the failing run judged has a "
+            f"{columns.capture} before that run started"
+        )
+        return Candidate(
+            **base,
+            status="ruled_out",
+            reason="arrived_before_run",
+            detail=f"{held}, so no row of {relation} arrived after the run read them",
+        )
+    if counts.good_late > 0:
+        return Candidate(
+            **base,
+            status="ruled_out",
+            reason="lateness_unchanged",
+            detail=f"{counts.good_late} row(s) of the window the last passing run "
+            f"judged also landed after that run started, so the lateness of "
+            f"{relation} was already there while the test passed",
+        )
+    return Candidate(
+        **base,
+        status="confirmed",
+        detail=f"{counts.bad_late} of the {counts.bad_window} row(s) of {relation} "
+        f"whose {columns.event} falls in the window the failing run judged have a "
+        f"{columns.capture} after that run started ({_at(bad_at)}), while every row "
+        "of the last passing run's window had landed before it started: the "
+        "loader delivered them after the run read the source",
+    )
+
+
+def arrival_unread(reason: str, detail: str, relation: str | None = None) -> Candidate:
+    return Candidate(
+        owner="loader",
+        kind="source_arrived_late",
+        relation=relation,
+        status="not_checked",
+        check=ARRIVAL_CHECK,
+        reason=reason,
+        detail=detail,
+    )
+
+
 __all__ = [
+    "ARRIVAL_CHECK",
     "LOCK_FILE",
     "PACKAGE_FILES",
+    "ArrivalColumns",
+    "ArrivalCounts",
     "Bounds",
     "Build",
     "Lineage",
     "Pin",
     "ProjectChange",
+    "arrival_candidate",
+    "arrival_unread",
+    "arrival_window",
     "last_build",
     "lineage",
     "no_pairs",

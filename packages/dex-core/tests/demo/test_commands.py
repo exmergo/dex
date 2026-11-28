@@ -34,8 +34,11 @@ PROJECT_SOURCES = [
     "demo_project/dbt/profiles.yml",
     "demo_project/dbt/models/staging/_sources.yml",
     "demo_project/dbt/models/staging/_staging.yml",
+    "demo_project/dbt/models/staging/stg_shipments.yml",
+    "demo_project/dbt/macros/dex_freshness.sql",
     "demo_project/dbt/models/staging/stg_orders.sql",
     "demo_project/dbt/models/staging/stg_order_items.sql",
+    "demo_project/dbt/models/staging/stg_shipments.sql",
     "demo_project/dbt/models/semantic/metricflow_time_spine.sql",
     "demo_project/dbt/models/semantic/_semantic.yml",
 ]
@@ -89,13 +92,14 @@ def test_demo_creates_the_warehouse_and_wires_it_up(run_from, capsys):
     # Relative to the run directory in both modes, the way every writer reports
     # the files it wrote under its root.
     assert data["path"] == DEMO_FILENAME
-    # The shop's 7 tables and 29,512 rows, and Elementary's 4 tables holding
-    # 6 runs and 24 test results (#1477).
-    assert data["object_count"] == 11
-    assert data["row_count"] == 29512 + 30
+    # The shop's 7 tables and 29,512 rows, the loader's shipments (168 rows,
+    # #1623), and Elementary's 4 tables holding 6 runs and 42 test results
+    # (#1477).
+    assert data["object_count"] == 12
+    assert data["row_count"] == 29512 + 168 + 6 + 42
     # Each table names its schema, the shop's included: `main`, DuckDB's
     # default, where the table itself names none.
-    assert [t["schema"] for t in data["tables"]] == ["main"] * 7 + [
+    assert [t["schema"] for t in data["tables"]] == ["main"] * 8 + [
         "main_elementary"
     ] * 4
     assert data["created"] == [DEMO_FILENAME, ".dex/config.yml", *PROJECT_FILES]
@@ -382,10 +386,11 @@ def test_the_generated_warehouse_drives_the_whole_explore_tour(run_from, capsys)
     map_argv, profile_argv, relationships_argv, query_argv, *_incident = printed
 
     mapped = _run(map_argv, capsys)["data"]
-    # The shop's 7 objects, 6 PII columns and 5 joins. Elementary's 4 tables
-    # (#1477) are inventoried and left out of the ranking, as the package's own.
-    assert mapped["object_count"] == 11
-    assert len(mapped["objects"]) == 7
+    # The shop's 7 objects and the loader's shipments (#1623), 6 PII columns
+    # and 5 joins. Elementary's 4 tables (#1477) are inventoried and left out
+    # of the ranking, as the package's own.
+    assert mapped["object_count"] == 12
+    assert len(mapped["objects"]) == 8
     assert mapped["excluded"]["count"] == 4
     assert mapped["excluded"]["by_namespace"] == [
         {"namespace": "dex_demo.main_elementary", "count": 4}

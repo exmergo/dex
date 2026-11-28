@@ -480,8 +480,11 @@ def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Pa
         "demo_project/dbt/profiles.yml",
         "demo_project/dbt/models/staging/_sources.yml",
         "demo_project/dbt/models/staging/_staging.yml",
+        "demo_project/dbt/models/staging/stg_shipments.yml",
+        "demo_project/dbt/macros/dex_freshness.sql",
         "demo_project/dbt/models/staging/stg_orders.sql",
         "demo_project/dbt/models/staging/stg_order_items.sql",
+        "demo_project/dbt/models/staging/stg_shipments.sql",
         "demo_project/dbt/models/semantic/metricflow_time_spine.sql",
         "demo_project/dbt/models/semantic/_semantic.yml",
         "demo_project/dbt/dbt_packages/elementary/dbt_project.yml",
@@ -489,14 +492,14 @@ def test_the_first_run_on_ramp_works_on_a_clean_install(wheel: str, tmp_path: Pa
         "demo_project/dbt/target/run_results.json",
         "demo_project/dbt/target/semantic_manifest.json",
     ]
-    # The shop's 29,512 rows, and the 30 the seeded history puts in
-    # Elementary's 4 tables.
-    assert created["data"]["row_count"] == 29512 + 30
+    # The shop's 29,512 rows, the loader's 168 shipments, and the 48 the seeded
+    # history puts in Elementary's 4 tables.
+    assert created["data"]["row_count"] == 29512 + 168 + 48
     # The second command found the config the first one wrote, with no flags.
     # It counts Elementary's 4 tables and ranks none of them, so the shop's
-    # 7 are the tour and their personal data is all it flags.
+    # 7 and the shipments are the tour and their personal data is all it flags.
     assert mapped["status"] == "ok"
-    assert mapped["data"]["object_count"] == 11
+    assert mapped["data"]["object_count"] == 12
     assert mapped["data"]["excluded"]["count"] == 4
     assert mapped["data"]["pii_column_count"] == 6
 

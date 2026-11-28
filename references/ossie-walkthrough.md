@@ -27,7 +27,7 @@ dex demo
 dex explore inventory
 ```
 
-`dex demo` writes `dex_demo.duckdb` (7 tables, 29,512 rows) and a
+`dex demo` writes `dex_demo.duckdb` (the shop's 7 tables and 29,512 rows) and a
 `.dex/config.yml` beside it, refusing rather than overwriting anything that is
 already there. The data is generated from a pinned seed and is deliberately
 flawed, which is what makes the rest of this page interesting.

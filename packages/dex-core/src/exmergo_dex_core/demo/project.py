@@ -4,10 +4,17 @@ A warehouse alone shows what is wrong with the data. An incident needs more: a
 test that checks the data, and a run that recorded the test failing. This module
 renders both as files, beside the warehouse :mod:`.warehouse` writes:
 
-- **A dbt project, small enough to read in one sitting.** One source over two of
-  the warehouse's tables, a staging model over each, and a ``unique`` and a
+- **A dbt project, small enough to read in one sitting.** One source over three
+  of the warehouse's tables, a staging model over each, and a ``unique`` and a
   ``not_null`` test on each model's key, with a dev-only ``profiles.yml`` wired
   to the demo file, as ``dex transform init`` writes one.
+- **A source that arrived late** (#1623): ``shipments``, which the loader lands
+  with a ``loaded_at`` capture time the source names as its ``loaded_at_field``.
+  ``stg_shipments`` declares ``shipped_at`` as its time column with a 12-hour
+  freshness, which renders ``dex_freshness`` (its macro is copied into
+  ``macros/``). The table's rows are dated from the newest seeded build, like
+  Elementary's history: the last day's shipments landed minutes after that
+  build started, so its freshness test failed.
 - **The Elementary package, declared and recorded.** ``packages.yml`` declares
   it at the release the reader supports, ``dbt_project.yml`` names its schema
   and turns its row samples off, and ``dbt_packages/elementary/dbt_project.yml``
@@ -27,9 +34,11 @@ renders both as files, beside the warehouse :mod:`.warehouse` writes:
   ``target/semantic_manifest.json`` (the semantic layer as MetricFlow reads it,
   which ``explore semantic list --local`` needs). In that build
   ``unique_stg_order_items_order_item_id`` fails, for the reason the warehouse
-  already plants: a batch of ``order_items`` was loaded twice. Every other test
-  passes. So ``dex maintain incidents`` reads one open incident, with no build
-  and no warehouse write first.
+  already plants: a batch of ``order_items`` was loaded twice, and
+  ``dex_freshness_stg_shipments_shipped_at__43200`` fails, because the last
+  day's shipments had not landed. Every other test passes. So ``dex maintain
+  incidents`` reads two open incidents, with no build and no warehouse write
+  first.
 
 The artifacts are generated, never produced by dbt here: the demo runs no dbt,
 installs no package and touches no network. They hold the fields dex's readers
@@ -123,6 +132,41 @@ config-version: 2
 #: The test the seeded build fails, by the id dbt gives it.
 FAILING_TEST = "test.analytics.unique_stg_order_items_order_item_id.90e333a108"
 
+#: The loader's late source (#1623): its table, its staging model, the columns
+#: the model selects (the event time ``shipped_at``, the capture time
+#: ``loaded_at``), and its key.
+SHIPMENTS = "shipments"
+_SHIPMENTS_MODEL = "stg_shipments"
+_SHIPMENT_COLUMNS = ("shipment_id", "carrier", "parcels", "shipped_at", "loaded_at")
+_SHIPMENT_KEY = "shipment_id"
+#: The freshness the model declares on ``shipped_at``, and the test it renders,
+#: by the id dbt gives it.
+_MAX_LAG = "12h"
+_MAX_LAG_SECONDS = 43200
+LATE_TEST = (
+    f"test.{PROJECT_NAME}.dex_freshness_{_SHIPMENTS_MODEL}_shipped_at"
+    f"__{_MAX_LAG_SECONDS}.28abf0b4d3"
+)
+#: Each rendered test's claim id, as ``dex transform plan`` writes it for this
+#: declaration (#1448): the incident is keyed by it.
+_SHIPMENT_CLAIMS = {
+    "unique": "0665fac67d6cc5d9",
+    "not_null": "e3c401e72c13f248",
+    "dex_freshness": "4e06c7a1957c63cf",
+}
+#: How often a shipment ships, how long the loader usually takes to land it,
+#: how many it holds, and when the late ones landed after the newest build
+#: started: before the demo ran, so they are in the table it writes.
+_SHIPMENT_EVERY = timedelta(hours=6)
+_LOAD_LAG = timedelta(minutes=20)
+_SHIPMENT_COUNT = 168
+_LATE_LANDED = timedelta(minutes=5)
+#: The last shipment ships this long before the newest build starts.
+_LAST_SHIPPED = timedelta(minutes=30)
+_CARRIERS = ("north", "south", "east")
+#: Where the declared test's macro is copied from: the one Dex ships.
+_FRESHNESS_MACRO = "dex_freshness.sql"
+
 #: Each staging model: its source table, the columns it selects, its key.
 _MODELS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
     (
@@ -137,6 +181,7 @@ _MODELS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
         ("order_item_id", "order_id", "product_id", "quantity", "unit_price"),
         "order_item_id",
     ),
+    (_SHIPMENTS_MODEL, SHIPMENTS, _SHIPMENT_COLUMNS, _SHIPMENT_KEY),
 )
 
 #: The generic tests on each model's key, with the hash dbt's id carries. dbt
@@ -147,6 +192,8 @@ _TEST_HASHES = {
     ("not_null", "stg_orders"): "81cfe2fe64",
     ("unique", "stg_order_items"): "90e333a108",
     ("not_null", "stg_order_items"): "26a7e2bc35",
+    ("unique", _SHIPMENTS_MODEL): "61ce1cfa9c",
+    ("not_null", _SHIPMENTS_MODEL): "13d2043380",
 }
 
 #: The semantic layer's file, and the time spine dbt requires beside any
@@ -245,6 +292,91 @@ def _sql(model: str) -> str:
     )
 
 
+def _freshness_macro() -> str:
+    from importlib.resources import files
+
+    return (
+        files("exmergo_dex_core.transform")
+        .joinpath("assets", "macros", _FRESHNESS_MACRO)
+        .read_text(encoding="utf-8")
+    )
+
+
+def _test_config(test: str) -> dict[str, Any]:
+    """A rendered test's ``config``, as ``dex transform plan`` writes it."""
+
+    config: dict[str, Any] = {}
+    if test == "dex_freshness":
+        config["tags"] = ["dex_every_run"]
+    config["meta"] = {
+        "disable_test_samples": True,
+        "dex": {"claim": _SHIPMENT_CLAIMS[test]},
+    }
+    return config
+
+
+#: ``stg_shipments``' YAML: the declaration ``dex transform plan`` renders for
+#: it, its grain's tests and the freshness test on ``shipped_at``. ``loaded_at``
+#: is the source's ``loaded_at_field``: the capture time diagnosis reads.
+_SHIPMENTS_YML = "version: 2\n\n" + yaml.safe_dump(
+    {
+        "models": [
+            {
+                "name": _SHIPMENTS_MODEL,
+                "description": "One row per shipment the carrier's loader lands.",
+                "config": {
+                    "meta": {
+                        "dex": {
+                            "grain": [_SHIPMENT_KEY],
+                            "population": {
+                                "rule": "Every shipment the loader has landed."
+                            },
+                        }
+                    }
+                },
+                "columns": [
+                    {
+                        "name": _SHIPMENT_KEY,
+                        "config": {"meta": {"dex": {"role": "key"}}},
+                        "data_tests": [
+                            {"unique": {"config": _test_config("unique")}},
+                            {"not_null": {"config": _test_config("not_null")}},
+                        ],
+                    },
+                    {
+                        "name": "shipped_at",
+                        "config": {
+                            "meta": {
+                                "dex": {
+                                    "role": "time",
+                                    "freshness": {
+                                        "max_lag": _MAX_LAG,
+                                        "basis": "business",
+                                    },
+                                }
+                            }
+                        },
+                        "data_tests": [
+                            {
+                                "dex_freshness": {
+                                    "arguments": {"max_lag_seconds": _MAX_LAG_SECONDS},
+                                    "config": _test_config("dex_freshness"),
+                                }
+                            }
+                        ],
+                    },
+                    {
+                        "name": "loaded_at",
+                        "config": {"meta": {"dex": {"role": "time"}}},
+                    },
+                ],
+            }
+        ]
+    },
+    sort_keys=False,
+)
+
+
 def _dump(document: Any) -> str:
     return yaml.safe_dump(document, sort_keys=False)
 
@@ -300,7 +432,12 @@ def _source_files(warehouse_name: str) -> list[tuple[str, str]]:
                             "name": SOURCE_NAME,
                             "description": "The shop's tables, as its loader writes.",
                             "schema": SOURCE_SCHEMA,
-                            "tables": [{"name": table} for _, table, _, _ in _MODELS],
+                            "tables": [
+                                {"name": table, "loaded_at_field": "loaded_at"}
+                                if table == SHIPMENTS
+                                else {"name": table}
+                                for _, table, _, _ in _MODELS
+                            ],
                         }
                     ]
                 }
@@ -323,10 +460,13 @@ def _source_files(warehouse_name: str) -> list[tuple[str, str]]:
                             ],
                         }
                         for model, table, _, key in _MODELS
+                        if model != _SHIPMENTS_MODEL
                     ]
                 }
             ),
         ),
+        (f"models/staging/{_SHIPMENTS_MODEL}.yml", _SHIPMENTS_YML),
+        (f"macros/{_FRESHNESS_MACRO}", _freshness_macro()),
     ]
     files.extend((f"models/staging/{model}.sql", _sql(model)) for model, *_ in _MODELS)
     files.append((f"models/semantic/{TIME_SPINE}.sql", _TIME_SPINE_SQL))
@@ -407,18 +547,34 @@ def _test_id(test: str, model: str) -> str:
     return f"test.{PROJECT_NAME}.{test}_{model}_{key}.{_TEST_HASHES[(test, model)]}"
 
 
-def seeded_tests() -> tuple[SeededTest, ...]:
-    """The project's four tests, as Elementary records them."""
+_LATE_KWARGS = {
+    "column_name": "shipped_at",
+    "max_lag_seconds": _MAX_LAG_SECONDS,
+    "model": f"{{{{ get_where_subquery(ref('{_SHIPMENTS_MODEL}')) }}}}",
+}
 
-    return tuple(
+
+def seeded_tests() -> tuple[SeededTest, ...]:
+    """The project's seven tests, as Elementary records them."""
+
+    return (
+        *(
+            SeededTest(
+                unique_id=_test_id(test, model),
+                model=model,
+                column=key,
+                short_name=test,
+            )
+            for model, _, _, key in _MODELS
+            for test in ("unique", "not_null")
+        ),
         SeededTest(
-            unique_id=_test_id(test, model),
-            model=model,
-            column=key,
-            short_name=test,
-        )
-        for model, _, _, key in _MODELS
-        for test in ("unique", "not_null")
+            unique_id=LATE_TEST,
+            model=_SHIPMENTS_MODEL,
+            column="shipped_at",
+            short_name="dex_freshness",
+            params=json.dumps(_LATE_KWARGS),
+        ),
     )
 
 
@@ -434,12 +590,77 @@ def history_tables(
     return elementary_tables(
         runs,
         seeded_tests(),
-        failing_test=FAILING_TEST,
-        failures=duplicated_keys(tables, "order_items", "order_item_id"),
+        failing={
+            FAILING_TEST: (
+                "outcome",
+                duplicated_keys(tables, "order_items", "order_item_id"),
+            ),
+            # dex_freshness returns one row when the column is stale.
+            LATE_TEST: ("late", 1),
+        },
         database=Path(warehouse_name).stem,
         project=PROJECT_NAME,
         dbt_version=DBT_VERSION,
     )
+
+
+def shipments_table(runs: tuple[SeededRun, ...]) -> tuple[DemoTable, ...]:
+    """The loader's ``shipments``, dated back from the newest of ``runs``.
+
+    One shipment every six hours, the newest half an hour before that build
+    started, each landed twenty minutes after it shipped, except the four that
+    shipped in the day before the build: those landed five minutes after it
+    started (and before the demo was generated, ten minutes after it), so the
+    build read the table without them. Empty of runs, there is no table.
+    """
+
+    if not runs:
+        return ()
+    newest = runs[-1].started_at
+    late_from = newest - timedelta(days=1)
+    rows: list[tuple] = []
+    for step in range(_SHIPMENT_COUNT - 1, -1, -1):
+        shipped = newest - _LAST_SHIPPED - step * _SHIPMENT_EVERY
+        landed = newest + _LATE_LANDED if shipped > late_from else shipped + _LOAD_LAG
+        number = _SHIPMENT_COUNT - step
+        rows.append(
+            (
+                f"shp_{number:04d}",
+                _CARRIERS[number % len(_CARRIERS)],
+                1 + (number * 7) % 9,
+                shipped.astimezone(UTC).replace(tzinfo=None),
+                landed.astimezone(UTC).replace(tzinfo=None),
+            )
+        )
+    return (
+        DemoTable(
+            name=SHIPMENTS,
+            columns=(
+                ("shipment_id", "VARCHAR"),
+                ("carrier", "VARCHAR"),
+                ("parcels", "INTEGER"),
+                ("shipped_at", "TIMESTAMP"),
+                ("loaded_at", "TIMESTAMP"),
+            ),
+            rows=tuple(rows),
+            note=(
+                "a carrier's shipments, each with when it shipped and when the "
+                "loader landed it: the last day's landed minutes after the newest "
+                "build read the table"
+            ),
+        ),
+    )
+
+
+def late_shipments(tables: tuple[DemoTable, ...]) -> int:
+    """How many shipments landed after the newest build started: the rows
+    ``maintain diagnose`` counts late."""
+
+    found = next((t for t in tables if t.name == SHIPMENTS), None)
+    if found is None or not found.rows:
+        return 0
+    newest = max(row[3] for row in found.rows) + _LAST_SHIPPED
+    return sum(1 for row in found.rows if row[4] > newest)
 
 
 #: The package's models the demo seeds a table for: those the reader's
@@ -795,6 +1016,10 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
             "meta": {},
             "tags": [],
         }
+        if table == SHIPMENTS:
+            # dbt 1.10+ writes the field at both levels.
+            sources[source_id]["loaded_at_field"] = "loaded_at"
+            sources[source_id]["config"]["loaded_at_field"] = "loaded_at"
         sql = _sql(model)
         nodes[model_id] = {
             "database": database,
@@ -828,6 +1053,8 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
             "latest_version": None,
             "primary_key": [key],
         }
+        if model == _SHIPMENTS_MODEL:
+            nodes[model_id].update(_shipments_entry())
         parent_map[model_id] = [source_id]
         child_map[source_id] = [model_id]
         tests = []
@@ -854,7 +1081,9 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
                     "fail_calc": "count(*)",
                     "warn_if": "!= 0",
                     "error_if": "!= 0",
-                    "meta": {},
+                    "meta": _test_config(test)["meta"]
+                    if model == _SHIPMENTS_MODEL
+                    else {},
                 },
                 "tags": [],
                 "description": "",
@@ -883,6 +1112,11 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
             }
             parent_map[test_id] = [model_id]
             child_map[test_id] = []
+        if model == _SHIPMENTS_MODEL:
+            nodes[LATE_TEST] = _late_test_node(database, model_id)
+            tests.append(LATE_TEST)
+            parent_map[LATE_TEST] = [model_id]
+            child_map[LATE_TEST] = []
         child_map[model_id] = sorted(tests)
     for source_id in sources:
         parent_map[source_id] = []
@@ -929,6 +1163,83 @@ def _manifest(database: str, build: SeededRun) -> dict[str, Any]:
     }
 
 
+def _shipments_entry() -> dict[str, Any]:
+    """What ``stg_shipments``' own YAML adds to its manifest node: its
+    description, its declaration and its columns."""
+
+    document = yaml.safe_load(_SHIPMENTS_YML)["models"][0]
+    columns: dict[str, Any] = {}
+    for column in document["columns"]:
+        meta = column.get("config", {}).get("meta", {})
+        columns[column["name"]] = {
+            "name": column["name"],
+            "description": "",
+            "meta": meta,
+            "config": {"meta": meta, "tags": []},
+            "tags": [],
+        }
+    meta = document["config"]["meta"]
+    return {
+        "description": document["description"],
+        "columns": columns,
+        "meta": meta,
+        "config": {"enabled": True, "materialized": "view", "meta": meta},
+        "patch_path": f"{PROJECT_NAME}://models/staging/{_SHIPMENTS_MODEL}.yml",
+    }
+
+
+def _late_test_node(database: str, model_id: str) -> dict[str, Any]:
+    """The freshness test on ``stg_shipments.shipped_at``, as dbt parses it."""
+
+    name = LATE_TEST.split(".")[2]
+    config = _test_config("dex_freshness")
+    return {
+        "database": database,
+        "schema": f"{SOURCE_SCHEMA}_dbt_test__audit",
+        "name": name,
+        "resource_type": "test",
+        "package_name": PROJECT_NAME,
+        "path": f"{name}.sql",
+        "original_file_path": f"models/staging/{_SHIPMENTS_MODEL}.yml",
+        "unique_id": LATE_TEST,
+        "fqn": [PROJECT_NAME, "staging", name],
+        "alias": name,
+        "checksum": {"name": "none", "checksum": ""},
+        "config": {
+            "enabled": True,
+            "schema": "dbt_test__audit",
+            "materialized": "test",
+            "severity": "ERROR",
+            "fail_calc": "count(*)",
+            "warn_if": "!= 0",
+            "error_if": "!= 0",
+            "tags": config["tags"],
+            "meta": config["meta"],
+        },
+        "tags": config["tags"],
+        "description": "",
+        "columns": {},
+        "meta": config["meta"],
+        "relation_name": None,
+        "raw_code": "{{ test_dex_freshness(**_dbt_generic_test_kwargs) }}",
+        "language": "sql",
+        "refs": [{"name": _SHIPMENTS_MODEL, "package": None, "version": None}],
+        "sources": [],
+        "depends_on": {
+            "macros": [f"macro.{PROJECT_NAME}.test_dex_freshness", *_TEST_MACROS],
+            "nodes": [model_id],
+        },
+        "column_name": "shipped_at",
+        "file_key_name": f"models.{_SHIPMENTS_MODEL}",
+        "attached_node": model_id,
+        "test_metadata": {
+            "name": "dex_freshness",
+            "kwargs": dict(_LATE_KWARGS),
+            "namespace": None,
+        },
+    }
+
+
 def duplicated_keys(tables: tuple[DemoTable, ...], table: str, column: str) -> int:
     """How many values of ``table.column`` occur more than once: the row count a
     dbt ``unique`` test on it returns, which its ``failures`` reports."""
@@ -940,9 +1251,10 @@ def duplicated_keys(tables: tuple[DemoTable, ...], table: str, column: str) -> i
 
 
 def _run_results(tables: tuple[DemoTable, ...], build: SeededRun) -> dict[str, Any]:
-    """One ``dbt build`` of the project: both views build, and of the four
-    tests only the ``unique`` test on ``stg_order_items`` can fail, where the
-    seeded run says it did."""
+    """One ``dbt build`` of the project: the three views build, and of the
+    seven tests only the ``unique`` test on ``stg_order_items`` and the
+    freshness test on ``stg_shipments`` can fail, where the seeded run says
+    each did."""
 
     results: list[dict[str, Any]] = []
     clock = build.started_at + timedelta(seconds=2)
@@ -973,10 +1285,16 @@ def _run_results(tables: tuple[DemoTable, ...], build: SeededRun) -> dict[str, A
 
     for model, table, _, key in _MODELS:
         entry(f"model.{PROJECT_NAME}.{model}", "success", "OK", None)
+        if model == _SHIPMENTS_MODEL:
+            if build.late == "fail":
+                entry(LATE_TEST, "fail", "Got 1 result, configured to fail if != 0", 1)
+            else:
+                entry(LATE_TEST, "pass", "", 0)
         for test in ("unique", "not_null"):
+            # Only the batch of order_items loaded twice breaks a key.
             failed = (
                 duplicated_keys(tables, table, key)
-                if test == "unique" and build.outcome == "fail"
+                if test == "unique" and build.outcome == "fail" and table != SHIPMENTS
                 else 0
             )
             if failed:
@@ -1123,16 +1441,20 @@ __all__ = [
     "DBT_VERSION",
     "DEMO_DIR",
     "FAILING_TEST",
+    "LATE_TEST",
     "PROJECT_DIR",
     "PROJECT_NAME",
+    "SHIPMENTS",
     "DemoProject",
     "build_project",
     "duplicated_keys",
     "history_tables",
+    "late_shipments",
     "project_collision",
     "project_digest",
     "refuse_collision",
     "refuse_target_name",
     "seeded_tests",
+    "shipments_table",
     "write_project",
 ]

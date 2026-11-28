@@ -21,6 +21,12 @@ source, with the run it was first observed in.
 So the break sits between the last pass and the first failure, across the
 unobserved week, and diagnosis bisects exactly there.
 
+A second incident (#1623): in the newest build alone,
+``dex_freshness_stg_shipments_shipped_at__43200`` fails, because the loader
+landed the last day's ``shipments`` minutes after that build started
+(:func:`~.project.shipments_table`). Its break is the week from the build
+before, where it passed.
+
 **Dated from when the demo was generated, not from** :data:`~.warehouse._ANCHOR`.
 The incident fold judges an open incident stale once its source has not observed
 it for three of its usual gaps, against the time it is called, so history dated
@@ -45,7 +51,7 @@ Pure: no I/O, no clock. The warehouse module writes these rows.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -97,6 +103,10 @@ _SCHEDULE: tuple[tuple[int, bool, Outcome], ...] = (
     (0, True, "fail"),
 )
 
+#: The weeks before the newest run in which the late shipments' freshness test
+#: fails: the newest build alone, the one that started before they landed.
+LATE_WEEKS = frozenset({0})
+
 
 @dataclass(frozen=True)
 class SeededRun:
@@ -108,8 +118,10 @@ class SeededRun:
     #: False for the run with the package's hooks off: dbt ran, and the
     #: package recorded nothing of it.
     hooks: bool
-    #: How the failing test came out in this run.
+    #: How the duplicated key's test came out in this run.
     outcome: Outcome
+    #: How the late shipments' freshness test came out in this run (#1623).
+    late: Outcome = "pass"
 
 
 def invocation_id(weeks_back: int) -> str:
@@ -122,11 +134,12 @@ def invocation_id(weeks_back: int) -> str:
 def seeded_runs(
     generated_at: datetime,
     schedule: Sequence[tuple[int, bool, Outcome]] = _SCHEDULE,
+    late_weeks: frozenset[int] = LATE_WEEKS,
 ) -> tuple[SeededRun, ...]:
     """The runs, oldest first, dated back from ``generated_at``.
 
-    ``schedule`` stands in for the seeded one, so a test can build the same
-    demo with a run removed.
+    ``schedule`` and ``late_weeks`` stand in for the seeded ones, so a test can
+    build the same demo with a run removed.
     """
 
     newest = generated_at.astimezone(UTC).replace(microsecond=0) - _NEWEST_BEFORE
@@ -137,6 +150,7 @@ def seeded_runs(
             completed_at=newest - weeks * _WEEK + _BUILD,
             hooks=hooks,
             outcome=outcome,
+            late="fail" if weeks in late_weeks else "pass",
         )
         for weeks, hooks, outcome in schedule
     )
@@ -150,6 +164,9 @@ class SeededTest:
     model: str
     column: str
     short_name: str
+    #: The test's arguments as Elementary records them, where they are more
+    #: than the column and the model.
+    params: str | None = None
 
 
 def _text(moment: datetime) -> str:
@@ -184,8 +201,7 @@ def elementary_tables(
     runs: Sequence[SeededRun],
     tests: Sequence[SeededTest],
     *,
-    failing_test: str,
-    failures: int,
+    failing: Mapping[str, tuple[Literal["outcome", "late"], int]],
     database: str,
     project: str,
     dbt_version: str,
@@ -193,8 +209,9 @@ def elementary_tables(
     """Every table the recorded layout lists, for ``runs``.
 
     ``dbt_invocations`` and ``elementary_test_results`` hold the runs; a run
-    with the hooks off writes no row to either. ``failures`` is what the
-    failing test reported in a run it failed in. ``test_result_rows`` and
+    with the hooks off writes no row to either. ``failing`` names each test
+    that can fail: the run field that says whether it did (``outcome`` or
+    ``late``), and the ``failures`` it reported where it did. ``test_result_rows`` and
     ``data_monitoring_metrics`` are built empty: with samples off and no
     monitor declared, the package's run leaves them so. They are seeded so the
     package's schema looks as a real install leaves it, which ``explore`` reads
@@ -232,7 +249,8 @@ def elementary_tables(
             )
         )
         for offset, test in enumerate(tests, start=1):
-            failed = test.unique_id == failing_test and run.outcome == "fail"
+            field, failures = failing.get(test.unique_id, ("outcome", 0))
+            failed = test.unique_id in failing and getattr(run, field) == "fail"
             detected = run.started_at + timedelta(seconds=5 * offset)
             results.append(
                 _row(
@@ -252,14 +270,16 @@ def elementary_tables(
                         "test_type": "dbt_test",
                         "test_sub_type": "generic",
                         "test_results_description": (
-                            f"Got {failures} results, configured to fail if != 0"
+                            f"Got {failures} result{'s' if failures != 1 else ''}, "
+                            "configured to fail if != 0"
                             if failed
                             else None
                         ),
                         "owners": "[]",
                         "tags": "[]",
                         "test_name": test.short_name,
-                        "test_params": (
+                        "test_params": test.params
+                        or (
                             f'{{"column_name": "{test.column}", "model": '
                             f"\"{{{{ get_where_subquery(ref('{test.model}')) }}}}\"}}"
                         ),
@@ -289,7 +309,9 @@ def elementary_tables(
             note=(
                 "Elementary's record of each test in each run: "
                 "unique_stg_order_items_order_item_id passes, then fails once the "
-                "batch loaded twice arrives"
+                "batch loaded twice arrives; the shipments' freshness test fails "
+                "in the newest build, which started before the last day's "
+                "shipments landed"
             ),
             schema=SCHEMA,
         ),
@@ -314,6 +336,7 @@ def elementary_tables(
 
 
 __all__ = [
+    "LATE_WEEKS",
     "NOT_SEEDED",
     "RELEASE",
     "SCHEMA",
