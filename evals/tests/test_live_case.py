@@ -1594,3 +1594,41 @@ def test_a_path_that_climbs_above_the_root_stays_outside():
     assert checks.grade(whole, _wrote(_write(2, "../../../work/x.sql")))[0]
     assert checks.grade(whole, _wrote(_write(2, "/../work/x.sql")))[0]
     assert not checks.grade(whole, _wrote(_write(2, "/work/./a/../x.sql")))[0]
+
+
+# --- an 8.3 short name places a path, never proves identity (#1625 :351) --------
+
+
+def _short(*parts: str) -> str:
+    return chr(92).join(["C:", "work", *parts])
+
+
+def test_a_short_name_prefix_does_not_prove_sql_file_identity():
+    # CodeRabbit's case: FOOBAR~1 may be foobaralpha, not foobarbeta.
+    events = _wrote(
+        _w(2, _short("FOOBAR~1", "q.sql"), "select 1"),
+        _q(3, "foobarbeta/q.sql"),
+        cwd=_short(),
+    )
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_write_at_a_short_name_that_may_alias_the_file_leaves_it_unknown():
+    # A clean Write at the long name, then a write at a short name that may be
+    # the same directory: the contents are no longer known.
+    events = _wrote(
+        _w(2, _short("foobarbeta", "q.sql"), "select 1"),
+        _w(3, _short("FOOBAR~1", "q.sql"), ELEMENTARY_SQL),
+        _q(4, "foobarbeta/q.sql"),
+        cwd=_short(),
+    )
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_the_long_name_spelled_exactly_still_proves_identity():
+    events = _wrote(
+        _w(2, _short("FooBarBeta", "q.sql"), "select 1"),
+        _q(3, "foobarbeta/q.sql"),
+        cwd=_short(),
+    )
+    assert checks.grade(NO_ELEMENTARY, events)[0]
