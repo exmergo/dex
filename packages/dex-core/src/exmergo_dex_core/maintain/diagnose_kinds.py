@@ -682,7 +682,7 @@ def plan_arrival(
             work.candidates.append(
                 ck.arrival_unread(
                     "source_not_listed",
-                    f"the source catalog could not be read: {exc}",
+                    f"the source catalog could not be read ({type(exc).__name__})",
                 )
             )
         return None
@@ -700,7 +700,8 @@ def plan_arrival(
             probe.work.candidates.append(
                 ck.arrival_unread(
                     "warehouse_refused",
-                    f"the count over {probe.identifier} could not be priced: {exc}",
+                    f"the count over {probe.identifier} could not be priced "
+                    f"({type(exc).__name__})",
                     relation=probe.relation,
                 )
             )

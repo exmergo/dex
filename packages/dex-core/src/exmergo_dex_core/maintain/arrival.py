@@ -446,7 +446,8 @@ def plan(
             work.candidates.append(
                 ck.arrival_unread(
                     "source_not_listed",
-                    f"the columns of {identifier} could not be read: {exc}",
+                    f"the columns of {identifier} could not be read "
+                    f"({type(exc).__name__})",
                     relation=identifier,
                 )
             )

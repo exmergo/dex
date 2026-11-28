@@ -492,6 +492,9 @@ def test_a_source_whose_columns_cannot_be_read_is_not_checked_alone(
     [held] = _late(diagnosis)
     assert (held["status"], held["reason"]) == ("not_checked", "source_not_listed")
     assert diagnosis["verdict"] == "no_cause"
+    # Only the error's type is reported, never its text.
+    assert "secret" not in json.dumps(diagnosis)
+    assert "DexError" in held["detail"]
 
 
 def test_a_read_error_s_text_is_masked_in_the_answer(
