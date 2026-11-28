@@ -42,18 +42,35 @@ def test_numbered_placeholders_bind_by_number_and_may_repeat():
         ("redshift", "'it\\'s \\\\ x'"),
         ("clickhouse", "'it''s \\\\ x'"),
         ("trino", "'it''s \\ x'"),
+        ("databricks", "'it\\'s \\\\ x'"),
     ],
 )
 def test_a_value_is_quoted_by_its_dialect_s_own_rules(connector, literal):
-    quote = "`" if connector in {"bigquery", "clickhouse"} else '"'
+    quote = "`" if connector in {"bigquery", "clickhouse", "databricks"} else '"'
     mark = "$1" if connector in {"postgres", "redshift"} else "?"
     sql = f"SELECT 1 FROM t AS {quote}t{quote} WHERE a = {mark}"  # noqa: S608
     assert bind(sql, ["it's \\ x"], connector).endswith(f"a = {literal}")
 
 
-def test_a_backslash_escaped_quote_does_not_end_a_clickhouse_literal():
+@pytest.mark.parametrize("connector", ["clickhouse", "databricks"])
+def test_a_backslash_escaped_quote_does_not_end_a_literal(connector):
     sql = "SELECT 1 FROM t AS `t` WHERE a = 'it\\'s ?' AND b = ?"
-    assert bind(sql, ["x"], "clickhouse").endswith("a = 'it\\'s ?' AND b = 'x'")
+    assert bind(sql, ["x"], connector).endswith("a = 'it\\'s ?' AND b = 'x'")
+
+
+def test_a_databricks_double_quoted_string_takes_the_same_escape():
+    sql = 'SELECT 1 FROM t AS `t` WHERE a = "it\\"s ?" AND b = ?'
+    assert bind(sql, ["x"], "databricks").endswith('a = "it\\"s ?" AND b = \'x\'')
+
+
+def test_a_backslash_ends_nothing_in_a_databricks_raw_string():
+    sql = "SELECT 1 FROM t AS `t` WHERE a = r'ends\\' AND b = ?"
+    assert bind(sql, ["x"], "databricks").endswith("a = r'ends\\' AND b = 'x'")
+
+
+def test_a_literal_chained_to_a_databricks_raw_string_has_its_own_escapes():
+    sql = "SELECT 1 FROM t AS `t` WHERE a = r'raw''it\\'s ?' AND b = ?"
+    assert bind(sql, ["x"], "databricks").endswith("''it\\'s ?' AND b = 'x'")
 
 
 def test_a_backslash_escaped_quote_does_not_end_a_clickhouse_identifier():
@@ -100,6 +117,11 @@ def test_a_count_that_does_not_match_is_refused(sql, params, connector):
 def test_sql_rendered_for_another_warehouse_is_refused(sql, connector):
     with pytest.raises(CubeRefusalError, match=f"CUBEJS_DB_TYPE={connector}"):
         bind(sql, ["x"], connector)
+
+
+def test_the_refusal_names_the_type_cube_knows_databricks_by():
+    with pytest.raises(CubeRefusalError, match="CUBEJS_DB_TYPE=databricks-jdbc"):
+        bind('SELECT 1 FROM t AS "t" WHERE a = ?', ["x"], "databricks")
 
 
 def test_a_value_dex_cannot_write_is_refused():

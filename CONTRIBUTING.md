@@ -500,7 +500,10 @@ Postgres dogfood database as `dex_ro`. ClickHouse and Trino are render-only:
 Dex executes over the seeded containers of their own suites, and the Trino
 renderer serves a copy of the model with each table under the `memory`
 catalog, since Dex names every Trino relation with its catalog. No setup and
-no secret: the `cube` job runs it on every push to `main`.
+no secret: the `cube` job runs it on every push to `main`. Databricks has no
+live case here: `scripts/setup_cube_dev.sh --db databricks` starts its renderer
+(the `-jdk` image, since Cube's Databricks driver is JDBC) for
+`record_cube.py`, and the recorded golden is what holds it.
 
 ```
 scripts/setup_postgres_dev.sh            # for the Postgres cases

@@ -21,7 +21,8 @@ executing it. ``query`` asks a Cube server for that SQL and runs it through the
 governed spine, in this order, because the safety contract is the order:
 
 1. the connector check: DuckDB, Postgres, BigQuery, Snowflake, Redshift,
-   ClickHouse and Trino, each held to a golden of what Cube renders for it;
+   ClickHouse, Trino and Databricks, each held to a golden of what Cube
+   renders for it;
 2. the PII request-gate on the grouped members, on the time dimension a grain
    buckets, and on every member a ``--where`` filter names, read from Cube's
    JSON filter (:mod:`...cube_dialect`) and looked up in the ``.dex/`` cache
@@ -525,15 +526,14 @@ class LocalCubeLayer:
         return index(loaded.cubes, loaded.views)
 
     def _supported_connector(self) -> str:
-        from ...cube.query import CUBE_CONNECTORS, UNSUPPORTED_CONNECTORS
+        from ...cube.query import CUBE_CONNECTORS
 
         connector = self._connector() or ""
         if connector in CUBE_CONNECTORS:
             return connector
-        why = UNSUPPORTED_CONNECTORS.get(connector, "it is not one Cube renders for")
         raise SemanticBackendError(
             f"a governed Cube query runs on {', '.join(CUBE_CONNECTORS)} in this "
-            f"release, and not on {connector or 'no connector'}: {why}. Read the "
+            f"release, and not on {connector or 'no connector'}. Read the "
             "layer with `explore semantic list`, then query the relations it names "
             "with `explore query`, which runs under the firewall and the cost guard"
         )

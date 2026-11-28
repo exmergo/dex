@@ -12,7 +12,8 @@ import pytest
 
 pytest.importorskip("databricks.sql")
 
-from fakes.databricks import FakeResult
+from databricks.sql import exc as dbsql_exc
+from fakes.databricks import FakeCursor, FakeResult
 
 from exmergo_dex_core.adapters import get_adapter, get_dialect
 from exmergo_dex_core.adapters.databricks import (
@@ -337,6 +338,97 @@ def test_the_sql_session_opens_lazily_on_the_first_billed_statement(fake_databri
         timeout_seconds=30,
     )
     assert fake_databricks.connect_count == 1
+
+
+def test_a_utc_session_is_pinned_only_when_asked(fake_databricks):
+    """Cube's rendered SQL truncates a timestamp in the session time zone, which
+    is the workspace's own setting, so the governed Cube path asks for UTC."""
+
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [{"n": 1}]
+    adapter = make_adapter(fake_databricks)
+    sql = "SELECT COUNT(*) AS n FROM `shop`.`core`.`customers`"
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    pin = "SET TIME ZONE 'UTC'"
+    assert pin not in [s.sql for s in fake_databricks.connection.statements]
+
+    adapter.pin_utc_session()
+    adapter.run_query(sql, max_rows=10, timeout_seconds=30)
+    assert [s.sql for s in fake_databricks.connection.statements][-4:] == [
+        "SET STATEMENT_TIMEOUT = 30",
+        pin,
+        "SET STATEMENT_TIMEOUT = 30",
+        sql,
+    ]
+
+
+def _slow_utc_pin(monkeypatch, fake, seconds: float, error: Exception | None = None):
+    """The zone statement takes `seconds` on the warehouse, then fails with `error`."""
+
+    execute = FakeCursor.execute
+
+    def timed(cursor, sql):
+        if sql == "SET TIME ZONE 'UTC'":
+            fake.connection.clock.now += seconds
+            if error is not None:
+                raise error
+        return execute(cursor, sql)
+
+    monkeypatch.setattr(FakeCursor, "execute", timed)
+
+
+def test_the_utc_pin_is_billed_and_the_cap_is_read_after_it(
+    fake_databricks, monkeypatch
+):
+    entries: list[dict] = []
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: FakeResult(
+        rows=[{"n": 1}], seconds=1.0
+    )
+    _slow_utc_pin(monkeypatch, fake_databricks, 2.0)
+    adapter = make_adapter(fake_databricks, ceiling=10.0, record=entries.append)
+    adapter.pin_utc_session()
+    adapter.run_query(
+        "SELECT COUNT(*) AS n FROM `shop`.`core`.`customers`",
+        max_rows=10,
+        timeout_seconds=30,
+    )
+    assert [e["billed_seconds"] for e in entries] == pytest.approx([2.0, 1.0])
+    statements = fake_databricks.connection.statements
+    assert next(s for s in statements if "TIME ZONE" in s.sql).session_timeout == 10
+    assert data_statements(fake_databricks)[-1].session_timeout == 8
+
+
+@pytest.mark.parametrize(
+    ("seconds", "error", "raised"),
+    [
+        (9.5, None, OverCeilingError),
+        (
+            10.0,
+            dbsql_exc.ServerOperationError("Statement has timed out after 10 seconds."),
+            OverCeilingError,
+        ),
+        (1.0, RuntimeError("gone"), RuntimeError),
+    ],
+    ids=["spends-the-budget", "times-out", "fails"],
+)
+def test_a_utc_pin_that_spends_the_budget_or_fails_is_billed_and_stops_the_query(
+    fake_databricks, monkeypatch, seconds, error, raised
+):
+    entries: list[dict] = []
+    warm(fake_databricks)
+    fake_databricks.connection.row_resolver = lambda sql: [{"n": 1}]
+    _slow_utc_pin(monkeypatch, fake_databricks, seconds, error)
+    adapter = make_adapter(fake_databricks, ceiling=10.0, record=entries.append)
+    adapter.pin_utc_session()
+    with pytest.raises(raised):
+        adapter.run_query(
+            "SELECT COUNT(*) AS n FROM `shop`.`core`.`customers`",
+            max_rows=10,
+            timeout_seconds=30,
+        )
+    assert [e["billed_seconds"] for e in entries] == pytest.approx([seconds])
+    assert data_statements(fake_databricks) == []
 
 
 def test_no_pinned_warehouse_refuses_billed_work_with_the_fix(fake_databricks):

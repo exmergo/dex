@@ -21,7 +21,8 @@ ceiling: Databricks kills the statement.
 Read-only is enforced in depth: the SELECT-only guard in the databricks
 dialect on every data statement through one execution door, an adapter that
 issues no mutating statements (REST metadata reads, ``SET STATEMENT_TIMEOUT``,
-``DESCRIBE DETAIL``, and guarded SELECTs only), and documented least-privilege
+``SET TIME ZONE 'UTC'``, ``DESCRIBE DETAIL``, and guarded SELECTs only), and
+documented least-privilege
 grants. Billed statements run only on the warehouse ``.dex/config.yml`` pins;
 dex never spends on a warehouse the config does not name.
 """
@@ -1446,6 +1447,18 @@ class DatabricksAdapter:
         labels = [d[0].lower() for d in cursor.description]
         return rows, labels
 
+    def pin_utc_session(self) -> None:
+        """Run this adapter's later statements in a UTC session.
+
+        For SQL rendered by a layer that assumes one: a statement Cube renders
+        truncates a timestamp, and reads the bounds of a date range, in the
+        session time zone, which is the workspace's or the warehouse's own
+        setting, so run under another zone it buckets rows differently. Only
+        UTC, so nothing caller-supplied is interpolated.
+        """
+
+        self._utc_session = True
+
     def _billed_cursor(self, cap_seconds: float | None = None):
         """A cursor prepared for spend: warehouse pinned (strict), the SQL
         session opened lazily on first use, and the server-side statement
@@ -1455,22 +1468,41 @@ class DatabricksAdapter:
 
         self._warehouse()  # refuses when config pins no warehouse
         remaining = self.cost_gate.statement_cap(unit="warehouse-second")
+        if self._conn is None:
+            self._conn = self._sql_connect()
+        cursor = self._conn.cursor()
+        self._set_statement_timeout(cursor, remaining, cap_seconds)
+        if getattr(self, "_utc_session", False):
+            # An engine-built session statement, a constant. It runs on the
+            # warehouse under the timeout above, so its time is billed and the
+            # timeout is set again from what remains after it.
+            pin = "SET TIME ZONE 'UTC'"
+            started = self._clock()
+            try:
+                cursor.execute(pin)
+            except Exception as exc:
+                raise self._translate(exc, cap_seconds) from exc
+            finally:
+                self._record_elapsed(started, cursor, pin)
+            remaining = self.cost_gate.statement_cap(unit="warehouse-second")
+            self._set_statement_timeout(cursor, remaining, cap_seconds)
+        return cursor
+
+    def _set_statement_timeout(
+        self, cursor: Any, remaining: int | None, cap_seconds: float | None
+    ) -> None:
         bounds = [b for b in (remaining, cap_seconds) if b is not None]
         # Remember which bound won so a timeout kill is reported as the wall
         # limit or the budget, whichever actually fired.
         self._cap_was_wall = cap_seconds is not None and (
             remaining is None or cap_seconds < remaining
         )
-        if self._conn is None:
-            self._conn = self._sql_connect()
-        cursor = self._conn.cursor()
         if bounds:
             # An engine-built session statement, not agent SQL. STATEMENT_TIMEOUT
             # treats 0 as "no timeout", so the cap never rounds below 1: the
             # budget bound cannot (`statement_cap` refuses first) and the wall
             # bound is floored here.
             cursor.execute(f"SET STATEMENT_TIMEOUT = {max(int(min(bounds)), 1)}")
-        return cursor
 
     def _record_elapsed(self, started: float, cursor: Any, sql: str) -> None:
         elapsed = max(self._clock() - started, 0.0)

@@ -79,6 +79,13 @@ FROM  app.orders  AS "orders"
 WHERE ("orders".ordered_at >= from_iso8601_timestamp('2026-01-01T00:00:00.000Z') AND "orders".ordered_at <= from_iso8601_timestamp('2026-03-31T23:59:59.999Z')) AND ("orders".status IN ('paid', 'shipped')) GROUP BY 1, 2
 HAVING (sum("orders".total) > CAST('1' AS DOUBLE)) ORDER BY  3  DESC
 LIMIT 10""",
+    "databricks": """SELECT `orders`.status `orders__status`, date_trunc('month', from_utc_timestamp(`orders`.ordered_at, 'UTC')) `orders__ordered_at_month`, sum(`orders`.total) `orders__revenue`, count(`orders`.id) `orders__count` 
+FROM  app.orders  AS `orders`
+WHERE (`orders`.ordered_at >= from_utc_timestamp(replace(replace('2026-01-01T00:00:00.000Z', 'T', ' '), 'Z', ''), 'UTC') AND `orders`.ordered_at <= from_utc_timestamp(replace(replace('2026-03-31T23:59:59.999Z', 'T', ' '), 'Z', ''), 'UTC')) AND (`orders`.status IN ('paid', 'shipped'))
+GROUP BY 1, 2
+HAVING (sum(`orders`.total) > '1')
+ORDER BY  3  DESC
+LIMIT 10""",
 }
 
 

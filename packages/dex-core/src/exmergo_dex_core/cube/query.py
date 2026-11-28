@@ -49,18 +49,19 @@ CUBE_CONNECTORS: dict[str, tuple[str, str]] = {
     "redshift": ("$", '"'),
     "clickhouse": ("?", "`"),
     "trino": ("?", '"'),
-}
-
-#: Why each connector outside :data:`CUBE_CONNECTORS` is refused, by name.
-UNSUPPORTED_CONNECTORS: dict[str, str] = {
-    "databricks": "its rendered SQL has no reviewed golden yet",
+    "databricks": ("?", "`"),
 }
 
 # Dialects whose string literals take a backslash escape, for the scanner that
 # finds placeholders outside quoted text.
-_BACKSLASH_ESCAPES = {"bigquery", "snowflake", "redshift", "clickhouse"}
+_BACKSLASH_ESCAPES = {"bigquery", "snowflake", "redshift", "clickhouse", "databricks"}
 # Dialects whose quoted identifiers take one too.
 _BACKSLASH_IDENTIFIERS = {"clickhouse"}
+# Databricks also writes a string in double quotes, with the same escapes, and
+# a raw one (``r'...'``), where a backslash is only a backslash.
+_DOUBLE_QUOTED_STRINGS = {"databricks"}
+# The database type a Cube server is started with, where it is not dex's name.
+_CUBE_DB_TYPES = {"databricks": "databricks-jdbc"}
 
 
 class CubeQueryError(DexError, ValueError):
@@ -699,17 +700,30 @@ def _placeholders(sql: str, dialect: str) -> list[tuple[int, int, str]]:
     found: list[tuple[int, int, str]] = []
     backslash = dialect in _BACKSLASH_ESCAPES
     identifiers = dialect in _BACKSLASH_IDENTIFIERS
+    double = dialect in _DOUBLE_QUOTED_STRINGS
     i, n = 0, len(sql)
     while i < n:
         char = sql[i]
         if char in "'\"`":
+            string = char == "'" or (double and char == '"')
+            raw = (
+                double
+                and string
+                and sql[i - 1 : i] in ("r", "R")
+                and not re.match(r"[\w`]", sql[max(i - 2, 0) : i - 1])
+            )
+            escapes = backslash and (string or identifiers) and not raw
             j = i + 1
             while j < n:
-                if backslash and (char == "'" or identifiers) and sql[j] == "\\":
+                if escapes and sql[j] == "\\":
                     j += 2
                     continue
                 if sql[j] == char:
-                    if j + 1 < n and sql[j + 1] == char:
+                    # Two quotes in a row are one escaped quote, except in a
+                    # Databricks string, where they end one literal and begin
+                    # the next, which has its own escape rules.
+                    chained = double and string
+                    if j + 1 < n and sql[j + 1] == char and not chained:
                         j += 2
                         continue
                     break
@@ -803,7 +817,8 @@ def _dialect_mismatch(connector: str) -> str:
     return (
         f"refused: the Cube server rendered SQL for another warehouse than "
         f"{connector}, dex's connector. Run the Cube server with the database type "
-        f"of the warehouse dex queries (CUBEJS_DB_TYPE={connector})"
+        f"of the warehouse dex queries "
+        f"(CUBEJS_DB_TYPE={_CUBE_DB_TYPES.get(connector, connector)})"
     )
 
 
