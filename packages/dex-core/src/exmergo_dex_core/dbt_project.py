@@ -644,16 +644,24 @@ def write_project_file(path: Path, content: str) -> None:
     tightened the same way. Windows governs access through ACLs rather than mode
     bits, so there the call changes nothing that matters, and before Python 3.13
     ``fchmod`` does not exist on it at all.
+
+    The text goes to disk verbatim: ``newline=""`` keeps text mode from
+    translating ``\n`` into the platform line ending. On Windows the platform
+    ending is ``\r\n``, and an authored ``\r\n`` that ``onboarding._read``
+    carries in ``content`` would come back out as ``\r\r\n``, so every ``dex
+    init`` run grew an authored line by one carriage return and the rewritten
+    bytes never matched what dex holds, so no later run could take the
+    skip-when-unchanged path.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.name != PROFILES_FILE:
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline="")
         return
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     if hasattr(os, "fchmod"):
         os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
         handle.write(content)
 
 
