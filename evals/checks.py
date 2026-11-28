@@ -168,10 +168,15 @@ def _calls_in(command: str) -> list[tuple[int, str, list[str], list[tuple[int, i
 
     patterns = [live._DEX_CALL] + [live._alias_call(n) for n in live._aliases(command)]
     quoted = live._quoted_spans(command)
+    comments = _comment_spans(command, quoted)
     found = []
     for pattern in patterns:
         for match in pattern.finditer(command):
             if live._is_quoted_data(command, match.start(), match.end(), quoted):
+                continue
+            if any(b <= match.start() < e for b, e in comments):
+                # `dex maintain incidents # dex explore query ...`: only the
+                # first runs; the rest of the line is a comment.
                 continue
             group, sub = match.group(1), match.group(2)
             label = f"{group} {sub}" if sub else group
@@ -184,15 +189,56 @@ def _sql_file_argument(
     command: str, start: int, quoted: list[tuple[int, int]]
 ) -> str | None:
     """The ``--sql-file`` argument of the call starting at ``start``: the
-    first one after it that is not inside quoted text. The call's own flags
-    say it has one, and they are read up to its own separator, so this is
-    that one."""
+    first one between it and the call's own end (a shell separator, or a
+    comment) that is not inside quoted text. A `--sql-file` with no argument
+    before that end has none, never the next call's."""
 
-    for match in _SQL_FILE.finditer(command, start):
+    end = _call_end(command, start, quoted)
+    for match in _SQL_FILE.finditer(command, start, end):
         if any(b <= match.start() < e for b, e in quoted):
             continue
         return next((g for g in match.groups() if g), None)
     return None
+
+
+def _call_end(command: str, start: int, quoted: list[tuple[int, int]]) -> int:
+    """Where the call starting at ``start`` ends: the first `;`, `|`, `&` or
+    newline outside quotes (the `&` of a redirect such as `2>&1` is not
+    one), or the start of a comment."""
+
+    comments = _comment_spans(command, quoted)
+    for i in range(start, len(command)):
+        if any(b <= i < e for b, e in quoted):
+            continue
+        if any(b == i for b, _ in comments):
+            return i
+        ch = command[i]
+        if ch in ";|\n":
+            return i
+        if ch == "&" and command[i - 1 : i] != ">" and command[i + 1 : i + 2] != ">":
+            return i
+    return len(command)
+
+
+def _comment_spans(
+    command: str, quoted: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """The shell comments in ``command``: a `#` outside quotes that begins a
+    word, to the end of its line. A `#` inside a word (`a#b`) is not one."""
+
+    spans = []
+    i = 0
+    while i < len(command):
+        if command[i] == "#" and not any(b <= i < e for b, e in quoted):
+            before = command[i - 1 : i]
+            if not before or before.isspace() or before in ";&|()":
+                end = command.find("\n", i)
+                end = len(command) if end < 0 else end
+                spans.append((i, end))
+                i = end
+                continue
+        i += 1
+    return spans
 
 
 def _denied_uses(events: list[dict[str, Any]]) -> set[str]:
@@ -420,8 +466,12 @@ def _reads_match(
         return True
     name = target.parts[-1].casefold() if target.parts else ""
     failed = _failed_uses(events) | _denied_uses(events)
+    uses = tool_uses(events)
+    # A Write proves its contents only once its own successful result is on
+    # record, before the query; a request with no result proves nothing.
+    succeeded = _succeeded_before(events, str(uses[call["position"]].get("id")))
     contents: str | None = None
-    for use in tool_uses(events)[: call["position"]]:
+    for use in uses[: call["position"]]:
         payload = use.get("input") or {}
         tool = use.get("name")
         if tool in WRITE_TOOLS:
@@ -439,7 +489,8 @@ def _reads_match(
                     # unplaceable path, or one an 8.3 short name may alias.
                     contents = None
                 continue
-            ok = tool == "Write" and str(use.get("id")) not in failed
+            use_id = str(use.get("id"))
+            ok = tool == "Write" and use_id in succeeded and use_id not in failed
             contents = str(payload.get("content") or "") if ok else None
         elif (
             tool in SHELL_TOOLS
@@ -688,3 +739,31 @@ def _failed_uses(events: list[dict[str, Any]]) -> set[str]:
             ):
                 failed.add(str(block.get("tool_use_id")))
     return failed
+
+
+def _succeeded_before(events: list[dict[str, Any]], stop_id: str) -> set[str]:
+    """The ids of the tool calls whose result is on record, and not an error,
+    before the event that makes the call ``stop_id``."""
+
+    done: set[str] = set()
+    for event in events:
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        blocks = content if isinstance(content, list) else []
+        if event.get("type") == "assistant" and any(
+            isinstance(b, dict)
+            and b.get("type") == "tool_use"
+            and str(b.get("id")) == stop_id
+            for b in blocks
+        ):
+            break
+        if event.get("type") != "user":
+            continue
+        for block in blocks:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and not block.get("is_error")
+            ):
+                done.add(str(block.get("tool_use_id")))
+    return done
