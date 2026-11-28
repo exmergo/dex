@@ -23,7 +23,12 @@ from typing import Any
 
 from ..config import BigQueryTarget
 from ..envelope import EstimateQuality, Paradigm
-from ..errors import ConnectorError, PrerequisiteError, StatementStage
+from ..errors import (
+    ConnectorError,
+    PrerequisiteError,
+    StatementStage,
+    WarehouseQueryError,
+)
 from ..guards.cost_guard import CostGate, OverCeilingError
 from ..guards.sql_guard import assert_select_only
 from .base import (
@@ -621,14 +626,17 @@ class BigQueryAdapter:
             try:
                 _job, iterator = self._execute(sql)
                 rows = list(iterator)
-            except self._api_exceptions.BadRequest as exc:
+            except (self._api_exceptions.BadRequest, WarehouseQueryError) as exc:
                 # An unqueryable shape discovered only at query time (for
                 # example an external table whose source is unreadable):
                 # degrade to metadata-only rather than failing the profile.
                 # The note names BigQuery's structured reason and never its
                 # message: notes are cached and copied into `explore map`, and
                 # a server message can quote the value it failed on (#591).
-                reason = _bad_request_reason(exc)
+                refused = self._refused_before_running(exc)
+                if refused is None:
+                    raise
+                reason = _bad_request_reason(refused)
                 self._note(
                     identifier,
                     "aggregate profiling failed and was skipped (BigQuery "
@@ -893,7 +901,7 @@ class BigQueryAdapter:
             f"SELECT {', '.join(select_parts)} FROM {self._quote(identifier)}",  # noqa: S608
             dialect=self.dialect,
         )
-        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+        floored = max(self._typed_dry_run(sql), float(_MIN_BILLED_BYTES))
         if not self.cost_gate.try_charge(floored):
             self._note(
                 identifier,
@@ -946,7 +954,7 @@ class BigQueryAdapter:
                 distinct_combination_sql(self._quote(identifier), prefix, _quote_ident),
                 dialect=self.dialect,
             )
-            floored = max(self._dry_run(statement), float(_MIN_BILLED_BYTES))
+            floored = max(self._typed_dry_run(statement), float(_MIN_BILLED_BYTES))
             priced[len(prefix)] = (statement, floored)
             return floored
 
@@ -1160,7 +1168,7 @@ class BigQueryAdapter:
                 f"WHERE {qcol} IS NOT NULL)) AS n_{i}"
             )
         sql = assert_select_only(f"SELECT {', '.join(parts)}", dialect=self.dialect)
-        floored = max(self._dry_run(sql), float(_MIN_BILLED_BYTES))
+        floored = max(self._typed_dry_run(sql), float(_MIN_BILLED_BYTES))
         if not self.cost_gate.try_charge(floored):
             self._note(
                 identifier,
@@ -1535,9 +1543,36 @@ class BigQueryAdapter:
             use_query_cache=True,
             labels={"app": "dex"},
         )
-        job = self._client.query(
-            sql, job_config=job_config, location=self.target.location
-        )
+        try:
+            job = self._client.query(
+                sql, job_config=job_config, location=self.target.location
+            )
+        # The insert is a synchronous `jobs.insert` POST, and the client raises
+        # whatever that POST answers from `query()` itself, before any job
+        # exists. A bytes-billed refusal is checked first, as it is at
+        # `result()` below: it is a budget verdict on a statement BigQuery would
+        # have run, and takes the same widen-and-retry rather than reading as
+        # the plan door. Every other `BadRequest` or `NotFound` here is BigQuery
+        # refusing the statement before it created a job, so nothing ran and
+        # nothing billed: the plan door, typed the way `run_query` already typed
+        # it for its own caller, now for every caller of this door (issue #1000).
+        except self._api_exceptions.GoogleAPICallError as exc:
+            if _is_bytes_billed(exc):
+                return self._widen_and_retry(
+                    exc,
+                    sql,
+                    dry_run_estimate,
+                    timeout_seconds=timeout_seconds,
+                    max_results=max_results,
+                    retried=_retried,
+                )
+            if isinstance(
+                exc, (self._api_exceptions.BadRequest, self._api_exceptions.NotFound)
+            ):
+                raise warehouse_refusal(
+                    _api_error_message(exc), stage=StatementStage.PLAN
+                ) from exc
+            raise
         try:
             iterator = job.result(timeout=timeout_seconds, max_results=max_results)
         # Keyed on the condition rather than on one class. BigQuery reports the
@@ -1546,34 +1581,18 @@ class BigQueryAdapter:
         # view, where the referenced tables are only expanded server-side, takes
         # the second path). Catching only the 400 left the widen-and-retry below
         # unreachable for exactly the queries whose cost is hardest to predict.
+        # Admission can answer at the insert above as well as here, since
+        # `result()` can insert the job again when it retries one that failed.
         except self._api_exceptions.GoogleAPICallError as exc:
-            if "bytes billed" in str(exc) or "bytesBilledLimitExceeded" in str(exc):
-                required = _parse_bytes_billed_required(str(exc))
-                if required is not None and not _retried:
-                    # No dry run predicts BigQuery's own execution-time
-                    # rounding of bytes billed (issue #320), so the estimate
-                    # this command already charged for the statement can be
-                    # a genuine underestimate even though nothing was wrong
-                    # with it at dry-run time. BigQuery's own refusal names
-                    # exactly what it needed; widen the charge by the gap and
-                    # retry once with that as the new cap. Raises the same
-                    # OverCeilingError/ConfirmationRequiredError this would
-                    # raise anyway if the confirmed ceiling itself can't
-                    # cover the real requirement, so a genuine over-budget
-                    # query still refuses, correctly, on the real number.
-                    self.cost_gate.charge(required - dry_run_estimate)
-                    return self._run(
-                        sql,
-                        required,
-                        timeout_seconds=timeout_seconds,
-                        max_results=max_results,
-                        _retried=True,
-                    )
-                raise OverCeilingError(
-                    "the query would bill more than the remaining budget "
-                    "(server-side maximum_bytes_billed); raise --budget or "
-                    "narrow the query"
-                ) from exc
+            if _is_bytes_billed(exc):
+                return self._widen_and_retry(
+                    exc,
+                    sql,
+                    dry_run_estimate,
+                    timeout_seconds=timeout_seconds,
+                    max_results=max_results,
+                    retried=_retried,
+                )
             # every other badrequest (or notfound) is bigquery refusing the
             # statement itself (an invalid query, a type it will not coerce, or
             # a referenced relation that does not exist). typed, so the envelope
@@ -1604,6 +1623,45 @@ class BigQueryAdapter:
         )
         return job, iterator
 
+    def _widen_and_retry(
+        self,
+        exc: Exception,
+        sql: str,
+        dry_run_estimate: float,
+        *,
+        timeout_seconds: float | None,
+        max_results: int | None,
+        retried: bool,
+    ) -> tuple[Any, Any]:
+        """:meth:`_run`'s answer to a bytes-billed refusal, at either door."""
+
+        required = _parse_bytes_billed_required(str(exc))
+        if required is not None and not retried:
+            # No dry run predicts BigQuery's own execution-time
+            # rounding of bytes billed (issue #320), so the estimate
+            # this command already charged for the statement can be
+            # a genuine underestimate even though nothing was wrong
+            # with it at dry-run time. BigQuery's own refusal names
+            # exactly what it needed; widen the charge by the gap and
+            # retry once with that as the new cap. Raises the same
+            # OverCeilingError/ConfirmationRequiredError this would
+            # raise anyway if the confirmed ceiling itself can't
+            # cover the real requirement, so a genuine over-budget
+            # query still refuses, correctly, on the real number.
+            self.cost_gate.charge(required - dry_run_estimate)
+            return self._run(
+                sql,
+                required,
+                timeout_seconds=timeout_seconds,
+                max_results=max_results,
+                _retried=True,
+            )
+        raise OverCeilingError(
+            "the query would bill more than the remaining budget "
+            "(server-side maximum_bytes_billed); raise --budget or "
+            "narrow the query"
+        ) from exc
+
     def _dry_run(self, sql: str) -> float:
         job_config = self._bq.QueryJobConfig(dry_run=True, use_query_cache=False)
         job = self._client.query(
@@ -1612,20 +1670,24 @@ class BigQueryAdapter:
         return float(getattr(job, "total_bytes_processed", 0) or 0)
 
     def _typed_dry_run(self, sql: str) -> float:
-        """dry run for a host's own statement.
+        """dry run for a statement whose caller has no degrade for a refusal:
+        a host's own statement, and the statistics probes'
+        (``exact_distinct_counts``, ``distinct_combination_counts``,
+        ``value_domain_counts``; issue #1000).
 
         a statement bigquery will not plan fails here first, on the free call,
         and the real client raises ``badrequest`` (or ``notfound`` on an
         unbuilt dev relation) from ``query()`` itself. typed the way ``_run``
-        types the refusal it meets at execution, so the envelope carries
-        ``execution_failure`` and bigquery's own words rather than the
-        ``internal`` an untyped api exception falls through to, which a host
-        reads as a crash and retries (issues #480, #1209).
+        types the refusal it meets at the job insert and at execution, so the
+        envelope carries ``execution_failure`` and bigquery's own words rather
+        than the ``internal`` an untyped api exception falls through to, which
+        a host reads as a crash and retries (issues #480, #1209).
 
         ``_dry_run`` stays untyped on purpose: the profile's own aggregate
         statements cross it through ``_execute`` and the scan estimate, and
-        those callers degrade to metadata on a ``badrequest`` rather than
-        failing the profile.
+        ``table_probe`` crosses it to price its combined statement, and those
+        callers degrade on a ``badrequest`` rather than failing: the profile
+        to metadata, ``table_probe`` to the separate probes.
 
         a refusal here is the plan door by definition, since a dry run runs
         nothing, so it carries :attr:`statementstage.plan` (issue #524).
@@ -1637,6 +1699,28 @@ class BigQueryAdapter:
             raise warehouse_refusal(
                 _api_error_message(exc), stage=StatementStage.PLAN
             ) from exc
+
+    def _refused_before_running(self, exc: Exception) -> Exception | None:
+        """The ``badrequest`` a statement was refused with before it ran, or
+        ``None``.
+
+        bare from :meth:`_dry_run`; typed by :meth:`_run` when it came from the
+        job insert (issue #1000), so a caller that degrades on a statement
+        bigquery would not plan reads the same refusals through either door as
+        it did before the insert was typed. a refusal at execution, and a
+        ``notfound`` at the insert, are not this, as they were not before.
+        """
+
+        if isinstance(exc, self._api_exceptions.BadRequest):
+            return exc
+        cause = exc.__cause__
+        if (
+            isinstance(exc, WarehouseQueryError)
+            and exc.stage is StatementStage.PLAN
+            and isinstance(cause, self._api_exceptions.BadRequest)
+        ):
+            return cause
+        return None
 
     def _request(self, operation: Callable[[], Any]) -> Any:
         try:
@@ -1674,6 +1758,14 @@ def _quote_ident(name: str) -> str:
 
     escaped = name.replace("`", "\\`")
     return f"`{escaped}`"
+
+
+def _is_bytes_billed(exc: Exception) -> bool:
+    """Whether an api error is BigQuery's bytes-billed refusal, read from the
+    condition rather than the class, which varies with the door it came
+    through."""
+
+    return "bytes billed" in str(exc) or "bytesBilledLimitExceeded" in str(exc)
 
 
 def _parse_bytes_billed_required(message: str) -> float | None:
