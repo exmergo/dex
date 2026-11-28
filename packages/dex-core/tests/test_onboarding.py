@@ -247,8 +247,16 @@ def test_init_never_grows_carriage_returns_in_authored_docs(
         b"# Our project\r\n\r\nKeep this byte for byte.\r\n"
     )
     (tmp_path / "AGENTS.md").write_bytes(b"# Team guidance\r\n")
-    run(tmp_path, capsys, "--mode", "explore", "--connector", "duckdb",
-        "--path", str(duckdb_file))
+    run(
+        tmp_path,
+        capsys,
+        "--mode",
+        "explore",
+        "--connector",
+        "duckdb",
+        "--path",
+        str(duckdb_file),
+    )
     for name, authored in (
         ("README.md", b"# Our project\r\n"),
         ("AGENTS.md", b"# Team guidance\r\n"),
@@ -259,8 +267,16 @@ def test_init_never_grows_carriage_returns_in_authored_docs(
     before = {
         name: (tmp_path / name).read_bytes() for name in ("README.md", "AGENTS.md")
     }
-    run(tmp_path, capsys, "--mode", "explore", "--connector", "duckdb",
-        "--path", str(duckdb_file))
+    run(
+        tmp_path,
+        capsys,
+        "--mode",
+        "explore",
+        "--connector",
+        "duckdb",
+        "--path",
+        str(duckdb_file),
+    )
     after = {
         name: (tmp_path / name).read_bytes() for name in ("README.md", "AGENTS.md")
     }
