@@ -616,6 +616,19 @@ one coverage number.
   declare on one relation, spelled alike (a quoted part keeps its case, so
   `DB.SCHEMA.ORDERS` and `"DB"."SCHEMA"."ORDERS"` are two), is listed per source
   with `also_declared_by` and counted once.
+  A test Dex rendered for a grain, a reference or a `never` null rule carries
+  `claim`, the id of the fact it checks, on its entry in the resource's `tests`
+  list, and is matched to that fact by the claim, whatever its kind or column,
+  except that a single-column grain's `not_null` carries the grain's claim but
+  is never its check: only its `unique` is. A test with no claim (hand-written, or rendered before #1448) and a generated
+  test such as `dex_freshness` are matched by kind and column, and a generated
+  test is never listed as stale. A fact with tests says
+  which under `matched_by`: `claim` or `kind_and_column`. A test whose claim
+  names no fact the declaration states (a stale render, or a test of a model or
+  column renamed since, which keeps its claim) is listed apart under
+  `data.declarations.stale_claims`, and still counts where its kind and column
+  match. Remove the test and declare the fact again to render it with a
+  current claim (#1498).
 
 ## `maintain reconcile [<class>]`
 

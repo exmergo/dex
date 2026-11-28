@@ -400,6 +400,8 @@ _COVERAGE_RESOURCE = (
     "[].tests[].column",
     "[].tests[].name",
     "[].tests[].is_incremental",
+    # The claim id a rendered test carries (#1498): a hash, never a value.
+    "[].tests[].claim",
     "[].downstream_tests",
     "[].downstream_tests.count",
     "[].downstream_tests.on",
@@ -639,6 +641,17 @@ def _coverage_fields() -> frozenset[str]:
         "[].verify[]",
         "[].also_declared_by",
         "[].also_declared_by[]",
+        "[].matched_by",
+    )
+    # Tests whose claim names no declared fact (#1498): names and claim ids.
+    paths.add("declarations.summary.stale_claims")
+    paths |= _under(
+        "declarations.stale_claims",
+        "[]",
+        "[].model",
+        "[].test",
+        "[].column",
+        "[].claim",
     )
     return _COMMON | frozenset(paths)
 

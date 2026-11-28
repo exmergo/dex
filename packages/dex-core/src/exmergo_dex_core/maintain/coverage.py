@@ -41,6 +41,7 @@ from typing import Any
 
 from .. import dbt_tests
 from ..manifest_paths import posix
+from ..transform.claims import claim_in
 
 #: The resource types inventoried, and the section each one is reported in.
 SECTIONS: dict[str, str] = {
@@ -337,6 +338,10 @@ def inventory(
                         resource.asserted.add(key)
                     else:
                         resource.undocumented_tested.add(str(column))
+                # The declared fact a rendered test checks (#1448, #1498).
+                claim = claim_in(test)
+                if claim is not None:
+                    record["claim"] = claim
             else:
                 record["name"] = test.get("name")
             resource.tests.append(record)
