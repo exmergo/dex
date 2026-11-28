@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -241,13 +242,23 @@ def test_exploration_without_dbt_and_optional_instructions(
 
 
 def test_init_never_grows_carriage_returns_in_authored_docs(
-    tmp_path, capsys, duckdb_file
+    tmp_path, capsys, duckdb_file, monkeypatch
 ):
+    posix_write_text = Path.write_text
+
+    def windows_write_text(self, data, encoding=None, errors=None, newline=None):
+        # Emulate Windows text mode: newline=None translates "\n" into "\r\n",
+        # so this regression is detectable on the ubuntu-only CI matrix too.
+        if newline is None:
+            data, newline = data.replace("\n", "\r\n"), "\n"
+        return posix_write_text(self, data, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "write_text", windows_write_text)
     (tmp_path / "README.md").write_bytes(
         b"# Our project\r\n\r\nKeep this byte for byte.\r\n"
     )
     (tmp_path / "AGENTS.md").write_bytes(b"# Team guidance\r\n")
-    run(
+    first_code, _ = run(
         tmp_path,
         capsys,
         "--mode",
@@ -257,17 +268,19 @@ def test_init_never_grows_carriage_returns_in_authored_docs(
         "--path",
         str(duckdb_file),
     )
-    for name, authored in (
-        ("README.md", b"# Our project\r\n"),
-        ("AGENTS.md", b"# Team guidance\r\n"),
+    assert first_code == 0
+    for name, authored, marker in (
+        ("README.md", b"# Our project\r\n", README_BEGIN),
+        ("AGENTS.md", b"# Team guidance\r\n", procedure.BEGIN),
     ):
         data = (tmp_path / name).read_bytes()
         assert data.startswith(authored)
         assert b"\r\r" not in data
+        assert marker.encode() in data
     before = {
         name: (tmp_path / name).read_bytes() for name in ("README.md", "AGENTS.md")
     }
-    run(
+    second_code, _ = run(
         tmp_path,
         capsys,
         "--mode",
@@ -277,6 +290,7 @@ def test_init_never_grows_carriage_returns_in_authored_docs(
         "--path",
         str(duckdb_file),
     )
+    assert second_code == 0
     after = {
         name: (tmp_path / name).read_bytes() for name in ("README.md", "AGENTS.md")
     }
