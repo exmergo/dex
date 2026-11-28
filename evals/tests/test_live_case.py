@@ -1592,6 +1592,8 @@ def test_the_committed_elementary_check_reads_a_sql_file():
     events = [
         *passing()[:-1],
         _use(9, "Write", {"file_path": "/work/q.sql", "content": sql}),
+        # Its result, so the check fails on the SQL, not on unknown contents.
+        _res(9, "File created"),
         _bash(10, f"{WRAP} explore query --sql-file q.sql"),
         _done(ANSWER),
     ]
