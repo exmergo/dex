@@ -1720,3 +1720,38 @@ def test_a_same_name_write_that_may_alias_the_file_leaves_it_unknown():
     unc = _w(3, "//server/share/work/q.sql", "select 1")
     events = _wrote(_w(2, "/work/q.sql", "select 1"), unc, _q(4))
     assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+# --- `.` and `..` resolved after the join (CodeRabbit, #1626 checks.py:317) ------
+
+
+def test_a_parent_step_out_of_the_workspace_is_outside():
+    whole = Check(check="no_file_writes", assertion="x", within=["."])
+    events = _wrote(_write(2, "../elsewhere.sql"))
+    assert checks.grade(whole, events)[0]
+    assert "../elsewhere.sql" in checks.information(whole, events)
+
+
+def test_a_path_through_the_project_and_back_is_in_the_workspace_not_the_project():
+    events = _wrote(_write(2, "demo_project/../x.sql"))
+    assert checks.grade(PROJECT_ONLY, events)[0]
+    assert checks.information(PROJECT_ONLY, events) == (
+        "wrote outside the project: ['x.sql']"
+    )
+
+
+def test_a_dotted_spelling_is_the_same_file_for_the_sql_file_reader():
+    clean = _w(2, "/work/demo_project/sub/../q.sql", "select 1")
+    assert checks.grade(NO_ELEMENTARY, _wrote(clean, _q(3, "demo_project/q.sql")))[0]
+    # A forbidden overwrite at a `..` spelling of the same file is seen.
+    events = _wrote(
+        _w(2, "/work/q.sql", "select 1"), _w(3, "../work/q.sql", ELEMENTARY_SQL), _q(4)
+    )
+    assert not checks.grade(NO_ELEMENTARY, events)[0]
+
+
+def test_a_path_that_climbs_above_the_root_stays_outside():
+    whole = Check(check="no_file_writes", assertion="x", within=["."])
+    assert checks.grade(whole, _wrote(_write(2, "../../../work/x.sql")))[0]
+    assert checks.grade(whole, _wrote(_write(2, "/../work/x.sql")))[0]
+    assert not checks.grade(whole, _wrote(_write(2, "/work/./a/../x.sql")))[0]
