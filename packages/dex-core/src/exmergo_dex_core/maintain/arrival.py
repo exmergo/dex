@@ -161,9 +161,11 @@ def capture_column(
     named; or ``None`` and why none was."""
 
     held = (manifest.get("sources") or {}).get(source) or {}
-    config = held.get("config") if isinstance(held.get("config"), Mapping) else {}
-    freshness = (
-        config.get("freshness") if isinstance(config.get("freshness"), Mapping) else {}
+    raw_config = held.get("config")
+    config: Mapping[str, Any] = raw_config if isinstance(raw_config, Mapping) else {}
+    raw_freshness = config.get("freshness")
+    freshness: Mapping[str, Any] = (
+        raw_freshness if isinstance(raw_freshness, Mapping) else {}
     )
     for named in (
         held.get("loaded_at_field"),
