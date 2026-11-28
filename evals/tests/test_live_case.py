@@ -25,6 +25,7 @@ import pytest
 
 from evals import checks, claude_agent
 from evals.__main__ import main
+from evals.claude_agent import agent_args
 from evals.runner import AgentResult, Verdict, read_verdict, run_quality, run_uplift
 from evals.suite import (
     AgentConfig,
@@ -33,6 +34,7 @@ from evals.suite import (
     EvalSuite,
     InvalidSuiteError,
     _suite_from_dict,
+    load_suite,
 )
 
 TEST = "unique_stg_order_items_order_item_id"
@@ -643,6 +645,111 @@ def test_uplift_without_case_is_an_error(cli):
     with pytest.raises(SystemExit) as exc:
         main(["skills/maintain", "--uplift"])
     assert exc.value.code == 2
+
+
+# --- the committed case (#1480) ------------------------------------------------
+
+
+def _demo_case() -> EvalCase:
+    suite = load_suite(Path(__file__).resolve().parents[2] / "skills" / "maintain")
+    [case] = [c for c in suite.evals if c.setup == [["demo"]]]
+    return case
+
+
+def test_the_committed_demo_case_runs_on_a_fresh_demo_with_the_records_flags():
+    case = _demo_case()
+    assert case.prompt == f"the {TEST} test started failing; work out why"
+    assert case.agent.timeout == 900
+    assert agent_args(case.agent) == [
+        "--permission-mode",
+        "acceptEdits",
+        "--max-budget-usd",
+        "5",
+        "--allowedTools",
+        "Bash(uv run *)",
+        "--disallowedTools",
+        "PowerShell",
+    ]
+    # The points about tool calls are checks; the rest is for the judge.
+    kinds = sorted(c.check for c in case.checks)
+    assert kinds == [
+        "first_dex_command",
+        "no_dex_command",
+        "no_dex_command",
+        "no_file_writes",
+    ]
+
+
+def _committed(case: EvalCase, events: list[dict]) -> dict[str, bool]:
+    return {c.assertion: checks.grade(c, events)[0] for c in case.checks}
+
+
+def test_the_committed_checks_pass_the_procedure_and_fail_each_departure():
+    case = _demo_case()
+    assert all(_committed(case, passing()).values())
+    first, elementary, writes, plan = (c.assertion for c in case.checks)
+    assert _committed(case, failing()) == {
+        first: False,
+        elementary: False,
+        writes: False,
+        plan: True,
+    }
+    planned = [
+        *passing()[:-1],
+        _bash(9, f'{WRAP} transform plan "keep one row" --edits-file -'),
+        _done(ANSWER),
+    ]
+    # Storing a plan writes `.dex/plans`, so it fails "writes nothing" too.
+    assert _committed(case, planned) == {
+        first: True,
+        elementary: True,
+        writes: False,
+        plan: False,
+    }
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "dbt_invocations",
+        "main_elementary.model_runs",
+        "elementary_test_results",
+        "dbt_run_results",
+        "test_result_rows",
+        "data_monitoring_metrics",
+    ],
+)
+def test_the_committed_pattern_catches_each_of_elementarys_tables(table):
+    case = _demo_case()
+    [check] = [c for c in case.checks if c.command == "explore query"]
+    read = " ".join(("select count(*) from", table))
+    events = [
+        *passing()[:-1],
+        _bash(9, f'{WRAP} explore query "{read}"'),
+        _done(ANSWER),
+    ]
+    assert not checks.grade(check, events)[0]
+
+
+@pytest.mark.parametrize(
+    "path, counted",
+    [
+        # The first live run's scratch file, in the workspace root.
+        ("/work/.dex_probe.sql", False),
+        ("/work/demo_project/dbt/models/staging/stg_order_items.sql", True),
+        ("/work/.dex/config.yml", True),
+    ],
+)
+def test_the_committed_write_check_counts_only_the_project(path, counted):
+    case = _demo_case()
+    [check] = [c for c in case.checks if c.check == "no_file_writes"]
+    events = [
+        *passing()[:-1],
+        _use(9, "Write", {"file_path": path, "content": "select 1"}),
+        _done(ANSWER),
+    ]
+    assert checks.grade(check, events)[0] is not counted
+    assert bool(checks.information(check, events)) is not counted
 
 
 # --- review follow-ups (#1625) ---------------------------------------------------
@@ -1448,6 +1555,62 @@ def test_a_run_with_no_transcript_gets_a_verdict_file_of_its_own(cli, plugin, tm
     main([*args, "--transcripts", str(out)])
     names = sorted(p.name for p in out.iterdir())
     assert names == ["case-7-skill-no-transcript.judge.json"]
+
+
+# --- the committed case against the second review's routes (#1626) --------------
+
+
+def _committed_check(kind: str, command: str = "") -> Check:
+    case = _demo_case()
+    [check] = [
+        c
+        for c in case.checks
+        if c.check == kind and (not command or c.command == command)
+    ]
+    return check
+
+
+@pytest.mark.parametrize(
+    "changes, passed",
+    [
+        ([".dex/snapshot.json"], False),
+        (["demo_project/dbt/models/staging/stg_order_items.sql"], False),
+        ([".dex/cache.json", ".dex/cache.lock", ".dex/queries.jsonl"], True),
+        ([".dex/spend.jsonl"], True),
+        ([".dex_probe.sql"], True),
+    ],
+    ids=["snapshot", "model_by_shell", "bookkeeping", "ledger", "scratch"],
+)
+def test_the_committed_write_check_reads_the_workspace(changes, passed):
+    check = _committed_check("no_file_writes")
+    assert checks.grade(check, passing(), changes)[0] is passed
+
+
+def test_the_committed_elementary_check_reads_a_sql_file():
+    check = _committed_check("no_dex_command", "explore query")
+    sql = " ".join(("select * from", "main_elementary.elementary_test_results"))
+    events = [
+        *passing()[:-1],
+        _use(9, "Write", {"file_path": "/work/q.sql", "content": sql}),
+        # Its result, so the check fails on the SQL, not on unknown contents.
+        _res(9, "File created"),
+        _bash(10, f"{WRAP} explore query --sql-file q.sql"),
+        _done(ANSWER),
+    ]
+    assert not checks.grade(check, events)[0]
+
+
+@pytest.mark.parametrize(
+    "command", ["transform repair stg_x", "transform place c --targets a --expr x"]
+)
+def test_the_committed_case_fails_a_plan_stored_by_another_command(command):
+    events = [*passing()[:-1], _bash(9, f"{WRAP} {command}"), _done(ANSWER)]
+    assert not checks.grade(_committed_check("no_file_writes"), events)[0]
+
+
+def test_the_committed_plan_check_ignores_a_help_call():
+    events = [*passing()[:-1], _bash(9, f"{WRAP} transform plan --help"), _done(ANSWER)]
+    assert checks.grade(_committed_check("no_dex_command", "transform plan"), events)[0]
 
 
 # --- CodeRabbit's second review: fail closed, and anchor at the workspace --------

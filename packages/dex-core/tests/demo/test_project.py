@@ -957,6 +957,67 @@ def test_diagnosis_names_the_semantic_model_keyed_on_the_failing_column(
     assert readers["unread_files"] == []
 
 
+def _files(root: Path) -> dict[Path, bytes]:
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+#: What a read writes in `.dex/` by itself: the cache, its lock, the query log.
+_BOOKKEEPING = {"cache.json", "cache.lock", "queries.jsonl", "spend.jsonl"}
+
+
+def _state(root: Path) -> dict[Path, bytes]:
+    files = _files(root / ".dex")
+    return {p: b for p, b in files.items() if p.as_posix() not in _BOOKKEEPING}
+
+
+@pytest.mark.parametrize("selector", [(), ("stg_order_items",)], ids=["all", "model"])
+def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
+    run_from, no_network, capsys, selector
+):
+    """#1480's deterministic arm: the live eval's case, with no agent. Asked why
+    a test started failing, the shipped procedure has the agent run
+    ``maintain incidents`` first, then ``maintain diagnose`` for the open
+    incident it found (with or without the model as the selector), and stop
+    there, since a question writes nothing. Run in that order on one demo, the
+    first returns the incident, the second that incident's cause and the
+    semantic-layer reader of its column, and the dbt project is left as the demo
+    wrote it. Each command reads the demo on its own, so the order is the
+    procedure's, not a dependency this test could catch breaking; the live
+    case's ``first_dex_command`` check holds the agent to it. The no-defect
+    twin is
+    ``test_the_same_demo_with_the_failing_runs_removed_returns_no_incident``."""
+
+    pytest.importorskip("duckdb")
+    _run(run_from.argv("demo"), capsys)
+    project = run_from.root / PROJECT_DIR
+    before = _files(project)
+    dex_before = _state(run_from.root)
+
+    incidents = _run(run_from.argv("maintain", "incidents", *selector), capsys)
+    [incident] = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
+    assert incident["subject"] == {"kind": "unique_id", "key": FAILING_TEST}
+
+    diagnose = _run(run_from.argv("maintain", "diagnose", *selector), capsys)
+    [diagnosis] = diagnose["data"]["diagnoses"]
+    assert diagnosis["subject"] == incident["subject"]["key"]
+    assert diagnosis["verdict"] == "cause"
+    [cause] = diagnosis["causes"]
+    assert (cause["owner"], cause["kind"]) == ("loader", "duplicate_load")
+    assert cause["relation"] == "dex_demo.main.order_items"
+    [reader] = diagnosis["semantic_readers"]["readers"]
+    assert (reader["semantic_model"], reader["kind"], reader["name"]) == (
+        "order_items",
+        "entity",
+        "order_item",
+    )
+    # The fix is named and handed to transform; nothing is written.
+    [step] = diagnosis["next_steps"]
+    assert step["command"].startswith("dex transform plan ")
+    assert _files(project) == before
+    # Nor anything in `.dex/` (a plan, a snapshot) but what a read writes itself.
+    assert _state(run_from.root) == dex_before
+
+
 def test_the_demo_s_semantic_layer_is_listed_from_its_seeded_artifacts(
     run_from, no_network, capsys
 ):
