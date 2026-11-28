@@ -548,9 +548,11 @@ def _windows_style(path: str) -> bool:
 
 
 def _absolute(path: str, root: str) -> list[str] | None:
-    """``path`` as absolute parts, read against ``root``. The known alias
-    spellings of a Windows path are turned into its drive form: Git Bash's
-    `/c/...`, and `~` for this user's home. ``None`` for no path."""
+    """``path`` as absolute parts, read against ``root``, with every ``.``
+    and ``..`` resolved after the join, so `../x.sql` from `/work` is
+    `/x.sql`, not inside `/work`. The known alias spellings of a Windows path
+    are turned into its drive form: Git Bash's `/c/...`, and `~` for this
+    user's home. ``None`` for no path."""
 
     if not path:
         return None
@@ -558,15 +560,37 @@ def _absolute(path: str, root: str) -> list[str] | None:
     if path.startswith("~"):
         home = str(Path.home())
         rest = path[1:].lstrip("/\\")
-        return _segments(home) + _segments(rest)
+        return _dots(_segments(home) + _raw_parts(rest))
     if _DRIVE.match(path):
-        return _segments(path)
+        return _dots(_raw_parts(path))
     if path.startswith(("/", "\\")):
-        parts = _segments(path)
+        parts = _dots(_raw_parts(path))
         if windows and parts and _GIT_BASH_DRIVE.match(parts[0]):
             return [f"{parts[0].upper()}:", *parts[1:]]
         return parts
-    return _segments(root) + _segments(path)
+    return _dots(_segments(root) + _raw_parts(path))
+
+
+def _raw_parts(path: str) -> list[str]:
+    """A path's parts with either slash, ``.`` and ``..`` kept for ``_dots``."""
+
+    return [p for p in path.replace("\\", "/").split("/") if p]
+
+
+def _dots(parts: list[str]) -> list[str]:
+    """``parts`` with ``.`` dropped and each ``..`` taking off the part before
+    it. A ``..`` with nothing left to take off is kept, so a path that climbs
+    above the top never lands inside the workspace."""
+
+    out: list[str] = []
+    for part in parts:
+        if part == ".":
+            continue
+        if part == ".." and out and out[-1] != "..":
+            out.pop()
+            continue
+        out.append(part)
+    return out
 
 
 def _locate(path: str, root: str) -> _Located | None:
