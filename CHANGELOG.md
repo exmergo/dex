@@ -14,6 +14,50 @@ pending fragments into a new section below. See
 
 <!-- towncrier release notes start -->
 
+## [1.19.2] - 2026-11-28
+
+### Added
+
+- **`dex maintain diagnose` names a source whose rows arrived after the run
+  read them.** The pipeline ran on time and the loader was late, so the run
+  built the model without rows that had not landed yet. Diagnosis now reads that
+  as a cause, `source_arrived_late`, owned by the loader. It is confirmed when
+  some rows of the failing run's window landed after that run started, and every
+  row of the last passing run's window had landed before it started. The arrival
+  time is the source's dbt `loaded_at_field`, or a column a staging model
+  declares with `freshness.basis: capture`, and never a business timestamp. The
+  window is read from the failing test's own time column, or from the time
+  column the tested model declares. The read is one count statement per source,
+  priced with the other checks, and returns counts only. Where no arrival time
+  or window can be read, the answer says `no_capture_time`, `no_run_times` or
+  `window_unknown` instead of ruling the loader out. `dex demo` now seeds this
+  case too: a `shipments` source whose last day landed minutes after the newest
+  build started, so the tour ends at two incidents and a cause for each. ([#1629](https://github.com/exmergo/dex/pull/1629))
+
+### Fixed
+
+- **A statement BigQuery will not plan inside a statistics probe reads
+  `execution_failure`, not `internal`.** The exact distinct-count, composite-key,
+  value-domain and combined table probes that `explore profile`, `explore map`,
+  `explore relationships` and the `maintain` commands run on BigQuery let a
+  `BadRequest` or `NotFound` from the dry run or the job insert escape bare, so
+  the envelope read `internal`, which a host takes for a crash and may retry. They
+  now raise the same typed refusal `explore query` already did, carrying
+  BigQuery's own words and `data.stage: "plan"`: nothing ran and nothing was
+  billed, so the statement has to change (#1000).
+
+  The job insert is typed this way for every BigQuery statement. A bytes-billed
+  refusal answered there is a budget verdict rather than a plan refusal: it takes
+  the same widen-and-retry it takes when the job fails on it, and past the budget
+  it refuses on cost. That includes profiling, which used to fall back to
+  metadata on that answer at the insert. It now gets its aggregates where the
+  budget covers them, and `explore profile` otherwise stops with its usual budget
+  refusal, keeping what it already profiled. The combined table probe still hands
+  back to the separate probes when its own dry run is refused, now on a `NotFound`
+  as well as a `BadRequest`. Profiling still degrades to metadata when BigQuery
+  will not plan an aggregate batch, at the dry run or the insert. ([#1628](https://github.com/exmergo/dex/pull/1628))
+
+
 ## [1.19.1] - 2026-11-27
 
 ### Added
