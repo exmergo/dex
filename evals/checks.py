@@ -432,8 +432,11 @@ def _reads_match(
                     _segments(path)[-1].casefold() == name
                 )
                 unplaced = place is None or not place.inside or not target.inside
-                if same_name and unplaced:
-                    # A spelling that cannot be told apart from the file.
+                if (same_name and unplaced) or (
+                    place is not None and place.could_be(target)
+                ):
+                    # A spelling that cannot be told apart from the file: an
+                    # unplaceable path, or one an 8.3 short name may alias.
                     contents = None
                 continue
             ok = tool == "Write" and str(use.get("id")) not in failed
@@ -530,12 +533,25 @@ class _Located:
     folds: bool
 
     def __eq__(self, other: object) -> bool:
+        """The same file, shown: each part equal as spelled (case-insensitively
+        on Windows). An 8.3 short name is not proof: `FOOBAR~1` may be
+        `foobaralpha` or `foobarbeta`."""
+
         if not isinstance(other, _Located):
             return NotImplemented
+        return self._matches(other, short_names=False)
+
+    def could_be(self, other: _Located) -> bool:
+        """Possibly the same file: equal once an 8.3 short name is allowed to
+        stand for a long name it abbreviates."""
+
+        return self._matches(other, short_names=True)
+
+    def _matches(self, other: _Located, *, short_names: bool) -> bool:
         if self.inside != other.inside or len(self.parts) != len(other.parts):
             return False
         return all(
-            _same_part(a, b, self.folds)
+            _same_part(a, b, self.folds, short_names=short_names)
             for a, b in zip(self.parts, other.parts, strict=True)
         )
 
@@ -611,16 +627,18 @@ def _locate(path: str, root: str) -> _Located | None:
     return _Located(False, tuple(parts), folds)
 
 
-def _same_part(a: str, b: str, folds: bool) -> bool:
+def _same_part(a: str, b: str, folds: bool, *, short_names: bool = True) -> bool:
     """One path part against another: exactly on a case-sensitive file
-    system; on Windows case-insensitively, and an 8.3 short name
-    (`PROGRA~1`) against the long name it abbreviates."""
+    system; on Windows case-insensitively, and (with ``short_names``) an 8.3
+    short name (`PROGRA~1`) against a long name it may abbreviate. That is
+    enough to place a path in the workspace, never to prove two paths are
+    one file."""
 
     if not folds:
         return a == b
     if a.casefold() == b.casefold():
         return True
-    return _short_for(a, b) or _short_for(b, a)
+    return short_names and (_short_for(a, b) or _short_for(b, a))
 
 
 def _short_for(short: str, long: str) -> bool:
