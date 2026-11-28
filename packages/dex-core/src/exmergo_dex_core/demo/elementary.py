@@ -23,7 +23,7 @@ unobserved week, and diagnosis bisects exactly there.
 
 A second incident (#1623): in the newest build alone,
 ``dex_freshness_stg_shipments_shipped_at__43200`` fails, because the loader
-landed the last day's ``shipments`` minutes after that build started
+landed the last twelve hours' ``shipments`` minutes after that build started
 (:func:`~.project.shipments_table`). Its break is the week from the build
 before, where it passed.
 
@@ -310,7 +310,7 @@ def elementary_tables(
                 "Elementary's record of each test in each run: "
                 "unique_stg_order_items_order_item_id passes, then fails once the "
                 "batch loaded twice arrives; the shipments' freshness test fails "
-                "in the newest build, which started before the last day's "
+                "in the newest build, which started before the last twelve hours' "
                 "shipments landed"
             ),
             schema=SCHEMA,

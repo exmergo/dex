@@ -13,8 +13,8 @@ renders both as files, beside the warehouse :mod:`.warehouse` writes:
   ``stg_shipments`` declares ``shipped_at`` as its time column with a 12-hour
   freshness, which renders ``dex_freshness`` (its macro is copied into
   ``macros/``). The table's rows are dated from the newest seeded build, like
-  Elementary's history: the last day's shipments landed minutes after that
-  build started, so its freshness test failed.
+  Elementary's history: the last twelve hours' shipments landed minutes after
+  that build started, so its freshness test failed.
 - **The Elementary package, declared and recorded.** ``packages.yml`` declares
   it at the release the reader supports, ``dbt_project.yml`` names its schema
   and turns its row samples off, and ``dbt_packages/elementary/dbt_project.yml``
@@ -157,7 +157,7 @@ _SHIPMENT_CLAIMS = {
 #: How often a shipment ships, how long the loader usually takes to land it,
 #: how many it holds, and when the late ones landed after the newest build
 #: started: before the demo ran, so they are in the table it writes.
-_SHIPMENT_EVERY = timedelta(hours=6)
+_SHIPMENT_EVERY = timedelta(hours=3)
 _LOAD_LAG = timedelta(minutes=20)
 _SHIPMENT_COUNT = 168
 _LATE_LANDED = timedelta(minutes=5)
@@ -607,17 +607,19 @@ def history_tables(
 def shipments_table(runs: tuple[SeededRun, ...]) -> tuple[DemoTable, ...]:
     """The loader's ``shipments``, dated back from the newest of ``runs``.
 
-    One shipment every six hours, the newest half an hour before that build
+    One shipment every three hours, the newest half an hour before that build
     started, each landed twenty minutes after it shipped, except the four that
-    shipped in the day before the build: those landed five minutes after it
-    started (and before the demo was generated, ten minutes after it), so the
-    build read the table without them. Empty of runs, there is no table.
+    shipped within the freshness test's twelve hours of the build: those landed
+    five minutes after it started (and before the demo was generated, ten
+    minutes after it), so the build read the table without them, and its
+    newest shipment was twelve and a half hours old. Empty of runs, there is no
+    table.
     """
 
     if not runs:
         return ()
     newest = runs[-1].started_at
-    late_from = newest - timedelta(days=1)
+    late_from = newest - timedelta(seconds=_MAX_LAG_SECONDS)
     rows: list[tuple] = []
     for step in range(_SHIPMENT_COUNT - 1, -1, -1):
         shipped = newest - _LAST_SHIPPED - step * _SHIPMENT_EVERY
@@ -645,8 +647,8 @@ def shipments_table(runs: tuple[SeededRun, ...]) -> tuple[DemoTable, ...]:
             rows=tuple(rows),
             note=(
                 "a carrier's shipments, each with when it shipped and when the "
-                "loader landed it: the last day's landed minutes after the newest "
-                "build read the table"
+                "loader landed it: the last twelve hours' landed minutes after "
+                "the newest build read the table"
             ),
         ),
     )

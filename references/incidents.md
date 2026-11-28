@@ -545,23 +545,29 @@ and takes each open incident to a cause, or to none.
 
     The failing run judged the rows whose event time falls after the last
     passing run started, through its own start; the last passing run, the
-    window of the same width before its start. Both starts are the runs'
+    window of the same width before its start. A freshness test that names
+    its `max_lag_seconds` (`dex_freshness`) judged, at each run, the rows
+    within that lag of the run's start instead, since those are the rows it
+    could count (`window_basis` says which). Both starts are the runs'
     `run_started_at` in `dbt_invocations`. Confirmed where some rows of the
     failing run's window have a capture time after that run started, and no
-    row of the last pass's window landed after it started; the evidence is
-    both windows' row counts, the late rows, the rows with no capture time and
-    both runs' starts. Ruled out where every row of the failing window landed
-    before the run (`arrived_before_run`), or where the last pass's window held
-    late rows too (`lateness_unchanged`: lateness the test already passed
-    with, so a loader whose usual lag reaches past a run's start is ruled out
-    here, however late one batch was). `not_checked` where no capture time is
-    named or it is not a date or timestamp (`no_capture_time`), a run's start is
+    row of the last pass's window landed after it started and before the
+    failing run; the evidence is both windows' row counts, the late rows, the
+    rows with no capture time and both runs' starts. Ruled out where every
+    row of the failing window landed before the run (`arrived_before_run`), or
+    where rows of the last pass's window landed after it and before the
+    failing run (`lateness_unchanged`: lateness the test already passed with,
+    so a loader whose usual lag reaches past a run's start is ruled out here,
+    however late one batch was). A row still missing at the failing run is
+    that failure's lateness, never the pass's. `not_checked` where no capture
+    time is named, it is not a date or timestamp, or rows of either window
+    have none so their arrival cannot be told (`no_capture_time`), a run's start is
     not recorded or no pass precedes the failure (`no_run_times`), or no event
     column can be read for the test (`window_unknown`), where the
     connection does not list the source (`source_not_listed`), and where the
     read itself did not answer (`firewall_refused`, `warehouse_refused`,
     `scan_offered`). The read is one
-    statement per source of five counts, never a value, each column read as
+    statement per source of six counts, never a value, each column read as
     whole epoch seconds (a timestamp with no time zone as UTC), through the
     query firewall and priced into the checks' one handshake, offered alone
     (`price.checks.arrival_offered`) where the grain checks fit and the two

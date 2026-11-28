@@ -442,3 +442,73 @@ def test_a_freshness_test_on_the_capture_column_reads_the_model_s_event_time(
 
     assert cause["evidence"]["event_source"] == "declaration fct_orders.shipped_at"
     assert cause["evidence"]["late_rows"] == len(LATE)
+
+
+def test_a_freshness_test_s_lag_counts_a_late_row_from_before_the_last_pass(
+    tmp_path: Path,
+):
+    """The review's case: a six-hour freshness check on hourly runs. A row
+    shipped before the last pass, still missing at the failing run, is one the
+    test could have counted there: late for the failure, and not lateness the
+    pass already ran with, since it had not landed by the failing run."""
+
+    root, warehouse = _arrive(
+        tmp_path, "on_time", declare_event=False, failing_freshness=True
+    )
+    [_, _, bad, _] = _runs()
+    con = duckdb.connect(str(warehouse))
+    con.execute(
+        "UPDATE raw.orders SET loaded_at = ? WHERE order_id BETWEEN 31 AND 40",
+        [bad.started + timedelta(minutes=10)],
+    )
+    con.close()
+    cause = _the_cause(_one(_diagnose(root, warehouse)), "source_arrived_late")
+
+    assert cause["evidence"]["window_basis"] == "max_lag (21600s)"
+    assert cause["evidence"]["late_rows"] == 10
+    # Each window is the six hours before its run's start.
+    failing = cause["evidence"]["failing_run"]["window"]
+    assert failing["after"].startswith((bad.started - timedelta(hours=6)).isoformat())
+    assert cause["evidence"]["last_passing_run"]["late_rows"] == 0
+
+
+def test_a_source_whose_columns_cannot_be_read_is_not_checked_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.adapters.duckdb import DuckDBAdapter
+    from exmergo_dex_core.errors import DexError
+
+    root, warehouse = _arrive(tmp_path, "late")
+    real = DuckDBAdapter.table_metadata
+
+    def refuse(self, identifier, *args, **kwargs):
+        if identifier.endswith("raw.orders"):
+            raise DexError("value 'secret' could not be read")
+        return real(self, identifier, *args, **kwargs)
+
+    monkeypatch.setattr(DuckDBAdapter, "table_metadata", refuse)
+    diagnosis = _one(_diagnose(root, warehouse))
+
+    [held] = _late(diagnosis)
+    assert (held["status"], held["reason"]) == ("not_checked", "source_not_listed")
+    assert diagnosis["verdict"] == "no_cause"
+
+
+def test_a_read_error_s_text_is_masked_in_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from exmergo_dex_core.errors import DexError
+    from exmergo_dex_core.maintain import arrival
+
+    root, warehouse = _arrive(tmp_path, "late")
+    monkeypatch.setattr(
+        arrival,
+        "read",
+        lambda engine, adapter, probes, command: [
+            DexError("Conversion Error: could not convert 'hunter2'") for _ in probes
+        ],
+    )
+    [held] = _late(_one(_diagnose(root, warehouse)))
+
+    assert (held["status"], held["reason"]) == ("not_checked", "warehouse_refused")
+    assert "hunter2" not in held["detail"]

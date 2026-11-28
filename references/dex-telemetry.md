@@ -146,7 +146,7 @@ of reviewable diffs. Nothing in your project changes until you run
 `dex demo` writes a local DuckDB warehouse, a small dbt project and the
 history of seven weekly builds in Elementary's tables. It holds two incidents.
 In the last two builds, a uniqueness test fails because a batch was loaded
-twice. In the newest build, a freshness test fails because the last day's
+twice. In the newest build, a freshness test fails because the last twelve hours'
 shipments landed minutes after the build started. No warehouse, no
 credentials, no network:
 

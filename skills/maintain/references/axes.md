@@ -761,18 +761,22 @@ for each source the failing test's lineage reads.
   `time` column the tested model declares (`evidence.event_source`).
 - **The windows**: the failing run's is the rows whose event time falls after
   the last passing run's start and through its own; the last pass's is the
-  window of the same width before its start. Each carries `window_rows` and
-  `late_rows` (rows whose capture time is after that run's start), and the
-  failing one `null_capture_rows`.
+  window of the same width before its start. For a freshness test that names
+  `max_lag_seconds`, each window is that lag before its run's start
+  (`window_basis`). Each carries `window_rows`, `late_rows` and
+  `null_capture_rows`. The last pass's `late_rows` counts only rows that
+  landed after it and before the failing run: a row still missing at the
+  failing run is the failure's own lateness.
 - **Confirmed** when the failing window has late rows and the last pass's has
-  none. **Ruled out** on `arrived_before_run` (no late rows) or
+  none. Rows with no capture time, where they leave the answer open, make it
+  `no_capture_time`. **Ruled out** on `arrived_before_run` (no late rows) or
   `lateness_unchanged` (the last pass's window was late too). **Not checked**
   on `no_capture_time`, `no_run_times`, `window_unknown`,
   `source_not_listed`, `firewall_refused`, `warehouse_refused` or
   `scan_offered`.
 - `corroborated_by` lists a freshness test that failed on the same lineage in
   the range. It is evidence only, and never changes the answer.
-- The read is five counts per source, priced with the other checks, and
+- The read is six counts per source, priced with the other checks, and
   offered alone under `price.checks.arrival_offered` when only it does not
   fit. It reads the source as it stands now, so a row deleted since is not
   seen and a redelivered row reads as late.

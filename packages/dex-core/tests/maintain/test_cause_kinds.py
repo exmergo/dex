@@ -780,3 +780,35 @@ def test_corroboration_is_listed_and_never_decides():
 
     assert held.status == "ruled_out"
     assert held.evidence["corroborated_by"] == also
+
+
+def test_a_freshness_lag_sets_each_run_s_window():
+    held = ck.arrival_window(_span(), 6 * 3600)
+
+    assert held.bad_from == T0 + timedelta(hours=1) - timedelta(hours=6)
+    assert held.good_from == T0 - timedelta(hours=6)
+    plain = ck.arrival_window(_span())
+    assert (plain.bad_from, plain.good_from) == (T0, T0 - timedelta(hours=1))
+    late = ck.arrival_candidate(
+        "dev.raw.orders", COLUMNS, _counts(), _span(), lag_seconds=21600
+    )
+    assert late.evidence["window_basis"] == "max_lag (21600s)"
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"bad_late": 0, "bad_null": 5},
+        {"good_null": 5},
+    ],
+)
+def test_rows_with_no_capture_time_leave_the_answer_unchecked(counts):
+    held = ck.arrival_candidate("dev.raw.orders", COLUMNS, _counts(**counts), _span())
+
+    assert (held.status, held.reason) == ("not_checked", "no_capture_time")
+
+
+def test_late_rows_with_no_capture_time_beside_them_still_confirm():
+    held = ck.arrival_candidate("dev.raw.orders", COLUMNS, _counts(bad_null=5), _span())
+
+    assert held.status == "confirmed"

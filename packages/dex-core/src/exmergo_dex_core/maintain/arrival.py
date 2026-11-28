@@ -17,6 +17,11 @@ answer; this module finds the two columns and reads the counts.
   tested model declares with role ``time`` on another basis. Either has to be
   a column of the source that the lineage reads from it, and not the capture
   column itself.
+- **The windows.** Each run judged the rows whose event time falls after the
+  last pass's start and through its own (the last pass, the window of the same
+  width before its start), or, for a freshness test that names its
+  ``max_lag_seconds``, the rows within that lag of each run's start: the rows
+  the test itself could count.
 - **Counts only, through the firewall.** One aggregate statement per source,
   both columns read as whole epoch seconds (:func:`.freshness.epoch_sql`, a value
   with no time zone read as UTC), sent through the runner ``explore query``
@@ -78,7 +83,14 @@ MAX_SOURCES = 25
 #: day of the failing run's start belongs to it.
 _GRACE = timedelta(days=1)
 
-_COUNTS = ("bad_window", "bad_late", "bad_null", "good_window", "good_late")
+_COUNTS = (
+    "bad_window",
+    "bad_late",
+    "bad_null",
+    "good_window",
+    "good_late",
+    "good_null",
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +103,8 @@ class ArrivalProbe:
     columns: ck.ArrivalColumns
     statement: str
     corroborated_by: tuple[dict[str, Any], ...] = ()
+    #: The freshness test's own lag, which sets the windows where it has one.
+    lag_seconds: int | None = None
 
 
 # --- the tests and the columns ------------------------------------------------------
@@ -264,31 +278,52 @@ def write(
     identifier: str,
     capture: tuple[str, str],
     event: tuple[str, str],
-    bounds: tuple[int, int, int],
+    bounds: tuple[int, int, int, int],
 ) -> str:
-    """The one statement over a source: five counts, never a value.
+    """The one statement over a source: six counts, never a value.
 
-    ``capture`` and ``event`` are (column, temporal kind); ``bounds`` the start
-    of the last pass's window, the last pass's start and the failing run's, in
-    whole epoch seconds."""
+    ``capture`` and ``event`` are (column, temporal kind); ``bounds`` the two
+    windows (:class:`~.cause_kinds.ArrivalWindows`) in whole epoch seconds:
+    the last pass's start of window and start, then the failing run's."""
 
     from ..guards.sql_guard import assert_select_only
 
-    good_from, good_at, bad_at = bounds
+    good_from, good_at, bad_from, bad_at = bounds
     c = epoch_sql(dialect, _quote(dialect, capture[0]), capture[1])
     e = epoch_sql(dialect, _quote(dialect, event[0]), event[1])
-    bad = f"({e}) > {good_at} AND ({e}) <= {bad_at}"
+    null = f"{_quote(dialect, capture[0])} IS NULL"
+    bad = f"({e}) > {bad_from} AND ({e}) <= {bad_at}"
     good = f"({e}) > {good_from} AND ({e}) <= {good_at}"
     parts = [
         f"COUNT(CASE WHEN {bad} THEN 1 END) AS bad_window",
         f"COUNT(CASE WHEN {bad} AND ({c}) > {bad_at} THEN 1 END) AS bad_late",
-        f"COUNT(CASE WHEN {bad} AND {_quote(dialect, capture[0])} IS NULL "
-        "THEN 1 END) AS bad_null",
+        f"COUNT(CASE WHEN {bad} AND {null} THEN 1 END) AS bad_null",
         f"COUNT(CASE WHEN {good} THEN 1 END) AS good_window",
-        f"COUNT(CASE WHEN {good} AND ({c}) > {good_at} THEN 1 END) AS good_late",
+        # Late at the last pass, and landed by the failing run: a row still
+        # missing then is that failure's lateness, not lateness the test
+        # already passed with.
+        f"COUNT(CASE WHEN {good} AND ({c}) > {good_at} AND ({c}) <= {bad_at} "
+        "THEN 1 END) AS good_late",
+        f"COUNT(CASE WHEN {good} AND {null} THEN 1 END) AS good_null",
     ]
     sql = f"SELECT {', '.join(parts)} FROM {_relation(dialect, identifier)}"  # noqa: S608
     return assert_select_only(sql, dialect=dialect)
+
+
+def lag_seconds(manifest: Mapping[str, Any], test: str) -> int | None:
+    """A freshness test's own lag: the rows it can count at a run are those
+    within it of the run's clock, so the window is read the same way."""
+
+    node = (manifest.get("nodes") or {}).get(test) or {}
+    kwargs = (node.get("test_metadata") or {}).get("kwargs") or {}
+    value = kwargs.get("max_lag_seconds")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float) and value > 0:
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip()) or None
+    return None
 
 
 def _epoch(moment: Any) -> int:
@@ -353,13 +388,15 @@ def plan(
 
     Reads catalog metadata only (the source's columns and their types)."""
 
+    from ..errors import DexError
     from .diagnose_kinds import _match
 
     found = work.found
     tests = scoped_tests(manifest, work.incident.tests)
     if not tests or found is None:
         return []
-    window = ck.arrival_window(work.span)
+    lag = lag_seconds(manifest, tests[0])
+    window = ck.arrival_window(work.span, lag)
     if isinstance(window, diag.Candidate):
         work.candidates.append(window)
         return []
@@ -372,7 +409,12 @@ def plan(
             )
         )
         return []
-    bounds = tuple(_epoch(t) for t in window)
+    bounds = (
+        _epoch(window.good_from),
+        _epoch(window.good_at),
+        _epoch(window.bad_from),
+        _epoch(window.bad_at),
+    )
     dialect = get_dialect(engine.connector or engine.config.connector)
     sources = manifest.get("sources") or {}
     probes: list[ArrivalProbe] = []
@@ -397,7 +439,18 @@ def plan(
                 )
             )
             continue
-        _, columns = adapter.table_metadata(identifier)
+        try:
+            _, columns = adapter.table_metadata(identifier)
+        except DexError as exc:
+            # One unreadable source never takes the others' answers with it.
+            work.candidates.append(
+                ck.arrival_unread(
+                    "source_not_listed",
+                    f"the columns of {identifier} could not be read: {exc}",
+                    relation=identifier,
+                )
+            )
+            continue
         live = {c.name.casefold(): (c.name, c.data_type) for c in columns}
         capture, why = capture_column(manifest, uid, found, live)
         if capture is None:
@@ -444,9 +497,10 @@ def plan(
                     identifier,
                     (capture, capture_kind),
                     (event, event_kind),
-                    bounds,  # type: ignore[arg-type]
+                    bounds,
                 ),
                 corroborated_by=corroboration(work, found, manifest),
+                lag_seconds=window.lag_seconds,
             )
         )
     return probes

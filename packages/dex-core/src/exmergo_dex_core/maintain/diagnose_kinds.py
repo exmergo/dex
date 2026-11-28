@@ -724,7 +724,7 @@ def run_arrival(
         from .incident_sources import _reraise_cost
 
         _reraise_cost(exc)
-        _arrival_unread_all(planned, "warehouse_refused", str(exc))
+        _arrival_unread_all(planned, "warehouse_refused", failure_text(exc))
         return
     for probe, answer in zip(planned.probes, answers, strict=True):
         work = probe.work
@@ -748,13 +748,19 @@ def run_arrival(
             work.candidates.append(
                 ck.arrival_unread(
                     "warehouse_refused",
-                    f"the count over {probe.identifier} returned no answer: {answer}",
+                    f"the count over {probe.identifier} returned no answer: "
+                    f"{failure_text(answer)}",
                     probe.relation,
                 )
             )
             continue
         candidate = ck.arrival_candidate(
-            probe.relation, probe.columns, answer, work.span, probe.corroborated_by
+            probe.relation,
+            probe.columns,
+            answer,
+            work.span,
+            probe.corroborated_by,
+            lag_seconds=probe.lag_seconds,
         )
         work.candidates.append(candidate)
         if candidate.status == "confirmed":

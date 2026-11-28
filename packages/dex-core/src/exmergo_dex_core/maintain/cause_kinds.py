@@ -34,7 +34,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -1221,11 +1221,13 @@ class ArrivalColumns:
 class ArrivalCounts:
     """The counts one statement read over a source, never a value.
 
-    ``bad_*`` are over the window the failing run judged (event time after the
-    last passing run's start, through the failing run's), ``good_*`` over the
-    window of the same width the last passing run judged. ``*_late`` counts the
-    rows whose capture time is after that run's start; ``bad_null`` the rows of
-    the failing window with no capture time.
+    ``bad_*`` are over the window the failing run judged, ``good_*`` over the
+    window the last passing run judged (:func:`arrival_window`). ``bad_late``
+    counts the rows whose capture time is after the failing run's start;
+    ``good_late`` the rows captured after the last pass started and by the
+    failing run's start, the lateness that pass already ran with (a row still
+    missing at the failing run is that failure's own). ``*_null`` counts the
+    rows with no capture time.
     """
 
     bad_window: int
@@ -1233,13 +1235,31 @@ class ArrivalCounts:
     bad_null: int
     good_window: int
     good_late: int
+    good_null: int = 0
+
+
+@dataclass(frozen=True)
+class ArrivalWindows:
+    """The event-time windows the two runs judged, each ``(after, through]``.
+
+    With no lag, the failing run judged the rows whose event falls after the
+    last pass started, through its own start, and the last pass the window of
+    the same width before its start. With a lag (a freshness test's
+    ``max_lag_seconds``), each run judged the rows within that lag of its own
+    start: the rows the test itself could count."""
+
+    good_from: datetime
+    good_at: datetime
+    bad_from: datetime
+    bad_at: datetime
+    lag_seconds: int | None = None
 
 
 def arrival_window(
-    span: DiagnosisRange,
-) -> tuple[datetime, datetime, datetime] | Candidate:
-    """The bounding runs' starts and the start of the last pass's window, or
-    the ``no_run_times`` answer where a start is not recorded."""
+    span: DiagnosisRange, lag_seconds: int | None = None
+) -> ArrivalWindows | Candidate:
+    """The windows the bounding runs judged, or the ``no_run_times`` answer
+    where a start is not recorded."""
 
     if span.after == UNKNOWN:
         return arrival_unread(
@@ -1268,7 +1288,10 @@ def arrival_window(
             "the failing run's recorded start is not after the last passing "
             "run's, so the two runs' windows cannot be told apart",
         )
-    return good - (bad - good), good, bad
+    if lag_seconds is not None and lag_seconds > 0:
+        lag = timedelta(seconds=lag_seconds)
+        return ArrivalWindows(good - lag, good, bad - lag, bad, lag_seconds)
+    return ArrivalWindows(good - (bad - good), good, good, bad)
 
 
 def _at(moment: datetime) -> str:
@@ -1281,6 +1304,7 @@ def arrival_candidate(
     counts: ArrivalCounts,
     span: DiagnosisRange,
     corroborated_by: Sequence[Mapping[str, Any]] = (),
+    lag_seconds: int | None = None,
 ) -> Candidate:
     """The late-arrival candidate for one source, from its counts.
 
@@ -1290,10 +1314,11 @@ def arrival_candidate(
     listed as evidence and never decides the answer.
     """
 
-    window = arrival_window(span)
+    window = arrival_window(span, lag_seconds)
     if isinstance(window, Candidate):
         return window.model_copy(update={"relation": relation})
-    good_from, good_at, bad_at = window
+    good_from, good_at = window.good_from, window.good_at
+    bad_from, bad_at = window.bad_from, window.bad_at
     good, bad = span.after, span.through
     assert good != UNKNOWN  # noqa: S101
     evidence: dict[str, Any] = {
@@ -1304,7 +1329,7 @@ def arrival_candidate(
         "failing_run": {
             "run": bad.run,
             "started_at": _at(bad_at),
-            "window": {"after": _at(good_at), "through": _at(bad_at)},
+            "window": {"after": _at(bad_from), "through": _at(bad_at)},
             "window_rows": counts.bad_window,
             "late_rows": counts.bad_late,
             "null_capture_rows": counts.bad_null,
@@ -1315,7 +1340,13 @@ def arrival_candidate(
             "window": {"after": _at(good_from), "through": _at(good_at)},
             "window_rows": counts.good_window,
             "late_rows": counts.good_late,
+            "null_capture_rows": counts.good_null,
         },
+        "window_basis": (
+            f"max_lag ({window.lag_seconds}s)"
+            if window.lag_seconds is not None
+            else "run_to_run"
+        ),
         "late_rows": counts.bad_late,
         "read": "the source as it stands now",
     }
@@ -1329,6 +1360,16 @@ def arrival_candidate(
         "check": ARRIVAL_CHECK,
         "evidence": evidence,
     }
+    if counts.bad_late == 0 and counts.bad_null > 0:
+        return Candidate(
+            **base,
+            status="not_checked",
+            reason="no_capture_time",
+            detail=f"{counts.bad_null} of the {counts.bad_window} row(s) of the "
+            f"window the failing run judged have no {columns.capture}, and none "
+            "of the rest landed after the run started, so when those rows landed "
+            "cannot be told",
+        )
     if counts.bad_late == 0:
         held = (
             "the window the failing run judged holds no row today"
@@ -1342,6 +1383,16 @@ def arrival_candidate(
             status="ruled_out",
             reason="arrived_before_run",
             detail=f"{held}, so no row of {relation} arrived after the run read them",
+        )
+    if counts.good_late == 0 and counts.good_null > 0:
+        return Candidate(
+            **base,
+            status="not_checked",
+            reason="no_capture_time",
+            detail=f"{counts.bad_late} row(s) of the failing run's window landed "
+            f"after it started, but {counts.good_null} row(s) of the last passing "
+            f"run's window have no {columns.capture}, so whether that window had "
+            "all landed in time cannot be told",
         )
     if counts.good_late > 0:
         return Candidate(
@@ -1381,6 +1432,7 @@ __all__ = [
     "PACKAGE_FILES",
     "ArrivalColumns",
     "ArrivalCounts",
+    "ArrivalWindows",
     "Bounds",
     "Build",
     "Lineage",

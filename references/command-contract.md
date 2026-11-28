@@ -1008,9 +1008,11 @@ dex maintain diagnose [<models>] [--invocations N]
                                      the failing run's window, by the test's event time, whose
                                      capture time, the source's loaded_at_field or a column declared
                                      freshness.basis capture, is after that run's start, where none
-                                     of the last pass's window landed after its start; ruled out on
+                                     of the last pass's window landed after its start and by the
+                                     failing run, each window the test's own max_lag_seconds
+                                     where it names one; ruled out on
                                      arrived_before_run or lateness_unchanged; not_checked on
-                                     no_capture_time, no_run_times or window_unknown; five counts
+                                     no_capture_time, no_run_times or window_unknown; six counts
                                      per source, priced with the checks, arrival_offered where only
                                      it does not fit). Each range file has one
                                      owner; same_commit rules project, seed and package out.

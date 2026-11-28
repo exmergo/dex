@@ -974,7 +974,9 @@ def test_diagnosis_names_the_shipments_that_landed_late_as_the_cause(
     assert evidence["capture_source"] == "loaded_at_field"
     assert evidence["event_column"] == "shipped_at"
     assert evidence["failing_run"]["run"] == seeded.invocation_id(0)
-    assert evidence["failing_run"]["window_rows"] == 28
+    # The test's own twelve hours: the window every late shipment sits in.
+    assert evidence["window_basis"] == "max_lag (43200s)"
+    assert evidence["failing_run"]["window_rows"] == 4
     assert evidence["last_passing_run"]["run"] == seeded.invocation_id(1)
     assert evidence["last_passing_run"]["late_rows"] == 0
     assert diagnosis["range"]["after"]["run"] == seeded.invocation_id(1)
@@ -996,7 +998,10 @@ def test_the_shipments_are_dated_from_the_newest_build():
     assert shipped[-1] == newest - timedelta(minutes=30)
     late = [row for row in table.rows if row[4] > newest]
     assert [row[4] for row in late] == [newest + timedelta(minutes=5)] * 4
-    assert all(row[3] > newest - timedelta(days=1) for row in late)
+    assert all(row[3] > newest - timedelta(hours=12) for row in late)
+    # The build read a newest shipment older than the test's twelve hours.
+    landed = [row[3] for row in table.rows if row[4] <= newest]
+    assert newest - max(landed) > timedelta(hours=12)
     assert late_shipments((table,)) == 4
     # Landed before the demo was generated, so the table holds them.
     assert max(row[4] for row in table.rows) < REFERENCE.replace(tzinfo=None)
@@ -1077,11 +1082,18 @@ def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
     dex_before = _state(run_from.root)
 
     incidents = _run(run_from.argv("maintain", "incidents", *selector), capsys)
-    [incident] = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
+    opened = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
+    # Unselected, the late shipments' incident is open beside it (#1623).
+    assert {i["tests"][0] for i in opened} == (
+        {FAILING_TEST} if selector else {FAILING_TEST, LATE_TEST}
+    )
+    [incident] = [i for i in opened if i["tests"] == [FAILING_TEST]]
     assert incident["subject"] == {"kind": "unique_id", "key": FAILING_TEST}
 
     diagnose = _run(run_from.argv("maintain", "diagnose", *selector), capsys)
-    [diagnosis] = diagnose["data"]["diagnoses"]
+    diagnoses = diagnose["data"]["diagnoses"]
+    assert len(diagnoses) == len(opened)
+    [diagnosis] = [d for d in diagnoses if d["subject"] == FAILING_TEST]
     assert diagnosis["subject"] == incident["subject"]["key"]
     assert diagnosis["verdict"] == "cause"
     [cause] = diagnosis["causes"]
