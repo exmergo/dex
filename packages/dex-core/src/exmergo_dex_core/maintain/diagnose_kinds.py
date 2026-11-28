@@ -1,4 +1,4 @@
-"""Gathering the evidence for the cause kinds ``dex demo`` does not seed (#1476).
+"""Gathering the evidence for the cause kinds beside the duplicate delivery (#1476).
 
 :mod:`.cause_kinds` decides each kind from its evidence; this module reads that
 evidence for one incident:
@@ -12,7 +12,9 @@ evidence for one incident:
   only, free);
 - ``maintain verify`` on a model the range changed, in-process;
 - both models' build times, from Elementary's ``dbt_run_results``
-  (:mod:`.run_times`), priced into the checks' one handshake by the caller.
+  (:mod:`.run_times`), priced into the checks' one handshake by the caller;
+- each source's rows counted by when they landed against the bounding runs'
+  starts (:mod:`.arrival`, #1623), priced into the same handshake.
 
 Read-only: nothing here writes to the warehouse, the project or ``.dex/``.
 """
@@ -48,6 +50,9 @@ class KindWork:
     span: diag.DiagnosisRange
     candidates: list[diag.Candidate] = field(default_factory=list)
     next_steps: list[dict[str, str]] = field(default_factory=list)
+    #: Every incident of the same read, so a freshness failure in the range
+    #: can corroborate a late source.
+    others: tuple[Incident, ...] = ()
 
 
 def merged_lineage(
@@ -638,6 +643,148 @@ def _unread_all(planned: SchedulePlan, reason: str, detail: str) -> None:
         work.candidates.append(ck.schedule_unread(reason, detail))
 
 
+# --- the loader: rows that arrived after the run read them ---------------------------
+
+
+@dataclass
+class ArrivalPlan:
+    """The count statements every incident's late-source candidates share."""
+
+    probes: list[Any]
+    estimate: float
+    per_table: dict[str, float]
+
+
+def plan_arrival(
+    engine: DexEngine,
+    works: Sequence[KindWork],
+    manifest: Mapping[str, Any],
+    adapter_for: Any,
+) -> ArrivalPlan | None:
+    """Plan each source's count, or record why it is not checked.
+
+    Returns ``None`` where nothing is read: each incident then already holds
+    its late-source candidates (or none, where its tests are not ones a late
+    source fails).
+    """
+
+    from ..errors import DexError
+    from . import arrival
+
+    wanting = [w for w in works if arrival.scoped_tests(manifest, w.incident.tests)]
+    if not wanting:
+        return None
+    try:
+        adapter = adapter_for()
+        identifiers = [meta.identifier for meta in adapter.list_objects()]
+    except DexError as exc:
+        for work in wanting:
+            work.candidates.append(
+                ck.arrival_unread(
+                    "source_not_listed",
+                    f"the source catalog could not be read ({type(exc).__name__})",
+                )
+            )
+        return None
+    probes = [
+        probe
+        for work in wanting
+        for probe in arrival.plan(engine, adapter, work, manifest, identifiers)
+    ]
+    if not probes:
+        return None
+    try:
+        estimate, lines = arrival.price(engine, adapter, probes)
+    except DexError as exc:
+        for probe in probes:
+            probe.work.candidates.append(
+                ck.arrival_unread(
+                    "warehouse_refused",
+                    f"the count over {probe.identifier} could not be priced "
+                    f"({type(exc).__name__})",
+                    relation=probe.relation,
+                )
+            )
+        return None
+    return ArrivalPlan(probes, estimate, lines)
+
+
+def run_arrival(
+    engine: DexEngine, adapter: Any, planned: ArrivalPlan, command: str
+) -> None:
+    """Run the planned counts and decide each source's candidate."""
+
+    from ..envelope import failure_text
+    from ..errors import DexError, WarehouseQueryError
+    from ..guards.query_firewall import QueryRefusedError
+    from . import arrival
+
+    try:
+        answers = arrival.read(engine, adapter, planned.probes, command)
+    except DexError as exc:
+        from .incident_sources import _reraise_cost
+
+        _reraise_cost(exc)
+        _arrival_unread_all(planned, "warehouse_refused", failure_text(exc))
+        return
+    for probe, answer in zip(planned.probes, answers, strict=True):
+        work = probe.work
+        if isinstance(answer, QueryRefusedError):
+            work.candidates.append(
+                ck.arrival_unread("firewall_refused", str(answer), probe.relation)
+            )
+            continue
+        if isinstance(answer, WarehouseQueryError):
+            work.candidates.append(
+                ck.arrival_unread(
+                    "warehouse_refused", failure_text(answer), probe.relation
+                )
+            )
+            continue
+        if isinstance(answer, BaseException):
+            from .incident_sources import _reraise_cost
+
+            if isinstance(answer, DexError):
+                _reraise_cost(answer)
+            work.candidates.append(
+                ck.arrival_unread(
+                    "warehouse_refused",
+                    f"the count over {probe.identifier} returned no answer: "
+                    f"{failure_text(answer)}",
+                    probe.relation,
+                )
+            )
+            continue
+        candidate = ck.arrival_candidate(
+            probe.relation,
+            probe.columns,
+            answer,
+            work.span,
+            probe.corroborated_by,
+            lag_seconds=probe.lag_seconds,
+        )
+        work.candidates.append(candidate)
+        if candidate.status == "confirmed":
+            work.next_steps.append(_arrival_step(candidate, work))
+
+
+def offer_arrival(planned: ArrivalPlan) -> None:
+    _arrival_unread_all(
+        planned,
+        "scan_offered",
+        "the count of the source's rows by capture time was priced at what the "
+        "per-command ceiling has left after the incident read, and did not fit; "
+        "it is offered under price.checks",
+    )
+
+
+def _arrival_unread_all(planned: ArrivalPlan, reason: str, detail: str) -> None:
+    for probe in planned.probes:
+        probe.work.candidates.append(
+            ck.arrival_unread(reason, detail, relation=probe.relation)
+        )
+
+
 # --- the repair steps ----------------------------------------------------------------
 
 
@@ -705,13 +852,40 @@ def _schedule_step(candidate: diag.Candidate) -> dict[str, str]:
     }
 
 
+def _arrival_step(candidate: diag.Candidate, work: KindWork) -> dict[str, str]:
+    evidence = candidate.evidence
+    late = evidence.get("late_rows")
+    event = evidence.get("event_column")
+    found = work.found
+    model = (
+        found.models.get(found.model, found.model.split(".")[-1])
+        if found is not None and found.model
+        else candidate.relation
+    )
+    return {
+        "command": f"dex maintain incidents {model}",
+        "purpose": (
+            f"the loader delivered {late} row(s) of {candidate.relation} after the "
+            f"run that read it started: once they have landed, rebuild {model} and "
+            "read the incident again. If the delay recurs, declare a "
+            f"freshness.deadline on {event} so the next late delivery is caught "
+            "when it happens, or schedule the run later; the orchestrator's "
+            "schedule is not a project file, so diagnosis writes nothing"
+        ),
+    }
+
+
 __all__ = [
+    "ArrivalPlan",
     "KindWork",
     "SchedulePlan",
     "git_kinds",
     "merged_lineage",
+    "offer_arrival",
     "offer_schedule",
+    "plan_arrival",
     "plan_schedule",
     "retype",
+    "run_arrival",
     "run_schedule",
 ]

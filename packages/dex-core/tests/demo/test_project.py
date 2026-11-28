@@ -42,11 +42,14 @@ from exmergo_dex_core.demo.project import (
     BUILD_INVOCATION_ID,
     DEMO_DIR,
     FAILING_TEST,
+    LATE_TEST,
     PROJECT_DIR,
     build_project,
     duplicated_keys,
     history_tables,
+    late_shipments,
     project_digest,
+    shipments_table,
     write_project,
 )
 
@@ -57,10 +60,10 @@ REFERENCE = datetime(2026, 11, 24, 12, 0, 0, tzinfo=UTC)
 # project, the history and the incident they give (the counts below, the tour),
 # then update the value.
 GOLDEN_PROJECT_DIGEST = (
-    "218c769a51ad5d0926d7f35ffdc197def6f28ca3967c2728637223ba114f8dd7"
+    "721d5a7c3decde07ca2d130187467af0387a39e172a69a6a4586067d4d72b072"
 )
 GOLDEN_HISTORY_DIGEST = (
-    "b153c4ce178845bc4ac12cd7d61eb8daf13f85f2050fa4fdd9e2891146ae9073"
+    "a115bd32616bd242c2b21f33f0e8557593952e3610718c45198fb978b187aad4"
 )
 
 #: Values of order_items.order_item_id that occur more than once: the rows the
@@ -143,7 +146,7 @@ def test_the_seeded_history_is_byte_for_byte_the_documented_history():
     assert row_digest(history) == GOLDEN_HISTORY_DIGEST
     assert {t.qualified: len(t.rows) for t in history} == {
         "main_elementary.dbt_invocations": 6,
-        "main_elementary.elementary_test_results": 24,
+        "main_elementary.elementary_test_results": 42,
         "main_elementary.test_result_rows": 0,
         "main_elementary.data_monitoring_metrics": 0,
     }
@@ -215,12 +218,17 @@ def test_the_failing_test_passes_four_weeks_and_fails_the_last_two():
     invocations, results, *_ = _history()
     index = {name: i for i, (name, _) in enumerate(results.columns)}
     by_run: dict[str, str] = {}
+    late_by_run: dict[str, str] = {}
     for row in results.rows:
         status = row[index["status"]]
         if row[index["test_unique_id"]] == FAILING_TEST:
             by_run[row[index["invocation_id"]]] = status
             if status == "fail":
                 assert row[index["failures"]] == DUPLICATED_ITEM_IDS
+        elif row[index["test_unique_id"]] == LATE_TEST:
+            late_by_run[row[index["invocation_id"]]] = status
+            if status == "fail":
+                assert row[index["failures"]] == 1
         else:
             assert status == "pass"
         assert row[index["result_rows"]] is None, "no sampled row is seeded"
@@ -231,6 +239,16 @@ def test_the_failing_test_passes_four_weeks_and_fails_the_last_two():
         "pass",
         None,
         "fail",
+        "fail",
+    ]
+    # The late shipments' freshness test fails in the newest build alone (#1623).
+    assert [late_by_run.get(r.invocation_id) for r in runs] == [
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        None,
+        "pass",
         "fail",
     ]
     assert len(invocations.rows) == 6, "the hooks-off week writes no row"
@@ -250,6 +268,9 @@ def test_the_one_failing_test_fails_for_the_batch_loaded_twice():
         "test.analytics.not_null_stg_orders_order_id.81cfe2fe64": "pass",
         FAILING_TEST: "fail",
         "test.analytics.not_null_stg_order_items_order_item_id.26a7e2bc35": "pass",
+        "test.analytics.unique_stg_shipments_shipment_id.61ce1cfa9c": "pass",
+        "test.analytics.not_null_stg_shipments_shipment_id.13d2043380": "pass",
+        LATE_TEST: "fail",
     }
     assert tests[FAILING_TEST]["failures"] == DUPLICATED_ITEM_IDS
     assert run["args"]["which"] == "build"
@@ -816,9 +837,18 @@ def test_the_demo_then_maintain_incidents_returns_the_incident_from_elementary(
     demo = _run(run_from.argv("demo"), capsys)
     data = _run(_printed(demo, "maintain incidents"), capsys)["data"]
 
-    [incident] = data["incidents"]
+    by_test = {i["tests"][0]: i for i in data["incidents"]}
+    assert set(by_test) == {FAILING_TEST, LATE_TEST}
+    incident = by_test[FAILING_TEST]
     assert incident["subject"] == {"kind": "unique_id", "key": FAILING_TEST}
     assert incident["state"] == "open"
+    # The late shipments (#1623): keyed by the claim Dex rendered, first seen in
+    # the newest build, after a pass the week before.
+    late = by_test[LATE_TEST]
+    assert late["subject"] == {"kind": "claim", "key": "4e06c7a1957c63cf"}
+    assert late["state"] == "open"
+    assert late["first_observed"]["run"] == seeded.invocation_id(0)
+    assert late["onset"]["after"]["run"] == seeded.invocation_id(1)
     assert incident["opening_source"] == "elementary"
     # First observed in the first failing build, a week before the newest.
     assert incident["first_observed"]["run"] == seeded.invocation_id(1)
@@ -876,14 +906,16 @@ def test_without_the_package_dbt_s_run_results_alone_return_it_with_no_start(
     shutil.rmtree(project / "dbt_packages")
 
     data = _run(_printed(demo, "maintain incidents"), capsys)["data"]
-    [incident] = data["incidents"]
+    [incident] = [i for i in data["incidents"] if i["tests"] == [FAILING_TEST]]
     assert incident["opening_source"] == "dbt_run_results"
     assert incident["first_observed"] == "unknown"
     assert data["sources"]["elementary"]["reason_code"] == "not_installed"
 
     path = project / "target" / "run_results.json"
     run = json.loads(path.read_text(encoding="utf-8"))
-    run["results"] = [r for r in run["results"] if r["unique_id"] != FAILING_TEST]
+    run["results"] = [
+        r for r in run["results"] if r["unique_id"] not in (FAILING_TEST, LATE_TEST)
+    ]
     path.write_text(json.dumps(run), encoding="utf-8")
     data = _run(_printed(demo, "maintain incidents"), capsys)["data"]
     assert data["incidents"] == []
@@ -901,8 +933,7 @@ def test_diagnosis_names_the_batch_loaded_twice_as_the_cause(
     demo = _run(run_from.argv("demo"), capsys)
     data = _run(_printed(demo, "maintain diagnose"), capsys)["data"]
 
-    [diagnosis] = data["diagnoses"]
-    assert diagnosis["subject"] == FAILING_TEST
+    [diagnosis] = [d for d in data["diagnoses"] if d["subject"] == FAILING_TEST]
     assert diagnosis["verdict"] == "cause"
     [cause] = diagnosis["causes"]
     assert (cause["owner"], cause["kind"]) == ("loader", "duplicate_load")
@@ -920,6 +951,63 @@ def test_diagnosis_names_the_batch_loaded_twice_as_the_cause(
     assert step["command"].startswith("dex transform plan ")
 
 
+def test_diagnosis_names_the_shipments_that_landed_late_as_the_cause(
+    run_from, no_network, capsys
+):
+    """#1623: the second incident's cause is the one the demo plants. The last
+    day's shipments landed after the newest build started, read from the
+    source's loaded_at_field against that build's start, while every shipment
+    of the week before landed in time."""
+
+    pytest.importorskip("duckdb")
+    demo = _run(run_from.argv("demo"), capsys)
+    data = _run(_printed(demo, "maintain diagnose"), capsys)["data"]
+
+    [diagnosis] = [d for d in data["diagnoses"] if d["tests"] == [LATE_TEST]]
+    assert diagnosis["verdict"] == "cause"
+    [cause] = diagnosis["causes"]
+    assert (cause["owner"], cause["kind"]) == ("loader", "source_arrived_late")
+    assert cause["relation"] == "dex_demo.main.shipments"
+    evidence = cause["evidence"]
+    assert evidence["late_rows"] == 4
+    assert evidence["capture_column"] == "loaded_at"
+    assert evidence["capture_source"] == "loaded_at_field"
+    assert evidence["event_column"] == "shipped_at"
+    assert evidence["failing_run"]["run"] == seeded.invocation_id(0)
+    # The test's own twelve hours: the window every late shipment sits in.
+    assert evidence["window_basis"] == "max_lag (43200s)"
+    assert evidence["failing_run"]["window_rows"] == 4
+    assert evidence["last_passing_run"]["run"] == seeded.invocation_id(1)
+    assert evidence["last_passing_run"]["late_rows"] == 0
+    assert diagnosis["range"]["after"]["run"] == seeded.invocation_id(1)
+    assert diagnosis["range"]["through"]["run"] == seeded.invocation_id(0)
+    [step] = diagnosis["next_steps"]
+    assert step["command"] == "dex maintain incidents stg_shipments"
+    assert "freshness.deadline on shipped_at" in step["purpose"]
+    late = next(s for s in demo["data"]["next_steps"] if "diagnose" in s["command"])
+    assert "4 shipments" in late["shows"]
+
+
+def test_the_shipments_are_dated_from_the_newest_build():
+    runs = _runs()
+    [table] = shipments_table(runs)
+    newest = runs[-1].started_at.replace(tzinfo=None)
+    assert len(table.rows) == 168
+    shipped = [row[3] for row in table.rows]
+    assert shipped == sorted(shipped)
+    assert shipped[-1] == newest - timedelta(minutes=30)
+    late = [row for row in table.rows if row[4] > newest]
+    assert [row[4] for row in late] == [newest + timedelta(minutes=5)] * 4
+    assert all(row[3] > newest - timedelta(hours=12) for row in late)
+    # The build read a newest shipment older than the test's twelve hours.
+    landed = [row[3] for row in table.rows if row[4] <= newest]
+    assert newest - max(landed) > timedelta(hours=12)
+    assert late_shipments((table,)) == 4
+    # Landed before the demo was generated, so the table holds them.
+    assert max(row[4] for row in table.rows) < REFERENCE.replace(tzinfo=None)
+    assert shipments_table(()) == ()
+
+
 def test_diagnosis_names_the_semantic_model_keyed_on_the_failing_column(
     run_from, no_network, capsys
 ):
@@ -932,7 +1020,7 @@ def test_diagnosis_names_the_semantic_model_keyed_on_the_failing_column(
     demo = _run(run_from.argv("demo"), capsys)
     data = _run(_printed(demo, "maintain diagnose"), capsys)["data"]
 
-    [diagnosis] = data["diagnoses"]
+    [diagnosis] = [d for d in data["diagnoses"] if d["subject"] == FAILING_TEST]
     readers = diagnosis["semantic_readers"]
     assert readers["status"] == "read"
     assert readers["tested"] == [
@@ -994,11 +1082,18 @@ def test_incidents_then_diagnose_on_one_demo_return_the_incident_and_its_cause(
     dex_before = _state(run_from.root)
 
     incidents = _run(run_from.argv("maintain", "incidents", *selector), capsys)
-    [incident] = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
+    opened = [i for i in incidents["data"]["incidents"] if i["state"] == "open"]
+    # Unselected, the late shipments' incident is open beside it (#1623).
+    assert {i["tests"][0] for i in opened} == (
+        {FAILING_TEST} if selector else {FAILING_TEST, LATE_TEST}
+    )
+    [incident] = [i for i in opened if i["tests"] == [FAILING_TEST]]
     assert incident["subject"] == {"kind": "unique_id", "key": FAILING_TEST}
 
     diagnose = _run(run_from.argv("maintain", "diagnose", *selector), capsys)
-    [diagnosis] = diagnose["data"]["diagnoses"]
+    diagnoses = diagnose["data"]["diagnoses"]
+    assert len(diagnoses) == len(opened)
+    [diagnosis] = [d for d in diagnoses if d["subject"] == FAILING_TEST]
     assert diagnosis["subject"] == incident["subject"]["key"]
     assert diagnosis["verdict"] == "cause"
     [cause] = diagnosis["causes"]

@@ -83,16 +83,20 @@ the `config` group, the `explore` group, the authoring surface (`transform`,
 
 ```
 dex demo [path]                   -> generate a seeded local DuckDB warehouse (the
-                                     shop's 7 tables and 29,512 rows, and Elementary's 4
-                                     holding 30) plus a .dex/config.yml beside it, so a
+                                     shop's 7 tables and 29,512 rows, a loader's shipments
+                                     holding 168, and Elementary's 4 holding 48) plus a
+                                     .dex/config.yml beside it, so a
                                      first run needs no warehouse and no credentials,
                                      and a small dbt project under demo_project/dbt/ with the
                                      seeded history of seven weekly builds (Elementary's
                                      tables in main_elementary, dated back from when
                                      the demo ran, and the newest build's artifacts)
-                                     in which one test starts failing, so maintain
-                                     incidents and maintain diagnose have an incident
-                                     to read (#1477), and a dbt semantic layer, one
+                                     in which one test starts failing for a key loaded
+                                     twice and, in the newest build, a freshness test
+                                     fails for shipments that landed after it started,
+                                     so maintain incidents and maintain diagnose have
+                                     two incidents to read (#1477, #1623), and a dbt
+                                     semantic layer, one
                                      semantic model keyed on the failing column, so
                                      diagnose names what reads it (#1478);
                                      reports every artifact under data.created and
@@ -983,9 +987,10 @@ dex maintain diagnose [<models>] [--invocations N]
                                      observed pass; after, at or after the first failure; series none
                                      on a project's first day), unseen (the windows no recorded state
                                      covers), and every candidate with the existing check that
-                                     answered it (check, finding, evidence as counts). This release
-                                     checks a uniqueness test failing because the loader delivered a
-                                     key twice, with the grain axis on each source the tested model
+                                     answered it (check, finding, evidence as counts). A uniqueness
+                                     test failing because the loader delivered a key twice
+                                     (duplicate_load) is held with the grain axis on each source the
+                                     tested model
                                      reads: key_lost_uniqueness against a bounding snapshot that
                                      proved the key unique, else the declared-claim check
                                      (declared_grain_not_unique). The other owners are answered over
@@ -995,10 +1000,21 @@ dex maintain diagnose [<models>] [--invocations N]
                                      project_change (files the commit range touched that the lineage
                                      is built from, then maintain verify on the changed models),
                                      package_upgraded (package-lock.yml's pins at the two commits),
-                                     seed_edited (the seed file's git hash at the two commits) and
+                                     seed_edited (the seed file's git hash at the two commits),
                                      built_before_parent (a parent model built after its child at the
                                      failing run and before it at the last pass, from Elementary's
-                                     dbt_run_results, priced with the checks). Each range file has one
+                                     dbt_run_results, priced with the checks) and source_arrived_late
+                                     (#1623: for a failing completeness or freshness test, rows of
+                                     the failing run's window, by the test's event time, whose
+                                     capture time, the source's loaded_at_field or a column declared
+                                     freshness.basis capture, is after that run's start, where none
+                                     of the last pass's window landed after its start and by the
+                                     failing run, each window the test's own max_lag_seconds
+                                     where it names one; ruled out on
+                                     arrived_before_run or lateness_unchanged; not_checked on
+                                     no_capture_time, no_run_times or window_unknown; six counts
+                                     per source, priced with the checks, arrival_offered where only
+                                     it does not fit). Each range file has one
                                      owner; same_commit rules project, seed and package out.
                                      verdict is cause, several or no_cause; no_cause
                                      answers with ruled_out and unseen and never names the likeliest

@@ -13,10 +13,11 @@ spans (#1467). Each open incident is then diagnosed (:mod:`.diagnosis`):
    failure the after. With no series, the whole break is a window no recorded
    state of the warehouse covers, and the answer says so.
 3. **Confirm.** Each candidate cause is confirmed by a check Dex already has,
-   named in the answer. This release checks the cause kind ``dex demo`` seeds
-   (#1477): a uniqueness test failing because the loader delivered a key twice.
-   Its check is the grain axis of ``maintain check``, run on each source relation
-   the tested model reads that carries the tested columns:
+   named in the answer. The loader's duplicate delivery (#1477), which
+   ``dex demo`` seeds, is a uniqueness test failing because the loader
+   delivered a key twice. Its check is the grain axis of ``maintain check``, run
+   on each source relation the tested model reads that carries the tested
+   columns:
 
    - with a before snapshot that measured the key unique,
      ``key_lost_uniqueness`` against that snapshot, exactly as ``maintain
@@ -29,9 +30,11 @@ spans (#1467). Each open incident is then diagnosed (:mod:`.diagnosis`):
    runs that bound the break (:mod:`.cause_kinds`, :mod:`.diagnose_kinds`,
    #1476): a source column the loader retyped (the schema axis), a model the
    project changed in the range (``maintain verify`` on it), a package version
-   ``package-lock.yml`` moved, a seed whose file hash changed, and a parent
+   ``package-lock.yml`` moved, a seed whose file hash changed, a parent
    model built after its child (both models' build times from Elementary's
-   ``dbt_run_results``).
+   ``dbt_run_results``), and a source whose rows arrived after the run read
+   them (each row's capture time against the bounding runs' starts,
+   :mod:`.arrival`, #1623), which ``dex demo`` seeds too.
 4. **Answer.** One confirmed cause, several, or none. With none, the answer is
    what was ruled out and the window that could not be seen; the most likely
    candidate is never named. A confirmed cause's repair is handed to
@@ -172,6 +175,7 @@ def diagnose(
                     ],
                 ),
                 diag.bisect(item.incident.onset),  # type: ignore[arg-type]
+                others=tuple(incidents),
             )
             for item in work
         ]
@@ -179,10 +183,11 @@ def diagnose(
         for kind in kinds:
             dk.git_kinds(engine, history, kind, verified)
             dk.retype(kind, manifest, series_read, adapter_for)
+        arrival = dk.plan_arrival(engine, kinds, manifest, adapter_for)
         schedule = dk.plan_schedule(
             engine, kinds, read.sources.get(incident_sources.ELEMENTARY), adapter_for
         )
-        if any(w.specs for w in work) or schedule is not None:
+        if any(w.specs for w in work) or schedule is not None or arrival is not None:
             adapter = adapter_for()
             checks_price = _confirm_all(
                 engine,
@@ -192,6 +197,7 @@ def diagnose(
                 spent_before=_billed(read.spend),
                 warnings=warnings,
                 schedule=schedule,
+                arrival=arrival,
             )
         elif opened:
             adapter = opened[0]
@@ -661,6 +667,7 @@ def _confirm_all(
     spent_before: float = 0.0,
     warnings: list[str] | None = None,
     schedule: dk.SchedulePlan | None = None,
+    arrival: dk.ArrivalPlan | None = None,
 ) -> dict[str, Any]:
     """Plan every candidate's check, price them as one handshake, run them,
     and record each candidate's answer on its work item.
@@ -774,9 +781,25 @@ def _confirm_all(
         if gate is None or gate.ceiling is None
         else max(gate.ceiling - spent_before, 0.0)
     )
+    arrival_alone: dict[str, Any] | None = None
+    if arrival is not None:
+        if left is not None and planned and estimate + arrival.estimate > left:
+            # As for the schedule below: the grain checks keep the room, and the
+            # count by capture time is offered rather than taking both down.
+            dk.offer_arrival(arrival)
+            arrival_alone = {
+                "estimate": arrival.estimate,
+                "per_table": arrival.per_table,
+            }
+            arrival = None
+        else:
+            estimate += arrival.estimate
+            for key, value in arrival.per_table.items():
+                per_table[key] = per_table.get(key, 0.0) + value
     offered_alone: dict[str, Any] | None = None
     if schedule is not None:
-        if left is not None and planned and estimate + schedule.estimate > left:
+        ahead = planned or arrival is not None
+        if left is not None and ahead and estimate + schedule.estimate > left:
             # Together they do not fit: the grain checks, which can confirm a
             # cause on their own, keep the room, and the build-times read is
             # offered rather than taking both down with it.
@@ -793,7 +816,9 @@ def _confirm_all(
     price: dict[str, Any] = {"estimate": estimate, "per_table": per_table}
     if offered_alone is not None:
         price["schedule_offered"] = offered_alone
-    if not planned and schedule is None:
+    if arrival_alone is not None:
+        price["arrival_offered"] = arrival_alone
+    if not planned and schedule is None and arrival is None:
         return price
     if left is not None and estimate > left:
         # One confirmation covers the whole command: what the incident read
@@ -802,6 +827,8 @@ def _confirm_all(
         price["offered"] = True
         if schedule is not None:
             dk.offer_schedule(schedule)
+        if arrival is not None:
+            dk.offer_arrival(arrival)
         for item, held_plan in planned:
             item.candidates.append(
                 _loader(
@@ -832,6 +859,15 @@ def _confirm_all(
             ),
             *(
                 [
+                    f"{len(arrival.probes)} count(s) of a source's rows by capture "
+                    "time, one per source relation a failing completeness or "
+                    "freshness test reads, over its capture and event columns"
+                ]
+                if arrival is not None
+                else []
+            ),
+            *(
+                [
                     "one read of Elementary's dbt_run_results for the build "
                     "times of the failing tests' models and their parents"
                 ]
@@ -841,6 +877,8 @@ def _confirm_all(
         ],
         axes=["grain"] if planned else [],
     )
+    if arrival is not None:
+        dk.run_arrival(engine, adapter, arrival, COMMAND)
     if schedule is not None:
         dk.run_schedule(engine, adapter, schedule, COMMAND)
 

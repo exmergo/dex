@@ -44,11 +44,11 @@ the report says 100 t. Without Dex, he reads the 40% drop and fires the crew of
 a ship that delivered.
 
 The story is told as a 70-second film,
-[The imperial records](https://www.youtube.com/watch?v=RBcf9eyZlaU). The late
-record is the story's illustration: `maintain diagnose` does not yet name a
-late-arriving source as a cause. What it confirms today is listed under
-[Investigate](#4-investigate), and `dex demo` seeds one of them, a key the
-loader delivered twice, so you can run it yourself.
+[The imperial records](https://www.youtube.com/watch?v=RBcf9eyZlaU). The
+story's cause is one `maintain diagnose` confirms: rows of a source that landed
+after the run read them, read from each row's arrival time against the run's
+start. `dex demo` seeds it, beside a key the loader delivered twice, so you can
+run both yourself (see [Try it offline](#try-it-offline)).
 
 ## How it works
 
@@ -115,10 +115,10 @@ clock, and a daily `deadline` in its time zone.
 onset between the last observed-good run and the first observed-bad one, with
 the commits in between, bounds it with the committed `maintain snapshot`
 series, and names every window no recorded state covers. Each candidate cause
-is answered by a check Dex already has: a key the loader delivered twice, a
-source column the loader retyped, a model the project changed in the range, a
-package upgraded, a seed edited, or a parent model the schedule built after
-its child. The verdict is a cause, several causes, or none, with what was ruled
+is answered by a check Dex already has: rows a source delivered after the run
+read them, a key the loader delivered twice, a source column the loader
+retyped, a model the project changed in the range, a package upgraded, a seed
+edited, or a parent model the schedule built after its child. The verdict is a cause, several causes, or none, with what was ruled
 out. It never names a likeliest guess.
 
 Each diagnosis also names the semantic models and metrics that read the broken
@@ -144,15 +144,17 @@ of reviewable diffs. Nothing in your project changes until you run
 ## Try it offline
 
 `dex demo` writes a local DuckDB warehouse, a small dbt project and the
-history of seven weekly builds in Elementary's tables. In the last two, a
-uniqueness test starts failing because a batch was loaded twice. No warehouse,
-no credentials, no network:
+history of seven weekly builds in Elementary's tables. It holds two incidents.
+In the last two builds, a uniqueness test fails because a batch was loaded
+twice. In the newest build, a freshness test fails because the last twelve hours'
+shipments landed minutes after the build started. No warehouse, no
+credentials, no network:
 
 ```bash
 uv tool install "exmergo-dex-core[duckdb]"
 dex demo
-dex maintain incidents   # one open incident, with its first failing build
-dex maintain diagnose    # the cause: the loader delivered the key twice
+dex maintain incidents   # two open incidents, each with its first failing build
+dex maintain diagnose    # the causes: a key delivered twice, shipments that landed late
 ```
 
 ## Further reading
