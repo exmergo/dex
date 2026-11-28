@@ -31,7 +31,15 @@ from .claude_agent import (
     ClaudeCliJudge,
     ClaudeNotAvailableError,
 )
-from .runner import CorpusReport, run_corpus, run_quality, run_suite, run_triggering
+from .runner import (
+    CorpusReport,
+    run_corpus,
+    run_quality,
+    run_suite,
+    run_triggering,
+    uplift_from,
+    uplift_score,
+)
 from .suite import load_corpus, load_suite
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -83,6 +91,23 @@ def main(argv: list[str] | None = None) -> int:
             "and the uplift baseline"
         ),
     )
+    parser.add_argument(
+        "--uplift",
+        action="store_true",
+        help="with --case, also run each selected case once without the skill",
+    )
+    parser.add_argument(
+        "--transcripts",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="write each workspace case's stream-json transcript into DIR",
+    )
+    parser.add_argument(
+        "--keep-workspaces",
+        action="store_true",
+        help="keep each workspace case's working directory (its path on stderr)",
+    )
     args = parser.parse_args(argv)
 
     plugin_dir = args.plugin_dir.resolve()
@@ -90,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"--plugin-dir {plugin_dir} has no .claude-plugin/plugin.json")
     if args.cases and (args.triggering or args.corpus):
         parser.error("--case only applies to a skill's output-quality cases")
+    if args.uplift and not args.cases:
+        parser.error("--uplift applies to --case; the full suite already runs it")
     plugin_args = ["--plugin-dir", str(plugin_dir)]
     # stderr, so --json output stays parseable.
     print(f"evaluating the dex plugin at {plugin_dir}", file=sys.stderr)
@@ -116,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             timeout=args.timeout,
             skill_args=plugin_args,
+            plugin_dir=plugin_dir,
+            transcripts=args.transcripts,
+            keep_workspaces=args.keep_workspaces,
         )
 
         if args.cases:
@@ -125,11 +155,37 @@ def main(argv: list[str] | None = None) -> int:
             suite.evals = [c for c in suite.evals if c.id in args.cases]
             judge = ClaudeCliJudge(model=args.model, timeout=args.timeout)
             cases = run_quality(suite, agent, judge)
+            _write_verdicts(args.transcripts, cases, "skill")
+            passed = all(c.passed for c in cases)
+            if not args.uplift:
+                if args.json:
+                    print(json.dumps([c.to_dict() for c in cases], indent=2))
+                else:
+                    _print_quality(suite.skill_name, cases)
+                return 0 if passed else 1
+            baseline = run_quality(suite, agent, judge, skill_enabled=False)
+            _write_verdicts(args.transcripts, baseline, "baseline")
+            rows = uplift_from(cases, baseline)
+            score = uplift_score(rows)
+            errored = [r for r in rows if r.error]
             if args.json:
-                print(json.dumps([c.to_dict() for c in cases], indent=2))
+                print(
+                    json.dumps(
+                        {
+                            "quality": [c.to_dict() for c in cases],
+                            "baseline": [c.to_dict() for c in baseline],
+                            "uplift_errors": {r.id: r.error for r in errored},
+                            "uplift_score": score,
+                        },
+                        indent=2,
+                    )
+                )
             else:
                 _print_quality(suite.skill_name, cases)
-            return 0 if all(c.passed for c in cases) else 1
+                _print_quality(f"{suite.skill_name}, without the skill", baseline)
+                _print_uplift(suite.skill_name, rows, score)
+            # An arm that errored measured nothing: no uplift, and no pass.
+            return 0 if passed and not errored and score >= 0.0 else 1
 
         if args.triggering:
             trig = run_triggering(suite, agent)
@@ -176,6 +232,31 @@ def _print_corpus(report: CorpusReport) -> None:
             print(f"    {r.task_id}: {r.error}")
 
 
+def _write_verdicts(directory: Path | None, reports, arm: str) -> None:
+    """Each case's graded assertions, the judge's own answers included, beside
+    its transcript and under its stem (``case-7-skill-2.jsonl`` gets
+    ``case-7-skill-2.judge.json``), so a failed grade can be told from a
+    failed agent after the run. A run that wrote no transcript (its setup
+    failed) is written as ``case-<id>-<arm>-no-transcript.judge.json``."""
+
+    if directory is None:
+        return
+    directory.mkdir(parents=True, exist_ok=True)
+    for report in reports:
+        if report.transcript:
+            path = Path(report.transcript)
+            path = path.with_name(f"{path.stem}.judge.json")
+        else:
+            stem = f"case-{report.id}-{arm}-no-transcript"
+            path = directory / f"{stem}.judge.json"
+            n = 2
+            while path.exists():
+                path = directory / f"{stem}-{n}.judge.json"
+                n += 1
+        path.write_text(json.dumps(report.to_dict(), indent=2) + "\n", encoding="utf-8")
+        print(f"case {report.id} verdicts written to {path}", file=sys.stderr)
+
+
 def _print_triggering(skill: str, report) -> None:
     fired = f"{report.positives_fired}/{report.positives_total} positives fired"
     print(f"[{skill}] triggering")
@@ -193,15 +274,34 @@ def _print_quality(skill: str, cases) -> None:
     for case in cases:
         mark = "ok " if case.passed else "FAIL"
         print(f"  {mark} #{case.id} {case.prompt[:60]!r}")
+        if case.error:
+            print(f"        - run error: {case.error}")
         for a in case.assertions:
             if not a.passed:
-                print(f"        - failed: {a.assertion}")
+                why = f" [{a.graded_by}: {a.detail}]" if a.detail else ""
+                if not why and a.verdict is not None:
+                    said = " ".join(a.verdict.split())[:120]
+                    why = f" [judge answered: {said!r}]"
+                print(f"        - failed: {a.assertion}{why}")
+            if a.info:
+                print(f"        - note ({a.assertion}): {a.info}")
+
+
+def _print_uplift(skill: str, rows, score: float) -> None:
+    errored = [r for r in rows if r.error]
+    for row in errored:
+        print(f"[{skill}] uplift not measured for #{row.id}: {row.error}")
+    measured = len(rows) - len(errored)
+    if errored and not measured:
+        print(f"[{skill}] uplift vs baseline: not measured")
+        return
+    print(f"[{skill}] uplift vs baseline {score:+.0%}")
 
 
 def _print_report(report) -> None:
     _print_triggering(report.skill_name, report.triggering)
     _print_quality(report.skill_name, report.quality)
-    print(f"[{report.skill_name}] uplift vs baseline {report.uplift_score:+.0%}")
+    _print_uplift(report.skill_name, report.uplift_cases, report.uplift_score)
     print(f"[{report.skill_name}] {'PASS' if report.passed else 'FAIL'}")
 
 

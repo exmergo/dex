@@ -16,9 +16,12 @@ runtime dependency.
 
 from __future__ import annotations
 
+import inspect
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from . import checks
 from .suite import Corpus, EvalCase, EvalSuite
 
 
@@ -29,27 +32,80 @@ class AgentResult:
     ``triggered`` is what the triggering metric reads; ``output`` is what the judge
     grades. Backends populate ``envelopes`` when they can capture the engine's
     stdout envelopes, which lets assertions check the sanitized boundary directly.
+    ``events`` is the run's ``stream-json`` transcript, which a case's
+    deterministic ``checks`` are graded from (``evals/checks.py``).
     """
 
     output: str = ""
     triggered: bool = False
     envelopes: list[dict] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)
+    #: Where the backend wrote the transcript (``--transcripts``), if it did.
+    transcript: str | None = None
+    #: The files the run added, changed or removed in its workspace, relative
+    #: to it, or ``None`` where the backend gave it no workspace to compare.
+    changes: list[str] | None = None
     error: str | None = None
 
 
 @runtime_checkable
 class AgentRunner(Protocol):
     """Drives an agent on one prompt. ``skill_enabled`` selects the skill-active
-    arm versus the no-skill baseline arm used for uplift."""
+    arm versus the no-skill baseline arm used for uplift.
+
+    A case that needs more than its prompt (``EvalCase.streamed``: a working
+    directory of its own, tool permissions, or checks read from the tool calls)
+    is run as ``run(prompt, skill_enabled=..., case=case)``; every other call
+    passes the prompt alone, so a runner that takes no ``case`` still runs
+    every other case.
+    """
 
     def run(self, prompt: str, *, skill_enabled: bool) -> AgentResult: ...
 
 
 @runtime_checkable
 class Judge(Protocol):
-    """Decides whether an agent result satisfies one assertion."""
+    """Decides whether an agent result satisfies one assertion.
+
+    A judge that can say what it answered also has ``verdict(case, assertion,
+    result) -> Verdict``, which the core reads in place of ``grade``: a judge
+    that gave no verdict is then the case's error rather than a failed
+    assertion, and its text reaches the report.
+    """
 
     def grade(self, case: EvalCase, assertion: str, result: AgentResult) -> bool: ...
+
+
+@dataclass
+class Verdict:
+    """What a judge said about one assertion: ``passed``, the ``text`` it
+    answered, and ``error`` when it gave no verdict (it failed, timed out, or
+    answered neither PASS nor FAIL)."""
+
+    passed: bool
+    text: str = ""
+    error: str | None = None
+
+
+#: A whole word token, so `PASS123` and `PASS_X` are not read as `PASS`.
+_WORD = re.compile(r"\w+")
+
+
+def read_verdict(text: str) -> Verdict:
+    """A judge's answer, read tolerantly: the first word must be PASS or FAIL
+    itself (``Failed to authenticate`` is no verdict), whatever markdown or
+    punctuation surrounds it and in any case (``**PASS**``, ``Pass.``)."""
+
+    found = _WORD.search(text)
+    word = found.group(0).upper() if found else ""
+    if word == "PASS":
+        return Verdict(passed=True, text=text)
+    if word == "FAIL":
+        return Verdict(passed=False, text=text)
+    shown = text.strip()[:200] or "nothing"
+    return Verdict(
+        passed=False, text=text, error=f"answered neither PASS nor FAIL: {shown!r}"
+    )
 
 
 @dataclass
@@ -136,8 +192,20 @@ class TriggeringReport:
 
 @dataclass
 class AssertionResult:
+    """One assertion's verdict. ``graded_by`` is ``judge`` for a judged
+    assertion and ``check`` for one read from the tool calls. ``detail`` says
+    what a check found, or why a judge gave no verdict; ``verdict`` is the text
+    a judge answered, where it can report one."""
+
     assertion: str
     passed: bool
+    graded_by: str = "judge"
+    detail: str = ""
+    verdict: str | None = None
+    #: What a check saw that does not decide it (writes outside the project).
+    info: str = ""
+    #: Why the judge gave no verdict, which makes the case's run an error.
+    judge_error: str = ""
 
 
 @dataclass
@@ -146,10 +214,17 @@ class CaseReport:
     prompt: str
     assertions: list[AssertionResult] = field(default_factory=list)
     error: str | None = None
+    #: Where the backend wrote this run's transcript, if it wrote one.
+    transcript: str | None = None
 
     @property
     def passed(self) -> bool:
-        return bool(self.assertions) and all(a.passed for a in self.assertions)
+        # A run that errored is no result, whatever its graders said about it.
+        return (
+            not self.error
+            and bool(self.assertions)
+            and all(a.passed for a in self.assertions)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,16 +233,30 @@ class CaseReport:
             "passed": self.passed,
             "error": self.error,
             "assertions": [
-                {"assertion": a.assertion, "passed": a.passed} for a in self.assertions
+                {
+                    "assertion": a.assertion,
+                    "passed": a.passed,
+                    "graded_by": a.graded_by,
+                    **({"detail": a.detail} if a.detail else {}),
+                    **({"verdict": a.verdict} if a.verdict is not None else {}),
+                    **({"info": a.info} if a.info else {}),
+                }
+                for a in self.assertions
             ],
         }
 
 
 @dataclass
 class UpliftCaseReport:
+    """One case's two arms. ``error`` is set when either arm errored (the run
+    or its judge): the row then measures nothing, so it is left out of the
+    uplift and fails the suite, rather than counting as a failed arm, which
+    would credit the skill with a broken baseline."""
+
     id: int
     passed_with_skill: bool
     passed_without_skill: bool
+    error: str | None = None
 
 
 @dataclass
@@ -185,14 +274,19 @@ class SuiteReport:
     def uplift_score(self) -> float:
         """Net fraction of cases the skill turns from failing to passing."""
 
-        with_skill = _rate([u.passed_with_skill for u in self.uplift_cases])
-        without = _rate([u.passed_without_skill for u in self.uplift_cases])
-        return round(with_skill - without, 4)
+        return uplift_score(self.uplift_cases)
 
     @property
     def passed(self) -> bool:
         # Triggering must be clean and the skill must not regress against baseline.
-        return self.triggering.passed and self.uplift_score >= 0.0
+        # A quality run or an uplift row with an error measured nothing, so the
+        # suite cannot pass; a quality case that ran and failed stays a result.
+        return (
+            self.triggering.passed
+            and not any(c.error for c in self.quality)
+            and not any(u.error for u in self.uplift_cases)
+            and self.uplift_score >= 0.0
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -205,6 +299,7 @@ class SuiteReport:
                     "id": u.id,
                     "passed_with_skill": u.passed_with_skill,
                     "passed_without_skill": u.passed_without_skill,
+                    **({"error": u.error} if u.error else {}),
                 }
                 for u in self.uplift_cases
             ],
@@ -233,20 +328,23 @@ def run_triggering(suite: EvalSuite, runner: AgentRunner) -> TriggeringReport:
 
 
 def run_quality(
-    suite: EvalSuite, runner: AgentRunner, judge: Judge
+    suite: EvalSuite, runner: AgentRunner, judge: Judge, *, skill_enabled: bool = True
 ) -> list[CaseReport]:
+    """Run every case once and grade it. ``skill_enabled=False`` runs the
+    baseline arm, which is how ``--case`` records a case against the agent
+    alone (``--uplift``)."""
+
     reports: list[CaseReport] = []
     for case in suite.evals:
-        result = runner.run(case.prompt, skill_enabled=True)
+        result = _run_case(runner, case, skill_enabled)
+        graded = _grade(case, result, judge)
         reports.append(
             CaseReport(
                 id=case.id,
                 prompt=case.prompt,
-                error=result.error,
-                assertions=[
-                    AssertionResult(assertion=a, passed=judge.grade(case, a, result))
-                    for a in case.assertions
-                ],
+                error=result.error or _judge_error(graded),
+                assertions=graded,
+                transcript=result.transcript,
             )
         )
     return reports
@@ -255,14 +353,53 @@ def run_quality(
 def run_uplift(
     suite: EvalSuite, runner: AgentRunner, judge: Judge
 ) -> list[UpliftCaseReport]:
+    rows = []
+    for case in suite.evals:
+        with_skill, skill_error = _arm(case, runner, judge, skill=True)
+        without, baseline_error = _arm(case, runner, judge, skill=False)
+        rows.append(
+            UpliftCaseReport(
+                id=case.id,
+                passed_with_skill=with_skill,
+                passed_without_skill=without,
+                error=_arm_error(skill_error, baseline_error),
+            )
+        )
+    return rows
+
+
+def uplift_from(
+    with_skill: list[CaseReport], without_skill: list[CaseReport]
+) -> list[UpliftCaseReport]:
+    """Pair each case's two arms, already run, into uplift rows."""
+
+    baseline = {c.id: c for c in without_skill}
     return [
         UpliftCaseReport(
-            id=case.id,
-            passed_with_skill=_all_pass(case, runner, judge, skill=True),
-            passed_without_skill=_all_pass(case, runner, judge, skill=False),
+            id=c.id,
+            passed_with_skill=c.passed,
+            passed_without_skill=baseline[c.id].passed,
+            error=_arm_error(c.error, baseline[c.id].error),
         )
-        for case in suite.evals
+        for c in with_skill
     ]
+
+
+def uplift_score(cases: list[UpliftCaseReport]) -> float:
+    """Net fraction of cases the skill turns from failing to passing, over the
+    cases both of whose arms ran; a row with an error measures nothing."""
+
+    measured = [u for u in cases if not u.error]
+    with_skill = _rate([u.passed_with_skill for u in measured])
+    without = _rate([u.passed_without_skill for u in measured])
+    return round(with_skill - without, 4)
+
+
+def _arm_error(skill: str | None, baseline: str | None) -> str | None:
+    said = [
+        f"{arm} arm: {e}" for arm, e in (("skill", skill), ("baseline", baseline)) if e
+    ]
+    return "; ".join(said) or None
 
 
 def run_suite(suite: EvalSuite, runner: AgentRunner, judge: Judge) -> SuiteReport:
@@ -276,13 +413,91 @@ def run_suite(suite: EvalSuite, runner: AgentRunner, judge: Judge) -> SuiteRepor
     )
 
 
-def _all_pass(
+def _arm(
     case: EvalCase, runner: AgentRunner, judge: Judge, *, skill: bool
-) -> bool:
-    result = runner.run(case.prompt, skill_enabled=skill)
-    return bool(case.assertions) and all(
-        judge.grade(case, a, result) for a in case.assertions
+) -> tuple[bool, str | None]:
+    """One arm of one case: whether it passed, and its error if it has one."""
+
+    result = _run_case(runner, case, skill)
+    graded = _grade(case, result, judge)
+    error = result.error or _judge_error(graded)
+    return (not error and bool(graded) and all(a.passed for a in graded)), error
+
+
+def _judge_error(graded: list[AssertionResult]) -> str | None:
+    """The first judge that gave no verdict, as the case's error: a judge
+    that failed is no evidence about the agent, so it is not a FAIL."""
+
+    for a in graded:
+        if a.judge_error:
+            return f"the judge gave no verdict: {a.judge_error} on {a.assertion!r}"
+    return None
+
+
+def _judged(judge: Judge, case: EvalCase, assertion: str, result: AgentResult):
+    reads = getattr(judge, "verdict", None)
+    if reads is None:
+        passed = judge.grade(case, assertion, result)
+        return AssertionResult(assertion=assertion, passed=passed)
+    said = reads(case, assertion, result)
+    if said.error:
+        return AssertionResult(
+            assertion=assertion,
+            passed=False,
+            detail=f"no verdict: {said.error}",
+            verdict=said.text,
+            judge_error=said.error,
+        )
+    return AssertionResult(
+        assertion=assertion, passed=said.passed, verdict=said.text or None
     )
+
+
+def _run_case(runner: AgentRunner, case: EvalCase, skill: bool) -> AgentResult:
+    if case.streamed:
+        if not _takes_case(runner):
+            # A runner built for plain cases cannot set up a workspace, pass
+            # the flags or keep the transcript: the case is unmeasured.
+            return AgentResult(
+                error=f"{type(runner).__name__}.run takes no `case`, which a case "
+                "with setup, agent or checks needs"
+            )
+        return runner.run(case.prompt, skill_enabled=skill, case=case)
+    return runner.run(case.prompt, skill_enabled=skill)
+
+
+def _takes_case(runner: AgentRunner) -> bool:
+    try:
+        parameters = inspect.signature(runner.run).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        p.name == "case" or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters
+    )
+
+
+def _grade(case: EvalCase, result: AgentResult, judge: Judge) -> list[AssertionResult]:
+    """The judged assertions, then the checks read from the tool calls. A run
+    that errored passes no check: an empty transcript holds no forbidden call,
+    which is no evidence the agent avoided one."""
+
+    graded = [_judged(judge, case, a, result) for a in case.assertions]
+    for check in case.checks:
+        if result.error:
+            passed, detail, info = False, f"not graded: {result.error}", ""
+        else:
+            passed, detail = checks.grade(check, result.events, result.changes)
+            info = checks.information(check, result.events, result.changes)
+        graded.append(
+            AssertionResult(
+                assertion=check.assertion,
+                passed=passed,
+                graded_by="check",
+                detail=detail,
+                info=info,
+            )
+        )
+    return graded
 
 
 def _rate(flags: list[bool]) -> float:
