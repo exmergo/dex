@@ -958,9 +958,10 @@ changes them only as stated (see [below](#an-intended-change---expect)). Use it 
 the plan names the command. A green build and a matching row count do not establish
 this, since a join rewrite can keep both and still change a measure.
 
-Each verdict except `awaiting_confirmation` and `plan_applied` is recorded on the
-stored plan, keyed by model, so `transform apply` and a `transform build
---for-plan` report whether each rewrite was compared and what came back. The
+Each verdict except `awaiting_confirmation`, `plan_applied`, `invalid_expectation`
+and `dev_target_locked` is recorded on the stored plan, keyed by model, so
+`transform apply` and a `transform build --for-plan` report whether each rewrite
+was compared and what came back. The
 latest comparison of a model replaces the earlier one. Recording moves no plan
 digest: the portable document carries the edits alone.
 
@@ -1019,6 +1020,7 @@ or `different` beside it before calling it a defect of the change.
 |---|---|
 | `plan_applied`, `plan_stale` | plan the change again against the tree as it is |
 | `baseline_not_compilable`, `proposed_not_compilable` | the model does not compile on that side; `detail` quotes a compile error, and a connection failure says to run `dbt compile` |
+| `dev_target_locked` | the dev DuckDB file is locked by another open connection, so dbt could not open it to compile: another process (the duckdb CLI, a notebook), or another `DexEngine` in this process that still holds its handle. Close it (`engine.close()` on that engine) and compare again. On DuckDB, `transform build` releases the engine's handle when it finishes, with or without `--verify`; an engine that ran another command (`explore`, `transform plan`, `transform repair`, `transform test`) holds its handle until it is closed. `detail` is fixed text, with no path or PID, and the verdict is not recorded on the plan, since it says nothing about the model |
 | `inputs_unsynchronized` | build the named parents on dev; one the last build left `error` or `skipped` needs its failure repaired first, in a plan of its own, applied and built (`--cold-deps` where a package owns it). A cold build counts. A plan that changes a seed or snapshot the proposed model reads (through any upstream model; one that does not read it compares as usual, #1429), or a macro or project setting that changes how an untouched parent compiles, cannot be compared, because dev holds the old rows. For a seed or snapshot, plan it on its own, apply and build it, then plan the model edits again and compare them. This plan stays uncompared: once it is applied the baseline is gone (`plan_applied`). After applying and building, a further change needs its own new, unapplied plan to compare |
 | `nondeterministic_expression` | the model calls a random, uuid or current-time function, or samples, so two runs can differ on their own |
 | `unsupported_type` | the named column cannot be grouped on this connector; `detail` names it and its type |

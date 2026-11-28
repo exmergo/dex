@@ -195,10 +195,16 @@ def compare(
 
 
 #: Verdicts that say nothing about the plan, so recording them would overwrite a
-#: verdict that does: a comparison still waiting on its price, and one refused
-#: because the plan is already applied.
+#: verdict that does: a comparison still waiting on its price, one refused
+#: because the plan is already applied, and one that never compiled because
+#: another connection held the dev file (#1378).
 _UNRECORDED = frozenset(
-    {"awaiting_confirmation", "plan_applied", "invalid_expectation"}
+    {
+        "awaiting_confirmation",
+        "plan_applied",
+        "invalid_expectation",
+        "dev_target_locked",
+    }
 )
 
 
@@ -888,6 +894,14 @@ def _compile_side(
             f"+{model}" if through_ancestors else model, vars_=vars_
         )
     except DbtRunError as exc:
+        # dbt opens the DuckDB file to write even to compile, so a handle held
+        # elsewhere stops it before it reads a line of SQL. That is not a model
+        # that does not compile, and saying so sends the caller at their SQL when
+        # the fix is to close the other connection (#1378).
+        if dev_target_locked(str(exc)):
+            raise _NotComparableError(
+                "dev_target_locked", _DEV_TARGET_LOCKED_DETAIL
+            ) from exc
         raise _NotComparableError(code, _compile_detail(str(exc))) from exc
     matches = [
         node
@@ -1259,6 +1273,34 @@ def _upstream_seeds(
         ):
             found.add(Path(path).as_posix())
     return frozenset(found)
+
+
+#: What DuckDB says when dbt cannot take the file's write lock because another
+#: connection holds it: ``Could not set lock on file "<path>": Conflicting lock is
+#: held in <executable> (PID <n>) by user <name>``. Both halves are matched, so a
+#: release that rewords one still classifies.
+_LOCK_CONFLICT_MARKERS = ("could not set lock on file", "conflicting lock")
+
+#: Fixed text: the warehouse's own message names the path, the executable and the
+#: PID holding the lock, none of which belongs in a result.
+_DEV_TARGET_LOCKED_DETAIL = (
+    "the dev DuckDB file is held open by another connection; close it, whether "
+    "that is another process (such as the duckdb CLI or a notebook) or "
+    "`engine.close()` on another DexEngine in this process, then compare again"
+)
+
+
+def dev_target_locked(message: str) -> bool:
+    """Whether a failed dbt run says the dev DuckDB file is locked elsewhere.
+
+    A compilation or parsing error is dbt's own verdict on the project, so one
+    that happens to mention a lock is still a model that does not compile.
+    """
+
+    lowered = message.lower()
+    if "compilation error" in lowered or "parsing error" in lowered:
+        return False
+    return any(marker in lowered for marker in _LOCK_CONFLICT_MARKERS)
 
 
 def _compile_detail(message: str) -> str:

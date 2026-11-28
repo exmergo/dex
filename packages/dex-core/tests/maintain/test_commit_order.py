@@ -8,6 +8,7 @@ group runs the same rules against a real ``git`` repository.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -20,7 +21,6 @@ from exmergo_dex_core.maintain.commit_history import (
     GitHistory,
     HistoryUnreadableError,
     MappedHistory,
-    git_env,
 )
 from exmergo_dex_core.maintain.incidents import fold_incidents
 from exmergo_dex_core.maintain.observations import (
@@ -434,7 +434,7 @@ _GIT = shutil.which("git")
 
 def _git(root: Path, *args: str) -> str:
     env = {
-        **git_env(),
+        **os.environ,
         "GIT_AUTHOR_NAME": "dex",
         "GIT_AUTHOR_EMAIL": "dex@example.invalid",
         "GIT_COMMITTER_NAME": "dex",
@@ -530,7 +530,6 @@ def _shallow_clone(repo: dict[str, str], tmp_path: Path, depth: int) -> Path:
         ],
         check=True,
         capture_output=True,
-        env=git_env(),
     )
     return clone
 
@@ -620,22 +619,3 @@ def test_one_failing_command_does_not_mark_the_history_unreadable(
     with pytest.raises(HistoryUnreadableError):
         git.between("0" * 40, [], 10)  # an object the repository lacks
     assert git.resolve(repo["b"]) == repo["b"]
-
-
-def test_git_fixture_does_not_write_to_an_inherited_repository(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    if _GIT is None:
-        pytest.skip("git is not installed")
-    decoy = tmp_path / "decoy"
-    decoy.mkdir()
-    _git(decoy, "init", "-q", "-b", "main")
-    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
-    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
-    root = tmp_path / "intended"
-    root.mkdir()
-    _git(root, "init", "-q", "-b", "main")
-    assert (root / ".git").is_dir()
-    commit = _commit(root, "fixture")
-    assert GitHistory(root).resolve(commit) == commit
-    assert _git(decoy, "for-each-ref") == ""

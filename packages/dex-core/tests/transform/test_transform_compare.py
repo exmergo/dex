@@ -14,6 +14,7 @@ from exmergo_dex_core.storage import FilesystemStore
 from exmergo_dex_core.transform.plans import EditKind, PlanEdit
 from exmergo_dex_core.transform.refactor_compare import (
     _upstream_seeds,
+    dev_target_locked,
     nondeterministic_expression,
 )
 
@@ -203,6 +204,89 @@ def test_a_baseline_that_will_not_compile_is_not_checked(project):
     result = engine.compare(plan_id)
     assert result.status == "not_checked"
     assert result.reason_code == "baseline_not_compilable"
+
+
+#: What DuckDB 2.0 under dbt-duckdb 1.11 says when dbt cannot take the write
+#: lock, as `_collect_messages` hands it on: the generic header with the lock
+#: line riding along. The path, executable and PID are the warehouse's words.
+_LOCK_MESSAGE = (
+    "[ERROR]: Encountered an error: IO Error: Could not set lock on file "
+    '"/tmp/somewhere/dev.duckdb": Conflicting lock is held in '
+    "/usr/local/bin/python3.14 (PID 1225953) by user root. However, you would be "
+    "able to open this database in read-only mode, e.g. by using the -readonly "
+    "parameter in the CLI."
+)
+
+
+@pytest.mark.parametrize(
+    ("message", "locked"),
+    [
+        (_LOCK_MESSAGE, True),
+        ("Conflicting lock is held in dbt (PID 7)", True),
+        (
+            "Compilation Error in model team_activity (models/team_activity.sql)\n"
+            "  Model 'model.p.team_activity' depends on a node named 'no_such_model'",
+            False,
+        ),
+        # Either half of DuckDB's sentence on its own, reworded around it.
+        (
+            'IO Error: Could not set lock on file "/tmp/dev.duckdb": another '
+            "connection has it open",
+            True,
+        ),
+        # dbt's own verdict on the project wins over a lock it happens to mention.
+        (
+            "Compilation Error in model team_activity (models/team_activity.sql)\n"
+            "  'conflicting lock' is not a defined macro",
+            False,
+        ),
+    ],
+)
+def test_a_lock_conflict_is_read_from_dbts_words(message, locked):
+    assert dev_target_locked(message) is locked
+
+
+def test_a_dev_file_another_connection_holds_is_reported_as_locked(project, tmp_path):
+    """#1378: a lock dbt cannot take is not a model that does not compile."""
+
+    import duckdb
+
+    engine = _engine(project)
+    plan_id = _plan(engine, project, ("models/team_activity.sql", _EQUIVALENT))
+    # Planning opened the engine's own handle; released before another one with
+    # DuckDB's default configuration opens the same file in this process.
+    engine.close()
+    held = duckdb.connect(str(tmp_path / "dev.duckdb"), read_only=True)
+    try:
+        result = engine.compare(plan_id)
+    finally:
+        held.close()
+    assert result.status == "not_checked"
+    assert result.reason_code == "dev_target_locked", result.detail
+    assert "engine.close()" in result.detail
+    # Fixed text: the warehouse named the path, the executable and the PID.
+    assert str(tmp_path) not in result.detail
+    assert "PID" not in result.detail
+    assert "python" not in result.detail.lower()
+    # It says nothing about the model, so apply has no verdict to report.
+    stored = engine.require_full_store("reading the plan").load_plan(plan_id)
+    assert not stored.comparisons
+    # Released, the same plan compares.
+    after = engine.compare(plan_id)
+    assert after.status == "equivalent", after.detail
+
+
+def test_a_verified_build_releases_the_dev_file_for_a_second_engine(project):
+    """#1378: engine A ran `build --verify`; engine B compares without A closing."""
+
+    first = _engine(project)
+    built = first.build(target="dev", verify=True)
+    assert built.success, built
+    second = _engine(project)
+    plan_id = _plan(second, project, ("models/team_activity.sql", _EQUIVALENT))
+    result = second.compare(plan_id)
+    assert result.status == "equivalent", result.detail
+    assert result.reason_code == "equivalent_on_compared_inputs"
 
 
 def test_an_unknown_macro_is_not_checked(project):
